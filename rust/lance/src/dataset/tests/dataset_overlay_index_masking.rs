@@ -662,6 +662,35 @@ async fn test_overlay_stale_with_compound_index_expression() {
     assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
 }
 
+#[tokio::test]
+async fn test_overlay_stale_with_cell_flag_and_scalar_index() {
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .register_cell_flag("age", "reviewed", true)
+        .await
+        .unwrap();
+    build_age_index(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_cell_flag",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    assert_eq!(
+        ids_matching(&dataset, "age = 10 AND cell_flag(age, 'reviewed')").await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999 AND cell_flag(age, 'reviewed')").await,
+        vec![1]
+    );
+}
+
 /// A `RewriteRows` update (under stable row ids) that touches only a *non-indexed* column moves
 /// the matched rows to a new fragment and, because the scalar index's field was not modified,
 /// extends that index's fragment coverage onto the new fragment

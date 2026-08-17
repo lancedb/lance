@@ -63,7 +63,7 @@ use lance_datafusion::exec::{
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
-use lance_file::reader::FileReaderOptions;
+use lance_file::{reader::FileReaderOptions, version::ConcreteFileVersion};
 use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::FullTextSearchQuery;
@@ -979,6 +979,7 @@ pub struct Scanner {
 
     aggregate: Option<Aggregate>,
     cell_flags_bound: bool,
+    precomputed_scalar_index: Option<PrecomputedScalarIndex>,
 
     /// Which version of the relational algebra to use when generating the physical plan
     relational_algebra_version: u32,
@@ -1020,6 +1021,13 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
+}
+
+#[derive(Clone)]
+struct PrecomputedScalarIndex {
+    exec: Arc<ScalarIndexExec>,
+    result: IndexExprResult,
+    fragments_covered: RoaringBitmap,
 }
 
 /// Represents a user-requested take operation
@@ -1213,6 +1221,7 @@ impl Scanner {
             file_reader_options,
             aggregate: None,
             cell_flags_bound: false,
+            precomputed_scalar_index: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -2842,7 +2851,10 @@ impl Scanner {
         Ok(false)
     }
 
-    async fn bind_cell_flag_expressions(&mut self) -> Result<()> {
+    async fn bind_cell_flag_expressions(
+        &mut self,
+        selected_fragments_override: Option<&[Fragment]>,
+    ) -> Result<()> {
         let filter_expression = self
             .filter
             .expr_filter
@@ -2884,7 +2896,9 @@ impl Scanner {
         }
 
         let limit_fragments = self.cell_flag_limit_fragments();
-        let selected_fragments = limit_fragments.as_deref().or(self.fragments.as_deref());
+        let selected_fragments = selected_fragments_override
+            .or(limit_fragments.as_deref())
+            .or(self.fragments.as_deref());
         let Some(bindings) =
             CellFlagExprBindings::try_new(&self.dataset, &expressions, selected_fragments).await?
         else {
@@ -2924,6 +2938,169 @@ impl Scanner {
         Ok(())
     }
 
+    async fn precompute_scalar_index_for_cell_flags(
+        &self,
+    ) -> Result<Option<(Vec<Fragment>, PrecomputedScalarIndex)>> {
+        if self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
+            == ConcreteFileVersion::V1
+            || !self.use_scalar_index
+            || self.include_deleted_rows
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.filter.query_filter.is_some()
+        {
+            return Ok(None);
+        }
+
+        let filter_plan = self.create_filter_plan(true, None, None).await?;
+        let Some(index_query) = filter_plan.expr_filter_plan.index_query else {
+            return Ok(None);
+        };
+
+        let result_format = self.index_expr_result_format();
+        let index_exec = ScalarIndexExec::new(self.dataset.clone(), index_query, result_format);
+        let batch = index_exec.execute_batch().await?;
+        let (index_result, fragments_covered) = IndexExprResult::deserialize(&batch)?;
+        let index_exec = Arc::new(index_exec.with_precomputed_batch(batch)?);
+
+        let target_fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or(self.dataset.fragments());
+        let target_fragment_ids = target_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<HashSet<_>>();
+
+        let mut selected_fragment_ids = if self.dataset.manifest().uses_stable_row_ids() {
+            target_fragment_ids.clone()
+        } else if let Some(candidates) = index_result.upper.allow_list() {
+            candidates
+                .iter()
+                .map(|(fragment_id, _)| *fragment_id)
+                .filter(|fragment_id| target_fragment_ids.contains(fragment_id))
+                .collect::<HashSet<_>>()
+        } else {
+            target_fragment_ids.clone()
+        };
+
+        if !self.fast_search {
+            selected_fragment_ids.extend(
+                target_fragment_ids
+                    .iter()
+                    .filter(|fragment_id| !fragments_covered.contains(**fragment_id)),
+            );
+        }
+
+        let stale_rows = self
+            .overlay_stale_index_rows(index_exec.expr(), target_fragments)
+            .await?;
+        selected_fragment_ids.extend(stale_rows.keys().copied());
+
+        let selected_fragments = target_fragments
+            .iter()
+            .filter(|fragment| selected_fragment_ids.contains(&(fragment.id as u32)))
+            .cloned()
+            .collect();
+        Ok(Some((
+            selected_fragments,
+            PrecomputedScalarIndex {
+                exec: index_exec,
+                result: index_result,
+                fragments_covered,
+            },
+        )))
+    }
+
+    fn additional_exact_index_conjuncts(
+        final_query: &ScalarIndexExpr,
+        precomputed_query: &ScalarIndexExpr,
+    ) -> Option<Vec<ScalarIndexExpr>> {
+        fn flatten_conjunction<'a>(
+            expression: &'a ScalarIndexExpr,
+            flattened: &mut Vec<&'a ScalarIndexExpr>,
+        ) {
+            match expression {
+                ScalarIndexExpr::And(lhs, rhs) => {
+                    flatten_conjunction(lhs, flattened);
+                    flatten_conjunction(rhs, flattened);
+                }
+                expression => flattened.push(expression),
+            }
+        }
+
+        let mut final_conjuncts = Vec::new();
+        flatten_conjunction(final_query, &mut final_conjuncts);
+        let mut precomputed_conjuncts = Vec::new();
+        flatten_conjunction(precomputed_query, &mut precomputed_conjuncts);
+
+        let mut matched = vec![false; final_conjuncts.len()];
+        for precomputed in precomputed_conjuncts {
+            let position = final_conjuncts
+                .iter()
+                .enumerate()
+                .find(|(position, candidate)| !matched[*position] && **candidate == precomputed)
+                .map(|(position, _)| position)?;
+            matched[position] = true;
+        }
+
+        final_conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| !matched[*position])
+            .map(|(_, conjunct)| match conjunct {
+                ScalarIndexExpr::Query(search) if search.exact_row_selection().is_some() => {
+                    Some(conjunct.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn scalar_index_input(
+        &self,
+        index_query: ScalarIndexExpr,
+        result_format: IndexExprResultWireFormat,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let optimized_query = index_query.optimize();
+        if let Some(precomputed) = &self.precomputed_scalar_index
+            && let Some(additional_conjuncts) =
+                Self::additional_exact_index_conjuncts(&optimized_query, precomputed.exec.expr())
+        {
+            if additional_conjuncts.is_empty() {
+                return Ok(precomputed.exec.clone());
+            }
+
+            let mut result = precomputed.result.clone();
+            for conjunct in additional_conjuncts {
+                result = result
+                    & conjunct
+                        .evaluate(self.dataset.as_ref(), &NoOpMetricsCollector)
+                        .await?;
+            }
+            // The ordinary index already proves that rows outside its upper mask cannot
+            // match. Cell Flag state is loaded for every fragment present in that upper
+            // mask, so the combined AND result remains valid across the ordinary index's
+            // complete coverage, not just the fragments containing candidates.
+            let batch = result.serialize(&precomputed.fragments_covered, result_format)?;
+            return Ok(Arc::new(
+                precomputed
+                    .exec
+                    .with_precomputed_query(optimized_query, batch)?,
+            ));
+        }
+
+        Ok(Arc::new(ScalarIndexExec::new(
+            self.dataset.clone(),
+            optimized_query,
+            result_format,
+        )))
+    }
+
     fn cell_flag_limit_fragments(&self) -> Option<Vec<Fragment>> {
         let limit = usize::try_from(self.limit?).ok()?;
         if !self.filter.is_none()
@@ -2961,7 +3138,15 @@ impl Scanner {
         if !self.cell_flags_bound && self.references_cell_flag()? {
             let mut bound = self.clone();
             bound.cell_flags_bound = true;
-            bound.bind_cell_flag_expressions().await?;
+            let precomputed = bound.precompute_scalar_index_for_cell_flags().await?;
+            bound
+                .bind_cell_flag_expressions(
+                    precomputed
+                        .as_ref()
+                        .map(|(fragments, _)| fragments.as_slice()),
+                )
+                .await?;
+            bound.precomputed_scalar_index = precomputed.map(|(_, precomputed)| precomputed);
             return Box::pin(bound.create_plan()).await;
         }
 
@@ -3413,13 +3598,10 @@ impl Scanner {
         }
 
         let result_format = self.index_expr_result_format();
-        let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                result_format,
-            )) as Arc<dyn ExecutionPlan>
-        });
+        let index_input = match filter_plan.index_query.clone() {
+            Some(index_query) => Some(self.scalar_index_input(index_query, result_format).await?),
+            None => None,
+        };
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
@@ -7099,6 +7281,141 @@ mod test {
         assert!(
             full_iops > limited_iops,
             "full planning I/O {full_iops} must exceed limited planning I/O {limited_iops}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cell_flag_binding_uses_scalar_index_candidates_before_loading_state() {
+        let test_uri = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset(&test_uri, FragmentCount::from(3), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        dataset
+            .register_cell_flag("i", "computed", false)
+            .await
+            .unwrap();
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i % 2 = 0")
+            .unwrap()
+            .set_cell_flag("i", "computed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("i = 0 AND cell_flag(i, 'computed')")
+            .unwrap();
+        let (selected_fragments, precomputed) = scanner
+            .precompute_scalar_index_for_cell_flags()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected_fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        let precomputed_query = precomputed.exec.expr().clone();
+        scanner.cell_flags_bound = true;
+        scanner
+            .bind_cell_flag_expressions(Some(&selected_fragments))
+            .await
+            .unwrap();
+        scanner.precomputed_scalar_index = Some(precomputed);
+        let final_filter_plan = scanner.create_filter_plan(true, None, None).await.unwrap();
+        let final_query = final_filter_plan
+            .expr_filter_plan
+            .index_query
+            .unwrap()
+            .optimize();
+        assert_eq!(
+            Scanner::additional_exact_index_conjuncts(&final_query, &precomputed_query)
+                .unwrap()
+                .len(),
+            1
+        );
+        let plan = scanner.create_plan().await.unwrap();
+
+        fn contains_precomputed_index(plan: &Arc<dyn ExecutionPlan>) -> bool {
+            if let Some(exec) = plan.downcast_ref::<ScalarIndexExec>() {
+                return exec.has_precomputed_batch();
+            }
+            plan.children().into_iter().any(contains_precomputed_index)
+        }
+        assert!(
+            contains_precomputed_index(&plan),
+            "physical plan did not retain the precomputed scalar-index batch: {plan:?}"
+        );
+
+        let batches = execute_plan(plan, LanceExecutionOptions::default())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .value(0),
+            0
+        );
+
+        let append = gen_batch()
+            .col("i", array::step_custom::<Int32Type>(12, 1))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        dataset.append(append, None).await.unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("i = 12 AND NOT cell_flag(i, 'computed')")
+            .unwrap();
+        let (selected_fragments, _) = scanner
+            .precompute_scalar_index_for_cell_flags()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected_fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .value(0),
+            12
         );
     }
 

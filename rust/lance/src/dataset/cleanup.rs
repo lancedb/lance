@@ -51,14 +51,16 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
+use lance_io::object_store::ObjectStore;
 use lance_table::{
-    format::{IndexMetadata, Manifest},
+    format::{CellFlagFile, CellFlagRoot, IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
 };
+use moka::future::Cache;
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use prost::Message;
@@ -66,10 +68,13 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{MissedTickBehavior, interval},
+};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
 
@@ -290,6 +295,88 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     Path::from_iter(relative_parts.unwrap())
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CleanupCellFlagRootKey {
+    flag_id: u32,
+    full_path: Path,
+    size_bytes: u64,
+    inline_hash: Option<[u8; 32]>,
+}
+
+struct CleanupIoContext {
+    permits: Arc<Semaphore>,
+    cell_flag_roots: Cache<CleanupCellFlagRootKey, Arc<CellFlagRoot>>,
+}
+
+impl Debug for CleanupIoContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CleanupIoContext")
+            .field("available_permits", &self.permits.available_permits())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CleanupIoContext {
+    fn new(io_parallelism: usize, max_cached_roots: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(io_parallelism.max(1))),
+            cell_flag_roots: Cache::builder()
+                .max_capacity(max_cached_roots.max(1) as u64)
+                .build(),
+        }
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::internal("Cleanup I/O semaphore closed".to_string()))
+    }
+
+    async fn load_cell_flag_root(
+        &self,
+        object_store: &ObjectStore,
+        full_path: &Path,
+        file: &CellFlagFile,
+        flag_id: u32,
+    ) -> Result<Arc<CellFlagRoot>> {
+        let key = CleanupCellFlagRootKey {
+            flag_id,
+            full_path: full_path.clone(),
+            size_bytes: file.size_bytes,
+            inline_hash: file
+                .inline_bytes
+                .as_deref()
+                .map(blake3::hash)
+                .map(|hash| *hash.as_bytes()),
+        };
+        let object_store = object_store.clone();
+        let full_path = full_path.clone();
+        let file = file.clone();
+        let permits = self.permits.clone();
+        self.cell_flag_roots
+            .try_get_with(key, async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::internal("Cleanup I/O semaphore closed".to_string()))?;
+                let root_bytes = read_cell_flag_bytes(&object_store, &full_path, &file).await?;
+                let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                    .map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Failed to decode cell flag root '{}': {}",
+                            file.path, error
+                        ))
+                    })?;
+                Ok(Arc::new(CellFlagRoot::try_from(root_proto)?))
+            })
+            .await
+            .map_err(|error: Arc<Error>| Error::cloned(error.to_string()))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
@@ -299,6 +386,7 @@ struct CleanupTask<'a> {
     ignored_manifests: HashSet<Path>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
+    io_context: Arc<CleanupIoContext>,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -424,6 +512,8 @@ impl<'a> CleanupTask<'a> {
         track_removed_manifests: bool,
         include_referenced_branches: bool,
     ) -> Self {
+        let io_parallelism = dataset.object_store.io_parallelism().max(1);
+        let max_cached_roots = dataset.manifest.cell_flag_states.len().max(io_parallelism);
         Self {
             dataset,
             policy,
@@ -432,6 +522,7 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
+            io_context: Arc::new(CleanupIoContext::new(io_parallelism, max_cached_roots)),
         }
     }
 
@@ -557,6 +648,7 @@ impl<'a> CleanupTask<'a> {
         // referenced.
 
         let manifest_and_indexes = async {
+            let _permit = self.io_context.acquire().await?;
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
             let indexes =
@@ -669,10 +761,12 @@ impl<'a> CleanupTask<'a> {
         let io_parallelism = self.dataset.object_store.io_parallelism().max(1);
         let object_store = self.dataset.object_store.clone();
         let dataset_base = self.dataset.base.clone();
+        let io_context = self.io_context.clone();
         let path_sets = stream::iter(manifest.cell_flag_states.clone())
             .map(move |state| {
                 let object_store = object_store.clone();
                 let dataset_base = dataset_base.clone();
+                let io_context = io_context.clone();
                 async move {
                     let mut paths = HashSet::new();
                     // Cleanup scans only this dataset's object store. Files owned by an
@@ -685,27 +779,24 @@ impl<'a> CleanupTask<'a> {
                     paths.insert(root_path.clone());
                     let full_root_path =
                         Path::from_iter(dataset_base.parts().chain(root_path.parts()));
-                    let root_bytes =
-                        read_cell_flag_bytes(&object_store, &full_root_path, &state.root).await?;
-                    let root_proto =
-                        lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
-                            .map_err(|error| {
-                                Error::invalid_input(format!(
-                                    "Failed to decode cell flag root '{}': {}",
-                                    state.root.path, error
-                                ))
-                            })?;
-                    let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
-                    for fragment in root.fragments {
+                    let root = io_context
+                        .load_cell_flag_root(
+                            &object_store,
+                            &full_root_path,
+                            &state.root,
+                            state.flag_id,
+                        )
+                        .await?;
+                    for fragment in &root.fragments {
                         if let lance_table::format::CellFlagFragmentState::Partial(file) =
-                            fragment.state
+                            &fragment.state
                             && file.base_id.is_none()
                         {
                             file.validate_bitmap_path_for_fragment(
                                 state.flag_id,
                                 fragment.fragment_id,
                             )?;
-                            paths.insert(Path::parse(file.path)?);
+                            paths.insert(Path::parse(&file.path)?);
                         }
                     }
                     Ok(paths)
@@ -728,6 +819,7 @@ impl<'a> CleanupTask<'a> {
         let dataset_base = self.dataset.base.clone();
         let branch_base = branch_base.clone();
         let base_paths = manifest.base_paths.clone();
+        let io_context = self.io_context.clone();
         let path_sets = stream::iter(manifest.cell_flag_states.clone())
             .map(move |state| {
                 let object_store = object_store.clone();
@@ -735,12 +827,13 @@ impl<'a> CleanupTask<'a> {
                 let dataset_base = dataset_base.clone();
                 let branch_base = branch_base.clone();
                 let base_paths = base_paths.clone();
+                let io_context = io_context.clone();
                 async move {
                     let mut paths = HashSet::new();
                     state.root.validate_root_path_for_flag(state.flag_id)?;
                     let root_path = Path::parse(&state.root.path)?;
                     let (root_base, root_is_parent_owned) = match state.root.base_id {
-                        None => (branch_base.clone(), false),
+                        None => (branch_base, false),
                         Some(root_base_id) => {
                             let root_base = base_paths.get(&root_base_id).ok_or_else(|| {
                                 Error::invalid_input(format!(
@@ -762,20 +855,17 @@ impl<'a> CleanupTask<'a> {
                     }
                     let full_root_path =
                         Path::from_iter(root_base.parts().chain(root_path.parts()));
-                    let root_bytes =
-                        read_cell_flag_bytes(&object_store, &full_root_path, &state.root).await?;
-                    let root_proto =
-                        lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
-                            .map_err(|error| {
-                                Error::invalid_input(format!(
-                                    "Failed to decode branch cell flag root '{}': {}",
-                                    state.root.path, error
-                                ))
-                            })?;
-                    let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
-                    for fragment in root.fragments {
+                    let root = io_context
+                        .load_cell_flag_root(
+                            &object_store,
+                            &full_root_path,
+                            &state.root,
+                            state.flag_id,
+                        )
+                        .await?;
+                    for fragment in &root.fragments {
                         let lance_table::format::CellFlagFragmentState::Partial(bitmap) =
-                            fragment.state
+                            &fragment.state
                         else {
                             continue;
                         };
@@ -790,7 +880,7 @@ impl<'a> CleanupTask<'a> {
                                 .is_some_and(|base| base.path == dataset_uri),
                         };
                         if bitmap_is_local {
-                            paths.insert(Path::parse(bitmap.path)?);
+                            paths.insert(Path::parse(&bitmap.path)?);
                         }
                     }
                     Ok(paths)
@@ -1404,10 +1494,12 @@ impl<'a> CleanupTask<'a> {
         inspection: &Mutex<CleanupInspection>,
         branch_base: &Path,
     ) -> Result<()> {
+        let _permit = self.io_context.acquire().await?;
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        drop(_permit);
         let cell_flag_paths = self.branch_cell_flag_paths(&manifest, branch_base).await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
@@ -1838,7 +1930,10 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            AutoCleanupParams, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1928,6 +2023,77 @@ mod tests {
         tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
+    }
+
+    #[tokio::test]
+    async fn cleanup_cell_flag_root_cache_is_shared_and_single_flight() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        let schema = batch.schema();
+        fixture
+            .create_with_data(RecordBatchIterator::new(vec![Ok(batch)], schema))
+            .await
+            .unwrap();
+
+        let mut dataset = *fixture.open().await.unwrap();
+        dataset
+            .register_cell_flag("i", "computed", false)
+            .await
+            .unwrap();
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i % 2 = 0")
+            .unwrap()
+            .set_cell_flag("i", "computed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        let state = dataset.manifest.cell_flag_states[0].clone();
+        let root_path = Path::parse(&state.root.path).unwrap();
+        let full_root_path = Path::from_iter(dataset.base.parts().chain(root_path.parts()));
+        let context = CleanupIoContext::new(4, 4);
+        let (first, concurrent) = tokio::try_join!(
+            context.load_cell_flag_root(
+                &dataset.object_store,
+                &full_root_path,
+                &state.root,
+                state.flag_id,
+            ),
+            context.load_cell_flag_root(
+                &dataset.object_store,
+                &full_root_path,
+                &state.root,
+                state.flag_id,
+            )
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &concurrent));
+
+        let cached = context
+            .load_cell_flag_root(
+                &dataset.object_store,
+                &full_root_path,
+                &state.root,
+                state.flag_id,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Explain {
+                max_candidate_files: 0,
+            },
+        );
+        assert!(Arc::ptr_eq(&task.io_context, &task.clone().io_context));
     }
 
     impl MockDatasetFixture {

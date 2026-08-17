@@ -487,6 +487,9 @@
                                 -Djdk.reflect.useDirectMethodHandle=false
                                 -Dio.netty.tryReflectionSetAccessible=true
                             </argLine>
+                            <environmentVariables>
+                                <LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED>1</LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED>
+                            </environmentVariables>
                             <forkNode
                                 implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>

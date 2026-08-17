@@ -120,6 +120,20 @@ pub struct ScalarIndexExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
+    precomputed_batch: Option<PrecomputedIndexBatch>,
+}
+
+#[derive(Clone)]
+struct PrecomputedIndexBatch(RecordBatch);
+
+impl std::fmt::Debug for PrecomputedIndexBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrecomputedIndexBatch")
+            .field("schema", &self.0.schema())
+            .field("num_rows", &self.0.num_rows())
+            .finish()
+    }
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -153,7 +167,51 @@ impl ScalarIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
+            precomputed_batch: None,
         }
+    }
+
+    pub(crate) async fn execute_batch(&self) -> Result<RecordBatch> {
+        Self::do_execute(
+            self.expr.clone(),
+            self.dataset.clone(),
+            self.metrics.clone(),
+            self.result_format,
+        )
+        .await
+    }
+
+    pub(crate) fn with_precomputed_batch(mut self, batch: RecordBatch) -> Result<Self> {
+        if batch.schema() != self.result_format.schema().clone() {
+            return Err(Error::internal(format!(
+                "Precomputed scalar index batch has schema {:?}, expected {:?}",
+                batch.schema(),
+                self.result_format.schema()
+            )));
+        }
+        self.precomputed_batch = Some(PrecomputedIndexBatch(batch));
+        Ok(self)
+    }
+
+    pub(crate) fn with_precomputed_query(
+        &self,
+        expr: ScalarIndexExpr,
+        batch: RecordBatch,
+    ) -> Result<Self> {
+        Self {
+            dataset: self.dataset.clone(),
+            expr: expr.optimize(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            result_format: self.result_format,
+            precomputed_batch: None,
+        }
+        .with_precomputed_batch(batch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_precomputed_batch(&self) -> bool {
+        self.precomputed_batch.is_some()
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -257,12 +315,17 @@ impl ExecutionPlan for ScalarIndexExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let batch_fut = Self::do_execute(
-            self.expr.clone(),
-            self.dataset.clone(),
-            self.metrics.clone(),
-            self.result_format,
-        );
+        let precomputed_batch = self.precomputed_batch.clone();
+        let expr = self.expr.clone();
+        let dataset = self.dataset.clone();
+        let metrics = self.metrics.clone();
+        let result_format = self.result_format;
+        let batch_fut = async move {
+            match precomputed_batch {
+                Some(batch) => Ok(batch.0),
+                None => Self::do_execute(expr, dataset, metrics, result_format).await,
+            }
+        };
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()

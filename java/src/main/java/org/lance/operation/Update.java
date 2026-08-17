@@ -31,6 +31,7 @@ public class Update implements Operation {
   private final long[] fieldsModified;
   private final long[] fieldsForPreservingFragBitmap;
   private final Optional<UpdateMode> updateMode;
+  private final byte[] internalMetadata;
 
   /**
    * Per-fragment matched row offsets serialized as portable RoaringBitmap bytes (little-endian,
@@ -48,7 +49,8 @@ public class Update implements Operation {
       long[] fieldsModified,
       long[] fieldsForPreservingFragBitmap,
       Optional<UpdateMode> updateMode,
-      Map<Long, byte[]> updatedFragmentOffsets) {
+      Map<Long, byte[]> updatedFragmentOffsets,
+      byte[] internalMetadata) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
@@ -56,6 +58,7 @@ public class Update implements Operation {
     this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
     this.updateMode = updateMode;
     this.updatedFragmentOffsets = updatedFragmentOffsets;
+    this.internalMetadata = internalMetadata;
   }
 
   public static Builder builder() {
@@ -213,7 +216,8 @@ public class Update implements Operation {
           fieldsModified,
           fieldsForPreservingFragBitmap,
           updateMode,
-          updatedFragmentOffsets);
+          updatedFragmentOffsets,
+          null);
     }
   }
 }

@@ -13,7 +13,9 @@
  */
 package org.lance.test;
 
+import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.Transaction;
 import org.lance.index.IndexParams;
 import org.lance.ipc.Query;
 
@@ -58,4 +60,9 @@ public class JniTestHelper {
   public static native void parseQuery(Optional<Query> query);
 
   public static native void parseIndexParams(IndexParams indexParams);
+
+  public static native Transaction createCellFlagTransaction(
+      Dataset dataset, String field, String name);
+
+  public static native void validateTransaction(Dataset dataset, Transaction transaction);
 }

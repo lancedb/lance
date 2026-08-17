@@ -21,13 +21,16 @@ use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
+use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
+use lance_index::mem_wal::CompactedSsTable;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_table::format::pb;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -36,6 +39,64 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+fn encode_java_update_internal_metadata(
+    compacted_sstables: &[CompactedSsTable],
+    inserted_rows_filter: Option<&KeyExistenceFilter>,
+) -> Option<Vec<u8>> {
+    if compacted_sstables.is_empty() && inserted_rows_filter.is_none() {
+        return None;
+    }
+
+    Some(
+        pb::transaction::Update {
+            compacted_sstables: compacted_sstables
+                .iter()
+                .map(pb::CompactedSsTable::from)
+                .collect(),
+            inserted_rows: inserted_rows_filter.map(Into::into),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    )
+}
+
+fn decode_java_update_internal_metadata(
+    encoded: Option<&[u8]>,
+) -> Result<(Vec<CompactedSsTable>, Option<KeyExistenceFilter>)> {
+    let Some(encoded) = encoded else {
+        return Ok((Vec::new(), None));
+    };
+    let metadata = pb::transaction::Update::decode(encoded).map_err(|error| {
+        Error::input_error(format!(
+            "Invalid internal Update metadata protobuf: {error}"
+        ))
+    })?;
+    if !metadata.removed_fragment_ids.is_empty()
+        || !metadata.updated_fragments.is_empty()
+        || !metadata.new_fragments.is_empty()
+        || !metadata.fields_modified.is_empty()
+        || !metadata.fields_for_preserving_frag_bitmap.is_empty()
+        || !metadata.updated_fragment_offsets.is_empty()
+        || !metadata.updated_fragment_offset_bitmaps.is_empty()
+    {
+        return Err(Error::input_error(
+            "Internal Update metadata contains public operation fields".to_string(),
+        ));
+    }
+
+    let compacted_sstables = metadata
+        .compacted_sstables
+        .into_iter()
+        .map(CompactedSsTable::try_from)
+        .collect::<lance_core::Result<Vec<_>>>()?;
+    let inserted_rows_filter = metadata
+        .inserted_rows
+        .as_ref()
+        .map(KeyExistenceFilter::try_from)
+        .transpose()?;
+    Ok((compacted_sstables, inserted_rows_filter))
+}
 
 impl IntoJava for &RewriteGroup {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -304,6 +365,79 @@ fn inner_read_transaction<'local>(
     Ok(transaction)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_createCellFlagTransaction<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JObject,
+    java_dataset: JObject,
+    field: JString,
+    name: JString,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_cell_flag_transaction(&mut env, java_dataset, field, name)
+    )
+}
+
+fn inner_create_cell_flag_transaction<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    field: JString,
+    name: JString,
+) -> Result<JObject<'local>> {
+    let field: String = field.extract(env)?;
+    let name: String = name.extract(env)?;
+    let transaction = {
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        block_on(dataset_guard.inner.register_cell_flag(field, name, false))?;
+        dataset_guard.read_transaction()?.ok_or_else(|| {
+            Error::runtime_error("Cell Flag registration did not publish a transaction".to_string())
+        })?
+    };
+    convert_to_java_transaction(env, transaction)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_validateTransaction(
+    mut env: JNIEnv,
+    _class: JObject,
+    java_dataset: JObject,
+    java_transaction: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_validate_transaction(&mut env, java_dataset, java_transaction)
+    );
+}
+
+fn inner_validate_transaction(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_transaction: JObject,
+) -> Result<()> {
+    let java_allocator = env
+        .call_method(
+            &java_dataset,
+            "allocator",
+            "()Lorg/apache/arrow/memory/BufferAllocator;",
+            &[],
+        )?
+        .l()?;
+    let mut dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        BlockingDataset::new(dataset_guard.inner.clone())
+    };
+    convert_to_rust_transaction(
+        env,
+        java_transaction,
+        Some(&java_allocator),
+        Some(&mut dataset),
+    )?;
+    Ok(())
+}
+
 pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
@@ -435,10 +569,10 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            compacted_sstables: _,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
-            inserted_rows_filter: _,
+            inserted_rows_filter,
             updated_fragment_offsets,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
@@ -502,9 +636,16 @@ fn convert_to_java_operation_inner<'local>(
                 }
                 java_map
             };
+            let internal_metadata = match encode_java_update_internal_metadata(
+                &compacted_sstables,
+                inserted_rows_filter.as_ref(),
+            ) {
+                Some(encoded) => JObject::from(env.byte_array_from_slice(&encoded)?),
+                None => JObject::null(),
+            };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;[B)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -513,6 +654,7 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
                     JValue::Object(&java_offsets_map),
+                    JValue::Object(&internal_metadata),
                 ],
             )?)
         }
@@ -1378,16 +1520,26 @@ fn convert_to_rust_operation(
                     }
                 }
             };
+            let internal_metadata = env
+                .get_field(java_operation, "internalMetadata", "[B")?
+                .l()?;
+            let internal_metadata = if internal_metadata.is_null() {
+                None
+            } else {
+                Some(env.convert_byte_array(JByteArray::from(internal_metadata))?)
+            };
+            let (compacted_sstables, inserted_rows_filter) =
+                decode_java_update_internal_metadata(internal_metadata.as_deref())?;
 
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                compacted_sstables: vec![],
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
-                inserted_rows_filter: None,
+                inserted_rows_filter,
                 updated_fragment_offsets,
             }
         }
@@ -1728,11 +1880,34 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use lance::dataset::write::merge_insert::inserted_rows::FilterType;
+    use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
     use super::*;
 
     pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
+    #[test]
+    fn test_update_internal_metadata_round_trip() {
+        let compacted_sstables = vec![CompactedSsTable::new(Uuid::new_v4(), 42)];
+        let inserted_rows_filter = KeyExistenceFilter {
+            field_ids: vec![1, 3],
+            filter: FilterType::ExactSet(HashSet::from([7, 11, 13])),
+        };
+        let encoded =
+            encode_java_update_internal_metadata(&compacted_sstables, Some(&inserted_rows_filter))
+                .unwrap();
+        let (decoded_sstables, decoded_filter) =
+            decode_java_update_internal_metadata(Some(&encoded)).unwrap();
+
+        assert_eq!(decoded_sstables, compacted_sstables);
+        assert_eq!(decoded_filter, Some(inserted_rows_filter));
+        assert!(encode_java_update_internal_metadata(&[], None).is_none());
+        assert_eq!(
+            decode_java_update_internal_metadata(None).unwrap(),
+            (Vec::new(), None)
+        );
+    }
 
     #[test]
     fn test_create_schema_from_arrow() {

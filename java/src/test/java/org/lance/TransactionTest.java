@@ -21,6 +21,7 @@ import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
 import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
+import org.lance.test.JniTestHelper;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -41,6 +42,25 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TransactionTest {
+
+  @Test
+  public void testValidInternalPayloadRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testValidInternalPayloadRoundTrip").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction transaction =
+              JniTestHelper.createCellFlagTransaction(dataset, "id", "reviewed")) {
+        assertEquals(2, dataset.version());
+        assertEquals("Project", transaction.operation().name());
+        assertTrue(transaction.transactionProperties().isEmpty());
+        assertFalse(transaction.toString().contains("lance.cell_flag_transaction"));
+
+        JniTestHelper.validateTransaction(dataset, transaction);
+      }
+    }
+  }
 
   @Test
   public void testInternalPayloadIsHiddenAndTransported(@TempDir Path tempDir) throws Exception {

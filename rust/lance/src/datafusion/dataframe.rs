@@ -19,9 +19,9 @@ use datafusion::{
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
     logical_expr::{
-        Expr, LogicalPlan, TableProviderFilterPushDown, TableType,
+        Expr, LogicalPlan, SortExpr, TableProviderFilterPushDown, TableType,
         expr::ScalarFunction,
-        logical_plan::{Projection, TableScan},
+        logical_plan::{Distinct, DistinctOn, Projection, TableScan},
     },
     optimizer::analyzer::AnalyzerRule,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream, streaming::PartitionStream},
@@ -371,17 +371,28 @@ fn preserve_output_expression_names(
     expressions: Vec<Expr>,
     original_schema: &DFSchema,
 ) -> Vec<Expr> {
-    if !matches!(plan, LogicalPlan::Projection(_) | LogicalPlan::Aggregate(_))
-        || expressions.len() != original_schema.fields().len()
-    {
+    let output_offset = match plan {
+        LogicalPlan::Projection(_) | LogicalPlan::Aggregate(_) => 0,
+        LogicalPlan::Window(window) => window.input.schema().fields().len(),
+        _ => return expressions,
+    };
+    if expressions.len() != original_schema.fields().len().saturating_sub(output_offset) {
         return expressions;
     }
 
+    preserve_expression_names(expressions, original_schema, output_offset)
+}
+
+fn preserve_expression_names(
+    expressions: Vec<Expr>,
+    original_schema: &DFSchema,
+    output_offset: usize,
+) -> Vec<Expr> {
     expressions
         .into_iter()
         .enumerate()
         .map(|(index, expression)| {
-            let (qualifier, field) = original_schema.qualified_field(index);
+            let (qualifier, field) = original_schema.qualified_field(output_offset + index);
             if expression.schema_name().to_string() == field.name().as_str() {
                 expression
             } else {
@@ -749,7 +760,7 @@ impl BindCellFlags {
         plan: LogicalPlan,
         required_by_parent: bool,
         provider: &LanceTableProvider,
-        replacement: &LanceTableProvider,
+        bindings: &HashMap<u32, DeferredCellFlagBinding>,
         functions: &HashMap<u32, Arc<datafusion::logical_expr::ScalarUDF>>,
     ) -> datafusion::common::Result<LogicalPlan> {
         let original_schema = plan.schema().as_ref().clone();
@@ -782,6 +793,9 @@ impl BindCellFlags {
             if let Some(scan_provider) = source.downcast_ref::<LanceTableProvider>()
                 && Arc::ptr_eq(&scan_provider.dataset, &provider.dataset)
             {
+                let replacement = scan_provider
+                    .clone()
+                    .with_cell_flag_bindings(bindings.clone())?;
                 let mut projection = scan.projection.clone();
                 if needs_row_address {
                     let row_addr_idx = replacement.row_addr_idx.ok_or_else(|| {
@@ -797,7 +811,7 @@ impl BindCellFlags {
                 }
                 LogicalPlan::TableScan(TableScan::try_new(
                     scan.table_name.clone(),
-                    provider_as_source(Arc::new(replacement.clone())),
+                    provider_as_source(Arc::new(replacement)),
                     projection,
                     expressions,
                     scan.fetch,
@@ -817,7 +831,7 @@ impl BindCellFlags {
                         input.clone(),
                         pass_row_address,
                         provider,
-                        replacement,
+                        bindings,
                         functions,
                     )
                 })
@@ -845,10 +859,60 @@ impl BindCellFlags {
                     )));
                 }
                 if matches!(plan, LogicalPlan::Projection(_)) {
-                    expressions.push(Expr::Column(row_address_columns.pop().unwrap()));
+                    let row_address = row_address_columns.pop().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "validated projection is missing its _rowaddr column".to_string(),
+                        )
+                    })?;
+                    if plan.schema().maybe_index_of_column(&row_address).is_none() {
+                        expressions.push(Expr::Column(row_address));
+                    }
                 }
             }
-            plan.with_new_exprs(expressions, inputs)?
+            if let LogicalPlan::Distinct(Distinct::On(distinct)) = &plan {
+                let mut expressions = expressions.into_iter();
+                let on_expr = expressions
+                    .by_ref()
+                    .take(distinct.on_expr.len())
+                    .collect::<Vec<_>>();
+                let select_expr = expressions
+                    .by_ref()
+                    .take(distinct.select_expr.len())
+                    .collect::<Vec<_>>();
+                let select_expr = preserve_expression_names(select_expr, &original_schema, 0);
+                let rewritten_sort_expr = expressions.collect::<Vec<_>>();
+                let sort_expr = match distinct.sort_expr.as_ref() {
+                    Some(original) if original.len() == rewritten_sort_expr.len() => Some(
+                        original
+                            .iter()
+                            .zip(rewritten_sort_expr)
+                            .map(|(sort, expression)| {
+                                SortExpr::new(expression, sort.asc, sort.nulls_first)
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    None if rewritten_sort_expr.is_empty() => None,
+                    _ => {
+                        return Err(DataFusionError::Internal(
+                            "DISTINCT ON cell_flag rewrite received an unexpected expression count"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let input = inputs.into_iter().next().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "DISTINCT ON cell_flag rewrite is missing its input".to_string(),
+                    )
+                })?;
+                LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+                    on_expr,
+                    select_expr,
+                    sort_expr,
+                    Arc::new(input),
+                )?))
+            } else {
+                plan.with_new_exprs(expressions, inputs)?
+            }
         };
 
         if !required_by_parent
@@ -861,12 +925,8 @@ impl BindCellFlags {
     }
 }
 
-impl AnalyzerRule for BindCellFlags {
-    fn analyze(
-        &self,
-        plan: LogicalPlan,
-        _config: &ConfigOptions,
-    ) -> datafusion::common::Result<LogicalPlan> {
+impl BindCellFlags {
+    fn analyze_connected(&self, plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
         if !contains_unbound_cell_flag(&plan)? {
             return Ok(plan);
         }
@@ -885,8 +945,38 @@ impl AnalyzerRule for BindCellFlags {
             functions.insert(flag_id, Arc::new(function));
             bindings.insert(flag_id, binding);
         }
-        let replacement = provider.clone().with_cell_flag_bindings(bindings)?;
-        self.rewrite_plan(plan, false, &provider, &replacement, &functions)
+        self.rewrite_plan(plan, false, &provider, &bindings, &functions)
+    }
+
+    fn analyze_with_subqueries(
+        &self,
+        plan: LogicalPlan,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        let plan = plan
+            .transform_up(|node| {
+                node.map_subqueries(|subquery_plan| {
+                    let LogicalPlan::Subquery(mut subquery) = subquery_plan else {
+                        return Err(DataFusionError::Internal(
+                            "embedded subquery rewrite received a non-subquery plan".to_string(),
+                        ));
+                    };
+                    subquery.subquery =
+                        Arc::new(self.analyze_with_subqueries(subquery.subquery.as_ref().clone())?);
+                    Ok(Transformed::yes(LogicalPlan::Subquery(subquery)))
+                })
+            })?
+            .data;
+        self.analyze_connected(plan)
+    }
+}
+
+impl AnalyzerRule for BindCellFlags {
+    fn analyze(
+        &self,
+        plan: LogicalPlan,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        self.analyze_with_subqueries(plan)
     }
 
     fn name(&self) -> &str {
@@ -1357,6 +1447,68 @@ mod tests {
         distinct_values.sort_unstable();
         assert_eq!(distinct_values, vec![false, true]);
 
+        let sql_distinct_on = manual_context
+            .sql(
+                "SELECT DISTINCT ON (cell_flag(embedding, 'computed')) \
+                 cell_flag(embedding, 'computed') AS flag_value \
+                 FROM items ORDER BY cell_flag(embedding, 'computed')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let distinct_on_values = sql_distinct_on
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("flag_value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .values()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(distinct_on_values, vec![false, true]);
+
+        let window = manual_context
+            .sql(
+                "SELECT ROW_NUMBER() OVER (\
+                   ORDER BY cell_flag(embedding, 'computed')\
+                 ) AS rn FROM items",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(window.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+
+        let scalar_subquery = manual_context
+            .sql(
+                "SELECT (\
+                   SELECT cell_flag(embedding, 'computed') \
+                   FROM items WHERE id = 1\
+                 ) AS flag_value",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let subquery_value = scalar_subquery[0]
+            .column_by_name("flag_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            subquery_value.values().iter().collect::<Vec<_>>(),
+            vec![true]
+        );
+
         let projected_filter_plan = LogicalPlanBuilder::scan_with_filters(
             "projected_items",
             provider_as_source(Arc::new(LanceTableProvider::new(
@@ -1393,6 +1545,56 @@ mod tests {
             .collect::<Vec<_>>();
         projected_filter_ids.sort_unstable();
         assert_eq!(projected_filter_ids, vec![1, 4, 7]);
+
+        let projected_row_address = context
+            .read_lance(dataset.clone(), false, true)
+            .unwrap()
+            .select(vec![col("embedding"), col(lance_core::ROW_ADDR)])
+            .unwrap()
+            .filter(cell_flag(col("embedding"), "computed"))
+            .unwrap()
+            .select_columns(&[lance_core::ROW_ADDR])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            projected_row_address
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
+
+        manual_context
+            .register_table(
+                "plain_items",
+                Arc::new(LanceTableProvider::new(dataset.clone(), false, false)),
+            )
+            .unwrap();
+        manual_context
+            .register_table(
+                "rowid_items",
+                Arc::new(LanceTableProvider::new(dataset.clone(), true, false)),
+            )
+            .unwrap();
+        let configured_self_join = manual_context
+            .sql(
+                "SELECT b._rowid FROM plain_items a JOIN rowid_items b ON a.id = b.id \
+                 WHERE cell_flag(a.embedding, 'computed')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            configured_self_join
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
 
         let self_join = manual_context
             .sql(

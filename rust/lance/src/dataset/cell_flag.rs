@@ -1007,7 +1007,7 @@ impl Dataset {
             .iter()
             .enumerate()
             .filter(|(position, _)| !inserted_positions.contains(*position as u64))
-            .map(|(_, address)| RowAddress::from(*address).fragment_id() as u64)
+            .map(|(_, address)| RowAddress::from(*address).fragment_id())
             .collect::<HashSet<_>>();
         let mut states = Vec::new();
         for definition in &self.manifest.cell_flag_definitions {
@@ -1017,17 +1017,10 @@ impl Dataset {
             if self.cell_flag_state(flag_id).is_none() && !produces_true {
                 continue;
             }
-            let root = self
-                .load_cell_flag_root(flag_id)
-                .await?
-                .unwrap_or(CellFlagRoot {
-                    fragments: Vec::new(),
-                });
-            let source_fragments = root
-                .fragments
-                .into_iter()
-                .filter(|fragment| source_fragment_ids.contains(&fragment.fragment_id))
-                .collect::<Vec<_>>();
+            let source_fragments = match self.load_cell_flag_root_shared(flag_id).await? {
+                Some(root) => select_cell_flag_fragments(&root, Some(&source_fragment_ids)),
+                None => Vec::new(),
+            };
             if source_fragments.is_empty() && !produces_true {
                 continue;
             }
@@ -1036,7 +1029,10 @@ impl Dataset {
                 let state = match &fragment.state {
                     CellFlagFragmentState::All => None,
                     CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-                        Some(self.load_cell_flag_bitmap(flag_id, &fragment).await?)
+                        Some(
+                            self.load_cell_flag_bitmap_shared(flag_id, &fragment)
+                                .await?,
+                        )
                     }
                 };
                 source_states.insert(fragment.fragment_id, state);
