@@ -1702,6 +1702,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let quantization_type = Q::quantization_type();
         let is_pq = quantization_type == QuantizationType::Product;
         let is_rq = quantization_type == QuantizationType::Rabit;
+        // Flat's "code" column is an identity copy of the raw vector (see
+        // `FlatQuantizer::quantize`), so its true arrow value type (Float16/32/64)
+        // is only known from the data itself: `FlatQuantizer::field()` hardcodes
+        // Float32, which is wrong whenever the vector column isn't Float32. Every
+        // other quantizer type's `field()` is driven by its own parameters (e.g.
+        // SQ's `num_bits`), not the raw vector's type, and is always correct.
         let is_flat = quantization_type == QuantizationType::Flat;
 
         // prepare the final writers
@@ -1710,15 +1716,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let writer_options = FileWriterOptions::default();
         // Covering columns are appended to whichever storage schema this build writes
-        // (code storage below, or the empty-flat fallback further down).
+        // (code storage below, or the empty-flat fallback further down). The schema is
+        // always declared as `[_rowid, code, extra…, covering…]` -- row id first, never
+        // inferred from a batch's own column order, which can put covering columns
+        // before `_rowid` and make every downstream reader that trusts column position
+        // (e.g. the default `QuantizerStorage::remap`) misread row ids.
         let covering_fields = self.covering_arrow_fields()?;
         let mut storage_writer = if is_flat {
             None
         } else {
             let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
             fields.extend(quantizer.extra_fields());
-            // Append any included ("covering") columns so they are persisted in
-            // the auxiliary storage file alongside the row id and code.
             fields.extend(covering_fields.iter().cloned());
             let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
             Some(file_versions::create_writer(
@@ -1808,7 +1816,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         }
 
                         if storage_writer.is_none() {
-                            let storage_schema: Schema = batch.schema_ref().as_ref().try_into()?;
+                            // Only flat reaches here (every other type declared its schema
+                            // eagerly above). Declare `[_rowid, flat, covering…]` explicitly --
+                            // row id always first -- rather than cloning the batch's own
+                            // schema, whose column order can put covering columns before
+                            // `_rowid`. The flat column's arrow type is looked up by name
+                            // from this batch (not assumed), since it is an identity copy
+                            // of the raw vector column and can be Float16/32/64.
+                            let flat_field = batch
+                                .schema_ref()
+                                .field_with_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+                                .map_err(|e| {
+                                    Error::invalid_input(format!(
+                                        "flat storage batch missing its code column: {e}"
+                                    ))
+                                })?
+                                .clone();
+                            let mut fields = vec![ROW_ID_FIELD.as_ref().clone(), flat_field];
+                            fields.extend(covering_fields.iter().cloned());
+                            let storage_schema: Schema =
+                                (&arrow_schema::Schema::new(fields)).try_into()?;
                             storage_writer = Some(file_versions::create_writer(
                                 self.format_version,
                                 self.store.create(&storage_path).await?,
@@ -1860,6 +1887,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         if storage_writer.is_none() {
+            // Every partition was empty, so flat never saw a batch to learn its value
+            // type from above. The IVF centroids preserve that type (they are computed
+            // over the same raw vectors `FlatQuantizer::quantize` copies verbatim).
             let Some(centroids) = ivf.centroids.as_ref() else {
                 return Err(Error::invalid_input(
                     "flat storage writer could not infer schema from empty partitions without IVF centroids",

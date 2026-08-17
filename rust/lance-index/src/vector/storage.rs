@@ -392,6 +392,22 @@ pub(crate) fn covering_field_indices_excluding(
         .collect()
 }
 
+/// Remap `batch`'s row ids through `frag_reuse_index`, locating the row id column
+/// by name rather than assuming it is at a fixed position. A covering storage batch
+/// is built from a scan projection of `[<covering...>, vector]` with `_rowid`
+/// appended by the scan, so `_rowid` lands wherever the covering columns end --
+/// never reliably at a fixed index once any are configured.
+pub(crate) fn remap_row_ids_by_name(
+    batch: RecordBatch,
+    frag_reuse_index: &dyn RowIdRemapper,
+) -> Result<RecordBatch> {
+    let row_id_idx = batch
+        .schema()
+        .index_of(ROW_ID)
+        .map_err(|_| Error::schema(format!("column {} not found", ROW_ID)))?;
+    frag_reuse_index.remap_row_ids_record_batch(batch, row_id_idx)
+}
+
 /// TODO: should we rename this to "VectorDistance"?;
 ///
 /// <section class="warning">
