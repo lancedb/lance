@@ -20,8 +20,8 @@
 //! update_map         incremental edits to the manifest's string maps
 //! validate           pre-commit checks against the manifest being replaced
 //! manifest_build     applying an operation to produce the next manifest
-//! index_maintenance    how that narrows or drops index metadata
-//! row_version          how it assigns row ids and per-row version metadata
+//! index_maintenance  how that narrows or drops index metadata
+//! row_version        how it assigns row ids and per-row version metadata
 //! conflicts          whether two operations collide, for the commit retry path
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
