@@ -547,6 +547,14 @@ impl WrappingObjectStore for CountingObjectStoreWrapper {
         self.wraps.fetch_add(1, Ordering::Relaxed);
         original
     }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
 }
 
 impl CountingObjectStoreWrapper {
