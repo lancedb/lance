@@ -76,13 +76,6 @@ pub fn apply_feature_flags(
         0
     };
 
-    // Capture before the reset below. The flag is not derivable from fragment
-    // content alone (see the migration path in `migrate_to_stable_row_ids`),
-    // so it must be carried across the reset explicitly, just like the MemWAL
-    // index-catchup bit above.
-    let had_stable_row_ids = manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
-        && manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS != 0;
-
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -97,13 +90,12 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
     }
 
-    // Set stable row IDs flag only when explicitly requested or when it was
-    // already set on the manifest before the reset above. The carry-through
-    // (`had_stable_row_ids`) is a safety net: subsequent commits on an already-
-    // migrated table inherit `use_stable_row_ids = true` from the dataset, which
-    // sets `enable_stable_row_id`; the carry catches any path that forgets to
-    // propagate the flag and prevents accidentally downgrading the table.
-    if enable_stable_row_id || had_stable_row_ids {
+    // If any fragment has row ids, they must all have row ids.
+    let has_row_ids = manifest
+        .fragments
+        .iter()
+        .any(|frag| frag.row_id_meta.is_some());
+    if has_row_ids || enable_stable_row_id {
         if !manifest
             .fragments
             .iter()
