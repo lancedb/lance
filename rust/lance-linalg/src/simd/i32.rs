@@ -40,8 +40,21 @@ impl std::fmt::Debug for i32x8 {
     }
 }
 
+/// Reads the first 8 elements and ignores the rest.
+///
+/// # Panics
+///
+/// If `value` has fewer than 8 elements.
 impl From<&[i32]> for i32x8 {
     fn from(value: &[i32]) -> Self {
+        // `load_unaligned` reads 8 lanes with no bounds check, and this is safe
+        // code reachable from outside the crate, so the check has to survive
+        // release builds -- `debug_assert!` would reinstate the out-of-bounds read.
+        assert!(
+            value.len() >= 8,
+            "i32x8 conversion requires at least 8 elements, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -318,4 +331,34 @@ impl Mul for i32x8 {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[test]
+    #[should_panic(expected = "i32x8 conversion requires at least 8 elements")]
+    fn from_slice_rejects_short_slice() {
+        // No feature guard: the assert precedes `load_unaligned`, so the panic
+        // happens on every host. An early `return` here would fail the test.
+        let _ = i32x8::from(&[0; 7][..]);
+    }
+
+    #[rstest]
+    #[case::exact_length(8)]
+    #[case::over_length(12)]
+    fn from_slice_reads_the_first_eight_lanes(#[case] len: usize) {
+        // `load_unaligned` / `store_unaligned` are `_mm256_loadu_si256` and
+        // `_mm256_storeu_si256`, both AVX.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // Ascending values so a wrong-offset load cannot pass; slicing an
+        // over-long fixture is how the exact-length case is produced.
+        let values: Vec<i32> = (1..=12).collect();
+
+        let reg = i32x8::from(&values[..len]);
+
+        assert_eq!(reg.as_array().as_slice(), &values[..8]);
+    }
+}

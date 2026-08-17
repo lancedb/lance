@@ -146,8 +146,21 @@ fn gather_scalar_x86(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
     unsafe { f32x8::load_unaligned(values.as_ptr()) }
 }
 
+/// Reads the first 8 elements and ignores the rest.
+///
+/// # Panics
+///
+/// If `value` has fewer than 8 elements.
 impl From<&[f32]> for f32x8 {
     fn from(value: &[f32]) -> Self {
+        // `load_unaligned` reads 8 lanes with no bounds check, and this is safe
+        // code reachable from outside the crate, so the check has to survive
+        // release builds -- `debug_assert!` would reinstate the out-of-bounds read.
+        assert!(
+            value.len() >= 8,
+            "f32x8 conversion requires at least 8 elements, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -526,8 +539,21 @@ impl std::fmt::Debug for f32x16 {
     }
 }
 
+/// Reads the first 16 elements and ignores the rest.
+///
+/// # Panics
+///
+/// If `value` has fewer than 16 elements.
 impl From<&[f32]> for f32x16 {
     fn from(value: &[f32]) -> Self {
+        // `load_unaligned` reads 16 lanes with no bounds check, and this is safe
+        // code reachable from outside the crate, so the check has to survive
+        // release builds -- `debug_assert!` would reinstate the out-of-bounds read.
+        assert!(
+            value.len() >= 16,
+            "f32x16 conversion requires at least 16 elements, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -934,6 +960,56 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    #[should_panic(expected = "f32x8 conversion requires at least 8 elements")]
+    fn f32x8_from_slice_rejects_short_slice() {
+        // No feature guard: the assert precedes `load_unaligned`, so the panic
+        // happens on every host. An early `return` here would fail the test.
+        let _ = f32x8::from(&[0.0; 7][..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "f32x16 conversion requires at least 16 elements")]
+    fn f32x16_from_slice_rejects_short_slice() {
+        let _ = f32x16::from(&[0.0; 15][..]);
+    }
+
+    #[rstest]
+    #[case::exact_length(8)]
+    #[case::over_length(12)]
+    fn f32x8_from_slice_reads_the_first_eight_lanes(#[case] len: usize) {
+        // `load_unaligned` / `store_unaligned` lower to `_mm256_loadu_ps` and
+        // `_mm256_storeu_ps`, which need AVX. FMA is not involved.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // Ascending values so a wrong-offset load cannot pass; slicing an
+        // over-long fixture is how the exact-length case is produced.
+        let values: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+
+        let reg = f32x8::from(&values[..len]);
+
+        assert_eq!(reg.as_array().as_slice(), &values[..8]);
+    }
+
+    #[rstest]
+    #[case::exact_length(16)]
+    #[case::over_length(24)]
+    fn f32x16_from_slice_reads_the_first_sixteen_lanes(#[case] len: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // Ascending values so a wrong-offset load cannot pass; slicing an
+        // over-long fixture is how the exact-length case is produced.
+        let values: Vec<f32> = (1..=24).map(|v| v as f32).collect();
+
+        let reg = f32x16::from(&values[..len]);
+
+        assert_eq!(reg.as_array().as_slice(), &values[..16]);
+    }
 
     #[test]
     fn test_basic_ops() {

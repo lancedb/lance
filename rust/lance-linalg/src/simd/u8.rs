@@ -83,8 +83,21 @@ impl std::fmt::Debug for u8x16 {
     }
 }
 
+/// Reads the first 16 elements and ignores the rest.
+///
+/// # Panics
+///
+/// If `value` has fewer than 16 elements.
 impl From<&[u8]> for u8x16 {
     fn from(value: &[u8]) -> Self {
+        // `load_unaligned` reads 16 lanes with no bounds check, and this is safe
+        // code reachable from outside the crate, so the check has to survive
+        // release builds -- `debug_assert!` would reinstate the out-of-bounds read.
+        assert!(
+            value.len() >= 16,
+            "u8x16 conversion requires at least 16 elements, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -402,6 +415,30 @@ impl SubAssign for u8x16 {
 mod tests {
 
     use super::*;
+    use rstest::rstest;
+
+    #[test]
+    #[should_panic(expected = "u8x16 conversion requires at least 16 elements")]
+    fn from_slice_rejects_short_slice() {
+        // No feature guard: the assert precedes `load_unaligned`, so the panic
+        // happens on every host. An early `return` here would fail the test.
+        let _ = u8x16::from(&[0; 15][..]);
+    }
+
+    #[rstest]
+    #[case::exact_length(16)]
+    #[case::over_length(24)]
+    fn from_slice_reads_the_first_sixteen_lanes(#[case] len: usize) {
+        // No feature guard needed: `_mm_loadu_si128` / `_mm_storeu_si128` are
+        // SSE2, which is baseline on x86_64.
+        // Ascending values so a wrong-offset load cannot pass; slicing an
+        // over-long fixture is how the exact-length case is produced.
+        let values: Vec<u8> = (1..=24).collect();
+
+        let reg = u8x16::from(&values[..len]);
+
+        assert_eq!(reg.as_array().as_slice(), &values[..16]);
+    }
 
     #[test]
     fn test_basic_u8x16_ops() {

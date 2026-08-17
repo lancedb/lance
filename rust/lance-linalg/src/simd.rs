@@ -27,6 +27,9 @@ use u8::u8x16;
 
 /// Lance SIMD lib
 ///
+/// The `From<&[T]>` supertrait bound means every register type converts from a
+/// slice. That conversion reads the first `N` elements and ignores the rest, and
+/// panics if the slice is shorter than `N` -- see each impl's `# Panics`.
 pub trait SIMD<T: Num + Copy, const N: usize>:
     std::fmt::Debug
     + AddAssign<Self>
@@ -57,6 +60,11 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     /// Load unaligned data from memory.
     ///
     /// # Safety
+    ///
+    /// `ptr` must be valid for reads of `N` contiguous `T`. The implementations
+    /// read a whole register with no bounds check, so a pointer derived from a
+    /// slice shorter than `N` reads beyond the slice, and past the end of the
+    /// allocation when the slice reaches its end.
     unsafe fn load_unaligned(ptr: *const T) -> Self;
 
     /// Store the values to aligned memory.
@@ -69,6 +77,8 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     /// Store the values to unaligned memory.
     ///
     /// # Safety
+    ///
+    /// `ptr` must be valid for writes of `N` contiguous `T`.
     unsafe fn store_unaligned(&self, ptr: *mut T);
 
     /// Return the values as an array.
