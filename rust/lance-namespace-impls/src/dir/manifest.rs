@@ -7,7 +7,7 @@
 //! to track tables and nested namespaces.
 
 use super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY;
-use super::manifest_feature_flags::{ensure_readable, ensure_writable};
+use super::manifest_feature_flags::{ensure_readable, ensure_writable, mark_drop_tombstone_rows};
 use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
@@ -1348,15 +1348,17 @@ impl ManifestNamespace {
         path
     }
 
-    fn deregistered_table_marker_path(&self, location: &str) -> Path {
+    fn deregistered_table_marker_path(&self, location: &str) -> Result<Path> {
         let table_path = self.table_path(location);
         let filename = table_path
             .filename()
-            .expect("a table location has a filename");
-        table_path
+            .ok_or_else(|| NamespaceError::InvalidInput {
+                message: format!("Table location '{location}' has no filename"),
+            })?;
+        Ok(table_path
             .parent()
             .unwrap_or_else(|| self.base_path.clone())
-            .join(format!(".{filename}{DEREGISTERED_TABLE_MARKER}"))
+            .join(format!(".{filename}{DEREGISTERED_TABLE_MARKER}")))
     }
 
     async fn has_deregistered_table_marker(&self, location: &str) -> Result<bool> {
@@ -1381,7 +1383,7 @@ impl ManifestNamespace {
     }
 
     async fn put_deregistered_table_marker(&self, location: &str) -> Result<bool> {
-        let marker_path = self.deregistered_table_marker_path(location);
+        let marker_path = self.deregistered_table_marker_path(location)?;
         match super::put_marker_file_atomic(
             &self.object_store,
             &marker_path,
@@ -1398,7 +1400,13 @@ impl ManifestNamespace {
     }
 
     async fn remove_deregistered_table_marker(&self, location: &str) {
-        let marker_path = self.deregistered_table_marker_path(location);
+        let marker_path = match self.deregistered_table_marker_path(location) {
+            Ok(marker_path) => marker_path,
+            Err(error) => {
+                log::warn!("Failed to resolve deregistration marker for '{location}': {error}");
+                return;
+            }
+        };
         if let Err(error) = self.object_store.delete(&marker_path).await
             && !error.is_not_found()
         {
@@ -2266,6 +2274,9 @@ impl ManifestNamespace {
         transaction: Transaction,
     ) -> std::result::Result<(), CommitError> {
         apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
+        if self.async_drop_enabled {
+            mark_drop_tombstone_rows(manifest.table_metadata_mut());
+        }
         let timestamp_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -2914,6 +2925,15 @@ impl ManifestNamespace {
 
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
+        if location
+            .split('/')
+            .all(|segment| segment.is_empty() || segment == ".")
+        {
+            return Err(NamespaceError::InvalidInput {
+                message: "Location must not be empty".to_string(),
+            }
+            .into());
+        }
         let object_id = Self::build_object_id(&[], name);
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::Internal {
@@ -3782,10 +3802,15 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 self.ensure_manifest_writable().await?;
-                let owns_manifest_deletion = self
-                    .tombstone_table_in_manifest(&object_id, &info.location)
-                    .boxed()
-                    .await?;
+                let owns_manifest_deletion = if self.async_drop_enabled {
+                    self.tombstone_table_in_manifest(&object_id, &info.location)
+                        .boxed()
+                        .await?
+                } else {
+                    self.delete_from_manifest_if_location(&object_id, Some(&info.location), true)
+                        .boxed()
+                        .await?
+                };
 
                 if !owns_manifest_deletion {
                     return Ok(DropTableResponse {
@@ -3794,7 +3819,9 @@ impl LanceNamespace for ManifestNamespace {
                         ..Default::default()
                     });
                 }
-                if let Err(error) = self.put_deregistered_table_marker(&info.location).await {
+                if self.async_drop_enabled
+                    && let Err(error) = self.put_deregistered_table_marker(&info.location).await
+                {
                     log::warn!(
                         "Failed to write deregistration marker for table location '{}': {error:?}",
                         info.location
@@ -3815,7 +3842,9 @@ impl LanceNamespace for ManifestNamespace {
                             message: format!("Failed to delete table directory: {:?}", e),
                         })
                     })?;
-                self.remove_deregistered_table_marker(&info.location).await;
+                if self.async_drop_enabled {
+                    self.remove_deregistered_table_marker(&info.location).await;
+                }
 
                 Ok(DropTableResponse {
                     id: request.id.clone(),
@@ -4308,12 +4337,6 @@ impl LanceNamespace for ManifestNamespace {
             .context
             .as_ref()
             .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
-        if expected_location.is_some() && !self.async_drop_enabled {
-            return Err(NamespaceError::Unsupported {
-                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
-            }
-            .into());
-        }
         if expected_location.is_some()
             && !Self::is_generated_dir_name(&object_id, &manifest_location)
         {
@@ -4333,6 +4356,12 @@ impl LanceNamespace for ManifestNamespace {
                     "Table '{}' is at '{}' instead of expected location '{}'",
                     object_id, table_uri, expected_location
                 ),
+            }
+            .into());
+        }
+        if expected_location.is_some() && !self.async_drop_enabled {
+            return Err(NamespaceError::Unsupported {
+                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
             }
             .into());
         }
@@ -4870,7 +4899,7 @@ mod tests {
         set_manifest_table_metadata(
             temp_path,
             crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY,
-            "1",
+            "2",
         )
         .await;
 
@@ -4893,7 +4922,7 @@ mod tests {
         set_manifest_table_metadata(
             temp_path,
             crate::dir::manifest_feature_flags::WRITER_FEATURE_FLAGS_KEY,
-            "1",
+            "2",
         )
         .await;
 

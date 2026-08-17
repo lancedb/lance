@@ -10320,6 +10320,7 @@ mod tests {
         let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
             .manifest_enabled(true)
             .dir_listing_enabled(false)
+            .async_drop_enabled(true)
             .build()
             .await
             .unwrap();

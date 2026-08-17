@@ -15,11 +15,9 @@
 //! with a clear "please upgrade" error instead of silently misreading data. The
 //! set of bits a build understands is `READER_KNOWN_FLAGS` / `WRITER_KNOWN_FLAGS`.
 //!
-//! This is the mechanism only: no manifest feature is defined yet, so the known
-//! masks are `0` and nothing is ever set — every current manifest reads and
-//! writes unchanged. The first format change that needs forward-compatibility
-//! protection adds its bit to the known masks and stamps it on write; from then
-//! on, builds without that bit refuse the new format rather than misreading it.
+//! The durable drop-tombstone row type is the first protected format feature.
+//! It is stamped only when asynchronous drop support is enabled, so catalogs
+//! that do not opt in remain readable and writable by older Lance versions.
 //! Manifests written before this mechanism carry no flag keys, which parse as
 //! `0` and stay compatible with every build.
 
@@ -33,12 +31,23 @@ pub const READER_FEATURE_FLAGS_KEY: &str = "lance.namespace.manifest.reader_feat
 /// `table_metadata` key holding the writer feature-flag bitmask (decimal `u64`).
 pub const WRITER_FEATURE_FLAGS_KEY: &str = "lance.namespace.manifest.writer_feature_flags";
 
-/// Reader feature-flag bits this build understands. No manifest feature is
-/// defined yet, so this build understands none and refuses any non-zero reader
-/// flag. A future format change adds its bit here.
-const READER_KNOWN_FLAGS: u64 = 0;
+const DROP_TOMBSTONE_ROWS_FLAG: u64 = 1;
+/// Reader feature-flag bits this build understands.
+const READER_KNOWN_FLAGS: u64 = DROP_TOMBSTONE_ROWS_FLAG;
 /// Writer feature-flag bits this build understands.
-const WRITER_KNOWN_FLAGS: u64 = 0;
+const WRITER_KNOWN_FLAGS: u64 = DROP_TOMBSTONE_ROWS_FLAG;
+
+/// Mark a manifest as containing durable drop-tombstone rows.
+pub fn mark_drop_tombstone_rows(table_metadata: &mut HashMap<String, String>) {
+    for key in [READER_FEATURE_FLAGS_KEY, WRITER_FEATURE_FLAGS_KEY] {
+        let flags = table_metadata
+            .get(key)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or_default()
+            | DROP_TOMBSTONE_ROWS_FLAG;
+        table_metadata.insert(key.to_string(), flags.to_string());
+    }
+}
 
 /// Whether this build can read a `__manifest` whose persisted reader feature
 /// flags are `reader_flags` — i.e. it understands every set bit.
@@ -158,13 +167,12 @@ mod tests {
 
     #[test]
     fn any_unknown_flag_is_refused() {
-        // This build understands no feature flags, so any non-zero bit is refused.
-        assert!(!can_read_manifest(1));
-        assert!(!can_write_manifest(1));
+        assert!(can_read_manifest(DROP_TOMBSTONE_ROWS_FLAG));
+        assert!(can_write_manifest(DROP_TOMBSTONE_ROWS_FLAG));
         assert!(!can_read_manifest(1 << 30));
         assert!(!can_write_manifest(1 << 63));
 
-        let reader = meta(&[(READER_FEATURE_FLAGS_KEY, "1")]);
+        let reader = meta(&[(READER_FEATURE_FLAGS_KEY, "2")]);
         let err = ensure_readable(&reader).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("upgrade"));
         assert!(is_incompatible_manifest_error(&err));
