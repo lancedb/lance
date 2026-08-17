@@ -332,6 +332,24 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
+  // Files produced for one fragment by a physical column-layout rewrite.
+  // The files are positionally aligned with the fragment and collectively
+  // provide exactly field_ids.
+  message OptimizeColumnsGroup {
+    uint64 fragment_id = 1;
+    repeated uint32 field_ids = 2;
+    repeated DataFile new_files = 3;
+    uint64 physical_rows = 4;
+  }
+
+  // Reorganize selected fields without changing their logical values or the
+  // fragment's row layout. materialized_through_version is the immutable
+  // snapshot cutoff used when the output files were produced.
+  message OptimizeColumns {
+    uint64 materialized_through_version = 1;
+    repeated OptimizeColumnsGroup groups = 2;
+  }
+
   // Overlay files to append to a single fragment, in order (the last entry is
   // newest). The overlays are appended to the fragment's existing `overlays`
   // list; they do not replace it, so overlays written by concurrent commits are
@@ -394,6 +412,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    OptimizeColumns optimize_columns = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
