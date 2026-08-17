@@ -2039,8 +2039,7 @@ impl Dataset {
         let mut cloned = self.clone();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
-            object_store.inner =
-                wrapper.wrap(&object_store.store_prefix, object_store.inner.clone());
+            object_store.apply_wrapper(wrapper.as_ref());
         }
         cloned.object_store = Arc::new(object_store);
         cloned.refs = Refs::new(

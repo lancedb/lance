@@ -26,6 +26,7 @@ use object_store::{
 };
 
 use crate::object_store::WrappingObjectStore;
+use object_store::list::PaginatedListStore;
 
 #[derive(Debug, Default, Clone)]
 pub struct IOTracker(Arc<Mutex<IoStats>>);
@@ -94,6 +95,16 @@ impl IOTracker {
 impl WrappingObjectStore for IOTracker {
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore::new(target, self.0.clone()))
+    }
+
+    // A pushed-down listing records itself against the store's tracker, so it is already
+    // counted without passing through here.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        Some(original)
     }
 }
 
