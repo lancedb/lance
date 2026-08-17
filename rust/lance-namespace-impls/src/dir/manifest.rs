@@ -532,6 +532,7 @@ impl ManifestStreamMutation for UpsertManifestMutation {
 
 struct DeleteObjectMutation {
     object_id: String,
+    expected_location: Option<String>,
     deleted: bool,
 }
 
@@ -545,6 +546,19 @@ impl ManifestStreamMutation for DeleteObjectMutation {
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
         if row.object_id == self.object_id {
+            if let Some(expected_location) = self.expected_location.as_deref()
+                && row.location.as_deref() != Some(expected_location)
+            {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Table '{}' moved from expected location '{}' to '{}'",
+                        self.object_id,
+                        expected_location,
+                        row.location.as_deref().unwrap_or("<missing>")
+                    ),
+                }
+                .into());
+            }
             self.deleted = true;
             return Ok(());
         }
@@ -2361,9 +2375,19 @@ impl ManifestNamespace {
 
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
+        self.delete_from_manifest_if_location(object_id, None).await
+    }
+
+    async fn delete_from_manifest_if_location(
+        &self,
+        object_id: &str,
+        expected_location: Option<&str>,
+    ) -> Result<()> {
         let object_id = object_id.to_string();
+        let expected_location = expected_location.map(str::to_string);
         self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
             object_id: object_id.clone(),
+            expected_location: expected_location.clone(),
             deleted: false,
         })
         .await
@@ -3646,11 +3670,10 @@ impl LanceNamespace for ManifestNamespace {
         // Get table info before deleting
         let table_info = self.query_manifest_for_table(&object_id).await?;
 
-        let table_uri = match table_info {
+        let (table_uri, manifest_location) = match table_info {
             Some(info) => {
-                // Delete from manifest only (leave physical data intact)
-                self.delete_from_manifest(&object_id).boxed().await?;
-                Self::construct_full_uri(&self.root, &info.location)?
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                (table_uri, info.location)
             }
             None => {
                 return Err(NamespaceError::TableNotFound {
@@ -3659,6 +3682,28 @@ impl LanceNamespace for ManifestNamespace {
                 .into());
             }
         };
+
+        if let Some(expected_location) = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get("expected_location"))
+            && expected_location.trim_end_matches('/') != table_uri.trim_end_matches('/')
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Table '{}' is at '{}' instead of expected location '{}'",
+                    object_id, table_uri, expected_location
+                ),
+            }
+            .into());
+        }
+
+        // The expected manifest location is checked again inside every rewrite
+        // attempt, so a concurrent drop-and-recreate cannot be deleted by a
+        // stale deregistration request.
+        self.delete_from_manifest_if_location(&object_id, Some(&manifest_location))
+            .boxed()
+            .await?;
 
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
@@ -4361,6 +4406,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_delete_rejects_replacement_location() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("new-generation.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = manifest_ns
+            .delete_from_manifest_if_location("table", Some("old-generation.lance"))
+            .await
+            .unwrap_err();
+
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected namespace error, got {error}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<NamespaceError>(),
+            Some(NamespaceError::ConcurrentModification { .. })
+        ));
+        assert!(error.to_string().contains("moved from expected location"));
+        assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_manifest_rewrite_fragment_bitmap_uses_overwrite_fragment_ids() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -4649,6 +4727,7 @@ mod tests {
                 ConcurrentDeleteBeforeCommitMutation {
                     inner: DeleteObjectMutation {
                         object_id: "table".to_string(),
+                        expected_location: None,
                         deleted: false,
                     },
                     root: temp_path.to_string(),
