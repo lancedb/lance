@@ -758,6 +758,13 @@ impl DirectoryNamespaceBuilder {
     /// - Connection to the storage backend fails
     /// - Storage options are invalid
     pub async fn build(self) -> Result<DirectoryNamespace> {
+        if self.async_drop_enabled && self.manifest_enabled && self.dir_listing_enabled {
+            return Err(NamespaceError::InvalidInput {
+                message: "async_drop_enabled requires dir_listing_enabled=false when the manifest is enabled"
+                    .to_string(),
+            }
+            .into());
+        }
         let (object_store, base_path) =
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
@@ -1059,6 +1066,19 @@ impl DirectoryNamespace {
             })
             .await?;
         Ok(Some(manifest_ns.clone()))
+    }
+
+    /// Retire a durable manifest drop intent after physical cleanup completes.
+    pub async fn complete_drop_tombstone(&self, object_id: &str, location: &str) -> Result<bool> {
+        let manifest_ns =
+            self.manifest_ns_for_write()
+                .await?
+                .ok_or_else(|| NamespaceError::InvalidInput {
+                    message: "drop tombstones require a manifest-enabled namespace".to_string(),
+                })?;
+        manifest_ns
+            .complete_drop_tombstone_at_uri(object_id, location)
+            .await
     }
 
     /// Lazily open the `__manifest` dataset (read-only) into the read cell.
