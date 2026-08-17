@@ -2627,13 +2627,19 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     single_query.key = normalized.key.slice(query_index * dim, dim);
                     // Probe a fixed number of partitions per query. The scanner
                     // only routes here when `minimum_nprobes == maximum_nprobes`
-                    // (see `Scanner::batch_index_search_supported`), so this is
-                    // exactly what the single-query path would search — no
-                    // adaptive `early_pruning` floor or late-search expansion
-                    // applies, making the batch result identical to repeated
-                    // single-query search.
-                    let nprobes = single_query.minimum_nprobes.max(1);
-                    single_query.maximum_nprobes = Some(nprobes);
+                    // and `minimum_nprobes > 0` (see
+                    // `Scanner::batch_index_search_supported`), so this is exactly
+                    // what the single-query path would search — no adaptive
+                    // `early_pruning` floor or late-search expansion applies,
+                    // making the batch result identical to repeated single-query
+                    // search. No clamp is needed: the gate rejects `nprobes(0)`
+                    // (which the single-query path treats as "probe nothing")
+                    // rather than silently searching one partition here.
+                    debug_assert!(
+                        single_query.minimum_nprobes > 0,
+                        "batch node reached with nprobes(0); the scanner gate should have fallen back"
+                    );
+                    single_query.maximum_nprobes = Some(single_query.minimum_nprobes);
                     let (partitions, q_c_dists) = index.find_partitions(&single_query)?;
                     partitions_per_query.push(Arc::new(partitions));
                     dists_per_query.push(Arc::new(q_c_dists));

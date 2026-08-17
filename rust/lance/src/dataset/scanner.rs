@@ -5580,6 +5580,14 @@ impl Scanner {
         if q.maximum_nprobes != Some(q.minimum_nprobes) {
             return Ok(false);
         }
+        // `nprobes(0)` is not rejected by the query builder, so `min == max == 0`
+        // slips past the fixed-nprobes check above. The single-query path probes
+        // nothing and returns an empty result, whereas the batch node would probe
+        // one partition's worth of neighbors — a silent divergence. Fall back so
+        // the per-query loop defines the semantics of `nprobes(0)`.
+        if q.minimum_nprobes == 0 {
+            return Ok(false);
+        }
         // Decide from the index metadata (no I/O) rather than opening the index
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
@@ -9984,6 +9992,126 @@ mod test {
         // with adaptive nprobes.
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None)
             .await;
+    }
+
+    /// `nprobes(0)` is not rejected by the query builder, so `minimum_nprobes ==
+    /// maximum_nprobes == 0` slips past the fixed-nprobes gate. The single-query
+    /// path then probes nothing and returns an empty result, whereas the batch
+    /// node would clamp `nprobes` up to one partition — a silent divergence. The
+    /// scanner must fall back so the per-query loop defines the semantics of
+    /// `nprobes(0)`, and the grouped batch result must equal repeated single-query
+    /// search (both empty here).
+    #[tokio::test]
+    async fn test_batch_knn_indexed_zero_nprobes_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 2;
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(0);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "nprobes(0) must not use the shared-scan batch node (which would clamp \
+             to one partition), got:\n{plan}"
+        );
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "nprobes(0) batch search should fall back to the per-query indexed loop, got:\n{plan}"
+        );
+
+        // The fallback runs the real single-query path per query, so the grouped
+        // batch result must match issuing each query on its own with nprobes(0).
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        let query_count = query_values.len() / 32;
+        for query_index in 0..query_count {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut single_scan = dataset.scan();
+            single_scan.nearest("vec", &query, k).unwrap();
+            single_scan.nprobes(0);
+            single_scan.project(&["i"]).unwrap();
+            let single = single_scan.try_into_batch().await.unwrap();
+
+            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(
+                batch_slice["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values(),
+                "nprobes(0) query {query_index}: batch rows must match single-query rows"
+            );
+        }
+    }
+
+    /// A wide batch probes more distinct partitions than one streaming chunk holds
+    /// (`STREAMING_SEARCH_BATCH_SIZE` = 16), so `search_partitions_batch` scores
+    /// them in several `spawn_cpu` dispatches, threading the per-query top-k heaps
+    /// across chunk boundaries. The small indexes in the other tests fit in a
+    /// single chunk and never exercise that seam; here an exact (flat) index with
+    /// more partitions than the chunk size, probed in full, pins the multi-chunk
+    /// path to repeated single-query search.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_streams_multiple_chunks() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        // More partitions than one streaming chunk so scoring spans multiple
+        // chunks; exact (flat) storage with every partition probed keeps the batch
+        // result an exact match for single-query search.
+        let num_partitions = 20;
+        let params = VectorIndexParams::ivf_flat(num_partitions, MetricType::L2);
+        test_ds
+            .dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 2;
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        // Probe every partition so both paths are exact regardless of centroid
+        // proximity, and so the batch spans multiple streaming chunks.
+        scan.nprobes(num_partitions);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfBatch"),
+            "wide IVF batch KNN should use the shared-scan batch node, got:\n{plan}"
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_batch_matches_single_queries(
+            dataset,
+            &batch,
+            &query_values,
+            k,
+            true,
+            None,
+            Some(num_partitions),
+        )
+        .await;
     }
 
     /// IVF_HNSW is an unsupported index type for the shared-scan batch path (its
