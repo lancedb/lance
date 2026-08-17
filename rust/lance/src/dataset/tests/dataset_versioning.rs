@@ -924,25 +924,16 @@ async fn test_commit_rejects_duplicate_fragment_ids() {
 }
 
 #[tokio::test]
-async fn test_commit_on_dataset_with_mixed_file_versions() {
+async fn test_open_rejects_dataset_with_v1_v2_file_versions() {
     // A v0.16 dataset that has both v1 and v2 files also has two fragments with
     // id 1, because the id allocation of that era could hand out an id a caller
     // had already supplied. The mixture is the more actionable diagnosis, so the
-    // duplicate check must not preempt it.
+    // duplicate check must not preempt it during open.
     let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
-    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
-    let ids = dataset
-        .manifest
-        .fragments
-        .iter()
-        .map(|f| f.id)
-        .collect::<Vec<_>>();
-    assert_eq!(ids, vec![0, 1, 1, 2]);
-
-    let err = dataset.delete("false").await.unwrap_err();
+    let err = Dataset::open(&test_dir.path_str()).await.unwrap_err();
     assert!(
         err.to_string()
-            .contains("The dataset contains a mixture of file versions"),
+            .contains("referenced data files do not have a single version"),
         "unexpected message: {err}"
     );
 }
