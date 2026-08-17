@@ -678,17 +678,12 @@ impl InvertedPartition {
         })
     }
 
-    /// Load postings for membership-only execution without preparing any
-    /// BM25 weights or score bounds. Same-position alternatives are unioned
-    /// when required so AND and phrase semantics remain identical to scoring.
-    #[instrument(level = "debug", skip_all)]
-    pub(in super::super) async fn load_membership_posting_lists(
+    fn membership_token_ids(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
         operator: Operator,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<PostingIterator>> {
+    ) -> Vec<(u32, String, u32)> {
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
         let required_positions = (is_and_query || is_phrase_query).then(|| {
@@ -711,29 +706,26 @@ impl InvertedPartition {
                 token_ids.push((token_id, token, position));
             }
         }
-        if token_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         if let Some(required_positions) = required_positions.as_ref()
             && let Some(matched_positions) = matched_positions.as_ref()
             && !required_positions.is_subset(matched_positions)
         {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
         token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
-        let loaded_postings = stream::iter(token_ids)
-            .map(|(token_id, token, position)| async move {
-                let posting = self
-                    .inverted_list
-                    .posting_list(token_id, is_phrase_query, metrics)
-                    .await?;
-                Result::Ok((token_id, token, position, posting))
-            })
-            .buffered(self.store.io_parallelism())
-            .try_collect::<Vec<_>>()
-            .await?;
+        token_ids
+    }
+
+    fn membership_posting_iterators(
+        &self,
+        loaded_postings: Vec<(u32, String, u32, PostingList)>,
+        params: &FtsSearchParams,
+        operator: Operator,
+    ) -> Result<Vec<PostingIterator>> {
+        let is_phrase_query = params.phrase_slop.is_some();
+        let is_and_query = operator == Operator::And;
         // A non-phrase OR already has exact union semantics in WAND, so keep
         // fuzzy alternatives as independent doc-only iterators. Materializing
         // a union is required only when one query position must act as a
@@ -797,6 +789,69 @@ impl InvertedPartition {
             ));
         }
         Ok(membership_postings)
+    }
+
+    /// Reuse membership postings only when every backing cache entry is
+    /// already present. A miss returns `None` without invoking any loader.
+    #[instrument(level = "debug", skip_all)]
+    pub(in super::super) async fn load_cached_membership_posting_lists(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Vec<PostingIterator>>> {
+        let is_phrase_query = params.phrase_slop.is_some();
+        let token_ids = self.membership_token_ids(tokens, params, operator);
+        if token_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let cached_postings = stream::iter(token_ids)
+            .map(|(token_id, token, position)| async move {
+                let posting = self
+                    .inverted_list
+                    .cached_posting_list(token_id, is_phrase_query, metrics)
+                    .await?;
+                Result::Ok(posting.map(|posting| (token_id, token, position, posting)))
+            })
+            .buffered(self.store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let Some(loaded_postings) = cached_postings.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        self.membership_posting_iterators(loaded_postings, params, operator)
+            .map(Some)
+    }
+
+    /// Load postings for membership-only execution without preparing any
+    /// BM25 weights or score bounds. Same-position alternatives are unioned
+    /// when required so AND and phrase semantics remain identical to scoring.
+    #[instrument(level = "debug", skip_all)]
+    pub(in super::super) async fn load_membership_posting_lists(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PostingIterator>> {
+        let is_phrase_query = params.phrase_slop.is_some();
+        let token_ids = self.membership_token_ids(tokens, params, operator);
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let loaded_postings = stream::iter(token_ids)
+            .map(|(token_id, token, position)| async move {
+                let posting = self
+                    .inverted_list
+                    .posting_list(token_id, is_phrase_query, metrics)
+                    .await?;
+                Result::Ok((token_id, token, position, posting))
+            })
+            .buffered(self.store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        self.membership_posting_iterators(loaded_postings, params, operator)
     }
 
     // search the documents that contain the query

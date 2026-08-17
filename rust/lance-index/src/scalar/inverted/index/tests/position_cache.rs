@@ -184,6 +184,12 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
         ),
         "positions should be stored in the dedicated position cache"
     );
+    let cached_phrase = inverted_list
+        .cached_posting_list(0, true, &NoOpMetricsCollector)
+        .await
+        .unwrap()
+        .expect("with-position prewarm should satisfy a cache-only phrase lookup");
+    assert!(cached_phrase.has_position());
 
     drop(positions);
     drop(group);
@@ -194,6 +200,14 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
             .get_with_key(&PositionKey { token_id: 0 })
             .await
             .is_none()
+    );
+    assert!(
+        inverted_list
+            .cached_posting_list(0, true, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .is_none(),
+        "a cache-only phrase lookup must not reload evicted positions"
     );
 
     index

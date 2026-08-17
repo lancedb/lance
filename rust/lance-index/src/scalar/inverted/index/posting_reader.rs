@@ -310,6 +310,41 @@ impl PostingListReader {
         }
     }
 
+    async fn cached_posting_metadata_for_token(
+        &self,
+        token_id: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Option<(Option<f32>, Option<u32>)> {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { max_scores, .. } => Some((
+                max_scores.as_ref().map(|scores| scores[token_id as usize]),
+                None,
+            )),
+            PostingMetadata::V2 { metadata } => {
+                if let Some(loaded) = metadata.get() {
+                    return Some((
+                        Some(loaded.max_scores[token_id as usize]),
+                        Some(loaded.lengths[token_id as usize]),
+                    ));
+                }
+                let cached = self
+                    .index_cache
+                    .get_with_key(&PostingMetadataKey { token_id })
+                    .await;
+                match cached {
+                    Some(cached) => {
+                        metrics.record_index_cache_hit();
+                        Some((Some(cached.max_score), Some(cached.length)))
+                    }
+                    None => {
+                        metrics.record_index_cache_miss();
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     /// Force the v2 bulk metadata (`max_scores`, `lengths`) into
     /// memory. Cheap to call repeatedly; no-op for legacy v1 indexes whose
     /// metadata is already populated from schema metadata at `try_new` time.
@@ -485,6 +520,83 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    /// Return a posting only when every required cache entry is already present.
+    ///
+    /// This never invokes a posting, metadata, or position loader. Compound
+    /// exclusion uses it to avoid an async preflight/replay cycle when a prior
+    /// query or prewarm has already paid the physical load cost.
+    pub(crate) async fn cached_posting_list(
+        &self,
+        token_id: u32,
+        is_phrase_query: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<PostingList>> {
+        let mut posting = match self.group_range_for_token(token_id) {
+            Some((start, end)) => {
+                let cached = self
+                    .index_cache
+                    .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
+                    .await;
+                let Some(group) = cached else {
+                    metrics.record_index_cache_miss();
+                    return Ok(None);
+                };
+                metrics.record_index_cache_hit();
+                let (max_score, length) = if group.needs_external_metadata() {
+                    let Some(metadata) = self
+                        .cached_posting_metadata_for_token(token_id, metrics)
+                        .await
+                    else {
+                        return Ok(None);
+                    };
+                    metadata
+                } else {
+                    (None, None)
+                };
+                let slot = (token_id - start) as usize;
+                group
+                    .posting_list(slot, max_score, length)?
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "token {token_id} maps to slot {slot} outside posting group [{start}, {end})"
+                        ))
+                    })?
+            }
+            None => {
+                let cached = self
+                    .index_cache
+                    .get_with_key(&posting_list_cache_key(token_id, self.has_impacts))
+                    .await;
+                let Some(posting) = cached else {
+                    metrics.record_index_cache_miss();
+                    return Ok(None);
+                };
+                metrics.record_index_cache_hit();
+                posting.as_ref().clone()
+            }
+        };
+
+        if !self.modern_posting_is_validated(token_id)? {
+            self.ensure_modern_posting_validated(token_id, &posting)
+                .await?;
+        }
+
+        if is_phrase_query && !posting.has_position() {
+            let cached = self
+                .index_cache
+                .get_with_key(&PositionKey { token_id })
+                .await;
+            let Some(positions) = cached else {
+                metrics.record_index_cache_miss();
+                return Ok(None);
+            };
+            metrics.record_index_cache_hit();
+            posting.set_positions(positions.0.clone());
+        }
+
+        Ok(Some(posting))
     }
 
     pub(super) async fn ensure_modern_posting_validated(

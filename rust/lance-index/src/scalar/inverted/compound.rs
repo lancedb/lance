@@ -2953,7 +2953,14 @@ async fn load_compound_partition(
             } else if load_mode == PartitionLoadMode::ScoringOnly
                 && score_mode == CompoundScoreMode::CompleteNoScores
             {
-                None
+                partition
+                    .load_cached_membership_posting_lists(
+                        tokens.as_ref(),
+                        params.as_ref(),
+                        operator,
+                        metrics.as_ref(),
+                    )
+                    .await?
             } else if score_mode == CompoundScoreMode::CompleteNoScores {
                 Some(
                     partition

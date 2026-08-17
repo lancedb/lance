@@ -339,6 +339,46 @@ async fn test_prewarm_synthetic_grouping_populates_group_entries() {
     }
 }
 
+#[tokio::test]
+async fn test_cached_posting_list_never_loads_a_cold_entry() {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+    builder.tokens.add("term".to_owned());
+    let mut posting = PostingListBuilder::new(false);
+    posting.add(0, PositionRecorder::Count(3));
+    builder.posting_lists.push(posting);
+    builder.docs.append(1000, 3);
+    builder.write(store.as_ref()).await.unwrap();
+
+    let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+    let cache = LanceCache::with_capacity(1 << 20);
+    let posting_reader = PostingListReader::try_new(reader, &cache).await.unwrap();
+    let metrics = NoOpMetricsCollector;
+    assert!(
+        posting_reader
+            .cached_posting_list(0, false, &metrics)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let loaded = posting_reader
+        .posting_list(0, false, &metrics)
+        .await
+        .unwrap();
+    let cached = posting_reader
+        .cached_posting_list(0, false, &metrics)
+        .await
+        .unwrap()
+        .expect("a normal load should populate the posting cache");
+    assert_eq!(posting_entries(&cached), posting_entries(&loaded));
+}
+
 /// End-to-end BM25 search over a grouped multi-group index must return the
 /// correct documents, and a warm-cache query must match the cold-cache
 /// result exactly (issue #7040).

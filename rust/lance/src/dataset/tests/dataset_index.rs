@@ -1575,8 +1575,12 @@ async fn test_compound_must_not_deferred_load_respects_modern_visibility() {
     .into();
     for (filter, expected_row_ids, expected_loads) in [
         ("scope = 0", Vec::new(), 0),
-        ("scope = 1", Vec::new(), 1),
-        ("scope = 2", vec![1], 1),
+        // The positive and prohibited terms share a runtime posting group.
+        // Loading the positive leaf above makes the prohibited member of that
+        // immutable group cache-resident, so neither visible-positive case
+        // needs a deferred load or positive preflight cycle.
+        ("scope = 1", Vec::new(), 0),
+        ("scope = 2", vec![1], 0),
     ] {
         let (rows, stats) =
             compound_fts_results_with_stats(&dataset, query.clone(), Some(1), Some(filter)).await;
