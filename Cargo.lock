@@ -4778,6 +4778,7 @@ dependencies = [
  "protobuf-src",
  "rand 0.9.5",
  "rstest",
+ "serde",
  "test-log",
  "tokio",
  "tracing",
