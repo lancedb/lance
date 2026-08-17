@@ -1124,7 +1124,14 @@ impl ManifestNamespace {
     }
 
     fn deregistered_table_marker_path(&self, location: &str) -> Path {
-        self.table_path(location).join(DEREGISTERED_TABLE_MARKER)
+        let table_path = self.table_path(location);
+        let filename = table_path
+            .filename()
+            .expect("a table location has a filename");
+        table_path
+            .parent()
+            .unwrap_or_else(|| self.base_path.clone())
+            .join(format!(".{filename}{DEREGISTERED_TABLE_MARKER}"))
     }
 
     async fn has_deregistered_table_marker(&self, location: &str) -> Result<bool> {
@@ -1134,11 +1141,14 @@ impl ManifestNamespace {
             .filter(|segment| !segment.is_empty() && *segment != ".")
         {
             path = path.join(segment);
-            if self
-                .object_store
-                .exists(&path.clone().join(DEREGISTERED_TABLE_MARKER))
-                .await?
-            {
+            let Some(filename) = path.filename() else {
+                continue;
+            };
+            let marker_path = path
+                .parent()
+                .unwrap_or_else(|| self.base_path.clone())
+                .join(format!(".{filename}{DEREGISTERED_TABLE_MARKER}"));
+            if self.object_store.exists(&marker_path).await? {
                 return Ok(true);
             }
         }
@@ -1168,7 +1178,7 @@ impl ManifestNamespace {
             && !error.is_not_found()
         {
             log::warn!(
-                "Failed to remove uncommitted deregistration marker at '{}': {error}",
+                "Failed to remove deregistration marker at '{}': {error}",
                 marker_path
             );
         }
@@ -3364,17 +3374,12 @@ impl LanceNamespace for ManifestNamespace {
                     .as_ref()
                     .expect("an overwrite has an existing table")
                     .location;
-                let marker_created = self
-                    .put_deregistered_table_marker(previous_location)
+                self.put_deregistered_table_marker(previous_location)
                     .await?;
                 if let Err(error) = self
                     .replace_manifest_table_location(entry, previous_location)
                     .await
                 {
-                    if marker_created {
-                        self.remove_deregistered_table_marker(previous_location)
-                            .await;
-                    }
                     let new_table_path = self.table_path(&dir_name);
                     if let Err(cleanup_error) =
                         self.object_store.remove_dir_all(new_table_path).await
@@ -3390,8 +3395,14 @@ impl LanceNamespace for ManifestNamespace {
                 }
                 let previous_table_path = self.table_path(previous_location);
                 match self.object_store.remove_dir_all(previous_table_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.is_not_found() => {}
+                    Ok(()) => {
+                        self.remove_deregistered_table_marker(previous_location)
+                            .await;
+                    }
+                    Err(error) if error.is_not_found() => {
+                        self.remove_deregistered_table_marker(previous_location)
+                            .await;
+                    }
                     Err(error) => {
                         log::warn!(
                             "Failed to delete overwritten table location '{}': {error:?}",
@@ -3479,18 +3490,10 @@ impl LanceNamespace for ManifestNamespace {
                     .await;
                 let owns_manifest_deletion = match delete_result {
                     Ok(owns_manifest_deletion) => owns_manifest_deletion,
-                    Err(error) => {
-                        if marker_created {
-                            self.remove_deregistered_table_marker(&info.location).await;
-                        }
-                        return Err(error);
-                    }
+                    Err(error) => return Err(error),
                 };
 
-                if !owns_manifest_deletion {
-                    if marker_created {
-                        self.remove_deregistered_table_marker(&info.location).await;
-                    }
+                if !marker_created && !owns_manifest_deletion {
                     return Ok(DropTableResponse {
                         id: request.id.clone(),
                         location: Some(Self::construct_full_uri(&self.root, &info.location)?),
@@ -3512,6 +3515,7 @@ impl LanceNamespace for ManifestNamespace {
                             message: format!("Failed to delete table directory: {:?}", e),
                         })
                     })?;
+                self.remove_deregistered_table_marker(&info.location).await;
 
                 Ok(DropTableResponse {
                     id: request.id.clone(),
@@ -4019,40 +4023,21 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        let marker_created = if expected_location.is_some() {
+        if expected_location.is_some() {
             self.ensure_manifest_writable().await?;
-            Some(
-                self.put_deregistered_table_marker(&manifest_location)
-                    .await?,
-            )
-        } else {
-            None
-        };
+            self.put_deregistered_table_marker(&manifest_location)
+                .await?;
+        }
 
         // Randomized table locations are checked again inside every rewrite attempt,
         // so a concurrent replacement cannot be deleted by a stale deregistration.
-        let delete_result = self
-            .delete_from_manifest_if_location(
-                &object_id,
-                Some(&manifest_location),
-                expected_location.is_some(),
-            )
-            .boxed()
-            .await;
-        let owns_manifest_deletion = match delete_result {
-            Ok(owns_manifest_deletion) => owns_manifest_deletion,
-            Err(error) => {
-                if marker_created == Some(true) {
-                    self.remove_deregistered_table_marker(&manifest_location)
-                        .await;
-                }
-                return Err(error);
-            }
-        };
-        if !owns_manifest_deletion && marker_created == Some(true) {
-            self.remove_deregistered_table_marker(&manifest_location)
-                .await;
-        }
+        self.delete_from_manifest_if_location(
+            &object_id,
+            Some(&manifest_location),
+            expected_location.is_some(),
+        )
+        .boxed()
+        .await?;
 
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
