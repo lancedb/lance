@@ -465,27 +465,39 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
     /// Delete the manifest information for the given base_uri in dynamodb
     async fn delete(&self, base_uri: &str) -> Result<()> {
-        let query_result = self
-            .ddb_query()
-            .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
-            .expression_attribute_values(
-                format!(":{}", base_uri!()),
-                AttributeValue::S(base_uri.into()),
-            )
-            .send()
-            .await
-            .wrap_err()?;
+        let mut exclusive_start_key = None;
+        loop {
+            let query_result = self
+                .ddb_query()
+                .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
+                .expression_attribute_values(
+                    format!(":{}", base_uri!()),
+                    AttributeValue::S(base_uri.into()),
+                )
+                .set_exclusive_start_key(exclusive_start_key)
+                .send()
+                .await
+                .wrap_err()?;
 
-        if let Some(items) = query_result.items {
-            for item in items {
-                if let Some(AttributeValue::N(version)) = item.get("version") {
-                    self.ddb_delete()
-                        .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
-                        .key(version!(), AttributeValue::N(version.clone()))
-                        .send()
-                        .await
-                        .wrap_err()?;
+            if let Some(items) = query_result.items {
+                for item in items {
+                    if let Some(AttributeValue::N(version)) = item.get("version") {
+                        self.ddb_delete()
+                            .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
+                            .key(version!(), AttributeValue::N(version.clone()))
+                            .send()
+                            .await
+                            .wrap_err()?;
+                    }
                 }
+            }
+
+            exclusive_start_key = query_result.last_evaluated_key;
+            if exclusive_start_key
+                .as_ref()
+                .is_none_or(|key| key.is_empty())
+            {
+                break;
             }
         }
         Ok(())
