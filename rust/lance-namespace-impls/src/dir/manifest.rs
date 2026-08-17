@@ -3378,6 +3378,7 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
+                self.ensure_manifest_writable().await?;
                 self.object_store
                     .put(
                         &self.deregistered_table_marker_path(&info.location),
@@ -3910,6 +3911,7 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         if expected_location.is_some() {
+            self.ensure_manifest_writable().await?;
             self.object_store
                 .put(
                     &self.deregistered_table_marker_path(&manifest_location),
