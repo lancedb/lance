@@ -501,3 +501,45 @@ async fn test_a_row_address_take() {
         .await
         .unwrap();
 }
+
+/// `_rowoffset` counts live rows from the start of the dataset, so a deleted row shifts it.
+#[tokio::test]
+#[rstest::rstest]
+#[case::projected(false)]
+#[case::taken(true)]
+async fn test_row_offsets(#[case] as_take: bool) {
+    use arrow::datatypes::UInt64Type;
+    use arrow_array::cast::AsArray;
+
+    let mut dataset = test_dataset().await;
+    dataset.delete("i = 3").await.unwrap();
+
+    let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
+        scan.project(&["i", "_rowoffset"])?;
+        if as_take {
+            scan.filter("_rowoffset IN (5, 10, 20)")?;
+        }
+        Ok(scan)
+    });
+    let batch = scan_rows(&dataset, scan_config).await.unwrap();
+
+    // Offsets count live rows, so deleting `i = 3` shifts every row after it down by one.
+    let offsets = batch[lance_core::ROW_OFFSET]
+        .as_primitive::<UInt64Type>()
+        .values();
+    let ids = batch["i"]
+        .as_primitive::<arrow::datatypes::Int32Type>()
+        .values();
+    let expected_id = |offset: u64| if offset < 3 { offset } else { offset + 1 } as i32;
+    for (offset, id) in offsets.iter().zip(ids) {
+        assert_eq!(
+            *id,
+            expected_id(*offset),
+            "offset {offset} names the wrong row"
+        );
+    }
+    match as_take {
+        true => assert_eq!(offsets, &[5, 10, 20]),
+        false => assert_eq!(offsets, &(0..199).collect::<Vec<u64>>()),
+    }
+}

@@ -32,6 +32,7 @@ use lance_index::scalar::expression::{IndexInformationProvider, ScalarIndexExpr}
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
+use super::row_offset::RowOffsetNode;
 use super::scan_index::with_lance_source;
 use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
@@ -40,6 +41,7 @@ use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_t
 use crate::dataset::scanner::TakeOperation;
 use crate::dataset::{Dataset, row_offsets_to_row_addresses};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, ScalarIndexInfo};
+use crate::io::exec::RowOffsetMap;
 
 /// What a data overlay did to an index's entries.
 ///
@@ -183,6 +185,10 @@ pub struct ScanPlanningContext {
     /// predicate's values rather than its expression: the rules see it after `PushDownFilter` has
     /// moved it, and the values are what survive that unchanged.
     take_rows: HashMap<String, Arc<RowAddrTreeMap>>,
+    /// Fragment row counts and deletion vectors, loaded only when the plan asks for `_rowoffset`.
+    /// `AddRowOffsetExec::try_new` is the one physical constructor that does I/O; this is how it
+    /// stops being one.
+    row_offsets: Option<RowOffsetMap>,
 }
 
 impl ScanPlanningContext {
@@ -197,8 +203,14 @@ impl ScanPlanningContext {
     pub async fn collect(plan: &LogicalPlan) -> Result<Self> {
         let mut leaf = None;
         let mut searches: Vec<(String, Option<DistanceType>)> = Vec::new();
+        let mut needs_row_offsets = false;
         let mut takes: Vec<TakeOperation> = Vec::new();
         plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && extension.node.as_any().is::<RowOffsetNode>()
+            {
+                needs_row_offsets = true;
+            }
             takes.extend(take_operations(node));
             if let LogicalPlan::Extension(extension) = node
                 && let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>()
@@ -260,6 +272,10 @@ impl ScanPlanningContext {
 
         let scalar_indices = Arc::new(dataset.scalar_index_info().await?);
         let index_staleness = prefetch_index_staleness(&dataset, &fragments).await?;
+        let row_offsets = match needs_row_offsets {
+            true => Some(RowOffsetMap::load(dataset.clone()).await?),
+            false => None,
+        };
         let take_rows = resolve_takes(&dataset, takes).await?;
 
         Ok(Self {
@@ -274,8 +290,13 @@ impl ScanPlanningContext {
             },
             scalar_indices,
             index_staleness,
+            row_offsets,
             take_rows,
         })
+    }
+
+    pub fn row_offsets(&self) -> Option<&RowOffsetMap> {
+        self.row_offsets.as_ref()
     }
 
     /// The rows a take-shaped predicate selects, if resolving it needed I/O and stage 2 did it.
