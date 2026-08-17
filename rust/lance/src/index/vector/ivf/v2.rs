@@ -2021,11 +2021,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // partitions, so collecting every loaded partition before scoring would
         // make peak memory scale with the batch width — up to the whole index.
         // Streaming bounds resident partition storage to the load window plus one
-        // chunk, which is then dropped once scored. `buffered` preserves the
-        // sorted load order above, so scoring order (and thus tie-breaking) stays
-        // deterministic. Each chunk is scored in a single `spawn_cpu` dispatch
-        // that only touches CPU-bound state — the partition-loading `await`s stay
-        // in this async loop so no CPU-pool thread ever parks on I/O (#7642).
+        // chunk. `buffered` preserves the sorted load order above, so scoring order
+        // (and thus the k-th-distance tie-break) stays deterministic.
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
@@ -2050,7 +2047,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .map(|_| BinaryHeap::with_capacity(heap_capacity))
             .collect();
 
-        while let Some(chunk) = loaded_chunks.next().await {
+        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
+        // dispatches the scoring immediately and only touches CPU-bound state, so
+        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
+        // flight during scoring: the async task, never a CPU-pool thread, does the
+        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
+        // docs recommend with `buffered`). Scoring stays sequential across chunks —
+        // each mutates the same per-query heaps — so a step costs about
+        // max(load, score) rather than their sum, and a scored chunk's storage is
+        // dropped before the next is scored, keeping peak memory bounded.
+        let mut pending = loaded_chunks.next().await;
+        while let Some(chunk) = pending {
             let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
             let index = self.clone();
             let pre_filter = pre_filter.clone();
@@ -2058,11 +2065,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let raw_query_contexts = raw_query_contexts.clone();
             let scratch_pool = self.scratch_pool.clone();
             let search_metrics = metrics.clone();
-            // Score one chunk of loaded partitions into the shared per-query heaps
-            // and hand the heaps back for the next chunk. The chunk's partition
-            // storage is dropped when this dispatch returns, keeping peak memory
-            // bounded by the chunk size rather than the batch's whole probe set.
-            heaps = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
                 scratch_pool.with_scratch(|scratch| -> Result<()> {
                     for (part_id, part_entry, probing_queries) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
@@ -2092,8 +2095,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     Ok(())
                 })?;
                 Ok(heaps)
-            })
-            .await?;
+            });
+            // Load the next chunk while this one is scored on the CPU pool.
+            let (scored, next) = futures::join!(score, loaded_chunks.next());
+            heaps = scored?;
+            pending = next;
         }
 
         heaps
