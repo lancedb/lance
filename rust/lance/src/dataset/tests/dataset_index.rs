@@ -43,7 +43,8 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
-    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_MUST_NOT_PROBES_METRIC, COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC,
+    COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, COMPOUND_POSITIVE_SURVIVORS_METRIC,
     COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
     COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
@@ -1325,6 +1326,118 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
 }
 
 #[tokio::test]
+async fn test_compound_must_not_phrase_is_exact_across_shapes() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "alpha beta rare red flag",
+            "alpha beta rare",
+            "alpha beta rare",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha beta red flag",
+            "alpha gamma rare",
+            "beta gamma rare",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha beta rare",
+            "alpha"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true, true).await;
+
+    let match_query = |term: &str| compound_match_query(term, "text", 1.0);
+    let prohibited_phrase = || -> FtsQuery {
+        PhraseQuery::new("red flag".to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let conjunction: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("alpha")),
+        (Occur::Must, match_query("beta")),
+        (Occur::MustNot, prohibited_phrase()),
+    ])
+    .into();
+    let reqopt: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("alpha")),
+        (Occur::Should, match_query("rare")),
+        (Occur::MustNot, prohibited_phrase()),
+    ])
+    .into();
+    let pure_should: FtsQuery = BooleanQuery::new([
+        (Occur::Should, match_query("alpha")),
+        (Occur::Should, match_query("beta")),
+        (Occur::Should, match_query("rare")),
+        (Occur::MustNot, prohibited_phrase()),
+    ])
+    .into();
+    let nested_positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("alpha")),
+        (Occur::MustNot, prohibited_phrase()),
+    ])
+    .into();
+    let nested: FtsQuery = BooleanQuery::new([
+        (Occur::Must, nested_positive),
+        (Occur::Should, match_query("beta")),
+    ])
+    .into();
+
+    for (shape, query) in [
+        ("conjunction", conjunction.clone()),
+        ("ReqOpt", reqopt),
+        ("pure SHOULD", pure_should),
+        ("nested Boolean", nested),
+    ] {
+        let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+        assert!(
+            exhaustive.len() > 2,
+            "{shape} must have candidates beyond top-k"
+        );
+        assert!(
+            exhaustive
+                .iter()
+                .all(|(row_id, _)| *row_id != 0 && *row_id != 5),
+            "{shape} must exclude every matching prohibited phrase"
+        );
+        let limited = compound_fts_results(&dataset, query, Some(2)).await;
+        assert_eq!(limited, exhaustive[..2], "{shape} top-k must remain exact");
+    }
+
+    let exhaustive = compound_fts_results(&dataset, conjunction.clone(), None).await;
+    assert!(
+        exhaustive
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "conjunction results should retain an ascending row-id score tie"
+    );
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(conjunction))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column Phrase prohibition should use the compound scorer:\n{plan}"
+    );
+}
+
+#[tokio::test]
 async fn test_pure_should_maxscore_is_exact_across_fragments() {
     let batch = arrow_array::record_batch!((
         "text",
@@ -1406,6 +1519,8 @@ async fn test_pure_should_maxscore_is_exact_across_fragments() {
     scanner.try_into_batch().await.unwrap();
     let stats = collected_stats.lock().unwrap().take().unwrap();
     for metric in [
+        COMPOUND_POSITIVE_SURVIVORS_METRIC,
+        COMPOUND_MUST_NOT_PROBES_METRIC,
         COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
         COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
         COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
@@ -1423,6 +1538,15 @@ async fn test_pure_should_maxscore_is_exact_across_fragments() {
     assert!(
         stats.all_counts[COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC] > 0,
         "pure-SHOULD execution should evaluate essential clauses"
+    );
+    assert!(
+        stats.all_counts[COMPOUND_POSITIVE_SURVIVORS_METRIC] > 0,
+        "pure-SHOULD execution should produce candidates for MUST_NOT"
+    );
+    assert_eq!(
+        stats.all_counts[COMPOUND_MUST_NOT_PROBES_METRIC],
+        stats.all_counts[COMPOUND_POSITIVE_SURVIVORS_METRIC],
+        "each positive survivor should probe MUST_NOT exactly once"
     );
     assert_eq!(
         stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),

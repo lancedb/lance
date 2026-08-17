@@ -13,6 +13,8 @@ pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
     "compound_peak_address_resolution_batch_size";
 pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
 pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
+pub const COMPOUND_POSITIVE_SURVIVORS_METRIC: &str = "compound_positive_survivors";
+pub const COMPOUND_MUST_NOT_PROBES_METRIC: &str = "compound_must_not_probes";
 pub const COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC: &str = "compound_should_skipped_windows";
 pub const COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC: &str =
     "compound_should_bound_recomputations";
@@ -112,6 +114,13 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record a candidate-buffer high-water mark for compound FTS.
     fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}
+
+    /// Record compound FTS candidates whose exact positive score reached the
+    /// current competitive floor before prohibited clauses were evaluated.
+    fn record_compound_positive_survivors(&self, _num_candidates: usize) {}
+
+    /// Record candidate-level probes of compound FTS MUST_NOT clauses.
+    fn record_compound_must_not_probes(&self, _num_probes: usize) {}
 
     /// Record pure-SHOULD compound FTS windows skipped using score bounds.
     fn record_compound_should_skipped_windows(&self, _num_windows: usize) {}

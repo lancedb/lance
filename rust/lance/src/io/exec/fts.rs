@@ -45,7 +45,8 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
-    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_MUST_NOT_PROBES_METRIC, COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC,
+    COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, COMPOUND_POSITIVE_SURVIVORS_METRIC,
     COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
     COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
@@ -1060,6 +1061,8 @@ pub struct FtsIndexMetrics {
     compound_peak_address_resolution_batch_size: Gauge,
     compound_score_floor_overflows: Count,
     compound_peak_buffered_candidates: Gauge,
+    compound_positive_survivors: Count,
+    compound_must_not_probes: Count,
     compound_should_skipped_windows: Count,
     compound_should_bound_recomputations: Count,
     compound_should_essential_evaluations: Count,
@@ -1093,6 +1096,9 @@ impl FtsIndexMetrics {
                 .new_count(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, partition),
             compound_peak_buffered_candidates: metrics
                 .new_gauge(COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, partition),
+            compound_positive_survivors: metrics
+                .new_count(COMPOUND_POSITIVE_SURVIVORS_METRIC, partition),
+            compound_must_not_probes: metrics.new_count(COMPOUND_MUST_NOT_PROBES_METRIC, partition),
             compound_should_skipped_windows: metrics
                 .new_count(COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, partition),
             compound_should_bound_recomputations: metrics
@@ -1173,6 +1179,14 @@ impl MetricsCollector for FtsIndexMetrics {
     fn record_compound_peak_buffered_candidates(&self, num_candidates: usize) {
         self.compound_peak_buffered_candidates
             .set_max(num_candidates);
+    }
+
+    fn record_compound_positive_survivors(&self, num_candidates: usize) {
+        self.compound_positive_survivors.add(num_candidates);
+    }
+
+    fn record_compound_must_not_probes(&self, num_probes: usize) {
+        self.compound_must_not_probes.add(num_probes);
     }
 
     fn record_compound_should_skipped_windows(&self, num_windows: usize) {
@@ -3547,15 +3561,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compound_should_metrics_are_counted_independently() {
+    fn test_compound_metrics_are_counted_independently() {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
 
+        metrics.record_compound_positive_survivors(11);
+        metrics.record_compound_must_not_probes(13);
         metrics.record_compound_should_skipped_windows(2);
         metrics.record_compound_should_bound_recomputations(3);
         metrics.record_compound_should_essential_evaluations(5);
         metrics.record_compound_should_non_essential_evaluations(7);
 
+        assert_eq!(metrics.compound_positive_survivors.value(), 11);
+        assert_eq!(metrics.compound_must_not_probes.value(), 13);
         assert_eq!(metrics.compound_should_skipped_windows.value(), 2);
         assert_eq!(metrics.compound_should_bound_recomputations.value(), 3);
         assert_eq!(metrics.compound_should_essential_evaluations.value(), 5);

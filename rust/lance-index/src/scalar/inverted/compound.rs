@@ -1949,6 +1949,12 @@ impl ComposableScorer for ReqOptScorer<'_> {
     }
 }
 
+#[derive(Default)]
+struct BooleanWork {
+    positive_survivors: usize,
+    must_not_probes: usize,
+}
+
 /// Boolean scorer preserving the current membership and score semantics.
 pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
@@ -1956,6 +1962,14 @@ pub(super) struct BooleanScorer<'a> {
     prohibited: Option<BoxScorer<'a>>,
     current: Option<u64>,
     optional_matches: bool,
+    min_competitive_score: f32,
+    positive_checked_doc: Option<u64>,
+    positive_score: Option<f32>,
+    positive_survivor_doc: Option<u64>,
+    prohibited_checked_doc: Option<u64>,
+    prohibited_matches: bool,
+    metrics: Option<&'a dyn MetricsCollector>,
+    work: BooleanWork,
 }
 
 impl<'a> BooleanScorer<'a> {
@@ -2027,45 +2041,91 @@ impl<'a> BooleanScorer<'a> {
             prohibited,
             current: None,
             optional_matches: false,
+            min_competitive_score: f32::NEG_INFINITY,
+            positive_checked_doc: None,
+            positive_score: None,
+            positive_survivor_doc: None,
+            prohibited_checked_doc: None,
+            prohibited_matches: false,
+            metrics,
+            work: BooleanWork::default(),
         })
     }
 
-    fn accept_driver_doc(&mut self) -> Result<bool> {
-        let Some(current) = self.driver.doc() else {
-            return Ok(false);
-        };
-        if !self.driver.matches()? {
-            return Ok(false);
+    fn set_current(&mut self, current: Option<u64>) {
+        if self.current != current {
+            self.optional_matches = false;
+            self.positive_checked_doc = None;
+            self.positive_score = None;
+            self.positive_survivor_doc = None;
+            self.prohibited_checked_doc = None;
+            self.prohibited_matches = false;
         }
-        if let Some(prohibited) = &mut self.prohibited
-            && prohibited.advance(current)? == Some(current)
-            && prohibited.matches()?
-        {
-            return Ok(false);
-        }
-        self.optional_matches = if let Some(optional) = &mut self.optional {
-            optional.advance(current)? == Some(current) && optional.matches()?
-        } else {
-            false
-        };
-        self.current = Some(current);
-        Ok(true)
+        self.current = current;
     }
 
-    fn next_accepted(&mut self, target: Option<u64>) -> Result<Option<u64>> {
-        let mut doc = match target {
+    fn position(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        let current = match target {
             Some(target) => self.driver.advance(target)?,
             None => self.driver.next()?,
         };
-        while doc.is_some() {
-            if self.accept_driver_doc()? {
-                return Ok(self.current);
-            }
-            doc = self.driver.next()?;
+        // The separate optional scorer is the exact fallback for shapes that
+        // cannot use ReqOpt. Keep its approximation positioned so parent
+        // shallow bounds include a possible optional contribution.
+        if let Some(current) = current
+            && let Some(optional) = &mut self.optional
+        {
+            optional.advance(current)?;
         }
-        self.current = None;
-        self.optional_matches = false;
-        Ok(None)
+        self.set_current(current);
+        Ok(current)
+    }
+
+    fn ensure_positive_score(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        if self.positive_checked_doc == Some(current) {
+            return Ok(self.positive_score);
+        }
+        if !self.driver.matches()? {
+            self.positive_checked_doc = Some(current);
+            self.positive_score = None;
+            return Ok(None);
+        }
+        self.optional_matches = if let Some(optional) = &mut self.optional {
+            debug_assert!(optional.doc().is_none_or(|doc| doc >= current));
+            optional.doc() == Some(current) && optional.matches()?
+        } else {
+            false
+        };
+        let mut score = self.driver.score()?;
+        if self.optional_matches
+            && let Some(optional) = &mut self.optional
+        {
+            score += optional.score()?;
+        }
+        let score = checked_score(score, "BooleanQuery scorer")?;
+        self.positive_checked_doc = Some(current);
+        self.positive_score = Some(score);
+        Ok(Some(score))
+    }
+
+    fn ensure_not_prohibited(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.prohibited_checked_doc == Some(current) {
+            return Ok(!self.prohibited_matches);
+        }
+        self.prohibited_matches = if let Some(prohibited) = &mut self.prohibited {
+            self.work.must_not_probes += 1;
+            prohibited.advance(current)? == Some(current) && prohibited.matches()?
+        } else {
+            false
+        };
+        self.prohibited_checked_doc = Some(current);
+        Ok(!self.prohibited_matches)
     }
 }
 
@@ -2079,14 +2139,14 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn next(&mut self) -> Result<Option<u64>> {
-        self.next_accepted(None)
+        self.position(None)
     }
 
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
-        self.next_accepted(Some(target))
+        self.position(Some(target))
     }
 
     fn cost(&self) -> usize {
@@ -2094,18 +2154,17 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn score(&mut self) -> Result<f32> {
-        if self.current.is_none() {
+        let current = self
+            .current
+            .ok_or_else(|| Error::internal("Boolean FTS scorer is not positioned on a document"))?;
+        if self.positive_checked_doc != Some(current) {
             return Err(Error::internal(
-                "Boolean FTS scorer is not positioned on a document",
+                "Boolean FTS score requested before confirming the positive scorer",
             ));
         }
-        let mut score = self.driver.score()?;
-        if self.optional_matches
-            && let Some(optional) = &mut self.optional
-        {
-            score += optional.score()?;
-        }
-        checked_score(score, "BooleanQuery scorer")
+        self.positive_score.ok_or_else(|| {
+            Error::internal("Boolean FTS score requested for a rejected positive candidate")
+        })
     }
 
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
@@ -2151,6 +2210,14 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        if min_score > self.min_competitive_score {
+            self.min_competitive_score = min_score;
+        }
         // When SHOULD is also present, a global sibling bound is required to
         // translate the parent threshold safely. The combined block bound still
         // prunes at this node. Without SHOULD, driver score is the full score.
@@ -2161,7 +2228,17 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn matches(&mut self) -> Result<bool> {
-        Ok(self.current.is_some())
+        let Some(score) = self.ensure_positive_score()? else {
+            return Ok(false);
+        };
+        if score < self.min_competitive_score {
+            return Ok(false);
+        }
+        if self.prohibited.is_some() && self.positive_survivor_doc != self.current {
+            self.positive_survivor_doc = self.current;
+            self.work.positive_survivors += 1;
+        }
+        self.ensure_not_prohibited()
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -2170,6 +2247,16 @@ impl ComposableScorer for BooleanScorer<'_> {
                 .optional
                 .as_ref()
                 .is_none_or(|optional| optional.scores_non_negative())
+    }
+}
+
+impl Drop for BooleanScorer<'_> {
+    fn drop(&mut self) {
+        let Some(metrics) = self.metrics else {
+            return;
+        };
+        metrics.record_compound_positive_survivors(self.work.positive_survivors);
+        metrics.record_compound_must_not_probes(self.work.must_not_probes);
     }
 }
 
@@ -2897,6 +2984,30 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BooleanMetrics {
+        positive_survivors: AtomicUsize,
+        must_not_probes: AtomicUsize,
+    }
+
+    impl MetricsCollector for BooleanMetrics {
+        fn record_parts_loaded(&self, _num_parts: usize) {}
+
+        fn record_index_loads(&self, _num_loads: usize) {}
+
+        fn record_comparisons(&self, _num_comparisons: usize) {}
+
+        fn record_compound_positive_survivors(&self, num_candidates: usize) {
+            self.positive_survivors
+                .fetch_add(num_candidates, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_must_not_probes(&self, num_probes: usize) {
+            self.must_not_probes
+                .fetch_add(num_probes, AtomicOrdering::Relaxed);
+        }
+    }
+
     #[test]
     fn score_bounds_are_conservative_under_nested_sum_and_boost() {
         let should = DisjunctionScorer::try_new(
@@ -3461,6 +3572,114 @@ mod tests {
     }
 
     #[test]
+    fn boolean_delays_must_not_until_exact_positive_score_is_competitive() {
+        let positive_rows = [(0, 0.5), (1, 50.0)];
+        let positive = || {
+            Box::new(MaterializedScorer::try_new(rows(&positive_rows)).unwrap()) as BoxScorer<'_>
+        };
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&[(0, 0.0), (1, 0.0)], Vec::new(), Some(1.0));
+        let mut scorer =
+            BooleanScorer::try_new(Vec::new(), vec![positive(), positive()], vec![prohibited])
+                .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(50.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(1, 100.0)]));
+        assert_eq!(
+            prohibited_approximations.load(AtomicOrdering::Relaxed),
+            1,
+            "the low-scoring document shares a high block bound but must not probe MUST_NOT"
+        );
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_delays_selective_must_not_probes() {
+        let positive_rows = (0..100)
+            .map(|doc| (doc, if doc == 99 { 50.0 } else { 0.5 }))
+            .collect::<Vec<_>>();
+        let prohibited_rows = (0..100).map(|doc| (doc, 0.0)).collect::<Vec<_>>();
+        let eager_probes = positive_rows.len();
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&prohibited_rows, Vec::new(), Some(1.0));
+        let metrics = BooleanMetrics::default();
+        let results = {
+            let positive = || {
+                Box::new(
+                    MaterializedScorer::try_new(rows(&positive_rows))
+                        .unwrap()
+                        .with_block_size(1),
+                ) as BoxScorer<'_>
+            };
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                Vec::new(),
+                vec![positive(), positive()],
+                vec![prohibited],
+                Some(&metrics),
+            )
+            .unwrap();
+            let competitive_score = Arc::new(CompetitiveScore::default());
+            competitive_score.raise(50.0);
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut scorer)
+                .unwrap()
+        };
+        let probes = prohibited_approximations.load(AtomicOrdering::Relaxed);
+
+        assert_eq!(results, rows(&[(99, 100.0)]));
+        assert_eq!(probes, 1);
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(metrics.positive_survivors.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(metrics.must_not_probes.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            probes * 5 <= eager_probes * 4,
+            "delayed MUST_NOT should reduce probes by at least 20%: {probes}/{eager_probes}"
+        );
+    }
+
+    #[test]
+    fn boolean_caches_must_not_decision_for_current_document() {
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&[(0, 0.0)], Vec::new(), Some(10.0));
+        let mut scorer = BooleanScorer::try_new(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0)])],
+            vec![prohibited],
+        )
+        .unwrap();
+
+        assert_eq!(scorer.next().unwrap(), Some(0));
+        assert!(scorer.matches().unwrap());
+        assert_eq!(scorer.score().unwrap(), 1.0);
+        assert!(scorer.matches().unwrap());
+        assert_eq!(scorer.score().unwrap(), 1.0);
+        assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_skips_must_not_for_positive_confirmation_rejects() {
+        let (positive, _, positive_confirmations) =
+            two_phase(&[(0, 1.0), (1, 2.0)], vec![1], Some(1.0));
+        let (prohibited, prohibited_approximations, _) =
+            two_phase(&[(0, 0.0), (1, 0.0)], Vec::new(), Some(10.0));
+        let mut scorer =
+            BooleanScorer::try_new(Vec::new(), vec![positive], vec![prohibited]).unwrap();
+
+        assert_eq!(
+            TopKCollector::new(2).collect(&mut scorer).unwrap(),
+            rows(&[(1, 2.0)])
+        );
+        assert_eq!(positive_confirmations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
     fn reqopt_delays_sparse_optional_probes() {
         let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
         let build = || {
@@ -3485,6 +3704,14 @@ mod tests {
             prohibited: None,
             current: None,
             optional_matches: false,
+            min_competitive_score: f32::NEG_INFINITY,
+            positive_checked_doc: None,
+            positive_score: None,
+            positive_survivor_doc: None,
+            prohibited_checked_doc: None,
+            prohibited_matches: false,
+            metrics: None,
+            work: BooleanWork::default(),
         };
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
 
