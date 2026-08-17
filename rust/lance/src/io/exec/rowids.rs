@@ -343,6 +343,22 @@ struct FragInfo {
     deletion_vector: Option<Arc<DeletionVector>>,
 }
 
+/// Everything [`AddRowOffsetExec`] needs about the dataset's fragments, loaded once.
+///
+/// Reading it costs I/O — deletion vectors, and row counts on datasets old enough not to record
+/// them — which is why it can be loaded separately from the node that uses it. A planner that must
+/// build its nodes synchronously loads this up front instead.
+#[derive(Clone, Debug)]
+pub struct RowOffsetMap(Arc<HashMap<u32, FragInfo>>);
+
+impl RowOffsetMap {
+    pub async fn load(dataset: Arc<Dataset>) -> LanceResult<Self> {
+        Ok(Self(
+            AddRowOffsetExec::compute_frag_id_to_offset(dataset).await?,
+        ))
+    }
+}
+
 /// Add a `_rowoffset` column to a stream of record batches that have a `_rowaddr` column.
 ///
 /// The row offset is the number of rows between the current row and the first row in the dataset.
@@ -402,6 +418,14 @@ impl AddRowOffsetExec {
     ) -> LanceResult<Self> {
         let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
         Self::internal_new(input, frag_id_to_offset)
+    }
+
+    /// As [`Self::try_new`], but from a [`RowOffsetMap`] that was loaded earlier.
+    pub fn try_new_from_map(
+        input: Arc<dyn ExecutionPlan>,
+        offsets: &RowOffsetMap,
+    ) -> LanceResult<Self> {
+        Self::internal_new(input, offsets.0.clone())
     }
 
     async fn compute_frag_id_to_offset(
@@ -523,7 +547,13 @@ impl ExecutionPlan for AddRowOffsetExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+        // One entry per output column, or anything reading these by column index goes out of
+        // bounds on the column this node appends.
+        stats
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+        Ok(Arc::new(stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
