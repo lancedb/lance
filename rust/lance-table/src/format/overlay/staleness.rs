@@ -86,8 +86,9 @@ fn stale_offsets_for_fragment(
 }
 
 // A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
-// covering every fragment (matching `DatasetPreFilter::new`) so overlay-stale rows can't slip
-// through unmasked. Only skip fragments explicitly absent from a present bitmap.
+// covering every fragment (matching `lance::index::prefilter::DatasetPreFilter::new`) so
+// overlay-stale rows can't slip through unmasked. Only skip fragments explicitly absent from a
+// present bitmap.
 fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
     coverage.is_none_or(|c| c.contains(frag_id))
 }

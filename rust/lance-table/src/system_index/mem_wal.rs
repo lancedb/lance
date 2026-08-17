@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! MemWAL index data structures and metadata helpers.
+//!
+//! The MemWAL Index stores:
+//! - Configuration (sharding_specs, maintained_indexes)
+//! - SSTable compaction progress
+//! - Shard state snapshots (eventually consistent)
+//!
+//! Writers no longer update the index on every write. Instead, they update
+//! shard manifests directly. This module provides functions to:
+//! - Load the MemWAL index
+//! - Update compacted SSTables (called during merge-insert commits)
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
