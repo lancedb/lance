@@ -81,9 +81,13 @@ pub struct EvaluatedIndex {
     applicable_fragments: RoaringBitmap,
 }
 
+// Keep common selective and dense masks single-pass without allowing highly fragmented stable-ID
+// masks to retain unbounded request-scoped range storage before final planning.
+const MAX_RETAINED_STABLE_INDEX_RANGE_BYTES: usize = 16 * 1024 * 1024;
+
 struct StableIndexRouting {
     row_id_sequence: Arc<RowIdSequence>,
-    upper_ranges: Vec<Range<u64>>,
+    upper_ranges: Option<Vec<Range<u64>>>,
 }
 
 enum FragmentMetadataLoad {
@@ -93,6 +97,23 @@ enum FragmentMetadataLoad {
 }
 
 impl EvaluatedIndex {
+    fn retain_stable_index_ranges(
+        upper_ranges: Vec<Range<u64>>,
+        retained_range_bytes: &AtomicUsize,
+    ) -> Option<Vec<Range<u64>>> {
+        let allocated_bytes = upper_ranges
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Range<u64>>());
+        retained_range_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |retained_bytes| {
+                retained_bytes
+                    .checked_add(allocated_bytes)
+                    .filter(|new_total| *new_total <= MAX_RETAINED_STABLE_INDEX_RANGE_BYTES)
+            })
+            .ok()
+            .map(|_| upper_ranges)
+    }
+
     /// Get the row id mask representing which rows matched the index filter.
     pub fn index_result(&self) -> &IndexExprResult {
         &self.index_result
@@ -136,6 +157,7 @@ impl EvaluatedIndex {
         dataset: &Dataset,
         fragment: &Fragment,
         only_indexed_fragments: bool,
+        retained_range_bytes: &AtomicUsize,
     ) -> Result<FragmentMetadataLoad> {
         let fragment_id = fragment.id as u32;
         if !self.applicable_fragments.contains(fragment_id) {
@@ -160,7 +182,10 @@ impl EvaluatedIndex {
             } else {
                 FragmentMetadataLoad::LoadWithStableRouting(StableIndexRouting {
                     row_id_sequence,
-                    upper_ranges,
+                    upper_ranges: Self::retain_stable_index_ranges(
+                        upper_ranges,
+                        retained_range_bytes,
+                    ),
                 })
             });
         }
@@ -709,7 +734,7 @@ impl FilteredReadStream {
             if dataset.manifest.uses_stable_row_ids() {
                 let (row_id_sequence, index_upper_ranges) =
                     if let Some(routing) = stable_index_routing {
-                        (routing.row_id_sequence, Some(routing.upper_ranges))
+                        (routing.row_id_sequence, routing.upper_ranges)
                     } else {
                         (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
                     };
@@ -746,7 +771,7 @@ impl FilteredReadStream {
     // Returns: FilteredReadInternalPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
-        fragments: &[LoadedFragment],
+        mut fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
     ) -> FilteredReadInternalPlan {
@@ -793,7 +818,7 @@ impl FilteredReadStream {
             num_logical_rows,
             num_physical_rows,
             deletion_vector,
-        } in fragments.iter()
+        } in fragments.iter_mut()
         {
             if let Some(range_before_filter) = &options.scan_range_before_filter
                 && range_offset >= range_before_filter.end
@@ -807,11 +832,11 @@ impl FilteredReadStream {
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
                 let range_end = if options.with_deleted_rows {
-                    range_offset += num_physical_rows;
-                    range_start + num_physical_rows
+                    range_offset += *num_physical_rows;
+                    range_start + *num_physical_rows
                 } else {
-                    range_offset += num_logical_rows;
-                    range_start + num_logical_rows
+                    range_offset += *num_logical_rows;
+                    range_start + *num_logical_rows
                 };
                 to_read = Self::trim_ranges(to_read, range_start..range_end, range_before_filter);
                 if to_read.is_empty() {
@@ -824,7 +849,7 @@ impl FilteredReadStream {
                 evaluated_index,
                 fragment,
                 row_id_sequence,
-                index_upper_ranges.as_deref(),
+                index_upper_ranges.take(),
                 to_read,
                 &mut to_skip,
                 &mut to_take,
@@ -958,7 +983,7 @@ impl FilteredReadStream {
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         fragment: &FileFragment,
         row_id_sequence: &Arc<RowIdSequence>,
-        index_upper_ranges: Option<&[Range<u64>]>,
+        index_upper_ranges: Option<Vec<Range<u64>>>,
         to_read: Vec<Range<u64>>,
         to_skip: &mut u64,
         to_take: &mut u64,
@@ -1072,7 +1097,7 @@ impl FilteredReadStream {
         physical_ranges.truncate(write_idx);
     }
 
-    /// Intersect two sets of sorted ranges
+    /// Intersect two sets of sorted ranges.
     fn intersect_ranges(ranges1: &[Range<u64>], ranges2: &[Range<u64>]) -> Vec<Range<u64>> {
         let mut result = Vec::new();
         let mut i = 0;
@@ -1105,16 +1130,13 @@ impl FilteredReadStream {
         to_read: &[Range<u64>],
         row_id_sequence: &RowIdSequence,
         index_mask: &RowAddrMask,
-        precomputed_ranges: Option<&[Range<u64>]>,
+        precomputed_ranges: Option<Vec<Range<u64>>>,
     ) -> Vec<Range<u64>> {
-        let computed_ranges;
-        let index_ranges = if let Some(precomputed_ranges) = precomputed_ranges {
-            precomputed_ranges
-        } else {
-            computed_ranges = row_id_sequence.mask_to_offset_ranges(index_mask);
-            &computed_ranges
-        };
-        Self::intersect_ranges(to_read, index_ranges)
+        // Taking routed ranges fragment-by-fragment drops each input as its final intersection is
+        // produced instead of retaining every routed range vector alongside the completed plan.
+        let index_ranges =
+            precomputed_ranges.unwrap_or_else(|| row_id_sequence.mask_to_offset_ranges(index_mask));
+        Self::intersect_ranges(to_read, &index_ranges)
     }
 
     /// Apply skip and take to ranges and update the counters
@@ -2266,11 +2288,13 @@ impl FilteredReadExec {
                 // fragments before opening their full metadata.
                 let needs_fragment_offsets = options.scan_range_before_filter.is_some();
                 let only_indexed_fragments = options.only_indexed_fragments;
+                let retained_range_bytes = Arc::new(AtomicUsize::new(0));
                 let frag_futs = fragments
                     .iter()
                     .map(|fragment| {
                         let dataset = dataset.clone();
                         let evaluated_index = evaluated_index.clone();
+                        let retained_range_bytes = retained_range_bytes.clone();
                         let fragment = fragment.clone();
                         async move {
                             let metadata_load = if needs_fragment_offsets {
@@ -2281,6 +2305,7 @@ impl FilteredReadExec {
                                         dataset.as_ref(),
                                         &fragment,
                                         only_indexed_fragments,
+                                        retained_range_bytes.as_ref(),
                                     )
                                     .await?
                             } else if only_indexed_fragments {
@@ -2324,7 +2349,7 @@ impl FilteredReadExec {
                 // finishes — stream construction rebuilds I/O-free handles
                 // from the manifest descriptors
                 Ok(FilteredReadStream::plan_scan(
-                    &loaded_fragments,
+                    loaded_fragments,
                     &evaluated_index,
                     options,
                 ))
@@ -3335,6 +3360,32 @@ mod tests {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[test]
+    fn test_stable_index_range_retention_is_bounded() {
+        let ranges = vec![0..1];
+        let range_bytes = ranges.capacity() * std::mem::size_of::<Range<u64>>();
+        let retained_range_bytes = AtomicUsize::new(
+            MAX_RETAINED_STABLE_INDEX_RANGE_BYTES
+                .checked_sub(range_bytes)
+                .unwrap(),
+        );
+
+        assert!(
+            EvaluatedIndex::retain_stable_index_ranges(ranges, &retained_range_bytes).is_some()
+        );
+        assert_eq!(
+            retained_range_bytes.load(Ordering::Relaxed),
+            MAX_RETAINED_STABLE_INDEX_RANGE_BYTES
+        );
+        assert!(
+            EvaluatedIndex::retain_stable_index_ranges(vec![1..2], &retained_range_bytes).is_none()
+        );
+        assert_eq!(
+            retained_range_bytes.load(Ordering::Relaxed),
+            MAX_RETAINED_STABLE_INDEX_RANGE_BYTES
+        );
     }
 
     struct TestFixture {
