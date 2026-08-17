@@ -33,7 +33,7 @@ use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
 use num_traits::One;
-use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Num};
 use rand::prelude::*;
 use rayon::prelude::*;
 use {
@@ -336,21 +336,129 @@ where
 // centroid output itself already requires that much memory.
 const MAX_CENTROID_ACCUMULATOR_BYTES: usize = 64 * 1024 * 1024;
 
-fn centroid_accumulator_count<T>(
+#[derive(Debug, PartialEq, Eq)]
+enum CentroidRecomputeStrategy {
+    InputPartitioned { accumulator_count: usize },
+    CentroidPartitioned { worker_count: usize },
+}
+
+fn centroid_recompute_strategy<T>(
     num_vectors: usize,
     centroid_len: usize,
+    k: usize,
     available_parallelism: usize,
-) -> usize {
-    let accumulator_bytes = centroid_len.saturating_mul(std::mem::size_of::<T>());
-    let memory_limited_parallelism = MAX_CENTROID_ACCUMULATOR_BYTES
-        .checked_div(accumulator_bytes)
-        .unwrap_or(1)
-        .max(1);
+) -> CentroidRecomputeStrategy {
+    let available_parallelism = available_parallelism.max(1);
+    let accumulator_count = if k < 16 {
+        1
+    } else {
+        available_parallelism.min(num_vectors.max(1))
+    };
+    let accumulator_bytes = centroid_len
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_mul(accumulator_count);
 
-    available_parallelism
-        .min(memory_limited_parallelism)
-        .min(num_vectors)
-        .max(1)
+    if accumulator_count == 1 || accumulator_bytes <= MAX_CENTROID_ACCUMULATOR_BYTES {
+        CentroidRecomputeStrategy::InputPartitioned { accumulator_count }
+    } else {
+        // A smaller accumulator count would couple the memory limit to compute
+        // parallelism. Retain the original disjoint centroid-owner algorithm
+        // when full input partitioning would exceed the allocation budget.
+        let worker_count = if k < available_parallelism || k < 16 {
+            1
+        } else {
+            available_parallelism
+        };
+        CentroidRecomputeStrategy::CentroidPartitioned { worker_count }
+    }
+}
+
+fn recompute_float_centroids<T>(
+    data: &[T],
+    dimension: usize,
+    k: usize,
+    membership: &[Option<u32>],
+    strategy: CentroidRecomputeStrategy,
+) -> Vec<T>
+where
+    T: Float + AddAssign + Send + Sync,
+{
+    let num_vectors = data.len() / dimension;
+    let centroid_len = k * dimension;
+
+    match strategy {
+        CentroidRecomputeStrategy::InputPartitioned { accumulator_count } => {
+            if num_vectors == 0 {
+                return vec![T::zero(); centroid_len];
+            }
+
+            let vectors_per_chunk = num_vectors.div_ceil(accumulator_count);
+
+            // Each worker scans a disjoint portion of the input once and
+            // writes to a private centroid buffer.
+            let mut accumulators = data
+                .par_chunks(vectors_per_chunk * dimension)
+                .zip(membership.par_chunks(vectors_per_chunk))
+                .map(|(data, membership)| {
+                    let mut local_centroids = vec![T::zero(); centroid_len];
+                    data.chunks(dimension)
+                        .zip(membership)
+                        .filter_map(|(vector, cluster_id)| {
+                            cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                        })
+                        .for_each(|(vector, cluster_id)| {
+                            let start = cluster_id * dimension;
+                            let centroid = &mut local_centroids[start..start + dimension];
+                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        });
+                    local_centroids
+                })
+                .collect::<Vec<_>>();
+
+            let mut centroids = accumulators
+                .pop()
+                .unwrap_or_else(|| vec![T::zero(); centroid_len]);
+            centroids
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, centroid)| {
+                    accumulators
+                        .iter()
+                        .for_each(|local_centroids| *centroid += local_centroids[idx]);
+                });
+            centroids
+        }
+        CentroidRecomputeStrategy::CentroidPartitioned { worker_count } => {
+            let mut centroids = vec![T::zero(); centroid_len];
+            if k == 0 {
+                return centroids;
+            }
+
+            let centroids_per_chunk = k / worker_count;
+            centroids
+                .par_chunks_mut(dimension * centroids_per_chunk)
+                .enumerate()
+                .with_max_len(1)
+                .for_each(|(chunk_idx, centroids)| {
+                    let start = chunk_idx * centroids_per_chunk;
+                    let end = ((chunk_idx + 1) * centroids_per_chunk).min(k);
+                    data.chunks(dimension)
+                        .zip(membership)
+                        .filter_map(|(vector, cluster_id)| {
+                            cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                        })
+                        .for_each(|(vector, cluster_id)| {
+                            if start <= cluster_id && cluster_id < end {
+                                let local_id = cluster_id - start;
+                                let centroid = &mut centroids
+                                    [local_id * dimension..(local_id + 1) * dimension];
+                                centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                            }
+                        });
+                });
+            centroids
+        }
+    }
 }
 
 impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
@@ -423,51 +531,13 @@ where
     ) -> KMeans {
         let num_vectors = data.len() / dimension;
         let centroid_len = k * dimension;
-        let available_parallelism = if k < 16 {
-            1
-        } else {
-            get_num_compute_intensive_cpus()
-        };
-        let accumulator_count = centroid_accumulator_count::<T::Native>(
+        let strategy = centroid_recompute_strategy::<T::Native>(
             num_vectors,
             centroid_len,
-            available_parallelism,
+            k,
+            get_num_compute_intensive_cpus(),
         );
-        let vectors_per_chunk = num_vectors.div_ceil(accumulator_count);
-
-        // Each worker scans a disjoint portion of the input once and writes to
-        // a private centroid buffer. This changes the input-read complexity
-        // from O(num_vectors * workers) to O(num_vectors) without contention.
-        let mut accumulators = data
-            .par_chunks(vectors_per_chunk * dimension)
-            .zip(membership.par_chunks(vectors_per_chunk))
-            .map(|(data, membership)| {
-                let mut local_centroids = vec![T::Native::zero(); centroid_len];
-                data.chunks(dimension)
-                    .zip(membership)
-                    .filter_map(|(vector, cluster_id)| {
-                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                    })
-                    .for_each(|(vector, cluster_id)| {
-                        let start = cluster_id * dimension;
-                        let centroid = &mut local_centroids[start..start + dimension];
-                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                    });
-                local_centroids
-            })
-            .collect::<Vec<_>>();
-
-        let mut centroids = accumulators
-            .pop()
-            .unwrap_or_else(|| vec![T::Native::zero(); centroid_len]);
-        centroids
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, centroid)| {
-                accumulators
-                    .iter()
-                    .for_each(|local_centroids| *centroid += local_centroids[idx]);
-            });
+        let mut centroids = recompute_float_centroids(data, dimension, k, membership, strategy);
 
         centroids
             .par_chunks_mut(dimension)
@@ -1749,11 +1819,56 @@ mod tests {
     }
 
     #[test]
-    fn test_centroid_accumulator_count_respects_memory_limit() {
-        assert_eq!(centroid_accumulator_count::<f32>(1_000_000, 1024, 16), 16);
+    fn test_centroid_recompute_strategies_produce_same_sums() {
+        let data = [1.0_f32, 3.0, 2.0, 4.0, 100.0, 100.0, 3.0, 5.0, 4.0, 6.0];
+        let membership = [Some(0), Some(1), None, Some(0), Some(1)];
+        let expected = [4.0, 8.0, 6.0, 10.0];
+
         assert_eq!(
-            centroid_accumulator_count::<f32>(1_000_000, 16 * 1024 * 1024, 16),
-            1
+            recompute_float_centroids(
+                &data,
+                2,
+                2,
+                &membership,
+                CentroidRecomputeStrategy::InputPartitioned {
+                    accumulator_count: 2,
+                },
+            ),
+            expected
+        );
+        assert_eq!(
+            recompute_float_centroids(
+                &data,
+                2,
+                2,
+                &membership,
+                CentroidRecomputeStrategy::CentroidPartitioned { worker_count: 2 },
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_centroid_recompute_strategy_respects_memory_without_losing_parallelism() {
+        assert_eq!(
+            centroid_recompute_strategy::<f32>(1_000_000, 1024, 256, 16),
+            CentroidRecomputeStrategy::InputPartitioned {
+                accumulator_count: 16,
+            }
+        );
+        assert_eq!(
+            centroid_recompute_strategy::<f32>(1_000_000, 1024 * 1024, 4096, 16),
+            CentroidRecomputeStrategy::InputPartitioned {
+                accumulator_count: 16,
+            }
+        );
+
+        // This is the large centroid grid from the performance regression:
+        // private accumulators would require 992 MiB on 62 workers. Keep all
+        // workers by partitioning centroids instead of reducing parallelism.
+        assert_eq!(
+            centroid_recompute_strategy::<f32>(65_536, 4096 * 1024, 4096, 62),
+            CentroidRecomputeStrategy::CentroidPartitioned { worker_count: 62 }
         );
     }
 

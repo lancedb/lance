@@ -7,36 +7,41 @@ use arrow_array::types::Float32Type;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lance_index::vector::kmeans::{KMeansAlgo, KMeansAlgoFloat};
 use lance_linalg::distance::DistanceType;
-use lance_testing::datagen::generate_random_array;
 
 fn bench_recompute_centroids(c: &mut Criterion) {
     let mut group = c.benchmark_group("kmeans_recompute_centroids");
 
-    let (num_vectors, dimension, k) = (128 * 1024, 128, 256);
-    let data = generate_random_array(num_vectors * dimension);
-    let membership = (0..num_vectors)
-        .map(|row| Some((row % k) as u32))
-        .collect::<Vec<_>>();
-    let cluster_sizes = vec![num_vectors / k; k];
+    let cases = [
+        ("input_partitioned", 128 * 1024, 128, 256),
+        ("large_centroid_grid", 65_536, 1024, 4096),
+    ];
 
-    group.bench_with_input(
-        BenchmarkId::new(format!("{dimension}d_{k}k"), num_vectors),
-        &num_vectors,
-        |b, _| {
-            b.iter(|| {
-                let mut cluster_sizes = cluster_sizes.clone();
-                black_box(KMeansAlgoFloat::<Float32Type>::to_kmeans(
-                    black_box(data.values()),
-                    dimension,
-                    k,
-                    black_box(&membership),
-                    &mut cluster_sizes,
-                    DistanceType::L2,
-                    0.0,
-                ))
-            });
-        },
-    );
+    for (name, num_vectors, dimension, k) in cases {
+        let data = vec![1.0_f32; num_vectors * dimension];
+        let membership = (0..num_vectors)
+            .map(|row| Some((row % k) as u32))
+            .collect::<Vec<_>>();
+        let cluster_sizes = vec![num_vectors / k; k];
+
+        group.bench_with_input(
+            BenchmarkId::new(name, format!("{num_vectors}x{dimension}d_{k}k")),
+            &num_vectors,
+            |b, _| {
+                b.iter(|| {
+                    let mut cluster_sizes = cluster_sizes.clone();
+                    black_box(KMeansAlgoFloat::<Float32Type>::to_kmeans(
+                        black_box(&data),
+                        dimension,
+                        k,
+                        black_box(&membership),
+                        &mut cluster_sizes,
+                        DistanceType::L2,
+                        0.0,
+                    ))
+                });
+            },
+        );
+    }
 
     group.finish();
 }
