@@ -36,7 +36,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex};
+use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
 };
@@ -681,7 +681,25 @@ impl ScalarIndex for BitmapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+
+        let tracked_null_rows = || {
+            if options.track_nulls && !self.null_map.is_empty() {
+                Some((*self.null_map).clone())
+            } else {
+                None
+            }
+        };
 
         let (row_ids, null_row_ids) = match query {
             SargableQuery::Equals(val) => {
@@ -692,12 +710,7 @@ impl ScalarIndex for BitmapIndex {
                 } else {
                     let key = OrderableScalarValue(val.clone());
                     let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                    let null_rows = if !self.null_map.is_empty() {
-                        Some((*self.null_map).clone())
-                    } else {
-                        None
-                    };
-                    ((*bitmap).clone(), null_rows)
+                    ((*bitmap).clone(), tracked_null_rows())
                 }
             }
             SargableQuery::Range(start, end) => {
@@ -748,12 +761,7 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                let null_rows = if !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
-                (result, null_rows)
+                (result, tracked_null_rows())
             }
             SargableQuery::IsIn(values) => {
                 metrics.record_comparisons(values.len());
@@ -801,11 +809,7 @@ impl ScalarIndex for BitmapIndex {
 
                 // If the query explicitly includes null, then nulls are TRUE (not NULL)
                 // Otherwise, nulls remain NULL (unknown)
-                let null_rows = if !has_null && !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
+                let null_rows = if has_null { None } else { tracked_null_rows() };
                 (result, null_rows)
             }
             SargableQuery::IsNull() => {
@@ -2813,8 +2817,32 @@ mod tests {
             .await
             .unwrap();
 
-        // Test 1: Search for value 5 - should return allow=[1], null=[2]
+        // Test 1: A caller that does not need NULL bookkeeping should receive
+        // the same true rows without cloning the null bitmap.
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(5)));
+        let result = index
+            .search_with_options(
+                &query,
+                SearchOptions { track_nulls: false },
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![1]);
+                assert!(row_ids.null_rows().is_empty());
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // The existing API keeps NULL rows for three-valued logic.
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         match result {

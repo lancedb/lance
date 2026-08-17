@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
     compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
@@ -2127,6 +2127,16 @@ impl ScalarIndex for BTreeIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
@@ -2193,7 +2203,7 @@ impl ScalarIndex for BTreeIndex {
         // page with zero nulls is a true Matches::All, while one with nulls needs
         // Matches::Some only to track the null rows; surfacing `null_count` here
         // could refine that classification (see #6802).
-        if !matches!(query, SargableQuery::IsNull()) {
+        if options.track_nulls && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
                 .page_lookup
@@ -3410,7 +3420,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchOptions,
+            SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -5469,13 +5480,10 @@ mod tests {
         }
     }
 
-    /// Regression test: BTree search must track null row IDs for non-IsNull
-    /// queries, even when no pages match the queried value.
-    ///
-    /// Without this, `NOT(x = val)` when `val` is absent from the data would
-    /// produce an empty null set, causing NULL rows to incorrectly pass.
+    /// Regression test: BTree search skips null pages only when the caller
+    /// explicitly opts out of NULL tracking.
     #[tokio::test]
-    async fn test_search_tracks_nulls_for_absent_value() {
+    async fn test_search_null_tracking_options_for_absent_value() {
         use arrow_array::{Int32Array, UInt64Array};
 
         let tmpdir = TempObjDir::default();
@@ -5526,16 +5534,22 @@ mod tests {
             index.page_lookup.all_null_pages.len(),
         );
 
-        let metrics = NoOpMetricsCollector;
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
 
-        // Search for Equals(0) — value 0 doesn't exist in any page
+        // A top-level positive filter can discard NULL results. No BTree page
+        // should be read when the searched value is absent.
+        let metrics = LocalMetricsCollector::default();
         let result = index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
-                &metrics,
-            )
+            .search_with_options(&query, SearchOptions { track_nulls: false }, &metrics)
             .await
             .unwrap();
+        assert_eq!(result, SearchResult::exact(RowAddrTreeMap::default()));
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 0);
+
+        // The existing search API keeps its NULL-preserving behavior for
+        // callers that need three-valued logic.
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         match result {
             SearchResult::Exact(set) => {
@@ -5557,7 +5571,7 @@ mod tests {
                     std::ops::Bound::Unbounded,
                     std::ops::Bound::Excluded(ScalarValue::Int32(Some(50))),
                 ),
-                &metrics,
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();

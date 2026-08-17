@@ -229,6 +229,85 @@ async fn test_create_scalar_index(
     dataset.index_statistics(&index_name).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_btree_nullable_filters_match_unindexed_scan() {
+    let test_uri = TempStrDir::default();
+    let num_rows = 10_000u64;
+    let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let ids = UInt64Array::from_iter_values(0..num_rows);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("value", Arc::new(values) as ArrayRef),
+        ("id", Arc::new(ids) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2_500,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragments().len() > 1);
+
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for predicate in [
+        "value = 7",
+        "value IN (7, 99)",
+        "NOT (value = 99)",
+        "NOT (value = 7)",
+        "NOT (value = 99 OR value = 7)",
+        "NOT (NOT (value = 7))",
+        "value = 99 OR value = 7",
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+        let sorted_ids = |batch: &RecordBatch| {
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(
+            sorted_ids(&indexed),
+            sorted_ids(&baseline),
+            "indexed result differs for {predicate}"
+        );
+    }
+}
+
 async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
     let test_uri = TempStrDir::default();
 
