@@ -382,18 +382,15 @@ impl ShardManifestStore {
         for _ in 0..MAX_CLAIM_RETRIES {
             let current = self.read_latest().await?;
 
-            // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
-            // with a distinguishable error rather than minting a new epoch,
-            // so a caller that skips its own status check still cannot
-            // resurrect a shard being dropped. Sophon's reconcile keys on
-            // the "sealed" marker in this message to tell it apart from an
-            // ordinary epoch fence.
+            // A non-active shard is either mid-drop or durably dropped. Refuse
+            // the claim rather than minting a new epoch, so cleanup remains the
+            // only operation that can make the physical generation reusable.
             if let Some(m) = &current
-                && m.status == ShardStatus::Sealed
+                && m.status != ShardStatus::Active
             {
                 return Err(Error::invalid_input(format!(
-                    "shard {} is sealed; refusing claim (drop in flight)",
-                    self.shard_id
+                    "shard {} is {:?}; refusing claim (drop fence)",
+                    self.shard_id, m.status
                 )));
             }
 

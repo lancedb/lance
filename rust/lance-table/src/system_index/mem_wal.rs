@@ -143,9 +143,9 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
 
 /// Lifecycle status of a WAL shard, persisted in [`ShardManifest`].
 ///
-/// `Sealed` is the durable in-doubt record for drop-table two-phase
-/// commit: a sealed shard refuses new writer claims (enforced in
-/// `claim_epoch`) but is reversible back to `Active` on rollback.
+/// `Sealed` is the durable in-doubt record for drop-table two-phase commit.
+/// `Dropped` records a committed drop and remains fenced until cleanup removes
+/// the old generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShardStatus {
     /// Normal: the shard accepts writer claims.
@@ -153,6 +153,8 @@ pub enum ShardStatus {
     Active,
     /// A drop is in flight: claims are refused. Reversible.
     Sealed,
+    /// The drop committed: claims are permanently refused for this generation.
+    Dropped,
 }
 
 impl ShardStatus {
@@ -161,6 +163,7 @@ impl ShardStatus {
         match self {
             Self::Active => 0,
             Self::Sealed => 1,
+            Self::Dropped => 2,
         }
     }
 
@@ -169,6 +172,7 @@ impl ShardStatus {
     fn from_i32(v: i32) -> Self {
         match v {
             1 => Self::Sealed,
+            2 => Self::Dropped,
             _ => Self::Active,
         }
     }
