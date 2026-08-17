@@ -4803,6 +4803,136 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
+    /// A reordered *full-schema* source whose keys repeat must be rejected as an
+    /// ambiguous merge, not as an internal row-address ordering failure.
+    ///
+    /// While target key columns were located by offsetting the source key
+    /// positions, a reordered source read a nullable payload column instead of
+    /// `target_<key>`. Every matched row then looked unmatched, so it took the
+    /// insert branch -- which carries the real target `_rowaddr` -- and reached
+    /// the in-place column rewrite. A repeated key fed the same address into the
+    /// update stream twice, and the reconciler reported the ordering violation of
+    /// https://github.com/lance-format/lance/issues/8282 rather than the
+    /// ambiguity the caller has to act on.
+    ///
+    /// `test_indexed_partial_merge_with_reordered_source` covers the misaligned
+    /// key lookup on a source that really is a subschema. This shape is the one
+    /// that additionally gets *misclassified*: a full schema in a different field
+    /// order fails the order-sensitive full match in `check_compatible_schema`
+    /// and falls through to `Subschema`, which sets `add_row_addr`. That
+    /// `_rowaddr` is what turns the misread into an internal error instead of
+    /// silently dropped rows.
+    ///
+    /// Both preconditions are asserted below rather than assumed, because the
+    /// ambiguity rejection this test expects has several call sites and the v2
+    /// fast-path one produces a byte-identical message.
+    #[tokio::test]
+    async fn test_indexed_full_schema_reordered_duplicate_keys_are_ambiguous() {
+        // `a` is null because that is the column the misaligned offset used to
+        // read. The duplicated update address already fails the address-sequence
+        // half of the whole-fragment direct-write check; the third row makes the
+        // row-count half fail on its own too. `b` is padding so the schema looks
+        // like a real payload table.
+        let target = record_batch!(
+            ("id", UInt64, [1, 2, 3]),
+            ("a", Int32, [None, None, None]),
+            ("b", Int32, [7, 8, 9])
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![target])
+            .await
+            .unwrap();
+        // Indexing the join key takes the merge off the fast path.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let version_before = dataset.version().version;
+
+        // Every target field is present, ordered (a, id, b) instead of
+        // (id, a, b), and both rows carry the same key.
+        let source = record_batch!(
+            ("a", Int32, [42, 43]),
+            ("id", UInt64, [1, 1]),
+            ("b", Int32, [70, 71])
+        )
+        .unwrap();
+        let source_schema = source.schema();
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        // Pin both preconditions. Without the first the duplicate is caught by
+        // the v2 writer, without the second no `_rowaddr` reaches the update
+        // stream; either way the reconciler is never involved and the assertions
+        // below would still pass.
+        assert!(
+            !job.can_use_create_plan(&source_schema).await.unwrap(),
+            "the indexed join key must keep this merge on the v1 slow path"
+        );
+        assert!(
+            matches!(
+                job.check_compatible_schema(&source_schema).unwrap(),
+                SchemaComparison::Subschema
+            ),
+            "a reordered full schema must still be classified as a subschema, \
+             otherwise `_rowaddr` never reaches the update stream"
+        );
+
+        let error = job
+            .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // The negative check runs first so a reconciler regression is what gets
+        // reported. Asserting on the message rather than the `Error` variant is
+        // deliberate: this error crosses the sort/repartition in
+        // `update_fragments`, so DataFusion hands it back as a shared error and
+        // `Arc::try_unwrap` in the conversion succeeds or fails depending on how
+        // many partitions still hold it. The variant therefore varies with the
+        // machine's CPU count; the text does not.
+        assert!(
+            !error.contains("is missing from the target fragment"),
+            "the merge must not reach the row-address reconciler, got: {error}"
+        );
+        assert!(
+            error.contains("Ambiguous merge inserts") && error.contains("id = 1"),
+            "expected the ambiguous-key rejection naming the key, got: {error}"
+        );
+
+        // The rejection must abort before committing: this shape runs through
+        // the in-place `RewriteColumns` branch, so a partial column rewrite is
+        // the failure worth guarding against.
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            version_before,
+            "a rejected merge must not commit a new version"
+        );
+        let remaining = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            remaining.num_rows(),
+            3,
+            "a rejected merge must not add or drop rows"
+        );
+        let a = remaining["a"].as_primitive::<Int32Type>();
+        assert_eq!(
+            a.null_count(),
+            a.len(),
+            "`a` must still be entirely null: {a:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_indexed_merge_insert() {
         let test_dir = TempStrDir::default();
