@@ -75,6 +75,7 @@ use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DEREGISTERED_TABLE_MARKER: &str = ".lance-deregistered";
+const DROP_TOMBSTONE_OBJECT_ID_PREFIX: &str = "__drop_tombstone$";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
@@ -128,6 +129,7 @@ fn manifest_locations_overlap(left: &str, right: &str) -> bool {
 pub enum ObjectType {
     Namespace,
     Table,
+    DropTombstone,
 }
 
 impl ObjectType {
@@ -135,6 +137,7 @@ impl ObjectType {
         match self {
             Self::Namespace => "namespace",
             Self::Table => "table",
+            Self::DropTombstone => "drop_tombstone",
         }
     }
 
@@ -142,6 +145,7 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
+            "drop_tombstone" => Ok(Self::DropTombstone),
             _ => Err(NamespaceError::Internal {
                 message: format!("Invalid object type: {}", s),
             }
@@ -437,6 +441,7 @@ struct UpsertManifestMutation {
     matched: Vec<bool>,
     when_matched: WhenMatched,
     expected_locations: HashMap<String, String>,
+    reject_drop_tombstone_overlaps: bool,
 }
 
 impl UpsertManifestMutation {
@@ -445,6 +450,7 @@ impl UpsertManifestMutation {
         base_objects: Option<Vec<String>>,
         when_matched: WhenMatched,
         expected_locations: HashMap<String, String>,
+        reject_drop_tombstone_overlaps: bool,
     ) -> Self {
         let entry_positions = entries
             .iter()
@@ -463,6 +469,7 @@ impl UpsertManifestMutation {
             matched,
             when_matched,
             expected_locations,
+            reject_drop_tombstone_overlaps,
         }
     }
 
@@ -487,6 +494,24 @@ impl ManifestStreamMutation for UpsertManifestMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
+        if self.reject_drop_tombstone_overlaps
+            && row.object_type == ObjectType::DropTombstone
+            && let Some(tombstoned_location) = row.location.as_deref()
+            && self.entries.iter().any(|entry| {
+                entry.location.as_deref().is_some_and(|location| {
+                    manifest_locations_overlap(location, tombstoned_location)
+                })
+            })
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{}' overlaps a durably deregistered table location",
+                    tombstoned_location
+                ),
+            }
+            .into());
+        }
+
         if let Some(index) = self.entry_positions.get(&row.object_id).copied() {
             if let Some(expected_location) = self.expected_locations.get(&row.object_id)
                 && row.location.as_deref() != Some(expected_location.as_str())
@@ -692,6 +717,206 @@ impl ManifestStreamMutation for DeleteObjectMutation {
                 output: false,
             }
         }
+    }
+}
+
+struct TombstoneTableMutation {
+    object_id: String,
+    expected_location: String,
+    tombstone_object_id: String,
+    deleted: bool,
+    tombstone_exists: bool,
+}
+
+impl TombstoneTableMutation {
+    fn tombstone_row(&self) -> ManifestOutputRow<'_> {
+        ManifestOutputRow {
+            object_id: &self.tombstone_object_id,
+            object_type: ObjectType::DropTombstone,
+            location: Some(&self.expected_location),
+            metadata: None,
+            base_objects: None,
+        }
+    }
+}
+
+impl ManifestStreamMutation for TombstoneTableMutation {
+    type Output = bool;
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.object_id {
+            if !row
+                .location
+                .as_deref()
+                .is_some_and(|location| manifest_locations_match(location, &self.expected_location))
+            {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Table '{}' moved from expected location '{}' to '{}'",
+                        self.object_id,
+                        self.expected_location,
+                        row.location.as_deref().unwrap_or("<missing>")
+                    ),
+                }
+                .into());
+            }
+            self.deleted = true;
+            return Ok(());
+        }
+
+        if row.object_type == ObjectType::DropTombstone
+            && row
+                .location
+                .as_deref()
+                .is_some_and(|location| manifest_locations_match(location, &self.expected_location))
+        {
+            self.tombstone_exists = true;
+        } else if row.object_type == ObjectType::Table
+            && row.location.as_deref().is_some_and(|location| {
+                manifest_locations_overlap(location, &self.expected_location)
+            })
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{}' is also registered to object '{}'",
+                    self.expected_location, row.object_id
+                ),
+            }
+            .into());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if self.deleted && !self.tombstone_exists {
+            output.append(index_data, self.tombstone_row())?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if self.deleted {
+            CopyOnWriteMutation::updated(true)
+        } else {
+            CopyOnWriteMutation::unchanged(false)
+        }
+    }
+}
+
+struct ReplaceTableLocationMutation {
+    entry: ManifestEntry,
+    expected_location: String,
+    tombstone_object_id: String,
+    replaced: bool,
+}
+
+impl ManifestStreamMutation for ReplaceTableLocationMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.entry.object_id {
+            if row.location.as_deref() != Some(self.expected_location.as_str()) {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Table '{}' moved from expected location '{}' to '{}'",
+                        self.entry.object_id,
+                        self.expected_location,
+                        row.location.as_deref().unwrap_or("<missing>")
+                    ),
+                }
+                .into());
+            }
+            self.replaced = true;
+            return output.append(
+                index_data,
+                ManifestOutputRow {
+                    object_id: &self.entry.object_id,
+                    object_type: self.entry.object_type,
+                    location: self.entry.location.as_deref(),
+                    metadata: self.entry.metadata.as_deref(),
+                    base_objects: None,
+                },
+            );
+        }
+
+        if row.object_type == ObjectType::Table
+            && row.location.as_deref().is_some_and(|location| {
+                manifest_locations_overlap(location, &self.expected_location)
+            })
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{}' is also registered to object '{}'",
+                    self.expected_location, row.object_id
+                ),
+            }
+            .into());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if !self.replaced {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Table '{}' was removed from expected location '{}'",
+                    self.entry.object_id, self.expected_location
+                ),
+            }
+            .into());
+        }
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &self.tombstone_object_id,
+                object_type: ObjectType::DropTombstone,
+                location: Some(&self.expected_location),
+                metadata: None,
+                base_objects: None,
+            },
+        )
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        CopyOnWriteMutation::updated(())
     }
 }
 
@@ -2515,6 +2740,35 @@ impl ManifestNamespace {
         Ok(locations)
     }
 
+    /// List physical locations retained as durable drop intents.
+    pub async fn list_drop_tombstone_locations(&self) -> Result<std::collections::HashSet<String>> {
+        let mut scanner = self.manifest_scanner().await?;
+        scanner
+            .filter("object_type = 'drop_tombstone'")
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to filter drop tombstones: {e:?}"),
+                })
+            })?;
+        scanner.project(&["location"]).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to project drop tombstones: {e:?}"),
+            })
+        })?;
+
+        let batches = Self::execute_scanner(scanner).await?;
+        let mut locations = std::collections::HashSet::new();
+        for batch in batches {
+            let location_array = Self::get_string_column(&batch, "location")?;
+            for index in 0..location_array.len() {
+                if !location_array.is_null(index) {
+                    locations.insert(location_array.value(index).to_string());
+                }
+            }
+        }
+        Ok(locations)
+    }
+
     /// Insert an entry into the manifest table
     async fn insert_into_manifest(
         &self,
@@ -2572,6 +2826,20 @@ impl ManifestNamespace {
                 base_objects.clone(),
                 when_matched.clone(),
                 HashMap::new(),
+                false,
+            )
+        })
+        .await
+    }
+
+    async fn register_table_in_manifest(&self, entry: ManifestEntry) -> Result<()> {
+        self.rewrite_manifest("Failed to register table in manifest", || {
+            UpsertManifestMutation::new(
+                vec![entry.clone()],
+                None,
+                WhenMatched::Fail,
+                HashMap::new(),
+                true,
             )
         })
         .await
@@ -2582,16 +2850,40 @@ impl ManifestNamespace {
         entry: ManifestEntry,
         expected_location: &str,
     ) -> Result<()> {
-        let object_id = entry.object_id.clone();
-        let expected_locations =
-            HashMap::from([(object_id.clone(), expected_location.to_string())]);
         self.rewrite_manifest("Failed to replace manifest table location", || {
-            UpsertManifestMutation::new(
-                vec![entry.clone()],
-                None,
-                WhenMatched::UpdateAll,
-                expected_locations.clone(),
-            )
+            ReplaceTableLocationMutation {
+                entry: entry.clone(),
+                expected_location: expected_location.to_string(),
+                tombstone_object_id: Self::drop_tombstone_object_id(),
+                replaced: false,
+            }
+        })
+        .await
+    }
+
+    fn drop_tombstone_object_id() -> String {
+        format!(
+            "{DROP_TOMBSTONE_OBJECT_ID_PREFIX}{}",
+            Uuid::new_v4().simple()
+        )
+    }
+
+    async fn tombstone_table_in_manifest(
+        &self,
+        object_id: &str,
+        expected_location: &str,
+    ) -> Result<bool> {
+        let object_id = object_id.to_string();
+        let expected_location = expected_location.to_string();
+        let tombstone_object_id = Self::drop_tombstone_object_id();
+        self.rewrite_manifest("Failed to tombstone table in manifest", || {
+            TombstoneTableMutation {
+                object_id: object_id.clone(),
+                expected_location: expected_location.clone(),
+                tombstone_object_id: tombstone_object_id.clone(),
+                deleted: false,
+                tombstone_exists: false,
+            }
         })
         .await
     }
@@ -2630,8 +2922,13 @@ impl ManifestNamespace {
             .into());
         }
 
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(location))
-            .await
+        self.register_table_in_manifest(ManifestEntry {
+            object_id,
+            object_type: ObjectType::Table,
+            location: Some(location),
+            metadata: None,
+        })
+        .await
     }
 
     /// Validate that all levels of a namespace path exist
@@ -3374,8 +3671,6 @@ impl LanceNamespace for ManifestNamespace {
                     .as_ref()
                     .expect("an overwrite has an existing table")
                     .location;
-                self.put_deregistered_table_marker(previous_location)
-                    .await?;
                 if let Err(error) = self
                     .replace_manifest_table_location(entry, previous_location)
                     .await
@@ -3392,6 +3687,12 @@ impl LanceNamespace for ManifestNamespace {
                         );
                     }
                     return Err(error);
+                }
+                if let Err(error) = self.put_deregistered_table_marker(previous_location).await {
+                    log::warn!(
+                        "Failed to write deregistration marker for overwritten table location '{}': {error:?}",
+                        previous_location
+                    );
                 }
                 let previous_table_path = self.table_path(previous_location);
                 match self.object_store.remove_dir_all(previous_table_path).await {
@@ -3481,24 +3782,23 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 self.ensure_manifest_writable().await?;
-                let marker_created = self.put_deregistered_table_marker(&info.location).await?;
-
-                // Delete from manifest first
-                let delete_result = self
-                    .delete_from_manifest_if_location(&object_id, Some(&info.location), true)
+                let owns_manifest_deletion = self
+                    .tombstone_table_in_manifest(&object_id, &info.location)
                     .boxed()
-                    .await;
-                let owns_manifest_deletion = match delete_result {
-                    Ok(owns_manifest_deletion) => owns_manifest_deletion,
-                    Err(error) => return Err(error),
-                };
+                    .await?;
 
-                if !marker_created && !owns_manifest_deletion {
+                if !owns_manifest_deletion {
                     return Ok(DropTableResponse {
                         id: request.id.clone(),
                         location: Some(Self::construct_full_uri(&self.root, &info.location)?),
                         ..Default::default()
                     });
+                }
+                if let Err(error) = self.put_deregistered_table_marker(&info.location).await {
+                    log::warn!(
+                        "Failed to write deregistration marker for table location '{}': {error:?}",
+                        info.location
+                    );
                 }
 
                 // Delete physical data directory using the dir_name from manifest
@@ -3886,6 +4186,16 @@ impl LanceNamespace for ManifestNamespace {
 
         let location = request.location.clone();
 
+        if location
+            .split('/')
+            .all(|segment| segment.is_empty() || segment == ".")
+        {
+            return Err(NamespaceError::InvalidInput {
+                message: "Location must not be empty".to_string(),
+            }
+            .into());
+        }
+
         // Validate that location is a relative path within the root directory
         // We don't allow absolute URIs or paths that escape the root
         if location.contains("://") {
@@ -3944,9 +4254,13 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        // Register the table with its location in the manifest
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(location.clone()))
-            .await?;
+        self.register_table_in_manifest(ManifestEntry {
+            object_id,
+            object_type: ObjectType::Table,
+            location: Some(location.clone()),
+            metadata: None,
+        })
+        .await?;
 
         Ok(RegisterTableResponse {
             location: Some(location),
@@ -4025,19 +4339,23 @@ impl LanceNamespace for ManifestNamespace {
 
         if expected_location.is_some() {
             self.ensure_manifest_writable().await?;
-            self.put_deregistered_table_marker(&manifest_location)
+            let owns_manifest_deletion = self
+                .tombstone_table_in_manifest(&object_id, &manifest_location)
+                .boxed()
+                .await?;
+            if owns_manifest_deletion
+                && let Err(error) = self.put_deregistered_table_marker(&manifest_location).await
+            {
+                log::warn!(
+                    "Failed to write deregistration marker for table location '{}': {error:?}",
+                    manifest_location
+                );
+            }
+        } else {
+            self.delete_from_manifest_if_location(&object_id, Some(&manifest_location), false)
+                .boxed()
                 .await?;
         }
-
-        // Randomized table locations are checked again inside every rewrite attempt,
-        // so a concurrent replacement cannot be deleted by a stale deregistration.
-        self.delete_from_manifest_if_location(
-            &object_id,
-            Some(&manifest_location),
-            expected_location.is_some(),
-        )
-        .boxed()
-        .await?;
 
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
@@ -4882,6 +5200,16 @@ mod tests {
             })
             .await
             .unwrap();
+        manifest_ns
+            .remove_deregistered_table_marker(&location)
+            .await;
+        assert!(
+            manifest_ns
+                .list_drop_tombstone_locations()
+                .await
+                .unwrap()
+                .contains(&location)
+        );
 
         let error = LanceNamespace::register_table(
             &manifest_ns,
@@ -4893,7 +5221,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("physically deleted"));
+        assert!(error.to_string().contains("durably deregistered"));
     }
 
     #[tokio::test]
@@ -4917,6 +5245,56 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("physically deleted"));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_location_above_drop_tombstone() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: ManifestNamespace::drop_tombstone_object_id(),
+                    object_type: ObjectType::DropTombstone,
+                    location: Some("ancestor/dropped-generation".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = LanceNamespace::register_table(
+            &manifest_ns,
+            RegisterTableRequest {
+                id: Some(vec!["table".to_string()]),
+                location: "ancestor".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("durably deregistered"));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_empty_location() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+
+        let error = LanceNamespace::register_table(
+            &manifest_ns,
+            RegisterTableRequest {
+                id: Some(vec!["table".to_string()]),
+                location: "/./".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[tokio::test]
@@ -5325,6 +5703,43 @@ mod tests {
                 .delete_from_manifest_if_location("table", Some("table.lance"), true)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_tombstone_has_single_cleanup_owner() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns =
+            create_manifest_namespace_with_retries(temp_dir.to_str().unwrap(), false, Some(0))
+                .await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("generation.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manifest_ns
+                .tombstone_table_in_manifest("table", "generation.lance")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manifest_ns
+                .tombstone_table_in_manifest("table", "generation.lance")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            manifest_ns.list_drop_tombstone_locations().await.unwrap(),
+            HashSet::from(["generation.lance".to_string()])
         );
     }
 
