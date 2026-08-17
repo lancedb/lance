@@ -57,27 +57,66 @@ public class Compaction {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(rewriteResults);
     Preconditions.checkNotNull(compactionOptions);
+    return nativeCommitCompaction(
+        dataset,
+        rewriteResults,
+        compactionOptions.getTargetRowsPerFragment(),
+        compactionOptions.getMaxRowsPerGroup(),
+        compactionOptions.getMaxBytesPerFile(),
+        compactionOptions.getMaterializeDeletions(),
+        compactionOptions.getMaterializeDeletionsThreshold(),
+        compactionOptions.getNumThreads(),
+        compactionOptions.getBatchSize(),
+        compactionOptions.getDeferIndexRemap(),
+        compactionOptions.getCompactionMode(),
+        compactionOptions.getBinaryCopyReadBatchBytes(),
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceRows(),
+        compactionOptions.getMaxSourceBytes());
+  }
+
+  /**
+   * Java wrapper around the raw commit-compaction JNI call. It acquires the dataset read lock so
+   * the native call cannot race with {@link Dataset#close()}; keep the raw native method private so
+   * no caller can bypass this lock.
+   */
+  public static CompactionMetrics nativeCommitCompaction(
+      Dataset dataset,
+      List<RewriteResult> rewriteResults,
+      Optional<Long> targetRowsPerFragment,
+      Optional<Long> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<Boolean> materializeDeletions,
+      Optional<Float> materializeDeletionsThreshold,
+      Optional<Long> numThreads,
+      Optional<Long> batchSize,
+      Optional<Boolean> deferIndexRemap,
+      Optional<String> compactionMode,
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
-      return nativeCommitCompaction(
+      return commitCompactionNative(
           dataset,
           rewriteResults,
-          compactionOptions.getTargetRowsPerFragment(),
-          compactionOptions.getMaxRowsPerGroup(),
-          compactionOptions.getMaxBytesPerFile(),
-          compactionOptions.getMaterializeDeletions(),
-          compactionOptions.getMaterializeDeletionsThreshold(),
-          compactionOptions.getNumThreads(),
-          compactionOptions.getBatchSize(),
-          compactionOptions.getDeferIndexRemap(),
-          compactionOptions.getCompactionMode(),
-          compactionOptions.getBinaryCopyReadBatchBytes(),
-          compactionOptions.getMaxSourceFragments(),
-          compactionOptions.getMaxSourceRows(),
-          compactionOptions.getMaxSourceBytes());
+          targetRowsPerFragment,
+          maxRowsPerGroup,
+          maxBytesPerFile,
+          materializeDeletions,
+          materializeDeletionsThreshold,
+          numThreads,
+          batchSize,
+          deferIndexRemap,
+          compactionMode,
+          binaryCopyReadBatchBytes,
+          maxSourceFragments,
+          maxSourceRows,
+          maxSourceBytes);
     }
   }
 
-  public static native CompactionMetrics nativeCommitCompaction(
+  private static native CompactionMetrics commitCompactionNative(
       Dataset dataset,
       List<RewriteResult> rewriteResults,
       Optional<Long> targetRowsPerFragment,

@@ -122,7 +122,7 @@ fn inner_plan_compaction<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompaction<'local>(
+pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     java_dataset: JObject,                    // Dataset
