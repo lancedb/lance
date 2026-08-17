@@ -2854,17 +2854,17 @@ impl ManifestNamespace {
             ReplaceTableLocationMutation {
                 entry: entry.clone(),
                 expected_location: expected_location.to_string(),
-                tombstone_object_id: Self::drop_tombstone_object_id(),
+                tombstone_object_id: Self::drop_tombstone_object_id(&entry.object_id),
                 replaced: false,
             }
         })
         .await
     }
 
-    fn drop_tombstone_object_id() -> String {
+    fn drop_tombstone_object_id(object_id: &str) -> String {
         format!(
-            "{DROP_TOMBSTONE_OBJECT_ID_PREFIX}{}",
-            Uuid::new_v4().simple()
+            "{DROP_TOMBSTONE_OBJECT_ID_PREFIX}{}${object_id}",
+            Uuid::new_v4().simple(),
         )
     }
 
@@ -2875,7 +2875,7 @@ impl ManifestNamespace {
     ) -> Result<bool> {
         let object_id = object_id.to_string();
         let expected_location = expected_location.to_string();
-        let tombstone_object_id = Self::drop_tombstone_object_id();
+        let tombstone_object_id = Self::drop_tombstone_object_id(&object_id);
         self.rewrite_manifest("Failed to tombstone table in manifest", || {
             TombstoneTableMutation {
                 object_id: object_id.clone(),
@@ -5254,7 +5254,7 @@ mod tests {
         manifest_ns
             .insert_into_manifest_with_metadata(
                 vec![ManifestEntry {
-                    object_id: ManifestNamespace::drop_tombstone_object_id(),
+                    object_id: ManifestNamespace::drop_tombstone_object_id("table"),
                     object_type: ObjectType::DropTombstone,
                     location: Some("ancestor/dropped-generation".to_string()),
                     metadata: None,
