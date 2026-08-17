@@ -77,6 +77,8 @@ const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DEREGISTERED_TABLE_MARKER: &str = ".lance-deregistered";
 const DROP_TOMBSTONE_OBJECT_ID_PREFIX: &str = "__drop_tombstone$";
 const DROP_EPOCH_OBJECT_ID: &str = "__drop_epoch";
+/// Deregistration response property containing the exact durable drop claim token.
+pub const DROP_TOMBSTONE_ID_PROPERTY: &str = "__drop_tombstone_id";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
@@ -206,6 +208,7 @@ pub struct TableInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DropTombstoneInfo {
+    pub tombstone_id: String,
     pub object_id: String,
     pub location: String,
 }
@@ -509,6 +512,17 @@ impl ManifestStreamMutation for UpsertManifestMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
+        if self.expected_drop_epoch.is_some()
+            && row.object_id == DROP_EPOCH_OBJECT_ID
+            && row.object_type != ObjectType::DropEpoch
+        {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Object id '{DROP_EPOCH_OBJECT_ID}' is reserved for manifest drop fencing"
+                ),
+            }
+            .into());
+        }
         if row.object_type == ObjectType::DropEpoch {
             let epoch = row
                 .metadata
@@ -695,6 +709,18 @@ impl ManifestStreamMutation for DeleteObjectMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
+        if row.object_type == ObjectType::DropEpoch {
+            return output.append(
+                index_data,
+                ManifestOutputRow {
+                    object_id: &row.object_id,
+                    object_type: row.object_type,
+                    location: row.location.as_deref(),
+                    metadata: row.metadata.as_deref(),
+                    base_objects: row.base_objects.as_deref(),
+                },
+            );
+        }
         if row.object_id == self.object_id {
             if let Some(expected_location) = self.expected_location.as_deref()
                 && !row
@@ -779,6 +805,7 @@ struct TombstoneTableMutation {
     tombstone_object_id: String,
     deleted: bool,
     tombstone_exists: bool,
+    owns_existing_tombstone: bool,
     claimed_missing: bool,
     drop_epoch: u64,
     saw_drop_epoch: bool,
@@ -798,7 +825,7 @@ impl TombstoneTableMutation {
 }
 
 impl ManifestStreamMutation for TombstoneTableMutation {
-    type Output = bool;
+    type Output = Option<String>;
 
     fn process_existing_row(
         &mut self,
@@ -806,6 +833,14 @@ impl ManifestStreamMutation for TombstoneTableMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
+        if row.object_id == DROP_EPOCH_OBJECT_ID && row.object_type != ObjectType::DropEpoch {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Object id '{DROP_EPOCH_OBJECT_ID}' is reserved for manifest drop fencing"
+                ),
+            }
+            .into());
+        }
         if row.object_type == ObjectType::DropEpoch {
             self.drop_epoch = row
                 .metadata
@@ -845,6 +880,7 @@ impl ManifestStreamMutation for TombstoneTableMutation {
                 .is_some_and(|location| manifest_locations_match(location, &self.expected_location))
         {
             self.tombstone_exists = true;
+            self.owns_existing_tombstone = row.object_id == self.tombstone_object_id;
         } else if row.object_type == ObjectType::Table
             && row.location.as_deref().is_some_and(|location| {
                 manifest_locations_overlap(location, &self.expected_location)
@@ -911,9 +947,11 @@ impl ManifestStreamMutation for TombstoneTableMutation {
 
     fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
         if self.deleted || self.claimed_missing {
-            CopyOnWriteMutation::updated(true)
+            CopyOnWriteMutation::updated(Some(self.tombstone_object_id.clone()))
+        } else if self.owns_existing_tombstone {
+            CopyOnWriteMutation::unchanged(Some(self.tombstone_object_id.clone()))
         } else {
-            CopyOnWriteMutation::unchanged(false)
+            CopyOnWriteMutation::unchanged(None)
         }
     }
 }
@@ -936,6 +974,14 @@ impl ManifestStreamMutation for ReplaceTableLocationMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
+        if row.object_id == DROP_EPOCH_OBJECT_ID && row.object_type != ObjectType::DropEpoch {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Object id '{DROP_EPOCH_OBJECT_ID}' is reserved for manifest drop fencing"
+                ),
+            }
+            .into());
+        }
         if row.object_type == ObjectType::DropEpoch {
             self.drop_epoch = row
                 .metadata
@@ -1052,8 +1098,7 @@ impl ManifestStreamMutation for ReplaceTableLocationMutation {
 }
 
 struct DeleteDropTombstoneMutation {
-    object_id: String,
-    location: String,
+    tombstone_id: String,
     deleted: bool,
 }
 
@@ -1066,18 +1111,7 @@ impl ManifestStreamMutation for DeleteDropTombstoneMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
-        let tombstoned_object_id = row
-            .object_id
-            .strip_prefix(DROP_TOMBSTONE_OBJECT_ID_PREFIX)
-            .and_then(|value| value.split_once('$'))
-            .map(|(_, object_id)| object_id);
-        if row.object_type == ObjectType::DropTombstone
-            && tombstoned_object_id == Some(self.object_id.as_str())
-            && row
-                .location
-                .as_deref()
-                .is_some_and(|location| manifest_locations_match(location, &self.location))
-        {
+        if row.object_type == ObjectType::DropTombstone && row.object_id == self.tombstone_id {
             self.deleted = true;
             return Ok(());
         }
@@ -2974,6 +3008,7 @@ impl ManifestNamespace {
                     continue;
                 }
                 tombstones.push(DropTombstoneInfo {
+                    tombstone_id: object_id_array.value(index).to_string(),
                     object_id: object_id.to_string(),
                     location: location_array.value(index).to_string(),
                 });
@@ -3100,18 +3135,20 @@ impl ManifestNamespace {
         &self,
         entry: ManifestEntry,
         expected_location: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let tombstone_object_id = Self::drop_tombstone_object_id(&entry.object_id);
         self.rewrite_manifest("Failed to replace manifest table location", || {
             ReplaceTableLocationMutation {
                 entry: entry.clone(),
                 expected_location: expected_location.to_string(),
-                tombstone_object_id: Self::drop_tombstone_object_id(&entry.object_id),
+                tombstone_object_id: tombstone_object_id.clone(),
                 replaced: false,
                 drop_epoch: 0,
                 next_drop_epoch: None,
             }
         })
-        .await
+        .await?;
+        Ok(tombstone_object_id)
     }
 
     fn drop_tombstone_object_id(object_id: &str) -> String {
@@ -3125,7 +3162,7 @@ impl ManifestNamespace {
         &self,
         object_id: &str,
         expected_location: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let object_id = object_id.to_string();
         let expected_location = expected_location.to_string();
         let tombstone_object_id = Self::drop_tombstone_object_id(&object_id);
@@ -3136,6 +3173,7 @@ impl ManifestNamespace {
                 tombstone_object_id: tombstone_object_id.clone(),
                 deleted: false,
                 tombstone_exists: false,
+                owns_existing_tombstone: false,
                 claimed_missing: false,
                 drop_epoch: 0,
                 saw_drop_epoch: false,
@@ -3146,37 +3184,15 @@ impl ManifestNamespace {
     }
 
     /// Retire a durable drop intent after its physical location is fully removed.
-    pub async fn complete_drop_tombstone(&self, object_id: &str, location: &str) -> Result<bool> {
-        let object_id = object_id.to_string();
-        let location = location.to_string();
+    pub async fn complete_drop_tombstone(&self, tombstone_id: &str) -> Result<bool> {
+        let tombstone_id = tombstone_id.to_string();
         self.rewrite_manifest("Failed to complete table drop tombstone", || {
             DeleteDropTombstoneMutation {
-                object_id: object_id.clone(),
-                location: location.clone(),
+                tombstone_id: tombstone_id.clone(),
                 deleted: false,
             }
         })
         .await
-    }
-
-    /// Retire the matching durable drop intent using its externally visible URI.
-    pub async fn complete_drop_tombstone_at_uri(
-        &self,
-        object_id: &str,
-        location: &str,
-    ) -> Result<bool> {
-        let tombstones = self.list_drop_tombstones().await?;
-        for tombstone in tombstones {
-            if tombstone.object_id == object_id {
-                let tombstone_uri = Self::construct_full_uri(&self.root, &tombstone.location)?;
-                if Self::table_locations_match(&tombstone_uri, location) {
-                    return self
-                        .complete_drop_tombstone(object_id, &tombstone.location)
-                        .await;
-                }
-            }
-        }
-        Ok(false)
     }
 
     /// Delete an entry from the manifest table
@@ -3971,23 +3987,26 @@ impl LanceNamespace for ManifestNamespace {
                     .as_ref()
                     .expect("an overwrite has an existing table")
                     .location;
-                if let Err(error) = self
+                let tombstone_id = match self
                     .replace_manifest_table_location(entry, previous_location)
                     .await
                 {
-                    let new_table_path = self.table_path(&dir_name);
-                    if let Err(cleanup_error) =
-                        self.object_store.remove_dir_all(new_table_path).await
-                        && !cleanup_error.is_not_found()
-                    {
-                        log::warn!(
-                            "Failed to clean up replacement table location '{}' after manifest conflict: {}",
-                            dir_name,
-                            cleanup_error
-                        );
+                    Ok(tombstone_id) => tombstone_id,
+                    Err(error) => {
+                        let new_table_path = self.table_path(&dir_name);
+                        if let Err(cleanup_error) =
+                            self.object_store.remove_dir_all(new_table_path).await
+                            && !cleanup_error.is_not_found()
+                        {
+                            log::warn!(
+                                "Failed to clean up replacement table location '{}' after manifest conflict: {}",
+                                dir_name,
+                                cleanup_error
+                            );
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
+                };
                 if let Err(error) = self.put_deregistered_table_marker(previous_location).await {
                     log::warn!(
                         "Failed to write deregistration marker for overwritten table location '{}': {error:?}",
@@ -4016,9 +4035,7 @@ impl LanceNamespace for ManifestNamespace {
                         }
                     };
                 if cleanup_complete
-                    && let Err(error) = self
-                        .complete_drop_tombstone(&object_id, previous_location)
-                        .await
+                    && let Err(error) = self.complete_drop_tombstone(&tombstone_id).await
                 {
                     log::warn!(
                         "Failed to retire overwritten table tombstone for '{}': {error:?}",
@@ -4096,23 +4113,27 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 self.ensure_manifest_writable().await?;
-                let owns_manifest_deletion = if self.async_drop_enabled {
+                let tombstone_id = if self.async_drop_enabled {
                     self.tombstone_table_in_manifest(&object_id, &info.location)
                         .boxed()
                         .await?
+                } else if self
+                    .delete_from_manifest_if_location(&object_id, Some(&info.location), true)
+                    .boxed()
+                    .await?
+                {
+                    Some(String::new())
                 } else {
-                    self.delete_from_manifest_if_location(&object_id, Some(&info.location), true)
-                        .boxed()
-                        .await?
+                    None
                 };
 
-                if !owns_manifest_deletion {
+                let Some(tombstone_id) = tombstone_id else {
                     return Ok(DropTableResponse {
                         id: request.id.clone(),
                         location: Some(Self::construct_full_uri(&self.root, &info.location)?),
                         ..Default::default()
                     });
-                }
+                };
                 if self.async_drop_enabled
                     && let Err(error) = self.put_deregistered_table_marker(&info.location).await
                 {
@@ -4137,10 +4158,7 @@ impl LanceNamespace for ManifestNamespace {
                         })
                     })?;
                 if self.async_drop_enabled {
-                    if let Err(error) = self
-                        .complete_drop_tombstone(&object_id, &info.location)
-                        .await
-                    {
+                    if let Err(error) = self.complete_drop_tombstone(&tombstone_id).await {
                         log::warn!(
                             "Failed to retire table drop tombstone for '{}': {error:?}",
                             info.location
@@ -4669,13 +4687,13 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        if expected_location.is_some() {
+        let tombstone_id = if expected_location.is_some() {
             self.ensure_manifest_writable().await?;
-            let owns_manifest_deletion = self
+            let tombstone_id = self
                 .tombstone_table_in_manifest(&object_id, &manifest_location)
                 .boxed()
                 .await?;
-            if owns_manifest_deletion
+            if tombstone_id.is_some()
                 && let Err(error) = self.put_deregistered_table_marker(&manifest_location).await
             {
                 log::warn!(
@@ -4683,15 +4701,21 @@ impl LanceNamespace for ManifestNamespace {
                     manifest_location
                 );
             }
+            tombstone_id
         } else {
             self.delete_from_manifest_if_location(&object_id, Some(&manifest_location), false)
                 .boxed()
                 .await?;
-        }
+            None
+        };
 
+        let properties = tombstone_id.map(|tombstone_id| {
+            HashMap::from([(DROP_TOMBSTONE_ID_PROPERTY.to_string(), tombstone_id)])
+        });
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
             location: Some(table_uri),
+            properties,
             ..Default::default()
         })
     }
@@ -6058,21 +6082,22 @@ mod tests {
             .await
             .unwrap();
 
+        let tombstone_id = manifest_ns
+            .tombstone_table_in_manifest("table", "generation.lance")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             manifest_ns
                 .tombstone_table_in_manifest("table", "generation.lance")
                 .await
                 .unwrap()
-        );
-        assert!(
-            !manifest_ns
-                .tombstone_table_in_manifest("table", "generation.lance")
-                .await
-                .unwrap()
+                .is_none()
         );
         assert_eq!(
             manifest_ns.list_drop_tombstones().await.unwrap(),
             vec![DropTombstoneInfo {
+                tombstone_id,
                 object_id: "table".to_string(),
                 location: "generation.lance".to_string(),
             }]
@@ -6104,26 +6129,51 @@ mod tests {
                 .unwrap()
         );
 
+        let tombstone_id = manifest_ns
+            .tombstone_table_in_manifest("table", "generation.lance")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             manifest_ns
                 .tombstone_table_in_manifest("table", "generation.lance")
                 .await
                 .unwrap()
-        );
-        assert!(
-            !manifest_ns
-                .tombstone_table_in_manifest("table", "generation.lance")
-                .await
-                .unwrap()
+                .is_none()
         );
         assert_eq!(manifest_ns.current_drop_epoch().await.unwrap(), 1);
         assert!(
             manifest_ns
-                .complete_drop_tombstone("table", "generation.lance")
+                .complete_drop_tombstone(&tombstone_id)
                 .await
                 .unwrap()
         );
-        assert!(manifest_ns.list_drop_tombstones().await.unwrap().is_empty());
+        let newer_tombstone_id = manifest_ns
+            .tombstone_table_in_manifest("table", "generation.lance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(tombstone_id, newer_tombstone_id);
+        assert!(
+            !manifest_ns
+                .complete_drop_tombstone(&tombstone_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            manifest_ns.list_drop_tombstones().await.unwrap(),
+            vec![DropTombstoneInfo {
+                tombstone_id: newer_tombstone_id.clone(),
+                object_id: "table".to_string(),
+                location: "generation.lance".to_string(),
+            }]
+        );
+        assert!(
+            manifest_ns
+                .complete_drop_tombstone(&newer_tombstone_id)
+                .await
+                .unwrap()
+        );
 
         let stale_registration = ManifestEntry {
             object_id: "stale".to_string(),
@@ -6154,6 +6204,70 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_manifest_drop_epoch_id_is_reserved_and_not_deleted_as_user_object() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns =
+            create_manifest_namespace_with_retries(temp_dir.to_str().unwrap(), false, Some(0))
+                .await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("generation.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        manifest_ns
+            .tombstone_table_in_manifest("table", "generation.lance")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !manifest_ns
+                .delete_from_manifest_if_location(DROP_EPOCH_OBJECT_ID, None, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(manifest_ns.current_drop_epoch().await.unwrap(), 1);
+
+        let legacy_dir = TempStdDir::default();
+        let legacy =
+            create_manifest_namespace_with_retries(legacy_dir.to_str().unwrap(), false, Some(0))
+                .await;
+        legacy
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: DROP_EPOCH_OBJECT_ID.to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("legacy.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: "table".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("generation.lance".to_string()),
+                        metadata: None,
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            legacy
+                .tombstone_table_in_manifest("table", "generation.lance")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

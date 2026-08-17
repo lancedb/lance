@@ -1069,16 +1069,14 @@ impl DirectoryNamespace {
     }
 
     /// Retire a durable manifest drop intent after physical cleanup completes.
-    pub async fn complete_drop_tombstone(&self, object_id: &str, location: &str) -> Result<bool> {
+    pub async fn complete_drop_tombstone(&self, tombstone_id: &str) -> Result<bool> {
         let manifest_ns =
             self.manifest_ns_for_write()
                 .await?
                 .ok_or_else(|| NamespaceError::InvalidInput {
                     message: "drop tombstones require a manifest-enabled namespace".to_string(),
                 })?;
-        manifest_ns
-            .complete_drop_tombstone_at_uri(object_id, location)
-            .await
+        manifest_ns.complete_drop_tombstone(tombstone_id).await
     }
 
     /// Lazily open the `__manifest` dataset (read-only) into the read cell.
