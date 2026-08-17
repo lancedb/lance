@@ -19,7 +19,10 @@ use datafusion::logical_expr::{
 };
 
 use datafusion::prelude::col;
-use lance_core::{ROW_ADDR, ROW_ID, datatypes::OnMissing};
+use lance_core::{
+    ROW_ADDR, ROW_ID,
+    datatypes::{OnMissing, Projection},
+};
 use lance_index::vector::DIST_COL;
 
 use super::prepare::PreparedQueries;
@@ -47,6 +50,31 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     if prefilter && let Some(filter) = filter.clone() {
         source = LogicalPlanBuilder::new(source).filter(filter)?.build()?;
     }
+
+    // An aggregate replaces the output projection, so late materialization above a search has
+    // nothing to materialize on its behalf — only whatever the aggregate itself reads. `COUNT(*)`
+    // reads nothing, and the take then drops out entirely rather than reading every column and
+    // projecting it away.
+    let take_projection = match &scanner.aggregate {
+        Some(aggregate) => {
+            let columns = aggregate
+                .group_by
+                .iter()
+                .chain(aggregate.aggregates.iter())
+                .flat_map(|expr| {
+                    expr.column_refs()
+                        .into_iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            scanner
+                .dataset
+                .empty_projection()
+                .union_columns(&columns, OnMissing::Ignore)?
+        }
+        None => scanner.projection_plan.physical_projection.clone(),
+    };
 
     // A postfilter reads columns the user may not have projected, and above a search the only way
     // to get a column is to take it. So the take has to cover the filter's columns too, and the
@@ -85,6 +113,7 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         let taken = with_take(
             LogicalPlanBuilder::new(searched),
             scanner,
+            &take_projection,
             &postfilter_columns,
         )?;
         // A vector search promises rows in distance order, and the take between the search and
@@ -190,11 +219,10 @@ fn scan_leaf(scanner: &Scanner) -> Result<LogicalPlan> {
 fn with_take(
     builder: LogicalPlanBuilder,
     scanner: &Scanner,
+    projection: &Projection,
     extra_columns: &[String],
 ) -> Result<LogicalPlanBuilder> {
-    let projection = scanner
-        .projection_plan
-        .physical_projection
+    let projection = projection
         .clone()
         .union_columns(extra_columns, OnMissing::Ignore)?;
     let input = builder.plan().clone();

@@ -673,3 +673,46 @@ async fn test_batch_search_groups_results_by_query() {
         .to_vec();
     assert_eq!(indices, vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
 }
+
+/// An aggregate replaces the output projection, so the take above a search has nothing to fetch for
+/// it. `COUNT(*)` reads no columns at all, and then the take goes away rather than reading every
+/// column so the aggregate can throw them out.
+#[tokio::test]
+async fn test_a_count_over_a_search_reads_no_columns() {
+    use crate::dataset::scanner::AggregateExpr;
+
+    let dataset = vector_dataset().await;
+    let plan = logical_plan_for(&dataset, |scan| {
+        scan.nearest("vec", &query_vector(), 5)?;
+        scan.aggregate(AggregateExpr::builder().count_star().build())
+    })
+    .await
+    .unwrap();
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+
+    assert!(
+        !text.contains("projection=[i, s, vec]"),
+        "the take is still fetching the output columns:\n{text}"
+    );
+    let batch = run(plan).await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+}
+
+/// The aggregate's own columns still have to be taken, or there is nothing to sum.
+#[tokio::test]
+async fn test_a_sum_over_a_search_takes_its_column() {
+    use crate::dataset::scanner::AggregateExpr;
+
+    let dataset = vector_dataset().await;
+    let plan = logical_plan_for(&dataset, |scan| {
+        scan.nearest("vec", &query_vector(), 5)?;
+        scan.aggregate(AggregateExpr::builder().sum("i").build())
+    })
+    .await
+    .unwrap();
+    let batch = run(plan).await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+}

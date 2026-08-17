@@ -260,14 +260,24 @@ fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
         return state.clone();
     }
 
+    let mut config = session
+        .copied_config()
+        .with_target_partitions(target_partitions);
+    // DataFusion compares an aggregate's physical input schema against its logical one, schema
+    // metadata included. A search emits `[_rowid, _distance]`, and whether the dataset's schema
+    // metadata rides along depends on which physical shape the search lowered to: the brute-force
+    // chain inherits it from the read below, the index chain builds its own schema without it. One
+    // logical node declares the schema for both, so the comparison cannot be satisfied — and what it
+    // would reject is metadata no aggregate reads.
+    config
+        .options_mut()
+        .execution
+        .skip_physical_aggregate_schema_check = true;
+
     let state = Arc::new(
         SessionStateBuilder::new()
             .with_default_features()
-            .with_config(
-                session
-                    .copied_config()
-                    .with_target_partitions(target_partitions),
-            )
+            .with_config(config)
             .with_runtime_env(session.runtime_env())
             .with_physical_optimizer_rules(physical_optimizer_rules())
             .build(),
