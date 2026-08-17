@@ -74,6 +74,7 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
+const DEREGISTERED_TABLE_MARKER: &str = ".lance-deregistered";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
@@ -1035,6 +1036,28 @@ impl ManifestNamespace {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             && suffix == object_id
+    }
+
+    fn deregistered_table_marker_path(&self, location: &str) -> Path {
+        self.base_path
+            .clone()
+            .join(location.trim_matches('/'))
+            .join(DEREGISTERED_TABLE_MARKER)
+    }
+
+    fn table_locations_match(left: &str, right: &str) -> bool {
+        fn physical_location(location: &str) -> String {
+            let location = location.trim_end_matches('/');
+            location
+                .strip_prefix("s3+ddb://")
+                .map(|suffix| {
+                    let path = suffix.split_once('?').map_or(suffix, |(path, _)| path);
+                    format!("s3://{}", path.trim_end_matches('/'))
+                })
+                .unwrap_or_else(|| location.to_string())
+        }
+
+        physical_location(left) == physical_location(right)
     }
 
     /// Construct a full URI from root and relative location
@@ -3720,15 +3743,6 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
-        if Self::is_generated_dir_name(&object_id, &location) {
-            return Err(NamespaceError::InvalidInput {
-                message: format!(
-                    "Location '{location}' uses the reserved namespace-generated table naming pattern"
-                ),
-            }
-            .into());
-        }
-
         // Validate that parent namespaces exist (if not root)
         if !namespace.is_empty() {
             self.validate_namespace_levels_exist(&namespace).await?;
@@ -3738,6 +3752,19 @@ impl LanceNamespace for ManifestNamespace {
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::TableAlreadyExists {
                 message: object_id.to_string(),
+            }
+            .into());
+        }
+
+        if self
+            .object_store
+            .exists(&self.deregistered_table_marker_path(&location))
+            .await?
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{location}' is being physically deleted after deregistration"
+                ),
             }
             .into());
         }
@@ -3804,7 +3831,7 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
         if let Some(expected_location) = expected_location
-            && expected_location.trim_end_matches('/') != table_uri.trim_end_matches('/')
+            && !Self::table_locations_match(expected_location, &table_uri)
         {
             return Err(NamespaceError::ConcurrentModification {
                 message: format!(
@@ -3813,6 +3840,15 @@ impl LanceNamespace for ManifestNamespace {
                 ),
             }
             .into());
+        }
+
+        if expected_location.is_some() {
+            self.object_store
+                .put(
+                    &self.deregistered_table_marker_path(&manifest_location),
+                    b"deregistered",
+                )
+                .await?;
         }
 
         // Randomized table locations are checked again inside every rewrite attempt,
@@ -4016,8 +4052,8 @@ mod tests {
     use lance_namespace::LanceNamespace;
     use lance_namespace::error::NamespaceError;
     use lance_namespace::models::{
-        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
-        ListTablesRequest, TableExistsRequest,
+        CreateNamespaceRequest, CreateTableRequest, DeregisterTableRequest, DescribeTableRequest,
+        DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
     };
     use lance_table::format::Fragment;
     use rstest::rstest;
@@ -4620,6 +4656,56 @@ mod tests {
                 .join(new_location)
                 .exists()
         );
+    }
+
+    #[test]
+    fn dynamodb_manifest_uri_matches_physical_s3_location() {
+        assert!(ManifestNamespace::table_locations_match(
+            "s3+ddb://bucket/db/table?ddbTableName=manifests",
+            "s3://bucket/db/table/",
+        ));
+    }
+
+    #[tokio::test]
+    async fn expected_deregister_blocks_reregistering_cleanup_location() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        let location = ManifestNamespace::generate_dir_name("table");
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some(location.clone()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let full_location =
+            ManifestNamespace::construct_full_uri(temp_dir.to_str().unwrap(), &location).unwrap();
+        manifest_ns
+            .deregister_table(DeregisterTableRequest {
+                id: Some(vec!["table".to_string()]),
+                context: Some(HashMap::from([(
+                    super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+                    full_location,
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let error = manifest_ns
+            .register_table(RegisterTableRequest {
+                id: Some(vec!["table".to_string()]),
+                location,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("physically deleted"));
     }
 
     #[tokio::test]
