@@ -3123,9 +3123,9 @@ impl Dataset {
     /// 1. Assigns a row ID sequence to every fragment via a merge operation.
     /// 2. Updates the table metadata to activate the stable row ID feature flag.
     ///
-    /// If concurrent writes occur between the two commits, the second commit will
-    /// fail and this method will return an error. In that case, call this method
-    /// again to retry the migration.
+    /// **No retries are attempted.** Callers should quiesce concurrent writes
+    /// before running this migration. If another write conflicts with either
+    /// commit, this method returns an error and the caller must retry.
     ///
     /// This method is idempotent: if the table already uses stable row IDs,
     /// it returns `Ok(())` immediately.
@@ -3137,46 +3137,28 @@ impl Dataset {
 
         // --- Commit 1: assign row ID sequences to all fragments via Merge ---
         //
-        // We retry manually instead of relying on CommitBuilder's built-in
-        // retry because on each conflict we must re-read the latest fragments
-        // and re-compute the ID assignment from scratch.
-        let ds_after_merge = loop {
-            let latest_version = self.latest_version_id().await?;
-            let latest_ds = self.checkout_version(latest_version).await?;
+        // Retries are disabled: callers are expected to quiesce writes before
+        // running this migration. An infinite retry loop risks hanging on a
+        // busy table; failing fast lets the caller decide when to retry.
+        let mut fragments = self.manifest.fragments.as_ref().clone();
+        Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        let schema = self.manifest.schema.clone();
+        let read_version = self.manifest.version;
 
-            // A concurrent migration may have already completed.
-            if latest_ds.manifest.uses_stable_row_ids() {
-                *self = latest_ds;
-                return Ok(());
-            }
+        let transaction = Transaction::new(
+            read_version,
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
 
-            let mut fragments = latest_ds.manifest.fragments.as_ref().clone();
-            // next_row_id is computed as a side effect of assigning IDs to fragments;
-            // commit 2 will recompute it from the committed manifest.
-            Self::assign_stable_row_ids_for_migration(&mut fragments)?;
-            let schema = latest_ds.manifest.schema.clone();
-            let read_version = latest_ds.manifest.version;
-
-            let transaction = Transaction::new(
-                read_version,
-                Operation::Merge {
-                    fragments,
-                    schema,
-                    preserves_nullability: true,
-                },
-                None,
-            );
-
-            match CommitBuilder::new(Arc::new(latest_ds))
-                .with_max_retries(0)
-                .execute(transaction)
-                .await
-            {
-                Ok(ds) => break ds,
-                Err(Error::RetryableCommitConflict { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        };
+        let ds_after_merge = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .execute(transaction)
+            .await?;
 
         // --- Commit 2: activate the stable row IDs feature flag ---
         //
