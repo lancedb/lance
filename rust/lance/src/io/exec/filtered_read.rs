@@ -104,14 +104,21 @@ impl EvaluatedIndex {
         let allocated_bytes = upper_ranges
             .capacity()
             .saturating_mul(std::mem::size_of::<Range<u64>>());
-        retained_range_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |retained_bytes| {
-                retained_bytes
-                    .checked_add(allocated_bytes)
-                    .filter(|new_total| *new_total <= MAX_RETAINED_STABLE_INDEX_RANGE_BYTES)
-            })
-            .ok()
-            .map(|_| upper_ranges)
+        let mut retained_bytes = retained_range_bytes.load(Ordering::Relaxed);
+        loop {
+            let new_total = retained_bytes
+                .checked_add(allocated_bytes)
+                .filter(|new_total| *new_total <= MAX_RETAINED_STABLE_INDEX_RANGE_BYTES)?;
+            match retained_range_bytes.compare_exchange_weak(
+                retained_bytes,
+                new_total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(upper_ranges),
+                Err(actual) => retained_bytes = actual,
+            }
+        }
     }
 
     /// Get the row id mask representing which rows matched the index filter.
