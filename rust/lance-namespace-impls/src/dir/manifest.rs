@@ -67,7 +67,6 @@ use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
     ops::{Deref, DerefMut},
     sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
@@ -413,6 +412,7 @@ struct UpsertManifestMutation {
     entry_positions: HashMap<String, usize>,
     matched: Vec<bool>,
     when_matched: WhenMatched,
+    expected_locations: HashMap<String, String>,
 }
 
 impl UpsertManifestMutation {
@@ -420,6 +420,7 @@ impl UpsertManifestMutation {
         entries: Vec<ManifestEntry>,
         base_objects: Option<Vec<String>>,
         when_matched: WhenMatched,
+        expected_locations: HashMap<String, String>,
     ) -> Self {
         let entry_positions = entries
             .iter()
@@ -437,6 +438,7 @@ impl UpsertManifestMutation {
             entry_positions,
             matched,
             when_matched,
+            expected_locations,
         }
     }
 
@@ -462,6 +464,19 @@ impl ManifestStreamMutation for UpsertManifestMutation {
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
         if let Some(index) = self.entry_positions.get(&row.object_id).copied() {
+            if let Some(expected_location) = self.expected_locations.get(&row.object_id)
+                && row.location.as_deref() != Some(expected_location.as_str())
+            {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Table '{}' moved from expected location '{}' to '{}'",
+                        row.object_id,
+                        expected_location,
+                        row.location.as_deref().unwrap_or("<missing>")
+                    ),
+                }
+                .into());
+            }
             match self.when_matched {
                 WhenMatched::Fail => {
                     return Err(NamespaceError::ConcurrentModification {
@@ -508,6 +523,17 @@ impl ManifestStreamMutation for UpsertManifestMutation {
     ) -> Result<()> {
         for index in 0..self.entries.len() {
             if !self.matched[index] {
+                if let Some(expected_location) =
+                    self.expected_locations.get(&self.entries[index].object_id)
+                {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Table '{}' was removed from expected location '{}'",
+                            self.entries[index].object_id, expected_location
+                        ),
+                    }
+                    .into());
+                }
                 output.append(index_data, self.entry_row(index))?;
             }
         }
@@ -993,32 +1019,21 @@ impl ManifestNamespace {
         format!("table id '{}'", Self::str_object_id(table_id))
     }
 
-    /// Generate a new directory name in format: `<hash>_<object_id>`
-    /// The hash is used to (1) optimize object store throughput,
-    /// (2) have high enough entropy in a short period of time to prevent issues like
-    /// failed table creation, delete and create new table of the same name, etc.
-    /// The object_id is added after the hash to ensure
+    /// Generate a new directory name in format: `<uuid>_<object_id>`.
+    /// The object_id is added after the UUID to ensure
     /// dir name uniqueness and make debugging easier.
     pub fn generate_dir_name(object_id: &str) -> String {
-        // Generate a random number for uniqueness
-        let random_num: u64 = rand::random();
-
-        // Create hash from random number + object_id
-        let mut hasher = DefaultHasher::new();
-        random_num.hash(&mut hasher);
-        object_id.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Format as lowercase hex (8 characters - sufficient entropy for uniqueness)
-        format!("{:08x}_{}", (hash & 0xFFFFFFFF) as u32, object_id)
+        format!("{}_{}", Uuid::new_v4().simple(), object_id)
     }
 
     fn is_generated_dir_name(object_id: &str, location: &str) -> bool {
         let Some((prefix, suffix)) = location.trim_end_matches('/').split_once('_') else {
             return false;
         };
-        prefix.len() == 8
-            && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        matches!(prefix.len(), 8 | 32)
+            && prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             && suffix == object_id
     }
 
@@ -2378,7 +2393,31 @@ impl ManifestNamespace {
         }
 
         self.rewrite_manifest("Failed to overwrite manifest", || {
-            UpsertManifestMutation::new(entries.clone(), base_objects.clone(), when_matched.clone())
+            UpsertManifestMutation::new(
+                entries.clone(),
+                base_objects.clone(),
+                when_matched.clone(),
+                HashMap::new(),
+            )
+        })
+        .await
+    }
+
+    async fn replace_manifest_table_location(
+        &self,
+        entry: ManifestEntry,
+        expected_location: &str,
+    ) -> Result<()> {
+        let object_id = entry.object_id.clone();
+        let expected_locations =
+            HashMap::from([(object_id.clone(), expected_location.to_string())]);
+        self.rewrite_manifest("Failed to replace manifest table location", || {
+            UpsertManifestMutation::new(
+                vec![entry.clone()],
+                None,
+                WhenMatched::UpdateAll,
+                expected_locations.clone(),
+            )
         })
         .await
     }
@@ -3032,7 +3071,15 @@ impl LanceNamespace for ManifestNamespace {
         } else {
             CreateTableMode::parse(request.mode.as_deref())?
         };
-        let dir_name = if let Some(existing_table) = &existing_table {
+        let overwriting_existing_table =
+            existing_has_manifests == Some(true) && create_mode == CreateTableMode::Overwrite;
+        let replacing_generated_location = overwriting_existing_table
+            && existing_table
+                .as_ref()
+                .is_some_and(|table| Self::is_generated_dir_name(&object_id, &table.location));
+        let dir_name = if replacing_generated_location {
+            Self::generate_dir_name(&object_id)
+        } else if let Some(existing_table) = &existing_table {
             existing_table.location.clone()
         } else if namespace.is_empty() && self.dir_listing_enabled {
             format!("{}.lance", table_name)
@@ -3040,8 +3087,6 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
-        let overwriting_existing_table =
-            existing_has_manifests == Some(true) && create_mode == CreateTableMode::Overwrite;
 
         if existing_has_manifests == Some(true) {
             match create_mode {
@@ -3118,7 +3163,11 @@ impl LanceNamespace for ManifestNamespace {
             ..Default::default()
         };
         let write_params = WriteParams {
-            mode: create_mode.write_mode(),
+            mode: if replacing_generated_location {
+                WriteMode::Create
+            } else {
+                create_mode.write_mode()
+            },
             session: self.session.clone(),
             store_params: Some(store_params),
             ..Default::default()
@@ -3135,16 +3184,51 @@ impl LanceNamespace for ManifestNamespace {
         if overwriting_existing_table {
             let metadata =
                 Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
-            self.upsert_into_manifest_with_metadata(
-                vec![ManifestEntry {
-                    object_id,
-                    object_type: ObjectType::Table,
-                    location: Some(dir_name),
-                    metadata,
-                }],
-                None,
-            )
-            .await?;
+            let entry = ManifestEntry {
+                object_id,
+                object_type: ObjectType::Table,
+                location: Some(dir_name.clone()),
+                metadata,
+            };
+            if replacing_generated_location {
+                let previous_location = &existing_table
+                    .as_ref()
+                    .expect("an overwrite has an existing table")
+                    .location;
+                if let Err(error) = self
+                    .replace_manifest_table_location(entry, previous_location)
+                    .await
+                {
+                    let new_table_path = self.base_path.clone().join(dir_name.as_str());
+                    if let Err(cleanup_error) =
+                        self.object_store.remove_dir_all(new_table_path).await
+                        && !cleanup_error.is_not_found()
+                    {
+                        log::warn!(
+                            "Failed to clean up replacement table location '{}' after manifest conflict: {}",
+                            dir_name,
+                            cleanup_error
+                        );
+                    }
+                    return Err(error);
+                }
+                let previous_table_path = self.base_path.clone().join(previous_location.as_str());
+                match self.object_store.remove_dir_all(previous_table_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.is_not_found() => {}
+                    Err(error) => {
+                        return Err(lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to delete overwritten table location '{}': {error:?}",
+                                previous_location
+                            ),
+                        }));
+                    }
+                }
+            } else {
+                self.upsert_into_manifest_with_metadata(vec![entry], None)
+                    .await?;
+            }
 
             Ok(CreateTableResponse {
                 version: Some(version),
@@ -3947,6 +4031,28 @@ mod tests {
         create_manifest_namespace_with_retries(root, inline_optimization_enabled, None).await
     }
 
+    async fn create_manifest_namespace_without_directory_listing(root: &str) -> ManifestNamespace {
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            root,
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        ManifestNamespace::from_directory(
+            root.to_string(),
+            None,
+            None,
+            object_store,
+            base_path,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
     async fn create_manifest_namespace_with_retries(
         root: &str,
         inline_optimization_enabled: bool,
@@ -4469,6 +4575,51 @@ mod tests {
         ));
         assert!(error.to_string().contains("moved from expected location"));
         assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn overwrite_moves_generated_table_to_a_new_location() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns =
+            create_manifest_namespace_without_directory_listing(temp_dir.to_str().unwrap()).await;
+        let mut request = CreateTableRequest::new();
+        request.id = Some(vec!["table".to_string()]);
+        manifest_ns
+            .create_table(request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let old_location = manifest_ns
+            .query_manifest_for_table("table")
+            .await
+            .unwrap()
+            .unwrap()
+            .location;
+
+        let mut request = CreateTableRequest::new();
+        request.id = Some(vec!["table".to_string()]);
+        request.mode = Some("overwrite".to_string());
+        manifest_ns
+            .create_table(request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let new_location = manifest_ns
+            .query_manifest_for_table("table")
+            .await
+            .unwrap()
+            .unwrap()
+            .location;
+
+        assert_ne!(old_location, new_location);
+        assert!(
+            !std::path::Path::new(temp_dir.to_str().unwrap())
+                .join(old_location)
+                .exists()
+        );
+        assert!(
+            std::path::Path::new(temp_dir.to_str().unwrap())
+                .join(new_location)
+                .exists()
+        );
     }
 
     #[tokio::test]
