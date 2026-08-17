@@ -4,7 +4,7 @@
 mod should_maxscore;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
@@ -35,6 +35,9 @@ use self::should_maxscore::ShouldMaxScoreScorer;
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
 const SCORE_FLOOR_RESOLUTION_BATCH_SIZE: usize = DEFAULT_BLOCK_SIZE;
+/// Bound deferred exclusion I/O concurrency while letting each completed
+/// batch raise the global score floor before more partitions are admitted.
+const DEFERRED_MUST_NOT_LOAD_BATCH_SIZE: usize = 8;
 
 /// One exact FTS result in a compound collector's candidate domain.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -240,6 +243,12 @@ fn sum_global_score_upper_bounds(children: &[BoxScorer<'_>]) -> Option<f32> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompoundScoreMode {
+    Scoring,
+    CompleteNoScores,
+}
+
 #[derive(Debug, Clone)]
 enum CompoundScorerPlan {
     Leaf {
@@ -256,11 +265,16 @@ enum CompoundScorerPlan {
         should: Vec<Self>,
         must: Vec<Self>,
         must_not: Vec<Self>,
+        score_mode: CompoundScoreMode,
     },
 }
 
 impl CompoundScorerPlan {
-    fn from_query(query: &FtsQuery, num_leaves: &mut usize) -> Result<Self> {
+    fn from_query(
+        query: &FtsQuery,
+        num_leaves: &mut usize,
+        score_mode: CompoundScoreMode,
+    ) -> Result<Self> {
         match query {
             FtsQuery::Match(query) => {
                 let index = *num_leaves;
@@ -275,35 +289,61 @@ impl CompoundScorerPlan {
                 *num_leaves += 1;
                 Ok(Self::Leaf { index, boost: 1.0 })
             }
-            FtsQuery::Boost(query) => Ok(Self::Boost {
-                positive: Box::new(Self::from_query(&query.positive, num_leaves)?),
-                negative: Box::new(Self::from_query(&query.negative, num_leaves)?),
-                negative_boost: query.negative_boost,
-            }),
+            FtsQuery::Boost(query) => {
+                if !query.negative_boost.is_finite() || query.negative_boost < 0.0 {
+                    return Err(Error::invalid_input(format!(
+                        "BoostQuery negative_boost must be finite and non-negative, got {}",
+                        query.negative_boost
+                    )));
+                }
+                let positive = Self::from_query(&query.positive, num_leaves, score_mode)?;
+                if score_mode == CompoundScoreMode::CompleteNoScores {
+                    return Ok(positive);
+                }
+                Ok(Self::Boost {
+                    positive: Box::new(positive),
+                    negative: Box::new(Self::from_query(&query.negative, num_leaves, score_mode)?),
+                    negative_boost: query.negative_boost,
+                })
+            }
             FtsQuery::MultiMatch(query) => Ok(Self::MultiMatch(
                 query
                     .match_queries
                     .iter()
-                    .map(|query| Self::from_query(&FtsQuery::Match(query.clone()), num_leaves))
+                    .map(|query| {
+                        Self::from_query(&FtsQuery::Match(query.clone()), num_leaves, score_mode)
+                    })
                     .collect::<Result<Vec<_>>>()?,
             )),
-            FtsQuery::Boolean(query) => Ok(Self::Boolean {
-                should: query
-                    .should
-                    .iter()
-                    .map(|query| Self::from_query(query, num_leaves))
-                    .collect::<Result<Vec<_>>>()?,
-                must: query
-                    .must
-                    .iter()
-                    .map(|query| Self::from_query(query, num_leaves))
-                    .collect::<Result<Vec<_>>>()?,
-                must_not: query
-                    .must_not
-                    .iter()
-                    .map(|query| Self::from_query(query, num_leaves))
-                    .collect::<Result<Vec<_>>>()?,
-            }),
+            FtsQuery::Boolean(query) => {
+                let should = if score_mode == CompoundScoreMode::CompleteNoScores
+                    && !query.must.is_empty()
+                {
+                    Vec::new()
+                } else {
+                    query
+                        .should
+                        .iter()
+                        .map(|query| Self::from_query(query, num_leaves, score_mode))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                Ok(Self::Boolean {
+                    should,
+                    must: query
+                        .must
+                        .iter()
+                        .map(|query| Self::from_query(query, num_leaves, score_mode))
+                        .collect::<Result<Vec<_>>>()?,
+                    must_not: query
+                        .must_not
+                        .iter()
+                        .map(|query| {
+                            Self::from_query(query, num_leaves, CompoundScoreMode::CompleteNoScores)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    score_mode,
+                })
+            }
         }
     }
 
@@ -344,20 +384,110 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new_with_metrics(
-                should
+                score_mode,
+            } => Ok(Box::new(
+                BooleanScorer::try_new_with_metrics_and_score_mode(
+                    should
+                        .iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    must.iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    must_not
+                        .iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    Some(metrics),
+                    *score_mode,
+                )?,
+            )),
+        }
+    }
+
+    /// Build a scorer whose score is an upper envelope of the complete query
+    /// score while ignoring every prohibited subtree.
+    ///
+    /// The gate runs before prohibited postings are loaded. Boolean
+    /// exclusions can only remove matches. A BoostQuery's negative side can be
+    /// dropped when [`Self::positive_gate_is_safe`] proves it cannot itself
+    /// score below zero. Under that precondition, false positives only load
+    /// deferred postings earlier than necessary.
+    fn build_gate<'a>(
+        &self,
+        leaves: &mut [Option<BoxScorer<'a>>],
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxScorer<'a>> {
+        match self {
+            Self::Leaf { index, boost } => {
+                let leaf = leaves
+                    .get_mut(*index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "compound FTS positive gate references missing leaf index {index}"
+                        ))
+                    })?;
+                Ok(Box::new(ScaleScorer::try_new(leaf, *boost)?))
+            }
+            Self::Boost { positive, .. } => positive.build_gate(leaves, metrics),
+            Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
+                children
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build_gate(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
-                must.iter()
-                    .map(|child| child.build(leaves, metrics))
-                    .collect::<Result<Vec<_>>>()?,
-                must_not
-                    .iter()
-                    .map(|child| child.build(leaves, metrics))
-                    .collect::<Result<Vec<_>>>()?,
-                Some(metrics),
+                DisjunctionScore::Max,
             )?)),
+            Self::Boolean { should, must, .. } => {
+                Ok(Box::new(BooleanScorer::try_new_with_metrics(
+                    should
+                        .iter()
+                        .map(|child| child.build_gate(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    must.iter()
+                        .map(|child| child.build_gate(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    Vec::new(),
+                    Some(metrics),
+                )?))
+            }
+        }
+    }
+
+    /// Whether [`Self::build_gate`] is guaranteed not to underestimate any
+    /// final score. A BoostQuery may only drop its negative side when that
+    /// subtree cannot itself produce a negative score.
+    fn positive_gate_is_safe(&self) -> bool {
+        match self {
+            Self::Leaf { boost, .. } => boost.is_finite() && *boost >= 0.0,
+            Self::Boost {
+                positive,
+                negative,
+                negative_boost,
+            } => {
+                positive.positive_gate_is_safe()
+                    && (*negative_boost == 0.0 || negative.scores_provably_non_negative())
+            }
+            Self::MultiMatch(children) => children.iter().all(Self::positive_gate_is_safe),
+            Self::Boolean { should, must, .. } => {
+                should.iter().chain(must).all(Self::positive_gate_is_safe)
+            }
+        }
+    }
+
+    fn scores_provably_non_negative(&self) -> bool {
+        match self {
+            Self::Leaf { boost, .. } => boost.is_finite() && *boost >= 0.0,
+            Self::Boost {
+                positive,
+                negative_boost,
+                ..
+            } => *negative_boost == 0.0 && positive.scores_provably_non_negative(),
+            Self::MultiMatch(children) => children.iter().all(Self::scores_provably_non_negative),
+            Self::Boolean { should, must, .. } => should
+                .iter()
+                .chain(must)
+                .all(Self::scores_provably_non_negative),
         }
     }
 }
@@ -815,9 +945,19 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn collect_mapped(
         &mut self,
         scorer: &mut dyn ComposableScorer,
+        map_document: impl FnMut(u64) -> Result<K>,
+    ) -> Result<CollectionStatus> {
+        self.collect_mapped_from(scorer, None, map_document)
+    }
+
+    fn collect_mapped_from(
+        &mut self,
+        scorer: &mut dyn ComposableScorer,
+        start_doc: Option<u64>,
         mut map_document: impl FnMut(u64) -> Result<K>,
     ) -> Result<CollectionStatus> {
         if self.limit == 0 {
@@ -832,7 +972,10 @@ impl<K: Copy + Ord> TopKCollector<K> {
             .reserve(expected.saturating_sub(self.heap.capacity()));
 
         scorer.set_min_competitive_score(self.competitive_score.get())?;
-        let mut doc = scorer.next()?;
+        let mut doc = match start_doc {
+            Some(start_doc) => scorer.advance(start_doc)?,
+            None => scorer.next()?,
+        };
         while let Some(doc_id) = doc {
             let min_score = self.competitive_score.get();
             scorer.set_min_competitive_score(min_score)?;
@@ -906,6 +1049,49 @@ impl TopKCollector<u64> {
         self.collect_mapped(scorer, Ok)?;
         Ok(self.into_rows())
     }
+}
+
+/// Return the first exact match at or above a fixed score floor without
+/// mutating the authoritative top-k collector.
+fn first_competitive_match(
+    scorer: &mut dyn ComposableScorer,
+    min_score: f32,
+) -> Result<Option<u64>> {
+    if min_score.is_nan() {
+        return Err(Error::invalid_input(
+            "minimum competitive FTS score cannot be NaN",
+        ));
+    }
+    scorer.set_min_competitive_score(min_score)?;
+    let mut doc = scorer.next()?;
+    while let Some(doc_id) = doc {
+        if min_score != f32::NEG_INFINITY {
+            let up_to = scorer.advance_shallow(doc_id)?;
+            if scorer.score_bounds(up_to)?.upper < min_score {
+                doc = if up_to == u64::MAX {
+                    None
+                } else {
+                    scorer.advance(up_to + 1)?
+                };
+                continue;
+            }
+        }
+        if let Some(match_cost) = scorer.match_cost()
+            && (!match_cost.is_finite() || match_cost < 0.0)
+        {
+            return Err(Error::internal(format!(
+                "FTS scorer reported invalid two-phase match cost: {match_cost}"
+            )));
+        }
+        if scorer.matches()?
+            && (min_score == f32::NEG_INFINITY
+                || checked_score(scorer.score()?, "compound positive gate")? >= min_score)
+        {
+            return Ok(Some(doc_id));
+        }
+        doc = scorer.next()?;
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1967,6 +2153,7 @@ pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
     optional: Option<BoxScorer<'a>>,
     prohibited: Option<BoxScorer<'a>>,
+    score_mode: CompoundScoreMode,
     current: Option<u64>,
     optional_matches: bool,
     min_competitive_score: f32,
@@ -1995,13 +2182,31 @@ impl<'a> BooleanScorer<'a> {
         must_not: Vec<BoxScorer<'a>>,
         metrics: Option<&'a dyn MetricsCollector>,
     ) -> Result<Self> {
+        Self::try_new_with_metrics_and_score_mode(
+            should,
+            must,
+            must_not,
+            metrics,
+            CompoundScoreMode::Scoring,
+        )
+    }
+
+    fn try_new_with_metrics_and_score_mode(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+        metrics: Option<&'a dyn MetricsCollector>,
+        score_mode: CompoundScoreMode,
+    ) -> Result<Self> {
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
                 return Err(Error::invalid_input(
                     "boolean query must have at least one should/must query",
                 ));
             }
-            let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
+            let driver = if score_mode == CompoundScoreMode::Scoring
+                && let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should)
+            {
                 Box::new(ShouldMaxScoreScorer::new(should, global_bounds, metrics)) as BoxScorer<'a>
             } else {
                 Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
@@ -2009,16 +2214,18 @@ impl<'a> BooleanScorer<'a> {
             };
             (driver, None)
         } else {
-            let mut optional = if should.is_empty() {
-                None
-            } else {
-                Some(
-                    Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
-                        as BoxScorer<'a>,
-                )
-            };
+            let mut optional =
+                if should.is_empty() || score_mode == CompoundScoreMode::CompleteNoScores {
+                    None
+                } else {
+                    Some(
+                        Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
+                            as BoxScorer<'a>,
+                    )
+                };
             let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
-            let driver = if required.scores_non_negative()
+            let driver = if score_mode == CompoundScoreMode::Scoring
+                && required.scores_non_negative()
                 && optional
                     .as_ref()
                     .is_some_and(|optional| optional.scores_non_negative())
@@ -2047,6 +2254,7 @@ impl<'a> BooleanScorer<'a> {
             driver,
             optional,
             prohibited,
+            score_mode,
             current: None,
             optional_matches: false,
             min_competitive_score: f32::NEG_INFINITY,
@@ -2104,9 +2312,8 @@ impl<'a> BooleanScorer<'a> {
             return Ok(false);
         }
 
-        // With no finite floor, every finite positive score is competitive.
-        // Probe after positive confirmation and score only documents that are
-        // not prohibited, avoiding wasted scoring when exclusions are dense.
+        // Probe after positive confirmation. Scoring mode scores only accepted
+        // documents, while COMPLETE_NO_SCORES stops after exact membership.
         self.work.positive_survivors += 1;
         self.work.must_not_probes += 1;
         let prohibited_matches = {
@@ -2126,6 +2333,9 @@ impl<'a> BooleanScorer<'a> {
         self.positive_checked_doc = Some(current);
         self.positive_survivor_doc = Some(current);
         self.prohibited_checked_doc = Some(current);
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return Ok(true);
+        }
         self.optional_matches = if let Some(optional) = &mut self.optional {
             optional.advance(current)? == Some(current) && optional.matches()?
         } else {
@@ -2247,7 +2457,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     fn next(&mut self) -> Result<Option<u64>> {
         if self.prohibited.is_none() {
             self.next_accepted_without_prohibited(None)
-        } else if self.min_competitive_score == f32::NEG_INFINITY {
+        } else if self.score_mode == CompoundScoreMode::CompleteNoScores
+            || self.min_competitive_score == f32::NEG_INFINITY
+        {
             self.next_accepted_without_score_floor(None)
         } else {
             self.position(None)
@@ -2260,7 +2472,9 @@ impl ComposableScorer for BooleanScorer<'_> {
         }
         if self.prohibited.is_none() {
             self.next_accepted_without_prohibited(Some(target))
-        } else if self.min_competitive_score == f32::NEG_INFINITY {
+        } else if self.score_mode == CompoundScoreMode::CompleteNoScores
+            || self.min_competitive_score == f32::NEG_INFINITY
+        {
             self.next_accepted_without_score_floor(Some(target))
         } else {
             self.position(Some(target))
@@ -2272,6 +2486,11 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn score(&mut self) -> Result<f32> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return Err(Error::internal(
+                "score requested from a COMPLETE_NO_SCORES Boolean FTS scorer",
+            ));
+        }
         if self.prohibited.is_none() {
             if self.current.is_none() {
                 return Err(Error::internal(
@@ -2300,6 +2519,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return Ok(u64::MAX);
+        }
         let mut up_to = self.driver.advance_shallow(target)?;
         if let Some(optional) = &mut self.optional
             && let Some(doc) = optional.doc()
@@ -2310,6 +2532,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return Ok(ScoreBounds::UNBOUNDED);
+        }
         let mut bounds = self.driver.score_bounds(up_to)?;
         if let Some(optional) = &mut self.optional
             && optional.doc().is_some_and(|doc| doc <= up_to)
@@ -2320,6 +2545,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn global_score_upper_bound(&self) -> Option<f32> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return None;
+        }
         if !self.scores_non_negative() {
             return None;
         }
@@ -2342,6 +2570,14 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            return Ok(());
+        }
         if self.prohibited.is_some() {
             if min_score.is_nan() {
                 return Err(Error::invalid_input(
@@ -2362,6 +2598,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn matches(&mut self) -> Result<bool> {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return Ok(self.current.is_some());
+        }
         if self.prohibited.is_none() {
             return Ok(self.current.is_some());
         }
@@ -2379,6 +2618,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn scores_non_negative(&self) -> bool {
+        if self.score_mode == CompoundScoreMode::CompleteNoScores {
+            return false;
+        }
         self.driver.scores_non_negative()
             && self
                 .optional
@@ -2405,12 +2647,6 @@ impl Drop for BooleanScorer<'_> {
 enum LeafQuery {
     Match(MatchQuery),
     Phrase(PhraseQuery),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LeafScoreMode {
-    Scoring,
-    Membership,
 }
 
 impl LeafQuery {
@@ -2447,15 +2683,17 @@ impl LeafQuery {
 
 fn collect_leaf_queries(
     query: &FtsQuery,
-    score_mode: LeafScoreMode,
-    leaves: &mut Vec<(LeafQuery, LeafScoreMode)>,
+    score_mode: CompoundScoreMode,
+    leaves: &mut Vec<(LeafQuery, CompoundScoreMode)>,
 ) -> Result<()> {
     match query {
         FtsQuery::Match(query) => leaves.push((LeafQuery::Match(query.clone()), score_mode)),
         FtsQuery::Phrase(query) => leaves.push((LeafQuery::Phrase(query.clone()), score_mode)),
         FtsQuery::Boost(query) => {
             collect_leaf_queries(&query.positive, score_mode, leaves)?;
-            collect_leaf_queries(&query.negative, score_mode, leaves)?;
+            if score_mode == CompoundScoreMode::Scoring {
+                collect_leaf_queries(&query.negative, score_mode, leaves)?;
+            }
         }
         FtsQuery::MultiMatch(query) => {
             leaves.extend(
@@ -2467,20 +2705,16 @@ fn collect_leaf_queries(
             );
         }
         FtsQuery::Boolean(query) => {
-            for child in query.should.iter().chain(&query.must) {
+            if score_mode == CompoundScoreMode::Scoring || query.must.is_empty() {
+                for child in &query.should {
+                    collect_leaf_queries(child, score_mode, leaves)?;
+                }
+            }
+            for child in &query.must {
                 collect_leaf_queries(child, score_mode, leaves)?;
             }
             for child in &query.must_not {
-                // Prohibited leaves never contribute a score. Start with the
-                // direct shapes covered by the current compound execution
-                // plan; complex nested exclusions retain the scoring cursor
-                // until the whole subtree can carry this mode explicitly.
-                let child_mode = if matches!(child, FtsQuery::Match(_) | FtsQuery::Phrase(_)) {
-                    LeafScoreMode::Membership
-                } else {
-                    LeafScoreMode::Scoring
-                };
-                collect_leaf_queries(child, child_mode, leaves)?;
+                collect_leaf_queries(child, CompoundScoreMode::CompleteNoScores, leaves)?;
             }
         }
     }
@@ -2492,7 +2726,7 @@ struct PreparedLeaf {
     params: Arc<FtsSearchParams>,
     operator: Operator,
     scorer: Arc<MemBM25Scorer>,
-    score_mode: LeafScoreMode,
+    score_mode: CompoundScoreMode,
 }
 
 fn tokenize_leaf(index: &InvertedIndex, leaf: &LeafQuery, params: &FtsSearchParams) -> Tokens {
@@ -2546,6 +2780,55 @@ fn validate_injected_scorer_tokens(scorer: &MemBM25Scorer, tokens: &Tokens) -> R
     Ok(())
 }
 
+fn validate_compound_query(query: &FtsQuery) -> Result<()> {
+    fn validate_multiplier(name: &str, value: f32) -> Result<()> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "{name} must be finite and non-negative, got {value}"
+            )))
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => validate_multiplier("MatchQuery boost", query.boost),
+        FtsQuery::Phrase(_) => Ok(()),
+        FtsQuery::Boost(query) => {
+            validate_multiplier("BoostQuery negative_boost", query.negative_boost)?;
+            validate_compound_query(&query.positive)?;
+            validate_compound_query(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => {
+            if query.match_queries.is_empty() {
+                return Err(Error::invalid_input(
+                    "MultiMatchQuery must have at least one match query",
+                ));
+            }
+            for match_query in &query.match_queries {
+                validate_multiplier("MultiMatchQuery boost", match_query.boost)?;
+            }
+            Ok(())
+        }
+        FtsQuery::Boolean(query) => {
+            if query.should.is_empty() && query.must.is_empty() {
+                return Err(Error::invalid_input(
+                    "boolean query must have at least one should/must query",
+                ));
+            }
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                validate_compound_query(child)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn prepare_compound_query(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -2556,10 +2839,14 @@ async fn prepare_compound_query(
     let first_index = indices
         .first()
         .ok_or_else(|| Error::invalid_input("compound FTS requires at least one index segment"))?;
+    // CompleteNoScores prunes score-only branches. Validate the original AST
+    // first so pruning cannot make malformed nested queries silently valid.
+    validate_compound_query(query)?;
     let mut leaf_queries = Vec::new();
-    collect_leaf_queries(query, LeafScoreMode::Scoring, &mut leaf_queries)?;
+    collect_leaf_queries(query, CompoundScoreMode::Scoring, &mut leaf_queries)?;
     let mut num_plan_leaves = 0;
-    let plan = CompoundScorerPlan::from_query(query, &mut num_plan_leaves)?;
+    let plan =
+        CompoundScorerPlan::from_query(query, &mut num_plan_leaves, CompoundScoreMode::Scoring)?;
     if num_plan_leaves != leaf_queries.len() {
         return Err(Error::internal(format!(
             "compound FTS planned {num_plan_leaves} leaves but prepared {}",
@@ -2573,14 +2860,14 @@ async fn prepare_compound_query(
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
         let scorer = match score_mode {
-            LeafScoreMode::Membership => membership_scorer
+            CompoundScoreMode::CompleteNoScores => membership_scorer
                 .get_or_insert_with(|| {
                     // Posting loading still carries a scorer, but membership
                     // cursors never observe its weights or score bounds.
                     Arc::new(MemBM25Scorer::new(1, 1, Default::default()))
                 })
                 .clone(),
-            LeafScoreMode::Scoring => match &base_scorer {
+            CompoundScoreMode::Scoring => match &base_scorer {
                 Some(scorer) => scorer.clone(),
                 None => Arc::new(
                     build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
@@ -2592,7 +2879,7 @@ async fn prepare_compound_query(
         for index in indices {
             let expanded_tokens =
                 expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())?;
-            if score_mode == LeafScoreMode::Scoring && base_scorer.is_some() {
+            if score_mode == CompoundScoreMode::Scoring && base_scorer.is_some() {
                 validate_injected_scorer_tokens(&scorer, &expanded_tokens)?;
             }
             tokens_by_segment.push(Arc::new(expanded_tokens));
@@ -2609,11 +2896,17 @@ async fn prepare_compound_query(
 }
 
 struct LoadedLeaf {
-    postings: Vec<PostingIterator>,
+    postings: Option<Vec<PostingIterator>>,
     params: Arc<FtsSearchParams>,
     operator: Operator,
     scorer: Arc<MemBM25Scorer>,
-    score_mode: LeafScoreMode,
+    score_mode: CompoundScoreMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartitionLoadMode {
+    ScoringOnly,
+    All,
 }
 
 enum LoadedDocuments {
@@ -2632,6 +2925,9 @@ struct LoadedPartition {
     partition: Arc<InvertedPartition>,
     documents: LoadedDocuments,
     leaves: Vec<LoadedLeaf>,
+    /// First positive document that can still meet the score floor used by
+    /// the preflight gate. Documents before it cannot enter the final top-k.
+    collection_start_doc: Option<u64>,
 }
 
 async fn load_compound_partition(
@@ -2641,6 +2937,7 @@ async fn load_compound_partition(
     leaves: &[PreparedLeaf],
     mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
+    load_mode: PartitionLoadMode,
 ) -> Result<Option<LoadedPartition>> {
     let leaf_loads = leaves.iter().map(|leaf| {
         let partition = partition.clone();
@@ -2652,19 +2949,36 @@ async fn load_compound_partition(
         let operator = leaf.operator;
         async move {
             let postings = if tokens.is_empty() {
-                Vec::new()
+                Some(Vec::new())
+            } else if load_mode == PartitionLoadMode::ScoringOnly
+                && score_mode == CompoundScoreMode::CompleteNoScores
+            {
+                None
+            } else if score_mode == CompoundScoreMode::CompleteNoScores {
+                Some(
+                    partition
+                        .load_membership_posting_lists(
+                            tokens.as_ref(),
+                            params.as_ref(),
+                            operator,
+                            metrics.as_ref(),
+                        )
+                        .await?,
+                )
             } else {
-                partition
-                    .load_posting_lists(
-                        tokens.as_ref(),
-                        params.as_ref(),
-                        operator,
-                        scorer.as_ref(),
-                        metrics.as_ref(),
-                        score_mode == LeafScoreMode::Scoring,
-                    )
-                    .await?
-                    .postings
+                Some(
+                    partition
+                        .load_posting_lists(
+                            tokens.as_ref(),
+                            params.as_ref(),
+                            operator,
+                            scorer.as_ref(),
+                            metrics.as_ref(),
+                            true,
+                        )
+                        .await?
+                        .postings,
+                )
             };
             Result::Ok(LoadedLeaf {
                 postings,
@@ -2718,7 +3032,72 @@ async fn load_compound_partition(
         partition,
         documents,
         leaves,
+        collection_start_doc: None,
     }))
+}
+
+async fn load_deferred_prohibited_postings(
+    mut loaded: LoadedPartition,
+    leaves: &[PreparedLeaf],
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<LoadedPartition> {
+    if loaded.leaves.len() != leaves.len() {
+        return Err(Error::internal(format!(
+            "compound FTS loaded {} leaves for a {}-leaf plan",
+            loaded.leaves.len(),
+            leaves.len()
+        )));
+    }
+    let segment_ordinal = loaded.segment_ordinal;
+    let loads = loaded
+        .leaves
+        .iter()
+        .enumerate()
+        .filter(|(_, leaf)| leaf.postings.is_none())
+        .map(|(index, loaded_leaf)| {
+            let partition = loaded.partition.clone();
+            let prepared = &leaves[index];
+            let tokens = prepared.tokens_by_segment[segment_ordinal].clone();
+            let params = prepared.params.clone();
+            let metrics = metrics.clone();
+            let operator = prepared.operator;
+            let score_mode = prepared.score_mode;
+            debug_assert_eq!(loaded_leaf.score_mode, CompoundScoreMode::CompleteNoScores);
+            async move {
+                if score_mode != CompoundScoreMode::CompleteNoScores {
+                    return Err(Error::internal(format!(
+                        "compound FTS deferred scoring leaf index {index}"
+                    )));
+                }
+                let postings = if tokens.is_empty() {
+                    Vec::new()
+                } else {
+                    partition
+                        .load_membership_posting_lists(
+                            tokens.as_ref(),
+                            params.as_ref(),
+                            operator,
+                            metrics.as_ref(),
+                        )
+                        .await?
+                };
+                Result::Ok((index, postings))
+            }
+        });
+    let postings = futures::future::try_join_all(loads).await?;
+    let num_loads = postings.len();
+    for (index, postings) in postings {
+        let leaf = loaded.leaves.get_mut(index).ok_or_else(|| {
+            Error::internal(format!(
+                "compound FTS deferred leaf index {index} disappeared while loading"
+            ))
+        })?;
+        leaf.postings = Some(postings);
+    }
+    if num_loads > 0 {
+        metrics.record_compound_must_not_posting_loads(num_loads);
+    }
+    Ok(loaded)
 }
 
 struct DeferredCompoundRows {
@@ -2731,17 +3110,69 @@ struct OverflowedCompoundPartition {
     partition_ordinal: usize,
     partition: Arc<InvertedPartition>,
     documents: Arc<PartitionDocuments>,
+    collection_start_doc: Option<u64>,
 }
 
 enum PartitionCollectionBoundary {
+    NeedsProhibited(Vec<LoadedPartition>),
     Deferred(DeferredCompoundRows),
     Overflow(OverflowedCompoundPartition),
 }
 
 struct CollectedPartitions {
     collector: TopKCollector<u64>,
-    remaining: Vec<LoadedPartition>,
+    remaining: VecDeque<LoadedPartition>,
     boundary: Option<PartitionCollectionBoundary>,
+}
+
+fn first_partition_competitive_doc<'a, D: WandDocuments + Sync>(
+    documents: &'a D,
+    leaves: &'a [LoadedLeaf],
+    plan: &CompoundScorerPlan,
+    metrics: &'a dyn MetricsCollector,
+    min_score: f32,
+) -> Result<Option<u64>> {
+    let is_membership_gate = min_score == f32::NEG_INFINITY;
+    let mut leaf_scorers = leaves
+        .iter()
+        .map(|leaf| -> Result<Option<BoxScorer<'a>>> {
+            if leaf.score_mode == CompoundScoreMode::CompleteNoScores {
+                return Ok(None);
+            }
+            let postings = leaf
+                .postings
+                .as_ref()
+                .ok_or_else(|| Error::internal("compound FTS positive posting was not loaded"))?;
+            let postings = postings
+                .iter()
+                .map(PostingIterator::fork_from_start)
+                .collect::<Vec<_>>();
+            let scorer: BoxScorer<'a> = if postings.is_empty() {
+                Box::new(EmptyScorer)
+            } else if is_membership_gate {
+                Box::new(WandCursor::new_membership(
+                    leaf.operator,
+                    postings,
+                    documents,
+                    leaf.scorer.clone(),
+                    leaf.params.as_ref(),
+                    metrics,
+                ))
+            } else {
+                Box::new(WandCursor::new(
+                    leaf.operator,
+                    postings,
+                    documents,
+                    leaf.scorer.clone(),
+                    leaf.params.as_ref(),
+                    metrics,
+                ))
+            };
+            Ok(Some(scorer))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut scorer = plan.build_gate(&mut leaf_scorers, metrics)?;
+    first_competitive_match(scorer.as_mut(), min_score)
 }
 
 fn collect_partition_with_documents<D, K>(
@@ -2750,6 +3181,7 @@ fn collect_partition_with_documents<D, K>(
     plan: &CompoundScorerPlan,
     metrics: &dyn MetricsCollector,
     collector: &mut TopKCollector<K>,
+    collection_start_doc: Option<u64>,
     mut map_document: impl FnMut(u64) -> Result<K>,
 ) -> Result<CollectionStatus>
 where
@@ -2758,13 +3190,16 @@ where
 {
     let mut leaf_scorers = leaves
         .into_iter()
-        .map(|leaf| {
-            let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
+        .map(|leaf| -> Result<Option<BoxScorer<'_>>> {
+            let postings = leaf.postings.ok_or_else(|| {
+                Error::internal("compound FTS prohibited posting was not loaded before collection")
+            })?;
+            let scorer: BoxScorer<'_> = if postings.is_empty() {
                 Box::new(EmptyScorer)
-            } else if leaf.score_mode == LeafScoreMode::Membership {
+            } else if leaf.score_mode == CompoundScoreMode::CompleteNoScores {
                 Box::new(WandCursor::new_membership(
                     leaf.operator,
-                    leaf.postings,
+                    postings,
                     documents,
                     leaf.scorer,
                     leaf.params.as_ref(),
@@ -2773,40 +3208,108 @@ where
             } else {
                 Box::new(WandCursor::new(
                     leaf.operator,
-                    leaf.postings,
+                    postings,
                     documents,
                     leaf.scorer,
                     leaf.params.as_ref(),
                     metrics,
                 ))
             };
-            Some(scorer)
+            Ok(Some(scorer))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
         ));
     }
-    collector.collect_mapped(scorer.as_mut(), &mut map_document)
+    collector.collect_mapped_from(scorer.as_mut(), collection_start_doc, &mut map_document)
 }
 
 fn collect_loaded_partitions(
-    partitions: Vec<LoadedPartition>,
+    mut partitions: VecDeque<LoadedPartition>,
     plan: &CompoundScorerPlan,
+    may_have_deferred_prohibited: bool,
     mask: &RowAddrMask,
     metrics: &dyn MetricsCollector,
     mut collector: TopKCollector<u64>,
 ) -> Result<CollectedPartitions> {
-    let mut partitions = partitions.into_iter();
-    while let Some(partition) = partitions.next() {
+    let mut needs_prohibited = Vec::with_capacity(DEFERRED_MUST_NOT_LOAD_BATCH_SIZE);
+    let mut has_safe_score_gate = None;
+    while let Some(mut partition) = partitions.pop_front() {
+        if may_have_deferred_prohibited
+            && partition.leaves.iter().any(|leaf| leaf.postings.is_none())
+        {
+            // Signed nested Boosts can make a positive-only score gate
+            // underestimate the final score. The positive match set remains
+            // exact, so use a membership-only gate for those plans instead of
+            // eagerly loading every prohibited posting.
+            let has_safe_score_gate =
+                *has_safe_score_gate.get_or_insert_with(|| plan.positive_gate_is_safe());
+            let min_score = if has_safe_score_gate {
+                collector.competitive_score.get()
+            } else {
+                f32::NEG_INFINITY
+            };
+            let collection_start_doc = match &partition.documents {
+                LoadedDocuments::Legacy(docs) => {
+                    let documents = LegacyWandDocuments::new(docs.as_ref(), mask);
+                    first_partition_competitive_doc(
+                        &documents,
+                        &partition.leaves,
+                        plan,
+                        metrics,
+                        min_score,
+                    )?
+                }
+                LoadedDocuments::Modern {
+                    lengths,
+                    visibility,
+                    ..
+                } => {
+                    let documents = ModernWandDocuments::filtered(lengths.as_ref(), visibility);
+                    first_partition_competitive_doc(
+                        &documents,
+                        &partition.leaves,
+                        plan,
+                        metrics,
+                        min_score,
+                    )?
+                }
+            };
+            if let Some(collection_start_doc) = collection_start_doc {
+                partition.collection_start_doc = Some(collection_start_doc);
+                needs_prohibited.push(partition);
+                if needs_prohibited.len() == DEFERRED_MUST_NOT_LOAD_BATCH_SIZE {
+                    return Ok(CollectedPartitions {
+                        collector,
+                        remaining: partitions,
+                        boundary: Some(PartitionCollectionBoundary::NeedsProhibited(
+                            needs_prohibited,
+                        )),
+                    });
+                }
+            }
+            continue;
+        }
+        if !needs_prohibited.is_empty() {
+            partitions.push_front(partition);
+            return Ok(CollectedPartitions {
+                collector,
+                remaining: partitions,
+                boundary: Some(PartitionCollectionBoundary::NeedsProhibited(
+                    needs_prohibited,
+                )),
+            });
+        }
         let LoadedPartition {
             segment_ordinal,
             partition_ordinal,
             partition: source,
             documents,
             leaves,
+            collection_start_doc,
         } = partition;
         match documents {
             LoadedDocuments::Legacy(docs) => {
@@ -2817,6 +3320,7 @@ fn collect_loaded_partitions(
                     plan,
                     metrics,
                     &mut collector,
+                    collection_start_doc,
                     Ok,
                 )?;
                 debug_assert_eq!(status, CollectionStatus::Complete);
@@ -2836,6 +3340,7 @@ fn collect_loaded_partitions(
                         plan,
                         metrics,
                         &mut collector,
+                        collection_start_doc,
                         |doc_id| {
                             let doc_id = DocId::new(u32::try_from(doc_id).map_err(|_| {
                                 Error::index(format!(
@@ -2869,6 +3374,7 @@ fn collect_loaded_partitions(
                         plan,
                         metrics,
                         &mut local_collector,
+                        collection_start_doc,
                         |doc_id| {
                             Ok(DocId::new(u32::try_from(doc_id).map_err(|_| {
                                 Error::index(format!(
@@ -2892,13 +3398,14 @@ fn collect_loaded_partitions(
                                 partition_ordinal,
                                 partition: source,
                                 documents: partition_documents,
+                                collection_start_doc,
                             })
                         }
                     };
                     metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
                     return Ok(CollectedPartitions {
                         collector,
-                        remaining: partitions.collect(),
+                        remaining: partitions,
                         boundary: Some(boundary),
                     });
                 }
@@ -2906,10 +3413,13 @@ fn collect_loaded_partitions(
         }
     }
     metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
+    let boundary = (!needs_prohibited.is_empty()).then_some(
+        PartitionCollectionBoundary::NeedsProhibited(needs_prohibited),
+    );
     Ok(CollectedPartitions {
         collector,
-        remaining: Vec::new(),
-        boundary: None,
+        remaining: partitions,
+        boundary,
     })
 }
 
@@ -2957,6 +3467,7 @@ async fn reload_compound_partition_with_projection(
         leaves,
         mask,
         metrics,
+        PartitionLoadMode::All,
     )
     .await?
     .ok_or_else(|| {
@@ -2977,6 +3488,7 @@ async fn reload_compound_partition_with_projection(
             )));
         }
     }
+    loaded.collection_start_doc = overflow.collection_start_doc;
     Ok(loaded)
 }
 
@@ -3035,6 +3547,9 @@ async fn compound_search_impl(
     }
     let (plan, leaves) =
         prepare_compound_query(indices, query, params, metrics.as_ref(), base_scorer).await?;
+    let has_prohibited_leaves = leaves
+        .iter()
+        .any(|leaf| leaf.score_mode == CompoundScoreMode::CompleteNoScores);
     prefilter.wait_for_ready().await?;
     let mask = prefilter.mask();
     let mut collector = TopKCollector::new(limit);
@@ -3054,15 +3569,20 @@ async fn compound_search_impl(
                         &leaves,
                         mask.clone(),
                         metrics.clone(),
+                        PartitionLoadMode::ScoringOnly,
                     )
                 });
-        let mut partitions = stream::iter(loads)
+        let mut loaded_partitions = stream::iter(loads)
             .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 32))
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        if has_prohibited_leaves {
+            loaded_partitions.sort_unstable_by_key(|partition| partition.partition_ordinal);
+        }
+        let mut partitions = VecDeque::from(loaded_partitions);
         while !partitions.is_empty() {
             let cpu_plan = plan.clone();
             let cpu_mask = mask.clone();
@@ -3071,6 +3591,7 @@ async fn compound_search_impl(
                 collect_loaded_partitions(
                     partitions,
                     &cpu_plan,
+                    has_prohibited_leaves,
                     cpu_mask.as_ref(),
                     cpu_metrics.as_ref(),
                     collector,
@@ -3080,6 +3601,15 @@ async fn compound_search_impl(
             collector = collected.collector;
             partitions = collected.remaining;
             match collected.boundary {
+                Some(PartitionCollectionBoundary::NeedsProhibited(pending)) => {
+                    let loads = pending.into_iter().map(|partition| {
+                        load_deferred_prohibited_postings(partition, &leaves, metrics.clone())
+                    });
+                    let loaded = futures::future::try_join_all(loads).await?;
+                    let mut resumed = VecDeque::from(loaded);
+                    resumed.append(&mut partitions);
+                    partitions = resumed;
+                }
                 Some(PartitionCollectionBoundary::Deferred(deferred)) => {
                     merge_resolved_compound_rows(&mut collector, deferred, metrics.as_ref())
                         .await?;
@@ -3092,7 +3622,7 @@ async fn compound_search_impl(
                         metrics.clone(),
                     )
                     .await?;
-                    partitions.insert(0, retry);
+                    partitions.push_front(retry);
                 }
                 None => debug_assert!(partitions.is_empty()),
             }
@@ -3111,7 +3641,7 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
-    use crate::scalar::inverted::query::{BooleanQuery, Occur};
+    use crate::scalar::inverted::query::{BooleanQuery, BoostQuery, MultiMatchQuery, Occur};
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -3142,20 +3672,316 @@ mod tests {
         ]));
         let mut leaves = Vec::new();
 
-        collect_leaf_queries(&query, LeafScoreMode::Scoring, &mut leaves).unwrap();
+        collect_leaf_queries(&query, CompoundScoreMode::Scoring, &mut leaves).unwrap();
 
         assert!(matches!(
             &leaves[0],
-            (LeafQuery::Match(_), LeafScoreMode::Scoring)
+            (LeafQuery::Match(_), CompoundScoreMode::Scoring)
         ));
         assert!(matches!(
             &leaves[1],
-            (LeafQuery::Match(_), LeafScoreMode::Membership)
+            (LeafQuery::Match(_), CompoundScoreMode::CompleteNoScores)
         ));
         assert!(matches!(
             &leaves[2],
-            (LeafQuery::Phrase(_), LeafScoreMode::Membership)
+            (LeafQuery::Phrase(_), CompoundScoreMode::CompleteNoScores)
         ));
+    }
+
+    #[test]
+    fn prohibited_subtrees_recursively_use_membership_mode() {
+        let nested = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Should,
+                FtsQuery::Phrase(PhraseQuery::new(String::from("optional phrase"))),
+            ),
+            (
+                Occur::Must,
+                FtsQuery::MultiMatch(MultiMatchQuery {
+                    match_queries: vec![
+                        MatchQuery::new(String::from("multi a")),
+                        MatchQuery::new(String::from("multi b")),
+                    ],
+                }),
+            ),
+            (
+                Occur::Must,
+                FtsQuery::Boost(BoostQuery::new(
+                    FtsQuery::Match(MatchQuery::new(String::from("boost positive"))),
+                    FtsQuery::Match(MatchQuery::new(String::from("boost negative"))),
+                    Some(0.25),
+                )),
+            ),
+            (
+                Occur::MustNot,
+                FtsQuery::Boolean(BooleanQuery::new([(
+                    Occur::Should,
+                    FtsQuery::Phrase(PhraseQuery::new(String::from("nested exclusion"))),
+                )])),
+            ),
+        ]));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("required"))),
+            ),
+            (Occur::MustNot, nested),
+        ]));
+        let mut leaves = Vec::new();
+
+        collect_leaf_queries(&query, CompoundScoreMode::Scoring, &mut leaves).unwrap();
+
+        assert_eq!(
+            leaves
+                .iter()
+                .map(|(leaf, _)| leaf.terms())
+                .collect::<Vec<_>>(),
+            vec![
+                "required",
+                "multi a",
+                "multi b",
+                "boost positive",
+                "nested exclusion"
+            ]
+        );
+        assert_eq!(leaves[0].1, CompoundScoreMode::Scoring);
+        assert!(
+            leaves[1..]
+                .iter()
+                .all(|(_, mode)| *mode == CompoundScoreMode::CompleteNoScores)
+        );
+    }
+
+    #[test]
+    fn prohibited_subtree_pruning_preserves_query_validation() {
+        let invalid_optional =
+            FtsQuery::Match(MatchQuery::new(String::from("invalid optional")).with_boost(f32::NAN));
+        let prohibited = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("required"))),
+            ),
+            (Occur::Should, invalid_optional),
+        ]));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("positive"))),
+            ),
+            (Occur::MustNot, prohibited),
+        ]));
+
+        let error = validate_compound_query(&query).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("MatchQuery boost must be finite and non-negative, got NaN")
+        );
+
+        let empty_multi_match = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("positive"))),
+            ),
+            (
+                Occur::MustNot,
+                FtsQuery::Boost(BoostQuery::new(
+                    FtsQuery::Match(MatchQuery::new(String::from("required"))),
+                    FtsQuery::MultiMatch(MultiMatchQuery {
+                        match_queries: Vec::new(),
+                    }),
+                    Some(0.5),
+                )),
+            ),
+        ]));
+        let error = validate_compound_query(&empty_multi_match).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("MultiMatchQuery must have at least one match query")
+        );
+    }
+
+    #[test]
+    fn prohibited_subtrees_never_score_nested_compound_leaves() {
+        let nested = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Should,
+                FtsQuery::Match(MatchQuery::new(String::from("optional"))),
+            ),
+            (
+                Occur::Must,
+                FtsQuery::MultiMatch(MultiMatchQuery {
+                    match_queries: vec![
+                        MatchQuery::new(String::from("multi a")),
+                        MatchQuery::new(String::from("multi b")),
+                    ],
+                }),
+            ),
+            (
+                Occur::Must,
+                FtsQuery::Boost(BoostQuery::new(
+                    FtsQuery::Match(
+                        MatchQuery::new(String::from("boost positive")).with_boost(2.0),
+                    ),
+                    FtsQuery::Match(MatchQuery::new(String::from("boost negative"))),
+                    Some(0.5),
+                )),
+            ),
+            (
+                Occur::MustNot,
+                FtsQuery::Boolean(BooleanQuery::new([(
+                    Occur::Should,
+                    FtsQuery::Match(MatchQuery::new(String::from("inner exclusion"))),
+                )])),
+            ),
+        ]));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("required"))),
+            ),
+            (Occur::MustNot, nested),
+        ]));
+        let mut num_leaves = 0;
+        let plan =
+            CompoundScorerPlan::from_query(&query, &mut num_leaves, CompoundScoreMode::Scoring)
+                .unwrap();
+        assert_eq!(num_leaves, 5);
+
+        let (positive, _) = instrumented(materialized(&[
+            (0, 10.0),
+            (1, 9.0),
+            (2, 8.0),
+            (3, 7.0),
+            (4, 6.0),
+        ]));
+        let prohibited_rows = [
+            &[(1, 1.0), (2, 1.0), (3, 1.0)][..],
+            &[(2, 1.0), (4, 1.0)][..],
+            &[(1, 3.0), (2, 3.0), (4, 3.0)][..],
+        ];
+        let metrics = BooleanMetrics::default();
+        let mut prohibited_work = Vec::new();
+        let mut leaves = vec![Some(positive)];
+        for values in prohibited_rows {
+            let (scorer, work) = instrumented(materialized(values));
+            leaves.push(Some(scorer));
+            prohibited_work.push(work);
+        }
+        let (inner_exclusion, _, inner_exclusion_confirmations) =
+            two_phase(&[(2, 1.0), (4, 1.0)], vec![2, 4], Some(1.0));
+        let (inner_exclusion, work) = instrumented(inner_exclusion);
+        leaves.push(Some(inner_exclusion));
+        prohibited_work.push(work);
+        let mut scorer = plan.build(&mut leaves, &metrics).unwrap();
+
+        assert_eq!(
+            TopKCollector::new(10).collect(scorer.as_mut()).unwrap(),
+            rows(&[(0, 10.0), (2, 8.0), (3, 7.0), (4, 6.0)])
+        );
+        assert!(leaves.iter().all(Option::is_none));
+        assert_eq!(
+            inner_exclusion_confirmations.load(AtomicOrdering::Relaxed),
+            2
+        );
+        for work in prohibited_work {
+            assert_eq!(work.scores.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(work.shallow_advances.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(work.bounds.load(AtomicOrdering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn positive_gate_keeps_floor_ties() {
+        let mut tied = MaterializedScorer::try_new(rows(&[(0, 4.0), (1, 5.0)])).unwrap();
+        assert_eq!(first_competitive_match(&mut tied, 5.0).unwrap(), Some(1));
+
+        let mut below = MaterializedScorer::try_new(rows(&[(0, 4.0), (1, 5.0)])).unwrap();
+        assert_eq!(first_competitive_match(&mut below, 6.0).unwrap(), None);
+
+        let (mut unbounded, work) = instrumented(materialized(&[(0, 1.0)]));
+        assert_eq!(
+            first_competitive_match(unbounded.as_mut(), f32::NEG_INFINITY).unwrap(),
+            Some(0)
+        );
+        assert_eq!(work.scores.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(work.shallow_advances.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(work.bounds.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn collection_resumes_at_first_competitive_positive() {
+        let values = [(0, 1.0), (1, 10.0), (2, 11.0)];
+        let mut gate = MaterializedScorer::try_new(rows(&values)).unwrap();
+        let start_doc = first_competitive_match(&mut gate, 10.0).unwrap();
+        assert_eq!(start_doc, Some(1));
+
+        let mut scorer = BooleanScorer::try_new(
+            Vec::new(),
+            vec![materialized(&values)],
+            vec![materialized(&[(1, 1.0)])],
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+        let mut collector = TopKCollector::with_competitive_score(1, competitive_score);
+
+        collector
+            .collect_mapped_from(&mut scorer, start_doc, Ok)
+            .unwrap();
+
+        assert_eq!(collector.into_rows(), rows(&[(2, 11.0)]));
+    }
+
+    #[test]
+    fn positive_gate_falls_back_for_signed_negative_subtrees() {
+        let match_query = |terms: &str| FtsQuery::Match(MatchQuery::new(String::from(terms)));
+        let signed_negative = FtsQuery::Boost(BoostQuery::new(
+            match_query("inner positive"),
+            match_query("inner negative"),
+            Some(1.0),
+        ));
+        let unsafe_query = FtsQuery::Boost(BoostQuery::new(
+            match_query("outer positive"),
+            signed_negative.clone(),
+            Some(0.5),
+        ));
+        let mut num_leaves = 0;
+        let unsafe_plan = CompoundScorerPlan::from_query(
+            &unsafe_query,
+            &mut num_leaves,
+            CompoundScoreMode::Scoring,
+        )
+        .unwrap();
+        assert!(!unsafe_plan.positive_gate_is_safe());
+        let metrics = BooleanMetrics::default();
+        let mut leaves = vec![
+            Some(materialized(&[(0, 1.0)])),
+            Some(materialized(&[(0, 1.0)])),
+            Some(materialized(&[(0, 11.0)])),
+        ];
+        let mut scorer = unsafe_plan.build(&mut leaves, &metrics).unwrap();
+        assert_eq!(
+            TopKCollector::new(1).collect(scorer.as_mut()).unwrap(),
+            rows(&[(0, 6.0)])
+        );
+
+        let safe_query = FtsQuery::Boost(BoostQuery::new(
+            match_query("outer positive"),
+            signed_negative,
+            Some(0.0),
+        ));
+        let mut num_leaves = 0;
+        let safe_plan = CompoundScorerPlan::from_query(
+            &safe_query,
+            &mut num_leaves,
+            CompoundScoreMode::Scoring,
+        )
+        .unwrap();
+        assert!(safe_plan.positive_gate_is_safe());
     }
 
     fn should_maxscore<'a>(
@@ -4075,6 +4901,7 @@ mod tests {
             driver: required,
             optional: Some(optional),
             prohibited: None,
+            score_mode: CompoundScoreMode::Scoring,
             current: None,
             optional_matches: false,
             min_competitive_score: f32::NEG_INFINITY,

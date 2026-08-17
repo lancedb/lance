@@ -15,6 +15,7 @@ pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_ov
 pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
 pub const COMPOUND_POSITIVE_SURVIVORS_METRIC: &str = "compound_positive_survivors";
 pub const COMPOUND_MUST_NOT_PROBES_METRIC: &str = "compound_must_not_probes";
+pub const COMPOUND_MUST_NOT_POSTING_LOADS_METRIC: &str = "compound_must_not_posting_loads";
 pub const COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC: &str = "compound_should_skipped_windows";
 pub const COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC: &str =
     "compound_should_bound_recomputations";
@@ -121,6 +122,9 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record candidate-level probes of compound FTS MUST_NOT clauses.
     fn record_compound_must_not_probes(&self, _num_probes: usize) {}
+
+    /// Record deferred prohibited posting leaves that were actually loaded.
+    fn record_compound_must_not_posting_loads(&self, _num_loads: usize) {}
 
     /// Record pure-SHOULD compound FTS windows skipped using score bounds.
     fn record_compound_should_skipped_windows(&self, _num_windows: usize) {}

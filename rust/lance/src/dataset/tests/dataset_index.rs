@@ -35,6 +35,7 @@ use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::cache::{
     CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, LanceCache, QuickCacheBackend,
 };
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
@@ -43,11 +44,11 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
-    COMPOUND_MUST_NOT_PROBES_METRIC, COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC,
-    COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, COMPOUND_POSITIVE_SURVIVORS_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
-    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+    COMPOUND_MUST_NOT_POSTING_LOADS_METRIC, COMPOUND_MUST_NOT_PROBES_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_POSITIVE_SURVIVORS_METRIC, COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC, COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -960,6 +961,39 @@ async fn compound_fts_results(
         .collect()
 }
 
+async fn compound_fts_results_with_stats(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+    filter: Option<&str>,
+) -> (Vec<(u64, f32)>, ExecutionSummaryCounts) {
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scan = dataset.scan();
+    scan.scan_stats_callback(Arc::new(move |stats| {
+        *stats_setter.lock().unwrap() = Some(stats.clone());
+    }))
+    .with_row_id()
+    .full_text_search(FullTextSearchQuery::new_query(query))
+    .unwrap();
+    if let Some(filter) = filter {
+        scan.prefilter(true).filter(filter).unwrap();
+    }
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    let rows = row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    (rows, stats)
+}
+
 async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
     let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
     assert!(
@@ -1395,12 +1429,24 @@ async fn test_compound_must_not_phrase_is_exact_across_shapes() {
         (Occur::Should, match_query("beta")),
     ])
     .into();
+    let nested_prohibited: FtsQuery = BooleanQuery::new([
+        (Occur::Must, prohibited_phrase()),
+        (Occur::Must, match_query("beta")),
+        (Occur::Should, match_query("rare")),
+    ])
+    .into();
+    let nested_prohibited_boolean: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("alpha")),
+        (Occur::MustNot, nested_prohibited),
+    ])
+    .into();
 
     for (shape, query) in [
         ("conjunction", conjunction.clone()),
         ("ReqOpt", reqopt),
         ("pure SHOULD", pure_should),
         ("nested Boolean", nested),
+        ("nested prohibited Boolean", nested_prohibited_boolean),
     ] {
         let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
         assert!(
@@ -1434,6 +1480,195 @@ async fn test_compound_must_not_phrase_is_exact_across_shapes() {
     assert!(
         plan.contains("CompoundFtsScorer"),
         "same-column Phrase prohibition should use the compound scorer:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_must_not_posting_loads_follow_positive_candidates() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "positive blocked",
+            "positive clear",
+            "positive blocked filler filler filler filler",
+            "neutral"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+
+    let match_query = |term: &str| compound_match_query(term, "text", 1.0);
+    let no_positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("missing")),
+        (Occur::MustNot, match_query("blocked")),
+    ])
+    .into();
+    let (rows, stats) = compound_fts_results_with_stats(&dataset, no_positive, Some(1), None).await;
+    assert!(rows.is_empty());
+    assert_eq!(
+        stats.all_counts[COMPOUND_MUST_NOT_POSTING_LOADS_METRIC], 0,
+        "prohibited postings must remain deferred when there are no positive candidates"
+    );
+
+    let has_positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("positive")),
+        (Occur::MustNot, match_query("blocked")),
+    ])
+    .into();
+    let (rows, stats) =
+        compound_fts_results_with_stats(&dataset, has_positive, Some(1), None).await;
+    assert_eq!(
+        rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        stats.all_counts[COMPOUND_MUST_NOT_POSTING_LOADS_METRIC], 1,
+        "only the first fragment should load the one prohibited posting leaf; the lower-scoring \
+         positive candidate in the second fragment must be pruned by the established score floor"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_must_not_deferred_load_respects_modern_visibility() {
+    let batch = arrow_array::record_batch!(
+        (
+            "text",
+            Utf8,
+            [
+                "positive blocked",
+                "positive clear",
+                "blocked neutral",
+                "neutral"
+            ]
+        ),
+        ("scope", Int32, [1, 2, 0, 0])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("positive", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    for (filter, expected_row_ids, expected_loads) in [
+        ("scope = 0", Vec::new(), 0),
+        ("scope = 1", Vec::new(), 1),
+        ("scope = 2", vec![1], 1),
+    ] {
+        let (rows, stats) =
+            compound_fts_results_with_stats(&dataset, query.clone(), Some(1), Some(filter)).await;
+        assert_eq!(
+            rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+            expected_row_ids,
+            "unexpected MUST_NOT result for prefilter {filter}"
+        );
+        assert_eq!(
+            stats.all_counts[COMPOUND_MUST_NOT_POSTING_LOADS_METRIC], expected_loads,
+            "unexpected prohibited posting loads for prefilter {filter}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_compound_phrase_confirmation_rejects_before_must_not_load() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        ["alpha filler beta blocked", "beta filler alpha blocked"]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let approximation: FtsQuery = MatchQuery::new("alpha beta".to_owned())
+        .with_column(Some("text".to_owned()))
+        .with_operator(Operator::And)
+        .into();
+    let mut approximation_row_ids = compound_fts_results(&dataset, approximation, None)
+        .await
+        .into_iter()
+        .map(|(row_id, _)| row_id)
+        .collect::<Vec<_>>();
+    approximation_row_ids.sort_unstable();
+    assert_eq!(approximation_row_ids, vec![0, 1]);
+
+    let positive_phrase: FtsQuery = PhraseQuery::new("alpha beta".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, positive_phrase),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let (rows, stats) = compound_fts_results_with_stats(&dataset, query, Some(1), None).await;
+    assert!(rows.is_empty());
+    assert_eq!(
+        stats.all_counts[COMPOUND_MUST_NOT_POSTING_LOADS_METRIC], 0,
+        "phrase approximations rejected by positions must not load prohibited postings"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_must_not_absent_from_positive_segment_keeps_match() {
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, ["blocked only", "positive clear"])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let positive_fragment_id = dataset.get_fragments()[1].id() as u32;
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("positive", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let rows = compound_fts_results(&dataset, query, Some(1)).await;
+    assert_eq!(
+        rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        vec![u64::from(RowAddress::new_from_parts(
+            positive_fragment_id,
+            0
+        ))]
     );
 }
 
@@ -1691,6 +1926,141 @@ async fn test_compound_tie_uses_resolved_row_id() {
             "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
         )),
         "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_must_not_projection_retry_preserves_exact_ties() {
+    // Every document has the same length and the same positive term, so all
+    // surviving scores tie. More than k + SCORE_FLOOR_RESOLUTION_BATCH_SIZE
+    // survivors in one segment force the no-resident-projection retry path.
+    let values = (0..384)
+        .map(|index| {
+            if index % 3 == 0 {
+                "common blocked"
+            } else {
+                "common clear"
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(("text", Utf8, values)).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 256,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("common", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row = (
+        limited[ROW_ID].as_primitive::<UInt64Type>().value(0),
+        limited[SCORE_COL].as_primitive::<Float32Type>().value(0),
+    );
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+
+    let exhaustive = compound_fts_results(&dataset, query, None).await;
+    assert_eq!(exhaustive.len(), 256);
+    assert_eq!(limited_row, exhaustive[0]);
+    assert_eq!(
+        limited_row.0, 1,
+        "row 0 is prohibited, so row 1 wins the tie"
+    );
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
+        Some(&1),
+        "MUST_NOT collection must exercise the score-floor overflow retry"
+    );
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_MUST_NOT_POSTING_LOADS_METRIC),
+        Some(&2),
+        "both positive-bearing segments must load their prohibited posting"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_must_not_equal_floor_loads_later_segment() {
+    // Reverse the segments so row 2 fills k=1 first. Row 0 has the same score
+    // and a smaller row id, so the later segment must pass an equal score floor,
+    // load its prohibited posting, and replace row 2.
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "common clear",
+            "common blocked",
+            "common clear",
+            "neutral blocked"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("common", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row = (
+        limited[ROW_ID].as_primitive::<UInt64Type>().value(0),
+        limited[SCORE_COL].as_primitive::<Float32Type>().value(0),
+    );
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+
+    let exhaustive = compound_fts_results(&dataset, query, None).await;
+    assert_eq!(exhaustive.len(), 2);
+    assert_eq!(exhaustive[0].1, exhaustive[1].1);
+    assert_eq!(limited_row, exhaustive[0]);
+    assert_eq!(limited_row.0, 0);
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_MUST_NOT_POSTING_LOADS_METRIC),
+        Some(&2),
+        "the later equal-floor segment must not be skipped before exclusion loads"
     );
 }
 

@@ -455,6 +455,350 @@ impl InvertedPartition {
         }
     }
 
+    fn union_plain_membership_posting_lists(
+        postings: Vec<PostingList>,
+        with_positions: bool,
+    ) -> Result<PostingList> {
+        if with_positions {
+            let mut positions_by_row_id = BTreeMap::<u64, Vec<u32>>::new();
+            for posting in postings {
+                let PostingList::Plain(posting) = posting else {
+                    return Err(Error::index(
+                        "cannot union mixed plain and compressed posting lists".to_owned(),
+                    ));
+                };
+                let positions = posting.positions.as_ref().ok_or_else(|| {
+                    Error::index("cannot union grouped phrase terms without positions".to_string())
+                })?;
+                let position_values = positions.values().as_primitive::<Int32Type>().values();
+                for (index, row_id) in posting.row_ids.iter().copied().enumerate() {
+                    let start = positions.value_offsets()[index] as usize;
+                    let end = positions.value_offsets()[index + 1] as usize;
+                    positions_by_row_id.entry(row_id).or_default().extend(
+                        position_values[start..end]
+                            .iter()
+                            .map(|value| *value as u32),
+                    );
+                }
+            }
+
+            let mut row_ids = Vec::with_capacity(positions_by_row_id.len());
+            let mut frequencies = Vec::with_capacity(positions_by_row_id.len());
+            let mut positions_builder = ListBuilder::new(Int32Builder::new());
+            for (row_id, mut positions) in positions_by_row_id {
+                positions.sort_unstable();
+                row_ids.push(row_id);
+                frequencies.push(positions.len() as f32);
+                for position in positions {
+                    positions_builder.values().append_value(position as i32);
+                }
+                positions_builder.append(true);
+            }
+            return Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(row_ids),
+                ScalarBuffer::from(frequencies),
+                None,
+                Some(positions_builder.finish()),
+            )));
+        }
+
+        let mut row_ids = BTreeSet::new();
+        for posting in postings {
+            let PostingList::Plain(posting) = posting else {
+                return Err(Error::index(
+                    "cannot union mixed plain and compressed posting lists".to_owned(),
+                ));
+            };
+            row_ids.extend(posting.row_ids.iter().copied());
+        }
+        let row_ids = row_ids.into_iter().collect::<Vec<_>>();
+        let frequencies = vec![1.0; row_ids.len()];
+        Ok(PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(row_ids),
+            ScalarBuffer::from(frequencies),
+            None,
+            None,
+        )))
+    }
+
+    fn union_compressed_membership_posting_lists(
+        postings: Vec<PostingList>,
+        with_positions: bool,
+    ) -> Result<PostingList> {
+        let block_size = postings.iter().find_map(|posting| match posting {
+            PostingList::Compressed(posting) => Some(posting.block_size),
+            PostingList::Plain(_) => None,
+        });
+        let Some(block_size) = block_size else {
+            return Err(Error::internal(
+                "compressed membership union received no compressed postings",
+            ));
+        };
+        let mut builder = PostingListBuilder::new_with_block_size(with_positions, block_size);
+
+        if with_positions {
+            // Compressed position streams use frequency prefix sums as document
+            // boundaries. Exact phrase membership must decode those frequencies,
+            // but it still avoids BM25 weights, score bounds, and document lengths.
+            let mut positions_by_doc_id = BTreeMap::<u32, Vec<u32>>::new();
+            for posting in postings {
+                for (doc_id, _, positions) in posting.iter() {
+                    let doc_id = u32::try_from(doc_id).map_err(|_| {
+                        Error::index(format!(
+                            "compressed posting doc id {} exceeds u32::MAX",
+                            doc_id
+                        ))
+                    })?;
+                    let positions = positions.ok_or_else(|| {
+                        Error::index(
+                            "cannot union grouped phrase terms without positions".to_string(),
+                        )
+                    })?;
+                    positions_by_doc_id
+                        .entry(doc_id)
+                        .or_default()
+                        .extend(positions);
+                }
+            }
+            for (doc_id, mut positions) in positions_by_doc_id {
+                positions.sort_unstable();
+                builder.add(doc_id, PositionRecorder::Position(positions.into()));
+            }
+        } else {
+            let mut doc_ids = RoaringBitmap::new();
+            let mut decoded_doc_ids = Vec::with_capacity(block_size);
+            let mut decode_buffer = Box::new([0_u32; MAX_POSTING_BLOCK_SIZE]);
+            for posting in postings {
+                let PostingList::Compressed(posting) = posting else {
+                    return Err(Error::index(
+                        "cannot union mixed plain and compressed posting lists".to_owned(),
+                    ));
+                };
+                let remainder = posting.length as usize % posting.block_size;
+                for block_idx in 0..posting.blocks.len() {
+                    decoded_doc_ids.clear();
+                    let block = posting.blocks.value(block_idx);
+                    if block_idx + 1 == posting.blocks.len() && remainder != 0 {
+                        super::super::encoding::decompress_posting_remainder_doc_ids(
+                            block,
+                            remainder,
+                            posting.posting_tail_codec,
+                            posting.block_size,
+                            &mut decoded_doc_ids,
+                        );
+                    } else {
+                        super::super::encoding::decompress_posting_block_doc_ids(
+                            block,
+                            decode_buffer.as_mut_slice(),
+                            &mut decoded_doc_ids,
+                            posting.block_size,
+                        );
+                    }
+                    doc_ids.extend(decoded_doc_ids.iter().copied());
+                }
+            }
+            for doc_id in doc_ids {
+                builder.add(doc_id, PositionRecorder::Count(1));
+            }
+        }
+
+        if builder.is_empty() {
+            return Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            )));
+        }
+        let num_blocks = builder.len().div_ceil(block_size);
+        let batch = builder.to_batch(vec![0.0; num_blocks])?;
+        let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+        let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        PostingList::from_batch(&batch, Some(max_score), Some(length))
+    }
+
+    fn union_membership_posting_lists(
+        postings: Vec<PostingList>,
+        with_positions: bool,
+    ) -> Result<PostingList> {
+        let has_plain = postings
+            .iter()
+            .any(|posting| matches!(posting, PostingList::Plain(_)));
+        let has_compressed = postings
+            .iter()
+            .any(|posting| matches!(posting, PostingList::Compressed(_)));
+        match (has_plain, has_compressed) {
+            (true, true) => Err(Error::index(
+                "cannot union mixed plain and compressed posting lists".to_owned(),
+            )),
+            (true, false) => Self::union_plain_membership_posting_lists(postings, with_positions),
+            (false, true) => {
+                Self::union_compressed_membership_posting_lists(postings, with_positions)
+            }
+            (false, false) => Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    fn membership_posting_iterator(
+        token: String,
+        token_id: u32,
+        position: u32,
+        mut posting: PostingList,
+        num_docs: usize,
+    ) -> PostingIterator {
+        if let PostingList::Plain(posting) = &mut posting {
+            // The generic iterator derives an IDF fallback when a plain list
+            // has no stored bound. Membership never reads score bounds, so a
+            // zero sentinel avoids doing score preparation on this path.
+            posting.max_score = Some(0.0);
+        }
+        PostingIterator::with_query_weight_deferred(
+            token, token_id, position, 0.0, posting, num_docs,
+        )
+    }
+
+    fn membership_requires_group_union(
+        operator: Operator,
+        is_phrase_query: bool,
+        positions: impl IntoIterator<Item = u32>,
+    ) -> bool {
+        if operator != Operator::And && !is_phrase_query {
+            return false;
+        }
+        let mut previous = None;
+        positions.into_iter().any(|position| {
+            let is_grouped = previous == Some(position);
+            previous = Some(position);
+            is_grouped
+        })
+    }
+
+    /// Load postings for membership-only execution without preparing any
+    /// BM25 weights or score bounds. Same-position alternatives are unioned
+    /// when required so AND and phrase semantics remain identical to scoring.
+    #[instrument(level = "debug", skip_all)]
+    pub(in super::super) async fn load_membership_posting_lists(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PostingIterator>> {
+        let is_phrase_query = params.phrase_slop.is_some();
+        let is_and_query = operator == Operator::And;
+        let required_positions = (is_and_query || is_phrase_query).then(|| {
+            (0..tokens.len())
+                .map(|index| tokens.position(index))
+                .collect::<HashSet<_>>()
+        });
+        let tokens = tokens.clone();
+        let token_positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
+        let mut token_ids = Vec::with_capacity(tokens.len());
+        let mut matched_positions = required_positions.as_ref().map(|_| HashSet::new());
+        for (index, token) in tokens.into_iter().enumerate() {
+            if let Some(token_id) = self.map(&token) {
+                let position = token_positions[index];
+                if let Some(matched_positions) = matched_positions.as_mut() {
+                    matched_positions.insert(position);
+                }
+                token_ids.push((token_id, token, position));
+            }
+        }
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(required_positions) = required_positions.as_ref()
+            && let Some(matched_positions) = matched_positions.as_ref()
+            && !required_positions.is_subset(matched_positions)
+        {
+            return Ok(Vec::new());
+        }
+
+        token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
+        token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
+        let loaded_postings = stream::iter(token_ids)
+            .map(|(token_id, token, position)| async move {
+                let posting = self
+                    .inverted_list
+                    .posting_list(token_id, is_phrase_query, metrics)
+                    .await?;
+                Result::Ok((token_id, token, position, posting))
+            })
+            .buffered(self.store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        // A non-phrase OR already has exact union semantics in WAND, so keep
+        // fuzzy alternatives as independent doc-only iterators. Materializing
+        // a union is required only when one query position must act as a
+        // single required/positional clause.
+        let needs_union = Self::membership_requires_group_union(
+            operator,
+            is_phrase_query,
+            loaded_postings.iter().map(|(_, _, position, _)| *position),
+        );
+        if (is_and_query || is_phrase_query)
+            && !needs_union
+            && loaded_postings
+                .iter()
+                .any(|(_, _, _, posting)| posting.is_empty())
+        {
+            return Ok(Vec::new());
+        }
+
+        let num_docs = self.docs.len();
+        if !needs_union {
+            return Ok(loaded_postings
+                .into_iter()
+                .filter(|(_, _, _, posting)| !posting.is_empty())
+                .map(|(token_id, token, position, posting)| {
+                    Self::membership_posting_iterator(token, token_id, position, posting, num_docs)
+                })
+                .collect());
+        }
+
+        let mut membership_postings = Vec::new();
+        let mut iter = loaded_postings.into_iter().peekable();
+        while let Some((token_id, token, position, posting)) = iter.next() {
+            let mut group = vec![posting];
+            while matches!(iter.peek(), Some((_, _, next_position, _)) if *next_position == position)
+            {
+                let Some((_, _, _, posting)) = iter.next() else {
+                    return Err(Error::internal(
+                        "grouped membership posting disappeared after peek",
+                    ));
+                };
+                group.push(posting);
+            }
+            let posting = if group.len() == 1 {
+                let Some(posting) = group.pop() else {
+                    return Err(Error::internal(
+                        "single-item membership posting group was empty",
+                    ));
+                };
+                posting
+            } else {
+                Self::union_membership_posting_lists(group, is_phrase_query)?
+            };
+            if posting.is_empty() {
+                if is_and_query || is_phrase_query {
+                    return Ok(Vec::new());
+                }
+                continue;
+            }
+            membership_postings.push(Self::membership_posting_iterator(
+                token, token_id, position, posting, num_docs,
+            ));
+        }
+        Ok(membership_postings)
+    }
+
     // search the documents that contain the query
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
@@ -799,5 +1143,242 @@ impl InvertedPartition {
                 .push(posting_list.into_builder(&builder.docs));
         }
         Ok(builder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scalar::inverted::encoding::{
+        compress_posting_list_with_tail_codec_and_block_size, decode_varint_u32,
+        posting_block_score_prefix_len,
+    };
+
+    fn posting_with_positions(
+        doc_ids: &[u32],
+        positions_by_doc: &[Vec<u32>],
+        is_compressed: bool,
+    ) -> PostingList {
+        if is_compressed {
+            let mut builder = PostingListBuilder::new(true);
+            for (doc_id, positions) in doc_ids.iter().copied().zip(positions_by_doc) {
+                builder.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+            }
+            let batch = builder
+                .to_batch(vec![0.0; doc_ids.len().div_ceil(LEGACY_BLOCK_SIZE)])
+                .unwrap();
+            PostingList::from_batch(&batch, Some(0.0), Some(doc_ids.len() as u32)).unwrap()
+        } else {
+            let mut positions_builder = ListBuilder::new(Int32Builder::new());
+            for positions in positions_by_doc {
+                for position in positions {
+                    positions_builder.values().append_value(*position as i32);
+                }
+                positions_builder.append(true);
+            }
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from_iter(doc_ids.iter().map(|doc_id| u64::from(*doc_id))),
+                // Deliberately omit frequencies: membership preparation must
+                // read only row ids and positions from a plain phrase posting.
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                Some(positions_builder.finish()),
+            ))
+        }
+    }
+
+    fn posting_with_truncated_frequencies(
+        doc_ids: &[u32],
+        block_size: usize,
+    ) -> Result<PostingList> {
+        let frequencies = vec![7_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            PostingTailCodec::VarintDelta,
+            block_size,
+        )?;
+        let block = blocks.value(0);
+        let prefix_len = posting_block_score_prefix_len(block_size);
+        let doc_bits = usize::from(block[prefix_len + 4]);
+        let doc_payload_len = doc_bits * block_size / 8;
+        let doc_only_end = prefix_len + 5 + doc_payload_len;
+        let doc_only_blocks = LargeBinaryArray::from_iter_values([&block[..doc_only_end]]);
+        Ok(PostingList::Compressed(CompressedPostingList::new(
+            doc_only_blocks,
+            1.0,
+            doc_ids.len() as u32,
+            PostingTailCodec::VarintDelta,
+            block_size,
+            None,
+            None,
+        )))
+    }
+
+    fn posting_with_truncated_tail_frequencies(
+        doc_ids: &[u32],
+        block_size: usize,
+        tail_codec: PostingTailCodec,
+    ) -> Result<PostingList> {
+        let frequencies = vec![7_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            tail_codec,
+            block_size,
+        )?;
+        let block = blocks.value(0);
+        let prefix_len = posting_block_score_prefix_len(block_size);
+        let doc_only_end = match tail_codec {
+            PostingTailCodec::Fixed32 => prefix_len + doc_ids.len() * 4,
+            PostingTailCodec::VarintDelta => {
+                let mut offset = prefix_len;
+                for _ in doc_ids {
+                    decode_varint_u32(block, &mut offset)?;
+                }
+                offset
+            }
+        };
+        let doc_only_blocks = LargeBinaryArray::from_iter_values([&block[..doc_only_end]]);
+        Ok(PostingList::Compressed(CompressedPostingList::new(
+            doc_only_blocks,
+            1.0,
+            doc_ids.len() as u32,
+            tail_codec,
+            block_size,
+            None,
+            None,
+        )))
+    }
+
+    #[test]
+    fn membership_group_union_decodes_only_compressed_doc_ids() -> Result<()> {
+        for block_size in [LEGACY_BLOCK_SIZE, MAX_POSTING_BLOCK_SIZE] {
+            let even = (0..block_size as u32)
+                .map(|doc_id| doc_id * 2)
+                .collect::<Vec<_>>();
+            let odd = (0..block_size as u32)
+                .map(|doc_id| doc_id * 2 + 1)
+                .collect::<Vec<_>>();
+            let posting = InvertedPartition::union_membership_posting_lists(
+                vec![
+                    posting_with_truncated_frequencies(&even, block_size)?,
+                    posting_with_truncated_frequencies(&odd, block_size)?,
+                ],
+                false,
+            )?;
+            let actual = posting
+                .iter()
+                .map(|(doc_id, _, _)| doc_id)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, (0..(block_size * 2) as u64).collect::<Vec<_>>());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn membership_group_union_is_skipped_for_non_phrase_or() {
+        let grouped_positions = [0, 0, 1];
+        assert!(!InvertedPartition::membership_requires_group_union(
+            Operator::Or,
+            false,
+            grouped_positions,
+        ));
+        assert!(InvertedPartition::membership_requires_group_union(
+            Operator::And,
+            false,
+            grouped_positions,
+        ));
+        assert!(InvertedPartition::membership_requires_group_union(
+            Operator::Or,
+            true,
+            grouped_positions,
+        ));
+        assert!(!InvertedPartition::membership_requires_group_union(
+            Operator::And,
+            false,
+            [0, 1, 2],
+        ));
+    }
+
+    #[test]
+    fn membership_group_union_decodes_only_compressed_tail_doc_ids() -> Result<()> {
+        for block_size in [LEGACY_BLOCK_SIZE, MAX_POSTING_BLOCK_SIZE] {
+            for tail_codec in [PostingTailCodec::Fixed32, PostingTailCodec::VarintDelta] {
+                let posting = InvertedPartition::union_membership_posting_lists(
+                    vec![
+                        posting_with_truncated_tail_frequencies(
+                            &[2, 10, 30],
+                            block_size,
+                            tail_codec,
+                        )?,
+                        posting_with_truncated_tail_frequencies(
+                            &[3, 10, 40],
+                            block_size,
+                            tail_codec,
+                        )?,
+                    ],
+                    false,
+                )?;
+                let actual = posting
+                    .iter()
+                    .map(|(doc_id, _, _)| doc_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, vec![2, 3, 10, 30, 40]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn membership_group_union_preserves_phrase_positions() -> Result<()> {
+        for is_compressed in [false, true] {
+            let posting = InvertedPartition::union_membership_posting_lists(
+                vec![
+                    posting_with_positions(&[0, 2], &[vec![0, 4], vec![2]], is_compressed),
+                    posting_with_positions(&[0, 1], &[vec![1], vec![3]], is_compressed),
+                ],
+                true,
+            )?;
+            let actual = posting
+                .iter()
+                .map(|(doc_id, _, positions)| {
+                    (
+                        doc_id,
+                        positions
+                            .map(Iterator::collect::<Vec<_>>)
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, vec![(0, vec![0, 1, 4]), (1, vec![3]), (2, vec![2])]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn membership_phrase_union_rejects_missing_positions() {
+        let posting = || {
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(vec![1_u64]),
+                ScalarBuffer::from(vec![1.0_f32]),
+                None,
+                None,
+            ))
+        };
+        let error =
+            InvertedPartition::union_membership_posting_lists(vec![posting(), posting()], true)
+                .unwrap_err();
+        assert!(matches!(&error, Error::Index { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot union grouped phrase terms without positions"),
+            "{error}"
+        );
     }
 }

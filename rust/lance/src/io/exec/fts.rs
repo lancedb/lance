@@ -45,11 +45,12 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
-    COMPOUND_MUST_NOT_PROBES_METRIC, COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC,
-    COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, COMPOUND_POSITIVE_SURVIVORS_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
-    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    COMPOUND_MUST_NOT_POSTING_LOADS_METRIC, COMPOUND_MUST_NOT_PROBES_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_POSITIVE_SURVIVORS_METRIC, COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC, COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -1063,6 +1064,7 @@ pub struct FtsIndexMetrics {
     compound_peak_buffered_candidates: Gauge,
     compound_positive_survivors: Count,
     compound_must_not_probes: Count,
+    compound_must_not_posting_loads: Count,
     compound_should_skipped_windows: Count,
     compound_should_bound_recomputations: Count,
     compound_should_essential_evaluations: Count,
@@ -1099,6 +1101,8 @@ impl FtsIndexMetrics {
             compound_positive_survivors: metrics
                 .new_count(COMPOUND_POSITIVE_SURVIVORS_METRIC, partition),
             compound_must_not_probes: metrics.new_count(COMPOUND_MUST_NOT_PROBES_METRIC, partition),
+            compound_must_not_posting_loads: metrics
+                .new_count(COMPOUND_MUST_NOT_POSTING_LOADS_METRIC, partition),
             compound_should_skipped_windows: metrics
                 .new_count(COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, partition),
             compound_should_bound_recomputations: metrics
@@ -1187,6 +1191,10 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_compound_must_not_probes(&self, num_probes: usize) {
         self.compound_must_not_probes.add(num_probes);
+    }
+
+    fn record_compound_must_not_posting_loads(&self, num_loads: usize) {
+        self.compound_must_not_posting_loads.add(num_loads);
     }
 
     fn record_compound_should_skipped_windows(&self, num_windows: usize) {
@@ -3567,6 +3575,7 @@ mod tests {
 
         metrics.record_compound_positive_survivors(11);
         metrics.record_compound_must_not_probes(13);
+        metrics.record_compound_must_not_posting_loads(17);
         metrics.record_compound_should_skipped_windows(2);
         metrics.record_compound_should_bound_recomputations(3);
         metrics.record_compound_should_essential_evaluations(5);
@@ -3574,6 +3583,7 @@ mod tests {
 
         assert_eq!(metrics.compound_positive_survivors.value(), 11);
         assert_eq!(metrics.compound_must_not_probes.value(), 13);
+        assert_eq!(metrics.compound_must_not_posting_loads.value(), 17);
         assert_eq!(metrics.compound_should_skipped_windows.value(), 2);
         assert_eq!(metrics.compound_should_bound_recomputations.value(), 3);
         assert_eq!(metrics.compound_should_essential_evaluations.value(), 5);

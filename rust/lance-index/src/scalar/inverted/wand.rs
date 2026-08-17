@@ -32,7 +32,8 @@ use super::{
     builder::ScoredDoc,
     encoding::{
         MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
-        decompress_posting_block, decompress_posting_remainder, seek_packed_doc_positions,
+        decompress_posting_block, decompress_posting_block_doc_ids, decompress_posting_remainder,
+        decompress_posting_remainder_doc_ids, seek_packed_doc_positions,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -387,6 +388,8 @@ pub struct PostingIterator {
     // the index of current block, this can be changed by `next() and shallow_next()`
     block_idx: usize,
     current_doc: Option<DocInfo>,
+    decode_mode: PostingDecodeMode,
+    is_initialized: bool,
     approximate_upper_bound: f32,
     // Stored block maxima may use partition-local statistics. Queries scored
     // with corpus-wide statistics must use a scorer-provided bound instead.
@@ -403,9 +406,23 @@ pub struct PostingIterator {
     compressed: Option<UnsafeCell<CompressedState>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostingDecodeMode {
+    Full,
+    DocIdsOnly,
+}
+
+impl PostingDecodeMode {
+    #[inline]
+    fn needs_frequencies(self) -> bool {
+        self == Self::Full
+    }
+}
+
 #[derive(Clone)]
 struct CompressedState {
     block_idx: usize,
+    decode_mode: PostingDecodeMode,
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
     buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
@@ -434,6 +451,7 @@ impl CompressedState {
     fn new(block_size: usize) -> Self {
         Self {
             block_idx: 0,
+            decode_mode: PostingDecodeMode::Full,
             doc_ids: Vec::with_capacity(block_size),
             freqs: Vec::with_capacity(block_size),
             buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
@@ -466,15 +484,25 @@ impl CompressedState {
 
         let remainder = length as usize % block_size;
         if block_idx + 1 == num_blocks && remainder != 0 {
-            decompress_posting_remainder(
-                block,
-                remainder,
-                tail_codec,
-                block_size,
-                &mut self.doc_ids,
-                &mut self.freqs,
-            );
-        } else {
+            if self.decode_mode.needs_frequencies() {
+                decompress_posting_remainder(
+                    block,
+                    remainder,
+                    tail_codec,
+                    block_size,
+                    &mut self.doc_ids,
+                    &mut self.freqs,
+                );
+            } else {
+                decompress_posting_remainder_doc_ids(
+                    block,
+                    remainder,
+                    tail_codec,
+                    block_size,
+                    &mut self.doc_ids,
+                );
+            }
+        } else if self.decode_mode.needs_frequencies() {
             decompress_posting_block(
                 block,
                 &mut self.buffer[..],
@@ -482,6 +510,18 @@ impl CompressedState {
                 &mut self.freqs,
                 block_size,
             );
+        } else {
+            decompress_posting_block_doc_ids(
+                block,
+                &mut self.buffer[..],
+                &mut self.doc_ids,
+                block_size,
+            );
+        }
+        if !self.decode_mode.needs_frequencies() {
+            // Keep the hot cursor path identical for scoring and membership:
+            // one mode branch per decoded block, not one branch per document.
+            self.freqs.resize(self.doc_ids.len(), 0);
         }
         self.block_idx = block_idx;
         self.position_block_idx = None;
@@ -606,10 +646,11 @@ impl Debug for PostingIterator {
             .field(
                 "doc",
                 &self
-                    .doc()
+                    .current_doc
                     .map(|doc| doc.doc_id())
                     .unwrap_or(TERMINATED_DOC_ID),
             )
+            .field("is_initialized", &self.is_initialized)
             .field("approximate_upper_bound", &self.approximate_upper_bound)
             .field("token_id", &self.token_id)
             .finish()
@@ -799,6 +840,30 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
     ) -> Self {
+        let mut posting = Self::with_query_weight_deferred(
+            token,
+            token_id,
+            position,
+            query_weight,
+            list,
+            num_doc,
+        );
+        posting.initialize(PostingDecodeMode::Full);
+        posting
+    }
+
+    /// Build an iterator without decoding its first block. The owning WAND
+    /// selects full or document-only decoding before it initializes the
+    /// iterator, avoiding an otherwise wasted frequency decode for prohibited
+    /// membership leaves.
+    pub(crate) fn with_query_weight_deferred(
+        token: String,
+        token_id: u32,
+        position: u32,
+        query_weight: f32,
+        list: PostingList,
+        num_doc: usize,
+    ) -> Self {
         // BM25's doc weight is bounded by K1 + 1 for any freq and doc length,
         // so query_weight * (K1 + 1) is a valid global bound even when index
         // stats drift after appends. Keeping it finite matters: an INFINITY
@@ -821,7 +886,7 @@ impl PostingIterator {
             PostingList::Plain(_) => None,
         };
 
-        let mut posting = Self {
+        Self {
             token,
             token_id,
             position,
@@ -830,14 +895,62 @@ impl PostingIterator {
             index: 0,
             block_idx: 0,
             current_doc: None,
+            decode_mode: PostingDecodeMode::Full,
+            is_initialized: false,
             approximate_upper_bound,
             use_scorer_upper_bound: false,
             grouped_terms: None,
             position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
+        }
+    }
+
+    fn initialize(&mut self, decode_mode: PostingDecodeMode) {
+        if self.is_initialized && self.decode_mode == decode_mode {
+            return;
+        }
+        self.decode_mode = decode_mode;
+        self.is_initialized = true;
+        self.current_doc = None;
+        if let Some(compressed) = self.compressed.as_ref() {
+            let compressed = unsafe { &mut *compressed.get() };
+            compressed.decode_mode = decode_mode;
+            compressed.doc_ids.clear();
+            compressed.freqs.clear();
+            compressed.position_block_idx = None;
+            compressed.position_values.clear();
+            compressed.position_offsets.clear();
+        }
+        self.refresh_current_doc();
+    }
+
+    /// Create a fresh deferred cursor over the same immutable posting data.
+    /// The caller's WAND chooses the decode mode when it initializes the fork.
+    pub(super) fn fork_from_start(&self) -> Self {
+        let list = self.list.clone();
+        let compressed = match &list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
         };
-        posting.refresh_current_doc();
-        posting
+        Self {
+            token: self.token.clone(),
+            token_id: self.token_id,
+            position: self.position,
+            query_weight: self.query_weight,
+            list,
+            index: 0,
+            block_idx: 0,
+            current_doc: None,
+            decode_mode: PostingDecodeMode::Full,
+            is_initialized: false,
+            approximate_upper_bound: self.approximate_upper_bound,
+            use_scorer_upper_bound: self.use_scorer_upper_bound,
+            grouped_terms: self.grouped_terms.clone(),
+            position_scratch: RefCell::new(Some(Vec::new())),
+            compressed,
+        }
     }
 
     pub(super) fn with_scorer_upper_bound(mut self) -> Self {
@@ -898,6 +1011,11 @@ impl PostingIterator {
 
     #[inline]
     fn score<S: Scorer + ?Sized>(&self, scorer: &S, freq: u32, doc_length: u32) -> f32 {
+        debug_assert_eq!(
+            self.decode_mode,
+            PostingDecodeMode::Full,
+            "membership-only posting iterator must not score documents"
+        );
         if let (Some(grouped_terms), Some(doc)) = (&self.grouped_terms, self.current_doc) {
             return grouped_terms
                 .iter()
@@ -924,6 +1042,10 @@ impl PostingIterator {
 
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
+        debug_assert!(
+            self.is_initialized,
+            "posting iterator must be initialized by its owning WAND"
+        );
         self.current_doc
     }
 
@@ -951,6 +1073,11 @@ impl PostingIterator {
     }
 
     fn position_cursor(&self) -> Result<PositionCursor<'_>> {
+        if !self.decode_mode.needs_frequencies() {
+            return Err(Error::internal(
+                "positions requested from a document-id-only posting iterator",
+            ));
+        }
         match self.list {
             PostingList::Plain(ref list) => {
                 let positions = list.positions.as_ref().ok_or_else(|| {
@@ -1099,6 +1226,10 @@ impl PostingIterator {
 
     // move to the next doc id that is greater than or equal to least_id
     fn next(&mut self, least_id: u64) {
+        debug_assert!(
+            self.is_initialized,
+            "posting iterator must be initialized before advancing"
+        );
         match self.list {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
@@ -1444,6 +1575,7 @@ pub(super) fn validate_modern_posting_doc_ids(
         ))
     })?;
     let mut state = CompressedState::new(list.block_size);
+    state.decode_mode = PostingDecodeMode::DocIdsOnly;
     state.decompress(
         list.blocks.value(last_block_idx),
         last_block_idx,
@@ -1997,9 +2129,41 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         documents: &'a D,
         scorer: S,
     ) -> Self {
+        Self::new_with_posting_decode_mode(
+            operator,
+            postings,
+            documents,
+            scorer,
+            PostingDecodeMode::Full,
+        )
+    }
+
+    fn new_membership(
+        operator: Operator,
+        postings: impl Iterator<Item = PostingIterator>,
+        documents: &'a D,
+        scorer: S,
+        needs_positions: bool,
+    ) -> Self {
+        let decode_mode = if needs_positions {
+            PostingDecodeMode::Full
+        } else {
+            PostingDecodeMode::DocIdsOnly
+        };
+        Self::new_with_posting_decode_mode(operator, postings, documents, scorer, decode_mode)
+    }
+
+    fn new_with_posting_decode_mode(
+        operator: Operator,
+        postings: impl Iterator<Item = PostingIterator>,
+        documents: &'a D,
+        scorer: S,
+        decode_mode: PostingDecodeMode,
+    ) -> Self {
         let mut head = BinaryHeap::new();
         let mut lead = Vec::new();
-        for posting in postings {
+        for mut posting in postings {
+            posting.initialize(decode_mode);
             if posting.doc().is_none() {
                 continue;
             }
@@ -4505,8 +4669,18 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             ),
         }
         .unwrap_or_default();
+        let wand = match mode {
+            WandCursorMode::Scoring => Wand::new(operator, postings.into_iter(), documents, scorer),
+            WandCursorMode::Membership => Wand::new_membership(
+                operator,
+                postings.into_iter(),
+                documents,
+                scorer,
+                params.phrase_slop.is_some(),
+            ),
+        };
         Self {
-            wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            wand,
             mode,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
@@ -5129,7 +5303,7 @@ mod tests {
             docs.append(row_id, 8);
         }
         let postings = vec![
-            PostingIterator::with_query_weight(
+            PostingIterator::with_query_weight_deferred(
                 String::from("alpha"),
                 0,
                 0,
@@ -5137,7 +5311,7 @@ mod tests {
                 generate_posting_list(vec![0, 2, 4], 1.0, None, is_compressed),
                 docs.len(),
             ),
-            PostingIterator::with_query_weight(
+            PostingIterator::with_query_weight_deferred(
                 String::from("beta"),
                 1,
                 1,
@@ -5147,13 +5321,14 @@ mod tests {
             ),
         ];
         let scored = Arc::new(AtomicUsize::new(0));
-        let mut wand = Wand::new(
+        let mut wand = Wand::new_membership(
             Operator::Or,
             postings.into_iter(),
             &docs,
             CountingScorer {
                 scored: scored.clone(),
             },
+            false,
         );
 
         let mut actual = Vec::new();
@@ -5167,6 +5342,174 @@ mod tests {
     }
 
     #[rstest]
+    fn membership_conjunction_intersects_docs_without_scoring(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        for row_id in 0..5 {
+            docs.append(row_id, 8);
+        }
+        let postings = vec![
+            PostingIterator::with_query_weight_deferred(
+                String::from("alpha"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(vec![0, 2, 4], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight_deferred(
+                String::from("beta"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(vec![1, 2, 4], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new_membership(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+            false,
+        );
+
+        let mut actual = Vec::new();
+        while let Some(doc) = wand.next_membership() {
+            actual.push(doc.doc_id());
+        }
+
+        assert_eq!(actual, vec![2, 4]);
+        assert_eq!(scored.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn membership_posting_synthesizes_zero_frequencies_across_blocks() {
+        let total = BLOCK_SIZE + 7;
+        let mut posting = PostingIterator::with_query_weight_deferred(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(
+                (0..total as u32).collect(),
+                (0..total as u32).map(|value| value % 9 + 1).collect(),
+                1.0,
+                None,
+                true,
+            ),
+            total,
+        );
+
+        posting.initialize(PostingDecodeMode::DocIdsOnly);
+        assert_eq!(posting.doc().unwrap().doc_id(), 0);
+        let compressed = unsafe { &*posting.compressed_state_ptr() };
+        assert_eq!(compressed.doc_ids.len(), BLOCK_SIZE);
+        assert_eq!(compressed.freqs, vec![0; BLOCK_SIZE]);
+
+        posting.next((BLOCK_SIZE + 3) as u64);
+        assert_eq!(posting.doc().unwrap().doc_id(), (BLOCK_SIZE + 3) as u64);
+        let compressed = unsafe { &*posting.compressed_state_ptr() };
+        assert_eq!(compressed.doc_ids.len(), 7);
+        assert_eq!(compressed.freqs, vec![0; 7]);
+    }
+
+    #[test]
+    fn deferred_scoring_posting_still_decodes_frequencies() {
+        let total = BLOCK_SIZE + 7;
+        let frequencies = (0..total as u32)
+            .map(|value| value % 9 + 1)
+            .collect::<Vec<_>>();
+        let mut posting = PostingIterator::with_query_weight_deferred(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(
+                (0..total as u32).collect(),
+                frequencies.clone(),
+                1.0,
+                None,
+                true,
+            ),
+            total,
+        );
+
+        posting.initialize(PostingDecodeMode::Full);
+        assert_eq!(posting.doc().unwrap().frequency(), frequencies[0]);
+        let compressed = unsafe { &*posting.compressed_state_ptr() };
+        assert_eq!(compressed.freqs, frequencies[..BLOCK_SIZE]);
+
+        posting.next((BLOCK_SIZE + 3) as u64);
+        assert_eq!(
+            posting.doc().unwrap().frequency(),
+            frequencies[BLOCK_SIZE + 3]
+        );
+        let compressed = unsafe { &*posting.compressed_state_ptr() };
+        assert_eq!(compressed.freqs, frequencies[BLOCK_SIZE..]);
+    }
+
+    #[test]
+    fn posting_fork_restarts_with_shared_backing_and_fresh_decode_state() {
+        let total = BLOCK_SIZE + 7;
+        let frequencies = (0..total as u32)
+            .map(|value| value % 9 + 1)
+            .collect::<Vec<_>>();
+        let list = generate_posting_list_with_freqs(
+            (0..total as u32).collect(),
+            frequencies.clone(),
+            1.0,
+            None,
+            true,
+        );
+        let grouped_terms = Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(2.0, &list)]);
+        let mut original =
+            PostingIterator::with_query_weight(String::from("term"), 7, 3, 2.5, list, total)
+                .with_scorer_upper_bound()
+                .with_grouped_terms(grouped_terms);
+        original.next((BLOCK_SIZE + 3) as u64);
+
+        let mut fork = original.fork_from_start();
+        assert!(!fork.is_initialized);
+        assert_eq!(fork.index, 0);
+        assert_eq!(fork.current_doc, None);
+        assert_eq!(fork.token, original.token);
+        assert_eq!(fork.token_id, original.token_id);
+        assert_eq!(fork.position, original.position);
+        assert_eq!(fork.query_weight, original.query_weight);
+        assert_eq!(
+            fork.approximate_upper_bound,
+            original.approximate_upper_bound
+        );
+        assert!(fork.use_scorer_upper_bound);
+        assert!(Arc::ptr_eq(
+            fork.grouped_terms.as_ref().unwrap(),
+            original.grouped_terms.as_ref().unwrap()
+        ));
+        let (PostingList::Compressed(original_list), PostingList::Compressed(fork_list)) =
+            (&original.list, &fork.list)
+        else {
+            panic!("expected compressed posting lists");
+        };
+        assert_eq!(
+            original_list.blocks.values().as_ptr(),
+            fork_list.blocks.values().as_ptr()
+        );
+        let compressed = unsafe { &*fork.compressed_state_ptr() };
+        assert!(compressed.doc_ids.is_empty());
+        assert!(compressed.freqs.is_empty());
+
+        fork.initialize(PostingDecodeMode::Full);
+        assert_eq!(fork.doc().unwrap().doc_id(), 0);
+        assert_eq!(fork.doc().unwrap().frequency(), frequencies[0]);
+        assert_eq!(original.doc().unwrap().doc_id(), (BLOCK_SIZE + 3) as u64);
+    }
+
+    #[rstest]
     fn membership_phrase_confirms_positions_without_scoring(
         #[values(false, true)] is_compressed: bool,
     ) {
@@ -5174,7 +5517,7 @@ mod tests {
         docs.append(0, 8);
         docs.append(1, 8);
         let postings = vec![
-            PostingIterator::with_query_weight(
+            PostingIterator::with_query_weight_deferred(
                 String::from("alpha"),
                 0,
                 0,
@@ -5187,7 +5530,7 @@ mod tests {
                 ),
                 docs.len(),
             ),
-            PostingIterator::with_query_weight(
+            PostingIterator::with_query_weight_deferred(
                 String::from("beta"),
                 1,
                 1,
@@ -5202,13 +5545,14 @@ mod tests {
             ),
         ];
         let scored = Arc::new(AtomicUsize::new(0));
-        let mut wand = Wand::new(
+        let mut wand = Wand::new_membership(
             Operator::And,
             postings.into_iter(),
             &docs,
             CountingScorer {
                 scored: scored.clone(),
             },
+            true,
         );
 
         let first = wand.next_membership().unwrap();
