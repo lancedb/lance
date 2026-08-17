@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Recording on a Lance scan's source how it will find its rows.
+//! Recording on a Lance scan's source how it will find its rows: a scalar index query, or a row
+//! restriction that makes the read a take.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -10,10 +11,14 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
+use datafusion::logical_expr::utils::conjunction;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 
+use lance_select::mask::RowAddrTreeMap;
+
 use super::context::ScanPlanningContext;
-use super::source::LanceScanSource;
+use super::source::{LanceScanSource, ScanRestriction};
+use crate::dataset::scanner::TakeOperation;
 
 /// Derive each Lance scan's scalar index query and record it on the scan's source.
 ///
@@ -104,4 +109,79 @@ pub fn map_lance_scan(
             Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
         })?
         .data)
+}
+
+/// Turn a predicate that names its rows into a direct take.
+///
+/// `_rowid IN (10, 20)` leaves nothing to search for: the ids *are* the selection. Recording them
+/// on the scan's source is the logical-layer version of `Scanner::take_source`, which assembles the
+/// same read by hand.
+///
+/// Row ids are resolved here; `_rowaddr` names a physical position, and turning those into row ids
+/// reads row-id sequences and deletion vectors, so stage 2 does it and this looks the answer up.
+///
+/// Runs after `PushDownFilter`, so the predicate has reached the scan, and before
+/// [`ResolveScalarIndexQuery`] — a row restriction and a scalar index query compete for the same
+/// slot on the read, and this one wins.
+#[derive(Debug)]
+pub struct ResolveTake {
+    context: Arc<ScanPlanningContext>,
+}
+
+impl ResolveTake {
+    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
+        Self { context }
+    }
+
+    /// The row ids a take selects, or `None` when the plan cannot be rewritten.
+    ///
+    /// A stage-2 miss means it walked a different plan than this one, so the predicate is left
+    /// alone rather than guessed at: reading every row and filtering is slower, not wrong.
+    fn rows_for(&self, take: &TakeOperation) -> Option<Arc<RowAddrTreeMap>> {
+        match take {
+            TakeOperation::RowIds(ids) => {
+                Some(Arc::new(RowAddrTreeMap::from_iter(ids.iter().copied())))
+            }
+            _ => self.context.take_rows(take).cloned(),
+        }
+    }
+}
+
+impl OptimizerRule for ResolveTake {
+    fn name(&self) -> &str {
+        "resolve_take"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::TableScan(scan) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let restrictable = with_lance_source(&plan, |source| source.options().rows.is_none());
+        if restrictable != Some(true) || scan.filters.is_empty() {
+            return Ok(Transformed::no(plan));
+        }
+        let Some(predicate) = conjunction(unnormalize_cols(scan.filters.iter().cloned())) else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some((take, remainder)) = TakeOperation::try_from_expr(&predicate) else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(rows) = self.rows_for(&take) else {
+            return Ok(Transformed::no(plan));
+        };
+        let mut scan = scan.clone();
+        scan.filters = remainder.into_iter().collect();
+        let restricted = LogicalPlan::TableScan(scan);
+        Ok(Transformed::yes(map_lance_scan(&restricted, |source| {
+            source.restricted_to(&ScanRestriction::Rows(rows.clone()))
+        })?))
+    }
 }

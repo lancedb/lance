@@ -19,6 +19,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -30,7 +31,8 @@ use lance_core::{
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_select::result::IndexExprResultWireFormat;
+use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_select::result::{IndexExprResult, IndexExprResultWireFormat};
 use lance_table::format::Fragment;
 
 use crate::dataset::scanner::MaterializationStyle;
@@ -42,6 +44,13 @@ use crate::io::exec::filtered_read::{
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{FilterPlan as ExprFilterPlan, Planner};
 use crate::{Error, Result};
+
+/// How a scan is narrowed to the rows one part of the plan is responsible for.
+#[derive(Debug, Clone)]
+pub enum ScanRestriction {
+    /// Read only these rows, identified by row id.
+    Rows(Arc<RowAddrTreeMap>),
+}
 
 /// The subset of [`Scanner`](crate::dataset::Scanner) state that reaches the scan leaf.
 ///
@@ -76,6 +85,11 @@ pub struct ScanSourceOptions {
     /// A branch of a coverage split keeps this, and should: the branches read disjoint fragment
     /// sets, so between them they still emit every deleted row exactly once.
     pub include_deleted_rows: bool,
+    /// Read only these rows, from [`ScanRestriction::Rows`].
+    ///
+    /// The row set arrives through the same leaf slot a scalar-index result would, so a scan
+    /// restricted this way cannot also consult a scalar index.
+    pub rows: Option<Arc<RowAddrTreeMap>>,
     /// How this scan's predicate splits into a scalar index query and a refine filter.
     ///
     /// `None` means nothing has resolved it yet and the leaf will do so itself. Filling this in is
@@ -111,6 +125,7 @@ impl std::fmt::Debug for ScanSourceOptions {
             .field("fast_search", &self.fast_search)
             .field("index_segments", &self.index_segments)
             .field("include_deleted_rows", &self.include_deleted_rows)
+            .field("rows", &self.rows)
             .field("filter_plan", &self.filter_plan)
             .field("legacy", &self.legacy_scanner.is_some())
             .finish()
@@ -173,6 +188,29 @@ impl LanceScanSource {
 
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
+    }
+
+    /// The scan-wide settings this leaf was built with.
+    ///
+    /// Read from here rather than from the `Scanner`, which is what lets stages 2 through 4 run
+    /// against any plan whose leaf is a Lance scan.
+    pub fn options(&self) -> &ScanSourceOptions {
+        &self.options
+    }
+
+    /// The same source, reading only the rows `restriction` names.
+    ///
+    /// The schema is unchanged, so a `TableScan`'s `projected_schema` stays valid across the swap.
+    pub fn restricted_to(&self, restriction: &ScanRestriction) -> Self {
+        let options = match restriction {
+            ScanRestriction::Rows(rows) => ScanSourceOptions {
+                rows: Some(rows.clone()),
+                use_scalar_index: false,
+                filter_plan: None,
+                ..self.options.clone()
+            },
+        };
+        self.with_options(options)
     }
 
     /// How this scan's predicate splits into a scalar index query and a refine filter, once a rule
@@ -410,6 +448,21 @@ impl LanceScanSource {
     /// mask. That does not by itself make the scan re-executable — `FilteredReadExec` drains one
     /// shared task stream per instance, so every Lance scan plan is single-execution — but it keeps
     /// the reason for that in one place instead of two.
+    /// A row restriction, shaped as the scalar-index result the leaf reads its rows from.
+    fn rows_as_index_input(&self, rows: &RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
+        let result = IndexExprResult::exact(RowAddrMask::from_allowed(rows.clone()));
+        let batch = result.serialize(
+            self.dataset.fragment_bitmap.as_ref(),
+            self.options.index_expr_result_format,
+        )?;
+        let schema = batch.schema();
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )?)
+    }
+
     fn fragments(&self) -> &Arc<Vec<Fragment>> {
         self.options
             .fragments
@@ -534,13 +587,18 @@ impl LanceScanSource {
             read_options = read_options.with_scan_range_before_filter(scan_range)?;
         }
 
-        let index_input = filter_plan.index_query.map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                self.options.index_expr_result_format,
-            )) as Arc<dyn ExecutionPlan>
-        });
+        // A row restriction and a scalar-index query compete for the same slot, and
+        // `restricted_to` has already turned the index off in that case.
+        let index_input = match &self.options.rows {
+            Some(rows) => Some(self.rows_as_index_input(rows)?),
+            None => filter_plan.index_query.map(|index_query| {
+                Arc::new(ScalarIndexExec::new(
+                    self.dataset.clone(),
+                    index_query,
+                    self.options.index_expr_result_format,
+                )) as Arc<dyn ExecutionPlan>
+            }),
+        };
 
         let plan = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
