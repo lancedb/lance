@@ -352,6 +352,53 @@ async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
 }
 
 #[tokio::test]
+async fn test_v8_decimal_zonemap_missing_extrema() {
+    async fn query_ids(
+        dataset: &Dataset,
+        predicate: &str,
+        use_scalar_index: bool,
+    ) -> (String, Vec<i64>) {
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .use_scalar_index(use_scalar_index)
+            .filter(predicate)
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        (plan, ids)
+    }
+
+    let test_dir = copy_test_data_to_tmp("v8.0.0/decimal_zonemap").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    for predicate in [
+        "value = arrow_cast(2.00, 'Decimal128(10, 2)')",
+        "value >= arrow_cast(2.00, 'Decimal128(10, 2)') AND \
+         value < arrow_cast(3.00, 'Decimal128(10, 2)')",
+        "value IN (arrow_cast(2.00, 'Decimal128(10, 2)'), \
+         arrow_cast(4.00, 'Decimal128(10, 2)'))",
+    ] {
+        let (indexed_plan, indexed_ids) = query_ids(&dataset, predicate, true).await;
+        let (flat_plan, flat_ids) = query_ids(&dataset, predicate, false).await;
+
+        assert!(indexed_plan.contains("ScalarIndexQuery"), "{indexed_plan}");
+        assert!(!flat_plan.contains("ScalarIndexQuery"), "{flat_plan}");
+        assert_eq!(
+            indexed_ids, flat_ids,
+            "indexed query diverged for {predicate}"
+        );
+        assert_eq!(flat_ids, vec![2]);
+    }
+}
+
+#[tokio::test]
 async fn test_max_fragment_id_migration() {
     // v0.5.9 and earlier did not store the max fragment id in the manifest.
     // This test ensures that we can read such datasets and migrate them to

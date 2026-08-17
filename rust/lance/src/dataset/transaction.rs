@@ -22,7 +22,7 @@ use crate::index::mem_wal::{
 };
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
-    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::deepsize::DeepSizeOf;
@@ -35,6 +35,7 @@ use lance_table::feature_flags::{
     FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
@@ -2810,6 +2811,9 @@ impl Transaction {
                     // TODO(rmeng): check new file and fragment are the same length
 
                     let mut columns_covered = HashSet::new();
+                    // Set when an existing file covers exactly the replaced
+                    // fields, so the whole file swaps rather than part of it.
+                    let mut replaced_in_place = false;
                     for file in &mut new_frag.files {
                         if file.fields == new_file.fields
                             && file.file_major_version == new_file.file_major_version
@@ -2819,16 +2823,78 @@ impl Transaction {
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
                             file.base_id = new_file.base_id;
+                            replaced_in_place = true;
                         }
                         columns_covered.extend(file.fields.iter());
                     }
+                    // Reject a file whose version does not decode before any
+                    // arm publishes it.
+                    new_file.file_version()?;
+
                     // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
                     // Then it means it's a all-NULL column that is being replaced with real data
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_file.file_version()?;
-
+                        new_frag.files.push(new_file.clone());
+                    } else if !replaced_in_place
+                        && new_file.fields.iter().all(|field| {
+                            let mut covering = new_frag
+                                .files
+                                .iter()
+                                .filter(|file| file.fields.contains(field))
+                                .peekable();
+                            // Covered by something, and by nothing we cannot
+                            // tombstone. A field no file covers leaves the
+                            // mixed layout the error below reports.
+                            covering.peek().is_some()
+                                && covering.all(|file| {
+                                    file.file_version()
+                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                })
+                        })
+                    {
+                        // Tombstone the replaced fields where they live and
+                        // append the new file to answer for them, the idiom
+                        // `update_columns` uses. Compaction decides that layout,
+                        // so the fields may sit in one wider file or span
+                        // several.
+                        //
+                        // Legacy V1 is excluded: its reader derives the page table
+                        // offset from the first field in the metadata, so
+                        // tombstoning one field leaves its siblings decoding from
+                        // the wrong pages. A field a V1 file covers keeps
+                        // exact-match replacement.
+                        for file in &mut new_frag.files {
+                            // Same reason as the guard above.
+                            if file.file_version()? == ConcreteFileVersion::V1 {
+                                continue;
+                            }
+                            file.fields = file
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    if new_file.fields.contains(field) {
+                                        TOMBSTONE_FIELD_ID
+                                    } else {
+                                        *field
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into();
+                        }
+                        // Every data file must share at least one field with
+                        // the dataset schema: a file kept alive only by
+                        // tombstones or by ids the schema no longer defines is
+                        // unreachable to readers, uncollectable by cleanup,
+                        // and reported corrupt by validate().
+                        let live_ids = schema
+                            .fields_pre_order()
+                            .map(|field| field.id)
+                            .collect::<HashSet<i32>>();
+                        new_frag
+                            .files
+                            .retain(|file| file.fields.iter().any(|f| live_ids.contains(f)));
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -2839,13 +2905,22 @@ impl Transaction {
                         ));
                     }
 
-                    // New base values for these fields supersede any overlay
-                    // still shadowing them; tombstone the overlaid fields so the
-                    // replacement is not silently masked.
+                    // New base values supersede any overlay still shadowing
+                    // them, so tombstone the overlaid fields. An overlay
+                    // committed after this transaction's snapshot is the newer
+                    // value though -- the conflict resolver rebases these two
+                    // precisely because the overlay wins -- so it stays, and
+                    // being newer it stays last, preserving the ordering.
+                    let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
+                        .overlays
+                        .drain(..)
+                        .partition(|overlay| overlay.committed_version <= self.read_version);
                     lance_table::format::overlay::tombstone_overlay_fields(
-                        &mut new_frag.overlays,
+                        &mut superseded,
                         &replaced_fields,
                     );
+                    superseded.extend(newer);
+                    new_frag.overlays = superseded;
 
                     final_fragments.push(new_frag);
                 }
@@ -4621,6 +4696,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments, schema, ..
         } => {
             merge_fragments_valid(manifest, fragments)?;
+            merge_schema_valid(manifest, schema, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
@@ -4823,16 +4899,177 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     Ok(())
 }
 
+/// Validate that a Merge schema preserves the dataset's field id bindings.
+///
+/// Readers resolve columns by field id (name -> schema id -> DataFile::fields
+/// position), so renumbered ids silently rebind live columns to other columns'
+/// bytes. Shared ids must keep their field path. Their logical type,
+/// nullability, storage encoding, and dictionary may change only when every
+/// existing base or overlay file carrying the id is replaced and every
+/// proposed fragment materializes the id in a base data file. New ids must
+/// exceed the manifest's max so a dropped field's id is never reused. An
+/// existing path may move to a fresh id only when every proposed fragment
+/// materializes that id in a base data file (the `alter_columns` cast path).
+/// Omitting a field (dropping it) and updating field metadata remain legal.
+fn merge_schema_valid(
+    manifest: &Manifest,
+    new_schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    let prior_schema = &manifest.schema;
+    let new_fragment_map: HashMap<u64, &Fragment> = fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+
+    // Remap and semantic errors first: a renumbered schema usually violates
+    // both the shared-id and new-id clauses.
+    for field in new_schema.fields_pre_order() {
+        let Some(prior_field) = prior_schema.field_by_id(field.id) else {
+            continue;
+        };
+        let prior_path = prior_schema.field_path(field.id)?;
+        let new_path = new_schema.field_path(field.id)?;
+        if prior_path != new_path {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps field id {} from \"{}\" to \"{}\". \
+                 Merge must preserve the dataset's field ids: derive the new schema \
+                 from the dataset's current schema instead of renumbering fields.",
+                field.id, prior_path, new_path
+            )));
+        }
+        if let Some(changes) = shared_field_binding_changes(prior_field, field)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Merge operation changes field id {} (\"{}\") without rewriting it in \
+                 every existing fragment: {}. Merge must preserve each existing field's \
+                 logical type, nullability, storage encoding, and dictionary unless all \
+                 existing base and overlay files carrying that field are replaced.",
+                field.id, new_path, changes
+            )));
+        }
+    }
+
+    let max_field_id = manifest.max_field_id();
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_none() && field.id <= max_field_id {
+            let next_id_msg = match max_field_id.checked_add(1) {
+                Some(next_id) => format!("New fields must use ids of at least {}.", next_id),
+                None => {
+                    "No further field id can be allocated because ids are exhausted.".to_string()
+                }
+            };
+            return Err(Error::invalid_input(format!(
+                "Merge operation assigns id {} to new field \"{}\", but ids up to {} are \
+                 already used by current or dropped fields. {}",
+                field.id,
+                new_schema.field_path(field.id)?,
+                max_field_id,
+                next_id_msg
+            )));
+        }
+    }
+
+    let mut prior_paths = HashMap::with_capacity(prior_schema.fields_pre_order().count());
+    for field in prior_schema.fields_pre_order() {
+        prior_paths.insert(prior_schema.field_path(field.id)?, field);
+    }
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_some() {
+            continue;
+        }
+        let new_path = new_schema.field_path(field.id)?;
+        let Some(prior_field) = prior_paths.get(&new_path) else {
+            continue;
+        };
+        let materialized = fragments.iter().all(|fragment| {
+            fragment
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&field.id))
+        });
+        if !materialized {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps existing field \"{}\" from id {} to id {} without \
+                 rewriting its data. Every proposed fragment must materialize the new field \
+                 id in a base data file.",
+                new_path, prior_field.id, field.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_field_binding_fully_rewritten(
+    manifest: &Manifest,
+    new_fragment_map: &HashMap<u64, &Fragment>,
+    field_id: i32,
+) -> bool {
+    manifest.fragments.iter().all(|prior_fragment| {
+        let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
+            return false;
+        };
+
+        let is_materialized = new_fragment
+            .files
+            .iter()
+            .any(|file| file.fields.contains(&field_id));
+        if !is_materialized {
+            return false;
+        }
+
+        prior_fragment
+            .referenced_lance_files()
+            .filter(|file| file.fields.contains(&field_id))
+            .all(|prior_file| {
+                !new_fragment.referenced_lance_files().any(|new_file| {
+                    new_file.fields.contains(&field_id)
+                        && new_file.base_id == prior_file.base_id
+                        && new_file.path == prior_file.path
+                })
+            })
+    })
+}
+
+fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
+    let mut changes = Vec::with_capacity(4);
+    if prior.logical_type != new.logical_type {
+        changes.push(format!(
+            "logical type {} -> {}",
+            prior.logical_type, new.logical_type
+        ));
+    }
+    if prior.nullable != new.nullable {
+        changes.push(format!("nullable {} -> {}", prior.nullable, new.nullable));
+    }
+    if prior.encoding != new.encoding {
+        changes.push(format!(
+            "storage encoding {:?} -> {:?}",
+            prior.encoding, new.encoding
+        ));
+    }
+    if prior.dictionary != new.dictionary {
+        changes.push("dictionary".to_string());
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(changes.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use chrono::Utc;
     use futures::TryStreamExt;
-    use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
@@ -4850,6 +5087,7 @@ mod tests {
 
     use crate::Dataset;
     use crate::dataset::write::WriteParams;
+    use crate::dataset::{ColumnAlteration, NewColumnTransform};
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
@@ -5008,6 +5246,435 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    /// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+    /// dropped id stays referenced by the data files and max_field_id stays 3.
+    async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        dataset.drop_columns(&[dropped]).await.unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+        let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+        expected_ids.push(3);
+        assert_eq!(dataset.schema().field_ids(), expected_ids);
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+        dataset
+    }
+
+    /// Expected values of every column surviving `dropped`, plus d.
+    fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+        [
+            ("a", [1, 2]),
+            ("b", [10, 20]),
+            ("c", [100, 200]),
+            ("d", [5, 5]),
+        ]
+        .into_iter()
+        .filter(|(name, _)| *name != dropped)
+        .collect()
+    }
+
+    fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+        for (name, expected) in cols {
+            let col = &batch[*name];
+            assert_eq!(
+                col.as_primitive::<Int32Type>().values(),
+                expected,
+                "column {}",
+                name
+            );
+        }
+    }
+
+    async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        Dataset::commit(
+            Arc::new(dataset.clone()),
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            dataset.session(),
+            false,
+        )
+        .await
+    }
+
+    fn one_field_schema() -> LanceSchema {
+        LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap()
+    }
+
+    fn fragment_with_file_fields(id: u64, path: &str, fields: Vec<i32>) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields(path, fields, None));
+        fragment
+    }
+
+    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_file_fields(0, "f.lance", fields)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    // Which clause rejects the lossy round-trip depends on the hole's
+    // position: a hole before the last field remaps a shared id, while a
+    // hole at the end reuses the dropped id for the new field.
+    #[rstest::rstest]
+    #[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+    #[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+    #[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_field_ids(
+        #[case] dropped: &str,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(message.contains(expected), "unexpected error: {}", message);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_dropped_field_id_reuse() {
+        // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+        // accident covered above.
+        let dataset = dataset_with_dropped_column("memory://", "b").await;
+
+        let mut schema = dataset.schema().clone();
+        let mut field =
+            LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+        field.id = 1;
+        schema.fields.push(field);
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"e\"")
+                && message.contains("must use ids of at least 4"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_nested_field_ids() {
+        // A hole inside a struct shifts a nested leaf's id onto a field
+        // outside the struct on renumbering; the full-path comparison must
+        // catch the cross-parent remap.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+            ArrowField::new("z", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        Arc::new(Int32Array::from(vec![10, 20])),
+                    ],
+                    None,
+                )),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset.drop_columns(&["s.x"]).await.unwrap();
+        assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let survivors = surviving_columns(dropped);
+        let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+        let mut schema = dataset.schema().clone();
+        schema
+            .mut_field_by_id(first_id)
+            .unwrap()
+            .metadata
+            .insert("wm".into(), "42".into());
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert_eq!(
+            dataset
+                .schema()
+                .field(survivors[0].0)
+                .unwrap()
+                .metadata
+                .get("wm"),
+            Some(&"42".to_string())
+        );
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let mut survivors = surviving_columns(dropped);
+        let omitted = survivors.remove(0);
+        let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+        let schema = dataset.schema().project(&names).unwrap();
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert!(dataset.schema().field(omitted.0).is_none());
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_schema_only_path_remap() {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        let fresh_id = dataset.manifest.max_field_id() + 1;
+
+        let mut schema = dataset.schema().clone();
+        schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "remaps existing field \"a\" from id {} to id {}",
+                prior_id, fresh_id
+            )) && message.contains("base data file"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true, "logical type")]
+    #[case::nullability(DataType::Int32, false, "nullable")]
+    #[tokio::test]
+    async fn test_merge_rejects_shared_id_type_or_nullability_change(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let field_id = dataset.schema().field("a").unwrap().id;
+
+        let mut schema = dataset.schema().clone();
+        let field = schema.mut_field_by_id(field_id).unwrap();
+        field.logical_type = LogicalType::try_from(&data_type).unwrap();
+        field.nullable = nullable;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("changes field id {} (\"a\")", field_id))
+                && message.contains(expected),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true)]
+    #[case::nullability(DataType::Int32, false)]
+    #[test]
+    fn test_merge_shared_id_change_requires_full_rewrite(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+    ) {
+        let schema = one_field_schema();
+        let prior_fragments = vec![
+            fragment_with_file_fields(0, "old-0.lance", vec![0]),
+            fragment_with_file_fields(1, "old-1.lance", vec![0]),
+        ];
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].logical_type = LogicalType::try_from(&data_type).unwrap();
+        new_schema.fields[0].nullable = nullable;
+
+        let rewritten_fragments = vec![
+            fragment_with_file_fields(0, "new-0.lance", vec![0]),
+            fragment_with_file_fields(1, "new-1.lance", vec![0]),
+        ];
+        merge_schema_valid(&manifest, &new_schema, &rewritten_fragments).unwrap();
+
+        let partially_rewritten = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        let err = merge_schema_valid(&manifest, &new_schema, &partially_rewritten).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_merge_shared_id_change_rejects_retained_overlay() {
+        let schema = one_field_schema();
+        let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);
+        prior_fragment.overlays.push(DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("old-overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![prior_fragment.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].nullable = false;
+
+        let mut rewritten = fragment_with_file_fields(0, "new.lance", vec![0]);
+        rewritten.overlays = prior_fragment.overlays.clone();
+        let err = merge_schema_valid(&manifest, &new_schema, &[rewritten]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_rewritten_fresh_field_id() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
+        let mut rewritten_schema = schema.clone();
+        rewritten_schema.fields[0].id = 1;
+        let mut rewritten = manifest.fragments[0].clone();
+        rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
+        merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
+
+        let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+            .await
+            .unwrap();
+        let new_id = dataset.schema().field("a").unwrap().id;
+        assert_ne!(new_id, prior_id);
+        assert!(
+            dataset.get_fragments().iter().all(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .any(|file| file.fields.contains(&new_id))
+            }),
+            "alter_columns must materialize the fresh id in every fragment base file"
+        );
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_merge_rejects_max_field_id_overflow() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0, i32::MAX]);
+        assert_eq!(manifest.max_field_id(), i32::MAX);
+
+        let mut new_schema = schema;
+        let mut extra =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        extra.id = 1;
+        new_schema.fields.push(extra);
+
+        let err = merge_schema_valid(&manifest, &new_schema, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
+            "unexpected error: {}",
+            message
+        );
     }
 
     #[test]
@@ -7845,9 +8512,10 @@ mod tests {
     #[test]
     fn test_data_replacement_tombstones_overlaid_fields() {
         // A DataReplacement writing new base values for field 5 must stop any
-        // overlay from shadowing those cells: field 5 is tombstoned in place
+        // overlay already shadowing those cells: field 5 is tombstoned in place
         // (preserving the overlay's field 3), and an overlay covering only field
-        // 5 is dropped entirely.
+        // 5 is dropped entirely. Both overlays predate the transaction's read
+        // version, which is what makes the replacement the newer value.
         let mut fragment = Fragment::new(0);
         fragment.files = vec![
             DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
@@ -7860,12 +8528,12 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                     roaring::RoaringBitmap::from_iter([0u32]),
                 ]),
-                committed_version: 3,
+                committed_version: 1,
             },
             DataOverlayFile {
                 data_file: DataFile::new_legacy_from_fields("o5.lance", vec![5], None),
                 coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
-                committed_version: 3,
+                committed_version: 1,
             },
         ];
 
@@ -7904,6 +8572,224 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    /// Replace `fields` in `fragment` at `read_version`, against a manifest
+    /// at `manifest_version` whose schema declares field ids 3 ("x"), 4 ("a"),
+    /// 5 ("v") and 6 ("y").
+    fn replace_fields(
+        fragment: Fragment,
+        fields: Vec<i32>,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let mut lance_schema = LanceSchema::try_from(&schema).unwrap();
+        lance_schema.fields[0].id = 3;
+        lance_schema.fields[1].id = 4;
+        lance_schema.fields[2].id = 5;
+        lance_schema.fields[3].id = 6;
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.version = manifest_version;
+
+        let column_indices = (0..fields.len() as i32).collect();
+        let txn = Transaction::new(
+            read_version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new(
+                        "v-new.lance",
+                        fields,
+                        column_indices,
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                )],
+            },
+            None,
+        );
+        txn.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )
+        .map(|(manifest, _)| manifest.fragments[0].clone())
+    }
+
+    /// Replace field 5 in `fragment` at `read_version`, against a manifest at
+    /// `manifest_version`.
+    fn replace_field_5(
+        fragment: Fragment,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        replace_fields(fragment, vec![5], manifest_version, read_version)
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_subset_of_legacy_file() {
+        // The V1 reader derives its page table offset from the first field in
+        // the file metadata, so turning `[4, 5]` into `[-2, 5]` would leave
+        // field 4 decoding from field 5's pages. With no exact match to swap,
+        // the replacement must be rejected rather than corrupting the sibling.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields(
+            "wide.lance",
+            vec![4, 5],
+            None,
+        )];
+
+        let result = replace_field_5(fragment, 1, 1);
+        assert!(
+            result.is_err(),
+            "legacy subset replacement must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_tombstones_fields_spanning_files() {
+        // The replaced fields sit in two different wider files. Each file is
+        // tombstoned for the field it holds and survives on its remaining
+        // live one, with the new file answering for both.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new(
+                "cd.lance",
+                vec![5, 6],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+        ];
+
+        let fragment = replace_fields(fragment, vec![4, 5], 1, 1).unwrap();
+        let file = |path| {
+            fragment
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} survives on its live field"))
+        };
+        assert_eq!(file("ab.lance").fields.as_ref(), &[3, TOMBSTONE_FIELD_ID]);
+        assert_eq!(file("cd.lance").fields.as_ref(), &[TOMBSTONE_FIELD_ID, 6]);
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_fields_spanning_a_legacy_file() {
+        // Spanning is only resolvable while every covering file can be
+        // tombstoned. A V1 file holding one of the replaced fields cannot,
+        // so the replacement must be rejected rather than half applied.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
+        ];
+
+        let result = replace_fields(fragment, vec![4, 5], 1, 1);
+        assert!(
+            result.is_err(),
+            "spanning a legacy file must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_retombstones_wider_file() {
+        // A wider file carrying a tombstone from an earlier round is
+        // tombstoned again for the newly replaced field and survives on its
+        // remaining live field.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, TOMBSTONE_FIELD_ID, 5],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+
+        let fragment = replace_fields(fragment, vec![5], 1, 1).unwrap();
+        let wide = fragment
+            .files
+            .iter()
+            .find(|file| file.path == "wide.lance")
+            .expect("wider file survives on its live field");
+        assert_eq!(
+            wide.fields.as_ref(),
+            &[4, TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID]
+        );
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_preserves_overlay_newer_than_snapshot() {
+        // An overlay committed after this transaction read its snapshot holds
+        // the newer value; the conflict resolver rebases the two precisely
+        // because the overlay wins. Tombstoning it would discard a committed
+        // write, so only overlays the transaction could have seen are superseded.
+        let mut fragment = Fragment::new(0);
+        // One wider file, so the replacement takes the tombstone-and-append path.
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, 5],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new(
+                "newer.lance",
+                vec![5],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version: 7,
+        }];
+
+        // Staged against version 6, i.e. before the overlay landed.
+        let fragment = replace_field_5(fragment, 7, 6).unwrap();
+        assert!(fragment.files.iter().any(|f| f.path == "v-new.lance"));
+        assert_eq!(
+            fragment.overlays.len(),
+            1,
+            "overlay committed after the snapshot must survive"
+        );
+        assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
     }
 
     #[test]

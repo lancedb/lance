@@ -197,7 +197,13 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Object stores for additional base paths, shared across clones.
+    pub(crate) base_object_stores: BaseObjectStores,
 }
+
+/// The `OnceCell` coalesces concurrent first resolutions into one build.
+pub(crate) type BaseObjectStores =
+    Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
 impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,6 +228,14 @@ pub struct Version {
 
     /// Key-value pairs of metadata.
     pub metadata: BTreeMap<String, String>,
+}
+
+/// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct VersionRef {
+    /// Version number within the current branch's history.
+    pub version: u64,
 }
 
 /// Convert Manifest to Data Version.
@@ -491,6 +505,16 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
+        self.set_manifest(manifest, manifest_location);
+        Ok(())
+    }
+
+    /// Replace the manifest, refreshing derived state. Base stores are kept
+    /// when `base_paths` is unchanged.
+    fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+        if manifest.base_paths != self.manifest.base_paths {
+            self.base_object_stores = Default::default();
+        }
         self.manifest = manifest;
         self.manifest_location = manifest_location;
         self.fragment_bitmap = Arc::new(
@@ -500,7 +524,6 @@ impl Dataset {
                 .map(|f| f.id as u32)
                 .collect(),
         );
-        Ok(())
     }
 
     /// Check out the latest version of the branch
@@ -575,8 +598,10 @@ impl Dataset {
     }
 
     fn already_checked_out(&self, location: &ManifestLocation, branch_name: Option<&str>) -> bool {
-        // We check the e_tag here just in case it has been overwritten. This can
-        // happen if the table has been dropped then re-created recently.
+        // The ETag is an opaque object-generation token, not a content hash.
+        // Comparing the token still prevents reusing this Dataset's manifest
+        // after the physical object was replaced, for example by a recent
+        // drop/recreate at the same URI and version.
         self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
@@ -855,6 +880,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Default::default(),
         })
     }
 
@@ -1618,15 +1644,7 @@ impl Dataset {
         )
         .await?;
 
-        self.manifest = Arc::new(manifest);
-        self.manifest_location = manifest_location;
-        self.fragment_bitmap = Arc::new(
-            self.manifest
-                .fragments
-                .iter()
-                .map(|f| f.id as u32)
-                .collect(),
-        );
+        self.set_manifest(Arc::new(manifest), manifest_location);
 
         Ok(())
     }
@@ -2012,6 +2030,7 @@ impl Dataset {
     ) -> Self {
         let mut cloned = self.clone();
         cloned.object_store = object_store;
+        cloned.base_object_stores = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2404,16 +2423,35 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        let store_params = self.store_params_for_base(Some(base_path));
+        // Cores are cached without wrappers; each resolution decorates the
+        // shared core with the caller's wrapper.
+        let mut core_params = self.store_params_for_base(Some(base_path));
+        let wrapper = core_params.object_store_wrapper.take();
 
-        let (store, _) = ObjectStore::from_uri_and_params(
-            self.session.store_registry(),
-            &base_path.path,
-            &store_params,
-        )
-        .await?;
+        let cell = {
+            let mut stores = self.base_object_stores.lock().unwrap();
+            stores.entry(base_id).or_default().clone()
+        };
+        let core = cell
+            .get_or_try_init(|| async {
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    self.session.store_registry(),
+                    &base_path.path,
+                    &core_params,
+                )
+                .await?;
+                Ok::<_, Error>(store)
+            })
+            .await?;
 
-        Ok(store)
+        match wrapper {
+            Some(wrapper) => {
+                let mut store = core.as_ref().clone();
+                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
+                Ok(Arc::new(store))
+            }
+            None => Ok(core.clone()),
+        }
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
@@ -2565,6 +2603,26 @@ impl Dataset {
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_fold(0_u64, |count, _| async move { Ok(count + 1) })
             .await
+    }
+
+    /// List lightweight references to all attached versions in the current branch's history.
+    ///
+    /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
+    /// deserialize every manifest. The references are sorted by version in ascending order.
+    /// Detached manifests are excluded; see [`Self::list_detached_manifests`].
+    ///
+    /// Use [`Self::latest_version_id`] instead when only the latest version is needed.
+    pub async fn version_refs(&self) -> Result<Vec<VersionRef>> {
+        let mut versions: Vec<_> = self
+            .commit_handler
+            .list_manifest_locations(&self.base, &self.object_store, false)
+            .map_ok(|location| VersionRef {
+                version: location.version,
+            })
+            .try_collect()
+            .await?;
+        versions.sort_unstable_by_key(|version| version.version);
+        Ok(versions)
     }
 
     /// List all detached manifest locations.

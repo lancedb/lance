@@ -392,6 +392,9 @@ def test_shard_writer_e2e_correctness(tmp_path):
     assert closed_memtable_stats["row_count"] == 0
     assert closed_memtable_stats["batch_count"] == 0
     assert closed_memtable_stats["generation"] >= 1
+    assert "frozen_count" in closed_memtable_stats
+    # close() flushes every frozen memtable, so nothing is still owed to flush.
+    assert closed_memtable_stats["frozen_bytes"] == 0
 
     # === File-system layout ===
     mem_wal_dir = os.path.join(ds_path, "_mem_wal", shard_id)
