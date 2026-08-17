@@ -4,12 +4,15 @@
 use std::sync::Arc;
 use std::vec;
 
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::CommitBuilder;
 use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowIdMeta};
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -590,7 +593,7 @@ async fn test_migrate_to_stable_row_ids_basic() {
         vec![Arc::new(Int64Array::from_iter_values(20..25))],
     )
     .unwrap();
-    let dataset_after_append = InsertBuilder::new(Arc::new(dataset))
+    let dataset_after_append = InsertBuilder::new(Arc::new(dataset.clone()))
         .with_params(&WriteParams {
             mode: WriteMode::Append,
             ..Default::default()
@@ -607,6 +610,8 @@ async fn test_migrate_to_stable_row_ids_basic() {
     );
     // next_row_id should have advanced by the 5 newly appended rows.
     assert_eq!(dataset_after_append.manifest.next_row_id, 25);
+
+    dataset.validate().await.unwrap();
 }
 
 #[tokio::test]
@@ -672,4 +677,91 @@ async fn test_migrate_to_stable_row_ids_empty() {
 
     assert!(dataset.manifest.uses_stable_row_ids());
     assert_eq!(dataset.manifest.next_row_id, 0);
+    dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_with_deletions() {
+    // Create a single-fragment dataset of 10 rows then soft-delete 3 of them.
+    let mut dataset = make_simple_dataset("memory://migrate_deletions", 10).await;
+    dataset.delete("id < 3").await.unwrap();
+
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 7);
+    assert_eq!(dataset.count_deleted_rows().await.unwrap(), 3);
+
+    // physical_rows counts the pre-deletion slots; row IDs must cover all of
+    // them so that the deleted rows' IDs are never reused.
+    let physical_rows = dataset.get_fragments()[0].metadata.physical_rows.unwrap();
+    assert_eq!(physical_rows, 10);
+
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    assert!(dataset.manifest.uses_stable_row_ids());
+    assert!(dataset.manifest.fragments[0].row_id_meta.is_some());
+
+    // next_row_id must equal physical_rows (10), not logical rows (7).
+    assert_eq!(dataset.manifest.next_row_id, 10);
+
+    dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_resumes_partial_attempt() {
+    // Create a 2-fragment dataset (10 rows each).
+    let mut dataset = make_simple_dataset("memory://migrate_resume", 10).await;
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(10..20))],
+    )
+    .unwrap();
+    dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch2])
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Simulate a partial migration: assign row IDs only to the first fragment
+    // and commit via Merge.  Because FLAG_STABLE_ROW_IDS is not set, the
+    // mixed state (one fragment with row_id_meta, one without) is accepted.
+    let mut fragments = dataset.manifest.fragments.as_ref().clone();
+    let f0_rows = fragments[0].physical_rows.unwrap() as u64;
+    let seq = RowIdSequence::from(0..f0_rows);
+    fragments[0].row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq).into()));
+
+    let partial_txn = Transaction::new(
+        dataset.manifest.version,
+        Operation::Merge {
+            fragments,
+            schema: dataset.manifest.schema.clone(),
+            preserves_nullability: true,
+        },
+        None,
+    );
+    dataset = CommitBuilder::new(Arc::new(dataset))
+        .with_max_retries(0)
+        .execute(partial_txn)
+        .await
+        .unwrap();
+
+    // Confirm the partial state: F0 has row IDs, F1 does not, flag not set.
+    assert!(dataset.manifest.fragments[0].row_id_meta.is_some());
+    assert!(dataset.manifest.fragments[1].row_id_meta.is_none());
+    assert!(!dataset.manifest.uses_stable_row_ids());
+
+    // Run the migration.  It should pick up the high-water mark from F0 (10)
+    // and assign IDs [10, 20) to F1, yielding next_row_id = 20.
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    assert!(dataset.manifest.uses_stable_row_ids());
+    for frag in dataset.manifest.fragments.iter() {
+        assert!(frag.row_id_meta.is_some(), "fragment {} missing row_id_meta", frag.id);
+    }
+    assert_eq!(dataset.manifest.next_row_id, 20);
+
+    dataset.validate().await.unwrap();
 }
