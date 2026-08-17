@@ -55,7 +55,7 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_table::feature_flags::apply_feature_flags;
+use lance_table::feature_flags::{apply_feature_flags, ensure_can_write_manifest};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
@@ -1840,6 +1840,7 @@ impl ManifestNamespace {
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
     ) -> std::result::Result<(), CommitError> {
+        ensure_can_write_manifest(manifest).map_err(CommitError::from)?;
         apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
         let timestamp_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

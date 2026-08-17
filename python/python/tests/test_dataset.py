@@ -5448,7 +5448,12 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5480,7 +5485,7 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5534,7 +5539,9 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5574,7 +5581,9 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     import json
 
     base_dir = tmp_path / "test"
@@ -5627,7 +5636,9 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+def test_data_overlay_rejects_invalid_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5669,7 +5680,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+def test_data_overlay_rejects_unsorted_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
     # Offsets map positionally to value rows in data_file. A RoaringBitmap would
     # silently reorder/dedup them, so a non-ascending list must be rejected up
     # front rather than corrupting the row mapping.

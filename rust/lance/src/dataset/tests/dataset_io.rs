@@ -13,11 +13,12 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::transaction::Operation;
 use crate::dataset::{ManifestWriteConfig, validate_dataset_root_for_drop, write_manifest_file};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
-use lance_table::format::{DataStorageFormat, Fragment};
+use lance_table::format::DataStorageFormat;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
@@ -1350,6 +1351,65 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_restore_rejects_unknown_target_flags() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let write_config = ManifestWriteConfig {
+        auto_set_feature_flags: false,
+        ..Default::default()
+    };
+    let mut unknown_manifest = dataset.manifest.as_ref().clone();
+    unknown_manifest.version = 2;
+    unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut supported_manifest = dataset.manifest.as_ref().clone();
+    supported_manifest.version = 3;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut supported_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = Dataset::commit(
+        &test_uri,
+        Operation::Restore { version: 2 },
+        Some(3),
+        None,
+        None,
+        Default::default(),
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
 #[tokio::test]
