@@ -10258,6 +10258,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deregister_table_expected_location_fence() {
+        use lance_namespace::models::{DeregisterTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let table_id = vec!["test_table".to_string()];
+        let location = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+
+        let mut stale_req = DeregisterTableRequest::new();
+        stale_req.id = Some(table_id.clone());
+        stale_req.context = Some(HashMap::from([(
+            "expected_location".to_string(),
+            format!("{location}-replacement"),
+        )]));
+        let error = namespace.deregister_table(stale_req).await.unwrap_err();
+        assert!(error.to_string().contains("instead of expected location"));
+
+        let mut matching_req = DeregisterTableRequest::new();
+        matching_req.id = Some(table_id);
+        matching_req.context = Some(HashMap::from([(
+            "expected_location".to_string(),
+            format!("{location}/"),
+        )]));
+        let response = namespace.deregister_table(matching_req).await.unwrap();
+        assert_eq!(response.location.as_deref(), Some(location.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_rejects_deterministic_location_fence() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        let location = namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        deregister_req.context = Some(HashMap::from([("expected_location".to_string(), location)]));
+        let error = namespace
+            .deregister_table(deregister_req)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("location is deterministic"));
+    }
+
+    #[tokio::test]
     async fn test_deregister_table_in_child_namespace() {
         use lance_namespace::models::{
             CreateNamespaceRequest, DeregisterTableRequest, TableExistsRequest,

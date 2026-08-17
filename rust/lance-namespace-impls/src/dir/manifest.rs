@@ -77,6 +77,7 @@ const MANIFEST_TABLE_NAME: &str = "__manifest";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
+const EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY: &str = "expected_location";
 /// Bounded concurrency for per-table `_versions/` probes when filtering declared tables.
 /// Higher values reduce latency but increase burst load against the object store.
 pub(crate) const DECLARED_FILTER_CONCURRENCY: usize = 16;
@@ -3683,10 +3684,20 @@ impl LanceNamespace for ManifestNamespace {
             }
         };
 
-        if let Some(expected_location) = request
+        let expected_location = request
             .context
             .as_ref()
-            .and_then(|context| context.get("expected_location"))
+            .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
+        if expected_location.is_some() && namespace.is_empty() && self.dir_listing_enabled {
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "Expected-location fencing is unsupported for root table '{}' when directory listing is enabled because its location is deterministic",
+                    object_id
+                ),
+            }
+            .into());
+        }
+        if let Some(expected_location) = expected_location
             && expected_location.trim_end_matches('/') != table_uri.trim_end_matches('/')
         {
             return Err(NamespaceError::ConcurrentModification {
@@ -3698,9 +3709,8 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        // The expected manifest location is checked again inside every rewrite
-        // attempt, so a concurrent drop-and-recreate cannot be deleted by a
-        // stale deregistration request.
+        // Randomized table locations are checked again inside every rewrite attempt,
+        // so a concurrent replacement cannot be deleted by a stale deregistration.
         self.delete_from_manifest_if_location(&object_id, Some(&manifest_location))
             .boxed()
             .await?;
@@ -3898,6 +3908,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStdDir;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
+    use lance_namespace::error::NamespaceError;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
         ListTablesRequest, TableExistsRequest,
