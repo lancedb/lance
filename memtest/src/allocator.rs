@@ -473,6 +473,135 @@ pub unsafe extern "C" fn memtest_malloc_usable_size(ptr: *mut c_void) -> size_t 
     sys::usable_size(ptr)
 }
 
+// mimalloc's Rust `GlobalAlloc` impl calls straight into its own `mi_*_aligned`
+// C entry points rather than `malloc`/`free` (see mimalloc-rs's `lib.rs`: `alloc`
+// -> `mi_malloc_aligned`, `alloc_zeroed` -> `mi_zalloc_aligned`, `realloc` ->
+// `mi_realloc_aligned`, `dealloc` -> `mi_free`), so the libc interposition above
+// never sees those allocations. We interpose those entry points directly. There's
+// no libc-style `__mi_malloc` alias to link against, so the real implementation
+// is resolved via `dlsym(RTLD_NEXT, ...)`.
+#[cfg(target_os = "linux")]
+mod mi {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+
+    unsafe fn resolve(name: &str, cache: &OnceLock<usize>) -> usize {
+        *cache.get_or_init(|| {
+            let cname = CString::new(name).expect("symbol name has no interior NUL");
+            unsafe { libc::dlsym(libc::RTLD_NEXT, cname.as_ptr()) as usize }
+        })
+    }
+
+    pub(super) unsafe fn malloc_aligned(size: size_t, alignment: size_t) -> *mut c_void {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        match unsafe { resolve("mi_malloc_aligned", &REAL) } {
+            0 => std::ptr::null_mut(),
+            f => unsafe {
+                std::mem::transmute::<usize, extern "C" fn(size_t, size_t) -> *mut c_void>(f)(
+                    size, alignment,
+                )
+            },
+        }
+    }
+
+    pub(super) unsafe fn zalloc_aligned(size: size_t, alignment: size_t) -> *mut c_void {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        match unsafe { resolve("mi_zalloc_aligned", &REAL) } {
+            0 => std::ptr::null_mut(),
+            f => unsafe {
+                std::mem::transmute::<usize, extern "C" fn(size_t, size_t) -> *mut c_void>(f)(
+                    size, alignment,
+                )
+            },
+        }
+    }
+
+    pub(super) unsafe fn realloc_aligned(
+        ptr: *mut c_void,
+        size: size_t,
+        alignment: size_t,
+    ) -> *mut c_void {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        match unsafe { resolve("mi_realloc_aligned", &REAL) } {
+            0 => std::ptr::null_mut(),
+            f => unsafe {
+                std::mem::transmute::<
+                    usize,
+                    extern "C" fn(*mut c_void, size_t, size_t) -> *mut c_void,
+                >(f)(ptr, size, alignment)
+            },
+        }
+    }
+
+    pub(super) unsafe fn free(ptr: *mut c_void) {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        if let f @ 1.. = unsafe { resolve("mi_free", &REAL) } {
+            unsafe { std::mem::transmute::<usize, extern "C" fn(*mut c_void)>(f)(ptr) }
+        }
+    }
+
+    pub(super) unsafe fn usable_size(ptr: *const c_void) -> size_t {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        match unsafe { resolve("mi_usable_size", &REAL) } {
+            0 => 0,
+            f => unsafe {
+                std::mem::transmute::<usize, extern "C" fn(*const c_void) -> size_t>(f)(ptr)
+            },
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn mi_malloc_aligned(size: size_t, alignment: size_t) -> *mut c_void {
+    let ptr = unsafe { mi::malloc_aligned(size, alignment) };
+    if !ptr.is_null() {
+        STATS.record_allocation(unsafe { mi::usable_size(ptr) } as usize);
+    }
+    ptr
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn mi_zalloc_aligned(size: size_t, alignment: size_t) -> *mut c_void {
+    let ptr = unsafe { mi::zalloc_aligned(size, alignment) };
+    if !ptr.is_null() {
+        STATS.record_allocation(unsafe { mi::usable_size(ptr) } as usize);
+    }
+    ptr
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn mi_realloc_aligned(
+    ptr: *mut c_void,
+    size: size_t,
+    alignment: size_t,
+) -> *mut c_void {
+    let old_size = if ptr.is_null() {
+        0
+    } else {
+        unsafe { mi::usable_size(ptr) as usize }
+    };
+    let new_ptr = unsafe { mi::realloc_aligned(ptr, size, alignment) };
+    if !new_ptr.is_null() {
+        STATS.record_deallocation(old_size);
+        STATS.record_allocation(unsafe { mi::usable_size(new_ptr) } as usize);
+    }
+    new_ptr
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn mi_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    STATS.record_deallocation(unsafe { mi::usable_size(ptr) } as usize);
+    unsafe { mi::free(ptr) };
+}
+
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct Interpose {

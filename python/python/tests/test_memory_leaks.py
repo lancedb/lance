@@ -100,8 +100,12 @@ def probe_index_statistics_no_leak(dataset_path: str) -> None:
         for idx in d.describe_indices():
             d.stats.index_stats(idx.name)
 
+    # mimalloc (the default allocator, see python/src/lib.rs) retains freed
+    # memory in per-thread arenas rather than returning it to the OS
+    # immediately, which settles RSS at a slightly higher plateau than a
+    # libc-malloc-backed run. The threshold here is bumped accordingly.
     assert_noleaks(
-        access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25
+        access_index_stats, iterations=1000, threshold_mb=3.0, check_interval=25
     )
 
 
