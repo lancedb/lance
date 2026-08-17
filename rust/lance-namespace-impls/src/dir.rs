@@ -10124,7 +10124,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_table() {
-        use lance_namespace::models::{RegisterTableRequest, TableExistsRequest};
+        use lance_namespace::models::{
+            DeregisterTableRequest, RegisterTableRequest, TableExistsRequest,
+        };
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -10169,6 +10171,22 @@ mod tests {
         list_req.id = Some(vec![]);
         let tables = namespace.list_tables(list_req).await.unwrap();
         assert!(tables.tables.contains(&"registered_table".to_string()));
+
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["registered_table".to_string()]);
+        deregister_req.context = Some(HashMap::from([(
+            EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+            table_uri,
+        )]));
+        let error = namespace
+            .deregister_table(deregister_req)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("was not generated as a unique table incarnation")
+        );
     }
 
     #[tokio::test]
@@ -10352,7 +10370,11 @@ mod tests {
             .deregister_table(deregister_req)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("location is deterministic"));
+        assert!(
+            error
+                .to_string()
+                .contains("was not generated as a unique table incarnation")
+        );
     }
 
     #[tokio::test]
@@ -10396,7 +10418,11 @@ mod tests {
             .deregister_table(deregister_req)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("location is deterministic"));
+        assert!(
+            error
+                .to_string()
+                .contains("was not generated as a unique table incarnation")
+        );
     }
 
     #[tokio::test]

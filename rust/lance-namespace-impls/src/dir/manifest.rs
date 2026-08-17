@@ -1013,6 +1013,15 @@ impl ManifestNamespace {
         format!("{:08x}_{}", (hash & 0xFFFFFFFF) as u32, object_id)
     }
 
+    fn is_generated_dir_name(object_id: &str, location: &str) -> bool {
+        let Some((prefix, suffix)) = location.trim_end_matches('/').split_once('_') else {
+            return false;
+        };
+        prefix.len() == 8
+            && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && suffix == object_id
+    }
+
     /// Construct a full URI from root and relative location
     pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
         let mut base_url = lance_io::object_store::uri_to_url(root)?;
@@ -3625,6 +3634,15 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
+        if Self::is_generated_dir_name(&object_id, &location) {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Location '{location}' uses the reserved namespace-generated table naming pattern"
+                ),
+            }
+            .into());
+        }
+
         // Validate that parent namespaces exist (if not root)
         if !namespace.is_empty() {
             self.validate_namespace_levels_exist(&namespace).await?;
@@ -3688,15 +3706,13 @@ impl LanceNamespace for ManifestNamespace {
             .context
             .as_ref()
             .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
-        let deterministic_location = format!("{table_name}.lance");
         if expected_location.is_some()
-            && namespace.is_empty()
-            && manifest_location.trim_end_matches('/') == deterministic_location
+            && !Self::is_generated_dir_name(&object_id, &manifest_location)
         {
             return Err(NamespaceError::Unsupported {
                 message: format!(
-                    "Expected-location fencing is unsupported for root table '{}' when directory listing is enabled because its location is deterministic",
-                    object_id
+                    "Expected-location fencing is unsupported for table '{}' because location '{}' was not generated as a unique table incarnation",
+                    object_id, manifest_location
                 ),
             }
             .into());
