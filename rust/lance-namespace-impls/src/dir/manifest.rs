@@ -6,6 +6,7 @@
 //! This module provides a namespace implementation that uses a manifest table
 //! to track tables and nested namespaces.
 
+use super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY;
 use super::manifest_feature_flags::{ensure_readable, ensure_writable};
 use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -77,7 +78,6 @@ const MANIFEST_TABLE_NAME: &str = "__manifest";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
-const EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY: &str = "expected_location";
 /// Bounded concurrency for per-table `_versions/` probes when filtering declared tables.
 /// Higher values reduce latency but increase burst load against the object store.
 pub(crate) const DECLARED_FILTER_CONCURRENCY: usize = 16;
@@ -3688,7 +3688,11 @@ impl LanceNamespace for ManifestNamespace {
             .context
             .as_ref()
             .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
-        if expected_location.is_some() && namespace.is_empty() && self.dir_listing_enabled {
+        let deterministic_location = format!("{table_name}.lance");
+        if expected_location.is_some()
+            && namespace.is_empty()
+            && manifest_location.trim_end_matches('/') == deterministic_location
+        {
             return Err(NamespaceError::Unsupported {
                 message: format!(
                     "Expected-location fencing is unsupported for root table '{}' when directory listing is enabled because its location is deterministic",

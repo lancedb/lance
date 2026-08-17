@@ -92,6 +92,8 @@ use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
 
+const EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY: &str = "expected_location";
+
 /// Thread-safe metrics tracker for namespace operations.
 ///
 /// Tracks the count of each API operation when `ops_metrics_enabled` is true.
@@ -3685,6 +3687,18 @@ impl LanceNamespace for DirectoryNamespace {
         // If manifest is enabled, delegate to manifest namespace
         if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
+        }
+
+        if request
+            .context
+            .as_ref()
+            .is_some_and(|context| context.contains_key(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY))
+        {
+            return Err(NamespaceError::Unsupported {
+                message: "Expected-location fencing is unsupported when the manifest is disabled because table locations are deterministic"
+                    .to_string(),
+            }
+            .into());
         }
 
         // V1 mode: create a .lance-deregistered marker file in the table directory
@@ -10339,6 +10353,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("location is deterministic"));
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_rejects_deterministic_location_after_config_change() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+        let creating_namespace = DirectoryNamespaceBuilder::new(root)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        let location = creating_namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+
+        let fencing_namespace = DirectoryNamespaceBuilder::new(root)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        deregister_req.context = Some(HashMap::from([(
+            EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+            location,
+        )]));
+
+        let error = fencing_namespace
+            .deregister_table(deregister_req)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("location is deterministic"));
+    }
+
+    #[tokio::test]
+    async fn test_deregister_table_rejects_location_fence_without_manifest() {
+        use lance_namespace::models::DeregisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut deregister_req = DeregisterTableRequest::new();
+        deregister_req.id = Some(vec!["test_table".to_string()]);
+        deregister_req.context = Some(HashMap::from([(
+            EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+            "file:///stale/test_table.lance".to_string(),
+        )]));
+
+        let error = namespace
+            .deregister_table(deregister_req)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("manifest is disabled"));
     }
 
     #[tokio::test]
