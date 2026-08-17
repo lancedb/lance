@@ -10,7 +10,6 @@
 //! operation vocabulary it matches on, the index rules it applies, the row version
 //! metadata it stamps, the validation that runs before it.
 
-
 use crate::feature_flags::{
     FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
@@ -1610,11 +1609,11 @@ mod tests {
     use crate::format::pb;
     use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
-    use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, overlay_with_field,
         sample_index_metadata, sample_manifest,
     };
+    use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -1736,12 +1735,7 @@ mod tests {
         );
 
         let (new_manifest, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &default_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
@@ -1772,12 +1766,7 @@ mod tests {
         );
 
         let (new_manifest, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &default_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
@@ -1956,12 +1945,7 @@ mod tests {
             None,
         );
 
-        let result = tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        );
+        let result = tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2018,12 +2002,7 @@ mod tests {
             None,
         );
 
-        let result = tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        );
+        let result = tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -2080,13 +2059,8 @@ mod tests {
             None,
         );
 
-        tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        )
-        .expect("bitmap at exact physical_rows boundary should succeed");
+        tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .expect("bitmap at exact physical_rows boundary should succeed");
     }
 
     #[test]
@@ -2767,13 +2741,8 @@ mod tests {
             },
             None,
         );
-        txn.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        )
-        .map(|(manifest, _)| manifest.fragments[0].clone())
+        txn.build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .map(|(manifest, _)| manifest.fragments[0].clone())
     }
 
     /// Replace field 5 in `fragment` at `read_version`, against a manifest at
@@ -3034,10 +3003,10 @@ mod tests {
 
     mod mem_wal_index_coverage {
         use super::*;
+        use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
         use crate::system_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
-        use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 
         fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
             IndexMetadata {

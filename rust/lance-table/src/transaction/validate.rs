@@ -266,7 +266,11 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 /// existing path may move to a fresh id only when every proposed fragment
 /// materializes that id in a base data file (the `alter_columns` cast path).
 /// Omitting a field (dropping it) and updating field metadata remain legal.
-fn merge_schema_valid(manifest: &Manifest, new_schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+fn merge_schema_valid(
+    manifest: &Manifest,
+    new_schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
     let prior_schema = &manifest.schema;
     let new_fragment_map: HashMap<u64, &Fragment> = fragments
         .iter()

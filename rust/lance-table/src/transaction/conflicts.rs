@@ -868,7 +868,6 @@ impl PartialEq for Operation {
     }
 }
 
-
 impl Operation {
     /// Returns the config keys that have been upserted by this operation.
     fn get_upsert_config_keys(&self) -> Vec<String> {

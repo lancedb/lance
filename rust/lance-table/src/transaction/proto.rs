@@ -785,7 +785,6 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-
 impl From<&UpdateMap> for pb::transaction::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
