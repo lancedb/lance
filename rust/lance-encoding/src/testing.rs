@@ -35,7 +35,7 @@ use crate::{
         try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
         try_variable_packed_struct_per_value, try_variable_rle_block, try_variable_width_miniblock,
-        try_variable_width_per_value,
+        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -141,7 +141,11 @@ impl CompressionStrategy for TestCompressionStrategy {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
-            } else if let Some(compressor) = try_variable_width_miniblock(field, data, &params)? {
+            } else if let Some(compressor) = if self.encoding == TestEncoding::StructuralSparse {
+                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+            } else {
+                try_variable_width_miniblock(field, data, &params)?
+            } {
                 compressor
             } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
                 compressor
