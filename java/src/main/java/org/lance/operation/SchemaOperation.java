@@ -18,8 +18,8 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -35,7 +35,7 @@ import java.util.Objects;
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;
-  private final List<ArrowSchema> cSchemas = new ArrayList<>();
+  private final Map<Long, ArrowSchema> inFlightSchemas = new HashMap<>();
 
   protected SchemaOperation(Schema schema) {
     this.schema = schema;
@@ -55,19 +55,26 @@ public abstract class SchemaOperation implements Operation {
     ArrowSchema cSchema = ArrowSchema.allocateNew(allocator);
     try {
       Data.exportSchema(allocator, schema, null, cSchema);
-      cSchemas.add(cSchema);
-      return cSchema.memoryAddress();
+      long address = cSchema.memoryAddress();
+      inFlightSchemas.put(address, cSchema);
+      return address;
     } catch (RuntimeException | Error error) {
       cSchema.close();
       throw error;
     }
   }
 
-  public synchronized void release() {
-    for (ArrowSchema cSchema : cSchemas) {
-      cSchema.close();
+  /** Confirm that JNI imported an exported schema and release its Java holder. */
+  private synchronized void finishSchemaExport(long address) {
+    ArrowSchema cSchema = inFlightSchemas.remove(address);
+    if (cSchema == null) {
+      throw new IllegalStateException("Unknown or completed ArrowSchema export: " + address);
     }
-    cSchemas.clear();
+    cSchema.close();
+  }
+
+  public synchronized void release() {
+    // In-flight holders are released only by finishSchemaExport after JNI imports them.
   }
 
   @Override

@@ -90,6 +90,52 @@ public class TransactionTest {
   }
 
   @Test
+  public void testClosedSchemaTransactionFailsBeforeJniExport(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("closed-schema").toString());
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction original =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(Project.builder().schema(testDataset.getSchema()).build())
+                  .build();
+          Transaction rebuilt = new Transaction.Builder(original).build()) {
+        original.close();
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> JniTestHelper.validateTransaction(dataset, original));
+        JniTestHelper.validateTransaction(dataset, rebuilt);
+      }
+    }
+  }
+
+  @Test
+  public void testIndependentTransactionsCanShareSchemaOperation(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("shared-schema").toString());
+      Project operation = Project.builder().schema(testDataset.getSchema()).build();
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction first =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(operation)
+                  .build();
+          Transaction second =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(operation)
+                  .build()) {
+        JniTestHelper.validateTransaction(dataset, first);
+        second.close();
+        JniTestHelper.validateTransaction(dataset, first);
+      }
+    }
+  }
+
+  @Test
   public void testReplacingInheritedOperationHasIndependentOwnership() {
     AtomicInteger originalReleases = new AtomicInteger();
     AtomicInteger replacementReleases = new AtomicInteger();
