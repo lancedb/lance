@@ -1007,12 +1007,14 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
-                let relative_loss_diff = if last_loss == 0.0 {
-                    if loss == 0.0 { 0.0 } else { f64::INFINITY }
-                } else {
-                    (loss - last_loss).abs() / last_loss.abs()
-                };
+                // Keep `last_loss` as the scale reference to preserve the legacy
+                // convergence threshold.
                 if kmeans_has_converged(loss, last_loss, params.tolerance) {
+                    let relative_loss_diff = if last_loss == 0.0 {
+                        if loss == 0.0 { 0.0 } else { f64::INFINITY }
+                    } else {
+                        (loss - last_loss).abs() / last_loss.abs()
+                    };
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
                         i, params.max_iters, redo, loss, last_loss, relative_loss_diff
