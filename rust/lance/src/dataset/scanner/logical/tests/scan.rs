@@ -220,6 +220,21 @@ async fn test_include_deleted_rows_surfaces_them_with_a_null_row_id(
     }
 }
 
+/// Deleted rows carry a null row id, and a search answers in row ids, so the two cannot be
+/// combined.
+#[tokio::test]
+async fn test_include_deleted_rows_is_rejected_for_a_search() {
+    let dataset = vector_dataset().await;
+    let mut scan = dataset.scan();
+    scan.with_row_id().include_deleted_rows();
+    scan.nearest("vec", &query_vector(), 5).unwrap();
+
+    let err = super::super::create_plan(&scan)
+        .await
+        .expect_err("a search cannot include deleted rows");
+    assert!(err.to_string().contains("deleted rows"), "{err}");
+}
+
 /// Every batch but the last carries exactly the requested number of rows.
 #[tokio::test]
 async fn test_strict_batch_size() {
