@@ -35,6 +35,7 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::files::scan::{ManifestScan, scan_manifests};
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -1693,137 +1694,128 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
         ));
     }
 
-    // Collect references from every present manifest concurrently, mirroring
-    // `process_manifests`. Reading manifests is I/O-bound and there can be many
-    // present versions (the workload this API targets), so a sequential walk
-    // would be needlessly slow.
-    let collected = Mutex::new((HashSet::<String>::new(), HashSet::<String>::new()));
+    // Walk every present manifest on the shared scan, which bounds both read
+    // parallelism and the memory held by in-flight manifests. Consumed
+    // sequentially, so the sets below need no locking; dropping each
+    // `ScannedManifest` returns its share of the scan's memory budget.
+    //
+    // `min_version` is deliberately not set: a keep-set has to cover every
+    // present manifest, and skipping one would authorize deleting the files it
+    // is the last to reference.
+    let ManifestScan { stream, .. } = scan_manifests(dataset, None);
+    let mut stream = stream;
+
+    let mut exact: HashSet<String> = HashSet::new();
+    let mut index_uuids: HashSet<String> = HashSet::new();
     // Guard against a listing anomaly (e.g. an eventual-consistency blip or a
     // concurrent cleanup that emptied `_versions/`) returning an empty keep-set:
     // a raw anti-join against an empty set would treat every file as an orphan.
-    let manifest_count = std::sync::atomic::AtomicUsize::new(0);
+    let mut manifest_count = 0usize;
 
     let data_dir = dataset.data_dir();
     let base = &dataset.base;
 
-    dataset
-        .commit_handler
-        .list_manifest_locations(base, &dataset.object_store, false)
-        .try_for_each_concurrent(dataset.object_store.io_parallelism(), |location| {
-            let collected = &collected;
-            let data_dir = &data_dir;
-            let manifest_count = &manifest_count;
-            async move {
-                manifest_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let manifest =
-                    read_manifest(&dataset.object_store, &location.path, location.size).await?;
-                let indexes =
-                    read_manifest_indexes(&dataset.object_store, &location, &manifest).await?;
+    while let Some(scanned) = stream.next().await {
+        let scanned = scanned?;
+        manifest_count += 1;
 
-                let mut local_exact: Vec<String> = Vec::new();
-                // The manifest file itself is referenced (it is a present version).
-                local_exact.push(remove_prefix(&location.path, base).to_string());
+        // The manifest file itself is referenced (it is a present version).
+        exact.insert(scanned.manifest_path.clone());
 
-                for fragment in manifest.fragments.iter() {
-                    // External row-id files are a referenced artifact we do not
-                    // enumerate; refuse rather than under-report (matches
-                    // `collect_paths`). Checked here so we cover every present
-                    // version, not just the latest.
-                    if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                        return Err(Error::not_supported_source(
-                            format!(
-                                "referenced_files is not supported on datasets with external \
-                                 row-id files (e.g. {}): the file is referenced but not enumerated",
-                                external_file.path
-                            )
-                            .into(),
-                        ));
-                    }
-                    // Same for external row-version metadata: a root-relative
-                    // referenced file this set does not enumerate, so a driver
-                    // would list it and see it as unreferenced. Refuse rather
-                    // than under-report.
-                    for (field, meta) in [
-                        ("created_at_version_meta", &fragment.created_at_version_meta),
-                        (
-                            "last_updated_at_version_meta",
-                            &fragment.last_updated_at_version_meta,
-                        ),
-                    ] {
-                        if let Some(RowDatasetVersionMeta::External(external_file)) = meta {
-                            return Err(Error::not_supported_source(
-                                format!(
-                                    "referenced_files is not supported on datasets with external \
-                                     row-version metadata ({field}, e.g. {}): the file is \
-                                     referenced but not enumerated",
-                                    external_file.path
-                                )
-                                .into(),
-                            ));
-                        }
-                    }
-                    // Base data files and data-overlay files share the
-                    // `data/{key}.lance` namespace; both must be kept.
-                    for file in fragment.referenced_lance_files() {
-                        // External-base files resolve outside this root; the
-                        // top-level `base_paths` guard only inspects the latest
-                        // manifest, so re-check per fragment across all present
-                        // versions rather than emit a bogus local path.
-                        if file.base_id.is_some() {
-                            return Err(Error::not_supported_source(
-                                "referenced_files is not supported on datasets with external \
-                                 base fragments: the file lives outside this dataset's root"
-                                    .into(),
-                            ));
-                        }
-                        let full = data_dir.clone().join(file.path.as_str());
-                        local_exact.push(remove_prefix(&full, base).to_string());
-                    }
-                    if let Some(delfile) = fragment.deletion_file.as_ref() {
-                        // Same external-base reasoning as data files above: a
-                        // deletion file in another base resolves outside this
-                        // root, so refuse rather than emit a phantom local path.
-                        if delfile.base_id.is_some() {
-                            return Err(Error::not_supported_source(
-                                "referenced_files is not supported on datasets with external \
-                                 base deletion files: the file lives outside this dataset's root"
-                                    .into(),
-                            ));
-                        }
-                        let delpath = deletion_file_path(base, fragment.id, delfile);
-                        local_exact.push(remove_prefix(&delpath, base).to_string());
-                    }
-                }
-
-                if let Some(relative_tx_path) = &manifest.transaction_file {
-                    let tx_path = Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str());
-                    local_exact.push(tx_path.to_string());
-                }
-
-                let mut guard = collected.lock().unwrap();
-                let (exact_paths, index_uuids) = &mut *guard;
-                exact_paths.extend(local_exact);
-                for index in &indexes {
-                    // An external-base index resolves outside this root, so its
-                    // uuid would become a phantom local `_indices/` prefix. Same
-                    // per-fragment reasoning as data and deletion files above:
-                    // the top-level `base_paths` guard only sees the latest
-                    // manifest, so re-check here across all present versions.
-                    if index.base_id.is_some() {
-                        return Err(Error::not_supported_source(
-                            "referenced_files is not supported on datasets with external \
-                             base indices: the index lives outside this dataset's root"
-                                .into(),
-                        ));
-                    }
-                    index_uuids.insert(index.uuid.to_string());
-                }
-                Ok(())
+        for fragment in scanned.manifest.fragments.iter() {
+            // External row-id files are a referenced artifact we do not
+            // enumerate; refuse rather than under-report (matches
+            // `collect_paths`). Checked here so we cover every present
+            // version, not just the latest.
+            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+                return Err(Error::not_supported_source(
+                    format!(
+                        "referenced_files is not supported on datasets with external \
+                         row-id files (e.g. {}): the file is referenced but not enumerated",
+                        external_file.path
+                    )
+                    .into(),
+                ));
             }
-        })
-        .await?;
+            // Same for external row-version metadata: a root-relative
+            // referenced file this set does not enumerate, so a driver
+            // would list it and see it as unreferenced. Refuse rather
+            // than under-report.
+            for (field, meta) in [
+                ("created_at_version_meta", &fragment.created_at_version_meta),
+                (
+                    "last_updated_at_version_meta",
+                    &fragment.last_updated_at_version_meta,
+                ),
+            ] {
+                if let Some(RowDatasetVersionMeta::External(external_file)) = meta {
+                    return Err(Error::not_supported_source(
+                        format!(
+                            "referenced_files is not supported on datasets with external \
+                             row-version metadata ({field}, e.g. {}): the file is \
+                             referenced but not enumerated",
+                            external_file.path
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            // Base data files and data-overlay files share the
+            // `data/{key}.lance` namespace; both must be kept.
+            for file in fragment.referenced_lance_files() {
+                // External-base files resolve outside this root; the
+                // top-level `base_paths` guard only inspects the latest
+                // manifest, so re-check per fragment across all present
+                // versions rather than emit a bogus local path.
+                if file.base_id.is_some() {
+                    return Err(Error::not_supported_source(
+                        "referenced_files is not supported on datasets with external \
+                         base fragments: the file lives outside this dataset's root"
+                            .into(),
+                    ));
+                }
+                let full = data_dir.clone().join(file.path.as_str());
+                exact.insert(remove_prefix(&full, base).to_string());
+            }
+            if let Some(delfile) = fragment.deletion_file.as_ref() {
+                // Same external-base reasoning as data files above: a
+                // deletion file in another base resolves outside this
+                // root, so refuse rather than emit a phantom local path.
+                if delfile.base_id.is_some() {
+                    return Err(Error::not_supported_source(
+                        "referenced_files is not supported on datasets with external \
+                         base deletion files: the file lives outside this dataset's root"
+                            .into(),
+                    ));
+                }
+                let delpath = deletion_file_path(base, fragment.id, delfile);
+                exact.insert(remove_prefix(&delpath, base).to_string());
+            }
+        }
 
-    if manifest_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        if let Some(relative_tx_path) = &scanned.manifest.transaction_file {
+            let tx_path = Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str());
+            exact.insert(tx_path.to_string());
+        }
+
+        for index in &scanned.indexes {
+            // An external-base index resolves outside this root, so its
+            // uuid would become a phantom local `_indices/` prefix. Same
+            // per-fragment reasoning as data and deletion files above:
+            // the top-level `base_paths` guard only sees the latest
+            // manifest, so re-check here across all present versions.
+            if index.base_id.is_some() {
+                return Err(Error::not_supported_source(
+                    "referenced_files is not supported on datasets with external \
+                     base indices: the index lives outside this dataset's root"
+                        .into(),
+                ));
+            }
+            index_uuids.insert(index.uuid.to_string());
+        }
+    }
+
+    if manifest_count == 0 {
         // An opened dataset always has at least one present manifest; zero means
         // a listing anomaly, not "nothing is referenced". Refuse rather than
         // hand back an empty keep-set that would authorize deleting everything.
@@ -1833,8 +1825,6 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
                 .into(),
         ));
     }
-
-    let (exact, index_uuids) = collected.into_inner().unwrap();
 
     let indices_dir = dataset.indices_dir();
     let index_prefixes: Vec<String> = index_uuids
