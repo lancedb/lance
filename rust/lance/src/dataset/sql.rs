@@ -199,7 +199,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
@@ -285,6 +285,44 @@ mod tests {
         let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
         let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
         assert_eq!(row_addrs.values(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_sql_wildcard_includes_system_columns_once() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_wildcard_system_columns",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT * FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(
+            batch.schema().field_names(),
+            vec!["x", "_rowid", "_rowaddr"]
+        );
+        assert_eq!(
+            batch["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+        assert_eq!(
+            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
     }
 
     #[tokio::test]
