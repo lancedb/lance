@@ -85,28 +85,6 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::dot(x, y)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    debug_assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let a = _mm512_loadu_ps(x.as_ptr().add(i));
-        let b = _mm512_loadu_ps(y.as_ptr().add(i));
-        acc = _mm512_fmadd_ps(a, b, acc);
-        i += 16;
-    }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    while i < n {
-        sum += x[i] * y[i];
-        i += 1;
-    }
-    sum
-}
-
 /// Negative [Dot] distance.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {

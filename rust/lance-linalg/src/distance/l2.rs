@@ -87,30 +87,6 @@ pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::l2(x, y)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    debug_assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let a = _mm512_loadu_ps(x.as_ptr().add(i));
-        let b = _mm512_loadu_ps(y.as_ptr().add(i));
-        let diff = _mm512_sub_ps(a, b);
-        acc = _mm512_fmadd_ps(diff, diff, acc);
-        i += 16;
-    }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    while i < n {
-        let diff = x[i] - y[i];
-        sum += diff * diff;
-        i += 1;
-    }
-    sum
-}
-
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
