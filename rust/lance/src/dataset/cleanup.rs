@@ -35,6 +35,7 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::files::strip_prefix;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -277,14 +278,6 @@ impl CleanupAction {
             } => Some(max_candidate_files),
         }
     }
-}
-
-fn remove_prefix(path: &Path, prefix: &Path) -> Path {
-    let relative_parts = path.prefix_match(prefix);
-    if relative_parts.is_none() {
-        return path.clone();
-    }
-    Path::from_iter(relative_parts.unwrap())
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +616,7 @@ impl<'a> CleanupTask<'a> {
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                let relative_data_path = strip_prefix(&full_data_path, &self.dataset.base)?;
                 referenced_files.data_paths.insert(relative_data_path);
             }
             let delpath = fragment
@@ -631,7 +624,7 @@ impl<'a> CleanupTask<'a> {
                 .as_ref()
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, &self.dataset.base);
+                let relative_path = strip_prefix(&delpath, &self.dataset.base)?;
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
@@ -867,7 +860,19 @@ impl<'a> CleanupTask<'a> {
         inspection: &CleanupInspection,
     ) -> Result<Option<CleanupFile>> {
         let path = obj_meta.location;
-        let relative_path = remove_prefix(&path, &self.dataset.base);
+        // Every listing here is rooted at the dataset base, so a path outside it means the
+        // object store reported something unexpected.  Propagating would strand a pass that
+        // `remove_stream` has already partly executed, so leave the file alone as we do for
+        // every other shape we cannot classify.  `debug!` rather than `warn!` because a store
+        // that misreports one path misreports every path of that kind.
+        let Ok(relative_path) = strip_prefix(&path, &self.dataset.base) else {
+            debug!(
+                path = path.as_ref(),
+                base = self.dataset.base.as_ref(),
+                "Will not garbage collect file because it is not under the dataset base"
+            );
+            return Ok(None);
+        };
         let size_bytes = obj_meta.size;
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
@@ -1232,7 +1237,7 @@ impl<'a> CleanupTask<'a> {
                     {
                         let full_data_path =
                             self.dataset.data_dir().clone().join(file.path.as_str());
-                        let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                        let relative_data_path = strip_prefix(&full_data_path, &self.dataset.base)?;
                         inspection
                             .verified_files
                             .data_paths
@@ -1256,7 +1261,7 @@ impl<'a> CleanupTask<'a> {
                     if base_path.path == self.dataset.uri {
                         if let Some(deletion_path) = deletion_path {
                             let relative_del_path =
-                                remove_prefix(&deletion_path, &self.dataset.base);
+                                strip_prefix(&deletion_path, &self.dataset.base)?;
                             inspection
                                 .verified_files
                                 .delete_paths
@@ -1975,12 +1980,21 @@ mod tests {
             self.load_dataset(&branch_ds.uri).await
         }
 
-        async fn count_files(&self) -> Result<FileCounts> {
+        /// The metadata the dataset's listing reports, as the cleanup pass sees it:
+        /// after any `object_meta_policy` rewrite, and after the `unmodified_since`
+        /// filter that decides which entries reach the classifier.
+        async fn listed_metas(
+            &self,
+            unmodified_since: Option<DateTime<Utc>>,
+        ) -> Result<Vec<ObjectMeta>> {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
-            let mut file_stream = os.read_dir_all(&path, None);
+            os.read_dir_all(&path, unmodified_since).try_collect().await
+        }
+
+        async fn count_files(&self) -> Result<FileCounts> {
             let mut file_count = FileCounts {
                 num_data_files: 0,
                 num_delete_files: 0,
@@ -1989,9 +2003,9 @@ mod tests {
                 num_tx_files: 0,
                 num_bytes: 0,
             };
-            while let Some(path) = file_stream.try_next().await? {
-                file_count.num_bytes += path.size;
-                match path.location.extension() {
+            for meta in self.listed_metas(None).await? {
+                file_count.num_bytes += meta.size;
+                match meta.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,
                     Some("manifest") => file_count.num_manifest_files += 1,
                     Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
@@ -2004,18 +2018,12 @@ mod tests {
         }
 
         async fn count_blob_files(&self) -> Result<usize> {
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let (os, path) =
-                ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
-                    .await?;
-            let mut file_stream = os.read_dir_all(&path, None);
-            let mut blob_count = 0usize;
-            while let Some(path) = file_stream.try_next().await? {
-                if path.location.extension() == Some("blob") {
-                    blob_count += 1;
-                }
-            }
-            Ok(blob_count)
+            Ok(self
+                .listed_metas(None)
+                .await?
+                .iter()
+                .filter(|meta| meta.location.extension() == Some("blob"))
+                .count())
         }
 
         async fn count_rows(&self) -> Result<usize> {
@@ -2143,6 +2151,97 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    /// A listed location outside the dataset base cannot be classified, so cleanup
+    /// leaves that file alone and finishes the pass. Aborting instead would strand a
+    /// pass that has already deleted files, and would repeat on every later run.
+    #[tokio::test]
+    async fn cleanup_skips_listed_files_outside_the_dataset_base() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        // Mimic a store wrapper that reports a rewritten location for the data files
+        // while leaving the manifest listing intact. A wrapper that rewrote every
+        // location would fail `read_manifest` long before this classifier runs, so a
+        // partial rewrite is the shape that actually reaches it.
+        //
+        // The rewrite has to carry the fixture's recorded write time across to the new
+        // location. Policies run in `HashMap` iteration order, so if this one ran before
+        // `add_recorded_file_time` the rewritten location would miss that lookup, keep
+        // its real filesystem mtime, and be dropped by `read_dir_all`'s
+        // `unmodified_since` cutoff before the classifier ever saw it — leaving this
+        // test green without exercising anything. Carrying the time over makes the
+        // outcome the same in either order, since the copy is idempotent.
+        //
+        // If you change how listings are filtered and this test still passes, confirm it
+        // still covers the guard by replacing the `let Ok(..) else` in
+        // `cleanup_file_if_not_referenced` with `strip_prefix(..)?` — this test must fail
+        // with an `Internal` error naming an `elsewhere/` path, and must pass again once
+        // the guard is restored.
+        let recorded_times = fixture.mock_store.last_modified_times.clone();
+        fixture
+            .mock_store
+            .policy
+            .lock()
+            .unwrap()
+            .set_obj_meta_policy(
+                "relocate_data_files_outside_base",
+                Arc::new(move |_, meta| {
+                    let mut meta = meta;
+                    if meta.location.extension() == Some("lance") {
+                        if let Some(recorded) = recorded_times.lock().unwrap().get(&meta.location) {
+                            meta.last_modified = *recorded;
+                        }
+                        let filename = meta.location.filename().expect("data file has a name");
+                        meta.location = Path::from(format!("elsewhere/{filename}"));
+                    }
+                    Ok(meta)
+                }),
+            );
+
+        let before_count = fixture.count_files().await.unwrap();
+        // The relocated entry has to survive the cutoff cleanup itself applies, or the
+        // classifier never sees it and every assertion below passes vacuously. Cleanup
+        // filters on `earliest_retained_manifest_time`, which for this fixture is the
+        // retained manifest's own timestamp, so use that rather than the policy's
+        // `before_timestamp` — the latter is two mock days later and would let the
+        // assertion pass on entries cleanup would have skipped.
+        let retained_manifest_time = fixture.open().await.unwrap().manifest.timestamp();
+        let relocated_is_listed = fixture
+            .listed_metas(Some(retained_manifest_time))
+            .await
+            .unwrap()
+            .iter()
+            .any(|meta| meta.location.as_ref().starts_with("elsewhere/"));
+        assert!(
+            relocated_is_listed,
+            "the rewritten location must reach the classifier for this test to mean anything"
+        );
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        let after_count = fixture.count_files().await.unwrap();
+
+        // The overwrite orphaned a data file, but its reported location is
+        // unclassifiable, so it stays.
+        assert_eq!(removed.data_files_removed, 0);
+        assert_eq!(after_count.num_data_files, before_count.num_data_files);
+        // The rest of the pass still runs, and its accounting matches what left disk.
+        assert_eq!(removed.old_versions, 1);
+        assert_lt!(
+            after_count.num_manifest_files,
+            before_count.num_manifest_files
+        );
+        assert_eq!(
+            removed.bytes_removed,
+            before_count.num_bytes - after_count.num_bytes
+        );
     }
 
     #[tokio::test]

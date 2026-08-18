@@ -26,7 +26,7 @@ use crate::dataset::files::arrow::{TRACKED_FILES_SCHEMA, TrackedFileBatch};
 use crate::dataset::files::file_types::FileType;
 use crate::dataset::files::scan::{ManifestScan, scan_manifests};
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::io::deletion::relative_deletion_file_path;
 
 mod arrow;
@@ -35,11 +35,25 @@ pub(crate) mod scan;
 
 const BATCH_SIZE: usize = 4096;
 
-fn remove_prefix(path: &Path, prefix: &Path) -> Path {
-    match path.prefix_match(prefix) {
-        Some(parts) => Path::from_iter(parts),
-        None => path.clone(),
-    }
+/// Make `path` relative to `prefix`, which every caller here needs because a
+/// dataset records root-relative paths.
+///
+/// Errors when `path` is not under `prefix`, because the root-relative path the
+/// caller asked for is not recoverable at that point. Returning the absolute
+/// path instead would be worse than failing: `tracked_files` and `all_files`
+/// both document their `path` column as relative to `base_uri`, so an absolute
+/// entry silently breaks that contract and a consumer joining the two gets a
+/// path that resolves nowhere.
+///
+/// Callers that classify a listed object for deletion want the opposite answer
+/// and should skip the object rather than propagate — see
+/// `CleanupTask::cleanup_file_if_not_referenced`.
+pub(crate) fn strip_prefix(path: &Path, prefix: &Path) -> Result<Path> {
+    path.prefix_match(prefix).map(Path::from_iter).ok_or_else(|| {
+        Error::internal(format!(
+            "path {path} is not under the dataset base {prefix}; a root-relative path was expected"
+        ))
+    })
 }
 
 /// A single row destined for the `tracked_files` output.
@@ -225,11 +239,9 @@ async fn get_index_files(
     // Phase 3: collect paths for the requested UUIDs in order.
     let mut paths = Vec::new();
     for uuid in &uuids {
-        paths.extend(
-            cache[uuid]
-                .iter()
-                .map(|meta| remove_prefix(&meta.location, base)),
-        );
+        for meta in cache[uuid].iter() {
+            paths.push(strip_prefix(&meta.location, base)?);
+        }
     }
     Ok(paths)
 }
@@ -463,7 +475,7 @@ fn build_all_files_batch(
     let mut ts_builder = TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC");
 
     for meta in chunk {
-        let rel = remove_prefix(&meta.location, base);
+        let rel = strip_prefix(&meta.location, base)?;
         base_uri_builder.append_value(uri);
         path_builder.append_value(rel.as_ref());
         size_builder.append_value(meta.size as i64);
@@ -485,6 +497,7 @@ fn build_all_files_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::Dataset;
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -552,6 +565,35 @@ mod tests {
         )
         .unwrap();
         RecordBatchIterator::new(vec![Ok(batch)], schema)
+    }
+
+    #[test]
+    fn strip_prefix_makes_a_path_root_relative() {
+        let base = Path::from("bucket/dataset");
+        let full = Path::from("bucket/dataset/data/x.lance");
+        assert_eq!(
+            strip_prefix(&full, &base).unwrap(),
+            Path::from("data/x.lance")
+        );
+    }
+
+    /// A path outside the base must error, not fall back to the absolute path.
+    /// `tracked_files` and `all_files` document their `path` column as relative to
+    /// `base_uri`, so an absolute entry breaks that contract silently.
+    #[test]
+    fn strip_prefix_rejects_a_path_outside_the_base() {
+        let base = Path::from("bucket/dataset");
+        let outside = Path::from("bucket/other/data/x.lance");
+        let error = strip_prefix(&outside, &base).unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::Internal { .. }),
+            "expected Internal, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("bucket/other/data/x.lance") && message.contains("bucket/dataset"),
+            "the error must name both paths, got {message}"
+        );
     }
 
     #[tokio::test]
