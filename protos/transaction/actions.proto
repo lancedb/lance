@@ -409,9 +409,15 @@ message AddIndexSegment {
   optional int32 index_version = 5;
   /*
    * Fragments covered by this segment (resolved to a fragment_bitmap at apply,
-   * and remapped under fragment relocation). Committed or same-op Local.
+   * and remapped under fragment relocation).
+   *
+   * Absent means the coverage is unknown, which is what the system indices
+   * (MemWAL, fragment reuse) carry and what pre-bitmap segments read back as.
+   * That is a different statement from a present-but-empty list, which says the
+   * segment covers no fragment at all -- the query path serves a segment of
+   * unknown coverage and skips one that covers nothing.
    */
-  repeated Ref covered_fragments = 6;
+  optional FragmentCoverage covered_fragments = 6;
   /*
    * Index files with sizes, when produced by the writer (e.g. a compaction that
    * rewrites the segment). Empty when unavailable.
@@ -420,6 +426,37 @@ message AddIndexSegment {
   // Data-change marker; see AddFragment.data_change. false marks a segment
   // rebuild/compaction that does not reflect any change to the indexed data.
   optional bool data_change = 8;
+  /*
+   * The base path this segment's files live under, for a segment imported from
+   * another dataset. Committed, or Local for a base minted by an AddBase in the
+   * same operation. Absent => the dataset's own index directory.
+   */
+  optional Ref base = 9;
+  /*
+   * When this segment was built, in milliseconds since the Unix epoch. Absent
+   * for a segment whose build time was not recorded.
+   */
+  optional uint64 created_at = 10;
+  /*
+   * The dataset version whose data this segment reflects.
+   *
+   * This is a correctness gate, not provenance: an overlay committed at or
+   * before it is treated as already folded into the index. A segment merged
+   * from several older ones reflects only as much as its oldest input, so this
+   * is genuinely below the version the operation reads and cannot be derived
+   * from it. Absent means the version the operation reads, which is what a
+   * freshly built segment reflects. It may never exceed that version.
+   */
+  optional uint64 dataset_version = 11;
+}
+
+/*
+ * A list of fragments, wrapped so that "no coverage recorded" is distinguishable
+ * from "covers nothing" (a bare `repeated` field cannot tell them apart).
+ */
+message FragmentCoverage {
+  // Committed, or Local for a fragment minted in the same operation.
+  repeated Ref fragments = 1;
 }
 
 /*
