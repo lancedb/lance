@@ -186,8 +186,16 @@ public class ScannerTest {
       VectorSchemaRoot root = reader.getVectorSchemaRoot();
       List<Field> fields = root.getSchema().getFields();
       assertEquals(1, fields.size());
-      assertEquals("id", fields.get(0).getName());
-      assertEquals(ArrowType.ArrowTypeID.Int, fields.get(0).getType().getTypeID());
+      Field idField = fields.get(0);
+      assertEquals("id", idField.getName());
+      // Pin the exact type, not just the ArrowTypeID family: the projected column is a nullable
+      // signed int32. ArrowTypeID.Int alone also matches int8/16/64 and unsigned, and the
+      // (IntVector) cast below only guards the width on non-empty results — an empty scan that
+      // exported e.g. int64 or a non-nullable id would otherwise slip through this helper.
+      assertTrue(idField.isNullable());
+      ArrowType.Int idType = (ArrowType.Int) idField.getType();
+      assertEquals(32, idType.getBitWidth());
+      assertTrue(idType.getIsSigned());
       while (reader.loadNextBatch()) {
         IntVector vector = (IntVector) root.getVector("id");
         int rowsInBatch = vector.getValueCount();
