@@ -74,6 +74,7 @@ rand.workspace = true
 rayon.workspace = true
 futures.workspace = true
 uuid.workspace = true
+zstd.workspace = true
 arrow.workspace = true
 blake3.workspace = true
 base64.workspace = true

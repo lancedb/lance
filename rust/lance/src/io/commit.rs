@@ -36,7 +36,8 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, pb,
+    decode_cell_flag_root, encode_cell_flag_root, is_detached_version, list_index_files_with_sizes,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -342,50 +343,82 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 20 * 1024 * 1024;
 /// multi-megabyte payloads.
 #[cfg(test)]
 pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
+const MAX_INLINE_CELL_FLAG_TRANSACTION_BYTES: usize = 64 * 1024;
+
+fn should_inline_transaction(transaction: &pb::Transaction) -> bool {
+    let max_bytes = if transaction.cell_flag_transaction.is_some() {
+        MAX_INLINE_CELL_FLAG_TRANSACTION_BYTES.min(MAX_INLINE_TRANSACTION_BYTES)
+    } else {
+        MAX_INLINE_TRANSACTION_BYTES
+    };
+    transaction.encoded_len() <= max_bytes
+}
 
 async fn localize_deep_clone_cell_flags(
     object_store: &ObjectStore,
     base_path: &Path,
     manifest: &mut Manifest,
 ) -> Result<()> {
-    let mut normalized_roots: HashMap<String, (u64, Arc<Vec<u8>>)> = HashMap::new();
+    let mut normalized_roots: HashMap<String, (u64, u64, Arc<Vec<u8>>)> = HashMap::new();
     for state in &mut manifest.cell_flag_states {
-        let (size_bytes, normalized_bytes) = if let Some((size_bytes, normalized_bytes)) =
-            normalized_roots.get(&state.root.path)
-        {
-            (*size_bytes, normalized_bytes.clone())
-        } else {
-            state.root.validate_root_path_for_flag(state.flag_id)?;
-            let relative = Path::parse(state.root.path.as_str())?;
-            let path = Path::from_iter(base_path.parts().chain(relative.parts()));
-            let bytes =
-                crate::dataset::cell_flag::read_cell_flag_bytes(object_store, &path, &state.root)
-                    .await?;
-            let mut root = pb::CellFlagRoot::decode(bytes.as_ref()).map_err(|error| {
-                Error::invalid_input(format!(
-                    "Failed to decode deep-cloned cell flag root '{}': {}",
-                    state.root.path, error
-                ))
-            })?;
-            for fragment in &mut root.fragments {
-                if let Some(pb::cell_flag_fragment::State::Partial(bitmap)) = &mut fragment.state {
-                    let typed_bitmap = lance_table::format::CellFlagFile::try_from(bitmap.clone())?;
-                    typed_bitmap
-                        .validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
-                    // collect_paths copied every referenced page under the same
-                    // dataset-relative path, so the cloned root must no longer
-                    // retain the source manifest's base-ID namespace.
-                    bitmap.base_id = None;
+        let (size_bytes, memory_size_bytes, normalized_bytes) =
+            if let Some((size_bytes, memory_size_bytes, normalized_bytes)) =
+                normalized_roots.get(&state.root.path)
+            {
+                (*size_bytes, *memory_size_bytes, normalized_bytes.clone())
+            } else {
+                state.root.validate_root_path_for_flag(state.flag_id)?;
+                let relative = Path::parse(state.root.path.as_str())?;
+                let path = Path::from_iter(base_path.parts().chain(relative.parts()));
+                let bytes = crate::dataset::cell_flag::read_cell_flag_bytes(
+                    object_store,
+                    &path,
+                    &state.root,
+                )
+                .await?;
+                let (mut root, memory_size) =
+                    decode_cell_flag_root(bytes.as_ref()).map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Failed to decode deep-cloned cell flag root '{}': {}",
+                            state.root.path, error
+                        ))
+                    })?;
+                if memory_size as u64 != state.root.memory_size_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "Cell flag root '{}' declares memory size {}, expected {}",
+                        state.root.path, memory_size, state.root.memory_size_bytes
+                    )));
                 }
-            }
-            let normalized = Arc::new(root.encode_to_vec());
-            object_store.put(&path, normalized.as_ref()).await?;
-            let size_bytes = normalized.len() as u64;
-            normalized_roots.insert(state.root.path.clone(), (size_bytes, normalized.clone()));
-            (size_bytes, normalized)
-        };
+                for fragment in &mut root.fragments {
+                    if let Some(pb::cell_flag_fragment::State::Partial(bitmap)) =
+                        &mut fragment.state
+                    {
+                        let typed_bitmap =
+                            lance_table::format::CellFlagFile::try_from(bitmap.clone())?;
+                        typed_bitmap.validate_bitmap_path_for_fragment(
+                            state.flag_id,
+                            fragment.fragment_id,
+                        )?;
+                        // collect_paths copied every referenced page under the same
+                        // dataset-relative path, so the cloned root must no longer
+                        // retain the source manifest's base-ID namespace.
+                        bitmap.base_id = None;
+                    }
+                }
+                let (normalized, memory_size) = encode_cell_flag_root(&root)?;
+                let normalized = Arc::new(normalized);
+                object_store.put(&path, normalized.as_ref()).await?;
+                let size_bytes = normalized.len() as u64;
+                let memory_size_bytes = memory_size as u64;
+                normalized_roots.insert(
+                    state.root.path.clone(),
+                    (size_bytes, memory_size_bytes, normalized.clone()),
+                );
+                (size_bytes, memory_size_bytes, normalized)
+            };
         state.root.base_id = None;
         state.root.size_bytes = size_bytes;
+        state.root.memory_size_bytes = memory_size_bytes;
         if state.root.inline_bytes.is_some() {
             state.root.inline_bytes = Some(normalized_bytes.as_ref().clone());
         }
@@ -407,7 +440,7 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
-    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    let inline_transaction = should_inline_transaction(&pb_transaction);
 
     let transaction_file = if !write_config.disable_transaction_file() {
         write_transaction_file(object_store, base_path, &pb_transaction).await?
@@ -1112,7 +1145,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
-    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    let inline_transaction = should_inline_transaction(&pb_transaction);
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -1509,7 +1542,7 @@ pub(crate) async fn commit_transaction(
         // transaction.
         transaction.validate_internal_extensions()?;
         let pb_transaction = pb::Transaction::from(&transaction);
-        let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+        let inline_transaction = should_inline_transaction(&pb_transaction);
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?

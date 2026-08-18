@@ -38,6 +38,7 @@ prost-types.workspace = true
 rand.workspace = true
 rangemap.workspace = true
 roaring.workspace = true
+zstd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true

@@ -17,7 +17,8 @@ pub use crate::rowids::version::{
 };
 pub use cell_flag::{
     CellFlagDefinition, CellFlagFile, CellFlagFragment, CellFlagFragmentState, CellFlagRoot,
-    CellFlagState,
+    CellFlagState, cell_flag_bitmap_memory_size, decode_cell_flag_bitmap, decode_cell_flag_root,
+    encode_cell_flag_bitmap, encode_cell_flag_query_bitmap, encode_cell_flag_root,
 };
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};

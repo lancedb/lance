@@ -4,7 +4,6 @@
 //! Lazy I/O for snapshot-level cell flag state.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -22,10 +21,11 @@ use lance_datafusion::udf::{
 use lance_datafusion::udf::{bound_cell_flag_flag_id, cell_flag_id};
 use lance_table::format::{
     CellFlagDefinition, CellFlagFile, CellFlagFragment, CellFlagFragmentState, CellFlagRoot,
-    CellFlagState, Manifest, pb,
+    CellFlagState, Manifest, cell_flag_bitmap_memory_size,
+    decode_cell_flag_bitmap as decode_adaptive_cell_flag_bitmap, decode_cell_flag_root,
+    encode_cell_flag_bitmap, encode_cell_flag_query_bitmap, encode_cell_flag_root, pb,
 };
 use object_store::{GetOptions, path::Path};
-use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -52,13 +52,12 @@ const MAX_CELL_FLAG_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INLINE_CELL_FLAG_BITMAP_BYTES: usize = 64 * 1024;
 /// Inline only states at or below 25% density; denser states benefit from
 /// independent immutable objects during repeated sparse mutations.
-const MAX_INLINE_CELL_FLAG_DENSITY_DENOMINATOR: u64 = 4;
 /// Cap total embedded bitmap bytes so large/high-fragment-count roots retain
 /// incremental immutable bitmap objects instead of becoming monolithic.
 const MAX_INLINE_CELL_FLAG_ROOT_BYTES: usize = 4 * 1024 * 1024;
 /// Small roots are copied into their manifest descriptor so cold planning does
 /// not require a separate object-store request.
-const MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES: usize = 64 * 1024;
+const MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES: usize = 4 * 1024 * 1024;
 /// Bound total root copies retained in one manifest across all tracked fields.
 const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const CELL_FLAG_QUERY_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -80,6 +79,7 @@ fn cell_flag_row_change_memory_bytes(
     const ROARING_CONTAINER_OVERHEAD_BYTES: usize = 1024 * 1024;
     let previous_bytes = previous_state
         .map(cell_flag_query_memory_bytes)
+        .transpose()?
         .unwrap_or_default();
     let input_bytes = previous_bytes
         .checked_add(change.set.serialized_size())
@@ -96,13 +96,15 @@ fn cell_flag_row_change_memory_bytes(
         Error::invalid_input("Cell Flag row change memory estimate overflow".to_string())
     })
 }
-fn cell_flag_query_memory_bytes(fragment: &CellFlagFragment) -> usize {
+fn cell_flag_query_memory_bytes(fragment: &CellFlagFragment) -> Result<usize> {
     match &fragment.state {
-        CellFlagFragmentState::All => 0,
+        CellFlagFragmentState::All => Ok(0),
         CellFlagFragmentState::Partial(file) => {
-            usize::try_from(file.size_bytes).unwrap_or(usize::MAX)
+            usize::try_from(file.memory_size_bytes).map_err(|_| {
+                Error::invalid_input("Cell Flag bitmap memory size exceeds this platform")
+            })
         }
-        CellFlagFragmentState::InlinePartial(bytes) => bytes.len(),
+        CellFlagFragmentState::InlinePartial(bytes) => cell_flag_bitmap_memory_size(bytes),
     }
 }
 
@@ -249,7 +251,16 @@ fn decode_cell_flag_bitmap(
     flag_id: u32,
     fragment: &CellFlagFragment,
 ) -> Result<RoaringBitmap> {
-    let bitmap = RoaringBitmap::deserialize_from(&mut Cursor::new(bytes)).map_err(|error| {
+    let memory_size = cell_flag_bitmap_memory_size(bytes)?;
+    if let CellFlagFragmentState::Partial(file) = &fragment.state
+        && memory_size as u64 != file.memory_size_bytes
+    {
+        return Err(Error::invalid_input(format!(
+            "Cell flag bitmap '{}' for flag ID {}, fragment {} declares memory size {}, expected {}",
+            source, flag_id, fragment.fragment_id, memory_size, file.memory_size_bytes
+        )));
+    }
+    let bitmap = decode_adaptive_cell_flag_bitmap(bytes).map_err(|error| {
         Error::invalid_input(format!(
             "Failed to decode cell flag bitmap '{}' for flag ID {}, fragment {}: {}",
             source, flag_id, fragment.fragment_id, error
@@ -658,12 +669,21 @@ impl Dataset {
             .get_or_insert_with_key(key, || async {
                 let store = self.object_store(descriptor.root.base_id).await?;
                 let bytes = read_cell_flag_bytes(&store, &path, &descriptor.root).await?;
-                let proto = pb::CellFlagRoot::decode(bytes.as_ref()).map_err(|error| {
+                let (proto, memory_size) = decode_cell_flag_root(bytes.as_ref()).map_err(|error| {
                     Error::invalid_input(format!(
                         "Failed to decode cell flag root '{}' for flag ID {}: {}",
                         descriptor.root.path, flag_id, error
                     ))
                 })?;
+                if memory_size as u64 != descriptor.root.memory_size_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "Cell flag root '{}' for flag ID {} declares memory size {}, expected {}",
+                        descriptor.root.path,
+                        flag_id,
+                        memory_size,
+                        descriptor.root.memory_size_bytes
+                    )));
+                }
                 let mut root = CellFlagRoot::try_from(proto)?;
 
                 for entry in &mut root.fragments {
@@ -825,22 +845,30 @@ impl Dataset {
                 flag_id, fragment_id
             )));
         }
-        let serialized_size = bitmap.serialized_size();
-        if serialized_size as u64 > MAX_CELL_FLAG_FILE_BYTES {
+        let query_bytes = encode_cell_flag_query_bitmap(bitmap);
+        if query_bytes.len() <= MAX_INLINE_CELL_FLAG_BITMAP_BYTES {
+            return Ok(CellFlagFragmentState::InlinePartial(query_bytes));
+        }
+        let bytes = encode_cell_flag_bitmap(bitmap);
+        if bytes.len() as u64 > MAX_CELL_FLAG_FILE_BYTES {
             return Err(Error::invalid_input(format!(
                 "Cell flag bitmap for flag ID {}, fragment {} has encoded size {}, maximum is {}",
-                flag_id, fragment_id, serialized_size, MAX_CELL_FLAG_FILE_BYTES
+                flag_id,
+                fragment_id,
+                bytes.len(),
+                MAX_CELL_FLAG_FILE_BYTES
             )));
         }
-        let mut bytes = Vec::with_capacity(serialized_size);
-        bitmap.serialize_into(&mut bytes)?;
-        let is_sparse = bitmap.len() <= physical_rows / MAX_INLINE_CELL_FLAG_DENSITY_DENOMINATOR;
-        if is_sparse && bytes.len() <= MAX_INLINE_CELL_FLAG_BITMAP_BYTES {
-            return Ok(CellFlagFragmentState::InlinePartial(bytes));
-        }
+        let memory_size = cell_flag_bitmap_memory_size(&bytes)?;
         Ok(CellFlagFragmentState::Partial(
-            self.write_cell_flag_bitmap_file(write_store, flag_id, fragment_id, &bytes)
-                .await?,
+            self.write_cell_flag_bitmap_file(
+                write_store,
+                flag_id,
+                fragment_id,
+                memory_size,
+                &bytes,
+            )
+            .await?,
         ))
     }
 
@@ -849,6 +877,7 @@ impl Dataset {
         write_store: &ObjectStore,
         flag_id: u32,
         fragment_id: u64,
+        memory_size: usize,
         bytes: &[u8],
     ) -> Result<CellFlagFile> {
         if bytes.len() as u64 > MAX_CELL_FLAG_FILE_BYTES {
@@ -870,6 +899,7 @@ impl Dataset {
         Ok(CellFlagFile {
             path: relative.to_string(),
             size_bytes: bytes.len() as u64,
+            memory_size_bytes: memory_size as u64,
             base_id: None,
             inline_bytes: None,
         })
@@ -917,20 +947,27 @@ impl Dataset {
             };
             if let Some(bytes) = spill {
                 let file = self
-                    .write_cell_flag_bitmap_file(write_store, flag_id, entry.fragment_id, &bytes)
+                    .write_cell_flag_bitmap_file(
+                        write_store,
+                        flag_id,
+                        entry.fragment_id,
+                        cell_flag_bitmap_memory_size(&bytes)?,
+                        &bytes,
+                    )
                     .await?;
                 entry.state = CellFlagFragmentState::Partial(file);
             }
         }
         let proto_root = pb::CellFlagRoot::from(&root);
-        let encoded_size = proto_root.encoded_len();
-        if encoded_size as u64 > MAX_CELL_FLAG_FILE_BYTES {
+        let (bytes, memory_size) = encode_cell_flag_root(&proto_root)?;
+        if bytes.len() as u64 > MAX_CELL_FLAG_FILE_BYTES {
             return Err(Error::internal(format!(
                 "Cell flag root for flag ID {} has encoded size {}, maximum is {}",
-                flag_id, encoded_size, MAX_CELL_FLAG_FILE_BYTES
+                flag_id,
+                bytes.len(),
+                MAX_CELL_FLAG_FILE_BYTES
             )));
         }
-        let bytes = proto_root.encode_to_vec();
         let relative = Path::from(CELL_FLAGS_DIR)
             .join(CELL_FLAG_ROOTS_DIR)
             .join(flag_id.to_string())
@@ -942,6 +979,7 @@ impl Dataset {
             root: CellFlagFile {
                 path: relative.to_string(),
                 size_bytes: bytes.len() as u64,
+                memory_size_bytes: memory_size as u64,
                 base_id: None,
                 inline_bytes: (bytes.len() <= MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES)
                     .then(|| bytes.to_vec()),
@@ -1419,14 +1457,13 @@ pub async fn load_cell_flag_fragments(
         return Ok(HashMap::new());
     };
     let fragments = select_cell_flag_fragments(&root, selected_fragment_ids.as_deref());
-    let required_bytes = fragments
-        .iter()
-        .try_fold(0usize, |total, fragment| {
-            total.checked_add(cell_flag_query_memory_bytes(fragment))
-        })
-        .ok_or_else(|| {
-            Error::invalid_input("Cell Flag query memory estimate overflow".to_string())
-        })?;
+    let required_bytes = fragments.iter().try_fold(0usize, |total, fragment| {
+        total
+            .checked_add(cell_flag_query_memory_bytes(fragment)?)
+            .ok_or_else(|| {
+                Error::invalid_input("Cell Flag query memory estimate overflow".to_string())
+            })
+    })?;
     reserve_cell_flag_query_memory(query_memory_bytes, required_bytes)?;
     let io_parallelism = dataset.object_store.io_parallelism().max(1);
     futures::stream::iter(fragments)
@@ -2639,6 +2676,7 @@ mod tests {
         let file = CellFlagFile {
             path: relative.to_string(),
             size_bytes: 1,
+            memory_size_bytes: 1,
             base_id: None,
             inline_bytes: None,
         };

@@ -4510,6 +4510,7 @@ dependencies = [
  "tracking-allocator",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -5115,6 +5116,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

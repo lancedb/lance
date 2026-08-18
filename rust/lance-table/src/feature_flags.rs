@@ -391,6 +391,7 @@ mod tests {
                     "_cell_flags/roots/{flag_id}/00000000-0000-0000-0000-000000000001.root"
                 ),
                 size_bytes: 0,
+                memory_size_bytes: 1,
                 base_id: None,
                 inline_bytes: None,
             },

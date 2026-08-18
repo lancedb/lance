@@ -68,7 +68,7 @@ message Transaction {
       oneof state {
         bool all_set = 3;
         bool none_set = 4;
-        // Portable serialized RoaringBitmap of local physical row offsets.
+        // Lance self-describing adaptive bitmap of local physical row offsets.
         bytes partial = 5;
       }
     }

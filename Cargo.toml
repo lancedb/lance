@@ -190,6 +190,7 @@ rangemap = { version = "1.0" }
 rayon = "1.10"
 regex-syntax = "0.8.10"
 roaring = "0.11.4"
+zstd = "0.13"
 rstest = "0.26.1"
 serde = { version = "^1" }
 serde_json = { version = "1" }

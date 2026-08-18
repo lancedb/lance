@@ -263,6 +263,9 @@ message CellFlagFile {
   // remains authoritative for reachability, clone, and cleanup; readers may
   // use this copy to avoid a separate metadata request.
   optional bytes inline_bytes = 4;
+  // Upper bound retained for the decoded object. For bitmap objects this may
+  // exceed size_bytes when the adaptive encoding uses a dense bitset.
+  uint64 memory_size_bytes = 5;
 }
 
 // Manifest descriptor for one registered flag that has at least one true row.
@@ -278,9 +281,9 @@ message CellFlagRoot {
 }
 
 // Flag state for one physical fragment. all_set=true means every physical row
-// is true. Partial states are portable serialized Roaring
-// bitmaps of physical row offsets. Small bitmaps may be embedded in the root;
-// larger bitmaps are referenced as immutable files. all_set=false is invalid.
+// is true. Partial states use Lance's self-describing adaptive bitmap encoding
+// for physical row offsets. Small bitmaps may be embedded in the root; larger
+// bitmaps are referenced as immutable files. all_set=false is invalid.
 message CellFlagFragment {
   uint64 fragment_id = 1;
   uint64 physical_rows = 2;

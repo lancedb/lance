@@ -53,7 +53,7 @@ use lance_core::{
 };
 use lance_io::object_store::ObjectStore;
 use lance_table::{
-    format::{CellFlagFile, CellFlagRoot, IndexMetadata, Manifest},
+    format::{CellFlagFile, CellFlagRoot, IndexMetadata, Manifest, decode_cell_flag_root},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -63,7 +63,6 @@ use lance_table::{
 use moka::future::Cache;
 use object_store::ObjectMeta;
 use object_store::path::Path;
-use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -394,7 +393,7 @@ impl CleanupIoContext {
                     .await
                     .map_err(|_| Error::internal("Cleanup I/O semaphore closed".to_string()))?;
                 let memory_weight = cleanup_cell_flag_memory_weight(
-                    usize::try_from(file.size_bytes).unwrap_or(usize::MAX),
+                    usize::try_from(file.memory_size_bytes).unwrap_or(usize::MAX),
                 );
                 let _byte_permit = byte_permits
                     .acquire_many_owned(memory_weight)
@@ -403,13 +402,19 @@ impl CleanupIoContext {
                         Error::internal("Cleanup I/O byte semaphore closed".to_string())
                     })?;
                 let root_bytes = read_cell_flag_bytes(&object_store, &full_path, &file).await?;
-                let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                let (root_proto, memory_size) = decode_cell_flag_root(root_bytes.as_ref())
                     .map_err(|error| {
                         Error::invalid_input(format!(
                             "Failed to decode cell flag root '{}': {}",
                             file.path, error
                         ))
                     })?;
+                if memory_size as u64 != file.memory_size_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "Cell flag root '{}' declares memory size {}, expected {}",
+                        file.path, memory_size, file.memory_size_bytes
+                    )));
+                }
                 Ok(Arc::new(CellFlagRoot::try_from(root_proto)?))
             })
             .await

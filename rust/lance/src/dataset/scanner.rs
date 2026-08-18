@@ -7221,7 +7221,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn cell_flag_limit_binding_loads_only_scanned_fragment_bitmaps() {
+    async fn cell_flag_limit_binding_avoids_io_for_inline_fragment_bitmaps() {
         let test_uri = TempStrDir::default();
         let mut dataset = gen_batch()
             .col("i", array::step::<Int32Type>())
@@ -7253,7 +7253,7 @@ mod test {
         assert_eq!(root.fragments.len(), 3);
         assert!(root.fragments.iter().all(|fragment| matches!(
             fragment.state,
-            lance_table::format::CellFlagFragmentState::Partial(_)
+            lance_table::format::CellFlagFragmentState::InlinePartial(_)
         )));
 
         async fn planning_iops(uri: &str, limit: Option<i64>) -> u64 {
@@ -7278,10 +7278,8 @@ mod test {
 
         let limited_iops = planning_iops(test_uri.as_ref(), Some(1)).await;
         let full_iops = planning_iops(test_uri.as_ref(), None).await;
-        assert!(
-            full_iops > limited_iops,
-            "full planning I/O {full_iops} must exceed limited planning I/O {limited_iops}"
-        );
+        assert_eq!(limited_iops, 0);
+        assert_eq!(full_iops, 0);
     }
 
     #[tokio::test]

@@ -45,7 +45,8 @@ use lance_table::{
     format::{
         BasePath, CELL_FLAG_MANIFEST_CONFIG_KEY, DataFile, DataStorageFormat, Fragment, IndexFile,
         IndexMetadata, Manifest, RowDatasetVersionMeta, RowDatasetVersionRun,
-        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
+        RowDatasetVersionSequence, RowIdMeta, decode_cell_flag_bitmap, encode_cell_flag_bitmap,
+        overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -56,7 +57,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 use prost::Message;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -387,6 +388,168 @@ fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
+const CELL_FLAG_ROW_ADDRESSES_MAGIC: &[u8; 4] = b"LCFR";
+const CELL_FLAG_ROW_ADDRESSES_ROARING: u8 = 0;
+const CELL_FLAG_ROW_ADDRESSES_FRAGMENTED: u8 = 1;
+const CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED: u8 = 2;
+const MAX_CELL_FLAG_ROW_ADDRESSES_BYTES: usize = 64 * 1024 * 1024;
+
+fn encode_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Vec<u8> {
+    let mut roaring = Vec::with_capacity(addresses.serialized_size());
+    addresses
+        .serialize_into(&mut roaring)
+        .expect("RoaringTreemap serialization to Vec cannot fail");
+
+    let mut fragments = Vec::<(u32, RoaringBitmap)>::new();
+    for address in addresses.iter() {
+        let fragment_id = (address >> 32) as u32;
+        if fragments.last().is_none_or(|(id, _)| *id != fragment_id) {
+            fragments.push((fragment_id, RoaringBitmap::new()));
+        }
+        fragments
+            .last_mut()
+            .expect("fragment inserted")
+            .1
+            .insert(address as u32);
+    }
+    let encoded_fragments = fragments
+        .into_iter()
+        .map(|(fragment_id, offsets)| (fragment_id, encode_cell_flag_bitmap(&offsets)))
+        .collect::<Vec<_>>();
+    let fragmented_size = 4_usize.saturating_add(
+        encoded_fragments
+            .iter()
+            .map(|(_, bytes)| 8_usize.saturating_add(bytes.len()))
+            .sum(),
+    );
+
+    let (encoding, payload) = if fragmented_size < roaring.len() {
+        let mut payload = Vec::with_capacity(fragmented_size);
+        payload.extend_from_slice(&(encoded_fragments.len() as u32).to_le_bytes());
+        for (fragment_id, bytes) in encoded_fragments {
+            payload.extend_from_slice(&fragment_id.to_le_bytes());
+            payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&bytes);
+        }
+        let compressed = zstd::bulk::compress(&payload, 1)
+            .expect("Zstd compression of Cell Flag row addresses cannot fail");
+        if compressed.len() + 8 < payload.len() {
+            let mut encoded = Vec::with_capacity(compressed.len() + 8);
+            encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(&compressed);
+            (CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED, encoded)
+        } else {
+            (CELL_FLAG_ROW_ADDRESSES_FRAGMENTED, payload)
+        }
+    } else {
+        (CELL_FLAG_ROW_ADDRESSES_ROARING, roaring)
+    };
+    let mut encoded = Vec::with_capacity(CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1 + payload.len());
+    encoded.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+    encoded.push(encoding);
+    encoded.extend_from_slice(&payload);
+    encoded
+}
+
+fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
+    if bytes.len() < CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1
+        || &bytes[..CELL_FLAG_ROW_ADDRESSES_MAGIC.len()] != CELL_FLAG_ROW_ADDRESSES_MAGIC
+    {
+        return Err(Error::invalid_input(
+            "Cell flag row addresses have an invalid encoding header",
+        ));
+    }
+    let payload = &bytes[CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1..];
+    match bytes[CELL_FLAG_ROW_ADDRESSES_MAGIC.len()] {
+        CELL_FLAG_ROW_ADDRESSES_ROARING => {
+            RoaringTreemap::deserialize_from(payload).map_err(|error| {
+                Error::invalid_input(format!("Invalid Cell flag row addresses: {error}"))
+            })
+        }
+        CELL_FLAG_ROW_ADDRESSES_FRAGMENTED => decode_fragmented_cell_flag_row_addresses(payload),
+        CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED => {
+            if payload.len() < 8 {
+                return Err(Error::invalid_input(
+                    "Compressed Cell flag row addresses are missing their decoded length",
+                ));
+            }
+            let decoded_size = u64::from_le_bytes(
+                payload[..8]
+                    .try_into()
+                    .expect("compressed row address header length checked"),
+            );
+            let decoded_size = usize::try_from(decoded_size).map_err(|_| {
+                Error::invalid_input("Cell flag row address size exceeds this platform")
+            })?;
+            if decoded_size > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
+                return Err(Error::invalid_input(format!(
+                    "Cell flag row addresses require {} bytes, maximum is {}",
+                    decoded_size, MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+                )));
+            }
+            let decoded = zstd::bulk::decompress(&payload[8..], decoded_size).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Invalid compressed Cell flag row addresses: {error}"
+                ))
+            })?;
+            decode_fragmented_cell_flag_row_addresses(&decoded)
+        }
+        encoding => Err(Error::invalid_input(format!(
+            "Cell flag row addresses have unknown encoding {}",
+            encoding
+        ))),
+    }
+}
+
+fn decode_fragmented_cell_flag_row_addresses(payload: &[u8]) -> Result<RoaringTreemap> {
+    let mut cursor = 0usize;
+    let fragment_count = read_cell_flag_row_address_u32(payload, &mut cursor)? as usize;
+    let mut addresses = RoaringTreemap::new();
+    let mut previous_fragment = None;
+    for _ in 0..fragment_count {
+        let fragment_id = read_cell_flag_row_address_u32(payload, &mut cursor)?;
+        if previous_fragment.is_some_and(|previous| previous >= fragment_id) {
+            return Err(Error::invalid_input(
+                "Cell flag row address fragments must be strictly increasing",
+            ));
+        }
+        previous_fragment = Some(fragment_id);
+        let length = read_cell_flag_row_address_u32(payload, &mut cursor)? as usize;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_input("Cell flag row address length overflow"))?;
+        let fragment_bytes = payload
+            .get(cursor..end)
+            .ok_or_else(|| Error::invalid_input("Cell flag row address fragment is truncated"))?;
+        cursor = end;
+        let offsets = decode_cell_flag_bitmap(fragment_bytes)?;
+        addresses.extend(
+            offsets
+                .iter()
+                .map(|offset| (u64::from(fragment_id) << 32) | u64::from(offset)),
+        );
+    }
+    if cursor != payload.len() {
+        return Err(Error::invalid_input(
+            "Cell flag row addresses contain trailing bytes",
+        ));
+    }
+    Ok(addresses)
+}
+
+fn read_cell_flag_row_address_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| Error::invalid_input("Cell flag row address offset overflow"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| Error::invalid_input("Cell flag row addresses are truncated"))?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(
+        value.try_into().expect("length checked"),
+    ))
+}
+
 const CELL_FLAG_TRANSACTION_PROPERTY_PREFIX: &str = "\0lance.cell_flag_transaction.";
 
 fn cell_flag_transaction_property_key(uuid: &str) -> String {
@@ -616,17 +779,10 @@ impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
             row_changes: value
                 .row_changes
                 .iter()
-                .map(|change| {
-                    let mut row_addresses = Vec::new();
-                    change
-                        .row_addresses
-                        .serialize_into(&mut row_addresses)
-                        .expect("RoaringTreemap serialization to Vec cannot fail");
-                    flag_pb::RowChange {
-                        flag_id: change.flag_id,
-                        value: change.value,
-                        row_addresses,
-                    }
+                .map(|change| flag_pb::RowChange {
+                    flag_id: change.flag_id,
+                    value: change.value,
+                    row_addresses: encode_cell_flag_row_addresses(&change.row_addresses),
                 })
                 .collect(),
             fragment_states: value
@@ -639,11 +795,7 @@ impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
                         }
                         CellFlagFragmentValue::All => flag_pb::fragment_state::State::AllSet(true),
                         CellFlagFragmentValue::Partial(bitmap) => {
-                            let mut bytes = Vec::new();
-                            bitmap
-                                .serialize_into(&mut bytes)
-                                .expect("RoaringBitmap serialization to Vec cannot fail");
-                            flag_pb::fragment_state::State::Partial(bytes)
+                            flag_pb::fragment_state::State::Partial(encode_cell_flag_bitmap(bitmap))
                         }
                     };
                     flag_pb::FragmentState {
@@ -732,13 +884,12 @@ impl TryFrom<pb::transaction::CellFlagTransaction> for CellFlagTransaction {
             .into_iter()
             .map(|change| {
                 let row_addresses =
-                    roaring::RoaringTreemap::deserialize_from(change.row_addresses.as_slice())
-                        .map_err(|error| {
-                            Error::invalid_input(format!(
-                                "Invalid cell flag row addresses for flag ID {}: {}",
-                                change.flag_id, error
-                            ))
-                        })?;
+                    decode_cell_flag_row_addresses(&change.row_addresses).map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Invalid cell flag row addresses for flag ID {}: {}",
+                            change.flag_id, error
+                        ))
+                    })?;
                 if row_addresses.is_empty() {
                     return Err(Error::invalid_input(format!(
                         "Cell flag row change for flag ID {} has no rows",
@@ -777,13 +928,12 @@ impl TryFrom<pb::transaction::CellFlagTransaction> for CellFlagTransaction {
                         )));
                     }
                     flag_pb::fragment_state::State::Partial(bytes) => {
-                        let bitmap =
-                            RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(|error| {
-                                Error::invalid_input(format!(
-                                    "Invalid cell flag bitmap for fragment '{}', flag ID {}: {}",
-                                    fragment.fragment_path, fragment.flag_id, error
-                                ))
-                            })?;
+                        let bitmap = decode_cell_flag_bitmap(&bytes).map_err(|error| {
+                            Error::invalid_input(format!(
+                                "Invalid cell flag bitmap for fragment '{}', flag ID {}: {}",
+                                fragment.fragment_path, fragment.flag_id, error
+                            ))
+                        })?;
                         CellFlagFragmentValue::Partial(bitmap)
                     }
                 };
@@ -7548,6 +7698,28 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .get(USER_PROPERTY)
+        );
+    }
+
+    #[test]
+    fn cell_flag_row_addresses_use_fragment_bitmaps_when_smaller() {
+        let row_addresses = RoaringTreemap::from_iter((0_u64..100).flat_map(|fragment_id| {
+            (0_u64..10_000)
+                .step_by(2)
+                .map(move |offset| (fragment_id << 32) | offset)
+        }));
+        let mut portable_roaring = Vec::new();
+        row_addresses.serialize_into(&mut portable_roaring).unwrap();
+
+        let encoded = encode_cell_flag_row_addresses(&row_addresses);
+        assert_eq!(
+            encoded[CELL_FLAG_ROW_ADDRESSES_MAGIC.len()],
+            CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED
+        );
+        assert!(encoded.len() * 4 < portable_roaring.len());
+        assert_eq!(
+            decode_cell_flag_row_addresses(&encoded).unwrap(),
+            row_addresses
         );
     }
 
