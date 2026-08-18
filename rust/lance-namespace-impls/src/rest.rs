@@ -2006,6 +2006,78 @@ mod tests {
         );
     }
 
+    async fn capture_create_index_body(request: CreateTableIndexRequest) -> serde_json::Value {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/table/my_table/create_index"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let result = namespace.create_table_index(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        serde_json::from_slice(&requests[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_table_index_sends_vector_index_params() {
+        let body = capture_create_index_body(CreateTableIndexRequest {
+            id: Some(vec!["my_table".to_string()]),
+            column: "vector".to_string(),
+            index_type: "IVF_HNSW_SQ".to_string(),
+            distance_type: Some("l2".to_string()),
+            num_partitions: Some(256),
+            num_sub_vectors: Some(96),
+            num_bits: Some(8),
+            sample_rate: Some(128),
+            max_iterations: Some(50),
+            target_partition_size: Some(4096),
+            m: Some(32),
+            ef_construction: Some(300),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(body["column"], "vector");
+        assert_eq!(body["index_type"], "IVF_HNSW_SQ");
+        assert_eq!(body["num_partitions"], 256);
+        assert_eq!(body["num_sub_vectors"], 96);
+        assert_eq!(body["num_bits"], 8);
+        assert_eq!(body["sample_rate"], 128);
+        assert_eq!(body["max_iterations"], 50);
+        assert_eq!(body["target_partition_size"], 4096);
+        assert_eq!(body["m"], 32);
+        assert_eq!(body["ef_construction"], 300);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_index_omits_unset_vector_index_params() {
+        let body = capture_create_index_body(CreateTableIndexRequest {
+            id: Some(vec!["my_table".to_string()]),
+            column: "vector".to_string(),
+            index_type: "IVF_HNSW_SQ".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        for field in [
+            "num_partitions",
+            "num_sub_vectors",
+            "num_bits",
+            "sample_rate",
+            "max_iterations",
+            "target_partition_size",
+            "m",
+            "ef_construction",
+        ] {
+            assert!(body.get(field).is_none(), "{field} should be omitted");
+        }
+    }
+
     #[tokio::test]
     async fn test_insert_into_table_success() {
         // Start a mock server
