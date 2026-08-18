@@ -48,6 +48,7 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
+use super::observer::WalObserver;
 use super::scanner::SsTableWarmer;
 use super::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
@@ -223,6 +224,12 @@ pub struct ShardWriterConfig {
     /// WAL pod). Default: `None`.
     pub warmer: Option<Arc<dyn SsTableWarmer>>,
 
+    /// Optional sink for write-path events, currently flush latency. Wired to
+    /// the flush handlers; supplied by the consumer (e.g. the WAL pod), which
+    /// owns the aggregation Lance would otherwise have to pick for it.
+    /// Default: `None`.
+    pub observer: Option<Arc<dyn WalObserver>>,
+
     /// Store params the base dataset was opened with, reused for the flusher's
     /// opens + writes (base + generations). Injected by `mem_wal_writer`; set
     /// these to the params of the dataset at `base_uri`, not to params bound to
@@ -256,6 +263,7 @@ impl Default for ShardWriterConfig {
             enable_memtable: true,
             hnsw_params: HashMap::new(),
             warmer: None,
+            observer: None,
             store_params: None,
             session: None,
         }
@@ -1868,6 +1876,7 @@ impl ShardWriter {
             None,
             config.max_wal_flush_interval,
             stats.clone(),
+            config.observer.clone(),
         );
         task_executor.add_handler(
             "wal_flusher".to_string(),
@@ -1884,6 +1893,7 @@ impl ShardWriter {
             epoch,
             index_configs.to_vec(),
             stats.clone(),
+            config.observer.clone(),
             config.frozen_memtable_grace,
         );
         task_executor.add_handler(
@@ -1956,6 +1966,7 @@ impl ShardWriter {
             Some(state.clone()),
             config.max_wal_flush_interval,
             stats,
+            config.observer.clone(),
         );
         task_executor.add_handler(
             "wal_flusher".to_string(),
@@ -3097,6 +3108,7 @@ struct WalFlushHandler {
     /// the append size-triggered (and freeze/close-triggered) only.
     flush_interval: Option<Duration>,
     stats: SharedWriteStats,
+    observer: Option<Arc<dyn WalObserver>>,
 }
 
 impl WalFlushHandler {
@@ -3106,6 +3118,7 @@ impl WalFlushHandler {
         wal_only_state: Option<Arc<WalOnlyState>>,
         flush_interval: Option<Duration>,
         stats: SharedWriteStats,
+        observer: Option<Arc<dyn WalObserver>>,
     ) -> Self {
         Self {
             wal_flusher,
@@ -3113,6 +3126,7 @@ impl WalFlushHandler {
             wal_only_state,
             flush_interval,
             stats,
+            observer,
         }
     }
 }
@@ -3299,9 +3313,14 @@ impl WalFlushHandler {
             .unwrap_or(0);
 
         if batches_flushed > 0 {
-            self.stats
-                .record_wal_flush(start.elapsed(), flush_result.wal_bytes);
+            // One reading for both sinks, so the cumulative total and the
+            // per-flush observation cannot disagree.
+            let elapsed = start.elapsed();
+            self.stats.record_wal_flush(elapsed, flush_result.wal_bytes);
             self.stats.record_wal_io(flush_result.wal_io_duration);
+            if let Some(observer) = &self.observer {
+                observer.on_wal_flush(elapsed, flush_result.wal_bytes);
+            }
         }
 
         Ok(flush_result)
@@ -3328,6 +3347,7 @@ struct MemTableFlushHandler {
     /// at all.
     index_configs: Vec<MemIndexConfig>,
     stats: SharedWriteStats,
+    observer: Option<Arc<dyn WalObserver>>,
     /// How long a frozen memtable lingers in memory after its flush commits
     /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
@@ -3342,6 +3362,7 @@ impl MemTableFlushHandler {
         epoch: u64,
         index_configs: Vec<MemIndexConfig>,
         stats: SharedWriteStats,
+        observer: Option<Arc<dyn WalObserver>>,
         grace: Duration,
     ) -> Self {
         Self {
@@ -3351,6 +3372,7 @@ impl MemTableFlushHandler {
             epoch,
             index_configs,
             stats,
+            observer,
             grace,
         }
     }
@@ -3523,8 +3545,12 @@ impl MemTableFlushHandler {
 
         let result = flush_result?;
 
+        let elapsed = start.elapsed();
         self.stats
-            .record_memtable_flush(start.elapsed(), result.rows_flushed);
+            .record_memtable_flush(elapsed, result.rows_flushed);
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush(elapsed, result.rows_flushed);
+        }
 
         info!(
             "Flushed frozen memtable generation {} ({} rows in {:?})",
@@ -3611,9 +3637,6 @@ impl WriteStats {
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
         self.wal_flush_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
-        // Also observed individually: the cumulative total above yields an
-        // average, which cannot show the tail an embedder alerts on.
-        super::metrics::record_flush_duration(super::metrics::KIND_WAL, duration);
     }
 
     /// Record WAL I/O duration (sub-component of WAL flush).
@@ -3639,7 +3662,6 @@ impl WriteStats {
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
         self.memtable_flush_rows
             .fetch_add(rows as u64, Ordering::Relaxed);
-        super::metrics::record_flush_duration(super::metrics::KIND_MEMTABLE, duration);
     }
 
     /// Get a snapshot of current statistics.
