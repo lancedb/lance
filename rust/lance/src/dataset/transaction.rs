@@ -2237,6 +2237,19 @@ impl Transaction {
                 "This dataset was not created with the stable row ids feature.  Please run `migrate_to_stable_row_ids` before attempting to use stable row ids".into(),
             ));
         }
+
+        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
+            let names: Vec<&str> = current_indices
+                .iter()
+                .map(|idx| idx.name.as_str())
+                .collect();
+            return Err(Error::invalid_input(format!(
+                "Cannot migrate to stable row IDs while indexes exist on the dataset. \
+                 Drop the following indexes first, then re-run the migration, and \
+                 recreate them afterwards: {}",
+                names.join(", ")
+            )));
+        }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
