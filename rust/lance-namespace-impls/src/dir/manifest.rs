@@ -288,6 +288,7 @@ struct ManifestIndexAccumulator {
     base_objects_values: Vec<Option<Vec<String>>>,
     base_objects_row_ids: Vec<u64>,
     row_count: u64,
+    has_drop_tombstones: bool,
 }
 
 impl ManifestIndexAccumulator {
@@ -320,6 +321,7 @@ impl ManifestIndexAccumulator {
             .entry(row.object_type.as_str())
             .or_default()
             .insert(row_id as u32);
+        self.has_drop_tombstones |= row.object_type == ObjectType::DropTombstone;
         self.base_objects_values
             .push(row.base_objects.map(|objects| objects.to_vec()));
         self.base_objects_row_ids.push(row_id);
@@ -2501,9 +2503,10 @@ impl ManifestNamespace {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
+        has_drop_tombstones: bool,
     ) -> std::result::Result<(), CommitError> {
         apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
-        if self.async_drop_enabled {
+        if has_drop_tombstones {
             mark_drop_tombstone_rows(manifest.table_metadata_mut());
         }
         let timestamp_nanos = SystemTime::now()
@@ -2671,6 +2674,7 @@ impl ManifestNamespace {
             };
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
+            let has_drop_tombstones = index_data.has_drop_tombstones;
 
             let Operation::Overwrite {
                 fragments, schema, ..
@@ -2731,6 +2735,7 @@ impl ManifestNamespace {
                     &mut manifest,
                     indices,
                     transaction,
+                    has_drop_tombstones,
                 )
                 .await;
 
@@ -3995,46 +4000,57 @@ impl LanceNamespace for ManifestNamespace {
                 metadata,
             };
             if replacing_generated_location {
-                let previous_location = &existing_table
+                let previous_location = existing_table
                     .as_ref()
                     .expect("an overwrite has an existing table")
-                    .location;
+                    .location
+                    .clone();
                 let tombstone_id = match self
-                    .replace_manifest_table_location(entry, previous_location)
+                    .replace_manifest_table_location(entry, &previous_location)
                     .await
                 {
                     Ok(tombstone_id) => tombstone_id,
                     Err(error) => {
-                        let new_table_path = self.table_path(&dir_name);
-                        if let Err(cleanup_error) =
-                            self.object_store.remove_dir_all(new_table_path).await
-                            && !cleanup_error.is_not_found()
-                        {
-                            log::warn!(
-                                "Failed to clean up replacement table location '{}' after manifest conflict: {}",
-                                dir_name,
-                                cleanup_error
-                            );
+                        let replacement_did_not_commit = self
+                            .query_manifest_for_table(&object_id)
+                            .await
+                            .is_ok_and(|current| {
+                                current.is_some_and(|current| {
+                                    manifest_locations_match(&current.location, &previous_location)
+                                })
+                            });
+                        if replacement_did_not_commit {
+                            let new_table_path = self.table_path(&dir_name);
+                            if let Err(cleanup_error) =
+                                self.object_store.remove_dir_all(new_table_path).await
+                                && !cleanup_error.is_not_found()
+                            {
+                                log::warn!(
+                                    "Failed to clean up replacement table location '{}' after manifest conflict: {}",
+                                    dir_name,
+                                    cleanup_error
+                                );
+                            }
                         }
                         return Err(error);
                     }
                 };
-                if let Err(error) = self.put_deregistered_table_marker(previous_location).await {
+                if let Err(error) = self.put_deregistered_table_marker(&previous_location).await {
                     log::warn!(
                         "Failed to write deregistration marker for overwritten table location '{}': {error:?}",
                         previous_location
                     );
                 }
-                let previous_table_path = self.table_path(previous_location);
+                let previous_table_path = self.table_path(&previous_location);
                 let cleanup_complete =
                     match self.object_store.remove_dir_all(previous_table_path).await {
                         Ok(()) => {
-                            self.remove_deregistered_table_marker(previous_location)
+                            self.remove_deregistered_table_marker(&previous_location)
                                 .await;
                             true
                         }
                         Err(error) if error.is_not_found() => {
-                            self.remove_deregistered_table_marker(previous_location)
+                            self.remove_deregistered_table_marker(&previous_location)
                                 .await;
                             true
                         }
@@ -4659,13 +4675,6 @@ impl LanceNamespace for ManifestNamespace {
             .context
             .as_ref()
             .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
-        if expected_location.is_some() && !self.async_drop_enabled {
-            return Err(NamespaceError::Unsupported {
-                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
-            }
-            .into());
-        }
-
         // Get table info before deleting
         let table_info = self.query_manifest_for_table(&object_id).await?;
 
@@ -4676,6 +4685,13 @@ impl LanceNamespace for ManifestNamespace {
             }
             None => {
                 if let Some(expected_location) = expected_location {
+                    if !self.async_drop_enabled {
+                        return Err(NamespaceError::Unsupported {
+                            message: "Expected-location fencing requires async_drop_enabled=true"
+                                .to_string(),
+                        }
+                        .into());
+                    }
                     let existing_tombstone =
                         self.list_drop_tombstones()
                             .await?
@@ -4725,6 +4741,12 @@ impl LanceNamespace for ManifestNamespace {
                     "Expected-location fencing is unsupported for table '{}' because location '{}' was not generated as a unique table incarnation",
                     object_id, manifest_location
                 ),
+            }
+            .into());
+        }
+        if expected_location.is_some() && !self.async_drop_enabled {
+            return Err(NamespaceError::Unsupported {
+                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
             }
             .into());
         }
@@ -5279,6 +5301,67 @@ mod tests {
         assert!(
             !ds.metadata()
                 .contains_key(crate::dir::manifest_feature_flags::WRITER_FEATURE_FLAGS_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_drop_flags_start_with_first_tombstone() {
+        use lance::dataset::builder::DatasetBuilder;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .async_drop_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        let table_id = vec!["t1".to_string()];
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(table_id.clone());
+        namespace
+            .create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+
+        let manifest_uri = format!("{temp_path}/{MANIFEST_TABLE_NAME}");
+        let dataset = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        assert!(
+            !dataset
+                .metadata()
+                .contains_key(crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY)
+        );
+
+        let location = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+        namespace
+            .deregister_table(DeregisterTableRequest {
+                id: Some(table_id),
+                context: Some(HashMap::from([(
+                    super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+                    location,
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(manifest_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .metadata()
+                .contains_key(crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY)
         );
     }
 
