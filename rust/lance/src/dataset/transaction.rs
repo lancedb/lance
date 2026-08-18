@@ -45,8 +45,8 @@ use lance_table::{
     format::{
         BasePath, CELL_FLAG_MANIFEST_CONFIG_KEY, DataFile, DataStorageFormat, Fragment, IndexFile,
         IndexMetadata, Manifest, RowDatasetVersionMeta, RowDatasetVersionRun,
-        RowDatasetVersionSequence, RowIdMeta, decode_cell_flag_bitmap, encode_cell_flag_bitmap,
-        overlay::DataOverlayFile, pb,
+        RowDatasetVersionSequence, RowIdMeta, cell_flag_bitmap_memory_size,
+        decode_cell_flag_bitmap, encode_cell_flag_bitmap, overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -61,6 +61,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    io::Write,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -383,9 +384,9 @@ impl CellFlagConflictScope {
     }
 }
 
-fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> String {
-    let bytes = pb::transaction::CellFlagTransaction::from(value).encode_to_vec();
-    STANDARD_NO_PAD.encode(bytes)
+fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> Result<String> {
+    let bytes = pb::transaction::CellFlagTransaction::try_from(value)?.encode_to_vec();
+    Ok(STANDARD_NO_PAD.encode(bytes))
 }
 
 const CELL_FLAG_ROW_ADDRESSES_MAGIC: &[u8; 4] = b"LCFR";
@@ -393,62 +394,111 @@ const CELL_FLAG_ROW_ADDRESSES_ROARING: u8 = 0;
 const CELL_FLAG_ROW_ADDRESSES_FRAGMENTED: u8 = 1;
 const CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED: u8 = 2;
 const MAX_CELL_FLAG_ROW_ADDRESSES_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY: u64 = 64 * 1024 * 1024;
 
-fn encode_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Vec<u8> {
-    let mut roaring = Vec::with_capacity(addresses.serialized_size());
-    addresses
-        .serialize_into(&mut roaring)
-        .expect("RoaringTreemap serialization to Vec cannot fail");
-
-    let mut fragments = Vec::<(u32, RoaringBitmap)>::new();
-    for address in addresses.iter() {
-        let fragment_id = (address >> 32) as u32;
-        if fragments.last().is_none_or(|(id, _)| *id != fragment_id) {
-            fragments.push((fragment_id, RoaringBitmap::new()));
-        }
-        fragments
-            .last_mut()
-            .expect("fragment inserted")
-            .1
-            .insert(address as u32);
+fn validate_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Result<()> {
+    let retained_bytes = addresses.serialized_size();
+    if retained_bytes > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Cell flag row addresses require {} retained bytes, maximum is {}",
+            retained_bytes, MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+        )));
     }
-    let encoded_fragments = fragments
-        .into_iter()
-        .map(|(fragment_id, offsets)| (fragment_id, encode_cell_flag_bitmap(&offsets)))
-        .collect::<Vec<_>>();
-    let fragmented_size = 4_usize.saturating_add(
-        encoded_fragments
-            .iter()
-            .map(|(_, bytes)| 8_usize.saturating_add(bytes.len()))
-            .sum(),
-    );
+    if addresses.len() > MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY {
+        return Err(Error::invalid_input(format!(
+            "Cell flag row addresses contain {} rows, maximum is {}",
+            addresses.len(),
+            MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY
+        )));
+    }
+    Ok(())
+}
 
-    let (encoding, payload) = if fragmented_size < roaring.len() {
-        let mut payload = Vec::with_capacity(fragmented_size);
-        payload.extend_from_slice(&(encoded_fragments.len() as u32).to_le_bytes());
-        for (fragment_id, bytes) in encoded_fragments {
-            payload.extend_from_slice(&fragment_id.to_le_bytes());
-            payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            payload.extend_from_slice(&bytes);
+fn encode_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Result<Vec<u8>> {
+    validate_cell_flag_row_addresses(addresses)?;
+    let roaring_size = addresses.serialized_size();
+    let mut fragmented = Vec::with_capacity(roaring_size.min(64 * 1024));
+    fragmented.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+    fragmented.push(CELL_FLAG_ROW_ADDRESSES_FRAGMENTED);
+    fragmented.extend_from_slice(&0_u32.to_le_bytes());
+    let mut fragmented_memory = 0usize;
+    let mut fragment_count = 0u32;
+    let mut has_fragmented_candidate = true;
+    for (fragment_id, offsets) in addresses.bitmaps() {
+        let Ok(bytes) = encode_cell_flag_bitmap(offsets) else {
+            has_fragmented_candidate = false;
+            break;
+        };
+        let memory_size = cell_flag_bitmap_memory_size(&bytes)?;
+        let Some(next_memory) = fragmented_memory.checked_add(memory_size) else {
+            has_fragmented_candidate = false;
+            break;
+        };
+        let Some(next_size) = fragmented
+            .len()
+            .checked_add(8)
+            .and_then(|size| size.checked_add(bytes.len()))
+        else {
+            has_fragmented_candidate = false;
+            break;
+        };
+        if next_memory > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+            || next_size >= CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1 + roaring_size
+        {
+            has_fragmented_candidate = false;
+            break;
         }
-        let compressed = zstd::bulk::compress(&payload, 1)
-            .expect("Zstd compression of Cell Flag row addresses cannot fail");
-        if compressed.len() + 8 < payload.len() {
-            let mut encoded = Vec::with_capacity(compressed.len() + 8);
-            encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            encoded.extend_from_slice(&compressed);
-            (CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED, encoded)
-        } else {
-            (CELL_FLAG_ROW_ADDRESSES_FRAGMENTED, payload)
+        fragment_count = fragment_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_input("Cell flag row address fragment count overflow"))?;
+        fragmented_memory = next_memory;
+        fragmented.extend_from_slice(&fragment_id.to_le_bytes());
+        fragmented.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        fragmented.extend_from_slice(&bytes);
+    }
+
+    if has_fragmented_candidate {
+        fragmented[5..9].copy_from_slice(&fragment_count.to_le_bytes());
+        let payload_len = fragmented.len() - CELL_FLAG_ROW_ADDRESSES_MAGIC.len() - 1;
+        if payload_len <= MAX_CELL_FLAG_ROW_ADDRESSES_BYTES / 2 {
+            let mut compressed = Vec::new();
+            compressed.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+            compressed.push(CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED);
+            compressed.extend_from_slice(&(payload_len as u64).to_le_bytes());
+            let mut encoder =
+                zstd::stream::write::Encoder::new(compressed, 1).map_err(|error| {
+                    Error::internal(format!(
+                        "Failed to compress Cell flag row addresses: {error}"
+                    ))
+                })?;
+            encoder
+                .write_all(&fragmented[CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1..])
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "Failed to compress Cell flag row addresses: {error}"
+                    ))
+                })?;
+            let encoded = encoder.finish().map_err(|error| {
+                Error::internal(format!(
+                    "Failed to compress Cell flag row addresses: {error}"
+                ))
+            })?;
+            if encoded.len() < fragmented.len() {
+                drop(fragmented);
+                return Ok(encoded);
+            }
         }
-    } else {
-        (CELL_FLAG_ROW_ADDRESSES_ROARING, roaring)
-    };
-    let mut encoded = Vec::with_capacity(CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1 + payload.len());
+        return Ok(fragmented);
+    }
+
+    drop(fragmented);
+    let mut encoded = Vec::with_capacity(CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1 + roaring_size);
     encoded.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
-    encoded.push(encoding);
-    encoded.extend_from_slice(&payload);
-    encoded
+    encoded.push(CELL_FLAG_ROW_ADDRESSES_ROARING);
+    addresses.serialize_into(&mut encoded).map_err(|error| {
+        Error::internal(format!("Failed to encode Cell flag row addresses: {error}"))
+    })?;
+    Ok(encoded)
 }
 
 fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
@@ -462,9 +512,24 @@ fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
     let payload = &bytes[CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1..];
     match bytes[CELL_FLAG_ROW_ADDRESSES_MAGIC.len()] {
         CELL_FLAG_ROW_ADDRESSES_ROARING => {
-            RoaringTreemap::deserialize_from(payload).map_err(|error| {
+            if payload.len() > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
+                return Err(Error::invalid_input(format!(
+                    "Cell flag row addresses require {} decoded bytes, maximum is {}",
+                    payload.len(),
+                    MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+                )));
+            }
+            let mut cursor = std::io::Cursor::new(payload);
+            let addresses = RoaringTreemap::deserialize_from(&mut cursor).map_err(|error| {
                 Error::invalid_input(format!("Invalid Cell flag row addresses: {error}"))
-            })
+            })?;
+            if cursor.position() as usize != payload.len() {
+                return Err(Error::invalid_input(
+                    "Cell flag row addresses contain trailing bytes",
+                ));
+            }
+            validate_cell_flag_row_addresses(&addresses)?;
+            Ok(addresses)
         }
         CELL_FLAG_ROW_ADDRESSES_FRAGMENTED => decode_fragmented_cell_flag_row_addresses(payload),
         CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED => {
@@ -492,6 +557,13 @@ fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
                     "Invalid compressed Cell flag row addresses: {error}"
                 ))
             })?;
+            if decoded.len() != decoded_size {
+                return Err(Error::invalid_input(format!(
+                    "Cell flag row addresses decoded to {} bytes, expected {}",
+                    decoded.len(),
+                    decoded_size
+                )));
+            }
             decode_fragmented_cell_flag_row_addresses(&decoded)
         }
         encoding => Err(Error::invalid_input(format!(
@@ -502,10 +574,19 @@ fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
 }
 
 fn decode_fragmented_cell_flag_row_addresses(payload: &[u8]) -> Result<RoaringTreemap> {
+    if payload.len() > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Cell flag row addresses require {} decoded bytes, maximum is {}",
+            payload.len(),
+            MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+        )));
+    }
     let mut cursor = 0usize;
     let fragment_count = read_cell_flag_row_address_u32(payload, &mut cursor)? as usize;
     let mut addresses = RoaringTreemap::new();
     let mut previous_fragment = None;
+    let mut retained_bytes = 0usize;
+    let mut cardinality = 0u64;
     for _ in 0..fragment_count {
         let fragment_id = read_cell_flag_row_address_u32(payload, &mut cursor)?;
         if previous_fragment.is_some_and(|previous| previous >= fragment_id) {
@@ -522,7 +603,25 @@ fn decode_fragmented_cell_flag_row_addresses(payload: &[u8]) -> Result<RoaringTr
             .get(cursor..end)
             .ok_or_else(|| Error::invalid_input("Cell flag row address fragment is truncated"))?;
         cursor = end;
+        retained_bytes = retained_bytes
+            .checked_add(cell_flag_bitmap_memory_size(fragment_bytes)?)
+            .ok_or_else(|| Error::invalid_input("Cell flag row address retained size overflow"))?;
+        if retained_bytes > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
+            return Err(Error::invalid_input(format!(
+                "Cell flag row addresses require {} retained bytes, maximum is {}",
+                retained_bytes, MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+            )));
+        }
         let offsets = decode_cell_flag_bitmap(fragment_bytes)?;
+        cardinality = cardinality
+            .checked_add(offsets.len())
+            .ok_or_else(|| Error::invalid_input("Cell flag row address cardinality overflow"))?;
+        if cardinality > MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY {
+            return Err(Error::invalid_input(format!(
+                "Cell flag row addresses contain {} rows, maximum is {}",
+                cardinality, MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY
+            )));
+        }
         addresses.extend(
             offsets
                 .iter()
@@ -534,6 +633,7 @@ fn decode_fragmented_cell_flag_row_addresses(payload: &[u8]) -> Result<RoaringTr
             "Cell flag row addresses contain trailing bytes",
         ));
     }
+    validate_cell_flag_row_addresses(&addresses)?;
     Ok(addresses)
 }
 
@@ -746,11 +846,13 @@ fn cell_flag_operation_digest(transaction: &Transaction) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
-    fn from(value: &CellFlagTransaction) -> Self {
+impl TryFrom<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
+    type Error = Error;
+
+    fn try_from(value: &CellFlagTransaction) -> Result<Self> {
         use pb::transaction::cell_flag_transaction as flag_pb;
 
-        Self {
+        Ok(Self {
             registrations: value
                 .registrations
                 .iter()
@@ -779,32 +881,36 @@ impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
             row_changes: value
                 .row_changes
                 .iter()
-                .map(|change| flag_pb::RowChange {
-                    flag_id: change.flag_id,
-                    value: change.value,
-                    row_addresses: encode_cell_flag_row_addresses(&change.row_addresses),
+                .map(|change| {
+                    Ok(flag_pb::RowChange {
+                        flag_id: change.flag_id,
+                        value: change.value,
+                        row_addresses: encode_cell_flag_row_addresses(&change.row_addresses)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             fragment_states: value
                 .fragment_states
                 .iter()
-                .map(|fragment| {
+                .map(|fragment| -> Result<_> {
                     let state = match &fragment.state {
                         CellFlagFragmentValue::None => {
                             flag_pb::fragment_state::State::NoneSet(true)
                         }
                         CellFlagFragmentValue::All => flag_pb::fragment_state::State::AllSet(true),
                         CellFlagFragmentValue::Partial(bitmap) => {
-                            flag_pb::fragment_state::State::Partial(encode_cell_flag_bitmap(bitmap))
+                            flag_pb::fragment_state::State::Partial(encode_cell_flag_bitmap(
+                                bitmap,
+                            )?)
                         }
                     };
-                    flag_pb::FragmentState {
+                    Ok(flag_pb::FragmentState {
                         fragment_path: fragment.fragment_path.clone(),
                         flag_id: fragment.flag_id,
                         state: Some(state),
-                    }
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             transfers: value
                 .transfers
                 .iter()
@@ -828,7 +934,7 @@ impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
                 .operation_digest
                 .map(|digest| digest.to_vec())
                 .unwrap_or_default(),
-        }
+        })
     }
 }
 
@@ -2489,7 +2595,6 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
-    cell_flag_transaction: Option<Box<CellFlagTransaction>>,
 }
 
 impl TransactionBuilder {
@@ -2500,7 +2605,6 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         }
     }
 
@@ -2522,38 +2626,28 @@ impl TransactionBuilder {
         self
     }
 
-    pub(crate) fn cell_flag_transaction(
-        mut self,
+    pub(crate) fn build_with_cell_flag_transaction(
+        self,
         mut changes: CellFlagTransaction,
         dataset_identity: String,
-    ) -> Self {
+    ) -> Result<Transaction> {
         if changes.is_empty() {
-            return self;
+            return Ok(self.build());
         }
         changes.dataset_identity = dataset_identity;
-        // Keep the uncommon flag payload off the builder's inline size.
-        // TransactionBuilder is retained across several write futures, and the
-        // Vec headers in this payload otherwise push those futures over
-        // the workspace's large-future limit even when tracking is unused.
-        self.cell_flag_transaction = Some(Box::new(changes));
-        self
+        self.build().with_cell_flag_transaction(changes)
     }
 
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
             .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
-        let transaction = Transaction {
+        Transaction {
             read_version: self.read_version,
             uuid,
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
-        };
-        if let Some(changes) = self.cell_flag_transaction {
-            transaction.with_cell_flag_transaction(*changes)
-        } else {
-            transaction
         }
     }
 }
@@ -2563,21 +2657,24 @@ impl Transaction {
         self,
         mut changes: CellFlagTransaction,
         dataset: &Dataset,
-    ) -> Self {
+    ) -> Result<Self> {
         if changes.is_empty() {
-            return self;
+            return Ok(self);
         }
         changes.dataset_identity = dataset.cell_flag_transaction_identity();
         self.with_cell_flag_transaction(changes)
     }
 
-    pub(crate) fn with_cell_flag_transaction(mut self, mut changes: CellFlagTransaction) -> Self {
+    pub(crate) fn with_cell_flag_transaction(
+        mut self,
+        mut changes: CellFlagTransaction,
+    ) -> Result<Self> {
         if changes.is_empty() {
-            return self;
+            return Ok(self);
         }
         changes.operation_digest = Some(cell_flag_operation_digest(&self));
-        self.set_cell_flag_transaction_payload(Some(encode_cell_flag_transaction(&changes)));
-        self
+        self.set_cell_flag_transaction_payload(Some(encode_cell_flag_transaction(&changes)?));
+        Ok(self)
     }
 
     pub(crate) fn with_cell_flag_affected_rows(
@@ -2612,7 +2709,7 @@ impl Transaction {
         } else if let Some(affected_rows) = affected_rows.filter(|rows| !rows.is_empty()) {
             changes.affected_rows = Some(affected_rows);
         }
-        self = self.with_cell_flag_transaction(changes);
+        self = self.with_cell_flag_transaction(changes)?;
         Ok(self)
     }
 
@@ -2684,10 +2781,10 @@ impl Transaction {
         }
         let changes = self.cell_flag_transaction()?;
         self.transaction_properties = properties.filter(|properties| !properties.is_empty());
-        Ok(match changes {
+        match changes {
             Some(changes) => self.with_cell_flag_transaction(changes),
-            None => self,
-        })
+            None => Ok(self),
+        }
     }
 
     /// Replaces the transaction UUID while preserving and re-signing any opaque
@@ -2702,10 +2799,10 @@ impl Transaction {
     pub fn with_uuid(mut self, uuid: impl Into<String>) -> Result<Self> {
         let changes = self.cell_flag_transaction()?;
         self.uuid = uuid.into();
-        Ok(match changes {
+        match changes {
             Some(changes) => self.with_cell_flag_transaction(changes),
-            None => self,
-        })
+            None => Ok(self),
+        }
     }
 
     /// Assigns a fresh random transaction UUID while preserving and re-signing
@@ -5503,7 +5600,7 @@ impl TryFrom<pb::Transaction> for Transaction {
         let cell_flag_transaction = if let Some(cell_flag_transaction) = typed_cell_flag_transaction
         {
             let changes = CellFlagTransaction::try_from(cell_flag_transaction)?;
-            Some(encode_cell_flag_transaction(&changes))
+            Some(encode_cell_flag_transaction(&changes)?)
         } else {
             None
         };
@@ -5824,7 +5921,7 @@ fn transaction_to_proto(
         let cell_flag_transaction = value
             .cell_flag_transaction_payload()
             .and_then(|encoded| decode_cell_flag_transaction(encoded).ok())
-            .map(|changes| pb::transaction::CellFlagTransaction::from(&changes));
+            .and_then(|changes| pb::transaction::CellFlagTransaction::try_from(&changes).ok());
         (transaction_properties, cell_flag_transaction)
     } else {
         (HashMap::new(), None)
@@ -7653,7 +7750,8 @@ mod tests {
             "application-value".to_string(),
         )]))))
         .build()
-        .with_cell_flag_transaction(changes.clone());
+        .with_cell_flag_transaction(changes.clone())
+        .unwrap();
         let expected = tx.cell_flag_transaction().unwrap().unwrap();
         let proto = pb::Transaction::from(&tx);
         assert!(proto.cell_flag_transaction.is_some());
@@ -7675,7 +7773,7 @@ mod tests {
 
         let properties = Arc::new(HashMap::from([(
             USER_PROPERTY.to_string(),
-            encode_cell_flag_transaction(&changes),
+            encode_cell_flag_transaction(&changes).unwrap(),
         )]));
         let user_transaction =
             TransactionBuilder::new(1, Operation::ReserveFragments { num_fragments: 1 })
@@ -7711,7 +7809,7 @@ mod tests {
         let mut portable_roaring = Vec::new();
         row_addresses.serialize_into(&mut portable_roaring).unwrap();
 
-        let encoded = encode_cell_flag_row_addresses(&row_addresses);
+        let encoded = encode_cell_flag_row_addresses(&row_addresses).unwrap();
         assert_eq!(
             encoded[CELL_FLAG_ROW_ADDRESSES_MAGIC.len()],
             CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED
@@ -7721,6 +7819,52 @@ mod tests {
             decode_cell_flag_row_addresses(&encoded).unwrap(),
             row_addresses
         );
+    }
+
+    fn many_stride_fragment_row_addresses(fragment_count: u32, memory_size: usize) -> Vec<u8> {
+        let mut bitmap = Vec::with_capacity(25);
+        bitmap.extend_from_slice(b"LCF1");
+        bitmap.push(4);
+        bitmap.extend_from_slice(&(memory_size as u64).to_le_bytes());
+        bitmap.extend_from_slice(&0_u32.to_le_bytes());
+        bitmap.extend_from_slice(&1_u32.to_le_bytes());
+        bitmap.extend_from_slice(&1_u32.to_le_bytes());
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+        encoded.push(CELL_FLAG_ROW_ADDRESSES_FRAGMENTED);
+        encoded.extend_from_slice(&fragment_count.to_le_bytes());
+        for fragment_id in 0..fragment_count {
+            encoded.extend_from_slice(&fragment_id.to_le_bytes());
+            encoded.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(&bitmap);
+        }
+        encoded
+    }
+
+    #[test]
+    fn fragmented_cell_flag_row_addresses_reject_cumulative_retained_memory() {
+        let encoded = many_stride_fragment_row_addresses(65, 1024 * 1024);
+        let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
+        assert!(error.to_string().contains("retained bytes"));
+
+        let fragmented = &encoded[CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1..];
+        let compressed = zstd::bulk::compress(fragmented, 1).unwrap();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+        encoded.push(CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED);
+        encoded.extend_from_slice(&(fragmented.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&compressed);
+        let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
+        assert!(error.to_string().contains("retained bytes"));
+    }
+
+    #[test]
+    fn cell_flag_row_address_writer_enforces_cardinality_limit() {
+        let mut addresses = RoaringTreemap::new();
+        addresses.insert_range(0..=MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY);
+        let error = encode_cell_flag_row_addresses(&addresses).unwrap_err();
+        assert!(error.to_string().contains("rows, maximum"));
     }
 
     #[test]
@@ -7745,7 +7889,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let error = transaction.cell_flag_transaction().unwrap_err();
         assert!(error.to_string().contains("outside the public transaction"));
@@ -7767,7 +7912,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let error = transaction.cell_flag_transaction().unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
@@ -7796,7 +7942,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let error = transaction.cell_flag_transaction().unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
@@ -7831,7 +7978,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let error = transaction.cell_flag_transaction().unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
@@ -7868,7 +8016,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let proto = pb::Transaction::from(&transaction);
         assert!(
@@ -7926,6 +8075,7 @@ mod tests {
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
         })
+        .unwrap()
         .with_cell_flag_affected_rows(Some(affected_rows.clone()))
         .unwrap();
 
@@ -8122,7 +8272,9 @@ mod tests {
             ..Default::default()
         };
         let error = transaction
-            .with_cell_flag_transaction_payload(Some(encode_cell_flag_transaction(&empty_changes)))
+            .with_cell_flag_transaction_payload(Some(
+                encode_cell_flag_transaction(&empty_changes).unwrap(),
+            ))
             .unwrap_err();
         assert!(
             error.to_string().contains("contains no changes"),
@@ -8178,7 +8330,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let encoded = encode_cell_flag_transaction(&changes);
+        let encoded = encode_cell_flag_transaction(&changes).unwrap();
         let forged = Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
@@ -8194,13 +8346,15 @@ mod tests {
 
         let mut retargeted =
             Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
-                .with_cell_flag_transaction(changes.clone());
+                .with_cell_flag_transaction(changes.clone())
+                .unwrap();
         retargeted.operation = Operation::ReserveFragments { num_fragments: 2 };
         assert!(retargeted.validate_internal_extensions().is_err());
 
         let mut uuid_retargeted =
             Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
-                .with_cell_flag_transaction(changes);
+                .with_cell_flag_transaction(changes)
+                .unwrap();
         uuid_retargeted.uuid = Uuid::new_v4().to_string();
         assert!(uuid_retargeted.cell_flag_transaction_payload().is_some());
         let error = uuid_retargeted.validate_internal_extensions().unwrap_err();

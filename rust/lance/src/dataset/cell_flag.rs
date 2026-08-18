@@ -61,15 +61,126 @@ const MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES: usize = 4 * 1024 * 1024;
 /// Bound total root copies retained in one manifest across all tracked fields.
 const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const CELL_FLAG_QUERY_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const CELL_FLAG_WRITE_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const CELL_FLAG_WRITE_MEMORY_PERMIT_BYTES: usize = 1024 * 1024;
 const CELL_FLAG_WRITE_MEMORY_PERMITS: usize =
-    CELL_FLAG_QUERY_MEMORY_BUDGET_BYTES / CELL_FLAG_WRITE_MEMORY_PERMIT_BYTES;
+    CELL_FLAG_WRITE_MEMORY_BUDGET_BYTES / CELL_FLAG_WRITE_MEMORY_PERMIT_BYTES;
+const CELL_FLAG_BITMAP_ENCODING_HEADER_BYTES: usize = 13;
+const CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES: usize = 8;
+// Zstd level 1 retains a compression context and match tables in addition to
+// its output Vec. Reserve headroom for that workspace and candidate metadata.
+const CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 
 fn cell_flag_write_memory_weight(bytes: usize) -> u32 {
     bytes
         .max(1)
         .div_ceil(CELL_FLAG_WRITE_MEMORY_PERMIT_BYTES)
         .min(CELL_FLAG_WRITE_MEMORY_PERMITS) as u32
+}
+
+fn checked_cell_flag_memory_sum(label: &str, values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(0usize, |total, value| {
+        total.checked_add(*value).ok_or_else(|| {
+            Error::invalid_input(format!("Cell Flag {label} memory estimate overflow"))
+        })
+    })
+}
+
+fn cell_flag_bitmap_encoder_memory_bytes_for_sizes(
+    roaring_bytes: usize,
+    bitset_bytes: usize,
+) -> Result<usize> {
+    let compressed_roaring_bytes = zstd::zstd_safe::compress_bound(roaring_bytes);
+    let compressed_bitset_bytes =
+        (bitset_bytes != 0).then(|| zstd::zstd_safe::compress_bound(bitset_bytes));
+    let compressed_bitset_bytes = compressed_bitset_bytes.unwrap_or_default();
+
+    // encode_cell_flag_bitmap retains the raw and compressed buffers while it
+    // compares raw, Zstd, bitset, and Zstd-bitset candidates. Account for both
+    // compressed payload copies as well as the encoder's final output phase.
+    let adaptive_candidate_peak = checked_cell_flag_memory_sum(
+        "adaptive bitmap candidate",
+        &[
+            roaring_bytes,
+            compressed_roaring_bytes,
+            compressed_roaring_bytes
+                .checked_add(CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "Cell Flag compressed Roaring memory estimate overflow".to_string(),
+                    )
+                })?,
+            bitset_bytes,
+            compressed_bitset_bytes,
+            if bitset_bytes == 0 {
+                0
+            } else {
+                compressed_bitset_bytes
+                    .checked_add(CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES)
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "Cell Flag compressed bitset memory estimate overflow".to_string(),
+                        )
+                    })?
+            },
+            CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES,
+        ],
+    )?;
+    let adaptive_output_peak = checked_cell_flag_memory_sum(
+        "adaptive bitmap output",
+        &[
+            compressed_roaring_bytes,
+            compressed_bitset_bytes,
+            roaring_bytes,
+            roaring_bytes
+                .checked_add(CELL_FLAG_BITMAP_ENCODING_HEADER_BYTES)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "Cell Flag adaptive bitmap output size overflow".to_string(),
+                    )
+                })?,
+            CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES,
+        ],
+    )?;
+
+    // The query encoder is only invoked when the adaptive output is small
+    // enough to inline. Its raw/Zstd candidates and final output coexist with
+    // that retained adaptive output until the inline decision is complete.
+    let inline_query_peak = checked_cell_flag_memory_sum(
+        "query bitmap",
+        &[
+            MAX_INLINE_CELL_FLAG_BITMAP_BYTES,
+            roaring_bytes,
+            compressed_roaring_bytes,
+            compressed_roaring_bytes
+                .checked_add(CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "Cell Flag query compressed memory estimate overflow".to_string(),
+                    )
+                })?,
+            roaring_bytes
+                .checked_add(CELL_FLAG_BITMAP_ENCODING_HEADER_BYTES)
+                .ok_or_else(|| {
+                    Error::invalid_input("Cell Flag query bitmap output size overflow".to_string())
+                })?,
+            CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES,
+        ],
+    )?;
+
+    Ok(adaptive_candidate_peak
+        .max(adaptive_output_peak)
+        .max(inline_query_peak))
+}
+
+fn cell_flag_bitmap_encoder_memory_bytes(bitmap: &RoaringBitmap) -> Result<usize> {
+    let roaring_bytes = bitmap.serialized_size();
+    let bitset_bytes = bitmap
+        .max()
+        .map(|value| value as usize / 8 + 1)
+        .filter(|bitset_bytes| *bitset_bytes < roaring_bytes)
+        .unwrap_or_default();
+    cell_flag_bitmap_encoder_memory_bytes_for_sizes(roaring_bytes, bitset_bytes)
 }
 
 fn cell_flag_row_change_memory_bytes(
@@ -92,7 +203,11 @@ fn cell_flag_row_change_memory_bytes(
             input_bytes, MAX_CELL_FLAG_FILE_BYTES
         )));
     }
-    input_bytes.checked_mul(2).ok_or_else(|| {
+    let encoder_bytes = cell_flag_bitmap_encoder_memory_bytes_for_sizes(
+        input_bytes,
+        input_bytes.saturating_sub(1),
+    )?;
+    input_bytes.checked_add(encoder_bytes).ok_or_else(|| {
         Error::invalid_input("Cell Flag row change memory estimate overflow".to_string())
     })
 }
@@ -177,7 +292,7 @@ fn inline_cell_flag_bytes(file: &CellFlagFile) -> Result<Option<Bytes>> {
     let Some(bytes) = file.inline_bytes.as_ref() else {
         return Ok(None);
     };
-    if bytes.len() as u64 != file.size_bytes {
+    if !file.path.is_empty() && bytes.len() as u64 != file.size_bytes {
         return Err(Error::invalid_input(format!(
             "Inline cell flag file '{}' has size {}, expected {}",
             file.path,
@@ -396,6 +511,53 @@ impl Dataset {
         name: impl Into<String>,
         initial_value: bool,
     ) -> Result<CellFlagDefinition> {
+        self.register_cell_flags([(field.as_ref().to_owned(), name.into(), initial_value)])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                Error::internal("Single Cell Flag registration returned no result".to_string())
+            })
+    }
+
+    /// Register multiple field-scoped Boolean flags in one atomic commit.
+    ///
+    /// Registrations are applied in input order and receive consecutive stable
+    /// IDs. If any registration is invalid, none of them are committed.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn register(dataset: &mut Dataset) -> Result<()> {
+    /// let definitions = dataset
+    ///     .register_cell_flags([
+    ///         ("embedding", "computed", false),
+    ///         ("embedding", "reviewed", true),
+    ///     ])
+    ///     .await?;
+    /// assert_eq!(definitions.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn register_cell_flags<I, F, N>(
+        &mut self,
+        registrations: I,
+    ) -> Result<Vec<CellFlagDefinition>>
+    where
+        I: IntoIterator<Item = (F, N, bool)>,
+        F: AsRef<str>,
+        N: Into<String>,
+    {
+        let registrations = registrations
+            .into_iter()
+            .map(|(field, name, initial_value)| {
+                (field.as_ref().to_owned(), name.into(), initial_value)
+            })
+            .collect::<Vec<_>>();
+        if registrations.is_empty() {
+            return Err(Error::invalid_input(
+                "At least one Cell Flag registration is required",
+            ));
+        }
         if self.manifest.next_cell_flag_id == 0
             && !cfg!(test)
             && std::env::var_os(ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV).is_none()
@@ -405,27 +567,44 @@ impl Dataset {
                 ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV
             )));
         }
-        let field = field.as_ref();
-        let field_id = self
-            .schema()
-            .field(field)
-            .ok_or_else(|| Error::invalid_input(format!("Unknown field '{}'", field)))?
-            .id;
-        let name = name.into();
-        if name.is_empty() {
-            return Err(Error::invalid_input("Cell flag name must not be empty"));
+        let mut next_flag_id = self.manifest.next_cell_flag_id;
+        let mut field_names = HashSet::with_capacity(registrations.len());
+        let mut definitions = Vec::with_capacity(registrations.len());
+        let mut transaction_registrations = Vec::with_capacity(registrations.len());
+        for (field, name, initial_value) in registrations {
+            let field_id = self
+                .schema()
+                .field(&field)
+                .ok_or_else(|| Error::invalid_input(format!("Unknown field '{}'", field)))?
+                .id;
+            if name.is_empty() {
+                return Err(Error::invalid_input("Cell flag name must not be empty"));
+            }
+            if self.cell_flag_definition(field_id, &name).is_some()
+                || !field_names.insert((field_id, name.clone()))
+            {
+                return Err(Error::invalid_input(format!(
+                    "Cell flag '{}' is already registered for field '{}'",
+                    name, field
+                )));
+            }
+            let following_flag_id = next_flag_id.checked_add(1).ok_or_else(|| {
+                Error::invalid_input("The dataset has exhausted the stable cell flag ID space")
+            })?;
+            let definition = CellFlagDefinition {
+                flag_id: next_flag_id,
+                field_id,
+                name,
+            };
+            transaction_registrations.push(CellFlagRegistration {
+                flag_id: definition.flag_id,
+                field_id: definition.field_id,
+                name: definition.name.clone(),
+                initial_value,
+            });
+            definitions.push(definition);
+            next_flag_id = following_flag_id;
         }
-        if self.cell_flag_definition(field_id, &name).is_some() {
-            return Err(Error::invalid_input(format!(
-                "Cell flag '{}' is already registered for field '{}'",
-                name, field
-            )));
-        }
-        let definition = CellFlagDefinition {
-            flag_id: self.manifest.next_cell_flag_id,
-            field_id,
-            name,
-        };
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Project {
@@ -436,19 +615,14 @@ impl Dataset {
         )
         .with_cell_flag_transaction_for_dataset(
             CellFlagTransaction {
-                registrations: vec![CellFlagRegistration {
-                    flag_id: definition.flag_id,
-                    field_id: definition.field_id,
-                    name: definition.name.clone(),
-                    initial_value,
-                }],
+                registrations: transaction_registrations,
                 ..Default::default()
             },
             self,
-        );
+        )?;
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
-        Ok(definition)
+        Ok(definitions)
     }
 
     /// Rename a registered flag without changing its stable ID or row state.
@@ -501,7 +675,7 @@ impl Dataset {
                 ..Default::default()
             },
             self,
-        );
+        )?;
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await
     }
@@ -537,7 +711,7 @@ impl Dataset {
                 ..Default::default()
             },
             self,
-        );
+        )?;
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await
     }
@@ -651,7 +825,11 @@ impl Dataset {
             return Ok(None);
         };
         descriptor.root.validate_root_path_for_flag(flag_id)?;
-        let path = self.cell_flag_path(&descriptor.root)?;
+        let path = if descriptor.root.path.is_empty() {
+            self.base.clone()
+        } else {
+            self.cell_flag_path(&descriptor.root)?
+        };
         let source_uri = self.cell_flag_source_uri(&descriptor.root)?;
         let key = CellFlagRootKey {
             source_uri: source_uri.to_string(),
@@ -670,12 +848,13 @@ impl Dataset {
             .get_or_insert_with_key(key, || async {
                 let store = self.object_store(descriptor.root.base_id).await?;
                 let bytes = read_cell_flag_bytes(&store, &path, &descriptor.root).await?;
-                let (proto, memory_size) = decode_cell_flag_root(bytes.as_ref()).map_err(|error| {
-                    Error::invalid_input(format!(
-                        "Failed to decode cell flag root '{}' for flag ID {}: {}",
-                        descriptor.root.path, flag_id, error
-                    ))
-                })?;
+                let (proto, memory_size) =
+                    decode_cell_flag_root(bytes.as_ref()).map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Failed to decode cell flag root '{}' for flag ID {}: {}",
+                            descriptor.root.path, flag_id, error
+                        ))
+                    })?;
                 if memory_size as u64 != descriptor.root.memory_size_bytes {
                     return Err(Error::invalid_input(format!(
                         "Cell flag root '{}' for flag ID {} declares memory size {}, expected {}",
@@ -688,32 +867,6 @@ impl Dataset {
                 let mut root = CellFlagRoot::try_from(proto)?;
 
                 for entry in &mut root.fragments {
-                    let fragment_id = u32::try_from(entry.fragment_id).map_err(|_| {
-                        Error::invalid_input(format!(
-                            "Cell flag root for flag ID {} references invalid fragment {}",
-                            flag_id, entry.fragment_id
-                        ))
-                    })?;
-                    let fragment = self
-                        .get_fragment_metadata_by_id(fragment_id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "Cell flag root for flag ID {} references unknown fragment {}",
-                                flag_id, entry.fragment_id
-                            ))
-                        })?;
-                    let physical_rows = fragment.physical_rows.ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "Fragment {} has no physical row count for cell flag",
-                            entry.fragment_id
-                        ))
-                    })?;
-                    if entry.physical_rows != physical_rows as u64 {
-                        return Err(Error::invalid_input(format!(
-                            "Cell flag root for flag ID {} records {} physical rows for fragment {}, manifest records {}",
-                            flag_id, entry.physical_rows, entry.fragment_id, physical_rows
-                        )));
-                    }
                     if let CellFlagFragmentState::Partial(file) = &mut entry.state
                         && file.base_id.is_none()
                     {
@@ -727,6 +880,34 @@ impl Dataset {
                 Ok(root)
             })
             .await?;
+        for entry in &root.fragments {
+            let fragment_id = u32::try_from(entry.fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Cell flag root for flag ID {} references invalid fragment {}",
+                    flag_id, entry.fragment_id
+                ))
+            })?;
+            let fragment = self
+                .get_fragment_metadata_by_id(fragment_id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Cell flag root for flag ID {} references unknown fragment {}",
+                        flag_id, entry.fragment_id
+                    ))
+                })?;
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Fragment {} has no physical row count for cell flag",
+                    entry.fragment_id
+                ))
+            })?;
+            if entry.physical_rows != physical_rows as u64 {
+                return Err(Error::invalid_input(format!(
+                    "Cell flag root for flag ID {} records {} physical rows for fragment {}, manifest records {}",
+                    flag_id, entry.physical_rows, entry.fragment_id, physical_rows
+                )));
+            }
+        }
         Ok(Some(root))
     }
 
@@ -748,6 +929,9 @@ impl Dataset {
         let Some(inline_bytes) = descriptor.root.inline_bytes.as_ref() else {
             return Ok(());
         };
+        if descriptor.root.path.is_empty() {
+            return Ok(());
+        }
         let mut object_file = descriptor.root.clone();
         object_file.inline_bytes = None;
         let path = self.cell_flag_path(&object_file)?;
@@ -848,11 +1032,17 @@ impl Dataset {
                 flag_id, fragment_id
             )));
         }
-        let query_bytes = encode_cell_flag_query_bitmap(bitmap);
-        if query_bytes.len() <= MAX_INLINE_CELL_FLAG_BITMAP_BYTES {
-            return Ok(CellFlagFragmentState::InlinePartial(query_bytes));
+        // The adaptive candidates include both query codecs, so a result above
+        // the inline limit proves the query encoding cannot fit either. Only
+        // pay for the query-friendly encoding when inlining remains possible.
+        let bytes = encode_cell_flag_bitmap(bitmap)?;
+        if bytes.len() <= MAX_INLINE_CELL_FLAG_BITMAP_BYTES {
+            let query_bytes = encode_cell_flag_query_bitmap(bitmap)?;
+            if query_bytes.len() <= MAX_INLINE_CELL_FLAG_BITMAP_BYTES {
+                cell_flag_bitmap_memory_size(&query_bytes)?;
+                return Ok(CellFlagFragmentState::InlinePartial(query_bytes));
+            }
         }
-        let bytes = encode_cell_flag_bitmap(bitmap);
         if bytes.len() as u64 > MAX_CELL_FLAG_FILE_BYTES {
             return Err(Error::invalid_input(format!(
                 "Cell flag bitmap for flag ID {}, fragment {} has encoded size {}, maximum is {}",
@@ -913,6 +1103,7 @@ impl Dataset {
         write_store: &ObjectStore,
         flag_id: u32,
         mut root: CellFlagRoot,
+        max_inline_bytes: usize,
     ) -> Result<Option<CellFlagState>> {
         if root.fragments.is_empty() {
             return Ok(None);
@@ -971,21 +1162,27 @@ impl Dataset {
                 MAX_CELL_FLAG_FILE_BYTES
             )));
         }
-        let relative = Path::from(CELL_FLAGS_DIR)
-            .join(CELL_FLAG_ROOTS_DIR)
-            .join(flag_id.to_string())
-            .join(format!("{}.root", Uuid::new_v4()));
-        let full_path = Path::from_iter(self.base.parts().chain(relative.parts()));
-        write_store.put(&full_path, &bytes).await?;
+        let inline_only =
+            bytes.len() <= MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES && bytes.len() <= max_inline_bytes;
+        let (path, size_bytes, inline_bytes) = if inline_only {
+            (String::new(), 0, Some(bytes.to_vec()))
+        } else {
+            let relative = Path::from(CELL_FLAGS_DIR)
+                .join(CELL_FLAG_ROOTS_DIR)
+                .join(flag_id.to_string())
+                .join(format!("{}.root", Uuid::new_v4()));
+            let full_path = Path::from_iter(self.base.parts().chain(relative.parts()));
+            write_store.put(&full_path, &bytes).await?;
+            (relative.to_string(), bytes.len() as u64, None)
+        };
         Ok(Some(CellFlagState {
             flag_id,
             root: CellFlagFile {
-                path: relative.to_string(),
-                size_bytes: bytes.len() as u64,
+                path,
+                size_bytes,
                 memory_size_bytes: memory_size as u64,
                 base_id: None,
-                inline_bytes: (bytes.len() <= MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES)
-                    .then(|| bytes.to_vec()),
+                inline_bytes,
             },
         }))
     }
@@ -1127,8 +1324,8 @@ impl Dataset {
             )));
         }
 
-        let source_offsets_by_fragment = source_row_addresses.bitmaps().collect::<HashMap<_, _>>();
-        let source_fragments = source_offsets_by_fragment
+        let source_fragment_layout = compacted_source_fragment_layout(source_row_addresses)?;
+        let source_fragments = source_fragment_layout
             .keys()
             .copied()
             .collect::<HashSet<_>>();
@@ -1162,26 +1359,29 @@ impl Dataset {
                         source_state.fragment_id
                     ))
                 })?;
+                let Some(&(source_live_prefix, source_live_offsets)) =
+                    source_fragment_layout.get(&fragment_id)
+                else {
+                    continue;
+                };
                 match &source_state.state {
                     CellFlagFragmentState::All => {
-                        if let Some(source_offsets) = source_offsets_by_fragment.get(&fragment_id) {
-                            remap_compacted_cell_flag_offsets(
-                                source_row_addresses,
-                                fragment_id,
-                                source_offsets,
-                                &output_ends,
-                                &mut output_bitmaps,
-                            )?;
-                        }
+                        remap_compacted_cell_flag_offsets(
+                            source_live_offsets,
+                            source_live_prefix,
+                            source_live_offsets,
+                            &output_ends,
+                            &mut output_bitmaps,
+                        )?;
                     }
                     CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-                        let source_offsets = self
+                        let source_flag_offsets = self
                             .load_cell_flag_bitmap_shared(flag_id, &source_state)
                             .await?;
                         remap_compacted_cell_flag_offsets(
-                            source_row_addresses,
-                            fragment_id,
-                            source_offsets.as_ref(),
+                            source_live_offsets,
+                            source_live_prefix,
+                            source_flag_offsets.as_ref(),
                             &output_ends,
                             &mut output_bitmaps,
                         )?;
@@ -1859,20 +2059,34 @@ fn fragment_physical_rows(fragment: &lance_table::format::Fragment) -> Result<u6
         })
 }
 
-fn remap_compacted_cell_flag_offsets(
+fn compacted_source_fragment_layout(
     source_row_addresses: &RoaringTreemap,
-    source_fragment_id: u32,
-    source_offsets: &RoaringBitmap,
+) -> Result<HashMap<u32, (u64, &RoaringBitmap)>> {
+    let mut live_prefix = 0_u64;
+    let mut layout = HashMap::new();
+    for (fragment_id, live_offsets) in source_row_addresses.bitmaps() {
+        layout.insert(fragment_id, (live_prefix, live_offsets));
+        live_prefix = live_prefix
+            .checked_add(live_offsets.len())
+            .ok_or_else(|| Error::invalid_input("Compacted source row count overflow"))?;
+    }
+    Ok(layout)
+}
+
+fn remap_compacted_cell_flag_offsets(
+    source_live_offsets: &RoaringBitmap,
+    source_live_prefix: u64,
+    source_flag_offsets: &RoaringBitmap,
     output_ends: &[u64],
     output_bitmaps: &mut [RoaringBitmap],
 ) -> Result<()> {
-    let first_address = u64::from(RowAddress::first_row(source_fragment_id));
-    for source_offset in source_offsets.iter() {
-        let source_address = first_address + u64::from(source_offset);
-        if !source_row_addresses.contains(source_address) {
+    for source_offset in source_flag_offsets.iter() {
+        if !source_live_offsets.contains(source_offset) {
             continue;
         }
-        let output_position = source_row_addresses.rank(source_address) - 1;
+        let output_position = source_live_prefix
+            .checked_add(source_live_offsets.rank(source_offset) - 1)
+            .ok_or_else(|| Error::internal("Compacted Cell Flag position overflow"))?;
         let output_fragment = output_ends.partition_point(|end| *end <= output_position);
         let output_start = output_fragment
             .checked_sub(1)
@@ -2389,6 +2603,7 @@ pub async fn apply_cell_flag_transaction(
     let has_exact_rewrite_sources = !exact_rewrite_group_by_source_fragment.is_empty();
 
     let mut descriptors = Vec::with_capacity(definitions.len());
+    let mut inline_manifest_bytes = 0usize;
     for definition in &definitions {
         let flag_id = definition.flag_id;
         let has_explicit_state_change = registration_initial_values.contains_key(&flag_id)
@@ -2459,6 +2674,19 @@ pub async fn apply_cell_flag_transaction(
             || (has_exact_rewrite && !exact_rewrite_needs_state && !has_explicit_state_change)
         {
             if let Some(descriptor) = current.cell_flag_state(flag_id) {
+                if let Some(bytes) = descriptor.root.inline_bytes.as_ref() {
+                    inline_manifest_bytes = inline_manifest_bytes
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| {
+                            Error::internal("Inline cell flag manifest size overflow")
+                        })?;
+                    if inline_manifest_bytes > MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
+                        return Err(Error::invalid_input(format!(
+                            "Inline Cell Flag roots require {} bytes, maximum is {}",
+                            inline_manifest_bytes, MAX_INLINE_CELL_FLAG_MANIFEST_BYTES
+                        )));
+                    }
+                }
                 descriptors.push(descriptor.clone());
             }
             continue;
@@ -2511,22 +2739,28 @@ pub async fn apply_cell_flag_transaction(
             })?;
             let physical_rows = fragment_physical_rows(fragment)?;
             validate_fragment_value(flag_id, *fragment_id, physical_rows, value)?;
-            let write_bytes = match value {
+            let serialized_bytes = match value {
                 CellFlagFragmentValue::Partial(bitmap) => bitmap.serialized_size(),
                 CellFlagFragmentValue::None | CellFlagFragmentValue::All => 0,
             };
-            if write_bytes as u64 > MAX_CELL_FLAG_FILE_BYTES {
+            if serialized_bytes as u64 > MAX_CELL_FLAG_FILE_BYTES {
                 return Err(Error::invalid_input(format!(
                     "Cell Flag override for flag ID {}, fragment {} has encoded size {}, maximum is {}",
-                    flag_id, fragment_id, write_bytes, MAX_CELL_FLAG_FILE_BYTES
+                    flag_id, fragment_id, serialized_bytes, MAX_CELL_FLAG_FILE_BYTES
                 )));
             }
-            flag_overrides.push((*fragment_id, physical_rows, write_bytes));
+            let write_memory_bytes = match value {
+                CellFlagFragmentValue::Partial(bitmap) => {
+                    cell_flag_bitmap_encoder_memory_bytes(bitmap)?
+                }
+                CellFlagFragmentValue::None | CellFlagFragmentValue::All => 0,
+            };
+            flag_overrides.push((*fragment_id, physical_rows, write_memory_bytes));
         }
         let io_parallelism = write_store.io_parallelism().max(1);
         let write_memory = Arc::new(Semaphore::new(CELL_FLAG_WRITE_MEMORY_PERMITS));
         let override_states = futures::stream::iter(flag_overrides)
-            .map(|(fragment_id, physical_rows, write_bytes)| {
+            .map(|(fragment_id, physical_rows, write_memory_bytes)| {
                 let write_memory = write_memory.clone();
                 let value = *overrides
                     .get(&(flag_id, fragment_id))
@@ -2541,7 +2775,9 @@ pub async fn apply_cell_flag_transaction(
                         }),
                         CellFlagFragmentValue::Partial(bitmap) => {
                             let _memory = write_memory
-                                .acquire_many_owned(cell_flag_write_memory_weight(write_bytes))
+                                .acquire_many_owned(cell_flag_write_memory_weight(
+                                    write_memory_bytes,
+                                ))
                                 .await
                                 .map_err(|_| {
                                     Error::internal(
@@ -2602,11 +2838,12 @@ pub async fn apply_cell_flag_transaction(
                     flag_id, fragment_id
                 )));
             }
-            let write_bytes = cell_flag_row_change_memory_bytes(states.get(fragment_id), change)?;
-            flag_changes.push((*fragment_id, physical_rows, write_bytes));
+            let write_memory_bytes =
+                cell_flag_row_change_memory_bytes(states.get(fragment_id), change)?;
+            flag_changes.push((*fragment_id, physical_rows, write_memory_bytes));
         }
         let changed_states = futures::stream::iter(flag_changes)
-            .map(|(fragment_id, physical_rows, write_bytes)| {
+            .map(|(fragment_id, physical_rows, write_memory_bytes)| {
                 let write_memory = write_memory.clone();
                 let change = pending_changes
                     .get(&(flag_id, fragment_id))
@@ -2614,7 +2851,7 @@ pub async fn apply_cell_flag_transaction(
                 let previous_state = states.get(&fragment_id);
                 async move {
                     let _memory = write_memory
-                        .acquire_many_owned(cell_flag_write_memory_weight(write_bytes))
+                        .acquire_many_owned(cell_flag_write_memory_weight(write_memory_bytes))
                         .await
                         .map_err(|_| {
                             Error::internal("Cell Flag write byte semaphore closed".to_string())
@@ -2669,28 +2906,20 @@ pub async fn apply_cell_flag_transaction(
                 CellFlagRoot {
                     fragments: states.into_values().collect(),
                 },
+                MAX_INLINE_CELL_FLAG_MANIFEST_BYTES.saturating_sub(inline_manifest_bytes),
             )
             .await?
         {
+            if let Some(bytes) = descriptor.root.inline_bytes.as_ref() {
+                inline_manifest_bytes = inline_manifest_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| Error::internal("Inline cell flag manifest size overflow"))?;
+            }
             descriptors.push(descriptor);
         }
     }
 
     descriptors.sort_by_key(|state| state.flag_id);
-    let mut inline_manifest_bytes = 0usize;
-    for descriptor in &mut descriptors {
-        let Some(bytes) = descriptor.root.inline_bytes.as_ref() else {
-            continue;
-        };
-        let next_inline_manifest_bytes = inline_manifest_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| Error::internal("Inline cell flag manifest size overflow"))?;
-        if next_inline_manifest_bytes <= MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
-            inline_manifest_bytes = next_inline_manifest_bytes;
-        } else {
-            descriptor.root.inline_bytes = None;
-        }
-    }
     manifest.cell_flag_states = descriptors;
     Ok(())
 }
@@ -2753,6 +2982,50 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("binding budget"));
         assert_eq!(reserved.load(Ordering::Relaxed), 40 * 1024 * 1024);
+    }
+
+    #[test]
+    fn write_memory_budget_accounts_for_all_bitmap_encoder_buffers() {
+        let roaring_bytes = 8 * 1024 * 1024;
+        let bitset_bytes = 4 * 1024 * 1024;
+        let compressed_roaring_bytes = zstd::zstd_safe::compress_bound(roaring_bytes);
+        let compressed_bitset_bytes = zstd::zstd_safe::compress_bound(bitset_bytes);
+        let estimate =
+            cell_flag_bitmap_encoder_memory_bytes_for_sizes(roaring_bytes, bitset_bytes).unwrap();
+
+        let adaptive_candidates = roaring_bytes
+            + 2 * compressed_roaring_bytes
+            + bitset_bytes
+            + 2 * compressed_bitset_bytes
+            + 2 * CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES
+            + CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES;
+        let inline_query = MAX_INLINE_CELL_FLAG_BITMAP_BYTES
+            + 2 * roaring_bytes
+            + 2 * compressed_roaring_bytes
+            + CELL_FLAG_BITMAP_COMPRESSED_LENGTH_BYTES
+            + CELL_FLAG_BITMAP_ENCODING_HEADER_BYTES
+            + CELL_FLAG_BITMAP_ENCODER_FIXED_MEMORY_BYTES;
+        assert!(estimate >= adaptive_candidates);
+        assert!(estimate >= inline_query);
+        assert_eq!(
+            cell_flag_write_memory_weight(estimate),
+            estimate
+                .div_ceil(CELL_FLAG_WRITE_MEMORY_PERMIT_BYTES)
+                .min(CELL_FLAG_WRITE_MEMORY_PERMITS) as u32
+        );
+    }
+
+    #[test]
+    fn large_bitmap_encoder_reserves_the_complete_write_budget() {
+        let estimate =
+            cell_flag_bitmap_encoder_memory_bytes_for_sizes(16 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap();
+
+        assert!(estimate > CELL_FLAG_WRITE_MEMORY_BUDGET_BYTES);
+        assert_eq!(
+            cell_flag_write_memory_weight(estimate),
+            CELL_FLAG_WRITE_MEMORY_PERMITS as u32
+        );
     }
 
     async fn dataset_with_rows(
@@ -2898,6 +3171,73 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("already registered")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_registration_is_atomic_and_uses_one_version() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let initial_version = dataset.version().version;
+
+        let definitions = dataset
+            .register_cell_flags([
+                ("value", "state_a", false),
+                ("value", "state_b", true),
+                ("value", "state_c", false),
+                ("value", "state_d", true),
+                ("value", "merge_state", false),
+            ])
+            .await?;
+
+        assert_eq!(dataset.version().version, initial_version + 1);
+        assert_eq!(dataset.manifest.cell_flag_states.len(), 2);
+        assert!(dataset.manifest.cell_flag_states.iter().all(|state| {
+            state.root.path.is_empty()
+                && state.root.size_bytes == 0
+                && state.root.inline_bytes.is_some()
+        }));
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.flag_id)
+                .collect::<Vec<_>>(),
+            (0..5).collect::<Vec<_>>()
+        );
+        assert_eq!(dataset.cell_flag_definitions(), definitions);
+        assert_eq!(
+            flagged_ids(&dataset, "value", "state_b").await?,
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            flagged_ids(&dataset, "value", "merge_state").await?,
+            Vec::<i32>::new()
+        );
+
+        for invalid_registrations in [
+            vec![("id", "duplicate", false), ("id", "duplicate", true)],
+            vec![("id", "valid", false), ("unknown", "invalid", false)],
+        ] {
+            let version = dataset.version().version;
+            let definitions_before = dataset.cell_flag_definitions().to_vec();
+            assert!(
+                dataset
+                    .register_cell_flags(invalid_registrations)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(dataset.version().version, version);
+            assert_eq!(dataset.cell_flag_definitions(), definitions_before);
+        }
+
+        assert!(
+            dataset
+                .register_cell_flags(Vec::<(&str, &str, bool)>::new())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("At least one")
         );
         Ok(())
     }
@@ -3138,6 +3478,47 @@ mod tests {
         );
 
         assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8, 9]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_root_is_revalidated_against_each_snapshot() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset.register_cell_flag("value", FLAG_NAME, true).await?;
+        let root = dataset
+            .load_cell_flag_root_shared(definition.flag_id)
+            .await?
+            .expect("initial true state has a root");
+        let root_fragment = root.fragments.first().expect("root has a fragment");
+        let fragment_id = u32::try_from(root_fragment.fragment_id).unwrap();
+
+        let mut mismatched_rows = dataset.clone();
+        let manifest = Arc::make_mut(&mut mismatched_rows.manifest);
+        let fragments = Arc::make_mut(&mut manifest.fragments);
+        let fragment = fragments
+            .iter_mut()
+            .find(|fragment| fragment.id == root_fragment.fragment_id)
+            .expect("root fragment exists in the source snapshot");
+        fragment.physical_rows = Some(fragment.physical_rows.unwrap() + 1);
+        let error = mismatched_rows
+            .load_cell_flag_root_shared(definition.flag_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("records"));
+        assert!(error.to_string().contains("manifest records"));
+
+        let mut missing_fragment = dataset.clone();
+        let mut fragment_bitmap = missing_fragment.fragment_bitmap.as_ref().clone();
+        fragment_bitmap.remove(fragment_id);
+        missing_fragment.fragment_bitmap = Arc::new(fragment_bitmap);
+        let error = missing_fragment
+            .load_cell_flag_root_shared(definition.flag_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("references unknown fragment"));
         Ok(())
     }
 
@@ -3601,6 +3982,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compaction_precomputes_cross_fragment_live_prefixes() {
+        let source_row_addresses = (0..1024_u32)
+            .flat_map(|fragment_id| {
+                [0, 2].map(move |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+            })
+            .collect::<RoaringTreemap>();
+        let layout = compacted_source_fragment_layout(&source_row_addresses).unwrap();
+
+        assert_eq!(layout.len(), 1024);
+        assert_eq!(layout.get(&0).map(|(prefix, _)| *prefix), Some(0));
+        assert_eq!(layout.get(&1023).map(|(prefix, _)| *prefix), Some(2046));
+
+        let &(live_prefix, live_offsets) = layout.get(&1023).unwrap();
+        let mut output_bitmaps = vec![RoaringBitmap::new()];
+        remap_compacted_cell_flag_offsets(
+            live_offsets,
+            live_prefix,
+            &RoaringBitmap::from_iter([2]),
+            &[2048],
+            &mut output_bitmaps,
+        )
+        .unwrap();
+        assert_eq!(output_bitmaps, vec![RoaringBitmap::from_iter([2047])]);
+    }
+
     #[tokio::test]
     async fn sparse_compaction_remaps_multiple_flags_across_output_fragments() -> Result<()> {
         let directory = TempStrDir::default();
@@ -3760,7 +4167,7 @@ mod tests {
             },
             None,
         )
-        .with_cell_flag_transaction_for_dataset(CellFlagTransaction::default(), &dataset);
+        .with_cell_flag_transaction_for_dataset(CellFlagTransaction::default(), &dataset)?;
 
         CommitBuilder::new(Arc::new(dataset))
             .execute(transaction)
@@ -4270,7 +4677,7 @@ mod tests {
                     ..Default::default()
                 },
                 &dataset,
-            );
+            )?;
 
         let error = CommitBuilder::new(Arc::new(dataset))
             .with_affected_rows(RowAddrTreeMap::from_iter([1_u64]))
@@ -4314,7 +4721,7 @@ mod tests {
                     ..Default::default()
                 },
                 &dataset,
-            )
+            )?
             .with_application_transaction_properties(Some(Arc::new(HashMap::from_iter([(
                 "application".to_string(),
                 "value".to_string(),
@@ -4436,11 +4843,26 @@ mod tests {
                 .is_some()
         );
         assert!(
+            shallow
+                .cell_flag_state(definition.flag_id)
+                .unwrap()
+                .root
+                .path
+                .is_empty()
+        );
+        assert!(
             deep.cell_flag_state(definition.flag_id)
                 .unwrap()
                 .root
                 .base_id
                 .is_none()
+        );
+        assert!(
+            deep.cell_flag_state(definition.flag_id)
+                .unwrap()
+                .root
+                .path
+                .is_empty()
         );
 
         let result = UpdateBuilder::new(Arc::new(dataset))
@@ -4470,7 +4892,7 @@ mod tests {
             explanation
                 .candidate_files
                 .iter()
-                .any(|file| file.path.contains(CELL_FLAGS_DIR))
+                .all(|file| !file.path.contains(CELL_FLAGS_DIR))
         );
         dataset.cleanup(policy).execute().await?;
 

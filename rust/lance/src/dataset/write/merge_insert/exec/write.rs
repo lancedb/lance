@@ -1182,7 +1182,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
             // Step 5: Create and store the transaction
             let transaction = Transaction::new(dataset.manifest.version, operation, None)
-                .with_cell_flag_transaction_for_dataset(cell_flag_transaction, dataset.as_ref());
+                .with_cell_flag_transaction_for_dataset(cell_flag_transaction, dataset.as_ref())?;
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {

@@ -2848,14 +2848,14 @@ pub async fn commit_compaction(
         },
     )
     .transaction_properties(options.transaction_properties.clone());
-    let transaction_builder =
-        if cell_flag_changes.is_empty() && dataset.manifest.next_cell_flag_id == 0 {
-            transaction_builder
-        } else {
-            transaction_builder
-                .cell_flag_transaction(cell_flag_changes, dataset.cell_flag_transaction_identity())
-        };
-    let transaction = transaction_builder.build();
+    let transaction = if cell_flag_changes.is_empty() && dataset.manifest.next_cell_flag_id == 0 {
+        transaction_builder.build()
+    } else {
+        transaction_builder.build_with_cell_flag_transaction(
+            cell_flag_changes,
+            dataset.cell_flag_transaction_identity(),
+        )?
+    };
 
     if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

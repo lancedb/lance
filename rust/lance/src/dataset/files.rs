@@ -278,16 +278,19 @@ async fn emit_cell_flag_file_batches(
     let mut builder = TrackedFileBatch::with_capacity(BATCH_SIZE);
     for state in &manifest.cell_flag_states {
         let root_base = resolve_file_base(&manifest, state.root.base_id, base_uri);
-        builder.append(&FileRow {
-            version: manifest.version,
-            base_uri: Cow::Borrowed(root_base.uri),
-            path: Cow::Borrowed(&state.root.path),
-            file_type: FileType::CellFlagFile,
-        });
-        if builder.len() == BATCH_SIZE {
-            let full = std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(BATCH_SIZE));
-            if !send_tracked_file_batch(sender, full).await? {
-                return Ok(false);
+        if !state.root.path.is_empty() {
+            builder.append(&FileRow {
+                version: manifest.version,
+                base_uri: Cow::Borrowed(root_base.uri),
+                path: Cow::Borrowed(&state.root.path),
+                file_type: FileType::CellFlagFile,
+            });
+            if builder.len() == BATCH_SIZE {
+                let full =
+                    std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(BATCH_SIZE));
+                if !send_tracked_file_batch(sender, full).await? {
+                    return Ok(false);
+                }
             }
         }
 

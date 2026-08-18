@@ -256,12 +256,14 @@ message CellFlagDefinition {
 // referenced file belongs to that base dataset (for example after a shallow
 // clone).
 message CellFlagFile {
+  // Empty only for an inline-only root. In that form inline_bytes is
+  // authoritative and size_bytes is zero. base_id, when present, supplies the
+  // default base for external bitmap objects referenced inside the root.
   string path = 1;
   uint64 size_bytes = 2;
   optional uint32 base_id = 3;
-  // Optional exact byte copy for small immutable roots. The referenced object
-  // remains authoritative for reachability, clone, and cleanup; readers may
-  // use this copy to avoid a separate metadata request.
+  // Encoded bytes for an inline-only small root, or an optional exact cache of
+  // a referenced root object.
   optional bytes inline_bytes = 4;
   // Platform-independent conservative upper bound on memory retained while
   // decoding and materializing the object. For bitmap objects this may exceed

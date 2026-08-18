@@ -1907,11 +1907,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
         }?;
-        Ok(if let Some(changes) = cell_flag_transaction {
+        if let Some(changes) = cell_flag_transaction {
             transaction.with_cell_flag_transaction(changes)
         } else {
-            transaction
-        })
+            Ok(transaction)
+        }
     }
 
     async fn finish_delete_update(
@@ -2720,7 +2720,8 @@ mod tests {
             }],
             dataset_identity: Uuid::new_v4().to_string(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let rewrite = Transaction::new_from_version(
             dataset.manifest.version,
             Operation::Rewrite {
@@ -2819,6 +2820,7 @@ mod tests {
                     dataset_identity: transaction_dataset_id.clone(),
                     ..Default::default()
                 })
+                .unwrap()
         };
 
         for compatible in [flag_change(1, 2), flag_change(2, 1)] {

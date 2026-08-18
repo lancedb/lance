@@ -833,10 +833,13 @@ impl<'a> CleanupTask<'a> {
                         return Ok::<_, Error>(paths);
                     }
                     state.root.validate_root_path_for_flag(state.flag_id)?;
-                    let root_path = Path::parse(&state.root.path)?;
-                    paths.insert(root_path.clone());
-                    let full_root_path =
-                        Path::from_iter(dataset_base.parts().chain(root_path.parts()));
+                    let full_root_path = if state.root.path.is_empty() {
+                        dataset_base.clone()
+                    } else {
+                        let root_path = Path::parse(&state.root.path)?;
+                        paths.insert(root_path.clone());
+                        Path::from_iter(dataset_base.parts().chain(root_path.parts()))
+                    };
                     let root = io_context
                         .load_cell_flag_root(
                             &object_store,
@@ -889,7 +892,6 @@ impl<'a> CleanupTask<'a> {
                 async move {
                     let mut paths = HashSet::new();
                     state.root.validate_root_path_for_flag(state.flag_id)?;
-                    let root_path = Path::parse(&state.root.path)?;
                     let (root_base, root_is_parent_owned) = match state.root.base_id {
                         None => (branch_base, false),
                         Some(root_base_id) => {
@@ -908,11 +910,15 @@ impl<'a> CleanupTask<'a> {
                             (dataset_base, true)
                         }
                     };
-                    if root_is_parent_owned {
-                        paths.insert(root_path.clone());
-                    }
-                    let full_root_path =
-                        Path::from_iter(root_base.parts().chain(root_path.parts()));
+                    let full_root_path = if state.root.path.is_empty() {
+                        root_base.clone()
+                    } else {
+                        let root_path = Path::parse(&state.root.path)?;
+                        if root_is_parent_owned {
+                            paths.insert(root_path.clone());
+                        }
+                        Path::from_iter(root_base.parts().chain(root_path.parts()))
+                    };
                     let root = io_context
                         .load_cell_flag_root(
                             &object_store,

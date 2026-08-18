@@ -3474,7 +3474,9 @@ impl Dataset {
             } else {
                 self.base.clone()
             };
-            file_paths.push((state.root.path.clone(), root_base));
+            if !state.root.path.is_empty() {
+                file_paths.push((state.root.path.clone(), root_base));
+            }
 
             let root = self
                 .load_cell_flag_root(state.flag_id)
@@ -3811,7 +3813,7 @@ impl Dataset {
                 ..Default::default()
             },
             self,
-        );
+        )?;
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;

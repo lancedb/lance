@@ -661,7 +661,7 @@ impl UpdateJob {
                         ..Default::default()
                     },
                     dataset.as_ref(),
-                );
+                )?;
             let new_dataset = self
                 .commit_builder(dataset, update_data.affected_rows)
                 .execute(transaction)
@@ -719,7 +719,7 @@ impl UpdateJob {
                     ..Default::default()
                 },
                 dataset.as_ref(),
-            );
+            )?;
 
         let new_dataset = self
             .commit_builder(dataset, update_data.affected_rows)

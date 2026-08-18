@@ -979,7 +979,7 @@ pub(super) async fn alter_columns(
             ..Default::default()
         },
         dataset,
-    );
+    )?;
 
     // TODO: adjust the indices here for the new schema
 
@@ -1041,7 +1041,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
             ..Default::default()
         },
         dataset,
-    );
+    )?;
 
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

@@ -69,7 +69,7 @@ message CellFlagFragment {
 }
 ```
 
-A missing fragment entry is `Empty`; `all_set=true` is `Full`; and either partial representation is an `LCF1` adaptive bitmap of physical row offsets. Partial bitmaps must be non-empty, non-full, and within `physical_rows`. Small bitmaps may be embedded in a root. Small roots may also be copied into their manifest descriptor, while the referenced immutable root remains part of clone and cleanup reachability.
+A missing fragment entry is `Empty`; `all_set=true` is `Full`; and either partial representation is an `LCF1` adaptive bitmap of physical row offsets. Partial bitmaps must be non-empty, non-full, and within `physical_rows`. Small bitmaps may be embedded in a root. A small root may be stored inline-only in its manifest descriptor: `path` is empty, `size_bytes` is zero, and `inline_bytes` is authoritative. An optional `base_id` supplies the default base for external bitmap objects referenced inside an inline root, which lets shallow clones retain source ownership without a root object. Larger roots use an immutable object path; an external descriptor may also carry an exact inline cache whose length equals `size_bytes`.
 
 All integers in the following binary envelopes are little-endian.
 

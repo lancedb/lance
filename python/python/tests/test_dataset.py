@@ -6583,9 +6583,15 @@ def test_cell_flag_public_api(tmp_path: Path):
         dataset.update_config({"lance.cell_flags.v1": "user-controlled"})
     assert dataset.version == version
     dataset.add_columns(pa.field("embedding", pa.int32()))
-    computed = dataset.register_cell_flag("embedding", "computed")
-    reviewed = dataset.register_cell_flag("embedding", "reviewed", True)
-    same_name = dataset.register_cell_flag("id", "computed")
+    version = dataset.version
+    computed, reviewed, same_name = dataset.register_cell_flags(
+        [
+            ("embedding", "computed", False),
+            ("embedding", "reviewed", True),
+            ("id", "computed", False),
+        ]
+    )
+    assert dataset.version == version + 1
     assert len({computed["flag_id"], reviewed["flag_id"], same_name["flag_id"]}) == 3
     assert dataset.cell_flag_definitions() == [computed, reviewed, same_name]
     assert _flag_rows(dataset) == [
@@ -6595,6 +6601,22 @@ def test_cell_flag_public_api(tmp_path: Path):
         (3, False),
     ]
     assert all(value for _, value in _flag_rows(dataset, name="reviewed"))
+
+    version = dataset.version
+    definitions = dataset.cell_flag_definitions()
+    with pytest.raises(ValueError, match="already registered"):
+        dataset.register_cell_flags(
+            [("id", "duplicate", False), ("id", "duplicate", True)]
+        )
+    assert dataset.version == version
+    assert dataset.cell_flag_definitions() == definitions
+
+    with pytest.raises(ValueError, match="Unknown field"):
+        dataset.register_cell_flags(
+            [("id", "valid", False), ("unknown", "invalid", False)]
+        )
+    assert dataset.version == version
+    assert dataset.cell_flag_definitions() == definitions
 
     flags_before_schema_changes = _flag_rows(dataset)
     dataset.add_columns({"derived": "id + 1"})

@@ -351,7 +351,7 @@ impl<'a> InsertBuilder<'a> {
                     ..Default::default()
                 },
                 dataset,
-            );
+            )?;
         }
 
         Ok(transaction)

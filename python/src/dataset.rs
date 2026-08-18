@@ -1915,6 +1915,28 @@ impl Dataset {
         Ok(value.into_any().unbind())
     }
 
+    fn register_cell_flags(
+        &mut self,
+        py: Python<'_>,
+        registrations: Vec<(String, String, bool)>,
+    ) -> PyResult<Py<PyAny>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let definitions = rt()
+            .block_on(None, new_self.register_cell_flags(registrations))?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        let values = PyList::empty(py);
+        for definition in definitions {
+            let value = PyDict::new(py);
+            value.set_item("flag_id", definition.flag_id)?;
+            value.set_item("field_id", definition.field_id)?;
+            value.set_item("name", definition.name)?;
+            values.append(value)?;
+        }
+        Ok(values.into_any().unbind())
+    }
+
     fn rename_cell_flag(&mut self, field: String, name: String, new_name: String) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.rename_cell_flag(field, name, new_name))?

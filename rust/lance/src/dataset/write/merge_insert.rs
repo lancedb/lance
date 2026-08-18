@@ -2964,7 +2964,7 @@ impl MergeInsertJob {
 
         let affected_rows = affected_rows.filter(|rows| !rows.is_empty());
         let transaction = Transaction::new(self.dataset.manifest.version, operation, None)
-            .with_cell_flag_transaction_for_dataset(cell_flag_changes, self.dataset.as_ref());
+            .with_cell_flag_transaction_for_dataset(cell_flag_changes, self.dataset.as_ref())?;
         let transaction = transaction.with_cell_flag_affected_rows(affected_rows.clone())?;
 
         Ok(UncommittedMergeInsert {

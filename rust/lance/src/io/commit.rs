@@ -367,15 +367,21 @@ async fn localize_deep_clone_cell_flags(
 ) -> Result<()> {
     let mut normalized_roots: HashMap<String, (u64, u64, Arc<Vec<u8>>)> = HashMap::new();
     for state in &mut manifest.cell_flag_states {
+        let inline_only = state.root.path.is_empty();
         let (size_bytes, memory_size_bytes, normalized_bytes) =
-            if let Some((size_bytes, memory_size_bytes, normalized_bytes)) =
-                normalized_roots.get(&state.root.path)
+            if let Some((size_bytes, memory_size_bytes, normalized_bytes)) = (!inline_only)
+                .then(|| normalized_roots.get(&state.root.path))
+                .flatten()
             {
                 (*size_bytes, *memory_size_bytes, normalized_bytes.clone())
             } else {
                 state.root.validate_root_path_for_flag(state.flag_id)?;
-                let relative = Path::parse(state.root.path.as_str())?;
-                let path = Path::from_iter(base_path.parts().chain(relative.parts()));
+                let path = if inline_only {
+                    base_path.clone()
+                } else {
+                    let relative = Path::parse(state.root.path.as_str())?;
+                    Path::from_iter(base_path.parts().chain(relative.parts()))
+                };
                 let bytes = crate::dataset::cell_flag::read_cell_flag_bytes(
                     object_store,
                     &path,
@@ -413,19 +419,27 @@ async fn localize_deep_clone_cell_flags(
                 }
                 let (normalized, memory_size) = encode_cell_flag_root(&root)?;
                 let normalized = Arc::new(normalized);
-                object_store.put(&path, normalized.as_ref()).await?;
-                let size_bytes = normalized.len() as u64;
+                if !inline_only {
+                    object_store.put(&path, normalized.as_ref()).await?;
+                }
+                let size_bytes = if inline_only {
+                    0
+                } else {
+                    normalized.len() as u64
+                };
                 let memory_size_bytes = memory_size as u64;
-                normalized_roots.insert(
-                    state.root.path.clone(),
-                    (size_bytes, memory_size_bytes, normalized.clone()),
-                );
+                if !inline_only {
+                    normalized_roots.insert(
+                        state.root.path.clone(),
+                        (size_bytes, memory_size_bytes, normalized.clone()),
+                    );
+                }
                 (size_bytes, memory_size_bytes, normalized)
             };
         state.root.base_id = None;
         state.root.size_bytes = size_bytes;
         state.root.memory_size_bytes = memory_size_bytes;
-        if state.root.inline_bytes.is_some() {
+        if inline_only || state.root.inline_bytes.is_some() {
             state.root.inline_bytes = Some(normalized_bytes.as_ref().clone());
         }
     }
@@ -2768,7 +2782,8 @@ mod tests {
                 ..Default::default()
             },
             &dataset,
-        );
+        )
+        .unwrap();
         let write_config = ManifestWriteConfig::default().with_transaction_file_disabled();
 
         let (manifest, _) = commit_transaction(

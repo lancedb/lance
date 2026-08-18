@@ -1624,6 +1624,32 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.register_cell_flag(field, name, initial_value)
 
+    def register_cell_flags(
+        self, registrations: Sequence[Tuple[str, str, bool]]
+    ) -> List[CellFlagDefinition]:
+        """Register multiple Boolean flags in one atomic dataset commit.
+
+        Each registration is a ``(field, name, initial_value)`` tuple. Stable
+        flag IDs follow input order. If any registration is invalid, none are
+        committed.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import tempfile
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"value": [1, 2]}), tempfile.mkdtemp()
+        ... )
+        >>> definitions = dataset.register_cell_flags([
+        ...     ("value", "computed", False),
+        ...     ("value", "reviewed", True),
+        ... ])
+        >>> [definition["name"] for definition in definitions]
+        ['computed', 'reviewed']
+        """
+        return self._ds.register_cell_flags(registrations)
+
     def rename_cell_flag(self, field: str, name: str, new_name: str) -> None:
         """Rename a registered flag without changing its stable ID or state.
 

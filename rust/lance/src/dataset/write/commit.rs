@@ -630,7 +630,7 @@ impl<'a> CommitBuilder<'a> {
         let merged = if cell_flag_changes.is_empty() {
             merged
         } else {
-            merged.with_cell_flag_transaction(cell_flag_changes)
+            merged.with_cell_flag_transaction(cell_flag_changes)?
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
