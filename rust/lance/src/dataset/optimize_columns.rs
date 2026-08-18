@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use futures::{StreamExt, stream};
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{BlobHandling, Schema};
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 use serde::{Deserialize, Serialize};
@@ -454,6 +454,20 @@ async fn stage_group(dataset: Arc<Dataset>, plan: PlannedGroup) -> Result<Staged
         ))
     })? as u64;
     let mut scanner = dataset.scan();
+    let has_legacy_blob = plan
+        .schema
+        .fields_pre_order()
+        .any(|field| field.is_blob() && !field.is_blob_v2());
+    if has_legacy_blob {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
+    let has_blob_v2 = plan
+        .schema
+        .fields_pre_order()
+        .any(|field| field.is_blob_v2());
+    if has_blob_v2 {
+        scanner.with_row_address();
+    }
     let names = plan
         .field_names
         .iter()
@@ -465,9 +479,27 @@ async fn stage_group(dataset: Arc<Dataset>, plan: PlannedGroup) -> Result<Staged
         .with_row_id()
         .include_deleted_rows();
     let field_names = plan.field_names.clone();
-    let data = scanner.try_into_stream().await?.map(move |batch| {
-        let batch = batch?;
-        project_user_fields(&batch, &field_names)
+    let rewrite_dataset = dataset.clone();
+    let rewrite_schema = plan.schema.clone();
+    let data = scanner.try_into_stream().await?.then(move |batch| {
+        let field_names = field_names.clone();
+        let rewrite_dataset = rewrite_dataset.clone();
+        let rewrite_schema = rewrite_schema.clone();
+        async move {
+            let batch = batch?;
+            let batch = if has_blob_v2 {
+                super::optimize::transform_blob_v2_batch(
+                    &rewrite_dataset,
+                    &rewrite_schema,
+                    batch,
+                    false,
+                )
+                .await?
+            } else {
+                batch
+            };
+            project_user_fields(&batch, &field_names)
+        }
     });
 
     let fragment = super::FileFragment::new(dataset, plan.fragment);
@@ -533,9 +565,13 @@ async fn discard_staged_groups(dataset: &Dataset, groups: &[StagedGroup]) {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{
+        ArrayRef, Int32Array, LargeBinaryArray, RecordBatch, RecordBatchIterator, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::stream;
+    use lance_arrow::BLOB_META_KEY;
+    use lance_file::version::LanceFileVersion;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
 
     use super::*;
@@ -593,6 +629,12 @@ mod tests {
             ))
             .await
             .unwrap()
+    }
+
+    async fn scan_all_blobs_binary(dataset: &Dataset) -> RecordBatch {
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        scanner.try_into_batch().await.unwrap()
     }
 
     #[tokio::test]
@@ -764,5 +806,170 @@ mod tests {
         let after = after.iter().find(|index| index.name == "b_idx").unwrap();
         assert_eq!(after.uuid, index_uuid);
         assert!(!after.fragment_bitmap.as_ref().unwrap().contains(0));
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_rewrites_legacy_blob() {
+        let expected = vec![Some(b"first".as_slice()), None, Some(b"third".as_slice())];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, true)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(LargeBinaryArray::from_iter(expected)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = scan_all_blobs_binary(&dataset).await;
+
+        dataset
+            .optimize_columns(OptimizeColumnsOptions {
+                groups: vec![ColumnGroup {
+                    fields: vec!["blob".to_string()],
+                }],
+                fragment_ids: None,
+                max_concurrency: Some(1),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(scan_all_blobs_binary(&dataset).await, before);
+        assert_eq!(dataset.column_layout_stats()[0].live_file_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_rewrites_blob_v2_and_nested_blob_v2() {
+        let mut blob_builder = crate::BlobArrayBuilder::new(3);
+        blob_builder.push_bytes(b"top-0").unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_bytes(b"top-2").unwrap();
+
+        let mut nested_blob_builder = crate::BlobArrayBuilder::new(3);
+        nested_blob_builder.push_bytes(b"nested-0").unwrap();
+        nested_blob_builder.push_bytes(b"nested-1").unwrap();
+        nested_blob_builder.push_null().unwrap();
+        let nested_fields = vec![crate::blob_field("nested_blob", true)];
+        let nested: ArrayRef = Arc::new(
+            StructArray::try_new(
+                nested_fields.clone().into(),
+                vec![nested_blob_builder.finish().unwrap()],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+            Field::new("info", DataType::Struct(nested_fields.into()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                blob_builder.finish().unwrap(),
+                nested,
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = scan_all_blobs_binary(&dataset).await;
+
+        dataset
+            .optimize_columns(OptimizeColumnsOptions {
+                groups: vec![ColumnGroup {
+                    fields: vec!["blob".to_string(), "info".to_string()],
+                }],
+                fragment_ids: None,
+                max_concurrency: Some(1),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(scan_all_blobs_binary(&dataset).await, before);
+        assert_eq!(dataset.column_layout_stats()[0].live_file_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_preserves_external_blob_v2_reference() {
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"external-payload").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let external_base = format!("file://{}", external_dir.std_path().display());
+        let test_uri = test_dir.path_str();
+
+        let mut blob_builder = crate::BlobArrayBuilder::new(2);
+        blob_builder.push_uri(external_uri).unwrap();
+        blob_builder.push_bytes(b"inline-payload").unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: external_base,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = scan_all_blobs_binary(&dataset).await;
+
+        dataset
+            .optimize_columns(OptimizeColumnsOptions {
+                groups: vec![ColumnGroup {
+                    fields: vec!["blob".to_string()],
+                }],
+                fragment_ids: None,
+                max_concurrency: Some(1),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(scan_all_blobs_binary(&dataset).await, before);
     }
 }

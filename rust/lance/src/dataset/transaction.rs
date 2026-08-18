@@ -2230,6 +2230,43 @@ impl Transaction {
         Ok(())
     }
 
+    /// Reapply OptimizeColumns index pruning after legacy coverage migration.
+    ///
+    /// `migrate_indices` runs after [`Self::build_manifest`] and can replace an
+    /// unknown or corrupt fragment bitmap with the coverage stored in the index
+    /// files. That recovered coverage predates the overlays materialized by this
+    /// operation, so target fragments must be removed again before commit.
+    pub(crate) fn prune_optimize_columns_indices_after_migration(
+        &self,
+        indices: &mut [IndexMetadata],
+    ) -> Result<()> {
+        let Operation::OptimizeColumns { groups, .. } = &self.operation else {
+            return Ok(());
+        };
+
+        for group in groups {
+            let fragment_id = u32::try_from(group.fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "OptimizeColumns fragment id {} does not fit in index coverage",
+                    group.fragment_id
+                ))
+            })?;
+            for index in indices.iter_mut() {
+                let covers_rewritten_field = group.field_ids.iter().any(|field_id| {
+                    index
+                        .fields
+                        .iter()
+                        .any(|index_field| u32::try_from(*index_field).ok() == Some(*field_id))
+                });
+                if covers_rewritten_field && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+                {
+                    fragment_bitmap.remove(fragment_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
