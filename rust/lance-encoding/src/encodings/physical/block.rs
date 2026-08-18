@@ -456,17 +456,6 @@ impl BlockDecompressor for GeneralBlockDecompressor {
         self.inner
             .decompress(LanceBuffer::from(decompressed), num_values)
     }
-
-    fn decompress_with_num_values_inference(
-        &self,
-        data: LanceBuffer,
-        num_values: u64,
-    ) -> Result<(DataBlock, Option<u64>)> {
-        let mut decompressed = Vec::new();
-        self.compressor.decompress(&data, &mut decompressed)?;
-        self.inner
-            .decompress_with_num_values_inference(LanceBuffer::from(decompressed), num_values)
-    }
 }
 
 // An encoder which uses generic compression, such as zstd/lz4 to encode buffers

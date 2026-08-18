@@ -10,7 +10,7 @@ import pyarrow as pa
 EXPECTED_LANCE_VERSION = "6.0.1"
 NUM_DENSE_ROWS = 513
 VALUES_PER_DENSE_ROW = 32
-NUM_EMPTY_ROWS = 65_536
+NUM_TRAILING_ROWS = 65_536
 
 assert lance.__version__ == EXPECTED_LANCE_VERSION
 
@@ -22,7 +22,7 @@ captions = pa.array(
         list(range(row * VALUES_PER_DENSE_ROW, (row + 1) * VALUES_PER_DENSE_ROW))
         for row in range(NUM_DENSE_ROWS)
     ]
-    + [[] for _ in range(NUM_EMPTY_ROWS)],
+    + [([] if row % 2 == 0 else None) for row in range(NUM_TRAILING_ROWS)],
     type=pa.list_(pa.uint32()),
 )
 table = pa.table(

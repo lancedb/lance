@@ -1378,7 +1378,7 @@ impl RleDecompressor {
         }))
     }
 
-    fn infer_num_values(
+    fn sum_run_lengths(
         &self,
         values_buffer: &LanceBuffer,
         lengths_buffer: &LanceBuffer,
@@ -1633,17 +1633,20 @@ impl BlockDecompressor for RleDecompressor {
         self.decode_data(vec![values_buffer, lengths_buffer], num_values, false)
     }
 
-    fn decompress_with_num_values_inference(
-        &self,
-        data: LanceBuffer,
-        _num_values: u64,
-    ) -> Result<(DataBlock, Option<u64>)> {
-        let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
-        let (values_buffer, lengths_buffer) =
-            self.decode_child_buffers(values_buffer, lengths_buffer)?;
-        let num_values = self.infer_num_values(&values_buffer, &lengths_buffer)?;
-        self.decode_child_data(&values_buffer, &lengths_buffer, num_values, false)
-            .map(|data| (data, Some(num_values)))
+    fn infer_num_values(&self, data: &LanceBuffer) -> Result<Option<u64>> {
+        // Pylance 6.0.1 used this exact RLE signature for structural levels. Newer RLE
+        // variants are not part of that compatibility case and may contain much wider,
+        // untrusted run lengths.
+        if self.bits_per_value != 16
+            || self.run_length_width != RunLengthWidth::U8
+            || !self.values.is_identity()
+            || !self.run_lengths.is_identity()
+        {
+            return Ok(None);
+        }
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(data)?;
+        self.sum_run_lengths(&values_buffer, &lengths_buffer)
+            .map(Some)
     }
 }
 
@@ -2011,27 +2014,42 @@ mod tests {
     }
 
     #[test]
-    fn block_rle_infers_value_count_from_run_lengths() {
+    fn legacy_block_rle_infers_value_count_without_materializing() {
         let num_values = u64::from(u16::MAX) + 8;
+        let full_runs = num_values / u64::from(u8::MAX);
+        let remainder = num_values % u64::from(u8::MAX);
+        let num_runs = full_runs + u64::from(remainder != 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(num_runs * 2).to_le_bytes());
+        frame.extend(std::iter::repeat_n(7_u16, num_runs as usize).flat_map(u16::to_le_bytes));
+        frame.extend(std::iter::repeat_n(u8::MAX, full_runs as usize));
+        if remainder != 0 {
+            frame.push(remainder as u8);
+        }
+
+        let inferred_num_values = RleDecompressor::new(16)
+            .infer_num_values(&LanceBuffer::from(frame))
+            .unwrap();
+        assert_eq!(inferred_num_values, Some(num_values));
+    }
+
+    #[test]
+    fn newer_block_rle_does_not_infer_untrusted_run_sum() {
         let mut frame = Vec::new();
         frame.extend_from_slice(&2_u64.to_le_bytes());
         frame.extend_from_slice(&7_u16.to_le_bytes());
-        frame.extend_from_slice(&(num_values as u32).to_le_bytes());
+        frame.extend_from_slice(&u32::MAX.to_le_bytes());
+        let frame = LanceBuffer::from(frame);
+        let decompressor = RleDecompressor::with_run_length_width(16, RunLengthWidth::U32);
 
-        let (decoded, inferred_num_values) =
-            RleDecompressor::with_run_length_width(16, RunLengthWidth::U32)
-                .decompress_with_num_values_inference(LanceBuffer::from(frame), 0)
-                .unwrap();
-        assert_eq!(inferred_num_values, Some(num_values));
-        let decoded = decoded.as_fixed_width().unwrap();
-        assert_eq!(decoded.num_values, num_values);
-        assert_eq!(decoded.bits_per_value, 16);
+        assert_eq!(decompressor.infer_num_values(&frame).unwrap(), None);
+        let error =
+            BlockDecompressor::decompress(&decompressor, frame, u64::from(u16::MAX)).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(
-            decoded
-                .data
-                .borrow_to_typed_slice::<u16>()
-                .iter()
-                .all(|level| *level == 7)
+            error
+                .to_string()
+                .contains("RLE decoding overflowed expected value count")
         );
     }
 

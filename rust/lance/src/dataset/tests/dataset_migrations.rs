@@ -587,6 +587,13 @@ async fn test_v6_0_1_miniblock_level_count_overflow() {
     let offsets = captions.value_offsets();
     assert_eq!(offsets[513], 16_416);
     assert!(offsets[513..].iter().all(|offset| *offset == 16_416));
+    assert_eq!(captions.null_count(), 32_768);
+    assert!(captions.is_valid(513));
+    assert_eq!(captions.value(513).len(), 0);
+    assert!(captions.is_null(514));
+    assert!(captions.is_valid(66_047));
+    assert_eq!(captions.value(66_047).len(), 0);
+    assert!(captions.is_null(66_048));
 }
 
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.
