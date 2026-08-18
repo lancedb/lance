@@ -206,14 +206,14 @@ pub trait BitPackingUninit: BitPacking {
     ///
     /// # Safety
     /// The input and output lengths have the same requirements as
-    /// [`Self::unchecked_pack`]. Every output element is initialized on return.
+    /// [`BitPacking::unchecked_pack`]. Every output element is initialized on return.
     unsafe fn unchecked_pack_uninit(width: usize, input: &[Self], output: &mut [MaybeUninit<Self>]);
 
     /// Unpacks into potentially uninitialized output storage.
     ///
     /// # Safety
     /// The input and output lengths have the same requirements as
-    /// [`Self::unchecked_unpack`]. Every output element is initialized on return.
+    /// [`BitPacking::unchecked_unpack`]. Every output element is initialized on return.
     unsafe fn unchecked_unpack_uninit(
         width: usize,
         input: &[Self],
