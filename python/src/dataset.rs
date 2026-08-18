@@ -4968,6 +4968,7 @@ fn prepare_vector_index_params(
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
+    let mut covering_columns: Vec<String> = Vec::new();
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -5129,6 +5130,14 @@ fn prepare_vector_index_params(
         if let Some(value) = kwargs.get_item("skip_transpose")? {
             skip_transpose = value.extract()?;
         }
+
+        // Covering ("included") columns: names of extra dataset columns stored inline in the
+        // index. Empty when absent. The core validates them when the index is built.
+        if let Some(cols) = kwargs.get_item("covering_columns")?
+            && !cols.is_none()
+        {
+            covering_columns = cols.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -5174,6 +5183,7 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    params.covering_columns(covering_columns);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {
