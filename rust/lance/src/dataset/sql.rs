@@ -8,8 +8,13 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::sqlparser::{
+    ast::{Expr, Ident, SelectItem, SetExpr, Statement},
+    dialect::GenericDialect,
+    parser::Parser,
+};
 use futures::TryStreamExt;
-use lance_core::datatypes::BlobHandling;
+use lance_core::{ROW_ADDR, datatypes::BlobHandling};
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -89,9 +94,49 @@ impl SqlQueryBuilder {
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
-        let df = ctx.sql(&self.sql).await?;
+        let df = match with_projected_row_addr(&self.sql, self.with_row_addr) {
+            Some(sql) => match ctx.sql(&sql).await {
+                Ok(df) => df,
+                Err(_) => ctx.sql(&self.sql).await?,
+            },
+            None => ctx.sql(&self.sql).await?,
+        };
         Ok(SqlQuery::new(df))
     }
+}
+
+fn with_projected_row_addr(sql: &str, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let [mut statement] = Parser::parse_sql(&GenericDialect, sql)
+        .ok()?
+        .try_into()
+        .ok()?;
+    let Statement::Query(query) = &mut statement else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    if select.distinct.is_some() {
+        return None;
+    }
+
+    let already_projected = select
+        .projection
+        .iter()
+        .map(ToString::to_string)
+        .any(|item| item.ends_with('*') || item.rsplit('.').next() == Some(ROW_ADDR));
+    if already_projected {
+        return None;
+    }
+    select
+        .projection
+        .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+            ROW_ADDR,
+        ))));
+    Some(statement.to_string())
 }
 
 pub struct SqlQuery {
@@ -226,9 +271,7 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.schema().fields().len(), 2);
         let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
-        let row_addrs = batch
-            .column(row_addr_index)
-            .as_primitive::<UInt64Type>();
+        let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
         assert_eq!(row_addrs.values(), &[0, 1]);
     }
 
