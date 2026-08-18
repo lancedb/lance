@@ -3057,25 +3057,6 @@ impl ManifestNamespace {
         Ok(epoch.unwrap_or_default())
     }
 
-    /// Insert an entry into the manifest table
-    async fn insert_into_manifest(
-        &self,
-        object_id: String,
-        object_type: ObjectType,
-        location: Option<String>,
-    ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(
-            vec![ManifestEntry {
-                object_id,
-                object_type,
-                location,
-                metadata: None,
-            }],
-            None,
-        )
-        .await
-    }
-
     /// Insert one or more entries into the manifest table with metadata and base_objects.
     ///
     /// This is the unified entry point for both single and batch inserts.
