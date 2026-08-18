@@ -36,7 +36,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex};
+use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
 };
@@ -681,7 +681,26 @@ impl ScalarIndex for BitmapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    #[instrument(name = "bitmap_search", level = "debug", skip_all)]
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+
+        let tracked_null_rows = || {
+            if options.track_nulls && !self.null_map.is_empty() {
+                Some((*self.null_map).clone())
+            } else {
+                None
+            }
+        };
 
         let (row_ids, null_row_ids) = match query {
             SargableQuery::Equals(val) => {
@@ -692,12 +711,7 @@ impl ScalarIndex for BitmapIndex {
                 } else {
                     let key = OrderableScalarValue(val.clone());
                     let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                    let null_rows = if !self.null_map.is_empty() {
-                        Some((*self.null_map).clone())
-                    } else {
-                        None
-                    };
-                    ((*bitmap).clone(), null_rows)
+                    ((*bitmap).clone(), tracked_null_rows())
                 }
             }
             SargableQuery::Range(start, end) => {
@@ -748,12 +762,7 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                let null_rows = if !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
-                (result, null_rows)
+                (result, tracked_null_rows())
             }
             SargableQuery::IsIn(values) => {
                 metrics.record_comparisons(values.len());
@@ -786,7 +795,7 @@ impl ScalarIndex for BitmapIndex {
                 .try_collect()
                 .await?;
 
-                // Add null bitmap if needed
+                // Add null bitmap if the query explicitly includes NULL.
                 if has_null && !self.null_map.is_empty() {
                     bitmaps.push(self.null_map.clone());
                 }
@@ -794,18 +803,13 @@ impl ScalarIndex for BitmapIndex {
                 let result = if bitmaps.is_empty() {
                     RowAddrTreeMap::default()
                 } else {
-                    // Convert Arc<RowAddrTreeMap> to &RowAddrTreeMap for union_all
                     let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                // If the query explicitly includes null, then nulls are TRUE (not NULL)
-                // Otherwise, nulls remain NULL (unknown)
-                let null_rows = if !has_null && !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
+                // Explicit NULL is TRUE; otherwise NULL remains UNKNOWN only when
+                // the caller needs three-valued-logic bookkeeping.
+                let null_rows = if has_null { None } else { tracked_null_rows() };
                 (result, null_rows)
             }
             SargableQuery::IsNull() => {

@@ -335,6 +335,22 @@ pub enum SearchResult {
     AtLeast(NullableRowAddrSet),
 }
 
+/// Execution-time options for scalar index search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// If true, the search should preserve NULL rows for three-valued logic.
+    pub track_nulls: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        // Keep the historical `ScalarIndex::search` contract. Callers that
+        // execute a top-level filter can explicitly disable this bookkeeping
+        // with `SearchOptions { track_nulls: false }`.
+        Self { track_nulls: true }
+    }
+}
+
 impl SearchResult {
     pub fn exact(row_ids: impl Into<RowAddrTreeMap>) -> Self {
         Self::Exact(NullableRowAddrSet::new(row_ids.into(), Default::default()))
@@ -511,6 +527,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Search the scalar index with execution-time options.
+    ///
+    /// Index implementations that do not need these options may use the default
+    /// implementation, which preserves the existing `search` behavior.
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let _ = options;
+        self.search(query, metrics).await
+    }
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids

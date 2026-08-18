@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
     compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
@@ -2127,6 +2127,16 @@ impl ScalarIndex for BTreeIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
@@ -2193,7 +2203,7 @@ impl ScalarIndex for BTreeIndex {
         // page with zero nulls is a true Matches::All, while one with nulls needs
         // Matches::Some only to track the null rows; surfacing `null_count` here
         // could refine that classification (see #6802).
-        if !matches!(query, SargableQuery::IsNull()) {
+        if options.track_nulls && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
                 .page_lookup
@@ -3410,7 +3420,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchOptions,
+            SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -5526,9 +5537,27 @@ mod tests {
             index.page_lookup.all_null_pages.len(),
         );
 
-        let metrics = NoOpMetricsCollector;
+        // A top-level lookup can skip all-null pages because the final filter
+        // discards UNKNOWN rows. This is the hot path for ordinary equality
+        // predicates and must not load the all-null pages.
+        let untracked_metrics = LocalMetricsCollector::default();
+        let _result = index
+            .search_with_options(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+                SearchOptions { track_nulls: false },
+                &untracked_metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            untracked_metrics.parts_loaded.load(Ordering::Relaxed),
+            0,
+            "an absent value must not load all-null pages when NULL tracking is disabled"
+        );
 
-        // Search for Equals(0) — value 0 doesn't exist in any page
+        // The legacy direct-search API retains NULL bookkeeping for callers
+        // that still need the three-valued result.
+        let metrics = NoOpMetricsCollector;
         let result = index
             .search(
                 &SargableQuery::Equals(ScalarValue::Int32(Some(0))),

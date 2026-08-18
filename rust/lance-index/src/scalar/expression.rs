@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
+    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1937,26 +1937,42 @@ impl ScalarIndexExpr {
     ///
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
-    #[async_recursion]
     pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
+        self.evaluate_nullable_impl(index_loader, metrics, false)
+            .await
+    }
+
+    /// Evaluate an expression while optionally retaining NULL rows from index
+    /// searches. A top-level filter eventually drops unknown rows, but a child
+    /// below `NOT` must retain them so SQL three-valued logic remains correct.
+    #[async_recursion]
+    async fn evaluate_nullable_impl(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        track_nulls: bool,
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                // `NOT` must preserve NULLs from the child.
+                let result = inner
+                    .evaluate_nullable_impl(index_loader, metrics, true)
+                    .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable_impl(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_nullable_impl(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable_impl(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_nullable_impl(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1964,7 +1980,13 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions { track_nulls },
+                        metrics,
+                    )
+                    .await?;
                 let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
