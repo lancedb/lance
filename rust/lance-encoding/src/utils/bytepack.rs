@@ -113,19 +113,45 @@ impl BytepackedIntegerEncoder {
     /// construction time.
     pub fn append(&mut self, value: u64) -> Result<()> {
         match self {
-            Self::U8(packer) => packer.append(u8::try_from(value).map_err(|_| {
-                Error::invalid_input(format!("value {value} does not fit in bytepacked u8"))
-            })?),
-            Self::U16(packer) => packer.append(u16::try_from(value).map_err(|_| {
-                Error::invalid_input(format!("value {value} does not fit in bytepacked u16"))
-            })?),
-            Self::U32(packer) => packer.append(u32::try_from(value).map_err(|_| {
-                Error::invalid_input(format!("value {value} does not fit in bytepacked u32"))
-            })?),
+            Self::U8(_) if value > u8::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u8"
+                )));
+            }
+            Self::U16(_) if value > u16::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u16"
+                )));
+            }
+            Self::U32(_) if value > u32::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u32"
+                )));
+            }
+            _ => {}
+        }
+        self.append_trusted(value);
+        Ok(())
+    }
+
+    /// Append a value whose range is guaranteed by the caller's construction.
+    pub(crate) fn append_trusted(&mut self, value: u64) {
+        match self {
+            Self::U8(packer) => {
+                debug_assert!(u8::try_from(value).is_ok());
+                packer.append(value as u8);
+            }
+            Self::U16(packer) => {
+                debug_assert!(u16::try_from(value).is_ok());
+                packer.append(value as u16);
+            }
+            Self::U32(packer) => {
+                debug_assert!(u32::try_from(value).is_ok());
+                packer.append(value as u32);
+            }
             Self::U64(packer) => packer.append(value),
             Self::Zero => {}
         }
-        Ok(())
     }
 
     /// Convert the encoder into a vector of bytes.

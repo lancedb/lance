@@ -5635,7 +5635,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    rep_index_builder.append(offset as u64)?;
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 offset = zipped_data.len();
             }
@@ -5646,7 +5646,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    rep_index_builder.append(offset as u64)?;
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 if control.is_visible {
                     let value = data_iter.next().unwrap();
@@ -5658,7 +5658,7 @@ impl PrimitiveStructuralEncoder {
 
         debug_assert_eq!(zipped_data.len(), len);
         // Put the final value in the rep index
-        rep_index_builder.append(zipped_data.len() as u64)?;
+        rep_index_builder.append_trusted(zipped_data.len() as u64);
 
         let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
@@ -5710,7 +5710,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        rep_index_builder.append(rep_offset as u64)?;
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5732,7 +5732,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        rep_index_builder.append(rep_offset as u64)?;
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5761,7 +5761,7 @@ impl PrimitiveStructuralEncoder {
         // if we are over `len` then we have a bug.
         debug_assert!(buf.len() <= len);
         // Put the final value in the rep index
-        rep_index_builder.append(buf.len() as u64)?;
+        rep_index_builder.append_trusted(buf.len() as u64);
 
         let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
