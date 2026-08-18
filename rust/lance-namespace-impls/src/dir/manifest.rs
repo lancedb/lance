@@ -288,7 +288,7 @@ struct ManifestIndexAccumulator {
     base_objects_values: Vec<Option<Vec<String>>>,
     base_objects_row_ids: Vec<u64>,
     row_count: u64,
-    has_drop_tombstones: bool,
+    has_drop_state_rows: bool,
 }
 
 impl ManifestIndexAccumulator {
@@ -321,7 +321,10 @@ impl ManifestIndexAccumulator {
             .entry(row.object_type.as_str())
             .or_default()
             .insert(row_id as u32);
-        self.has_drop_tombstones |= row.object_type == ObjectType::DropTombstone;
+        self.has_drop_state_rows |= matches!(
+            row.object_type,
+            ObjectType::DropTombstone | ObjectType::DropEpoch
+        );
         self.base_objects_values
             .push(row.base_objects.map(|objects| objects.to_vec()));
         self.base_objects_row_ids.push(row_id);
@@ -2503,10 +2506,10 @@ impl ManifestNamespace {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
-        has_drop_tombstones: bool,
+        has_drop_state_rows: bool,
     ) -> std::result::Result<(), CommitError> {
         apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
-        if has_drop_tombstones {
+        if has_drop_state_rows {
             mark_drop_tombstone_rows(manifest.table_metadata_mut());
         }
         let timestamp_nanos = SystemTime::now()
@@ -2674,7 +2677,7 @@ impl ManifestNamespace {
             };
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
-            let has_drop_tombstones = index_data.has_drop_tombstones;
+            let has_drop_state_rows = index_data.has_drop_state_rows;
 
             let Operation::Overwrite {
                 fragments, schema, ..
@@ -2735,7 +2738,7 @@ impl ManifestNamespace {
                     &mut manifest,
                     indices,
                     transaction,
-                    has_drop_tombstones,
+                    has_drop_state_rows,
                 )
                 .await;
 
@@ -4148,7 +4151,16 @@ impl LanceNamespace for ManifestNamespace {
                         .await?
                     {
                         TombstoneTableResult::Owned(tombstone_id) => Some(tombstone_id),
-                        TombstoneTableResult::Existing(_) | TombstoneTableResult::Missing => None,
+                        TombstoneTableResult::Existing(_) => None,
+                        TombstoneTableResult::Missing => {
+                            return Err(NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "Table '{}' was concurrently deregistered without a drop intent",
+                                    object_id
+                                ),
+                            }
+                            .into());
+                        }
                     }
                 } else if self
                     .delete_from_manifest_if_location(&object_id, Some(&info.location), true)
@@ -4157,7 +4169,13 @@ impl LanceNamespace for ManifestNamespace {
                 {
                     Some(String::new())
                 } else {
-                    None
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Table '{}' was concurrently deregistered before drop cleanup was claimed",
+                            object_id
+                        ),
+                    }
+                    .into());
                 };
 
                 let Some(tombstone_id) = tombstone_id else {
@@ -5345,7 +5363,7 @@ mod tests {
             .unwrap()
             .location
             .unwrap();
-        namespace
+        let response = namespace
             .deregister_table(DeregisterTableRequest {
                 id: Some(table_id),
                 context: Some(HashMap::from([(
@@ -5356,12 +5374,43 @@ mod tests {
             })
             .await
             .unwrap();
+        let tombstone_id = response
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(DROP_TOMBSTONE_ID_PROPERTY))
+            .expect("async deregistration returns its durable tombstone id");
 
+        let dataset = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .metadata()
+                .contains_key(crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY)
+        );
+        assert!(
+            dataset
+                .metadata()
+                .contains_key(crate::dir::manifest_feature_flags::WRITER_FEATURE_FLAGS_KEY)
+        );
+
+        assert!(
+            namespace
+                .complete_drop_tombstone(tombstone_id)
+                .await
+                .unwrap()
+        );
         let dataset = DatasetBuilder::from_uri(manifest_uri).load().await.unwrap();
         assert!(
             dataset
                 .metadata()
                 .contains_key(crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY)
+        );
+        assert!(
+            dataset
+                .metadata()
+                .contains_key(crate::dir::manifest_feature_flags::WRITER_FEATURE_FLAGS_KEY)
         );
     }
 
