@@ -202,6 +202,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sql_with_row_addr_includes_unprojected_row_addr() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_implicit_row_addr",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT x FROM dataset")
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(batch.schema().fields().len(), 2);
+        let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
+        let row_addrs = batch
+            .column(row_addr_index)
+            .as_primitive::<UInt64Type>();
+        assert_eq!(row_addrs.values(), &[0, 1]);
+    }
+
+    #[tokio::test]
     async fn test_sql_blob_all_binary() {
         let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
         let mut blobs = BlobArrayBuilder::new(2);
