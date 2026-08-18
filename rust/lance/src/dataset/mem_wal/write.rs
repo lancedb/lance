@@ -6072,14 +6072,15 @@ mod tests {
             .with_max_unflushed_memtable_bytes(100)
             .with_backpressure_log_interval(Duration::from_millis(50));
 
-        let controller = BackpressureController::new(config);
-        let stats = controller.stats().clone();
-
         let unflushed = Arc::new(AtomicUsize::new(1000));
         let release = unflushed.clone();
 
-        let parked =
-            controller.maybe_apply_backpressure(|| (unflushed.load(AtomicOrdering::Relaxed), None));
+        let controller = fake_local(&config, move || {
+            (unflushed.load(AtomicOrdering::Relaxed), None)
+        });
+        let stats = controller.stats().clone();
+
+        let parked = controller.maybe_apply_backpressure(0, empty_shard_memory());
 
         let observer = async {
             // Bounded so a regression that never publishes the park fails here
@@ -6121,13 +6122,13 @@ mod tests {
             .with_max_unflushed_memtable_bytes(100)
             .with_backpressure_log_interval(Duration::from_millis(50));
 
-        let controller = BackpressureController::new(config);
+        let controller = fake_local(&config, || (1000, None));
 
         // Never drops below the threshold, so the timeout is what ends the wait.
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
-                controller.maybe_apply_backpressure(|| (1000, None)),
+                controller.maybe_apply_backpressure(0, empty_shard_memory()),
             )
             .await
             .is_err()
