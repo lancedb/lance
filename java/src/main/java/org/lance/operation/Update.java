@@ -20,6 +20,7 @@ import com.google.common.base.MoreObjects;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -31,19 +32,30 @@ public class Update implements Operation {
   private final long[] fieldsForPreservingFragBitmap;
   private final Optional<UpdateMode> updateMode;
 
+  /**
+   * Per-fragment matched row offsets serialized as portable RoaringBitmap bytes (little-endian,
+   * spec-compliant). Keys are fragment ids; values are the serialized bitmap for the local physical
+   * row offsets (0-based) within the fragment whose columns were rewritten. Empty map means the
+   * caller did not supply offsets and the partial last_updated refresh in build_manifest will not
+   * activate.
+   */
+  private final Map<Long, byte[]> updatedFragmentOffsets;
+
   private Update(
       List<Long> removedFragmentIds,
       List<FragmentMetadata> updatedFragments,
       List<FragmentMetadata> newFragments,
       long[] fieldsModified,
       long[] fieldsForPreservingFragBitmap,
-      Optional<UpdateMode> updateMode) {
+      Optional<UpdateMode> updateMode,
+      Map<Long, byte[]> updatedFragmentOffsets) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
     this.fieldsModified = fieldsModified;
     this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
     this.updateMode = updateMode;
+    this.updatedFragmentOffsets = updatedFragmentOffsets;
   }
 
   public static Builder builder() {
@@ -74,6 +86,10 @@ public class Update implements Operation {
     return updateMode;
   }
 
+  public Map<Long, byte[]> updatedFragmentOffsets() {
+    return updatedFragmentOffsets;
+  }
+
   @Override
   public String name() {
     return "Update";
@@ -87,6 +103,7 @@ public class Update implements Operation {
         .add("fieldsModified", fieldsModified)
         .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
         .add("updateMode", updateMode)
+        .add("updatedFragmentOffsets", updatedFragmentOffsets)
         .toString();
   }
 
@@ -100,7 +117,32 @@ public class Update implements Operation {
         && Objects.equals(newFragments, that.newFragments)
         && Arrays.equals(fieldsModified, that.fieldsModified)
         && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
-        && Objects.equals(updateMode, that.updateMode);
+        && Objects.equals(updateMode, that.updateMode)
+        && offsetMapsEqual(updatedFragmentOffsets, that.updatedFragmentOffsets);
+  }
+
+  /** Deep-equality for {@code Map<Long, byte[]>}: keys by value, arrays by content. */
+  private static boolean offsetMapsEqual(Map<Long, byte[]> a, Map<Long, byte[]> b) {
+    if (a == b) return true;
+    if (a.size() != b.size()) return false;
+    for (Map.Entry<Long, byte[]> entry : a.entrySet()) {
+      if (!Arrays.equals(entry.getValue(), b.get(entry.getKey()))) return false;
+    }
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int h = Objects.hash(removedFragmentIds, updatedFragments, newFragments, updateMode);
+    h = 31 * h + Arrays.hashCode(fieldsModified);
+    h = 31 * h + Arrays.hashCode(fieldsForPreservingFragBitmap);
+    // Sum entry hashes (XOR key ^ array-content hash) so result is insertion-order-independent.
+    int mapHash = 0;
+    for (Map.Entry<Long, byte[]> entry : updatedFragmentOffsets.entrySet()) {
+      mapHash += Long.hashCode(entry.getKey()) ^ Arrays.hashCode(entry.getValue());
+    }
+    h = 31 * h + mapHash;
+    return h;
   }
 
   public enum UpdateMode {
@@ -115,6 +157,7 @@ public class Update implements Operation {
     private long[] fieldsModified = new long[0];
     private long[] fieldsForPreservingFragBitmap = new long[0];
     private Optional<UpdateMode> updateMode = Optional.empty();
+    private Map<Long, byte[]> updatedFragmentOffsets = Collections.emptyMap();
 
     private Builder() {}
 
@@ -148,6 +191,20 @@ public class Update implements Operation {
       return this;
     }
 
+    /**
+     * Set the per-fragment matched row offsets for a RewriteColumns commit.
+     *
+     * <p>Keys are fragment ids; values are portable RoaringBitmap bytes (little-endian,
+     * spec-compliant serialization) encoding the local physical row offsets (0-based) within the
+     * fragment that matched the update_columns hash join. When non-empty and update mode is
+     * RewriteColumns with stable row IDs enabled, build_manifest will call the partial last_updated
+     * refresh for those offsets only.
+     */
+    public Builder updatedFragmentOffsets(Map<Long, byte[]> updatedFragmentOffsets) {
+      this.updatedFragmentOffsets = updatedFragmentOffsets;
+      return this;
+    }
+
     public Update build() {
       return new Update(
           removedFragmentIds,
@@ -155,7 +212,8 @@ public class Update implements Operation {
           newFragments,
           fieldsModified,
           fieldsForPreservingFragBitmap,
-          updateMode);
+          updateMode,
+          updatedFragmentOffsets);
     }
   }
 }

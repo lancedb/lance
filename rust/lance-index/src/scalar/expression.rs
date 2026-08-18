@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
+    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1937,26 +1937,40 @@ impl ScalarIndexExpr {
     ///
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
-    #[async_recursion]
     pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
+        self.evaluate_with_options(index_loader, metrics, true)
+            .await
+    }
+
+    #[async_recursion]
+    async fn evaluate_with_options(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        track_nulls: bool,
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                // NOT needs the child's NULL rows to preserve SQL three-valued
+                // logic. Once enabled, keep tracking through the whole subtree.
+                let result = inner
+                    .evaluate_with_options(index_loader, metrics, true)
+                    .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1964,7 +1978,13 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        metrics,
+                    )
+                    .await?;
                 let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
@@ -1985,7 +2005,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_with_options(index_loader, metrics, false)
             .await?
             .drop_nulls())
     }
@@ -4920,6 +4940,44 @@ mod tests {
                 .iter()
                 .any(|leaf| matches!(leaf, ScalarIndexExpr::Not(_)))
         );
+    }
+
+    #[test]
+    fn test_optimize_parser_merges_ranges_for_multiple_columns() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves =
+            optimize_parsed_scalar_filter("x > 10 AND x < 20 AND y > 30 AND y < 40", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                                Bound::Excluded(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(30))),
+                                Bound::Excluded(ScalarValue::Int64(Some(40))),
+                            ))
+                        )
+            )
+        }));
     }
 
     #[test]

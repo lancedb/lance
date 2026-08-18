@@ -49,6 +49,7 @@ use crate::{
             },
             general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
             packed::{
+                PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
                 PackedStructFixedWidthMiniBlockDecompressor,
                 PackedStructFixedWidthMiniBlockEncoder, PackedStructVariablePerValueDecompressor,
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
@@ -769,6 +770,27 @@ pub fn try_variable_packed_struct_per_value(
     ))))
 }
 
+/// Encode all packed structs with the exact strategy recursively.
+pub fn try_packed_struct_per_value(
+    strategy: Arc<dyn CompressionStrategy>,
+    field: &Field,
+    data: &DataBlock,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let Some(has_variable_child) = validate_packed_struct(field, data)? else {
+        return Ok(None);
+    };
+    if has_variable_child {
+        return Ok(Some(Box::new(PackedStructVariablePerValueEncoder::new(
+            strategy,
+            field.children.clone(),
+        ))));
+    }
+
+    Ok(Some(Box::new(PackedStructFixedPerValueEncoder::new(
+        field.children.clone(),
+    ))))
+}
+
 /// Encode variable-width values directly, with FSST or per-value compression
 /// when applicable.
 pub fn try_variable_width_per_value(
@@ -1069,6 +1091,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::PackedStruct(description) => Ok(Box::new(
+                PackedStructFixedPerValueDecompressor::new(description)?,
+            )),
             _ => todo!("fixed-per-value decompressor for {:?}", description),
         }
     }

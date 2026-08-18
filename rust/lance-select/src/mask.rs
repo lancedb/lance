@@ -649,12 +649,10 @@ impl RowAddrTreeMap {
 
     /// Convert the set into an iterator of row addrs
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// This is unsafe because if any of the inner RowAddrSelection elements
-    /// is not a Partial then the iterator will panic because we don't know
-    /// the size of the bitmap.
-    pub unsafe fn into_addr_iter(self) -> impl Iterator<Item = u64> {
+    /// Panics if any selection is `Full` because the fragment size is unknown.
+    pub fn into_addr_iter(self) -> impl Iterator<Item = u64> {
         self.inner
             .into_iter()
             .flat_map(|(fragment, selection)| match selection {
@@ -675,10 +673,10 @@ impl RowAddrTreeMap {
     /// rather than its individual bits, so dense ranges cost
     /// O(num_containers) (roughly num_rows / 65536) instead of O(num_rows).
     ///
-    /// # Safety
-    /// Same contract as [`Self::into_addr_iter`]: panics if any entry is
-    /// `Full`, since the fragment size is unknown at this layer.
-    pub unsafe fn iter_runs(&self) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
+    /// # Panics
+    ///
+    /// Panics if any selection is `Full` because the fragment size is unknown.
+    pub fn iter_runs(&self) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
         self.inner
             .iter()
             .flat_map(|(&fragment, selection)| match selection {
@@ -1582,9 +1580,7 @@ mod tests {
         let mut mask = RowAddrTreeMap::default();
         mask.insert_fragment(0);
 
-        unsafe {
-            let _ = mask.into_addr_iter().collect::<Vec<u64>>();
-        }
+        let _ = mask.into_addr_iter().collect::<Vec<u64>>();
     }
 
     #[test]
@@ -1596,7 +1592,7 @@ mod tests {
         mask.insert(2 << 32 | 10);
 
         let expected = vec![0u64, 1, 1 << 32 | 5, 2 << 32 | 10];
-        let actual: Vec<u64> = unsafe { mask.into_addr_iter().collect() };
+        let actual: Vec<u64> = mask.into_addr_iter().collect();
         assert_eq!(actual, expected);
     }
 
@@ -1608,8 +1604,7 @@ mod tests {
         mask.insert_range(10..15);
         mask.insert_range((1u64 << 32) + 100..(1u64 << 32) + 103);
 
-        // SAFETY: only Partial entries.
-        let runs: Vec<(u32, RangeInclusive<u32>)> = unsafe { mask.iter_runs().collect() };
+        let runs: Vec<(u32, RangeInclusive<u32>)> = mask.iter_runs().collect();
         assert_eq!(runs, vec![(0, 0..=2), (0, 10..=14), (1, 100..=102)]);
     }
 
@@ -1622,13 +1617,14 @@ mod tests {
         mask.insert_range(20..25);
         mask.insert_range((1u64 << 32)..(1u64 << 32) + 3);
 
-        let from_runs: Vec<u64> = unsafe { mask.iter_runs() }
+        let from_runs: Vec<u64> = mask
+            .iter_runs()
             .flat_map(|(frag, run)| {
                 let frag = u64::from(frag);
                 (*run.start()..=*run.end()).map(move |v| (frag << 32) | u64::from(v))
             })
             .collect();
-        let from_bits: Vec<u64> = unsafe { mask.clone().into_addr_iter() }.collect();
+        let from_bits: Vec<u64> = mask.clone().into_addr_iter().collect();
         assert_eq!(from_runs, from_bits);
     }
 

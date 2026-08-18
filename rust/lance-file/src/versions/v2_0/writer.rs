@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-
 use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -309,6 +308,9 @@ impl Writer {
         Ok(())
     }
 
+    /// Reject a null in a non-nullable field whether or not a null ancestor
+    /// masks it: the 2.0 logical encoders cannot store such a slot. The 2.1+
+    /// structural writer counts only visible nulls (`writer::nullability`).
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
             return Err(Error::invalid_input(format!(

@@ -1368,21 +1368,24 @@ mod tests {
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+        RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
     };
-    use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{Dimension, RowCount, array};
+    use lance_file::version::LanceFileVersion;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         IndexType,
-        scalar::{BuiltinIndexType, ScalarIndexParams, SearchResult, TextQuery},
+        scalar::{
+            BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
+        },
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
@@ -3388,6 +3391,144 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(rows, 2, "value 'd' lives in appended fragment");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_append_with_backpressured_multichunk_read() {
+        const WIDE_DIMENSION: usize = 140_000;
+        const NARROW_DIMENSION: usize = 4_096;
+        const SHORT_ROWS: usize = 68;
+        const LONG_ROWS: usize = 128;
+
+        fn make_batch(schema: Arc<Schema>, rows: usize, base: usize) -> RecordBatch {
+            let docs_field = schema.field(1);
+            let DataType::List(item_field) = docs_field.data_type() else {
+                unreachable!("docs must be a list");
+            };
+            let DataType::Struct(doc_fields) = item_field.data_type() else {
+                unreachable!("docs items must be structs");
+            };
+            let wide_values = Float32Array::from_iter_values(
+                (0..rows * WIDE_DIMENSION).map(|index| ((index + base) % 1009) as f32),
+            );
+            let narrow_values = Float32Array::from_iter_values(
+                (0..rows * NARROW_DIMENSION).map(|index| ((index + base) % 251) as f32),
+            );
+            let docs = StructArray::new(
+                doc_fields.clone(),
+                vec![
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(wide_values, WIDE_DIMENSION as i32)
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            narrow_values,
+                            NARROW_DIMENSION as i32,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows).map(|index| format!("document-{}", index + base)),
+                    )),
+                ],
+                None,
+            );
+            let docs = ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+                Arc::new(docs),
+                None,
+            );
+            let ids = UInt64Array::from_iter_values(base as u64..(base + rows) as u64);
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(docs)]).unwrap()
+        }
+
+        let vector_item = Arc::new(Field::new("item", DataType::Float32, true));
+        let doc_fields = vec![
+            Field::new(
+                "wide",
+                DataType::FixedSizeList(vector_item.clone(), WIDE_DIMENSION as i32),
+                true,
+            ),
+            Field::new(
+                "narrow",
+                DataType::FixedSizeList(vector_item, NARROW_DIMENSION as i32),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, true),
+        ]
+        .into();
+        let docs_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("docs", DataType::List(docs_item), true),
+        ]));
+
+        let initial_batch = make_batch(schema.clone(), 1, 1_000);
+        let initial_reader = RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            initial_reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["docs.text"],
+                IndexType::Inverted,
+                Some("docs_text".to_string()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended_batches = vec![
+            Ok(make_batch(schema.clone(), SHORT_ROWS, 0)),
+            Ok(make_batch(schema.clone(), LONG_ROWS, SHORT_ROWS)),
+        ];
+        let appended_reader = RecordBatchIterator::new(appended_batches, schema);
+        dataset
+            .append(
+                appended_reader,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The deleted first batch makes the live delta start exactly at the
+        // second write-batch boundary, matching a merge-insert style update.
+        dataset.delete("id < 68").await.unwrap();
+
+        let optimize_options = OptimizeOptions::append();
+        // Nested FTS reads the entire `docs` root. Under this budget the wide
+        // sibling is split into same-priority chunks, then the narrow sibling's
+        // higher-priority I/O consumes the remaining budget while the wide read
+        // is awaited. Admitted chunks must continue despite that backpressure.
+        let optimize = crate::index::scalar::TEST_TRAINING_IO_BUFFER_SIZE.scope(
+            70 * 1024 * 1024,
+            dataset.optimize_indices(&optimize_options),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+            .await
+            .expect("incremental nested FTS optimization timed out")
+            .unwrap();
+
+        let segments = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "docs_text")
+            .count();
+        assert_eq!(segments, 2, "optimization should add one FTS delta segment");
     }
 
     #[tokio::test]

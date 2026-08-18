@@ -37,13 +37,16 @@ use lance_core::cache::{
 };
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
+use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -224,6 +227,90 @@ async fn test_create_scalar_index(
     assert_eq!(indices[0].name, index_name);
 
     dataset.index_statistics(&index_name).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_btree_nullable_filters_match_unindexed_scan() {
+    let test_uri = TempStrDir::default();
+    let num_rows = 10_000u64;
+    let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let ids = UInt64Array::from_iter_values(0..num_rows);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("value", Arc::new(values) as ArrayRef),
+        ("id", Arc::new(ids) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2_500,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragments().len() > 1);
+
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for predicate in [
+        "value = 7",
+        "value IN (7, 99)",
+        "NOT (value = 99)",
+        "NOT (value = 7)",
+        "NOT (value = 99 OR value = 7)",
+        "NOT (NOT (value = 7))",
+        "value = 99 OR value = 7",
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "Expected BTree scalar index query for {predicate}:\n{plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+        let sorted_ids = |batch: &RecordBatch| {
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(
+            sorted_ids(&indexed),
+            sorted_ids(&baseline),
+            "indexed result differs for {predicate}"
+        );
+    }
 }
 
 async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
@@ -1319,6 +1406,173 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
         plan.contains("CompoundFtsScorer"),
         "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
     );
+}
+
+#[tokio::test]
+async fn test_pure_should_maxscore_is_exact_across_fragments() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "alpha beta rare blocked",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "beta",
+            "alpha"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true, true).await;
+
+    let match_query = |term: &str, boost: f32| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, match_query("alpha", 0.25)),
+        (Occur::Should, match_query("beta", 0.25)),
+        (Occur::Should, match_query("rare", 4.0)),
+        (
+            Occur::Should,
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("blocked", 1.0)),
+    ])
+    .into();
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert!(!exhaustive.iter().any(|(row_id, _)| *row_id == 0));
+    assert!(exhaustive.len() >= 3);
+    assert!(
+        exhaustive[..3]
+            .iter()
+            .all(|(_, score)| *score == exhaustive[0].1)
+            && exhaustive[..3].windows(2).all(|rows| rows[0].0 < rows[1].0),
+        "the top three identical rows should tie in ascending row-id order"
+    );
+    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(limited, exhaustive[..2]);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    for metric in [
+        COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+        COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+        COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+        COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    ] {
+        assert!(
+            stats.all_counts.contains_key(metric),
+            "pure-SHOULD execution stats should expose {metric}"
+        );
+    }
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC] > 0,
+        "pure-SHOULD execution should recompute clause bounds"
+    );
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC] > 0,
+        "pure-SHOULD execution should evaluate essential clauses"
+    );
+    assert_eq!(
+        stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
+        Some(&(4 * 5)),
+        "four index partitions should be searched once for each of five query leaves"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column pure SHOULD should use the compound scorer:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_phrase_confirmation_short_circuit_is_exact() {
+    let texts = (0..100)
+        .map(|row| {
+            if row % 10 == 0 {
+                "high cost phrase check cheap reject bonus"
+            } else if row % 5 == 0 {
+                "high cost phrase check cheap reject"
+            } else {
+                "high cost phrase check cheap filler reject"
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let phrase_query = |terms: &str| -> FtsQuery {
+        PhraseQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, phrase_query("high cost phrase check")),
+        (Occur::Must, phrase_query("cheap reject")),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, query.clone(), 10).await;
+
+    let nested: FtsQuery = BooleanQuery::new([
+        (Occur::Must, query.clone()),
+        (Occur::Should, compound_match_query("bonus", "text", 1.0)),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, nested, 10).await;
 }
 
 #[tokio::test]
@@ -4075,6 +4329,140 @@ async fn test_fts_phrase_query_preserves_stop_word_gaps() {
     assert!(!ids.contains(&3), "ids={ids:?}");
 }
 
+fn json_batch(values: Vec<&str>) -> RecordBatch {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("json", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
+    let initial = json_batch(initial_values);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+#[tokio::test]
+async fn test_json_btree_index_statistics() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": 1000}"#,
+        r#"{"val": 2000}"#,
+        r#"{"val": 3000}"#,
+    ])
+    .await;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("json_idx").await.unwrap()).unwrap();
+
+    assert_eq!(stats["name"], "json_idx");
+    assert_eq!(stats["num_indices"], 1);
+    assert_eq!(stats["num_indexed_rows"], 3);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    assert_eq!(stats["indices"][0]["min"], "1000");
+    assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
+#[rstest]
+#[case::merge(false)]
+#[case::append_rebuild(true)]
+#[tokio::test]
+async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#]).await;
+
+    for values in [
+        vec![r#"{"val": null}"#, r#"{"val": 2000}"#],
+        vec![r#"{"other": 1}"#, r#"{"val": 3000}"#],
+    ] {
+        let batch = json_batch(values);
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    let options = if append_rebuild {
+        OptimizeOptions::append()
+    } else {
+        OptimizeOptions::default()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let indexed_fragments = dataset
+        .load_indices_by_name("json_idx")
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+        .collect::<HashSet<_>>();
+    assert_eq!(indexed_fragments, HashSet::from([0, 1, 2]));
+
+    let result = dataset
+        .scan()
+        .filter("json_get_int(json, 'val') >= 2000")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn test_optimize_append_json_btree_preserves_float_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#]).await;
+    let appended = json_batch(vec![r#"{"val": 2}"#]);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let predicate = "json_get_float(json, 'val') = 2.0";
+    let indexed = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
 async fn prepare_json_dataset() -> (Dataset, String) {
     let text_col = Arc::new(StringArray::from(vec![
         r#"{
@@ -4888,7 +5276,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version.into(),
+        dataset_version.resolve(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -4917,7 +5305,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version.into(),
+            dataset_version.resolve(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -4996,7 +5384,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0.into(),
+        ConcreteFileVersion::V2_0,
         "Index files should never use legacy format, even for legacy datasets"
     );
 }

@@ -5674,8 +5674,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    // SAFETY: We know that `start <= len`
-                    unsafe { rep_index_builder.append(offset as u64) };
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 offset = zipped_data.len();
             }
@@ -5686,8 +5685,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    // SAFETY: We know that `start <= len`
-                    unsafe { rep_index_builder.append(offset as u64) };
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 if control.is_visible {
                     let value = data_iter.next().unwrap();
@@ -5699,10 +5697,7 @@ impl PrimitiveStructuralEncoder {
 
         debug_assert_eq!(zipped_data.len(), len);
         // Put the final value in the rep index
-        // SAFETY: `zipped_data.len() == len`
-        unsafe {
-            rep_index_builder.append(zipped_data.len() as u64);
-        }
+        rep_index_builder.append_trusted(zipped_data.len() as u64);
 
         let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
@@ -5754,8 +5749,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        // SAFETY: We know that `buf.len() <= len`
-                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5777,8 +5771,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        // SAFETY: We know that `buf.len() <= len`
-                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5807,10 +5800,7 @@ impl PrimitiveStructuralEncoder {
         // if we are over `len` then we have a bug.
         debug_assert!(buf.len() <= len);
         // Put the final value in the rep index
-        // SAFETY: `zipped_data.len() == len`
-        unsafe {
-            rep_index_builder.append(buf.len() as u64);
-        }
+        rep_index_builder.append_trusted(buf.len() as u64);
 
         let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
@@ -6402,14 +6392,6 @@ impl PrimitiveStructuralEncoder {
                         "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
                         variable.bits_per_offset
                     ))
-                }
-                DataBlock::Struct(struct_data_block)
-                    if !struct_data_block.has_variable_width_child() =>
-                {
-                    Some(
-                        "Full-zip packed struct requires at least one variable-width child"
-                            .to_string(),
-                    )
                 }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
