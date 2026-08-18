@@ -32,10 +32,11 @@ use lance_core::utils::futures::StreamOnDropExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriterOptions;
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -406,7 +407,7 @@ pub struct IvfShuffler {
 
     shuffle_output_root_filename: String,
 
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -446,11 +447,11 @@ impl IvfShuffler {
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
         })
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
@@ -496,7 +497,7 @@ impl IvfShuffler {
         info!("Writing unsorted data to disk at {}", path);
         info!("with schema: {:?}", schema);
 
-        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+        let mut file_writer = V1FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             Schema::try_from(schema.as_ref())?,
             &Default::default(),
@@ -528,7 +529,7 @@ impl IvfShuffler {
 
             if self.is_legacy {
                 let reader =
-                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
+                    V1FileReader::try_new_self_described(&object_store, &path, None).await?;
                 total_batches.push(reader.num_batches());
             } else {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
@@ -572,7 +573,7 @@ impl IvfShuffler {
 
             if self.is_legacy {
                 let reader =
-                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?;
+                    V1FileReader::try_new_self_described(&object_store, &path, None).await?;
                 let lance_schema = reader
                     .schema()
                     .project(&[PART_ID_COLUMN])
@@ -655,9 +656,8 @@ impl IvfShuffler {
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
-                _reader_handle = Some(
-                    PreviousFileReader::try_new_self_described(&object_store, &path, None).await?,
-                );
+                _reader_handle =
+                    Some(V1FileReader::try_new_self_described(&object_store, &path, None).await?);
 
                 stream::iter(start..end)
                     .map(|i| {
@@ -806,13 +806,11 @@ impl IvfShuffler {
                         true,
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
-                    let mut file_writer = lance_file::writer::FileWriter::try_new(
+                    let mut file_writer = versions::create_writer(
+                        this.format_version,
                         writer,
                         lance_schema,
-                        FileWriterOptions {
-                            format_version: Some(this.format_version),
-                            ..Default::default()
-                        },
+                        FileWriterOptions::default(),
                     )?;
 
                     for partition_and_idx in shuffled.into_iter().enumerate() {

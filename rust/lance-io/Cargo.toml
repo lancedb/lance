@@ -16,18 +16,11 @@ rust-version.workspace = true
 object_store = { workspace = true }
 opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
-lance-arrow.workspace = true
 lance-core.workspace = true
 lance-namespace.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
-arrow-arith.workspace = true
 arrow-array.workspace = true
-arrow-buffer.workspace = true
-arrow-cast.workspace = true
-arrow-data.workspace = true
 arrow-schema.workspace = true
-arrow-select.workspace = true
-async-recursion.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
@@ -41,10 +34,11 @@ metrics = { workspace = true, optional = true }
 moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid.workspace = true
 path_abs.workspace = true
 rand.workspace = true
 tempfile.workspace = true

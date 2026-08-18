@@ -13,7 +13,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,11 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+/// Marker schema for the flat index, which stores no data of its own.
+static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+});
+
 #[derive(Default)]
 pub struct FlatQueryParams {
     lower_bound: Option<f32>,
@@ -98,7 +103,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema() -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+        FLAT_SCHEMA.clone()
     }
 
     fn search(
@@ -329,7 +334,7 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
-    async fn load(_: &PreviousFileReader) -> Result<Self> {
+    async fn load(_: &V1FileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
 }
@@ -517,6 +522,15 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+
+    #[test]
+    fn test_schema_is_initialized_once() {
+        // The subindex schema is requested per call, so it is shared rather
+        // than rebuilt. Pointer equality is what distinguishes a shared schema
+        // from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(&FlatIndex::schema(), &FlatIndex::schema()));
+        assert_eq!(FlatIndex::schema().field(0).name(), "__flat_marker");
+    }
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,

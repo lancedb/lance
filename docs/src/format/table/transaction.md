@@ -685,7 +685,9 @@ In this scenario:
 If the backing object store does not support atomic operations (rename-if-not-exists or put-if-not-exists), an external manifest store can be used to enable concurrent writers.
 
 An external manifest store is a key-value store that supports put-if-not-exists operations.
-The external manifest store supplements but does not replace the manifests in object storage.
+It is the concurrency coordinator and fast version index: its conditional write selects one
+immutable staging manifest for each version. The canonical manifest bytes in object storage
+remain authoritative, so the external store supplements but does not replace them.
 A reader unaware of the external manifest store can still read the table, but may observe a version up to one commit behind the true latest version.
 
 ### Commit Process with External Store
@@ -698,24 +700,41 @@ The commit process follows a four-step protocol:
    - Write the new manifest to object storage under a unique path determined by a new UUID
    - This staged manifest is not yet visible to readers
 
-2. **Commit to external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
-   - Atomically commit the path of the staged manifest to the external store using put-if-not-exists
-   - The commit is effectively complete after this step
-   - If this operation fails due to conflict, another writer has committed this version
+2. **Reserve version in external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
+   - Atomically reserve the version for this staged manifest using put-if-not-exists
+   - The reservation selects one immutable staging object; it is not yet the canonical commit
+   - If this operation fails due to conflict, another writer reserved this version
 
 3. **Finalize in object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
    - Copy the staged manifest to the final path
+   - Successful materialization at this deterministic path is the commit point
    - This makes the manifest discoverable by readers unaware of the external store
 
 4. **Update external store pointer**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
    - Update the external store to point to the finalized manifest path
+   - After copying, read the canonical object's current metadata. Return its ETag to the caller as
+     an opaque physical-generation observation so runtime caches do not collapse a newly committed
+     Dataset into an older cached Dataset at the same URI and version
+   - Do not persist that ETag in the external store. Concurrent finalizers can copy the same selected
+     immutable bytes into different physical generations, and COPY plus external-store publication
+     is not atomic. Every helper therefore publishes the same stable path-and-size tuple
    - Completes the synchronization between external store and object storage
 
 **Fault Tolerance:**
 
-If the writer fails after step 2 but before step 4, the external store and object store are temporarily out of sync.
-Readers detect this condition and attempt to complete the synchronization.
-If synchronization fails, the reader refuses to load to ensure dataset portability.
+If the writer fails after step 2 but before step 3, the external store contains a pending
+reservation. Readers that use the external store detect this state and retry materialization.
+If step 3 succeeds but step 4 fails, the canonical object remains committed; readers use it and
+may repair the external index. Staging deletion is garbage collection and does not affect the
+commit outcome.
+
+**Rolling Upgrade:**
+
+Roll this behavior out normally across the fleet. New readers ignore legacy stored
+ETags, and legacy readers already accept finalized rows without an ETag, so mixed-version rows
+remain compatible. While both legacy finalizers and legacy readers remain, the pre-existing race
+can still republish a stale ETag that a legacy reader rejects. Full protection takes effect when
+the rolling upgrade converges; no row migration or quiesced cutover is required.
 
 ### Reader Process with External Store
 
@@ -725,7 +744,9 @@ The reader follows a validation and synchronization protocol:
 
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
    - Retrieve the manifest path for the requested version
-   - If the path does not end with a UUID, return it directly (synchronization complete)
+   - If the path does not end with a UUID, validate the canonical object's size. Ignore any legacy
+     stored ETag because it is neither content identity nor dataset-incarnation identity; the
+     validation HEAD still returns the current canonical ETag to the caller
    - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
@@ -733,11 +754,12 @@ The reader follows a validation and synchronization protocol:
    - This operation is idempotent
 
 3. **Update external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-   - Update the external store to reflect the finalized path
-   - Future readers will see the synchronized state
+   - Best-effort record the finalized path and size without an ETag while returning the observed
+     destination ETag to the current caller
+   - If this index repair fails, retain staging so a future reader can retry it
 
 4. **Return finalized path**: Return `{dataset}/_versions/{version}.manifest`
-   - Always return the finalized path
-   - If synchronization fails, return an error to prevent reading inconsistent state
+   - Return once canonical materialization succeeds, even if index repair or staging cleanup fails
+   - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.

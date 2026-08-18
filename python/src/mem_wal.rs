@@ -18,13 +18,13 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
 use lance_index::mem_wal::{
-    MergedGeneration as LanceMergedGeneration, ShardingField, ShardingSpec,
+    CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -52,10 +52,10 @@ pub fn py_evaluate_sharding_spec<'py>(
     result.to_pyarrow(py)
 }
 
-/// Write a primary-key dedup sidecar (`_pk_index/`) for a flushed-generation
+/// Write a primary-key dedup sidecar (`_pk_index/`) for an SSTable
 /// dataset already written at `gen_path`, mirroring what production flush emits.
 ///
-/// Test-support only: lets Python tests stage a *faithful* flushed generation
+/// Test-support only: lets Python tests stage a *faithful* SSTable
 /// (dataset + sidecar). Production always writes the sidecar during flush, so a
 /// dataset-without-sidecar is not a state the system otherwise produces.
 #[pyfunction(name = "_write_pk_sidecar", signature = (gen_path, data, pk_columns))]
@@ -115,16 +115,17 @@ fn optional_string(value: Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
-/// Represents a single generation of a MemWAL shard that has been merged
-/// into the base table. Used with `MergeInsertBuilder.mark_generations_as_merged()`.
-#[pyclass(name = "_MergedGeneration", module = "_lib")]
-pub struct PyMergedGeneration {
+/// Points to an SSTable compacted into the base table.
+///
+/// Used with `MergeInsertBuilder.mark_sstables_as_compacted()`.
+#[pyclass(name = "_CompactedSsTable", module = "_lib")]
+pub struct PyCompactedSsTable {
     pub shard_id: String,
     pub generation: u64,
 }
 
 #[pymethods]
-impl PyMergedGeneration {
+impl PyCompactedSsTable {
     #[new]
     pub fn new(shard_id: String, generation: u64) -> Self {
         Self {
@@ -145,23 +146,23 @@ impl PyMergedGeneration {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_MergedGeneration(shard_id='{}', generation={})",
+            "_CompactedSsTable(shard_id='{}', generation={})",
             self.shard_id, self.generation
         )
     }
 }
 
-impl PyMergedGeneration {
-    pub fn to_lance(&self) -> PyResult<LanceMergedGeneration> {
+impl PyCompactedSsTable {
+    pub fn to_lance(&self) -> PyResult<LanceCompactedSsTable> {
         let uuid = Uuid::parse_str(&self.shard_id)
             .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
-        Ok(LanceMergedGeneration::new(uuid, self.generation))
+        Ok(LanceCompactedSsTable::new(uuid, self.generation))
     }
 }
 
 /// Snapshot of a MemWAL shard's state at a point in time.
 ///
-/// Used to specify which flushed generations to include when creating an
+/// Used to specify which SSTables to include when creating an
 /// `_LsmScanner`. Supports a builder pattern for adding generations.
 #[pyclass(name = "_ShardSnapshot", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
@@ -195,13 +196,13 @@ impl PyShardSnapshot {
         slf
     }
 
-    /// Add a flushed generation by its generation number and storage path.
-    pub fn with_flushed_generation(
+    /// Add an SSTable by its generation number and storage path.
+    pub fn with_sstable(
         mut slf: PyRefMut<'_, Self>,
         generation: u64,
         path: String,
     ) -> PyRefMut<'_, Self> {
-        slf.inner = slf.inner.clone().with_flushed_generation(generation, path);
+        slf.inner = slf.inner.clone().with_sstable(generation, path);
         slf
     }
 
@@ -212,10 +213,10 @@ impl PyShardSnapshot {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_ShardSnapshot(shard_id='{}', current_gen={}, flushed_gens={})",
+            "_ShardSnapshot(shard_id='{}', current_gen={}, sstables={})",
             self.inner.shard_id,
             self.inner.current_generation,
-            self.inner.flushed_generations.len()
+            self.inner.sstables.len()
         )
     }
 }
@@ -384,7 +385,7 @@ impl PyShardWriter {
 
     /// Create an LSM scanner that includes the active MemTable for strong consistency.
     ///
-    /// The scanner covers: base table + given flushed generations + current active MemTable.
+    /// The scanner covers: base table + given SSTables + current active MemTable.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -537,7 +538,7 @@ impl PyExecutionPlan {
     }
 }
 
-/// LSM-aware scanner covering base table, flushed MemTables, and active MemTable.
+/// LSM-aware scanner covering base table, SSTables, and active MemTable.
 ///
 /// Provides deduplication by primary key, always returning the newest version
 /// of each row across all LSM levels.
@@ -949,10 +950,8 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
         "max_buffered_batch_position",
         stats.max_buffered_batch_position,
     )?;
-    dict.set_item(
-        "max_flushed_batch_position",
-        stats.max_flushed_batch_position,
-    )?;
+    dict.set_item("durable_batch_count", stats.durable_batch_count)?;
+    dict.set_item("global_offset", stats.global_offset)?;
     dict.set_item(
         "pending_wal_start_batch_position",
         stats.pending_wal_start_batch_position,
@@ -1023,33 +1022,48 @@ fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,
-        flushed_generations: manifest
-            .flushed_generations
+        sstables: manifest
+            .sstables
             .into_iter()
-            .map(|generation| FlushedGeneration {
-                generation: generation.generation,
-                path: generation.path,
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
             })
             .collect(),
     }
 }
 
 fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
+    // Close awaits every frozen memtable's flush, so nothing is owed afterwards
+    // regardless of whether the active memtable had buffered batches.
+    let stats_before_close = MemTableStats {
+        frozen_count: 0,
+        frozen_bytes: 0,
+        ..stats_before_close
+    };
+
     if stats_before_close.batch_count == 0 {
         return stats_before_close;
     }
 
+    // After a successful close every buffered batch is flushed and WAL-durable,
+    // so the synthesized empty memtable starts at the writer's global end and the
+    // durable cursor has caught up to it.
+    let global_end = stats_before_close.global_offset + stats_before_close.batch_count;
     MemTableStats {
         row_count: 0,
         batch_count: 0,
         estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
         max_buffered_batch_position: None,
-        max_flushed_batch_position: None,
+        durable_batch_count: global_end,
+        global_offset: global_end,
         pending_wal_start_batch_position: None,
         pending_wal_end_batch_position: None,
         pending_wal_batch_count: 0,
         pending_wal_row_count: 0,
         pending_wal_estimated_bytes: 0,
+        frozen_count: 0,
+        frozen_bytes: 0,
     }
 }

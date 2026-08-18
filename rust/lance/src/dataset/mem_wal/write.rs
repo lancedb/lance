@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
+    MemIndexKind, validate_index_configs,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
@@ -48,12 +49,12 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
-use super::scanner::GenerationWarmer;
+use super::scanner::SsTableWarmer;
 use super::wal::{
-    BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState,
-    WalRetryConfig, WalTailer, empty_flush_result,
+    BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
+    WalOnlyState, WalRetryConfig, WalTailer, WriterCursors, apply_index_range, empty_flush_result,
 };
-use super::{TOMBSTONE, schema_with_tombstone};
+use super::{TOMBSTONE, relax_non_pk_nullability, schema_with_tombstone};
 use crate::session::Session;
 
 use super::manifest::ShardManifestStore;
@@ -84,17 +85,6 @@ pub struct ShardWriterConfig {
     /// - Potential data loss if process crashes before flush
     /// - Lower latency, batched S3 operations
     pub durable_write: bool,
-
-    /// Whether to update indexes synchronously on each write.
-    ///
-    /// When true:
-    /// - Newly written data is immediately searchable via indexes
-    /// - Higher latency due to index update overhead
-    ///
-    /// When false:
-    /// - Index updates are deferred
-    /// - New data may not appear in index-accelerated queries immediately
-    pub sync_indexed_write: bool,
 
     /// Maximum WAL buffer size in bytes before triggering a flush.
     ///
@@ -167,23 +157,6 @@ pub struct ShardWriterConfig {
     /// Default: 30 seconds
     pub backpressure_log_interval: Duration,
 
-    /// Maximum rows to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Larger values enable
-    /// better vectorization but increase memory usage and latency before data
-    /// becomes searchable.
-    ///
-    /// Default: 10,000 rows
-    pub async_index_buffer_rows: usize,
-
-    /// Maximum time to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Ensures bounded latency
-    /// for data to become searchable even during low write throughput.
-    ///
-    /// Default: 1 second
-    pub async_index_interval: Duration,
-
     /// Interval for periodic stats logging.
     ///
     /// Stats (write throughput, backpressure events, memtable size) are logged
@@ -193,14 +166,14 @@ pub struct ShardWriterConfig {
     pub stats_log_interval: Option<Duration>,
 
     /// How long a frozen memtable lingers in memory after its flush commits,
-    /// before it is evicted and served only from the on-disk flushed dataset.
+    /// before it is evicted and served only from the on-disk SSTable dataset.
     ///
     /// `Duration::ZERO` (the default) disables retention: evict on commit, no
     /// sweep ticker. Correct for single-shot queries, which can't observe a
     /// generation evicted mid-read.
     ///
     /// A non-zero value is required only for queries split across reads (e.g.
-    /// fresh tier and base table read separately, then deduped): the flushed
+    /// fresh tier and base table read separately, then deduped): the SSTable
     /// dataset loses the per-batch boundaries that bound as-of membership
     /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]), so a
     /// generation evicted between a query's reads can serve a stale row. Set it
@@ -225,8 +198,7 @@ pub struct ShardWriterConfig {
     ///   `durable_write` settings as MemTable mode.
     ///
     /// MemTable-tied tunables (`max_memtable_size`, `max_memtable_rows`,
-    /// `max_memtable_batches`, `sync_indexed_write`, `async_index_buffer_rows`,
-    /// `async_index_interval`) are ignored when `enable_memtable == false`.
+    /// `max_memtable_batches`) are ignored when `enable_memtable == false`.
     ///
     /// For raw single-entry synchronous atomic appends with no buffering and
     /// no background tasks, use `WalAppender` directly — it is a strictly
@@ -239,7 +211,7 @@ pub struct ShardWriterConfig {
     /// These control the in-memory HNSW graph this writer builds for its
     /// MemTable (and, on flush, the on-disk graph serialized from it). They are
     /// a property of the writer that builds the MemTable, not of the index
-    /// definition: each flushed generation is independent, so different writers
+    /// definition: each SSTable is independent, so different writers
     /// may use different parameters. An index without an entry uses the default
     /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
     /// `2 * num_edges`), equivalent to FAISS's `M`.
@@ -250,7 +222,7 @@ pub struct ShardWriterConfig {
     /// Optional warmer fired pre-commit for each new generation (zero cold reads
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
     /// WAL pod). Default: `None`.
-    pub warmer: Option<Arc<dyn GenerationWarmer>>,
+    pub warmer: Option<Arc<dyn SsTableWarmer>>,
 
     /// Store params the base dataset was opened with, reused for the flusher's
     /// opens + writes (base + generations). Injected by `mem_wal_writer`; set
@@ -294,7 +266,6 @@ impl Default for ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
             max_wal_persist_retries: 3,
@@ -305,8 +276,6 @@ impl Default for ShardWriterConfig {
             manifest_scan_batch_size: 2,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024, // 1GB
             backpressure_log_interval: Duration::from_secs(30),
-            async_index_buffer_rows: 10_000,
-            async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
@@ -338,12 +307,6 @@ impl ShardWriterConfig {
     /// Set durable writes mode.
     pub fn with_durable_write(mut self, durable: bool) -> Self {
         self.durable_write = durable;
-        self
-    }
-
-    /// Set indexed writes mode.
-    pub fn with_sync_indexed_write(mut self, indexed: bool) -> Self {
-        self.sync_indexed_write = indexed;
         self
     }
 
@@ -423,25 +386,13 @@ impl ShardWriterConfig {
         self
     }
 
-    /// Set async index buffer rows.
-    pub fn with_async_index_buffer_rows(mut self, rows: usize) -> Self {
-        self.async_index_buffer_rows = rows;
-        self
-    }
-
-    /// Set async index interval.
-    pub fn with_async_index_interval(mut self, interval: Duration) -> Self {
-        self.async_index_interval = interval;
-        self
-    }
-
     /// Set stats logging interval. Use None to disable periodic stats logging.
     pub fn with_stats_log_interval(mut self, interval: Option<Duration>) -> Self {
         self.stats_log_interval = interval;
         self
     }
 
-    /// Set how long a flushed memtable lingers in memory before eviction. MUST
+    /// Set how long an SSTable lingers in memory before eviction. MUST
     /// exceed the maximum query elapsed time — see `frozen_memtable_grace`.
     pub fn with_frozen_memtable_grace(mut self, grace: Duration) -> Self {
         self.frozen_memtable_grace = grace;
@@ -508,7 +459,13 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
         let mut ticker_intervals: Vec<(Interval, MessageFactory<T>)> = tickers
             .into_iter()
             .map(|(duration, factory)| {
-                let interval = interval_at(tokio::time::Instant::now() + duration, duration);
+                let mut interval = interval_at(tokio::time::Instant::now() + duration, duration);
+                // `Burst` (the default) replays every tick missed while `handle()`
+                // was running. A WAL append can easily outlast its own interval, so
+                // the missed ticks pile up, the ticker arm below is always ready,
+                // and — being `biased` — it starves `rx` indefinitely: freeze
+                // completion cells and `close()`'s final append never get handled.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 (interval, factory)
             })
             .collect();
@@ -551,12 +508,12 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                         debug!("Task '{}' received cancellation", self.name);
                         break Ok(());
                     }
-                    _ = first_interval.tick() => {
-                        let message = (ticker_intervals[0].1)();
-                        if let Err(e) = self.handler.handle(message).await {
-                            error!("Task '{}' error handling ticker message: {}", self.name, e);
-                        }
-                    }
+                    // Explicit messages outrank the ticker. A tick is a backstop
+                    // — it only ever *adds* an append that a real trigger would
+                    // have made anyway — whereas a message may be a freeze's
+                    // completion cell or `close()`'s final append, which nothing
+                    // else will deliver. Polling the ticker first (as this did)
+                    // lets a ready tick starve them.
                     msg = self.rx.recv() => {
                         match msg {
                             Some(message) => {
@@ -568,6 +525,12 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                                 debug!("Task '{}' channel closed", self.name);
                                 break Ok(());
                             }
+                        }
+                    }
+                    _ = first_interval.tick() => {
+                        let message = (ticker_intervals[0].1)();
+                        if let Err(e) = self.handler.handle(message).await {
+                            error!("Task '{}' error handling ticker message: {}", self.name, e);
                         }
                     }
                 }
@@ -614,20 +577,39 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Cancel and join every handler registered by [`Self::add_handler`].
+    ///
+    /// Cancellation causes each handler's dispatcher to stop accepting messages and call
+    /// [`MessageHandler::cleanup`]. This method waits for every dispatcher to finish, even if
+    /// cleanup fails or a dispatcher panics, and then returns the first such failure. It returns
+    /// `Ok(())` only after every registered handler has been cleaned up successfully.
     pub async fn shutdown_all(&self) -> Result<()> {
         info!("Shutting down all tasks");
         self.cancellation_token.cancel();
 
         let tasks = std::mem::take(&mut *self.tasks.write().unwrap());
+        let mut first_error = None;
         for (name, handle) in tasks {
             match handle.await {
                 Ok(Ok(())) => debug!("Task '{}' completed successfully", name),
-                Ok(Err(e)) => warn!("Task '{}' completed with error: {}", name, e),
-                Err(e) => error!("Task '{}' panicked: {}", name, e),
+                Ok(Err(e)) => {
+                    warn!("Task '{}' completed with error: {}", name, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    error!("Task '{}' panicked: {}", name, e);
+                    if first_error.is_none() {
+                        first_error = Some(Error::internal(format!(
+                            "Task '{name}' panicked during shutdown: {e}"
+                        )));
+                    }
+                }
             }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -686,10 +668,12 @@ pub type DurabilityCell = WatchableOnceCell<DurabilityResult>;
 /// Statistics for backpressure monitoring.
 #[derive(Debug, Default)]
 pub struct BackpressureStats {
-    /// Total number of times backpressure was applied.
+    /// Total number of *completed* waits.
     total_count: AtomicU64,
-    /// Total time spent waiting on backpressure (in milliseconds).
+    /// Total time completed waits spent parked (in milliseconds).
     total_wait_ms: AtomicU64,
+    /// Writers parked in `maybe_apply_backpressure` right now.
+    active_count: AtomicU64,
 }
 
 impl BackpressureStats {
@@ -698,18 +682,26 @@ impl BackpressureStats {
         Self::default()
     }
 
-    /// Record a backpressure event.
+    /// Record a completed backpressure wait.
     pub fn record(&self, wait_ms: u64) {
         self.total_count.fetch_add(1, Ordering::Relaxed);
         self.total_wait_ms.fetch_add(wait_ms, Ordering::Relaxed);
     }
 
-    /// Get the total backpressure count.
+    /// Count a writer as parked until the returned guard drops. Drop-based
+    /// because the caller's future can be cancelled mid-wait, which would
+    /// otherwise strand a waiter that never returns.
+    pub fn begin_wait(&self) -> BackpressureWaitGuard<'_> {
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        BackpressureWaitGuard(self)
+    }
+
+    /// Get the completed-wait count.
     pub fn count(&self) -> u64 {
         self.total_count.load(Ordering::Relaxed)
     }
 
-    /// Get the total time spent waiting on backpressure.
+    /// Get the total time completed waits spent parked.
     pub fn total_wait_ms(&self) -> u64 {
         self.total_wait_ms.load(Ordering::Relaxed)
     }
@@ -719,17 +711,34 @@ impl BackpressureStats {
         BackpressureStatsSnapshot {
             total_count: self.total_count.load(Ordering::Relaxed),
             total_wait_ms: self.total_wait_ms.load(Ordering::Relaxed),
+            active_count: self.active_count.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Keeps its writer counted in `active_count` for as long as it is held.
+#[derive(Debug)]
+pub struct BackpressureWaitGuard<'a>(&'a BackpressureStats);
+
+impl Drop for BackpressureWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.active_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Snapshot of backpressure statistics.
 #[derive(Debug, Clone, Default)]
 pub struct BackpressureStatsSnapshot {
-    /// Total number of times backpressure was applied.
+    /// Number of waits that have *finished*. A wait in progress is not counted
+    /// here, and a cancelled one never is.
     pub total_count: u64,
-    /// Total time spent waiting on backpressure (in milliseconds).
+    /// Total time finished waits spent parked (in milliseconds), on the same
+    /// denominator as `total_count`.
     pub total_wait_ms: u64,
+    /// Writers parked right now. This is the field that answers "am I being
+    /// throttled at this instant" — the totals only move once a wait ends, so
+    /// they read zero throughout a first, still-ongoing stall.
+    pub active_count: u64,
 }
 
 /// A **live** view of the calling shard's resident memtable bytes, handed to
@@ -812,6 +821,13 @@ pub trait BackpressureController: Send + Sync + Debug {
         incoming_bytes: usize,
         shard: ShardMemory,
     ) -> Result<()>;
+
+    /// Throttling counters for [`ShardWriter::backpressure_stats`]. An injected
+    /// controller keeps its own metrics, so the default reports zeros rather
+    /// than requiring it to maintain lance's.
+    fn stats_snapshot(&self) -> BackpressureStatsSnapshot {
+        BackpressureStatsSnapshot::default()
+    }
 }
 
 /// In-memory size of a batch list, for sizing an admission decision against
@@ -912,6 +928,10 @@ impl LocalBackpressureController {
 
 #[async_trait::async_trait]
 impl BackpressureController for LocalBackpressureController {
+    fn stats_snapshot(&self) -> BackpressureStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// Blocks while this shard's unflushed bytes are at or above
     /// `max_unflushed_memtable_bytes`, waiting on the oldest flush. Never
     /// returns [`Error::Backpressure`] — this valve only ever delays.
@@ -926,6 +946,9 @@ impl BackpressureController for LocalBackpressureController {
     ) -> Result<()> {
         let start = std::time::Instant::now();
         let mut iteration = 0u32;
+        // Held for the whole stall so an operator polling mid-wait sees it; the
+        // totals below cannot, since they only move once the wait ends.
+        let mut active_wait = None;
 
         loop {
             let (unflushed_memtable_bytes, oldest_watcher) = self.source.read();
@@ -940,6 +963,9 @@ impl BackpressureController for LocalBackpressureController {
             }
 
             iteration += 1;
+            if active_wait.is_none() {
+                active_wait = Some(self.stats.begin_wait());
+            }
 
             debug!(
                 "Backpressure triggered: unflushed_bytes={}, max={}, iteration={}",
@@ -1110,7 +1136,7 @@ fn now_millis() -> u64 {
     start_time().elapsed().as_millis() as u64
 }
 
-/// Replay WAL entries written after the last successfully-flushed generation
+/// Replay WAL entries written after the last successfully-flushed SSTable
 /// into the freshly-built MemTable. Updates any in-memory indexes attached to
 /// the MemTable so replayed rows are immediately searchable.
 ///
@@ -1124,31 +1150,60 @@ fn now_millis() -> u64 {
 /// Aborts with an error if any replayed entry's `writer_epoch` is strictly
 /// greater than `our_epoch` — that indicates a successor writer claimed the
 /// shard between our `claim_epoch` and this replay, fencing us.
+/// Outcome of replaying a shard's WAL into memory.
+struct ReplayResult {
+    /// The active memtable — the final, partial one replay left unsealed. A fresh
+    /// shard yields an empty one; every sealed memtable was flushed to a Lance
+    /// generation during replay and is not returned.
+    active: MemTable,
+    /// One past the highest WAL entry position observed — the next write position.
+    next_wal_position: u64,
+}
+
+/// Replay a shard's WAL into memory, flushing sealed memtables as the batch store
+/// fills.
+///
+/// A single memtable holds at most `max_memtable_batches` batches, but a WAL is
+/// unbounded — so replay must rotate exactly as the live write path does. It
+/// seals a full memtable and, because the data is already durable, flushes it to
+/// a Lance generation right here (the same `MemTableFlusher::flush` the live path
+/// uses), rather than holding every sealed memtable in memory until open
+/// finishes. That bounds resident memory to ~two memtables and truncates the WAL
+/// as it goes, so a later reopen replays only the unflushed tail. Only the final
+/// partial memtable is returned, as the active one.
+///
+/// `make_memtable(generation, global_offset)` builds a fresh, cursor-bound
+/// memtable. Rotation happens at WAL-entry boundaries, never mid-entry, so each
+/// sealed memtable covers a clean range of complete entries and stamps the last
+/// one as its SSTable's `replay_after_wal_entry_position`.
+#[allow(clippy::too_many_arguments)]
 async fn replay_memtable_from_wal(
     object_store: Arc<ObjectStore>,
     base_path: Path,
     shard_id: Uuid,
     our_epoch: u64,
     manifest: &ShardManifest,
-    memtable: &mut MemTable,
-) -> Result<u64> {
+    base_generation: u64,
+    mut make_memtable: impl FnMut(u64, usize) -> Result<MemTable>,
+    flusher: &MemTableFlusher,
+    wal_flusher: &WalFlusher,
+    index_configs: &[MemIndexConfig],
+    max_memtable_size: usize,
+) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
     // cursor of 0 means "no flush has ever stamped this shard" and replay
     // starts at position 1. After flushing position N the cursor holds N
     // and replay starts at N+1. The arithmetic collapses to a single
     // saturating_add(1) in both cases — we deliberately do not consult
-    // `flushed_generations` here, since an external compactor may
+    // `sstables` here, since an external compactor may
     // legitimately drain that vector back to empty after merging its
     // contents into the base table.
     let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
 
-    // The MemTable is always freshly built before this function runs, so
-    // any existing BatchStore entries can only have come from this replay
-    // pass. We index everything in `[0, batch_count)` at the end.
-    debug_assert_eq!(memtable.batch_count(), 0);
-
     let tailer = WalTailer::new(object_store, base_path, shard_id);
     let mut position = start_position;
+
+    let mut active = make_memtable(base_generation, 0)?;
 
     loop {
         match tailer.read_entry(position).await? {
@@ -1165,16 +1220,62 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // Entries written before deletes existed lack `_tombstone`;
-                    // inject `false` so they match the extended memtable schema.
-                    // Normal entries already carry it and pass through unchanged.
-                    let target_schema = memtable.schema().clone();
+                    // Re-label to the current storage schema; entries written
+                    // before deletes existed also need `_tombstone = false`.
+                    let storage_schema = active.schema().clone();
                     let batches = entry
                         .batches
                         .into_iter()
-                        .map(|b| ensure_tombstone_column(b, &target_schema))
+                        .map(|b| ensure_tombstone_column(b, &storage_schema))
                         .collect::<Result<Vec<_>>>()?;
-                    memtable.insert_batches_only(batches).await?;
+
+                    // Seal + flush at the entry boundary on the *same* criteria the
+                    // live path uses (`maybe_trigger_memtable_flush`): the memtable
+                    // is at or over `max_memtable_size` bytes, or this whole entry
+                    // won't fit the batch store. The byte trigger is the one that
+                    // matters beyond avoiding overflow — it is what keeps a memtable
+                    // under `max_memtable_rows`, and therefore keeps the in-memory
+                    // HNSW index (sized to `max_memtable_rows`) from exhausting its
+                    // capacity when the final active memtable is indexed.
+                    //
+                    // Rotate at the entry boundary so no entry is split across two
+                    // memtables and each sealed one covers a clean range of complete
+                    // entries. Never rotate an empty memtable — if a single entry
+                    // has more batches than a memtable can hold, a fresh one would
+                    // overflow too, the same hard limit the live put path has, left
+                    // to the insert below to surface.
+                    if !active.batch_store().is_empty()
+                        && memtable_reached_flush_threshold(
+                            &active,
+                            max_memtable_size,
+                            batches.len(),
+                        )
+                    {
+                        let store = active.batch_store();
+                        // The last entry this memtable fully absorbed is the one
+                        // before the entry about to be inserted.
+                        let covered = position.saturating_sub(1);
+                        let generation = active.generation() + 1;
+                        let global_end = store.global_end();
+
+                        // The sealed data is already durable in the WAL — mark it
+                        // so the flush's `all_flushed_to_wal` precondition holds and
+                        // no WAL re-append is attempted.
+                        wal_flusher.advance_durable(global_end);
+                        flush_replayed_memtable(
+                            flusher,
+                            &active,
+                            our_epoch,
+                            covered,
+                            global_end,
+                            index_configs,
+                        )
+                        .await?;
+
+                        active = make_memtable(generation, global_end)?;
+                    }
+
+                    active.insert_batches_only(batches).await?;
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -1186,21 +1287,18 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    // Update in-memory indexes with the replayed batches so readers see them
-    // through the index path (matching what would have happened on the
-    // pre-crash writer's WAL flush). Indexes from the previous writer don't
-    // persist; this rebuilds them from the WAL.
-    if let Some(indexes) = memtable.indexes_arc() {
-        let batches_after = memtable.batch_count();
-        if batches_after > 0 {
-            let store = memtable.batch_store();
-            let mut stored: Vec<StoredBatch> = Vec::with_capacity(batches_after);
-            for pos in 0..batches_after {
-                if let Some(s) = store.get(pos) {
-                    stored.push(s.clone());
-                }
-            }
-            tokio::task::spawn_blocking(move || indexes.insert_batches_parallel(&stored))
+    // Rebuild the active memtable's in-memory indexes from the batches just
+    // replayed, so readers see them through the index path — matching what the
+    // pre-crash writer's flush would have done. Sealed memtables needed no
+    // in-memory index build: they were flushed straight to disk and are gone.
+    if let Some(indexes) = active.indexes_arc() {
+        let batch_count = active.batch_count();
+        if batch_count > 0 {
+            let store = active.batch_store();
+            let stored: Vec<StoredBatch> = (0..batch_count)
+                .filter_map(|pos| store.get(pos).cloned())
+                .collect();
+            tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
                 .await
                 .map_err(|e| {
                     Error::internal(format!("WAL replay index update task panicked: {}", e))
@@ -1208,7 +1306,50 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    Ok(position)
+    Ok(ReplayResult {
+        active,
+        next_wal_position: position,
+    })
+}
+
+/// Whether a memtable has reached the threshold at which it should be sealed and
+/// flushed: at or over `max_memtable_size` bytes, or without room in its batch
+/// store for `incoming_batches` more.
+///
+/// The single source of truth for the flush trigger, shared by the live put path
+/// (`maybe_trigger_memtable_flush`, checking post-insert with `incoming_batches =
+/// 1` — "is there room for the next batch") and by replay (checking pre-insert
+/// with the next WAL entry's batch count). Keeping one predicate is what stops the
+/// two from drifting — e.g. someone adding a third criterion to one and not the
+/// other, which is the exact class of bug this whole change set is about.
+fn memtable_reached_flush_threshold(
+    memtable: &MemTable,
+    max_memtable_size: usize,
+    incoming_batches: usize,
+) -> bool {
+    memtable.estimated_size() >= max_memtable_size
+        || memtable.batch_store().remaining_capacity() < incoming_batches
+}
+
+/// Flush a sealed replay memtable to a Lance generation, choosing the indexed
+/// path when secondary indexes are configured (mirroring the live memtable-flush
+/// handler). Commits the manifest, stamping `covered` as the generation's
+/// `replay_after_wal_entry_position` so a later reopen skips these entries.
+async fn flush_replayed_memtable(
+    flusher: &MemTableFlusher,
+    memtable: &MemTable,
+    epoch: u64,
+    covered: u64,
+    durable: usize,
+    index_configs: &[MemIndexConfig],
+) -> Result<()> {
+    if index_configs.is_empty() {
+        flusher.flush(memtable, epoch, covered, durable).await?;
+    } else {
+        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_configs, covered, durable))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Pair each primary-key column name with its field id (both derived from the
@@ -1221,46 +1362,44 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// Ensure `batch` carries the `_tombstone` column required by the extended
-/// memtable schema, injecting `false` for every row when it is absent.
+/// Re-label `batch` to the storage schema, injecting `_tombstone = false` when
+/// absent — callers pass logical-shaped batches, and WAL entries written before
+/// deletes existed lack the column.
 ///
-/// Used on the normal write path ([`ShardWriter::put`]) where callers pass
-/// base-shaped batches, and on WAL replay of entries written before deletes
-/// existed (legacy entries lack the column). A batch that already carries
-/// `_tombstone` (a normal replayed entry) is returned unchanged.
+/// A batch that already carries `_tombstone` is re-labeled too, so an entry
+/// written under an older storage schema replays into the current one.
 fn ensure_tombstone_column(
     batch: RecordBatch,
-    target_schema: &Arc<ArrowSchema>,
+    storage_schema: &Arc<ArrowSchema>,
 ) -> Result<RecordBatch> {
-    if batch.schema().column_with_name(TOMBSTONE).is_some() {
-        return Ok(batch);
-    }
     let n = batch.num_rows();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(Arc::new(BooleanArray::from(vec![false; n])));
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+    if batch.schema().column_with_name(TOMBSTONE).is_none() {
+        columns.push(Arc::new(BooleanArray::from(vec![false; n])));
+    }
+    RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
         Error::invalid_input(format!(
-            "failed to inject _tombstone column (does the batch match the base schema?): {}",
+            "failed to inject _tombstone column (does the batch match the base table schema?): {}",
             e
         ))
     })
 }
 
-/// Build a tombstone batch from a key-only `keys` batch: the primary key
-/// columns are carried through, `_tombstone` is set to `true`, and every other
-/// column in the memtable schema is null.
+/// Build a tombstone batch from a key-only `keys` batch: primary keys carried
+/// through, `_tombstone` true, every other column null.
 ///
-/// Errors if `keys` is missing a primary key column, or if a non-PK column is
-/// non-nullable (a tombstone must null it) — surfaced via the `RecordBatch`
-/// validation.
+/// Non-PK columns are nullable in the storage schema however the base table
+/// declares them — that is what lets a strict table have tombstones at all.
+/// Primary keys are not, so the validation below still rejects a null,
+/// mistyped, or missing key.
 fn build_tombstone_batch(
     keys: &RecordBatch,
-    target_schema: &Arc<ArrowSchema>,
+    storage_schema: &Arc<ArrowSchema>,
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = keys.num_rows();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
+    for field in storage_schema.fields() {
         let name = field.name();
         if name == TOMBSTONE {
             columns.push(Arc::new(BooleanArray::from(vec![true; n])));
@@ -1276,9 +1415,9 @@ fn build_tombstone_batch(
             columns.push(new_null_array(field.data_type(), n));
         }
     }
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+    RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
         Error::invalid_input(format!(
-            "failed to build tombstone batch (is every non-primary-key column nullable?): {}",
+            "failed to build tombstone batch (do the delete keys match the primary key?): {}",
             e
         ))
     })
@@ -1292,6 +1431,10 @@ struct SharedWriterState {
     memory: Arc<MemoryCounters>,
     wal_flusher: Arc<WalFlusher>,
     wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
+    /// The index-apply task's channel. Separate from the WAL flusher's on
+    /// purpose: `TaskDispatcher::run` awaits `handle()` inline, so sharing one
+    /// would put a ~100ms S3 PUT in front of every latency-sensitive index apply.
+    index_apply_tx: mpsc::UnboundedSender<TriggerIndexApply>,
     memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
     config: ShardWriterConfig,
     schema: Arc<ArrowSchema>,
@@ -1311,6 +1454,7 @@ impl SharedWriterState {
         memory: Arc<MemoryCounters>,
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
+        index_apply_tx: mpsc::UnboundedSender<TriggerIndexApply>,
         memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
@@ -1325,6 +1469,7 @@ impl SharedWriterState {
             memory,
             wal_flusher,
             wal_flush_tx,
+            index_apply_tx,
             memtable_flush_tx,
             config,
             schema,
@@ -1336,59 +1481,100 @@ impl SharedWriterState {
         }
     }
 
+    /// Ask the index-apply task to cover `[indexed, end_batch_position)` of this
+    /// store. Cheap and idempotent: a range already covered is a no-op, which is
+    /// the common case under load, since one apply coalesces the puts queued
+    /// behind it.
+    fn trigger_index_apply(
+        &self,
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        end_batch_position: usize,
+    ) -> Result<()> {
+        self.index_apply_tx
+            .send(TriggerIndexApply {
+                batch_store,
+                indexes,
+                end_batch_position,
+            })
+            .map_err(|_| Error::io("index apply channel closed"))
+    }
+
     /// Freeze the current memtable and send it to the flush handler.
     ///
     /// Takes `&mut WriterState` directly since caller already holds the lock.
     fn freeze_memtable(&self, state: &mut WriterState) -> Result<u64> {
-        let pending_wal_range = state.memtable.batch_store().pending_wal_flush_range();
+        let durable = self.wal_flusher.durable();
+        let pending_wal_range = state
+            .memtable
+            .batch_store()
+            .pending_wal_flush_range(durable);
         let last_wal_entry_position = state.last_flushed_wal_entry_position;
 
         let old_batch_store = state.memtable.batch_store();
-        let old_indexes = state.memtable.indexes_arc();
 
         let next_generation = state.memtable.generation() + 1;
-        let mut new_memtable = MemTable::with_capacity(
+        // The incoming memtable's batch 0 continues the writer's batch sequence
+        // where the outgoing one ends. Without this coordinate, local positions
+        // (which restart at 0 every rotation) cannot be mapped onto the
+        // writer-global durability cursor.
+        let next_global_offset = old_batch_store.global_end();
+        let mut new_memtable = MemTable::with_capacity_at(
             self.schema.clone(),
             next_generation,
             self.pk_field_ids.clone(),
             CacheConfig::default(),
             self.max_memtable_batches,
+            next_global_offset,
         )?;
 
-        // Build an IndexStore when there are user indexes *or* a primary key:
-        // the PK dedup index (and its flushed on-disk sidecar) is required for
-        // cross-generation dedup even when no secondary index is configured.
-        if !self.index_configs.is_empty() || !self.pk_columns.is_empty() {
-            let mut indexes = IndexStore::from_configs(
-                &self.index_configs,
-                self.max_memtable_rows,
-                self.max_memtable_batches,
-            )?;
+        // Always build and bind an IndexStore, even with no user indexes and no
+        // primary key. It is what carries the memtable's `indexed_count`, and
+        // binding it to the writer's cursors is what lets a reader derive the
+        // visible prefix — so an index-less memtable that skipped this would fall
+        // back to `visible == indexed` and publish rows before they were durable.
+        // (A PK memtable also needs the PK dedup index and its flushed sidecar.)
+        let mut indexes = IndexStore::from_configs(
+            &self.index_configs,
+            self.max_memtable_rows,
+            self.max_memtable_batches,
+        )?;
+        if !self.pk_columns.is_empty() {
             indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
-            new_memtable.set_indexes_arc(Arc::new(indexes));
         }
+        indexes.set_durability(Arc::clone(self.wal_flusher.cursors()), next_global_offset);
+        new_memtable.set_indexes_arc(Arc::new(indexes));
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
         old_memtable.freeze(last_wal_entry_position);
+
+        // Set up completion tracking on the outgoing table before it is retained
+        // and before any fallible dispatch, so the retained table already carries
+        // its cells and a failed send below can poison-and-return without leaving
+        // partial state to unwind.
         let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
 
-        if pending_wal_range.is_some() {
+        // The outgoing memtable may still owe an index apply — the puts that
+        // filled it triggered one, but the task need not have drained yet, and
+        // this is the last chance to name that store. Its L0 flush is gated on
+        // the WAL append (below), not on indexing, so without this its tail could
+        // stay unindexed and invisible for the rest of its life.
+        let pending_index_apply = match old_memtable.indexes_arc() {
+            Some(old_indexes) if old_indexes.indexed_count() < old_batch_store.len() => {
+                Some((old_batch_store.clone(), old_indexes, old_batch_store.len()))
+            }
+            _ => None,
+        };
+
+        let pending_wal_flush = if pending_wal_range.is_some() {
             let completion_cell: WatchableOnceCell<
                 std::result::Result<WalFlushResult, WalFlushFailure>,
             > = WatchableOnceCell::new();
-            let completion_reader = completion_cell.reader();
-            old_memtable.set_wal_flush_completion(completion_reader);
-
-            let end_batch_position = old_batch_store.len();
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::BatchStore {
-                    batch_store: old_batch_store,
-                    indexes: old_indexes,
-                },
-                end_batch_position,
-                Some(completion_cell),
-            )?;
-        }
+            old_memtable.set_wal_flush_completion(completion_cell.reader());
+            Some((old_batch_store.len(), completion_cell))
+        } else {
+            None
+        };
 
         // Resident bytes, not `estimated_size`: the sealed memtable keeps its
         // indexes in memory until the flush takes them. `flush_memtable`
@@ -1406,13 +1592,37 @@ impl SharedWriterState {
 
         let frozen_memtable = Arc::new(old_memtable);
 
-        // Keep this generation queryable past its manifest commit (swept after
-        // the grace by `SweepExpired`). Arc refcount, not a copy — the flush
-        // task holds it alive for the whole drain anyway.
+        // Retain the outgoing table in the read view *before* the fallible
+        // dispatches below. `state.memtable` was already replaced, so a failed
+        // send that returned here without this push would drop the table and its
+        // accepted rows would silently vanish from every scan. Keep it queryable
+        // past its manifest commit too (swept after the grace by `SweepExpired`);
+        // Arc refcount, not a copy — the flush task holds it alive anyway.
         state.frozen_memtables.push_back(FrozenMemTable {
             memtable: frozen_memtable.clone(),
             flushed_at_ms: None,
         });
+
+        // Dispatch can only fail if a background task's channel is already closed,
+        // i.e. the writer is being torn down. Poison so the read path fails fast
+        // with the typed error instead of serving the retained-but-never-durable
+        // tail, then return — the table stays in the read view.
+        if let Some((batch_store, indexes, end_batch_position)) = pending_index_apply {
+            self.trigger_index_apply(batch_store, indexes, end_batch_position)
+                .inspect_err(|e| self.wal_flusher.poison(e))?;
+        }
+
+        if let Some((end_batch_position, completion_cell)) = pending_wal_flush {
+            self.wal_flusher
+                .trigger_flush(
+                    WalFlushSource::BatchStore {
+                        batch_store: old_batch_store,
+                    },
+                    end_batch_position,
+                    Some(completion_cell),
+                )
+                .inspect_err(|e| self.wal_flusher.poison(e))?;
+        }
 
         debug!(
             "Frozen memtable generation {}, pending_count = {}",
@@ -1428,9 +1638,19 @@ impl SharedWriterState {
         Ok(next_generation)
     }
 
-    /// Track batch for WAL durability.
-    fn track_batch_for_wal(&self, batch_position: usize) -> super::wal::BatchDurableWatcher {
-        self.wal_flusher.track_batch(batch_position)
+    /// Watch for a write to become visible: indexed, and — in durable mode —
+    /// WAL-durable too.
+    ///
+    /// `target_indexed` is memtable-local; `target_durable` is writer-global.
+    /// Different coordinate spaces on purpose — see `WalFlusher::track_batch`.
+    fn track_batch_for_wal(
+        &self,
+        indexes: Option<Arc<IndexStore>>,
+        target_indexed: usize,
+        target_durable: usize,
+    ) -> super::wal::BatchDurableWatcher {
+        self.wal_flusher
+            .track_batch(indexes, target_indexed, target_durable)
     }
 
     /// Check if memtable flush is needed and trigger if so.
@@ -1441,8 +1661,10 @@ impl SharedWriterState {
             return Ok(());
         }
 
-        let should_flush = state.memtable.estimated_size() >= self.config.max_memtable_size
-            || state.memtable.is_batch_store_full();
+        // Checked post-insert: flush if there is no longer room for even one more
+        // batch (or the byte threshold is crossed). Same predicate replay uses.
+        let should_flush =
+            memtable_reached_flush_threshold(&state.memtable, self.config.max_memtable_size, 1);
 
         if should_flush {
             state.flush_requested = true;
@@ -1461,10 +1683,9 @@ impl SharedWriterState {
         let batch_count = state.memtable.batch_count();
         let total_bytes = state.memtable.estimated_size();
         let batch_store = state.memtable.batch_store();
-        let indexes = state.memtable.indexes_arc();
 
         // Check if there are any unflushed batches
-        let has_pending = batch_store.pending_wal_flush_count() > 0;
+        let has_pending = batch_store.pending_wal_flush_count(self.wal_flusher.durable()) > 0;
 
         // Check time-based trigger first
         let time_trigger = if let Some(interval) = self.config.max_wal_flush_interval {
@@ -1493,10 +1714,7 @@ impl SharedWriterState {
         // If time trigger fired, send a flush message
         if time_trigger.is_some() {
             let _ = self.wal_flush_tx.send(TriggerWalFlush {
-                source: WalFlushSource::BatchStore {
-                    batch_store,
-                    indexes,
-                },
+                source: WalFlushSource::BatchStore { batch_store },
                 end_batch_position: batch_count,
                 done: None,
             });
@@ -1521,7 +1739,6 @@ impl SharedWriterState {
             let _ = self.wal_flush_tx.send(TriggerWalFlush {
                 source: WalFlushSource::BatchStore {
                     batch_store: batch_store.clone(),
-                    indexes: indexes.clone(),
                 },
                 end_batch_position: batch_count,
                 done: None,
@@ -1607,6 +1824,12 @@ pub struct ShardWriter {
     manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     mode: WriterMode,
+    /// The base table's schema as the caller passed it — no `_tombstone`,
+    /// nullability untouched. Caller input is held to it (see
+    /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
+    /// it; the memtable, WAL, and SSTables carry the widened storage schema
+    /// ([`relax_non_pk_nullability`]) instead.
+    logical_schema: Arc<ArrowSchema>,
 }
 
 impl ShardWriter {
@@ -1630,10 +1853,26 @@ impl ShardWriter {
             ));
         }
 
-        // Callers pass the base schema; lance owns the `_tombstone` column and
-        // appends it here so the memtable/generation schema = base + tombstone.
-        // Idempotent, so a reopen that already extended the schema is a no-op.
-        let schema = schema_with_tombstone(&schema);
+        // A durable writer needs a flush ticker to make progress, in either
+        // mode. With `durable_write` on, a put becomes durable only once its WAL
+        // append lands, and neither mode self-triggers that append per put — the
+        // background ticker drives it. Without an interval (or with a zero one,
+        // which tokio cannot schedule), a small put that never fills the
+        // size-triggered buffer would block until close. Reject the config here
+        // rather than let a put hang.
+        if config.durable_write && config.max_wal_flush_interval.is_none_or(|d| d.is_zero()) {
+            return Err(Error::invalid_input(
+                "durable_write requires a positive max_wal_flush_interval: with no \
+                 flush ticker a durable put has nothing to drive its WAL append and \
+                 would block until close",
+            ));
+        }
+
+        // The caller's schema is the shard's logical schema; the storage schema
+        // is derived below, once the primary key is known. lance owns
+        // `_tombstone` and appends it here — idempotent across reopens.
+        let logical_schema = schema;
+        let tombstoned = schema_with_tombstone(&logical_schema);
 
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;
@@ -1643,6 +1882,37 @@ impl ShardWriter {
             shard_id,
             config.manifest_scan_batch_size,
         ));
+
+        // Derive PK metadata and run every side-effect-free validation *before*
+        // claiming the epoch. `claim_epoch` durably bumps the stored epoch and,
+        // for a successor, `write_fence_sentinel` fences the predecessor — so an
+        // open doomed by purely local input (an index config that disagrees with
+        // the schema) must fail here, before it can knock the healthy incumbent off
+        // the shard. Memtable-only: WAL-only mode has no indexes to validate.
+        let memtable_validation = if config.enable_memtable {
+            let lance_schema = Schema::try_from(tombstoned.as_ref())?;
+            let pk_fields = lance_schema.unenforced_primary_key();
+            let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
+            let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
+
+            // Reject an index config that disagrees with the schema *before* a
+            // single row is accepted. Such a config fails deterministically on
+            // every insert, including inserts replayed from the WAL — so once a row
+            // is durable the shard can never reopen. Fail the open instead.
+            validate_index_configs(
+                &index_configs,
+                tombstoned.as_ref(),
+                &lance_schema,
+                &pk_columns,
+            )?;
+
+            // Widen only now that the primary key is known — a tombstone nulls
+            // every non-PK column, and PK detection needs the strict schema.
+            let storage_schema = relax_non_pk_nullability(&tombstoned, &pk_columns);
+            Some((pk_field_ids, pk_columns, storage_schema))
+        } else {
+            None
+        };
 
         // Claim the shard (epoch-based fencing) — done once, then shared
         // with the WalAppender via `with_claimed_epoch`.
@@ -1685,7 +1955,12 @@ impl ShardWriter {
         }
 
         // Create WAL flusher backed by the shared appender.
-        let mut wal_flusher = WalFlusher::new(wal_appender);
+        // Build the cursors from *this writer's* config. `durable_write` is what
+        // decides whether durability is part of visibility, so a flusher that
+        // defaulted it would leave a non-durable put waiting on a durability
+        // cursor nothing ever advances.
+        let cursors = Arc::new(WriterCursors::new(config.durable_write));
+        let mut wal_flusher = WalFlusher::with_cursors(wal_appender, cursors);
 
         let (wal_flush_tx, wal_flush_rx) = mpsc::unbounded_channel();
         wal_flusher.set_flush_channel(wal_flush_tx.clone());
@@ -1695,11 +1970,15 @@ impl ShardWriter {
         let task_executor = Arc::new(TaskExecutor::new());
 
         let mode = if config.enable_memtable {
+            let (pk_field_ids, pk_columns, storage_schema) = memtable_validation
+                .expect("memtable_validation is Some when enable_memtable is true");
             Self::open_memtable_mode(
                 &config,
-                &schema,
+                &storage_schema,
                 &manifest,
                 &index_configs,
+                pk_field_ids,
+                pk_columns,
                 wal_flusher.clone(),
                 wal_flush_tx,
                 wal_flush_rx,
@@ -1732,6 +2011,7 @@ impl ShardWriter {
             manifest_store,
             stats,
             mode,
+            logical_schema,
         })
     }
 
@@ -1741,6 +2021,8 @@ impl ShardWriter {
         schema: &Arc<ArrowSchema>,
         manifest: &ShardManifest,
         index_configs: &[MemIndexConfig],
+        pk_field_ids: Vec<i32>,
+        pk_columns: Vec<String>,
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         wal_flush_rx: mpsc::UnboundedReceiver<TriggerWalFlush>,
@@ -1753,50 +2035,93 @@ impl ShardWriter {
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
     ) -> Result<WriterMode> {
-        // Create MemTable with primary key field IDs from schema
-        let lance_schema = Schema::try_from(schema.as_ref())?;
-        let pk_fields = lance_schema.unenforced_primary_key();
-        let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
-        let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
-        let mut memtable = MemTable::with_capacity(
-            schema.clone(),
-            manifest.current_generation,
-            pk_field_ids.clone(),
-            CacheConfig::default(),
-            config.max_memtable_batches,
-        )?;
+        // PK metadata and index/interval validation were resolved in `open`
+        // before the epoch was claimed (a doomed open must not fence the
+        // incumbent first).
 
-        // Create indexes if configured and set them on the MemTable. The
-        // PK-position index is enabled before any WAL replay below so replayed
-        // rows are recorded in it. A primary key alone (no secondary index)
-        // still needs the PK index so flush writes its on-disk dedup sidecar.
-        if !index_configs.is_empty() || !pk_columns.is_empty() {
+        // Build a fresh, cursor-bound memtable at a given generation and
+        // writer-global coordinate. Replay calls this for the first memtable and
+        // after every rotation. Always builds and binds an `IndexStore`, even
+        // with no user indexes and no primary key — see the note in
+        // `freeze_memtable` for why an index-less memtable still needs one.
+        let make_bound_memtable = |generation: u64, global_offset: usize| -> Result<MemTable> {
+            let mut memtable = MemTable::with_capacity_at(
+                schema.clone(),
+                generation,
+                pk_field_ids.clone(),
+                CacheConfig::default(),
+                config.max_memtable_batches,
+                global_offset,
+            )?;
             let mut indexes = IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
                 config.max_memtable_batches,
             )?;
-            indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+            if !pk_columns.is_empty() {
+                indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+            }
+            indexes.set_durability(Arc::clone(wal_flusher.cursors()), global_offset);
             memtable.set_indexes_arc(Arc::new(indexes));
-        }
+            Ok(memtable)
+        };
+
+        // The flusher writes sealed memtables to Lance generations — both the
+        // ones replay seals below and the ones the live path freezes later.
+        let flusher = Arc::new(
+            MemTableFlusher::new(
+                object_store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                shard_id,
+                manifest_store.clone(),
+            )
+            .with_warmer(config.warmer.clone())
+            .with_storage_context(config.store_params.clone(), config.session.clone()),
+        );
 
         // Replay any WAL entries written after the last successfully-flushed
-        // generation. Each entry's writer_epoch is checked against ours; an
-        // entry with a strictly greater epoch indicates a successor writer
-        // claimed the shard between our `claim_epoch` and replay, so we
-        // abort the open with a fence error. The replay walked the tailer
-        // up to the WAL tip, so we hand the discovered next-write position
-        // straight to the appender — its first append skips the
-        // discover_next_position probe entirely.
-        let next_wal_position = replay_memtable_from_wal(
+        // SSTable, flushing sealed memtables to Lance SSTables as the batch
+        // store fills. Each entry's writer_epoch is checked against ours; an entry
+        // with a strictly greater epoch means a successor claimed the shard
+        // between our `claim_epoch` and replay, so we abort with a fence error.
+        // Replay walks the tailer to the WAL tip and returns the discovered
+        // next-write position, so the appender's first append skips the
+        // discover_next_position probe.
+        let ReplayResult {
+            active: memtable,
+            next_wal_position,
+        } = replay_memtable_from_wal(
             object_store.clone(),
             base_path.clone(),
             shard_id,
             epoch,
             manifest,
-            &mut memtable,
+            manifest.current_generation,
+            make_bound_memtable,
+            &flusher,
+            &wal_flusher,
+            index_configs,
+            config.max_memtable_size,
         )
         .await?;
+
+        // Mark the active memtable's replayed batches durable. They came *from*
+        // the WAL, and replay has already re-derived its indexes over them.
+        //
+        // Without this the durability cursor stays at the last sealed generation,
+        // so the next WAL flush re-covers the active tail: it re-appends the
+        // already-durable rows *and* re-inserts every replayed row into the
+        // indexes. None of the three in-memory indexes is idempotent (HNSW mints
+        // fresh node ids for the same row, FTS increments doc_count/df rather than
+        // recomputing them, BTree is a multiset), so a full scan keeps looking
+        // healthy while every index-accelerated query silently returns duplicates
+        // — and it compounds, because the WAL now holds those rows twice.
+        //
+        // `global_end()` is the writer-global batch count through this memtable,
+        // since its coordinate continues where the last sealed generation ended.
+        wal_flusher.advance_durable(memtable.batch_store().global_end());
+
         wal_flusher
             .wal_appender()
             .seed_next_position(next_wal_position)
@@ -1808,8 +2133,8 @@ impl ShardWriter {
         // it is durably reflected in this writer's memtable. We can't
         // seed from `manifest.wal_entry_position_last_seen` — that field
         // is bumped on every successful tailer read by other readers, so
-        // it may sit above what's actually covered by any flushed
-        // generation. Subtracting 1 from a fresh shard's `next_wal_position`
+        // it may sit above what's actually covered by any
+        // SSTable. Subtracting 1 from a fresh shard's `next_wal_position`
         // of `FIRST_WAL_ENTRY_POSITION` (= 1) yields 0, which correctly
         // means "no entry covered yet."
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
@@ -1837,8 +2162,13 @@ impl ShardWriter {
         );
 
         // Background WAL flush handler — parallel WAL I/O + index updates.
-        let wal_handler =
-            WalFlushHandler::new(wal_flusher.clone(), Some(state.clone()), stats.clone());
+        let wal_handler = WalFlushHandler::new(
+            wal_flusher.clone(),
+            Some(state.clone()),
+            None,
+            config.max_wal_flush_interval,
+            stats.clone(),
+        );
         task_executor.add_handler(
             "wal_flusher".to_string(),
             Box::new(wal_handler),
@@ -1846,14 +2176,15 @@ impl ShardWriter {
         )?;
 
         // Background MemTable flush handler — frozen memtable to Lance file.
-        // It rebuilds the same secondary indexes on each flushed generation.
+        // It rebuilds the same secondary indexes on each SSTable.
         let memtable_handler = MemTableFlushHandler::new(
             state.clone(),
             memory.clone(),
             flusher,
+            wal_flusher.clone(),
             epoch,
             index_configs.to_vec(),
-            stats,
+            stats.clone(),
             config.frozen_memtable_grace,
         );
         task_executor.add_handler(
@@ -1862,12 +2193,28 @@ impl ShardWriter {
             memtable_flush_rx,
         )?;
 
+        // The index-apply task. Its own channel and its own dispatcher: the
+        // dispatcher awaits `handle()` inline, so sharing the WAL flusher's
+        // channel would queue every index apply behind a ~100ms S3 PUT.
+        let (index_apply_tx, index_apply_rx) = mpsc::unbounded_channel();
+        let index_handler = IndexApplyHandler {
+            cursors: Arc::clone(wal_flusher.cursors()),
+            wal_flusher: wal_flusher.clone(),
+            stats,
+        };
+        task_executor.add_handler(
+            "index_applier".to_string(),
+            Box::new(index_handler),
+            index_apply_rx,
+        )?;
+
         // Shared state used by `put()` to dispatch trigger checks.
         let writer_state = Arc::new(SharedWriterState::new(
             state.clone(),
             memory,
             wal_flusher,
             wal_flush_tx,
+            index_apply_tx,
             memtable_flush_tx,
             config.clone(),
             schema.clone(),
@@ -1897,9 +2244,25 @@ impl ShardWriter {
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
     ) -> Result<WriterMode> {
+        // The pending queue is shared with the flush handler so a background
+        // tick can resolve to the batches still owed an append — the WAL-only
+        // analog of resolving a tick against the durability cursor in MemTable
+        // mode. A durable put waits on the durability cursor the handler's
+        // append advances, so the ticker must run (`open` rejects durable +
+        // no-interval); a non-durable writer may pass no interval and rely on
+        // the size/close triggers alone.
+        let state = Arc::new(WalOnlyState::default());
+
         // Background WAL flush handler — no MemTable state to consult, so
-        // pass `None` for the frozen-vs-active detection.
-        let wal_handler = WalFlushHandler::new(wal_flusher, None, stats);
+        // pass `None` for the frozen-vs-active detection; the pending queue and
+        // the flush interval drive the background append instead.
+        let wal_handler = WalFlushHandler::new(
+            wal_flusher,
+            None,
+            Some(state.clone()),
+            config.max_wal_flush_interval,
+            stats,
+        );
         task_executor.add_handler(
             "wal_flusher".to_string(),
             Box::new(wal_handler),
@@ -1944,6 +2307,7 @@ impl ShardWriter {
     #[instrument(name = "sw_put", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
         Self::validate_non_empty(&batches)?;
+        self.validate_against_logical_schema(&batches)?;
 
         match &self.mode {
             WriterMode::MemTable {
@@ -1951,9 +2315,8 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
-                // Inject `_tombstone = false` so the batch matches the
-                // extended memtable schema; callers only ever pass base-shaped
-                // batches and never name the column.
+                // Callers pass logical-shaped batches and never name
+                // `_tombstone`.
                 let batches = batches
                     .into_iter()
                     .map(|b| ensure_tombstone_column(b, &writer_state.schema))
@@ -1982,9 +2345,8 @@ impl ShardWriter {
     /// its key: it wins newest-per-PK resolution (suppressing the older real
     /// row) and is then dropped from query results.
     ///
-    /// Only supported in memtable mode. Because a tombstone nulls every non-PK
-    /// column, those columns must be nullable in the base schema; a delete
-    /// against a schema with a non-nullable non-PK column errors.
+    /// Only supported in memtable mode. Works against non-nullable base columns:
+    /// tombstones live in the storage schema, which widens them to nullable.
     ///
     /// ```
     /// # use lance::Result;
@@ -2071,6 +2433,7 @@ impl ShardWriter {
         batches: Vec<RecordBatch>,
     ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
         Self::validate_non_empty(&batches)?;
+        self.validate_against_logical_schema(&batches)?;
 
         match &self.mode {
             WriterMode::MemTable {
@@ -2078,8 +2441,7 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
-                // Inject `_tombstone = false` to match the extended memtable
-                // schema, mirroring `put`.
+                // Mirrors `put`.
                 let batches = batches
                     .into_iter()
                     .map(|b| ensure_tombstone_column(b, &writer_state.schema))
@@ -2091,6 +2453,49 @@ impl ShardWriter {
                 "put_no_wait is only supported in MemTable mode",
             )),
         }
+    }
+
+    /// Reject caller input that violates the logical schema: wrong column names,
+    /// order, count, or types, or a null where the base table declares
+    /// non-nullable.
+    ///
+    /// The *only* gate on that contract — the storage schema accepts the null,
+    /// append and `merge_insert` compare with `NullabilityComparison::Ignore`,
+    /// and the encoder takes validity from the array, not the field — so a null
+    /// that gets past here reaches the base table silently.
+    ///
+    /// Runs before the WAL append: a batch rejected only afterwards would fail
+    /// identically on every replay, leaving the shard unable to reopen.
+    fn validate_against_logical_schema(&self, batches: &[RecordBatch]) -> Result<()> {
+        for (i, batch) in batches.iter().enumerate() {
+            // Everything downstream matches columns by position, so a swapped
+            // pair of same-typed columns would be stored under each other's
+            // names unless caught here.
+            for (col, (expected, actual)) in self
+                .logical_schema
+                .fields()
+                .iter()
+                .zip(batch.schema().fields())
+                .enumerate()
+            {
+                if expected.name() != actual.name() {
+                    return Err(Error::invalid_input(format!(
+                        "batch {i} column {col} is named '{}', but the base table schema \
+                         declares '{}' at that position",
+                        actual.name(),
+                        expected.name()
+                    )));
+                }
+            }
+            RecordBatch::try_new(self.logical_schema.clone(), batch.columns().to_vec()).map_err(
+                |e| {
+                    Error::invalid_input(format!(
+                        "batch {i} does not match the base table schema: {e}"
+                    ))
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_non_empty(batches: &[RecordBatch]) -> Result<()> {
@@ -2153,50 +2558,78 @@ impl ShardWriter {
             // 1. Insert all batches into memtable atomically
             let results = state.memtable.insert_batches_only(batches).await?;
 
-            // Get batch position range
+            // 2. Capture the store the batches actually landed in, *before* step
+            //    6 below can freeze and swap the active memtable. Reading it
+            //    afterwards hands the flush trigger the **new** store paired with
+            //    the **old** store's end position, so the new store's watermark
+            //    jumps past batches that were never appended.
+            let batch_store = state.memtable.batch_store();
+            let indexes = state.memtable.indexes_arc();
+
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
             let batch_positions = start_pos..end_pos;
 
-            // 2. Publish the memtable's new resident size before any freeze
+            // 3. Publish the memtable's new resident size before any freeze
             // below reclassifies it, so `seal` reads the same value it moves.
             writer_state.memory.set_active(state.memtable.memory_size());
 
-            // 3. Track last batch for WAL durability
-            let durable_watcher = writer_state.track_batch_for_wal(end_pos.saturating_sub(1));
+            // 4. Watch for this write to become *visible*: indexed, and — under
+            //    `durable_write` — WAL-durable too.
+            //
+            //    The two targets live in different coordinate spaces. `end_pos`
+            //    is memtable-local, which is what the index apply works in. The
+            //    durability cursor is writer-global, because batch positions
+            //    restart at 0 in every memtable while that cursor spans the
+            //    writer's whole life — a local durable target would already be
+            //    satisfied by a *previous* memtable's appends, so the first N
+            //    puts into every post-rotation memtable would ack as durable with
+            //    no WAL append ever happening.
+            let durable_watcher = writer_state.track_batch_for_wal(
+                indexes.clone(),
+                end_pos,
+                batch_store.global_offset() + end_pos,
+            );
 
-            // 4. Check if WAL flush should be triggered
+            // 5. Check if WAL flush should be triggered
             writer_state.maybe_trigger_wal_flush(&mut state);
 
-            // 5. Check if memtable flush is needed
+            // 6. Check if memtable flush is needed (may freeze and rotate)
             if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state) {
                 warn!("Failed to trigger memtable flush: {}", e);
             }
-
-            // Get batch_store and indexes while we have the lock (for durable_write case)
-            let batch_store = state.memtable.batch_store();
-            let indexes = state.memtable.indexes_arc();
 
             (batch_positions, durable_watcher, batch_store, indexes)
         }; // Lock released here
 
         self.stats.record_put(start.elapsed());
 
-        // Trigger the flush here (outside the lock) so the watcher can resolve;
-        // only the `wait()` is the caller's to schedule.
-        let watcher = if self.config.durable_write {
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::BatchStore {
-                    batch_store,
-                    indexes,
-                },
-                batch_positions.end,
-                None,
-            )?;
-            Some(durable_watcher)
-        } else {
-            None
-        };
+        // Trigger the index apply, in **both** modes. This is what makes reads
+        // read-your-writes regardless of `durable_write`: skipping durability now
+        // costs the caller durability only, not visibility. It is cheap
+        // (in-memory, ~ms), so there is no reason to batch it onto the WAL's
+        // schedule — that schedule exists to bound S3 API cost, which an
+        // in-memory index apply does not incur.
+        if let Some(indexes) = indexes {
+            writer_state.trigger_index_apply(batch_store, indexes, batch_positions.end)?;
+        }
+
+        // The WAL append is *not* triggered here. It happens on the background
+        // ticker (and on the size trigger, and at freeze/close), which is the only
+        // way the flush interval can mean anything: while every durable put
+        // triggered its own append, the interval could add a redundant trigger but
+        // never delay or batch one.
+        //
+        // The cost is real and accepted: a single client's sequential *durable*
+        // throughput drops from ~10 writes/sec (one PUT round-trip) to roughly one
+        // per tick. That is a policy choice — the interval should mean what it
+        // says, and S3 API cost should be bounded. Latency-sensitive callers want
+        // `durable_write: false`, which now costs them durability only, not
+        // visibility.
+
+        // The watcher is returned in both modes now. A non-durable put still
+        // waits — for its index apply (~ms), not for an S3 PUT (~100ms).
+        let watcher = Some(durable_watcher);
 
         Ok((WriteResult { batch_positions }, watcher))
     }
@@ -2230,54 +2663,48 @@ impl ShardWriter {
         // Push batches into the pending queue and capture the assigned
         // [start, end) range. `next_batch_position` is monotonic across the
         // writer's lifetime; positions are not BatchStore indices but they
-        // are used the same way for durability tracking.
+        // are used the same way for durability tracking. Because the queue is
+        // strict FIFO with contiguous positions and its front always sits at
+        // the durability cursor, `end` is exactly the writer-global durable
+        // count this put reaches once its append lands — no globalizing offset
+        // as in MemTable mode, which restarts positions per generation.
         let batch_positions = state.push(batches);
 
-        // Time- and size-based triggers, mirroring MemTable mode but reading
-        // pending bytes from `WalOnlyState` instead of an active MemTable.
-        // Only fires for non-durable writes; durable writes go through the
-        // explicit done-cell path below so flush errors (e.g., fence) reach
-        // the caller.
-        if !self.config.durable_write {
-            let target_position = batch_positions.end;
-            let pending_bytes = state.estimated_size();
-            self.maybe_trigger_wal_flush_wal_only(
-                state,
-                wal_flush_tx,
-                trigger,
-                target_position,
-                pending_bytes,
-            );
-        }
+        // Under `durable_write` the put becomes durable only once its WAL
+        // append lands. Track it on the writer-global durability cursor *before*
+        // triggering, so a flush that completes between here and the wait is not
+        // missed: the watcher recomputes visibility from the cursor rather than
+        // latching a one-shot wake. WAL-only mode has no indexes, so the
+        // index-visibility half of the watcher is a no-op (`None`, target 0).
+        let durable_watcher = self
+            .config
+            .durable_write
+            .then(|| self.wal_flusher.track_batch(None, 0, batch_positions.end));
+
+        // Time- and size-based triggers on the write path, for durable and
+        // non-durable puts alike — mirroring MemTable mode's
+        // `maybe_trigger_wal_flush`. The background ticker drives the append
+        // too; whichever fires first wins, and a redundant trigger is a cheap
+        // no-op because the flush snapshot/commit is idempotent.
+        self.maybe_trigger_wal_flush_wal_only(
+            state,
+            wal_flush_tx,
+            trigger,
+            batch_positions.end,
+            state.estimated_size(),
+        );
 
         self.stats.record_put(start.elapsed());
 
-        // For durable writes, trigger an immediate flush and wait for the
-        // done cell. Using the done cell instead of the durability watermark
-        // watcher ensures flush errors (e.g., the WalAppender returning a
-        // fence error) propagate back to `put` instead of hanging.
-        if self.config.durable_write {
-            let done = WatchableOnceCell::new();
-            let reader = done.reader();
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::WalOnly {
-                    state: state.clone(),
-                },
-                batch_positions.end,
-                Some(done),
-            )?;
-            let mut reader = reader;
-            match reader.await_value().await {
-                Some(Ok(_)) => {}
-                // Rebuild the typed error (peer fence vs. persistence-failure
-                // self-fence) so a WAL-only durable caller can tell them apart.
-                Some(Err(failure)) => return Err(failure.into_error()),
-                None => {
-                    return Err(Error::io(
-                        "WAL flush handler exited before reporting durability",
-                    ));
-                }
-            }
+        // Durable writes wait on the durability cursor, advanced by the append
+        // the ticker (or the trigger above) drives — the same watermark path
+        // MemTable mode uses. A terminal flush failure (a peer fence or an
+        // exhausted-retry persistence self-fence) poisons the writer and wakes
+        // the waiter with that typed error instead of leaving it to hang. This
+        // is why `open` rejects `durable_write` with no flush ticker: nothing
+        // else would advance the cursor a small put is parked on.
+        if let Some(mut watcher) = durable_watcher {
+            watcher.wait().await?;
         }
 
         Ok(WriteResult { batch_positions })
@@ -2404,24 +2831,49 @@ impl ShardWriter {
 
     /// Get current MemTable statistics. Returns an error in WAL-only mode
     /// (no MemTable exists).
+    ///
+    /// Deliberately does *not* `check_poisoned`, unlike the read and write
+    /// paths: a poisoned writer is exactly when an operator most needs to see
+    /// its state, and the caller deciding whether to evict reads these stats.
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         let batch_store = state.memtable.batch_store();
-        let pending_wal = batch_store.pending_wal_flush_stats();
+        let durable = self.wal_flusher.durable();
+        let pending_wal = batch_store.pending_wal_flush_stats(durable);
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
             estimated_size: state.memtable.estimated_size(),
             generation: state.memtable.generation(),
             max_buffered_batch_position: batch_store.max_buffered_batch_position(),
-            max_flushed_batch_position: batch_store.max_flushed_batch_position(),
+            durable_batch_count: durable,
+            global_offset: batch_store.global_offset(),
             pending_wal_start_batch_position: pending_wal.start_batch_position,
             pending_wal_end_batch_position: pending_wal.end_batch_position,
             pending_wal_batch_count: pending_wal.batch_count,
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
+            frozen_count: state.frozen_memtables.len(),
+            // Summed from the read view rather than read off `frozen_memtable_bytes`:
+            // that counter drains on flush *completion* so a failure cannot wedge
+            // writes, which would report zero for a table still sitting in memory.
+            frozen_bytes: state
+                .frozen_memtables
+                .iter()
+                .filter(|frozen| frozen.flushed_at_ms.is_none())
+                .map(|frozen| frozen.memtable.estimated_size())
+                .sum(),
         })
+    }
+
+    /// Snapshot of the backpressure counters. Both writer modes answer, so a
+    /// caller asking "am I throttled" need not know which mode it is in.
+    pub fn backpressure_stats(&self) -> BackpressureStatsSnapshot {
+        match &self.mode {
+            WriterMode::MemTable { backpressure, .. }
+            | WriterMode::WalOnly { backpressure, .. } => backpressure.stats_snapshot(),
+        }
     }
 
     /// Create a scanner for querying the current MemTable data.
@@ -2429,11 +2881,12 @@ impl ShardWriter {
     /// The scanner provides read access to all data currently in the MemTable,
     /// with optional filtering, projection, and index support.
     ///
-    /// The scanner captures the current `max_visible_batch_position` from the
+    /// The scanner captures the current `visible_count` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn scan(&self) -> Result<MemTableScanner> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(state.memtable.scan())
@@ -2443,10 +2896,11 @@ impl ShardWriter {
     /// Prefer [`Self::in_memory_memtable_refs`] on the read path — it also
     /// carries frozen-awaiting-flush generations.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn active_memtable_ref(
         &self,
     ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTableRef> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(in_memory_ref(&state.memtable))
@@ -2458,10 +2912,11 @@ impl ShardWriter {
     /// path uses this instead of [`Self::active_memtable_ref`] so a
     /// concurrent reader sees no hole while a flush drains.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn in_memory_memtable_refs(
         &self,
     ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTables> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(crate::dataset::mem_wal::scanner::InMemoryMemTables {
@@ -2492,10 +2947,16 @@ impl ShardWriter {
         }
     }
 
-    /// Seal the active memtable so it's queued for L0 flush. No-op when
-    /// the active memtable is empty. Errors in WAL-only mode or if this
-    /// writer has been fenced by a successor. Pair with
-    /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
+    /// Seal the active memtable so it's queued for L0 flush. Errors in
+    /// WAL-only mode or if this writer has been fenced by a successor.
+    ///
+    /// The returned [`SealFence`] is what makes a *bounded* wait possible:
+    /// a caller that needs "everything written before my seal is in L0"
+    /// awaits [`SealFence::wait`], which covers the flushes outstanding at
+    /// seal time and nothing else. [`Self::wait_for_flush_drain`] instead
+    /// loops until the frozen set is *empty*, re-collecting it each round,
+    /// so it also waits on every memtable frozen *while it waits*. Under
+    /// sustained writes that set may never empty.
     ///
     /// Beyond test setup where deterministic flush points are required,
     /// this is the primary lever for callers that need to drive flushes
@@ -2505,7 +2966,7 @@ impl ShardWriter {
     /// the next epoch starts with no replayable entries from the old
     /// layout.
     #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
-    pub async fn force_seal_active(&self) -> Result<()> {
+    pub async fn force_seal_active(&self) -> Result<SealFence> {
         match &self.mode {
             WriterMode::MemTable {
                 state,
@@ -2515,11 +2976,28 @@ impl ShardWriter {
                 self.check_fenced().await?;
                 self.wal_flusher.check_poisoned()?;
                 let mut state = state.write().await;
-                if state.memtable.batch_count() == 0 {
-                    return Ok(());
-                }
-                writer_state.freeze_memtable(&mut state)?;
-                Ok(())
+                let sealed_generation = if state.memtable.batch_count() == 0 {
+                    None
+                } else {
+                    let generation = state.memtable.generation();
+                    writer_state.freeze_memtable(&mut state)?;
+                    Some(generation)
+                };
+                // Capture the outstanding set under the same lock that froze,
+                // so no freeze can slip between the two and widen the fence.
+                // It covers more than the generation just sealed: a
+                // size/interval trigger freezes generations asynchronously, so
+                // an empty active memtable does *not* mean every pre-call write
+                // already reached L0. Watchers are popped as flushes settle, so
+                // whatever remains here is exactly what is still owed.
+                Ok(SealFence {
+                    sealed_generation,
+                    watchers: state
+                        .frozen_flush_watchers
+                        .iter()
+                        .map(|(_, w)| w.clone())
+                        .collect(),
+                })
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
                 "force_seal_active not available in WAL-only mode (no MemTable)",
@@ -2533,12 +3011,10 @@ impl ShardWriter {
     /// want everything-on-disk. Errors in WAL-only mode, or if any
     /// awaited flush reports `DurabilityResult::Failed`.
     ///
-    /// Useful in tests for deterministic post-flush assertions, and in
-    /// production wherever a caller needs a synchronous fence after
-    /// [`Self::force_seal_active`] — e.g. trimming memtable residency
-    /// across shards in a multi-table WAL writer, or ensuring the WAL
-    /// is fully drained to Lance storage before rolling to a new
-    /// format/epoch.
+    /// Useful in tests for deterministic post-flush assertions. In
+    /// production prefer [`SealFence::wait`] from the seal itself: this
+    /// drains the queue to empty, including memtables frozen after the
+    /// call, so under sustained writes it may not return.
     #[instrument(name = "sw_wait_for_flush_drain", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn wait_for_flush_drain(&self) -> Result<()> {
         let state_lock = match &self.mode {
@@ -2605,12 +3081,65 @@ impl ShardWriter {
         Ok(())
     }
 
+    /// Send the close-time final WAL flush and await its completion.
+    ///
+    /// Sends directly on the flush channel rather than via
+    /// [`WalFlusher::trigger_flush`]: the latter silently returns `Ok` when the
+    /// flusher's `flush_tx` is unset, which would let close report success
+    /// without ever persisting the final WAL entry. A closed send channel must
+    /// surface as an error here so close never acknowledges durability it did
+    /// not achieve.
+    async fn flush_final_wal(
+        wal_flush_tx: &mpsc::UnboundedSender<TriggerWalFlush>,
+        source: WalFlushSource,
+        end_batch_position: usize,
+    ) -> Result<()> {
+        let done = WatchableOnceCell::new();
+        let mut reader = done.reader();
+        if wal_flush_tx
+            .send(TriggerWalFlush {
+                source,
+                end_batch_position,
+                done: Some(done),
+            })
+            .is_err()
+        {
+            return Err(Error::io("WAL flush channel closed during close"));
+        }
+
+        match reader.await_value().await {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(failure)) => Err(failure.into_error()),
+            None => Err(Error::io(
+                "WAL flush handler exited before reporting durability during close",
+            )),
+        }
+    }
+
+    fn merge_close_stage(
+        close_result: Result<()>,
+        stage: &str,
+        stage_result: Result<()>,
+    ) -> Result<()> {
+        if let (Err(_), Err(stage_error)) = (&close_result, &stage_result) {
+            warn!("Close stage '{stage}' also failed: {stage_error}");
+        }
+        close_result.and(stage_result)
+    }
+
     /// Close the writer gracefully.
     ///
     /// Flushes pending data and shuts down background tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pending WAL data cannot be persisted, an active or
+    /// frozen MemTable cannot be flushed, a flush handler exits before reporting
+    /// completion, or background tasks cannot be shut down.
     #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn close(self) -> Result<()> {
         info!("Closing ShardWriter for shard {}", self.config.shard_id);
+        let mut close_result: Result<()> = Ok(());
 
         match &self.mode {
             WriterMode::MemTable {
@@ -2618,31 +3147,46 @@ impl ShardWriter {
                 writer_state,
                 ..
             } => {
-                // Send final WAL flush message and wait for completion
+                // Drain *both* tasks against the active memtable. The index apply
+                // and the WAL append are independent now, so closing has to
+                // settle both: the L0 flush below turns this memtable into a
+                // Lance generation, and a generation whose indexes never saw the
+                // tail is a generation with a hole in it.
                 let st = state.read().await;
                 let batch_store = st.memtable.batch_store();
                 let indexes = st.memtable.indexes_arc();
                 let batch_count = st.memtable.batch_count();
                 drop(st);
 
+                if batch_count > 0
+                    && let Some(indexes) = indexes
+                    && indexes.indexed_count() < batch_count
+                {
+                    let mut watcher = self.wal_flusher.track_batch(
+                        Some(Arc::clone(&indexes)),
+                        batch_count,
+                        0, // durability is settled by the WAL flush below
+                    );
+                    writer_state.trigger_index_apply(
+                        Arc::clone(&batch_store),
+                        indexes,
+                        batch_count,
+                    )?;
+                    watcher.wait().await?;
+                }
+
                 if batch_count > 0 {
-                    let done = WatchableOnceCell::new();
-                    let reader = done.reader();
-                    if writer_state
-                        .wal_flush_tx
-                        .send(TriggerWalFlush {
-                            source: WalFlushSource::BatchStore {
-                                batch_store,
-                                indexes,
-                            },
-                            end_batch_position: batch_count,
-                            done: Some(done),
-                        })
-                        .is_ok()
-                    {
-                        let mut reader = reader;
-                        let _ = reader.await_value().await;
-                    }
+                    // Append-only source: on this branch the index apply is a
+                    // separate task (drained above), so the final WAL flush carries
+                    // no indexes. #7769's failure propagation still applies.
+                    let stage_result = Self::flush_final_wal(
+                        &writer_state.wal_flush_tx,
+                        WalFlushSource::BatchStore { batch_store },
+                        batch_count,
+                    )
+                    .await;
+                    close_result =
+                        Self::merge_close_stage(close_result, "final WAL flush", stage_result);
                 }
 
                 // Freeze the active memtable (if any rows) so it joins the
@@ -2658,22 +3202,37 @@ impl ShardWriter {
                 // Propagate any freeze error: at close time the caller
                 // has explicitly asked for full durability, so silently
                 // dropping a freeze failure would lose data without any
-                // signal. If freeze fails, surface the error rather than
-                // continuing on to drain only the pre-existing frozen
-                // memtables (whose flushes can still be waited on, but
-                // the caller now knows the close was incomplete).
+                // signal. If freeze fails, its error is recorded as the
+                // first causal failure, but close still drains any
+                // pre-existing frozen MemTable watchers so a successor
+                // failure is logged without replacing the first error.
                 let watchers: Vec<_> = {
                     let mut st = state.write().await;
                     if st.memtable.row_count() > 0 {
-                        writer_state.freeze_memtable(&mut st)?;
+                        let freeze_result = writer_state.freeze_memtable(&mut st).map(|_| ());
+                        close_result = Self::merge_close_stage(
+                            close_result,
+                            "active MemTable freeze",
+                            freeze_result,
+                        );
                     }
                     st.frozen_flush_watchers
                         .iter()
                         .map(|(_, w)| w.clone())
                         .collect()
                 };
-                for mut w in watchers {
-                    let _ = w.await_value().await;
+                for mut watcher in watchers {
+                    let stage_result = match watcher.await_value().await {
+                        Some(durability) => durability.into_result(),
+                        None => Err(Error::io(
+                            "MemTable flush handler exited before reporting completion during close",
+                        )),
+                    };
+                    close_result = Self::merge_close_stage(
+                        close_result,
+                        "frozen MemTable flush watcher",
+                        stage_result,
+                    );
                 }
             }
             WriterMode::WalOnly {
@@ -2686,30 +3245,32 @@ impl ShardWriter {
                 let pending = state.batch_count();
                 let end_position = state.next_batch_position();
                 if pending > 0 {
-                    let done = WatchableOnceCell::new();
-                    let reader = done.reader();
-                    if wal_flush_tx
-                        .send(TriggerWalFlush {
-                            source: WalFlushSource::WalOnly {
-                                state: state.clone(),
-                            },
-                            end_batch_position: end_position,
-                            done: Some(done),
-                        })
-                        .is_ok()
-                    {
-                        let mut reader = reader;
-                        let _ = reader.await_value().await;
-                    }
+                    let stage_result = Self::flush_final_wal(
+                        wal_flush_tx,
+                        WalFlushSource::WalOnly {
+                            state: state.clone(),
+                        },
+                        end_position,
+                    )
+                    .await;
+                    close_result =
+                        Self::merge_close_stage(close_result, "final WAL flush", stage_result);
                 }
             }
         }
 
         // Shutdown background tasks
-        self.task_executor.shutdown_all().await?;
+        let shutdown_result = self.task_executor.shutdown_all().await;
+        let close_result = Self::merge_close_stage(close_result, "task shutdown", shutdown_result);
 
-        info!("ShardWriter closed for shard {}", self.config.shard_id);
-        Ok(())
+        match &close_result {
+            Ok(()) => info!("ShardWriter closed for shard {}", self.config.shard_id),
+            Err(error) => warn!(
+                "ShardWriter close for shard {} failed: {error}",
+                self.config.shard_id
+            ),
+        }
+        close_result
     }
 }
 
@@ -2721,12 +3282,30 @@ pub struct MemTableStats {
     pub estimated_size: usize,
     pub generation: u64,
     pub max_buffered_batch_position: Option<usize>,
-    pub max_flushed_batch_position: Option<usize>,
+    /// Writer-global count of WAL-durable batches. Exclusive: 0 means none.
+    /// Compare against `global_offset + batch_count` to see what this memtable
+    /// still owes the WAL.
+    pub durable_batch_count: usize,
+    /// Writer-global coordinate of this memtable's batch 0.
+    pub global_offset: usize,
     pub pending_wal_start_batch_position: Option<usize>,
     pub pending_wal_end_batch_position: Option<usize>,
     pub pending_wal_batch_count: usize,
     pub pending_wal_row_count: usize,
     pub pending_wal_estimated_bytes: usize,
+    /// Frozen memtables in the read view: sealed-awaiting-flush, plus flushed
+    /// ones still inside `frozen_memtable_grace`.
+    pub frozen_count: usize,
+    /// Heap bytes still owed to flush: frozen memtables awaiting a first flush,
+    /// plus any left resident by a failed one. Drains on flush commit, so unlike
+    /// `frozen_count` it excludes in-grace tables.
+    ///
+    /// Plus the active memtable's `estimated_size`, this is roughly what
+    /// backpressure meters against `max_unflushed_memtable_bytes` — but only
+    /// roughly: backpressure's own counter drains whenever a flush *completes*,
+    /// so bytes stranded by a failed flush stay visible here while no longer
+    /// throttling writes.
+    pub frozen_bytes: usize,
 }
 
 /// WAL statistics.
@@ -2736,16 +3315,126 @@ pub struct WalStats {
     pub next_wal_entry_position: u64,
 }
 
-/// Background handler for WAL flush operations.
+/// The L0 flushes outstanding when [`ShardWriter::force_seal_active`]
+/// returned — the exact predicate for "everything written before that call
+/// is in L0".
 ///
-/// This handler does parallel WAL I/O + index updates during flush.
-/// Indexes are passed through the TriggerWalFlush message.
+/// The set is fixed at seal time, so [`Self::wait`] is bounded no matter how
+/// many memtables freeze while it waits, and each entry reports the outcome of
+/// its own flush. That is why the fence is a captured watcher set and not a
+/// generation number compared against `ShardManifest::current_generation`: the
+/// manifest advances to `generation + 1` on every committed flush without
+/// checking for a gap, so a later generation's success moves it past a
+/// generation that failed and never reached L0 — the watermark would report
+/// durability that does not exist.
+#[derive(Debug)]
+pub struct SealFence {
+    sealed_generation: Option<u64>,
+    watchers: Vec<DurabilityWatcher>,
+}
+
+impl SealFence {
+    /// The generation the seal froze, or `None` when the active memtable
+    /// was empty (a no-op seal). Independent of what the fence covers: an
+    /// empty active memtable says nothing about generations frozen earlier
+    /// and still awaiting flush, which the fence still waits on.
+    pub fn sealed_generation(&self) -> Option<u64> {
+        self.sealed_generation
+    }
+
+    /// Block until every flush this fence covers has landed in L0.
+    ///
+    /// Errors if any of them reports `DurabilityResult::Failed`, or if the
+    /// flush handler exited without reporting.
+    pub async fn wait(self) -> Result<()> {
+        for mut watcher in self.watchers {
+            match watcher.await_value().await {
+                Some(durability) => durability.into_result()?,
+                None => {
+                    return Err(Error::io(
+                        "MemTable flush handler exited before reporting completion",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The oldest store that still owes the WAL an append, or `None` when everything
+/// is durable.
+///
+/// Ordering is the whole point. WAL entry positions are assigned in append-call
+/// order; replay walks them ascending; row positions follow; and primary-key
+/// recency is "newest visible row position wins". So appending a newer memtable
+/// ahead of an older one's tail silently inverts dedup after a crash.
+///
+/// Taking "the active memtable" would do exactly that, because a timer tick
+/// enqueued before a freeze is handled after it and would resolve to the incoming
+/// memtable. Selecting by cursor instead makes the target a function of what is
+/// actually durable, not of when the timer happened to fire.
+fn next_pending_store(
+    frozen: impl Iterator<Item = Arc<BatchStore>>,
+    active: Arc<BatchStore>,
+    durable: usize,
+) -> Option<Arc<BatchStore>> {
+    frozen
+        .chain(std::iter::once(active))
+        .find(|store| store.global_end() > durable)
+}
+
+/// The index-apply task: one sequential consumer of the index-apply channel.
+///
+/// Sequential consumption is the safety property. `HnswGraph::insert_batch` hard-
+/// rejects any range whose start is not its `indexed_len`, so the apply must see
+/// contiguous, in-order ranges — and a single consumer guarantees that
+/// regardless of how many putters race behind it. Ordering comes from the task,
+/// not from a flush interval, which is why triggering per-put is exactly as safe
+/// as triggering on a timer, and lets a put become visible in milliseconds
+/// instead of waiting on an S3 round-trip.
+struct IndexApplyHandler {
+    cursors: Arc<WriterCursors>,
+    wal_flusher: Arc<WalFlusher>,
+    stats: SharedWriteStats,
+}
+
+#[async_trait]
+impl MessageHandler<TriggerIndexApply> for IndexApplyHandler {
+    async fn handle(&mut self, message: TriggerIndexApply) -> Result<()> {
+        match apply_index_range(&self.cursors, message).await {
+            Ok(applied) => {
+                // A coalesced no-op indexes nothing (`rows_indexed == 0`);
+                // recording it would inflate the count and skew avg latency.
+                if applied.rows_indexed > 0 {
+                    self.stats
+                        .record_index_update(applied.duration, applied.rows_indexed);
+                }
+                Ok(())
+            }
+            // An index apply cannot be partially rolled back, so a failure is
+            // terminal: poison, and let reopen rebuild the indexes from the WAL.
+            // See the note in `WalFlusher::flush_from_batch_store`.
+            Err(e) => {
+                self.wal_flusher.poison(&e);
+                Err(e)
+            }
+        }
+    }
+}
+
 struct WalFlushHandler {
     wal_flusher: Arc<WalFlusher>,
     /// MemTable-mode writer state, used to detect "frozen vs active" flushes
     /// via Arc::ptr_eq on the active batch_store. `None` when running in
     /// WAL-only mode (no MemTable, no frozen-vs-active distinction).
     memtable_state: Option<Arc<RwLock<WriterState>>>,
+    /// WAL-only-mode pending queue, so a background tick can resolve to the
+    /// batches still owed an append. `None` in MemTable mode. Exactly one of
+    /// `memtable_state` / `wal_only_state` is `Some`.
+    wal_only_state: Option<Arc<WalOnlyState>>,
+    /// How often to append in the background. `None` disables the ticker, leaving
+    /// the append size-triggered (and freeze/close-triggered) only.
+    flush_interval: Option<Duration>,
     stats: SharedWriteStats,
 }
 
@@ -2753,11 +3442,15 @@ impl WalFlushHandler {
     fn new(
         wal_flusher: Arc<WalFlusher>,
         memtable_state: Option<Arc<RwLock<WriterState>>>,
+        wal_only_state: Option<Arc<WalOnlyState>>,
+        flush_interval: Option<Duration>,
         stats: SharedWriteStats,
     ) -> Self {
         Self {
             wal_flusher,
             memtable_state,
+            wal_only_state,
+            flush_interval,
             stats,
         }
     }
@@ -2765,12 +3458,49 @@ impl WalFlushHandler {
 
 #[async_trait]
 impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
+    /// Append periodically in the background.
+    ///
+    /// This is what the flush interval was always supposed to mean. It routed to
+    /// a timer that was only ever *evaluated on the write path*, so it could add
+    /// a redundant trigger but never delay or batch one — with every durable put
+    /// triggering its own append, tuning the knob did nothing at all.
+    ///
+    /// The ticker exists to bound S3 API cost: an append is a PUT, billed per
+    /// call, and it is the only thing on this schedule. The index apply is not —
+    /// it is in-memory and free to batch, so it runs per-put on its own task.
+    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerWalFlush>)> {
+        // No interval => no ticker. A zero interval would panic in tokio.
+        let Some(interval) = self.flush_interval.filter(|d| !d.is_zero()) else {
+            return vec![];
+        };
+        // The tick names no store: `MessageFactory` is synchronous and cannot take
+        // the async state lock. `handle()` resolves it against the cursor.
+        vec![(
+            interval,
+            Box::new(|| TriggerWalFlush {
+                source: WalFlushSource::NextPending,
+                end_batch_position: 0,
+                done: None,
+            }),
+        )]
+    }
+
     async fn handle(&mut self, message: TriggerWalFlush) -> Result<()> {
         let TriggerWalFlush {
             source,
             end_batch_position,
             done,
         } = message;
+
+        // A timer tick names no store — resolve it now, at handle time.
+        let (source, end_batch_position) = match source {
+            WalFlushSource::NextPending => match self.resolve_next_pending().await {
+                Some(resolved) => resolved,
+                // Everything is already durable; the tick has nothing to do.
+                None => return Ok(()),
+            },
+            other => (other, end_batch_position),
+        };
 
         let result = self.do_flush(source, end_batch_position).await;
 
@@ -2802,6 +3532,64 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
 }
 
 impl WalFlushHandler {
+    /// Pick the store the WAL still owes an append, oldest first.
+    ///
+    /// **WAL entries must be appended in global batch-position order for the
+    /// writer's lifetime.** `WalAppender::append` assigns each entry's position
+    /// from its own counter, in call order; replay walks those positions
+    /// ascending and assigns row positions in that order; and primary-key recency
+    /// is "newest visible row position wins". So append order fixes dedup order.
+    /// Append two memtables out of order and replay silently hands the dedup to
+    /// the *stale* row — corruption that survives the crash that caused it, and
+    /// that a full scan cannot see.
+    ///
+    /// Resolving to "the active memtable" would break exactly that: a tick
+    /// enqueued before a freeze is handled after it, resolves to the incoming
+    /// memtable, and appends its batches ahead of the outgoing memtable's tail.
+    /// So the target is a function of `durable`, not of when the timer fired.
+    ///
+    /// Safe to walk the frozen list because a store that still owes an append
+    /// cannot be swept: its L0 flush is blocked on the completion cell that only
+    /// that append fires.
+    ///
+    /// In WAL-only mode there is a single FIFO pending queue and no memtable
+    /// rotation, so the ordering hazard above cannot arise: the tick resolves to
+    /// the queue whenever it holds un-appended batches.
+    async fn resolve_next_pending(&self) -> Option<(WalFlushSource, usize)> {
+        if let Some(state_lock) = self.memtable_state.as_ref() {
+            let state = state_lock.read().await;
+            let durable = self.wal_flusher.durable();
+
+            return next_pending_store(
+                state
+                    .frozen_memtables
+                    .iter()
+                    .map(|frozen| frozen.memtable.batch_store()),
+                state.memtable.batch_store(),
+                durable,
+            )
+            .map(|store| {
+                let end = store.len();
+                (WalFlushSource::BatchStore { batch_store: store }, end)
+            });
+        }
+
+        let state = self.wal_only_state.as_ref()?;
+        if state.batch_count() == 0 {
+            // Everything already appended; the tick has nothing to do.
+            return None;
+        }
+        // `flush_from_wal_only` snapshots the whole queue, so the end position
+        // is informational here; carry the next position for symmetry.
+        let end = state.next_batch_position();
+        Some((
+            WalFlushSource::WalOnly {
+                state: Arc::clone(state),
+            },
+            end,
+        ))
+    }
+
     /// Unified flush method for both active and frozen memtables and for
     /// WAL-only mode.
     ///
@@ -2821,18 +3609,6 @@ impl WalFlushHandler {
     ) -> Result<WalFlushResult> {
         let start = Instant::now();
 
-        // Whether this flush actually updates any in-memory indexes — only
-        // a BatchStore source carrying a non-empty `IndexStore` does. Used
-        // to gate the `record_index_update` stat so WAL-only flushes don't
-        // pollute the index-update counters.
-        let has_indexes = matches!(
-            &source,
-            WalFlushSource::BatchStore {
-                indexes: Some(_),
-                ..
-            }
-        );
-
         // Early-out for BatchStore sources where the watermark already
         // covers the requested end position. Detection of "frozen flush"
         // requires the active memtable's batch_store; WAL-only handlers
@@ -2840,8 +3616,7 @@ impl WalFlushHandler {
         // BatchStore source, so the early-out simplifies to the watermark
         // comparison.
         if let WalFlushSource::BatchStore { batch_store, .. } = &source {
-            let max_flushed = batch_store.max_flushed_batch_position();
-            let flushed_up_to = max_flushed.map(|p| p + 1).unwrap_or(0);
+            let flushed_up_to = batch_store.local_end(self.wal_flusher.durable());
             let is_frozen_flush = if let Some(state_lock) = &self.memtable_state {
                 let state = state_lock.read().await;
                 !Arc::ptr_eq(batch_store, &state.memtable.batch_store())
@@ -2866,12 +3641,6 @@ impl WalFlushHandler {
             self.stats
                 .record_wal_flush(start.elapsed(), flush_result.wal_bytes);
             self.stats.record_wal_io(flush_result.wal_io_duration);
-            if has_indexes {
-                self.stats.record_index_update(
-                    flush_result.index_update_duration,
-                    flush_result.rows_indexed,
-                );
-            }
         }
 
         Ok(flush_result)
@@ -2890,10 +3659,13 @@ struct MemTableFlushHandler {
     /// frozen bytes once its flush commits.
     memory: Arc<MemoryCounters>,
     flusher: Arc<MemTableFlusher>,
+    /// Source of the writer-global durability cursor, which the L0 flush asserts
+    /// covers the whole frozen memtable before it writes a generation.
+    wal_flusher: Arc<WalFlusher>,
     epoch: u64,
-    /// Secondary index configs to rebuild on each flushed generation. When
+    /// Secondary index configs to rebuild on each SSTable. When
     /// non-empty the handler flushes via [`MemTableFlusher::flush_with_indexes`]
-    /// so queries over flushed generations use index lookups instead of full
+    /// so queries over SSTables use index lookups instead of full
     /// scans — and so vector search's index-only `fast_search` can see the data
     /// at all.
     index_configs: Vec<MemIndexConfig>,
@@ -2909,6 +3681,7 @@ impl MemTableFlushHandler {
         state: Arc<RwLock<WriterState>>,
         memory: Arc<MemoryCounters>,
         flusher: Arc<MemTableFlusher>,
+        wal_flusher: Arc<WalFlusher>,
         epoch: u64,
         index_configs: Vec<MemIndexConfig>,
         stats: SharedWriteStats,
@@ -2918,6 +3691,7 @@ impl MemTableFlushHandler {
             state,
             memory,
             flusher,
+            wal_flusher,
             epoch,
             index_configs,
             stats,
@@ -3028,14 +3802,20 @@ impl MemTableFlushHandler {
             let covered_wal_entry_position = wal_flushed_position
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
-            // Rebuild secondary indexes on the flushed generation so later
+            // Rebuild secondary indexes on the SSTable so later
             // queries hit an index instead of scanning. Skip the extra
             // dataset open when there are no indexes to build. The indexed
             // path's future is boxed to keep this async block's nesting
             // under the type-layout recursion limit.
+            // Read the durability cursor *after* the WAL-append completion above,
+            // not before: the append that makes this memtable durable is the very
+            // thing we just waited on, so a cursor sampled earlier would still be
+            // short of it and trip the flush precondition.
+            let durable = self.wal_flusher.durable();
+
             if self.index_configs.is_empty() {
                 self.flusher
-                    .flush(&memtable, self.epoch, covered_wal_entry_position)
+                    .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
                     .await
             } else {
                 Box::pin(self.flusher.flush_with_indexes(
@@ -3043,6 +3823,7 @@ impl MemTableFlushHandler {
                     self.epoch,
                     &self.index_configs,
                     covered_wal_entry_position,
+                    durable,
                 ))
                 .await
             }
@@ -3075,15 +3856,15 @@ impl MemTableFlushHandler {
             // the read union until a later flush or WAL replay, else a transient
             // error reopens the hole.
             if flush_result.is_ok() {
-                let flushed_generation = memtable.generation();
+                let sstable = memtable.generation();
                 if self.grace.is_zero() {
                     state
                         .frozen_memtables
-                        .retain(|frozen| frozen.memtable.generation() != flushed_generation);
+                        .retain(|frozen| frozen.memtable.generation() != sstable);
                 } else {
                     let now = now_millis();
                     for frozen in state.frozen_memtables.iter_mut() {
-                        if frozen.memtable.generation() == flushed_generation {
+                        if frozen.memtable.generation() == sstable {
                             frozen.flushed_at_ms = Some(now);
                         }
                     }
@@ -3098,7 +3879,7 @@ impl MemTableFlushHandler {
 
         info!(
             "Flushed frozen memtable generation {} ({} rows in {:?})",
-            result.generation.generation,
+            result.sstable.generation,
             result.rows_flushed,
             start.elapsed()
         );
@@ -3391,6 +4172,7 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
+    use rstest::rstest;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -3398,6 +4180,26 @@ mod tests {
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    #[test]
+    fn test_merge_close_stage_preserves_first_error() {
+        let result = ShardWriter::merge_close_stage(
+            Err(Error::io("primary close error")),
+            "secondary close stage",
+            Err(Error::io("secondary close error")),
+        );
+
+        let error = result.expect_err("close must preserve the first error");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("primary close error"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.to_string().contains("secondary close error"),
+            "secondary error replaced the primary error: {error}"
+        );
     }
 
     /// Base schema with `id` marked as the unenforced primary key (delete needs
@@ -3415,6 +4217,17 @@ mod tests {
         ]))
     }
 
+    /// [`create_pk_test_schema`] with a non-nullable `name` — the shape that
+    /// used to make `delete` fail.
+    fn create_strict_pk_test_schema() -> Arc<ArrowSchema> {
+        let fields: Vec<Field> = create_pk_test_schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(false))
+            .collect();
+        Arc::new(ArrowSchema::new(fields))
+    }
+
     fn id_only_keys(ids: &[i32]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![Field::new(
@@ -3427,12 +4240,61 @@ mod tests {
         .unwrap()
     }
 
+    /// Two same-typed columns handed over swapped pass every positional check
+    /// downstream, so the logical-schema gate has to catch them by name.
+    #[tokio::test]
+    async fn test_put_rejects_swapped_same_typed_columns() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("email", DataType::Utf8, true),
+        ]));
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                ..Default::default()
+            },
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let swapped = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("email", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a@example.com"])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+
+        let error = writer.put(vec![swapped]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("column 0") && message.contains("email") && message.contains("name"),
+            "error should name the position and both columns: {message}"
+        );
+
+        writer.close().await.unwrap();
+    }
+
     #[test]
     fn test_ensure_tombstone_column_injects_false() {
         let base = create_test_schema();
-        let target = schema_with_tombstone(&base);
-        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &target).unwrap();
-        assert_eq!(out.schema(), target);
+        let storage = schema_with_tombstone(&base);
+        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &storage).unwrap();
+        assert_eq!(out.schema(), storage);
         let ts = out
             .column_by_name(TOMBSTONE)
             .unwrap()
@@ -3444,16 +4306,16 @@ mod tests {
             "put injects _tombstone = false"
         );
         // Idempotent: a batch already carrying the column passes through.
-        let again = ensure_tombstone_column(out.clone(), &target).unwrap();
+        let again = ensure_tombstone_column(out.clone(), &storage).unwrap();
         assert_eq!(again.schema(), out.schema());
     }
 
     #[test]
     fn test_build_tombstone_batch_shape() {
-        let target = schema_with_tombstone(&create_test_schema());
+        let storage = schema_with_tombstone(&create_test_schema());
         let tomb =
-            build_tombstone_batch(&id_only_keys(&[5, 7]), &target, &["id".to_string()]).unwrap();
-        assert_eq!(tomb.schema(), target);
+            build_tombstone_batch(&id_only_keys(&[5, 7]), &storage, &["id".to_string()]).unwrap();
+        assert_eq!(tomb.schema(), storage);
         assert_eq!(tomb.num_rows(), 2);
         let ids = tomb
             .column_by_name("id")
@@ -3478,7 +4340,7 @@ mod tests {
 
     #[test]
     fn test_build_tombstone_batch_missing_pk_errors() {
-        let target = schema_with_tombstone(&create_test_schema());
+        let storage = schema_with_tombstone(&create_test_schema());
         let keys = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![Field::new(
                 "other",
@@ -3488,18 +4350,62 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1]))],
         )
         .unwrap();
-        assert!(build_tombstone_batch(&keys, &target, &["id".to_string()]).is_err());
+        assert!(build_tombstone_batch(&keys, &storage, &["id".to_string()]).is_err());
     }
 
     #[test]
-    fn test_build_tombstone_batch_non_nullable_nonpk_errors() {
-        // A tombstone must null every non-PK column; a non-nullable one fails.
+    fn test_build_tombstone_batch_nulls_non_nullable_base_column() {
+        // The point of the storage schema: a tombstone nulls `v` even though the
+        // base table declares it non-nullable.
+        let pk = ["id".to_string()];
         let base = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
         ]));
-        let target = schema_with_tombstone(&base);
-        assert!(build_tombstone_batch(&id_only_keys(&[1]), &target, &["id".to_string()]).is_err());
+        let storage = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
+
+        let batch = build_tombstone_batch(&id_only_keys(&[1]), &storage, &pk).unwrap();
+
+        assert!(batch["v"].is_null(0), "the tombstone must null `v`");
+        assert!(!batch["id"].is_null(0), "the primary key survives");
+        assert!(
+            batch[TOMBSTONE]
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_rejects_null_primary_key() {
+        // Primary keys are never relaxed, so the storage schema still rejects a
+        // null key — the delete path needs no separate check for it.
+        let pk = ["id".to_string()];
+        let base = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let storage = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![None::<i32>]))],
+        )
+        .unwrap();
+
+        let error = build_tombstone_batch(&keys, &storage, &pk).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("non-nullable"),
+            "error should name the nullability violation: {error}"
+        );
     }
 
     #[tokio::test]
@@ -3566,6 +4472,159 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Delete works against a base table with non-nullable non-PK columns, and
+    /// survivors come back through the narrowing egress relabel intact.
+    #[tokio::test]
+    async fn test_delete_against_non_nullable_base_column_round_trip() {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_strict_pk_test_schema();
+        assert!(
+            !schema.field_with_name("name").unwrap().is_nullable(),
+            "the point of this test is a non-nullable non-PK column"
+        );
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            ..Default::default()
+        };
+        let shard_id = config.shard_id;
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut rows: Vec<(i32, String)> = Vec::new();
+        for b in &batches {
+            assert!(
+                !b.schema().field_with_name("name").unwrap().is_nullable(),
+                "egress must narrow back to the logical schema"
+            );
+            let ids = b["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let names = b["name"].as_any().downcast_ref::<StringArray>().unwrap();
+            rows.extend((0..ids.len()).map(|i| (ids.value(i), names.value(i).to_string())));
+        }
+        rows.sort_unstable();
+
+        assert_eq!(
+            rows,
+            vec![
+                (0, "name_0".to_string()),
+                (1, "name_1".to_string()),
+                (3, "name_3".to_string()),
+                (4, "name_4".to_string()),
+            ],
+            "id=2 deleted; every survivor keeps its non-nullable value"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The storage schema no longer rejects a caller's null, so `put` is the
+    /// only thing standing between a null and a non-nullable base column.
+    #[tokio::test]
+    async fn test_put_rejects_null_in_non_nullable_base_column() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_strict_pk_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                ..Default::default()
+            },
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let error = writer.put(vec![null_name_batch()]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("base table schema"),
+            "error should point at the schema contract: {error}"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// WAL-only mode validates too — it has no memtable, so before this gate
+    /// nothing checked its input at all.
+    #[tokio::test]
+    async fn test_wal_only_put_rejects_null_in_non_nullable_base_column() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_strict_pk_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            wal_only_config(Uuid::new_v4()),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let error = writer.put(vec![null_name_batch()]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// A caller-shaped batch that declares `name` nullable and carries a null —
+    /// legal Arrow, illegal against a base table that declares it non-nullable.
+    fn null_name_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            ],
+        )
+        .unwrap()
     }
 
     /// `delete_no_wait` lands the tombstone in the in-memory tier (visible at
@@ -3661,7 +4720,7 @@ mod tests {
     /// await), but the tombstone still lands in the in-memory tier. The delete
     /// analog of `test_put_no_wait_non_durable_returns_no_watcher`.
     #[tokio::test]
-    async fn test_shard_writer_delete_no_wait_non_durable_returns_no_watcher() {
+    async fn test_non_durable_delete_is_read_your_writes() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let config = ShardWriterConfig {
@@ -3682,7 +4741,10 @@ mod tests {
             .delete_no_wait(vec![id_only_keys(&[2])])
             .await
             .unwrap();
-        assert!(watcher.is_none(), "non-durable delete has nothing to await");
+        // As with a put: a non-durable delete awaits its index apply, not an S3
+        // round-trip. It is read-your-writes, just not durable.
+        let mut watcher = watcher.expect("a non-durable delete awaits its index apply");
+        watcher.wait().await.unwrap();
 
         // Tombstone landed in the in-memory tier (5 rows + 1 tombstone).
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
@@ -3695,7 +4757,7 @@ mod tests {
     /// with an optional filter. Mirrors how a query reads a WAL table after a
     /// flush — the path the wallop fuzz exercised when it caught a deleted row
     /// resurfacing.
-    async fn read_flushed_ids_via_lsm(
+    async fn read_sstable_ids_via_lsm(
         writer: &ShardWriter,
         schema: Arc<ArrowSchema>,
         base_uri: &str,
@@ -3708,8 +4770,8 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().unwrap();
         let mut snapshot =
             ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
-        for fg in &manifest.flushed_generations {
-            snapshot = snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &manifest.sstables {
+            snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
         let mut scanner = LsmScanner::without_base_table(
             schema,
@@ -3745,14 +4807,13 @@ mod tests {
         ShardWriterConfig {
             shard_id,
             durable_write: false,
-            sync_indexed_write: true,
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
-    /// *same* flushed generation, so flush-time dedup must keep the tombstone
+    /// *same* SSTable, so flush-time dedup must keep the tombstone
     /// (newest) and the read must fold it away. Regression for the wallop
     /// phantom (deleted row resurfacing in a filtered read after flush).
     #[tokio::test]
@@ -3781,14 +4842,14 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![0, 1, 3, 4],
-            "id=2 deleted before flush; tombstone must not surface in a flushed-gen scan"
+            "id=2 deleted before flush; tombstone must not surface in an SSTable scan"
         );
         // The filtered read path (folds NOT _tombstone into the predicate) must
         // also drop it — this is the exact wallop failure shape (`id < 3`).
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 3"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 3"))
                 .await,
             vec![0, 1],
             "filtered read after flush must not resurface deleted id=2"
@@ -3802,7 +4863,7 @@ mod tests {
     /// mask the older row by PK. This is the wallop scenario (seed flushed,
     /// then delete, then flush).
     #[tokio::test]
-    async fn test_shard_writer_delete_across_flushed_generations() {
+    async fn test_shard_writer_delete_across_sstables() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
@@ -3831,12 +4892,12 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![1, 2, 3, 4],
             "id=0 tombstoned in a newer gen must mask the older gen's live row"
         );
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
                 .await,
             Vec::<i32>::new(),
             "filtered read 'id < 1' must not resurface cross-gen deleted id=0"
@@ -3845,13 +4906,13 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// Same as the cross-generation case, but the flushed generations carry a
+    /// Same as the cross-generation case, but the SSTables carry a
     /// BTree index on `id` (as every wallop table does). A filtered read
     /// `id < 1` resolves through the scalar index; the `NOT _tombstone` residual
     /// must still be applied or the deleted row leaks. This is the exact wallop
     /// failure (BTree id + `FilteredRead 'id < 1'` resurfacing deleted id=0).
     #[tokio::test]
-    async fn test_shard_writer_delete_across_flushed_generations_indexed() {
+    async fn test_shard_writer_delete_across_sstables_indexed() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
@@ -3883,12 +4944,12 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![1, 2, 3, 4],
             "indexed cross-gen: full scan must mask deleted id=0"
         );
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
                 .await,
             Vec::<i32>::new(),
             "indexed filtered read 'id < 1' must not resurface deleted id=0 (wallop repro)"
@@ -4070,9 +5131,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4113,9 +5173,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4142,7 +5201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_no_wait_non_durable_returns_no_watcher() {
+    async fn test_non_durable_put_is_read_your_writes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
@@ -4150,9 +5209,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4165,7 +5223,21 @@ mod tests {
         let batch = create_test_batch(&schema, 0, 10);
         let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
         assert_eq!(result.batch_positions, 0..1);
-        assert!(watcher.is_none(), "non-durable put has nothing to await");
+
+        // A non-durable put still has something to await: its *index apply*.
+        // Skipping durability now costs the caller durability only — not
+        // visibility. Before the index apply was split off the WAL flush, a
+        // non-durable write was not read-your-writes at all: the row stayed
+        // invisible until some later flush happened to index it.
+        let mut watcher = watcher.expect("a non-durable put awaits its index apply");
+        watcher.wait().await.unwrap();
+
+        let scanned = writer.scan().await.unwrap().try_into_batch().await.unwrap();
+        assert_eq!(
+            scanned.num_rows(),
+            10,
+            "a non-durable put must be readable as soon as it returns"
+        );
 
         let stats = writer.memtable_stats().await.unwrap();
         assert_eq!(stats.row_count, 10);
@@ -4182,9 +5254,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4217,9 +5288,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4253,12 +5323,12 @@ mod tests {
     }
 
     /// End-to-end check that the background flush handler rebuilds secondary
-    /// indexes on every flushed generation. Before this, the handler flushed
-    /// via plain `flush`, leaving flushed generations unindexed — point
+    /// indexes on every SSTable. Before this, the handler flushed
+    /// via plain `flush`, leaving SSTables unindexed — point
     /// lookups had to full-scan and vector search's index-only `fast_search`
     /// couldn't see the data at all.
     #[tokio::test]
-    async fn test_flushed_generation_is_indexed() {
+    async fn test_sstable_is_indexed() {
         use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -4269,9 +5339,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4303,22 +5372,18 @@ mod tests {
         writer.force_seal_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
 
-        // Resolve the flushed generation recorded in the manifest.
+        // Resolve the SSTable recorded in the manifest.
         let manifest = writer.manifest().await.unwrap().unwrap();
-        assert_eq!(
-            manifest.flushed_generations.len(),
-            1,
-            "expected exactly one flushed generation"
-        );
+        assert_eq!(manifest.sstables.len(), 1, "expected exactly one SSTable");
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, manifest.flushed_generations[0].path
+            base_uri, shard_id, manifest.sstables[0].path
         );
 
-        // The flushed generation must carry the BTree index built during flush.
+        // The SSTable must carry the BTree index built during flush.
         let dataset = crate::Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1, "flushed generation should have one index");
+        assert_eq!(indices.len(), 1, "SSTable should have one index");
         assert_eq!(indices[0].name, "id_idx");
 
         // A PK filter over it must resolve through the index, not a full scan.
@@ -4358,9 +5423,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 1024, // Very small - will trigger flush quickly
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4387,6 +5451,88 @@ mod tests {
             stats.generation > initial_gen,
             "Generation should increment after auto-flush"
         );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The two fields count different things on purpose: bytes drain on flush
+    /// commit, the handle lingers for `frozen_memtable_grace`. A long grace
+    /// therefore leaves count non-zero with bytes back at zero.
+    #[tokio::test]
+    async fn test_memtable_stats_frozen_count_outlives_frozen_bytes() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 1024, // small enough to seal within the loop below
+            frozen_memtable_grace: Duration::from_secs(600),
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let fresh = writer.memtable_stats().await.unwrap();
+        assert_eq!(fresh.frozen_count, 0);
+        assert_eq!(fresh.frozen_bytes, 0);
+
+        for i in 0..20 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.frozen_count > 0,
+            "flushed memtables must stay in the read view for the grace window"
+        );
+        assert_eq!(
+            stats.frozen_bytes, 0,
+            "every seal flushed, so nothing is owed to flush"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The controller sits in a private `WriterMode` variant, reachable only
+    /// through the writer. Both modes must answer.
+    #[rstest::rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_backpressure_stats_reachable_in_both_modes(#[case] enable_memtable: bool) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            enable_memtable,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        // A writer well under the threshold has never throttled.
+        let stats = writer.backpressure_stats();
+        assert_eq!(stats.total_count, 0);
+        assert_eq!(stats.total_wait_ms, 0);
+        assert_eq!(stats.active_count, 0);
 
         writer.close().await.unwrap();
     }
@@ -4449,7 +5595,113 @@ mod tests {
             call_count.load(Ordering::SeqCst)
         );
 
-        executor.shutdown_all().await.ok();
+        executor
+            .shutdown_all()
+            .await
+            .expect("dispatcher should shut down successfully");
+    }
+
+    #[tokio::test]
+    async fn test_task_executor_shutdown_propagates_cleanup_error_and_joins_all_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CleanupHandler {
+            cleanup_count: Arc<AtomicUsize>,
+            error_message: Option<&'static str>,
+        }
+
+        #[async_trait]
+        impl MessageHandler<u32> for CleanupHandler {
+            async fn handle(&mut self, _message: u32) -> Result<()> {
+                Ok(())
+            }
+
+            async fn cleanup(&mut self, _shutdown_ok: bool) -> Result<()> {
+                self.cleanup_count.fetch_add(1, Ordering::SeqCst);
+                match self.error_message {
+                    Some(message) => Err(Error::io(message)),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        let executor = TaskExecutor::new();
+        let cleanup_count = Arc::new(AtomicUsize::new(0));
+        let (_failing_tx, failing_rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "failing-cleanup".to_string(),
+                Box::new(CleanupHandler {
+                    cleanup_count: cleanup_count.clone(),
+                    error_message: Some("intentional cleanup failure"),
+                }),
+                failing_rx,
+            )
+            .unwrap();
+        let (_successful_tx, successful_rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "successful-cleanup".to_string(),
+                Box::new(CleanupHandler {
+                    cleanup_count: cleanup_count.clone(),
+                    error_message: None,
+                }),
+                successful_rx,
+            )
+            .unwrap();
+
+        let error = executor
+            .shutdown_all()
+            .await
+            .expect_err("shutdown must propagate the handler cleanup failure");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("intentional cleanup failure"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            cleanup_count.load(Ordering::SeqCst),
+            2,
+            "shutdown must join and clean up every task after the first failure"
+        );
+        assert!(executor.tasks.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_task_executor_shutdown_propagates_task_panic() {
+        struct PanickingCleanupHandler;
+
+        #[async_trait]
+        impl MessageHandler<u32> for PanickingCleanupHandler {
+            async fn handle(&mut self, _message: u32) -> Result<()> {
+                Ok(())
+            }
+
+            async fn cleanup(&mut self, _shutdown_ok: bool) -> Result<()> {
+                panic!("intentional cleanup panic");
+            }
+        }
+
+        let executor = TaskExecutor::new();
+        let (_tx, rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "panicking-cleanup".to_string(),
+                Box::new(PanickingCleanupHandler),
+                rx,
+            )
+            .unwrap();
+
+        let error = executor
+            .shutdown_all()
+            .await
+            .expect_err("shutdown must propagate the task panic");
+        assert!(matches!(&error, Error::Internal { .. }));
+        assert!(
+            error.to_string().contains("panicking-cleanup")
+                && error.to_string().contains("panicked during shutdown"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Same as the local-fs test but against memory:// — closer to S3
@@ -4465,9 +5717,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4510,9 +5761,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold — every batch crosses it.
             max_memtable_size: 64,
             manifest_scan_batch_size: 2,
@@ -4577,9 +5827,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: usize::MAX,
             max_unflushed_memtable_bytes: usize::MAX,
             manifest_scan_batch_size: 2,
@@ -4644,6 +5893,55 @@ mod tests {
         reopened.close().await.unwrap();
     }
 
+    #[rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_close_propagates_final_wal_persistence_failure(#[case] enable_memtable: bool) {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            enable_memtable,
+            max_wal_buffer_size: usize::MAX,
+            max_wal_flush_interval: None,
+            max_wal_persist_retries: 0,
+            max_memtable_size: usize::MAX,
+            max_unflushed_memtable_bytes: usize::MAX,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+        let task_executor = writer.task_executor.clone();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        controls.fail_wal_puts(usize::MAX);
+
+        let error = writer
+            .close()
+            .await
+            .expect_err("close must propagate the final WAL persistence failure");
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(
+            error
+                .to_string()
+                .contains("injected transient WAL put failure"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            task_executor.tasks.read().unwrap().is_empty(),
+            "close must join background tasks before returning an error"
+        );
+    }
+
     /// Regression: the memtable flush should successfully fire many
     /// times in a row. A bug where every flush wrote the same path was
     /// caught by lance-format/lance#6713.
@@ -4658,9 +5956,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold so a few batches cross it.
             max_memtable_size: 1024,
             manifest_scan_batch_size: 2,
@@ -4756,6 +6053,92 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 4);
         // Should have recorded backpressure wait time (waited 3 times)
         assert_eq!(controller.stats().count(), 1);
+        assert_eq!(
+            controller.stats().snapshot().active_count,
+            0,
+            "the wait is over, so nobody is parked"
+        );
+    }
+
+    /// The totals only move when a wait ends, so a first stall would be
+    /// invisible to a poller if `active_count` did not report it live.
+    #[tokio::test]
+    async fn test_backpressure_in_progress_wait_is_observable() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use std::time::Duration;
+
+        let config = ShardWriterConfig::default()
+            .with_max_unflushed_memtable_bytes(100)
+            .with_backpressure_log_interval(Duration::from_millis(50));
+
+        let controller = BackpressureController::new(config);
+        let stats = controller.stats().clone();
+
+        let unflushed = Arc::new(AtomicUsize::new(1000));
+        let release = unflushed.clone();
+
+        let parked =
+            controller.maybe_apply_backpressure(|| (unflushed.load(AtomicOrdering::Relaxed), None));
+
+        let observer = async {
+            // Bounded so a regression that never publishes the park fails here
+            // instead of hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stats.snapshot().active_count == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "an ongoing wait was never published"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mid = stats.snapshot();
+            assert_eq!(mid.active_count, 1);
+            assert_eq!(
+                mid.total_count, 0,
+                "a wait still in progress is not a completed one"
+            );
+            assert_eq!(mid.total_wait_ms, 0);
+
+            release.store(0, AtomicOrdering::Relaxed);
+        };
+
+        let (result, ()) = tokio::join!(parked, observer);
+        result.unwrap();
+
+        let after = stats.snapshot();
+        assert_eq!(after.active_count, 0, "the guard drops when the wait ends");
+        assert_eq!(after.total_count, 1);
+    }
+
+    /// A `put` whose caller times out drops the wait future mid-park. The gauge
+    /// must come back down, or a cancelled writer is throttled forever on paper.
+    #[tokio::test]
+    async fn test_backpressure_cancelled_wait_does_not_leak_active_count() {
+        use std::time::Duration;
+
+        let config = ShardWriterConfig::default()
+            .with_max_unflushed_memtable_bytes(100)
+            .with_backpressure_log_interval(Duration::from_millis(50));
+
+        let controller = BackpressureController::new(config);
+
+        // Never drops below the threshold, so the timeout is what ends the wait.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                controller.maybe_apply_backpressure(|| (1000, None)),
+            )
+            .await
+            .is_err()
+        );
+
+        let after = controller.stats().snapshot();
+        assert_eq!(after.active_count, 0, "cancellation must release the guard");
+        assert_eq!(
+            after.total_count, 0,
+            "a cancelled wait never completed, so it is not a completed wait"
+        );
     }
 
     /// Records what it saw and answers with a fixed verdict.
@@ -4962,7 +6345,7 @@ mod tests {
             durable_write: true,
             enable_memtable: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
@@ -4987,8 +6370,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Two durable puts → two WAL entries (durable_write triggers an
-        // explicit flush per put).
+        // Two durable puts → two WAL entries. Each `put` awaits its own append
+        // (driven by the background ticker) before returning, so the second
+        // batch is only pushed after the first is durable — they never coalesce.
         let r1 = writer
             .put(vec![create_test_batch(&schema, 0, 4)])
             .await
@@ -5017,6 +6401,51 @@ mod tests {
         // Both entries from the same writer should have the same epoch.
         assert_eq!(e0.writer_epoch, e1.writer_epoch);
         assert!(e0.writer_epoch >= 1);
+    }
+
+    /// A durable WAL-only put is driven by the background ticker, not an inline
+    /// per-put flush: `put().await` must not return until the ticker's append
+    /// advances the durability watermark it waits on. With a long interval and a
+    /// buffer the write cannot cross, the ticker is the *only* thing that can
+    /// make the put durable — so if the WAL entry is present the instant `put`
+    /// returns (before any `close()`), the watermark-wait is doing its job.
+    #[tokio::test]
+    async fn test_wal_only_durable_put_waits_for_ticker_append() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let mut config = wal_only_config(shard_id);
+        config.max_wal_flush_interval = Some(Duration::from_millis(100));
+        config.max_wal_buffer_size = 100 * 1024 * 1024; // never crossed
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 4)])
+            .await
+            .unwrap();
+
+        // `put` returned, so the batch must already be durable — read the WAL
+        // directly, without closing the writer.
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        assert_eq!(tailer.next_position().await.unwrap(), 2);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
+        assert_eq!(entry.batches.len(), 1);
+        assert_eq!(entry.batches[0].num_rows(), 4);
+
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -5253,9 +6682,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -5279,8 +6707,9 @@ mod tests {
     }
 
     // A durable write whose WAL PUT keeps failing poisons the writer with a
-    // typed persistence failure; the next write fails fast with the same reason;
-    // and once storage heals, reopening replays the WAL and writes resume.
+    // typed persistence failure; the next write *and every read* fail fast with
+    // the same reason; and once storage heals, reopening replays the WAL and
+    // writes resume.
     #[tokio::test]
     async fn test_writer_poisons_on_persistence_failure_and_recovers_on_reopen() {
         let (store, base_path, controls) = failing_memory_store().await;
@@ -5319,6 +6748,31 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // ...and rejects *reads* too. Batch 0 was committed to the BatchStore
+        // before its WAL PUT failed, so a poisoned writer that still served
+        // reads would hand out a row that is not durable and that replay will
+        // not reproduce — a divergent snapshot. Mirrors SlateDB's
+        // `check_closed()` at the top of every read.
+        for reason in [
+            writer.scan().await.err().and_then(|e| e.fence_reason()),
+            writer
+                .active_memtable_ref()
+                .await
+                .err()
+                .and_then(|e| e.fence_reason()),
+            writer
+                .in_memory_memtable_refs()
+                .await
+                .err()
+                .and_then(|e| e.fence_reason()),
+        ] {
+            assert_eq!(reason, Some(FenceReason::PersistenceFailure));
+        }
+
+        // Stats stay readable: this is what an operator (and the eviction path)
+        // inspects to decide what to do about the poisoned shard.
+        writer.memtable_stats().await.unwrap();
         drop(writer);
 
         // Storage heals: reopening replays the WAL and accepts writes again.
@@ -5330,6 +6784,224 @@ mod tests {
             .put(vec![create_test_batch(&schema, 2, 1)])
             .await
             .unwrap();
+    }
+
+    /// A doomed open must fail on local validation *before* it claims the epoch,
+    /// so it cannot fence the healthy writer already serving the shard. The
+    /// index-config check used to run *after* `claim_epoch` (and, for a successor,
+    /// after `write_fence_sentinel`), so a rejected open still bumped the stored
+    /// epoch and fenced the incumbent.
+    #[tokio::test]
+    async fn test_doomed_open_does_not_fence_incumbent() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+
+        // An index config that disagrees with the schema (FTS on the Int32 `id`
+        // column) is rejected on local validation. On the old path this rejection
+        // landed only after the epoch had already been claimed.
+        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
+            "bad_fts".to_string(),
+            0,
+            "id".to_string(),
+        ));
+        let err = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![bad_fts],
+        )
+        .await
+        .map(|_| ())
+        .expect_err("an FTS index on a non-Utf8 column must be rejected");
+        assert!(
+            err.to_string().contains("bad_fts") && err.to_string().contains("Utf8"),
+            "unexpected error: {err}"
+        );
+
+        // The incumbent is untouched: not fenced, still accepting writes.
+        writer_a.check_fenced().await.unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap();
+        writer_a.close().await.unwrap();
+    }
+
+    /// A failed dispatch during `freeze_memtable` must not drop the outgoing
+    /// table's rows from the read view. The active memtable is replaced before
+    /// the WAL-flush and index-apply sends; a send that failed (background tasks
+    /// gone) used to return before the outgoing table was retained in
+    /// `frozen_memtables`, so its accepted rows silently vanished — a scan
+    /// returned 0 rows with no error. The writer must instead retain the table
+    /// and poison, so reads fail fast rather than serve a divergent snapshot.
+    #[tokio::test]
+    async fn test_freeze_dispatch_failure_retains_rows_and_poisons() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Non-durable + no ticker: the put is read-your-writes (waits for its
+        // index apply) but nothing is WAL-flushed, so the freeze below still owes
+        // a WAL append.
+        let config = ShardWriterConfig {
+            durable_write: false,
+            max_wal_flush_interval: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+
+        // Tear the background tasks down out from under the writer, so the
+        // freeze's dispatch sends hit closed channels.
+        writer.abort().await.unwrap();
+
+        let err = writer
+            .force_seal_active()
+            .await
+            .expect_err("force_seal_active must surface the failed dispatch");
+        assert!(
+            err.to_string().contains("channel closed"),
+            "unexpected error: {err}"
+        );
+
+        // The failure poisoned the writer: reads fail fast instead of returning a
+        // silent zero-row snapshot of a shard whose rows were dropped.
+        assert!(
+            writer.scan().await.is_err(),
+            "a poisoned writer must reject reads, not serve a divergent snapshot"
+        );
+        assert!(writer.in_memory_memtable_refs().await.is_err());
+    }
+
+    /// A WAL holding more batches than one memtable's capacity must reopen.
+    ///
+    /// One memtable holds at most `max_memtable_batches` batches, but a WAL is
+    /// unbounded, so replay has to rotate — seal the full memtable, start a fresh
+    /// one — exactly as the live write path does. Before, replay stuffed
+    /// everything into a single memtable and `open()` failed outright with
+    /// "MemTable batch store is full", leaving the shard permanently unopenable.
+    #[tokio::test]
+    async fn test_replay_rotates_when_wal_exceeds_one_memtable() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        const N: i32 = 8;
+
+        // Writer A has a *large* capacity, so its eight one-batch puts all land in
+        // a single memtable and it never freezes or flushes a generation of its
+        // own. Dropping it without close leaves an eight-entry WAL and no
+        // generations — a WAL that no single small memtable could hold.
+        let writer_a_config = ShardWriterConfig {
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        // Writer B has a *two-batch* capacity, so replaying that eight-entry WAL is
+        // exactly what must rotate. Keeping the configs distinct isolates replay
+        // rotation from the live rotation writer A would otherwise do concurrently.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                writer_a_config,
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            for id in 0..N {
+                writer_a
+                    .put(vec![create_test_batch(&schema, id, 1)])
+                    .await
+                    .unwrap();
+            }
+            // Drop without close: only the WAL survives, and it holds more batches
+            // than writer B's memtable can.
+        }
+
+        // Total rows across the active memtable plus every SSTable.
+        // Distinct ids, so no cross-generation dedup — a plain sum is exact.
+        async fn total_rows(writer: &ShardWriter, base_uri: &str, shard_id: Uuid) -> usize {
+            let mut rows = writer.memtable_stats().await.unwrap().row_count;
+            let manifest = writer.manifest().await.unwrap().unwrap();
+            for sstable in &manifest.sstables {
+                let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, sstable.path);
+                let dataset = crate::Dataset::open(&gen_uri).await.unwrap();
+                rows += dataset.count_rows(None).await.unwrap();
+            }
+            rows
+        }
+
+        // Reopen. This used to fail with a full-batch-store error.
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .expect("a WAL larger than one memtable must still reopen");
+
+        // Rotation produced sealed memtables, and replay flushed each to a Lance
+        // generation rather than holding it in memory or leaving it in the WAL.
+        let manifest = writer_b.manifest().await.unwrap().unwrap();
+        assert!(
+            !manifest.sstables.is_empty(),
+            "replay must have sealed and flushed at least one full memtable"
+        );
+
+        // Every row survived, split between the SSTables and the
+        // active (partial) memtable.
+        assert_eq!(
+            total_rows(&writer_b, &base_uri, shard_id).await as i32,
+            N,
+            "every replayed row must be durable, across generations and the active memtable"
+        );
+        writer_b.close().await.unwrap();
+
+        // Because the sealed memtables were flushed, the manifest's replay cursor
+        // advanced past their WAL entries — so a second reopen replays only the
+        // tail and still accounts for every row. The WAL truncates across reopens
+        // rather than growing without bound.
+        let writer_c =
+            ShardWriter::open(store, base_path, base_uri.clone(), config, schema, vec![])
+                .await
+                .unwrap();
+        assert_eq!(total_rows(&writer_c, &base_uri, shard_id).await as i32, N);
+        writer_c.close().await.unwrap();
     }
 
     /// Replay-on-open recovers durable WAL entries that were never flushed
@@ -5394,6 +7066,431 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
+    /// Replayed batches are already WAL-durable, so the first flush after a
+    /// reopen must not re-append them to the WAL or re-insert them into the
+    /// indexes. Before replay stamped the durability cursor it stayed at
+    /// "nothing flushed", so the next flush re-covered `[0, end)`: it appended
+    /// the already-durable rows a second time *and* re-indexed them. None of
+    /// the in-memory indexes is idempotent, so an indexed PK lookup returned
+    /// the row twice while a full scan still looked healthy.
+    #[tokio::test]
+    async fn test_replay_does_not_reappend_or_reindex() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Writer A: two durable batches (5 + 3 = 8 rows), dropped without close.
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                memtable_config_with_pk(shard_id),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 5)])
+                .await
+                .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 100, 3)])
+                .await
+                .unwrap();
+        }
+
+        // Writer B reopens and replays A's two batches.
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let stats = writer_b.memtable_stats().await.unwrap();
+        assert_eq!(stats.batch_count, 2);
+        assert_eq!(
+            stats.durable_batch_count, 2,
+            "replayed batches came from the WAL, so the durability cursor must already cover them"
+        );
+
+        // One more durable put. Its flush must cover only the new batch.
+        writer_b
+            .put(vec![create_test_batch(&schema, 200, 2)])
+            .await
+            .unwrap();
+
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut wal_rows = 0;
+        for position in first..next {
+            if let Some(entry) = tailer.read_entry(position).await.unwrap() {
+                wal_rows += entry.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+        }
+        assert_eq!(
+            wal_rows, 10,
+            "WAL must hold 8 replayed + 2 new rows; a re-covering flush re-appends the replayed 8"
+        );
+
+        // The indexed arm must not see a replayed row twice.
+        let mut scanner = writer_b.scan().await.unwrap();
+        scanner.filter("id = 0").unwrap();
+        let hit = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            hit.num_rows(),
+            1,
+            "indexed PK lookup returned the replayed row more than once"
+        );
+
+        let all = writer_b
+            .scan()
+            .await
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(all.num_rows(), 10);
+
+        writer_b.close().await.unwrap();
+    }
+
+    /// A non-durable put is readable through the **index-backed** arms the moment
+    /// it returns, not just through a full scan.
+    ///
+    /// This is what splitting the index apply off the WAL flush buys. Before, the
+    /// index apply only ran as one arm of the flush, so with `durable_write:
+    /// false` nothing triggered it on the put path at all: the row sat in the
+    /// batch store, unindexed, until some later flush happened along. A full scan
+    /// (which reads the batch store directly) could still find it, while every
+    /// index-accelerated query could not — the tiers disagreed. Now the apply is
+    /// triggered per-put in both modes, so `put` returning means "indexed".
+    #[tokio::test]
+    async fn test_non_durable_put_is_visible_through_the_index() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            durable_write: false,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        // The indexed PK lookup must find it — this is the arm that saw nothing
+        // before, because the index apply had never run.
+        let mut scanner = writer.scan().await.unwrap();
+        scanner.filter("id = 3").unwrap();
+        let hit = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            hit.num_rows(),
+            1,
+            "an index-backed lookup must see a non-durable put as soon as it returns"
+        );
+
+        // ...and so must the unindexed full scan, i.e. the tiers agree.
+        let all = writer.scan().await.unwrap().try_into_batch().await.unwrap();
+        assert_eq!(all.num_rows(), 5);
+
+        writer.close().await.unwrap();
+    }
+
+    /// The durability cursor is writer-global, so a put into a *post-rotation*
+    /// memtable must still wait for its own WAL append.
+    ///
+    /// Batch positions restart at 0 in every memtable, but the durability watch
+    /// channel spans the writer's whole life and is never reset. When the put
+    /// path targeted a memtable-local position, the first N puts into every
+    /// memtable after the first were already "satisfied" by the *previous*
+    /// memtable's N appends: they acked instantly, with no WAL append, and
+    /// `durable_write: true` silently degraded to non-durable. Worse, the next
+    /// append then sent a *smaller* value, walking the watermark backwards and
+    /// hanging any watcher still waiting on the old, higher one.
+    ///
+    /// The cursor is now a writer-global exclusive count and every target is
+    /// lifted through the store's `global_offset`, so it only ever moves forward
+    /// and a post-rotation put can only be acked by its own append.
+    #[tokio::test]
+    async fn test_durable_ack_after_rotation_requires_its_own_wal_append() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // A two-batch memtable, so the third put forces a freeze + rotation.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Fill and rotate the first memtable.
+        for i in 0..3 {
+            writer
+                .put(vec![create_test_batch(&schema, i * 5, 5)])
+                .await
+                .unwrap();
+        }
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.global_offset > 0,
+            "expected a rotation; the active memtable is still the writer's first"
+        );
+
+        // Every batch acked so far must be genuinely durable, and the cursor must
+        // cover the active memtable's entire prefix rather than lagging inside it.
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.durable_batch_count >= stats.global_offset + stats.batch_count,
+            "durable_write acked a put the WAL never received: durable={} but the active \
+             memtable spans [{}, {})",
+            stats.durable_batch_count,
+            stats.global_offset,
+            stats.global_offset + stats.batch_count
+        );
+
+        // And the WAL really holds every row we acked (3 puts x 5 rows).
+        writer.close().await.unwrap();
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut wal_rows = 0;
+        for position in first..next {
+            if let Some(entry) = tailer.read_entry(position).await.unwrap() {
+                wal_rows += entry.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+        }
+        assert_eq!(
+            wal_rows, 15,
+            "every acked row must be in the WAL; a post-rotation put that acked without an \
+             append would leave rows missing"
+        );
+    }
+
+    /// A background tick must append the **oldest** store that still owes the WAL,
+    /// never "whatever memtable is active".
+    ///
+    /// A tick carries no store: it is enqueued by a timer and resolved when it is
+    /// handled. So a tick enqueued before a freeze is handled *after* it, and
+    /// resolving to the active memtable would append the incoming memtable's
+    /// batches ahead of the outgoing memtable's tail. WAL entry positions are
+    /// assigned in append-call order, replay walks them ascending, row positions
+    /// follow, and primary-key recency is "newest visible row position wins" — so
+    /// that inverts dedup after a crash, handing the key to the stale row. It
+    /// survives the crash that caused it, and a full scan cannot see it.
+    #[test]
+    fn test_next_pending_store_picks_the_oldest_owing_an_append() {
+        let schema = create_test_schema();
+
+        // A frozen store of 2 batches at coordinate 0, and the active store that
+        // rotated in behind it at coordinate 2.
+        let frozen = Arc::new(BatchStore::with_capacity(4));
+        frozen.append(create_test_batch(&schema, 0, 1)).unwrap();
+        frozen.append(create_test_batch(&schema, 1, 1)).unwrap();
+        let active = Arc::new(BatchStore::with_capacity_at(4, 2));
+        active.append(create_test_batch(&schema, 2, 1)).unwrap();
+
+        let frozen_list = || std::iter::once(Arc::clone(&frozen));
+
+        // Nothing durable: the frozen store owes the oldest append, so it wins —
+        // even though the active memtable also has un-appended batches.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&picked, &frozen),
+            "the outgoing memtable's tail must be appended before the incoming one's head"
+        );
+
+        // Still true partway through the frozen store.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 1).unwrap();
+        assert!(Arc::ptr_eq(&picked, &frozen));
+
+        // Once the frozen store is fully durable, the active one is next.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 2).unwrap();
+        assert!(Arc::ptr_eq(&picked, &active));
+
+        // Everything durable: nothing to do.
+        assert!(next_pending_store(frozen_list(), Arc::clone(&active), 3).is_none());
+    }
+
+    /// A durable writer with no flush ticker cannot make progress in either
+    /// mode — the ticker is the only thing that drives the WAL append the put
+    /// waits on — so `open()` rejects it rather than letting a put block forever.
+    #[rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_open_rejects_durable_write_without_a_ticker(#[case] enable_memtable: bool) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            durable_write: true,
+            enable_memtable,
+            max_wal_flush_interval: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let Err(err) = ShardWriter::open(store, base_path, base_uri, config, schema, vec![]).await
+        else {
+            panic!("durable_write with no ticker must be rejected");
+        };
+        assert!(
+            err.to_string().contains("max_wal_flush_interval"),
+            "the error must name the knob, got: {err}"
+        );
+    }
+
+    /// WAL entries must be appended in global batch-position order across a
+    /// memtable rotation, because append order *is* primary-key recency order.
+    ///
+    /// `WalAppender::append` assigns each entry's position from its own counter,
+    /// in call order. Replay walks those positions ascending and assigns row
+    /// positions in that order. Primary-key recency is "newest visible row
+    /// position wins". So an out-of-order append silently inverts dedup after a
+    /// crash — the stale row wins — and a full scan cannot see it.
+    ///
+    /// The hazard is the background ticker. If it resolved to "whatever memtable
+    /// is active" rather than to the oldest store still owing an append, a tick
+    /// enqueued before a freeze but handled after it would append the *incoming*
+    /// memtable's batches ahead of the outgoing memtable's tail. So the target is
+    /// resolved from the durability cursor, not from wall-clock timing.
+    #[tokio::test]
+    async fn test_wal_append_order_preserves_pk_recency_across_rotation() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Two batches per memtable, so the second put fills it and rotates.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Memtable 1: ids 7 then 20 (the second fills it and triggers the freeze).
+        writer
+            .put(vec![create_test_batch(&schema, 7, 1)])
+            .await
+            .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 20, 1)])
+            .await
+            .unwrap();
+        // Memtable 2 overwrites id=7 with a newer row. Its append must land in the
+        // WAL *after* memtable 1's, or replay would resolve id=7 to the stale copy.
+        writer
+            .put(vec![create_test_batch(&schema, 30, 1)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        // Walk the WAL in entry order and collect the ids as replay would see them.
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for position in first..next {
+            let Some(entry) = tailer.read_entry(position).await.unwrap() else {
+                continue;
+            };
+            for batch in &entry.batches {
+                let column = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.extend((0..column.len()).map(|i| column.value(i)));
+            }
+        }
+
+        assert_eq!(
+            ids,
+            vec![7, 20, 30],
+            "WAL entries must follow global batch-position order; memtable 1's rows must \
+             precede memtable 2's, or replay inverts primary-key recency"
+        );
+    }
+
+    /// An index config that disagrees with the schema fails `open()` outright.
+    /// It must not be allowed to accept writes: the insert would fail
+    /// deterministically on every batch, including batches replayed from the
+    /// WAL, so once a row was durable the shard could never reopen. Before this
+    /// check, an FTS index on a non-Utf8 column silently indexed nothing and the
+    /// shard reported healthy.
+    #[tokio::test]
+    async fn test_open_rejects_index_config_that_disagrees_with_schema() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // `id` is Int32, not a string column.
+        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
+            "bad_fts".to_string(),
+            0,
+            "id".to_string(),
+        ));
+
+        let Err(err) = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![bad_fts],
+        )
+        .await
+        else {
+            panic!("open must reject an FTS index on a non-Utf8 column");
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bad_fts") && message.contains("Utf8"),
+            "error must name the index and the constraint, got: {message}"
+        );
+    }
+
     /// Replay is a no-op on a fresh shard: the MemTable starts empty.
     #[tokio::test]
     async fn test_memtable_replay_no_op_on_fresh_shard() {
@@ -5419,13 +7516,13 @@ mod tests {
 
     /// Regression for the OSS-WAL compactor-drain bug: after a flush
     /// records its generation in the manifest and an external compactor
-    /// later drains `flushed_generations` back to empty (the legitimate
-    /// outcome of merging the generation into the base table), reopening
+    /// later drains `sstables` back to empty (the legitimate
+    /// outcome after compacting the SSTable into the base table), reopening
     /// the writer must not re-replay the already-flushed WAL entry into
     /// the active memtable.
     ///
     /// Under the pre-fix logic, replay disambiguated "fresh shard" from
-    /// "flushed-then-compacted" with `flushed_generations.is_empty()`,
+    /// "flushed-then-compacted" with `sstables.is_empty()`,
     /// which collapsed both cases into start-at-0. With 1-based WAL
     /// positions and a default cursor of 0 meaning "no flush stamped",
     /// the flush-then-drain sequence leaves `replay_after_wal_entry_position`
@@ -5439,7 +7536,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // Writer A: write 5 rows, close (forces a flush of the active
-        // memtable). The manifest now records a flushed generation and
+        // memtable). The manifest now records an SSTable and
         // pins `replay_after_wal_entry_position` to the covered WAL entry.
         {
             let writer_a = ShardWriter::open(
@@ -5459,14 +7556,14 @@ mod tests {
             writer_a.close().await.unwrap();
         }
 
-        // Simulate an external compactor merging the flushed generation
-        // into the base table: drain `flushed_generations` to empty via a
+        // Simulate an external compactor compacting the SSTable.
+        // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
         let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         let pre = manifest_store.read_latest().await.unwrap().unwrap();
         assert!(
-            !pre.flushed_generations.is_empty(),
-            "writer A's close() should have stamped a flushed generation"
+            !pre.sstables.is_empty(),
+            "writer A's close() should have stamped an SSTable"
         );
         let cursor_at_flush = pre.replay_after_wal_entry_position;
         assert!(
@@ -5480,22 +7577,22 @@ mod tests {
         manifest_store
             .commit_update(compactor_epoch, |current| ShardManifest {
                 version: current.version + 1,
-                flushed_generations: vec![],
+                sstables: vec![],
                 ..current.clone()
             })
             .await
             .unwrap();
         let post = manifest_store.read_latest().await.unwrap().unwrap();
         assert!(
-            post.flushed_generations.is_empty(),
-            "compactor drain should have left flushed_generations empty"
+            post.sstables.is_empty(),
+            "compactor drain should have left sstables empty"
         );
         assert_eq!(
             post.replay_after_wal_entry_position, cursor_at_flush,
             "compactor must not touch the replay cursor"
         );
 
-        // Writer B reopens. Pre-fix: replay saw flushed_generations empty,
+        // Writer B reopens. Pre-fix: replay saw sstables empty,
         // restarted at WAL position 0, and re-inserted writer A's rows.
         // Post-fix: replay starts at cursor + 1, finds no entry, and the
         // memtable stays empty.
@@ -5730,8 +7827,9 @@ mod tests {
     /// fence), the drained batches were dropped — the next concurrent put
     /// would then see an empty pending queue and spuriously return Ok,
     /// hiding the data loss. With the snapshot/commit fix, the failed flush
-    /// leaves the batches in the queue, and the concurrent put gets a clean
-    /// fence error too (when its own flush attempts the same WAL position).
+    /// leaves the batches in the queue for retry, and — because the flush is
+    /// terminal — it poisons the writer, waking *both* parked durability
+    /// waiters with the typed fence error instead of either one hanging.
     #[tokio::test]
     async fn test_wal_only_fenced_concurrent_puts_do_not_silently_succeed() {
         use std::sync::Arc;
@@ -5782,9 +7880,10 @@ mod tests {
         // the destructive-drain bug, the first flush would consume both
         // pending batches into a failing append; the second flush would
         // see an empty queue and return spurious success, silently losing
-        // the second put's data. With the snapshot/commit fix, the failed
-        // append leaves both batches in the queue and the second flush
-        // also fails with the fence error.
+        // the second put's data. Now both puts park on the durability
+        // watermark; the ticker's append fails with the fence, poisons the
+        // writer, and both waiters wake with the fence error — batches intact
+        // in the queue.
         let a1 = writer_a.clone();
         let a2 = writer_a.clone();
         let schema1 = schema.clone();
@@ -5843,6 +7942,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memtable_stats_record_index_update() {
+        // MemTable mode with a BTree index: index application runs on its own
+        // task and must record an index-update stat. Regression for the stat
+        // silently reading zero after index apply moved off the WAL-flush path.
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "id_idx".to_string(),
+            field_id: 0,
+            column: "id".to_string(),
+        })];
+
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            flush_test_config(Uuid::new_v4()),
+            schema.clone(),
+            index_configs,
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 3)])
+            .await
+            .unwrap();
+
+        let stats_handle = writer.stats_handle();
+        // `close()` drains the index-apply task, so the apply is settled here.
+        writer.close().await.unwrap();
+
+        let snapshot = stats_handle.snapshot();
+        assert!(
+            snapshot.index_update_count >= 1,
+            "the index apply must record an index-update stat, got {}",
+            snapshot.index_update_count
+        );
+        assert_eq!(
+            snapshot.index_update_rows, 3,
+            "every indexed row must be counted exactly once, got {}",
+            snapshot.index_update_rows
+        );
+        assert!(
+            snapshot.avg_index_update_latency().is_some(),
+            "a recorded index update must expose an average latency"
+        );
+    }
+
+    #[tokio::test]
     async fn test_force_seal_active_and_wait_for_flush_drain() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
@@ -5853,9 +8001,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -5870,15 +8017,16 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
 
         writer
             .put(vec![create_test_batch(&schema, 0, 10)])
             .await
             .unwrap();
-        writer.force_seal_active().await.unwrap();
-        writer.wait_for_flush_drain().await.unwrap();
+        let fence = writer.force_seal_active().await.unwrap();
+        assert_eq!(fence.sealed_generation(), Some(initial_gen));
+        fence.wait().await.unwrap();
 
         let stats = writer.memtable_stats().await.unwrap();
         assert_eq!(stats.generation, initial_gen + 1);
@@ -5889,9 +8037,130 @@ mod tests {
             .await
             .unwrap()
             .expect("manifest should exist after flush");
-        assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
+        assert_eq!(manifest.sstables.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
+    }
+
+    /// Durable writes so `put` returns only once the row is indexed and
+    /// WAL-durable. Both fence tests tear the background tasks down before
+    /// freezing, and a freeze still owing an index apply or a WAL append
+    /// would dispatch onto a closed channel and poison the writer.
+    fn seal_fence_test_config(shard_id: Uuid) -> ShardWriterConfig {
+        ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: true,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        }
+    }
+
+    /// An empty active memtable does not mean every pre-call write is in
+    /// L0: a size/interval trigger swaps generation N for an empty N+1
+    /// while N's flush is still in flight. The seal must fence that
+    /// generation anyway — reporting "nothing sealed, nothing to wait for"
+    /// lets a caller acknowledge a flush that has not happened.
+    #[tokio::test]
+    async fn test_force_seal_active_fences_pending_generation_when_active_is_empty() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            seal_fence_test_config(Uuid::new_v4()),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Stop the flush tasks, then freeze by hand: this is the post-rotation
+        // state held still — generation N frozen and unflushed, N+1 active and
+        // empty.
+        writer.task_executor.shutdown_all().await.unwrap();
+        let pending_generation = match &writer.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                ..
+            } => {
+                let mut state = state.write().await;
+                writer_state.freeze_memtable(&mut state).unwrap() - 1
+            }
+            WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
+        };
+
+        let fence = writer.force_seal_active().await.unwrap();
+        assert_eq!(
+            fence.sealed_generation(),
+            None,
+            "the active memtable was empty, so this seal froze nothing"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fence.wait())
+                .await
+                .is_err(),
+            "generation {pending_generation} is still awaiting flush; the fence must not be satisfied"
+        );
+    }
+
+    /// The fence is tied to each flush's own outcome, never to
+    /// `ShardManifest::current_generation`. The manifest advances to
+    /// `generation + 1` on every committed flush without checking for a gap,
+    /// so a later generation's success moves it past one that failed — a
+    /// watermark comparison would report durability that does not exist.
+    #[tokio::test]
+    async fn test_force_seal_active_fence_ignores_manifest_generation_advance() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            seal_fence_test_config(Uuid::new_v4()),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // No flush task, so the sealed generation never reaches L0.
+        writer.task_executor.shutdown_all().await.unwrap();
+        let fence = writer.force_seal_active().await.unwrap();
+        let sealed = fence
+            .sealed_generation()
+            .expect("the active memtable held rows");
+
+        // Advance the manifest past the sealed generation, as a later
+        // generation's successful flush would.
+        writer
+            .manifest_store
+            .commit_update(writer.epoch(), |current| ShardManifest {
+                version: current.version + 1,
+                current_generation: sealed + 2,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fence.wait())
+                .await
+                .is_err(),
+            "generation {sealed} never reached L0; a manifest advance past it must not satisfy its fence"
+        );
     }
 
     /// `abort` tears down the background flush tasks WITHOUT flushing —
@@ -5908,9 +8177,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -5928,7 +8196,7 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
 
         writer.abort().await.unwrap();
@@ -5939,7 +8207,7 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
         assert_eq!(
             flushed_after, flushed_before,
@@ -5963,9 +8231,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             // Short grace so the sweep is observable without a slow test.
@@ -5988,10 +8255,10 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert!(
             manifest
-                .flushed_generations
+                .sstables
                 .iter()
                 .any(|g| g.generation == initial_gen),
-            "flushed generation must be recorded in the manifest"
+            "SSTable must be recorded in the manifest"
         );
 
         // Still queryable in memory immediately after commit (within grace).
@@ -5999,7 +8266,7 @@ mod tests {
         assert_eq!(refs.active.generation, initial_gen + 1);
         assert!(
             refs.frozen.iter().any(|f| f.generation == initial_gen),
-            "flushed generation must stay queryable during the grace window"
+            "SSTable must stay queryable during the grace window"
         );
 
         // After the grace elapses (plus a sweep tick) the handle is evicted.
@@ -6023,9 +8290,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             frozen_memtable_grace: Duration::ZERO,
@@ -6047,10 +8313,10 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert!(
             manifest
-                .flushed_generations
+                .sstables
                 .iter()
                 .any(|g| g.generation == initial_gen),
-            "flushed generation must be recorded in the manifest"
+            "SSTable must be recorded in the manifest"
         );
 
         // ...and the in-memory handle is already gone, no sweep tick needed.
@@ -6061,6 +8327,54 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_close_propagates_frozen_memtable_flush_failure() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(writer_b.epoch() > writer_a.epoch());
+
+        let error = writer_a
+            .close()
+            .await
+            .expect_err("close must propagate the fenced MemTable flush");
+        assert!(
+            matches!(error, Error::IO { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("Writer fenced"),
+            "unexpected error: {error}"
+        );
+
+        writer_b.close().await.unwrap();
     }
 
     /// Regression: a transient flush failure must NOT reopen the
@@ -6135,6 +8449,18 @@ mod tests {
             "retained sealed memtable must still hold its rows"
         );
         assert_eq!(refs.active.generation, initial_gen + 1);
+
+        // Nor did it vanish from the stats. Backpressure released these bytes on
+        // flush completion so the failure cannot wedge writes, but the memtable
+        // is still resident, and this snapshot is what an operator reads to
+        // decide whether to evict the shard.
+        let stats = writer_a.memtable_stats().await.unwrap();
+        assert_eq!(stats.frozen_count, 1);
+        assert!(
+            stats.frozen_bytes >= refs.frozen[0].batch_store.estimated_bytes(),
+            "a failed flush must keep owing its resident bytes, got {}",
+            stats.frozen_bytes
+        );
 
         writer_b.close().await.unwrap();
     }
@@ -6286,9 +8612,7 @@ mod shard_writer_tests {
             Some("100")
         );
         // Every tunable field is present.
-        assert!(defaults.contains_key("sync_indexed_write"));
         assert!(defaults.contains_key("enable_memtable"));
-        assert!(defaults.contains_key("async_index_interval_ms"));
         // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
@@ -6311,7 +8635,12 @@ mod shard_writer_tests {
 
         let vector_dim = 32;
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_multi_segment_index_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://multi-segment-index-{}/",
+            Uuid::new_v4().simple()
+        );
 
         // Initial fragment + an IVF vector index covering it.
         let initial = create_test_batch(&schema, 0, 256, vector_dim);
@@ -6449,7 +8778,7 @@ mod shard_writer_tests {
         // The tombstone-only generation still flushed (data without an HNSW index).
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert_eq!(
-            manifest.flushed_generations.len(),
+            manifest.sstables.len(),
             1,
             "the all-tombstone generation must still flush"
         );
@@ -6495,9 +8824,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
         let writer = dataset
             .mem_wal_writer(shard_id, config)
             .await
@@ -6518,22 +8845,22 @@ mod shard_writer_tests {
             .await
             .expect("Failed to read manifest")
             .expect("Manifest should exist");
-        assert_eq!(manifest.flushed_generations.len(), 1);
+        assert_eq!(manifest.sstables.len(), 1);
 
-        let flushed = &manifest.flushed_generations[0];
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
-        let flushed_dataset = Dataset::open(&gen_uri)
+        let sstable = &manifest.sstables[0];
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        let sstable = Dataset::open(&gen_uri)
             .await
-            .expect("Failed to open flushed generation");
-        let flushed_indices = flushed_dataset.load_indices().await.unwrap();
-        assert_eq!(flushed_indices.len(), 1);
-        assert_eq!(flushed_indices[0].name, "text_fts");
+            .expect("Failed to open SSTable");
+        let sstable_indices = sstable.load_indices().await.unwrap();
+        assert_eq!(sstable_indices.len(), 1);
+        assert_eq!(sstable_indices[0].name, "text_fts");
         assert_eq!(
-            flushed_indices[0].index_version, 1,
+            sstable_indices[0].index_version, 1,
             "maintained v1 FTS index must flush as v1"
         );
 
-        let results = flushed_dataset
+        let results = sstable
             .scan()
             .full_text_search(FullTextSearchQuery::new("Sample".to_owned()))
             .unwrap()
@@ -6549,7 +8876,12 @@ mod shard_writer_tests {
 
         let vector_dim = 32;
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_writer_hnsw_params_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://writer-hnsw-params-{}/",
+            Uuid::new_v4().simple()
+        );
 
         let initial = create_test_batch(&schema, 0, 256, vector_dim);
         let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
@@ -6830,9 +9162,7 @@ mod shard_writer_tests {
 
         // Create shard writer
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -6857,7 +9187,12 @@ mod shard_writer_tests {
         let target_id = 1_000i64 + 37;
 
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_shard_writer_hnsw_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://shard-writer-hnsw-{}/",
+            Uuid::new_v4().simple()
+        );
 
         let initial_batch = create_test_batch(&schema, 0, 256, vector_dim);
         let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
@@ -6885,9 +9220,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7026,9 +9359,7 @@ mod shard_writer_tests {
 
         // Create shard writer with default config
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7053,7 +9384,7 @@ mod shard_writer_tests {
     /// 2. File system layout is correct (WAL files, manifest, generation directories)
     /// 3. WAL entries contain expected data
     /// 4. Data can be read after each flush cycle
-    /// 5. Manifest tracks flushed generations correctly
+    /// 5. Manifest tracks SSTables correctly
     ///
     /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_e2e_correctness -- --nocapture
     #[tokio::test]
@@ -7105,7 +9436,6 @@ mod shard_writer_tests {
         let shard_id = Uuid::new_v4();
         let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(true) // Ensure WAL files are written
-            .with_sync_indexed_write(true)
             .with_max_memtable_size(50 * 1024) // 50KB - triggers flush after ~8 batches
             .with_max_wal_buffer_size(10 * 1024) // 10KB WAL buffer
             .with_max_wal_flush_interval(Duration::from_millis(50)); // Fast flush
@@ -7182,24 +9512,24 @@ mod shard_writer_tests {
             .expect("Failed to read manifest")
             .expect("Manifest should exist");
 
-        // Verify flushed generations exist on disk
+        // Verify SSTables exist on disk
         assert!(
-            !manifest.flushed_generations.is_empty(),
-            "Should have at least one flushed generation"
+            !manifest.sstables.is_empty(),
+            "Should have at least one SSTable"
         );
-        for flushed_gen in &manifest.flushed_generations {
+        for sstable in &manifest.sstables {
             // The path stored in manifest is relative to the shard directory
             // Construct full path: temp_dir/_mem_wal/shard_id/generation_folder
             let gen_path = temp_dir
                 .path()
                 .join("_mem_wal")
                 .join(shard_id.to_string())
-                .join(&flushed_gen.path);
+                .join(&sstable.path);
 
             // The generation directory should exist
             assert!(
                 gen_path.exists(),
-                "Flushed generation directory should exist at {:?}",
+                "SSTable directory should exist at {:?}",
                 gen_path
             );
 
@@ -7229,9 +9559,13 @@ mod shard_writer_tests {
         // Re-open dataset and create new writer to verify recovery
         let dataset = Dataset::open(&uri).await.expect("Failed to reopen dataset");
         let new_shard_id = Uuid::new_v4();
-        let new_config = ShardWriterConfig::new(new_shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(true);
+        // `durable_write(true)` so the put waits for its flush, which is what
+        // currently publishes the rows. A non-durable put is *not* yet
+        // read-your-writes: the index apply is welded to the WAL flush, so the
+        // rows stay invisible until the next flush. This test used to pass with
+        // `durable_write(false)` only because an un-advanced cursor of 0 was
+        // misread as "batch 0 is visible" — it was asserting the dirty read.
+        let new_config = ShardWriterConfig::new(new_shard_id).with_durable_write(true);
 
         let new_writer = dataset
             .mem_wal_writer(new_shard_id, new_config)
@@ -7316,11 +9650,11 @@ mod shard_writer_tests {
             .expect("flush must not be redirected at the base table");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        assert_eq!(manifest.flushed_generations.len(), 1);
-        let flushed = manifest.flushed_generations[0].clone();
+        assert_eq!(manifest.sstables.len(), 1);
+        let sstable = manifest.sstables[0].clone();
 
         // The generation landed under `_mem_wal/`, and the base table is untouched.
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
         let generation = Dataset::open(&gen_uri)
             .await
             .expect("generation must exist at its own path");
@@ -7336,7 +9670,7 @@ mod shard_writer_tests {
         // Opening the base instead would dedup back down to 16 rows.
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
         let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
         let rows: usize = scanner
             .try_into_stream()
@@ -7409,8 +9743,8 @@ mod shard_writer_tests {
         writer.wait_for_flush_drain().await.expect("flush failed");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        assert_eq!(manifest.flushed_generations.len(), 1);
-        let flushed = manifest.flushed_generations[0].clone();
+        assert_eq!(manifest.sstables.len(), 1);
+        let sstable = manifest.sstables[0].clone();
 
         // The generation's own Lance manifest is the signal to key on. Keying on
         // the generation folder alone would pass vacuously: sidecars like
@@ -7421,7 +9755,7 @@ mod shard_writer_tests {
         // `{gen}/data/` never reaches a wrapper under `file://`. The manifest
         // goes through `put_opts`, and only the flusher's `Dataset::write` /
         // `open_generation` writes it — both of which must carry the params.
-        let gen_manifest = format!("{}/_versions", flushed.path);
+        let gen_manifest = format!("{}/_versions", sstable.path);
 
         assert!(
             controls.wrote_under(&gen_manifest),
@@ -7432,7 +9766,7 @@ mod shard_writer_tests {
         // And the read path must resolve the generation through them too.
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
         let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
         let rows: usize = scanner
             .try_into_stream()
@@ -7452,7 +9786,7 @@ mod shard_writer_tests {
         // fragments are read through it (reads have no local bypass), as is the
         // generation's standalone PK index.
         assert!(
-            controls.read_under(&format!("{}/data/", flushed.path)),
+            controls.read_under(&format!("{}/data/", sstable.path)),
             "the scan must read the generation through the base's store params"
         );
 
@@ -7501,10 +9835,10 @@ mod shard_writer_tests {
         writer.wait_for_flush_drain().await.expect("flush failed");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        let flushed = manifest.flushed_generations[0].clone();
+        let sstable = manifest.sstables[0].clone();
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
 
         // What `DatasetBuilder::with_object_store` leaves on an opened dataset:
         // a store pinned at the base's own path.

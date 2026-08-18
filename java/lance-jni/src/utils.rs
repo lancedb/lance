@@ -12,7 +12,7 @@ use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -191,6 +191,8 @@ pub fn build_compaction_options(
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
     max_source_fragments: &JObject,            // Optional<Long>
+    max_source_rows: &JObject,                 // Optional<Long>
+    max_source_bytes: &JObject,                // Optional<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -233,6 +235,12 @@ pub fn build_compaction_options(
     }
     if let Some(max_source_fragments_val) = env.get_long_opt(max_source_fragments)? {
         compaction_options.max_source_fragments = Some(max_source_fragments_val as usize);
+    }
+    if let Some(max_source_rows_val) = env.get_long_opt(max_source_rows)? {
+        compaction_options.max_source_rows = Some(max_source_rows_val as usize);
+    }
+    if let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)? {
+        compaction_options.max_source_bytes = Some(max_source_bytes_val as u64);
     }
 
     Ok(compaction_options)

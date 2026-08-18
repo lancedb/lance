@@ -95,8 +95,7 @@ impl OssStoreProvider {
 
     fn build_oss_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         let operator = Operator::from_iter::<Oss>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?;
 
         Ok(OpendalStore::new(operator))
     }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
@@ -13,6 +13,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
+use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -39,13 +40,15 @@ pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
-    storage_format: Option<LanceFileVersion>,
+    storage_format: Option<ConcreteFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
+    source_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
+    retry_timeout: Duration,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
@@ -64,9 +67,11 @@ impl<'a> CommitBuilder<'a> {
             commit_handler: None,
             store_params: None,
             object_store: None,
+            source_store: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
+            retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
@@ -93,6 +98,12 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
+        self.storage_format = Some(storage_format.resolve());
+
+        self
+    }
+
+    pub(crate) fn with_exact_storage_format(mut self, storage_format: ConcreteFileVersion) -> Self {
         self.storage_format = Some(storage_format);
         self
     }
@@ -100,6 +111,18 @@ impl<'a> CommitBuilder<'a> {
     /// Pass an object store to use.
     pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
         self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pass the object store of the dataset being cloned from.
+    ///
+    /// Only used by `Operation::Clone`: the source manifest is read through this store
+    /// while the new dataset is written through the destination store. This lets a clone
+    /// cross object stores/accounts (e.g. between two Azure accounts), where the source
+    /// is not reachable with the destination's credentials. Defaults to the destination
+    /// store when not set, preserving same-store behavior.
+    pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
+        self.source_store = Some(source_store);
         self
     }
 
@@ -164,6 +187,26 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Set the wall-clock budget used by commit conflict backoff.
+    ///
+    /// The first commit attempt is always allowed to complete. If it conflicts,
+    /// each backoff sleep is bounded by the time remaining in this budget. The
+    /// default is 30 seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use lance::dataset::CommitBuilder;
+    ///
+    /// let _builder = CommitBuilder::new("memory://dataset")
+    ///     .with_retry_timeout(Duration::from_secs(10));
+    /// ```
+    pub fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
+        self.retry_timeout = retry_timeout;
         self
     }
 
@@ -240,6 +283,9 @@ impl<'a> CommitBuilder<'a> {
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
+
+        // Store used to read the source manifest for a clone (see with_source_store).
+        let source_store = self.source_store.clone();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -381,6 +427,7 @@ impl<'a> CommitBuilder<'a> {
                     &transaction,
                     &manifest_config,
                     &self.commit_config,
+                    self.retry_timeout,
                 )
                 .await?
             } else {
@@ -391,6 +438,7 @@ impl<'a> CommitBuilder<'a> {
                     &transaction,
                     &manifest_config,
                     &self.commit_config,
+                    self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
                 )
@@ -404,6 +452,7 @@ impl<'a> CommitBuilder<'a> {
         } else {
             commit_new_dataset(
                 object_store.as_ref(),
+                source_store.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -428,13 +477,21 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
+                    dataset.base_object_stores.clone()
+                } else {
+                    Default::default()
+                };
+                Ok(Dataset {
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    base_object_stores,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -461,6 +518,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Default::default(),
                 })
             }
         }
@@ -525,7 +583,10 @@ mod tests {
 
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
-    use lance_table::format::{DataFile, Fragment};
+    use lance_table::format::{
+        DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
+    };
+    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -537,7 +598,9 @@ mod tests {
     use super::*;
 
     fn sample_fragment() -> Fragment {
-        let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
+        let (major_version, minor_version) =
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
+
         Fragment {
             id: 0,
             files: vec![DataFile {
@@ -567,6 +630,30 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowConflictingCommitHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for SlowConflictingCommitHandler {
+        fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
+        async fn commit(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &object_store::path::Path,
+            _object_store: &ObjectStore,
+            _manifest_writer: ManifestWriter,
+            _naming_scheme: ManifestNamingScheme,
+            _transaction: Option<TableTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(CommitError::CommitConflict)
         }
     }
 
@@ -784,6 +871,13 @@ mod tests {
         assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(1800));
     }
 
+    #[test]
+    fn test_commit_retry_timeout_default_is_thirty_seconds() {
+        let builder = CommitBuilder::new("memory://default-retry-timeout");
+        assert_eq!(builder.retry_timeout, DEFAULT_COMMIT_RETRY_TIMEOUT);
+        assert_eq!(DEFAULT_COMMIT_RETRY_TIMEOUT, Duration::from_secs(30));
+    }
+
     #[tokio::test]
     async fn test_commit_timeout_zero_rejected() {
         let dataset = Arc::new(
@@ -935,6 +1029,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_retry_timeout_interrupts_conflict_backoff() {
+        let dataset = InsertBuilder::new("memory://retry-timeout")
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let result = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(Arc::new(SlowConflictingCommitHandler))
+            .with_max_retries(3)
+            .with_retry_timeout(Duration::from_millis(150))
+            .with_timeout(None)
+            .execute(sample_transaction(1))
+            .await;
+
+        let error = result.expect_err("conflict backoff should respect retry timeout");
+        assert!(
+            matches!(&error, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_commit_batch() {
         // Create a dataset
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -967,7 +1093,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

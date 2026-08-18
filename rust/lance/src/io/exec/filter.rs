@@ -48,10 +48,6 @@ impl ExecutionPlan for LanceFilterExec {
         "LanceFilterExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         self.filter.properties()
     }
@@ -71,7 +67,6 @@ impl ExecutionPlan for LanceFilterExec {
         // Rewrap the result in a LanceFilterExec to preserve the logical expression
         let new_filter_plan = self.filter.clone().with_new_children(children)?;
         let new_filter = new_filter_plan
-            .as_any()
             .downcast_ref::<FilterExec>()
             .expect("FilterExec::with_new_children should return FilterExec")
             .clone();
@@ -93,7 +88,7 @@ impl ExecutionPlan for LanceFilterExec {
         self.filter.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         self.filter.partition_statistics(partition)
     }
 

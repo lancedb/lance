@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
@@ -41,7 +41,8 @@ use crate::{
     Dataset,
     dataset::{
         ROW_ID,
-        fragment::{FileFragment, FragmentReader},
+        fragment::{FileFragment, V1FragmentReader},
+        versions,
     },
     datatypes::Schema,
 };
@@ -157,10 +158,6 @@ impl LancePushdownScanExec {
 impl ExecutionPlan for LancePushdownScanExec {
     fn name(&self) -> &str {
         "LancePushdownScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -284,7 +281,7 @@ struct FragmentScanner {
     predicate_projection: Arc<Schema>,
     predicate: Expr,
     config: ScanConfig,
-    reader: FragmentReader,
+    reader: V1FragmentReader,
     stats: Option<RecordBatch>,
 }
 
@@ -305,15 +302,14 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
+        let mut reader =
+            versions::open_v1_fragment_reader(&fragment, dataset.schema(), &frag_config).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader
-            .legacy_read_page_stats(Some(&predicate_projection))
-            .await?;
+        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
 
         Ok(Self {
             fragment,
@@ -382,7 +378,7 @@ impl FragmentScanner {
                     projection_reader.with_row_address();
                 }
                 let batch = projection_reader
-                    .legacy_read_batch_projected(batch_id, .., &self.projection)
+                    .read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
@@ -415,7 +411,7 @@ impl FragmentScanner {
                 reader.with_row_address();
 
                 let batch = reader
-                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
+                    .read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -489,7 +485,7 @@ impl FragmentScanner {
                         self.projection.project_by_ids(&remaining_fields, true);
                     Some(
                         self.reader
-                            .legacy_read_batch_projected(
+                            .read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -659,20 +655,20 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.legacy_num_batches();
+        let num_batches = self.reader.num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches as u32)
                 .map(|batch_id| {
                     self.reader
-                        .legacy_num_rows_in_batch(batch_id)
+                        .num_rows_in_batch(batch_id)
                         .expect("Operation does not yet support v2 fragments")
                         as usize
                 })
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let context = SimplifyContext::default().with_schema(schema);
+            let context = SimplifyContext::builder().with_schema(schema).build();
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);

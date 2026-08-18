@@ -39,8 +39,6 @@ use lance_index::mem_wal::{ShardManifest, ShardStatus};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
-use object_store::PutMode;
-use object_store::PutOptions;
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -146,7 +144,7 @@ impl ShardManifestStore {
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
             current_generation: 1,
-            flushed_generations: vec![],
+            sstables: vec![],
             status: ShardStatus::Active,
         };
 
@@ -184,68 +182,26 @@ impl ShardManifestStore {
         let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
 
-        if self.object_store.is_local() {
-            // Local storage: Use temp file + atomic rename for fencing
-            let temp_filename = format!("{}.tmp.{}", filename, uuid::Uuid::new_v4());
-            let temp_path = self.manifest_dir.clone().join(temp_filename.as_str());
-
-            // Write to temp file
-            self.object_store
-                .inner
-                .put(&temp_path, Bytes::from(bytes).into())
-                .await
-                .map_err(|e| Error::io(format!("Failed to write temp manifest: {}", e)))?;
-
-            // Atomically rename to final path
-            match self
-                .object_store
-                .inner
-                .rename_if_not_exists(&temp_path, &path)
-                .await
-            {
-                Ok(()) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // Clean up temp file
-                    let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(format!(
+        self.object_store
+            .put_if_absent(&path, Bytes::from(bytes).into())
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. }
+                ) {
+                    Error::io(format!(
                         "Manifest version {} already exists for shard {}",
                         version, self.shard_id
-                    )));
-                }
-                Err(e) => {
-                    // Clean up temp file
-                    let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(format!(
+                    ))
+                } else {
+                    Error::io(format!(
                         "Failed to write manifest version {} for shard {}: {}",
-                        version, self.shard_id, e
-                    )));
+                        version, self.shard_id, error
+                    ))
                 }
-            }
-        } else {
-            // Cloud storage: Use PUT-IF-NOT-EXISTS
-            let put_opts = PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            };
-
-            self.object_store
-                .inner
-                .put_opts(&path, Bytes::from(bytes).into(), put_opts)
-                .await
-                .map_err(|e| {
-                    if matches!(e, object_store::Error::AlreadyExists { .. }) {
-                        Error::io(format!(
-                            "Manifest version {} already exists for shard {}",
-                            version, self.shard_id
-                        ))
-                    } else {
-                        Error::io(format!(
-                            "Failed to write manifest version {} for shard {}: {}",
-                            version, self.shard_id, e
-                        ))
-                    }
-                })?;
-        }
+            })?;
 
         // Best-effort update version hint (failures are logged as warnings)
         self.write_version_hint(version).await;
@@ -462,7 +418,7 @@ impl ShardManifestStore {
                     replay_after_wal_entry_position: 0,
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
-                    flushed_generations: vec![],
+                    sstables: vec![],
                     status: ShardStatus::Active,
                 }
             };
@@ -619,7 +575,7 @@ mod tests {
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
             current_generation: 1,
-            flushed_generations: vec![],
+            sstables: vec![],
             status: ShardStatus::Active,
         }
     }

@@ -4,6 +4,7 @@
 pub mod aggregate;
 pub mod chunker;
 pub mod dataframe;
+#[cfg(any(test, feature = "datagen"))]
 pub mod datagen;
 pub mod exec;
 pub mod expr;

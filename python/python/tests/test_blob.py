@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import gc
 import importlib
 import io
+import queue
 import subprocess
 import sys
 import tarfile
 import textwrap
+import threading
 import uuid
 from pathlib import Path
 
@@ -179,6 +182,29 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_sql_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    table = pa.table(
+        [pa.array(values, pa.large_binary())],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    batches = (
+        ds.sql("SELECT blobs FROM dataset")
+        .blob_handling("all_binary")
+        .build()
+        .to_batch_records()
+    )
+    assert pa.Table.from_batches(batches).column("blobs").to_pylist() == values
+
+
 def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
     values = [b"abc", b"defgh", b"ijklmnop"]
     blob_field = pa.field(
@@ -269,6 +295,44 @@ def dataset_with_blobs(tmp_path):
     )
     ds.insert(table)
     return ds
+
+
+@pytest.fixture
+def dataset_with_mixed_blob_v2(tmp_path):
+    external_blob = tmp_path / "external.bin"
+    external_blob.write_bytes(b"external")
+    payloads = [b"in", b"packed!!", b"dedicated payload", b"external", None, b""]
+    values = [
+        payloads[0],
+        payloads[1],
+        payloads[2],
+        external_blob.as_uri(),
+        None,
+        payloads[5],
+    ]
+    schema = pa.schema(
+        [
+            lance.blob_field(
+                "blobs",
+                inline_size_threshold=4,
+                dedicated_size_threshold=12,
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+    table = pa.table(
+        {"blobs": lance.blob_array(values), "idx": range(len(values))}, schema=schema
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "mixed_blob_v2",
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+        max_rows_per_file=2,
+        max_rows_per_group=2,
+    )
+    assert len(dataset.get_fragments()) == 3
+    return dataset, payloads
 
 
 def test_blob_files(dataset_with_blobs):
@@ -514,6 +578,172 @@ def test_read_blobs_without_preserve_order_returns_same_rows(
     assert sorted(blobs) == sorted(expected)
 
 
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+@pytest.mark.parametrize(
+    "selected_indices",
+    [
+        [0, 5],
+        [0, 5, 4],
+        [5],
+        [0, 5, 1],
+        [4, 4, 5],
+    ],
+)
+def test_blob_selection_apis_preserve_nulls_and_empty_values(
+    dataset_with_mixed_blob_v2, selection_kind, selected_indices
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    if selection_kind == "ids":
+        all_selectors = _blob_row_ids(dataset)
+    elif selection_kind == "addresses":
+        all_selectors = _blob_row_addresses(dataset)
+    else:
+        all_selectors = list(range(len(payloads)))
+    selectors = [all_selectors[index] for index in selected_indices]
+    kwargs = {selection_kind: selectors}
+    expected = [payloads[index] for index in selected_indices]
+
+    blob_files = dataset.take_blobs("blobs", **kwargs)
+    assert [None if blob is None else blob.readall() for blob in blob_files] == expected
+
+    blobs = dataset.read_blobs("blobs", **kwargs, preserve_order=True)
+    assert [data for _, data in blobs] == expected
+
+
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+def test_read_blob_ranges_mixed_sources_preserves_request_identity(
+    dataset_with_mixed_blob_v2, selection_kind
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    selected_indices = [3, 1, 1, 0, 2, 4, 5]
+    ranges = [(1, 3), (2, 4), (0, 4), (1, 1), (5, 0), (0, 0), (0, 0)]
+    addresses = _blob_row_addresses(dataset)
+    if selection_kind == "ids":
+        all_selectors = _blob_row_ids(dataset)
+    elif selection_kind == "addresses":
+        all_selectors = addresses
+    else:
+        all_selectors = list(range(len(payloads)))
+    selectors = [all_selectors[index] for index in selected_indices]
+    requests = [
+        (row, offset, length) for row, (offset, length) in zip(selectors, ranges)
+    ]
+
+    results = dataset.read_blob_ranges(
+        "blobs",
+        requests,
+        selector=selection_kind,
+        io_buffer_size=1024,
+        preserve_order=True,
+    )
+
+    expected = []
+    for request_index, (row_index, (offset, length)) in enumerate(
+        zip(selected_indices, ranges)
+    ):
+        payload = payloads[row_index]
+        expected.append(
+            (
+                request_index,
+                addresses[row_index],
+                None if payload is None else payload[offset : offset + length],
+            )
+        )
+    assert results == expected
+
+
+def test_blob_selection_apis_preserve_blob_v1_nulls_and_empty_values(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field(
+                "blobs",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"blobs": [None, b"", b"abc"], "idx": range(3)}, schema=schema),
+        tmp_path / "blob_v1_nulls",
+        data_storage_version="2.0",
+    )
+    addresses = _blob_row_addresses(dataset)
+
+    blob_files = dataset.take_blobs("blobs", indices=[0, 1, 2])
+    assert [None if blob is None else blob.readall() for blob in blob_files] == [
+        None,
+        b"",
+        b"abc",
+    ]
+
+    blobs = dataset.read_blobs("blobs", indices=[0, 1, 2])
+    assert [data for _, data in blobs] == [None, b"", b"abc"]
+
+    results = dataset.read_blob_ranges(
+        "blobs",
+        [(0, 0, 0), (0, 0, 1), (1, 0, 0), (2, 1, 1)],
+        selector="indices",
+    )
+
+    assert results == [
+        (0, addresses[0], None),
+        (1, addresses[0], None),
+        (2, addresses[1], b""),
+        (3, addresses[2], b"b"),
+    ]
+
+
+def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
+    dataset_with_mixed_blob_v2,
+):
+    dataset, _ = dataset_with_mixed_blob_v2
+    results = dataset.read_blob_ranges(
+        "blobs",
+        [(3, 0, 1), (4, 0, 1), (1, 1, 2), (0, 0, 2)],
+        selector="indices",
+        preserve_order=False,
+    )
+
+    assert sorted(results) == sorted(
+        [
+            (0, _blob_row_addresses(dataset)[3], b"e"),
+            (1, _blob_row_addresses(dataset)[4], None),
+            (2, _blob_row_addresses(dataset)[1], b"ac"),
+            (3, _blob_row_addresses(dataset)[0], b"in"),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("requests", "message"),
+    [
+        ([(0, 2**64 - 1, 2)], "offset \\+ length overflowed"),
+        ([(0, 0, 4)], "exceeds blob size"),
+    ],
+)
+def test_read_blob_ranges_rejects_invalid_ranges(
+    dataset_with_mixed_blob_v2, requests, message
+):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    with pytest.raises(ValueError, match=message):
+        dataset.read_blob_ranges("blobs", requests, selector="indices")
+
+
+def test_read_blob_ranges_rejects_invalid_selector(dataset_with_mixed_blob_v2):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    with pytest.raises(ValueError, match="selector must be one of"):
+        dataset.read_blob_ranges("blobs", [], selector="offsets")
+
+
+def test_read_blob_ranges_accepts_empty_batch(dataset_with_mixed_blob_v2):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    assert dataset.read_blob_ranges("blobs", [], selector="indices") == []
+
+
 def test_blob_file_seek(tmp_path, dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)
@@ -524,6 +754,61 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        pytest.param([], id="empty_list"),
+        pytest.param([(0, 0), (4, 0)], id="empty_ranges"),
+        pytest.param([(2, 1), (0, 1), (1, 1)], id="non_monotonic"),
+        pytest.param([(1, 2), (0, 4), (1, 2), (0, 0), (2, 2)], id="dup_overlap"),
+    ],
+)
+def test_blob_file_read_ranges_matches_read_range(dataset_with_blobs, ranges):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[4] as f:
+        expected = [f.read_range(offset, length) for offset, length in ranges]
+        assert f.read_ranges(ranges) == expected
+
+
+def test_blob_file_read_ranges_preserves_input_order(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.read_ranges([(2, 1), (0, 1), (1, 2)]) == [b"r", b"b", b"ar"]
+
+
+def test_blob_file_read_ranges_does_not_change_cursor(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.tell() == 0
+        assert f.read_ranges([(0, 3)]) == [b"bar"]
+        assert f.tell() == 0
+        f.seek(2)
+        assert f.read_ranges([(2, 1), (0, 3)]) == [b"r", b"bar"]
+        assert f.tell() == 2
+        assert f.read(1) == b"r"
+
+
+@pytest.mark.parametrize(
+    ("ranges", "message"),
+    [
+        pytest.param([(2**64 - 1, 2)], "offset \\+ length overflowed", id="overflow"),
+        pytest.param([(0, 1), (1, 100)], "exceeds blob size", id="out_of_bounds"),
+    ],
+)
+def test_blob_file_read_ranges_rejects_invalid_ranges(
+    dataset_with_blobs, ranges, message
+):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[0] as f:
+        with pytest.raises(ValueError, match=message):
+            f.read_ranges(ranges)
+        assert f.tell() == 0
 
 
 def test_null_blobs(tmp_path):
@@ -544,8 +829,7 @@ def test_null_blobs(tmp_path):
     ds = lance.write_dataset(table, tmp_path / "test_ds")
 
     blobs = ds.take_blobs("blob", ids=range(100))
-    for blob in blobs:
-        assert blob.size() == 0
+    assert blobs == [None] * 100
 
     ds.insert(pa.table({"id": pa.array(range(100, 200), pa.uint64())}))
 
@@ -559,8 +843,7 @@ def test_null_blobs(tmp_path):
 
     for blob_col in ["blob", "more_blob"]:
         blobs = ds.take_blobs(blob_col, indices=range(100, 200))
-        for blob in blobs:
-            assert blob.size() == 0
+        assert blobs == [None] * 100
 
         blobs = ds.to_table(columns=[blob_col])
         for blob in blobs.column(blob_col):
@@ -1054,7 +1337,14 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
     ds.add_columns(lance.blob_field("blob"))
 
     assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
-    assert ds.take_blobs("blob", indices=range(4)) == []
+    assert ds.take_blobs("blob", indices=range(4)) == [None] * 4
+    assert [data for _, data in ds.read_blobs("blob", indices=range(4))] == [None] * 4
+    ranges = ds.read_blob_ranges(
+        "blob",
+        [(index, 0, 1) for index in range(4)],
+        selector="indices",
+    )
+    assert [data for _, _, data in ranges] == [None] * 4
 
 
 def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
@@ -1379,6 +1669,44 @@ def test_packed_blob_writer_bulk_rejects_non_binary_array(tmp_path, payloads):
     assert len(packed.finish_array("blob")) == 1
 
 
+@pytest.mark.parametrize(
+    "open_writer",
+    [
+        pytest.param("open_packed_blob_writer", id="packed"),
+        pytest.param("open_dedicated_blob_writer", id="dedicated"),
+    ],
+)
+def test_failed_blob_writer_traceback_can_be_released_on_another_thread(
+    tmp_path, monkeypatch, open_writer
+):
+    failures = queue.Queue()
+
+    def fail_with_live_writer():
+        files = LanceFileSession(tmp_path)
+        writer = getattr(files, open_writer)("data-file.lance", 1)
+        assert writer.blob_id == 1
+        try:
+            raise OSError("simulated object-store write failure")
+        except OSError as error:
+            # The traceback retains this frame and its local writer, matching a
+            # writer-thread failure handed to an owning thread for propagation.
+            failures.put(error)
+
+    writer_thread = threading.Thread(target=fail_with_live_writer)
+    writer_thread.start()
+    writer_thread.join(timeout=10)
+    assert not writer_thread.is_alive()
+
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    error = failures.get_nowait()
+    assert str(error) == "simulated object-store write failure"
+    del error
+    gc.collect()
+
+    assert unraisable == []
+
+
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
 
@@ -1696,6 +2024,80 @@ def dataset_for_pandas_no_blob_tests(tmp_path):
     return lance.write_dataset(table, tmp_path / "no_blob_pandas_ds")
 
 
+def _lazy_blob_values(dataset):
+    values = dataset.scanner(columns=["blob"]).to_pandas(blob_mode="lazy")["blob"]
+    return [None if value is None else value.readall() for value in values]
+
+
+@pytest.mark.parametrize(
+    "values, has_sidecar",
+    [
+        pytest.param([b"", b"payload", None], False, id="leading_empty"),
+        pytest.param([b"", b"", b""], False, id="all_empty"),
+        pytest.param(
+            [b"payload", b"", None, b"tail", b""],
+            False,
+            id="payload_empty_null",
+        ),
+        pytest.param(
+            [b"", b"p" * (64 * 1024 + 1024), None, b""],
+            True,
+            id="sidecar_backed",
+        ),
+    ],
+)
+def test_blob_v2_lazy_preserves_empty_and_null(tmp_path, values, has_sidecar):
+    dataset_path = tmp_path / "blob_v2_lazy_empty"
+    schema = pa.schema([lance.blob_field("blob")])
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays([lance.blob_array(values)], schema=schema),
+        dataset_path,
+        data_storage_version="2.2",
+    )
+
+    descriptions = dataset.to_table(columns=["blob"]).column("blob").to_pylist()
+    assert [description is None for description in descriptions] == [
+        value is None for value in values
+    ]
+    if values[0] == b"":
+        assert descriptions[0]["position"] == 0
+        assert descriptions[0]["size"] == 0
+    if has_sidecar:
+        assert any(
+            description is not None and description["kind"] == 1
+            for description in descriptions
+        )
+        assert any(path.suffix == ".blob" for path in _dataset_file_set(dataset_path))
+
+    assert _lazy_blob_values(dataset) == values
+
+
+def test_blob_v1_lazy_preserves_empty_and_null_sentinels(tmp_path):
+    values = [b"", None, b"payload"]
+    schema = pa.schema(
+        [
+            pa.field(
+                "blob",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            )
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [pa.array(values, type=pa.large_binary())],
+            schema=schema,
+        ),
+        tmp_path / "blob_v1_lazy_empty",
+        data_storage_version="2.0",
+    )
+
+    descriptions = dataset.to_table(columns=["blob"]).column("blob").to_pylist()
+    assert descriptions[0] == {"position": 0, "size": 0}
+    assert descriptions[1] == {"position": 1, "size": 0}
+    assert _lazy_blob_values(dataset) == values
+
+
 @pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
 def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
     dataset_for_pandas_no_blob_tests,
@@ -1925,7 +2327,46 @@ def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
     with blobs[1] as f:
         assert f.read() == packed
 
-    assert dataset.take_blobs("info.blob", indices=[2]) == []
+    assert dataset.take_blobs("info.blob", indices=[2]) == [None]
+
+
+def test_write_list_struct_nested_blob_v2(tmp_path):
+    payload_fields = [
+        lance.blob_field("blob"),
+        pa.field("format", pa.string()),
+    ]
+    payload_values = pa.StructArray.from_arrays(
+        [
+            lance.blob_array([b"first", b"second", None]),
+            pa.array(["bin", "bin", "bin"]),
+        ],
+        fields=payload_fields,
+    )
+    media_fields = [
+        pa.field("type", pa.string()),
+        pa.field("payload", payload_values.type),
+    ]
+    media_values = pa.StructArray.from_arrays(
+        [pa.array(["image", "image", "image"]), payload_values],
+        fields=media_fields,
+    )
+    media = pa.ListArray.from_arrays(pa.array([0, 2, 3]), media_values)
+    table = pa.table({"media": media})
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "list_struct_nested_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    media = (
+        dataset.scanner(columns=["media"], blob_handling="all_binary")
+        .to_table()
+        .column("media")
+        .combine_chunks()
+    )
+    blobs = media.values.field("payload").field("blob")
+    assert blobs.to_pylist() == [b"first", b"second", None]
 
 
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(
