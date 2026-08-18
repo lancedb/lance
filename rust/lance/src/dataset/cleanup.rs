@@ -1289,6 +1289,8 @@ pub struct CleanupPolicy {
     pub before_timestamp: Option<DateTime<Utc>>,
     /// If not none, cleanup all versions before the specified version.
     pub before_version: Option<u64>,
+    /// If not none, cleanup only the specified versions.
+    pub versions: Option<HashSet<u64>>,
     /// If true, delete unverified data files even if they are recent
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
@@ -1312,6 +1314,9 @@ impl CleanupPolicy {
         if let Some(before_version) = self.before_version {
             should_clean &= manifest.version < before_version;
         }
+        if let Some(versions) = self.versions.as_ref() {
+            should_clean &= versions.contains(&manifest.version);
+        }
         should_clean
     }
 }
@@ -1321,6 +1326,7 @@ impl Default for CleanupPolicy {
         Self {
             before_timestamp: None,
             before_version: None,
+            versions: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
@@ -1345,6 +1351,24 @@ impl CleanupPolicyBuilder {
     pub fn before_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
         self.policy.before_timestamp = Some(timestamp);
         self
+    }
+
+    /// Cleanup only the specified dataset versions.
+    ///
+    /// This is an exact-version filter. If other policy filters are also
+    /// configured, a manifest is removed only when it satisfies all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `versions` is empty.
+    pub fn versions(mut self, versions: Vec<u64>) -> Result<Self> {
+        if versions.is_empty() {
+            return Err(Error::invalid_input(
+                "versions must not be empty when specified",
+            ));
+        }
+        self.policy.versions = Some(versions.into_iter().collect());
+        Ok(self)
     }
 
     /// Cleanup all versions except the last `n` versions of the dataset.
@@ -3470,6 +3494,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_specific_versions_only() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let policy = CleanupPolicyBuilder::default()
+            .versions(vec![2])
+            .unwrap()
+            .build();
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+
+        let versions = fixture
+            .open()
+            .await
+            .unwrap()
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![1, 3]);
     }
 
     #[tokio::test]

@@ -59,7 +59,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 use std::iter::empty;
 use std::sync::Arc;
@@ -3438,6 +3438,14 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
 
     let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
 
+    let versions = env.get_optional_from_method(jpolicy, "getVersions", |env, list_obj| {
+        let mut versions = HashSet::new();
+        for version in env.get_longs(&list_obj)? {
+            versions.insert(version as u64);
+        }
+        Ok(versions)
+    })?;
+
     let delete_unverified = env
         .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
@@ -3461,6 +3469,7 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
     Ok(CleanupPolicy {
         before_timestamp,
         before_version,
+        versions,
         delete_unverified,
         error_if_tagged_old_versions,
         clean_referenced_branches,
