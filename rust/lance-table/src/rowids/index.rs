@@ -9,22 +9,30 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
-use rangemap::RangeInclusiveMap;
 
 /// An index of row ids
 ///
-/// This index is used to map row ids to their corresponding addresses. These
-/// addresses correspond to physical positions in the dataset. See [RowAddress].
+/// This index maps row ids to their corresponding addresses. These addresses
+/// correspond to physical positions in the dataset. See [RowAddress].
 ///
-/// This structure only contains rows that physically exist. However, it may
+/// This structure only reports rows that physically exist and are live. It may
 /// map to addresses that have been tombstoned. A separate tombstone index is
 /// used to track tombstoned rows.
 // (Implementation)
-// Disjoint ranges of row ids are stored as the keys of the map. The values are
-// a pair of segments. The first segment is the row ids, and the second segment
-// is the addresses.
+// One entry per fragment holds the fragment row id sequence, its deletion
+// vector, and the row id range each segment of that sequence covers. A lookup
+// picks the fragments whose range can hold the id, then asks the covering
+// segment for the position of the id. Building the index reads segment bounds
+// only, so the build cost follows the segment count rather than the row count.
 #[derive(Debug)]
-pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
+pub struct RowIdIndex {
+    /// Fragments that hold at least one row id, sorted by their lowest row id.
+    fragments: Vec<FragmentEntry>,
+    /// `max_end[i]` is the highest row id that `fragments[..=i]` cover. A lookup
+    /// walks back from the last fragment starting at or below the wanted id and
+    /// stops once this bound falls below it.
+    max_end: Vec<u64>,
+}
 
 pub struct FragmentRowIdIndex {
     pub fragment_id: u32,
@@ -32,337 +40,200 @@ pub struct FragmentRowIdIndex {
     pub deletion_vector: Arc<DeletionVector>,
 }
 
+/// One segment of a fragment row id sequence, plus the physical offset that the
+/// first row of the segment sits at inside the fragment.
+#[derive(Debug)]
+struct SegmentEntry {
+    seq_idx: usize,
+    range: RangeInclusive<u64>,
+    start_offset: u32,
+}
+
+#[derive(Debug)]
+struct FragmentEntry {
+    fragment_id: u32,
+    sequence: Arc<RowIdSequence>,
+    deletion_vector: Arc<DeletionVector>,
+    segments: Vec<SegmentEntry>,
+    start: u64,
+    end: u64,
+}
+
+/// Row id bounds of a segment. `None` for an empty segment.
+fn segment_bounds(segment: &U64Segment) -> Option<RangeInclusive<u64>> {
+    segment.range()
+}
+
+impl FragmentEntry {
+    fn new(source: &FragmentRowIdIndex) -> Option<Self> {
+        let mut segments: Vec<SegmentEntry> = Vec::new();
+        let mut start_offset: u32 = 0;
+        for (seq_idx, segment) in source.row_id_sequence.0.iter().enumerate() {
+            let len = segment.len() as u32;
+            if let Some(range) = segment_bounds(segment) {
+                segments.push(SegmentEntry {
+                    seq_idx,
+                    range,
+                    start_offset,
+                });
+            }
+            start_offset += len;
+        }
+        let start = segments.iter().map(|entry| *entry.range.start()).min()?;
+        let end = segments.iter().map(|entry| *entry.range.end()).max()?;
+        Some(Self {
+            fragment_id: source.fragment_id,
+            sequence: source.row_id_sequence.clone(),
+            deletion_vector: source.deletion_vector.clone(),
+            segments,
+            start,
+            end,
+        })
+    }
+
+    /// Address of `row_id` inside this fragment. `None` when the fragment does
+    /// not hold the id, or holds it as a deleted row. A deleted id resolves the
+    /// same way an absent one does, so the caller keeps looking in the remaining
+    /// candidates.
+    fn resolve(&self, row_id: u64) -> Option<RowAddress> {
+        for entry in &self.segments {
+            if !entry.range.contains(&row_id) {
+                continue;
+            }
+            let Some(position) = self.sequence.0[entry.seq_idx].position(row_id) else {
+                continue;
+            };
+            let row_offset = entry.start_offset + position as u32;
+            if self.deletion_vector.contains(row_offset) {
+                return None;
+            }
+            return Some(RowAddress::new_from_parts(self.fragment_id, row_offset));
+        }
+        None
+    }
+
+    fn covers(&self, row_id: u64) -> bool {
+        self.start <= row_id && row_id <= self.end
+    }
+}
+
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let chunks = fragment_indices
+        let mut fragments: Vec<FragmentEntry> = fragment_indices
             .iter()
-            .flat_map(decompose_sequence)
-            .collect::<Vec<_>>();
+            .filter_map(FragmentEntry::new)
+            .collect();
+        fragments.sort_unstable_by_key(|entry| entry.start);
 
-        let mut final_chunks = Vec::new();
-        for processed_chunk in prep_index_chunks(chunks) {
-            match processed_chunk {
-                RawIndexChunk::NonOverlapping(chunk) => {
-                    final_chunks.push(chunk);
-                }
-                RawIndexChunk::Overlapping(_range, overlapping_chunks) => {
-                    // Intersecting row-id ranges don't imply intersecting id sets;
-                    // sparse ids and deletion holes leave the union short of the span.
-                    // The real invariant (no id in two fragments) is checked in the merge.
-                    let merged_chunk = merge_overlapping_chunks(overlapping_chunks)?;
-                    final_chunks.push(merged_chunk);
-                }
-            }
+        let mut max_end = Vec::with_capacity(fragments.len());
+        let mut running = 0_u64;
+        for entry in &fragments {
+            running = running.max(entry.end);
+            max_end.push(running);
         }
 
-        Ok(Self(RangeInclusiveMap::from_iter(final_chunks)))
+        Ok(Self { fragments, max_end })
     }
 
     /// Get the address for a given row id.
     ///
     /// Will return None if the row id does not exist in the index.
     pub fn get(&self, row_id: u64) -> Option<RowAddress> {
-        let (row_id_segment, address_segment) = self.0.get(&row_id)?;
-        let pos = row_id_segment.position(row_id)?;
-        let address = address_segment.get(pos)?;
-        Some(RowAddress::from(address))
+        self.candidates(row_id)
+            .find_map(|(_, entry)| entry.resolve(row_id))
     }
 
     /// Get addresses for many row ids in one pass over the index.
     ///
     /// Returns one entry per input id, in input order (`None` for missing).
-    /// Sorts a working copy of the input internally so the chunk iterator
-    /// is advanced at most once per chunk, amortizing the per-id tree walk
-    /// from O(N · log F) to O(F + N).
+    /// Sorts a working copy of the input so that neighbouring ids reach the same
+    /// fragment, and tries the fragment that answered last before searching the
+    /// candidates again.
     pub fn get_many(&self, row_ids: &[u64]) -> Vec<Option<RowAddress>> {
-        let n = row_ids.len();
-        let mut out = vec![None; n];
-        if n == 0 {
+        let mut out = vec![None; row_ids.len()];
+        if row_ids.is_empty() {
             return out;
         }
 
-        let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..n).collect();
-        sorted.sort_unstable_by_key(|&(id, _)| id);
+        let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..row_ids.len()).collect();
+        sorted.sort_unstable_by_key(|&(row_id, _)| row_id);
 
-        let mut chunks = self.0.iter().peekable();
-        for (id, orig_idx) in sorted {
-            // Advance past chunks that end before this id.
-            while let Some((range, _)) = chunks.peek() {
-                if *range.end() < id {
-                    chunks.next();
-                } else {
+        let mut last: Option<usize> = None;
+        for (row_id, orig_idx) in sorted {
+            if let Some(slot) = last
+                && self.fragments[slot].covers(row_id)
+                && let Some(address) = self.fragments[slot].resolve(row_id)
+            {
+                out[orig_idx] = Some(address);
+                continue;
+            }
+            for (slot, entry) in self.candidates(row_id) {
+                if let Some(address) = entry.resolve(row_id) {
+                    out[orig_idx] = Some(address);
+                    last = Some(slot);
                     break;
                 }
-            }
-            let Some((range, (row_id_seg, addr_seg))) = chunks.peek() else {
-                break;
-            };
-            if id < *range.start() {
-                continue; // falls in a gap between chunks
-            }
-            if let Some(pos) = row_id_seg.position(id)
-                && let Some(addr) = addr_seg.get(pos)
-            {
-                out[orig_idx] = Some(RowAddress::from(addr));
             }
         }
         out
     }
+
+    /// Check that no row id is live in more than one fragment.
+    ///
+    /// This walks every live row id, so the cost follows the row count. `new`
+    /// leaves it out on purpose: a point lookup would otherwise pay for a full
+    /// pass over the index. Callers that want the guarantee run it as a
+    /// diagnostic.
+    pub fn verify(&self) -> Result<()> {
+        for (slot, entry) in self.fragments.iter().enumerate() {
+            for segment_entry in &entry.segments {
+                for row_id in entry.sequence.0[segment_entry.seq_idx].iter() {
+                    if entry.resolve(row_id).is_none() {
+                        continue;
+                    }
+                    let duplicated = self.candidates(row_id).any(|(other_slot, other)| {
+                        other_slot != slot && other.resolve(row_id).is_some()
+                    });
+                    if duplicated {
+                        return Err(Error::internal(format!(
+                            "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fragments that can hold `row_id`, highest starting id first.
+    fn candidates(&self, row_id: u64) -> impl Iterator<Item = (usize, &FragmentEntry)> {
+        let upper = self
+            .fragments
+            .partition_point(|entry| entry.start <= row_id);
+        self.fragments[..upper]
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(move |(slot, _)| self.max_end[*slot] >= row_id)
+            .filter(move |(_, entry)| entry.end >= row_id)
+    }
 }
 
 impl DeepSizeOf for RowIdIndex {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.0
+    /// Counts the tables this index owns. The row id sequences and deletion
+    /// vectors sit behind `Arc`s that the per-fragment caches also hold, and
+    /// each of those entries is charged to the cache that owns it.
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        let fragment_bytes = self.fragments.len() * std::mem::size_of::<FragmentEntry>();
+        let segment_bytes: usize = self
+            .fragments
             .iter()
-            .map(|(_, (row_id_segment, address_segment))| {
-                (2 * std::mem::size_of::<u64>())
-                    + std::mem::size_of::<(U64Segment, U64Segment)>()
-                    + row_id_segment.deep_size_of_children(context)
-                    + address_segment.deep_size_of_children(context)
-            })
-            .sum()
+            .map(|entry| entry.segments.len() * std::mem::size_of::<SegmentEntry>())
+            .sum();
+        let bound_bytes = self.max_end.len() * std::mem::size_of::<u64>();
+        fragment_bytes + segment_bytes + bound_bytes
     }
-}
-
-fn decompose_sequence(
-    frag_index: &FragmentRowIdIndex,
-) -> Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))> {
-    let mut start_address: u64 = RowAddress::first_row(frag_index.fragment_id).into();
-    let mut current_offset = 0u32;
-    let no_deletions = frag_index.deletion_vector.is_empty();
-
-    frag_index
-        .row_id_sequence
-        .0
-        .iter()
-        .filter_map(|segment| {
-            let segment_len = segment.len();
-
-            let result = if no_deletions {
-                decompose_segment_no_deletions(segment, start_address)
-            } else {
-                decompose_segment_with_deletions(
-                    segment,
-                    start_address,
-                    current_offset,
-                    &frag_index.deletion_vector,
-                )
-            };
-
-            current_offset += segment_len as u32;
-            start_address += segment_len as u64;
-
-            result
-        })
-        .collect()
-}
-
-/// Build an IndexChunk from a list of (row_id, address) pairs.
-fn build_chunk_from_pairs(pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
-    if pairs.is_empty() {
-        return None;
-    }
-    let (row_ids, addresses): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
-    let row_id_segment = U64Segment::from_iter(row_ids);
-    let address_segment = U64Segment::from_iter(addresses);
-    let coverage = row_id_segment.range()?;
-    Some((coverage, (row_id_segment, address_segment)))
-}
-
-/// Fast path: no deletions. O(1) for Range segments.
-fn decompose_segment_no_deletions(segment: &U64Segment, start_address: u64) -> Option<IndexChunk> {
-    match segment {
-        U64Segment::Range(range) if !range.is_empty() => {
-            let len = range.end - range.start;
-            let row_id_segment = U64Segment::Range(range.clone());
-            let address_segment = U64Segment::Range(start_address..start_address + len);
-            let coverage = range.start..=range.end - 1;
-            Some((coverage, (row_id_segment, address_segment)))
-        }
-        _ if segment.is_empty() => None,
-        _ => {
-            // Non-Range segments: must iterate to build address mapping.
-            let pairs: Vec<(u64, u64)> = segment
-                .iter()
-                .enumerate()
-                .map(|(i, row_id)| (row_id, start_address + i as u64))
-                .collect();
-            build_chunk_from_pairs(pairs)
-        }
-    }
-}
-
-/// Slow path: has deletions, must check each row.
-fn decompose_segment_with_deletions(
-    segment: &U64Segment,
-    start_address: u64,
-    current_offset: u32,
-    deletion_vector: &DeletionVector,
-) -> Option<IndexChunk> {
-    let pairs: Vec<(u64, u64)> = segment
-        .iter()
-        .enumerate()
-        .filter_map(|(i, row_id)| {
-            let row_offset = current_offset + i as u32;
-            if !deletion_vector.contains(row_offset) {
-                Some((row_id, start_address + i as u64))
-            } else {
-                None
-            }
-        })
-        .collect();
-    build_chunk_from_pairs(pairs)
-}
-
-type IndexChunk = (RangeInclusive<u64>, (U64Segment, U64Segment));
-
-#[derive(Debug)]
-enum RawIndexChunk {
-    NonOverlapping(IndexChunk),
-    Overlapping(RangeInclusive<u64>, Vec<IndexChunk>),
-}
-
-impl RawIndexChunk {
-    fn range_end(&self) -> u64 {
-        match self {
-            Self::NonOverlapping((range, _)) => *range.end(),
-            Self::Overlapping(range, _) => *range.end(),
-        }
-    }
-}
-
-/// Given a vector of index chunks, sort them and return an iterator of index chunks.
-///
-/// The iterator will yield chunks that are non-overlapping or a set of chunks
-/// that are overlapping.
-fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = RawIndexChunk> {
-    chunks.sort_by_key(|(range, _)| u64::MAX - *range.start());
-
-    let mut output = Vec::new();
-
-    // Start assuming non-overlapping in first chunk.
-    if let Some(first_chunk) = chunks.pop() {
-        output.push(RawIndexChunk::NonOverlapping(first_chunk));
-    } else {
-        // Early return for empty.
-        return output.into_iter();
-    }
-
-    let mut current_range = 0..=0;
-    let mut current_overlap = Vec::new();
-    while let Some(chunk) = chunks.pop() {
-        debug_assert_eq!(
-            current_overlap
-                .iter()
-                .map(|(range, _): &IndexChunk| *range.start())
-                .min()
-                .unwrap_or_default(),
-            *current_range.start(),
-        );
-        debug_assert_eq!(
-            current_overlap
-                .iter()
-                .map(|(range, _): &IndexChunk| *range.end())
-                .max()
-                .unwrap_or_default(),
-            *current_range.end(),
-        );
-
-        if current_overlap.is_empty() {
-            // We haven't found overlap yet.
-            let last_chunk_end = output.last().unwrap().range_end();
-            if *chunk.0.start() <= last_chunk_end {
-                // We have found overlap.
-                match output.pop().unwrap() {
-                    RawIndexChunk::NonOverlapping(chunk) => {
-                        current_overlap.push(chunk);
-                    }
-                    _ => unreachable!(),
-                }
-                current_overlap.push(chunk);
-
-                let range_start = *current_overlap.first().unwrap().0.start();
-                let range_end = *current_overlap
-                    .last()
-                    .unwrap()
-                    .0
-                    .end()
-                    .max(current_overlap.first().unwrap().0.end());
-                current_range = range_start..=range_end;
-            } else {
-                // We are still in non-overlapping space.
-                output.push(RawIndexChunk::NonOverlapping(chunk));
-            }
-        } else {
-            // We are making an overlap chunk
-            if chunk.0.start() <= current_range.end() {
-                // We are still in overlap.
-                let range_end = *chunk.0.end().max(current_range.end());
-                current_range = *current_range.start()..=range_end;
-
-                current_overlap.push(chunk);
-            } else {
-                // We have exited overlap.
-                output.push(RawIndexChunk::Overlapping(
-                    std::mem::replace(&mut current_range, 0..=0),
-                    std::mem::take(&mut current_overlap),
-                ));
-                output.push(RawIndexChunk::NonOverlapping(chunk));
-            }
-        }
-    }
-    debug_assert_eq!(
-        current_overlap
-            .iter()
-            .map(|(range, _): &IndexChunk| *range.start())
-            .min()
-            .unwrap_or_default(),
-        *current_range.start(),
-    );
-    debug_assert_eq!(
-        current_overlap
-            .iter()
-            .map(|(range, _): &IndexChunk| *range.end())
-            .max()
-            .unwrap_or_default(),
-        *current_range.end(),
-    );
-
-    if !current_overlap.is_empty() {
-        output.push(RawIndexChunk::Overlapping(
-            current_range.clone(),
-            current_overlap,
-        ));
-    }
-
-    output.into_iter()
-}
-
-fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<IndexChunk> {
-    let total_capacity = overlapping_chunks
-        .iter()
-        .map(|(_, (row_ids, _))| row_ids.len())
-        .sum();
-    let mut values = Vec::with_capacity(total_capacity);
-    for (_, (row_ids, row_addrs)) in overlapping_chunks.iter() {
-        values.extend(row_ids.iter().zip(row_addrs.iter()));
-    }
-    values.sort_by_key(|(row_id, _)| *row_id);
-    // A duplicate row id here means two fragments claim the same live id: a
-    // corrupt index, not a resolvable sparse-coverage case.
-    if let Some(w) = values.windows(2).find(|w| w[0].0 == w[1].0) {
-        return Err(Error::internal(format!(
-            "row id index corrupt: stable row id {} is live in multiple fragments",
-            w[0].0
-        )));
-    }
-    let row_id_segment = U64Segment::from_iter(values.iter().map(|(row_id, _)| *row_id));
-    let address_segment = U64Segment::from_iter(values.iter().map(|(_, row_addr)| *row_addr));
-
-    let range = row_id_segment.range().unwrap();
-
-    Ok((range, (row_id_segment, address_segment)))
 }
 
 #[cfg(test)]
@@ -914,7 +785,8 @@ mod tests {
                 },
             ];
 
-            let error = RowIdIndex::new(&fragment_indices).unwrap_err();
+            let index = RowIdIndex::new(&fragment_indices).unwrap();
+            let error = index.verify().unwrap_err();
             let is_internal = matches!(&error, Error::Internal { .. });
             let expected_message =
                 format!("stable row id {row_id} is live in multiple fragments");
