@@ -2234,7 +2234,7 @@ impl Transaction {
                 .unwrap_or_default()
         {
             return Err(Error::not_supported_source(
-                "Cannot enable stable row ids on existing dataset".into(),
+                "This dataset was not created with the stable row ids feature.  Please run `migrate_to_stable_row_ids` before attempting to use stable row ids".into(),
             ));
         }
         let mut reference_paths = match current_manifest {
@@ -2330,7 +2330,7 @@ impl Transaction {
                         Some(migration_nri)
                     } else {
                         return Err(Error::not_supported_source(
-                            "Cannot enable stable row ids on existing dataset".into(),
+                            "This dataset was not created with the stable row ids feature.  Please run `migrate_to_stable_row_ids` before attempting to use stable row ids".into(),
                         ));
                     }
                 }
