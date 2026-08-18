@@ -284,8 +284,8 @@ message AddBase {
  */
 message TombstoneFieldData {
   Ref fragment = 1;
-  // Committed field ids whose current backing is tombstoned.
-  repeated uint64 field_ids = 2;
+  // The fields whose current backing is tombstoned.
+  repeated Ref field_ids = 2;
   // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
@@ -374,7 +374,7 @@ message UpdateCompactedSsTables {
  * no live fields). References an existing committed field id.
  */
 message DropField {
-  uint64 field = 1;
+  Ref field = 1;
 }
 
 /*
@@ -387,7 +387,7 @@ message DropField {
  * AddDataFile to rewrite the data. New facets are added as optional fields.
  */
 message AlterField {
-  uint64 field = 1;
+  Ref field = 1;
   optional string name = 2;
   // New Arrow logical type (see Field.logical_type). The cast.
   optional string logical_type = 3;
