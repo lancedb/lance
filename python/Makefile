@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 .PHONY: help install build test integtest doctest compattest format format-python lint lint-python lint-rust clean
 PYTHON ?=
-PYTEST_ARGS ?= -vvv -s -m "not recurring"
+PYTEST_ARGS ?= -vvv -s
 KEEP_COMPOSE ?= 0
 COMPOSE_FILE ?= ../docker-compose.yml
 UV_SYNC = uv sync
@@ -32,7 +32,7 @@ install: ## Sync dependencies and set up local development tools
 build: ## Build the local Rust extension with maturin
 	$(UV_RUN) maturin develop --uv
 
-test: ## Run Python tests except recurring tests
+test: ## Run Python tests
 	pytest $(PYTEST_ARGS) python/tests
 
 integtest: ## Start LocalStack and run integration tests

@@ -4,7 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -26,7 +26,10 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
+    path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -823,6 +826,57 @@ impl ObjectStore {
         Writer::shutdown(writer.as_mut()).await
     }
 
+    /// Atomically creates an object without replacing an existing object.
+    ///
+    /// Local stores publish a uniquely named staging object with a conditional
+    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// is rejected because it can silently ignore conditional create requests.
+    ///
+    /// Returns [`object_store::Error::NotSupported`] without writing when the
+    /// backend cannot reliably provide put-if-absent semantics.
+    pub async fn put_if_absent(
+        &self,
+        path: &Path,
+        content: PutPayload,
+    ) -> object_store::Result<()> {
+        if self.scheme == "cos" {
+            return Err(object_store::Error::NotSupported {
+                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
+                         versioning has ever been enabled"
+                    .into(),
+            });
+        }
+
+        if self.is_local() {
+            let staging_path =
+                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            self.inner.put(&staging_path, content).await?;
+            let result = self.inner.rename_if_not_exists(&staging_path, path).await;
+            if result.is_err()
+                && let Err(error) = self.inner.delete(&staging_path).await
+            {
+                log::warn!(
+                    "Failed to remove staging object {} after atomic create failed: {}",
+                    staging_path,
+                    error
+                );
+            }
+            result
+        } else {
+            self.inner
+                .put_opts(
+                    path,
+                    content,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
+    }
+
     pub async fn delete(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;
         Ok(())
@@ -951,6 +1005,53 @@ impl ObjectStore {
             return super::local::remove_dir_all(&path);
         }
         Ok(())
+    }
+
+    /// Remove eligible materialized empty directories below a local root.
+    ///
+    /// This is a no-op for object stores, which do not materialize directories.
+    /// Traversal does not follow symbolic links. Directories in `retained_dirs` and their
+    /// descendants are preserved. Other directories are removed only if they are empty and
+    /// either appear in `verified_dirs` or predate `unmodified_since`. Passing `None` for
+    /// `unmodified_since` disables the age check.
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// # use chrono::Utc;
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> Result<()> {
+    /// store
+    ///     .remove_empty_dirs(
+    ///         "dataset/_indices",
+    ///         HashSet::new(),
+    ///         HashSet::new(),
+    ///         Some(Utc::now()),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remove_empty_dirs(
+        &self,
+        root_path: impl Into<Path>,
+        retained_dirs: HashSet<Path>,
+        verified_dirs: HashSet<Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        if !self.is_local() && self.scheme != "file-object-store" {
+            return Ok(());
+        }
+
+        let path = Path::parse(root_path.into())?;
+        let metrics = self.io_tracker.begin_io("delete");
+        let result = tokio::task::spawn_blocking(move || {
+            super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
+        })
+        .await
+        .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
+        metrics.record(&result, 0);
+        result
     }
 
     pub fn remove_stream<'a>(
@@ -1250,6 +1351,44 @@ mod tests {
         Ok(contents)
     }
 
+    #[tokio::test]
+    async fn test_put_if_absent() {
+        let temp_dir = TempStrDir::default();
+        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let store = ObjectStore::local();
+        store
+            .put_if_absent(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"second").into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ));
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"first".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent_rejects_cos() {
+        let mut store = ObjectStore::memory();
+        store.scheme = "cos".to_string();
+        let path = Path::from("atomic-create");
+
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(!store.exists(&path).await.unwrap());
+    }
+
     #[test]
     fn test_io_parallelism_clamped_to_nonzero() {
         // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
@@ -1481,6 +1620,84 @@ mod tests {
             .unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[tokio::test]
+    async fn test_remove_empty_directories(#[case] scheme: &str) {
+        let path = TempStdDir::default();
+        let stale_dir = path.join("stale");
+        let nested_stale_dir = path.join("nested_stale");
+        let nested_stale_child = nested_stale_dir.join("child");
+        create_dir_all(&stale_dir).unwrap();
+        create_dir_all(&nested_stale_child).unwrap();
+        create_dir_all(path.join("retained").join("child")).unwrap();
+        write_to_file(
+            path.join("file_bearing")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
+            "keep",
+        )
+        .unwrap();
+        create_dir_all(path.join("file_bearing").join("empty_child")).unwrap();
+
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
+
+        #[cfg(unix)]
+        let unmodified_since = {
+            let old_modified_time =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+            for directory in [&stale_dir, &nested_stale_dir, &nested_stale_child] {
+                std::fs::File::open(directory)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(old_modified_time))
+                    .unwrap();
+            }
+            DateTime::<Utc>::from(std::time::SystemTime::now())
+                - chrono::TimeDelta::try_days(7).unwrap()
+        };
+        #[cfg(not(unix))]
+        let unmodified_since = DateTime::<Utc>::from(std::time::SystemTime::now())
+            + chrono::TimeDelta::try_days(1).unwrap();
+
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::new(),
+                Some(unmodified_since),
+            )
+            .await
+            .unwrap();
+
+        assert!(!path.join("stale").exists());
+        assert!(!path.join("nested_stale").exists());
+        assert!(path.join("retained").join("child").exists());
+        assert!(path.join("file_bearing").join("empty_child").exists());
+
+        create_dir_all(path.join("fresh")).unwrap();
+        create_dir_all(path.join("verified")).unwrap();
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::from([base.clone().join("verified")]),
+                Some(
+                    DateTime::<Utc>::from(std::time::SystemTime::now())
+                        - chrono::TimeDelta::try_days(7).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(path.join("fresh").exists());
+        assert!(!path.join("verified").exists());
     }
 
     #[derive(Debug)]

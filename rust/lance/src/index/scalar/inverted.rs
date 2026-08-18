@@ -908,6 +908,32 @@ pub async fn load_segments(
     Ok(Some(indices))
 }
 
+/// Return the fragment coverage for the logical FTS index selected by `column`
+/// and `document_granularity`.
+///
+/// Returns `None` when no FTS index is available or when any physical segment
+/// has unknown coverage. In either case, callers must not use the result for
+/// pruning.
+pub(crate) async fn fts_index_fragment_bitmap(
+    dataset: &Dataset,
+    column: &str,
+    document_granularity: DocumentGranularity,
+) -> Result<Option<RoaringBitmap>> {
+    let Some(segments) = load_segments(dataset, column, document_granularity).await? else {
+        return Ok(None);
+    };
+
+    let fragment_bitmap =
+        segments
+            .iter()
+            .try_fold(RoaringBitmap::new(), |mut coverage, segment| {
+                coverage |= segment.fragment_bitmap.as_ref()?.clone();
+                Some(coverage)
+            });
+
+    Ok(fragment_bitmap)
+}
+
 /// Load and validate the shared [`InvertedIndexDetails`] across committed
 /// segments returned by [`load_segments`].
 ///
@@ -915,8 +941,10 @@ pub async fn load_segments(
 /// payload (tokenizer, position settings, etc.); inconsistent
 /// segments return an error. Details are canonicalized before comparison so
 /// legacy segments that omit default fields remain compatible with newly
-/// written text FTS segments. Returns the canonical details that may be used
-/// when constructing a tokenizer or running a query against the index.
+/// written text FTS segments. `posting_format_version` is a physical
+/// per-segment property and may differ when a legacy FTS v1 segment is
+/// combined with a newly written one. Returns the first segment's
+/// canonicalized details for tokenizer construction and query planning.
 pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
@@ -933,7 +961,7 @@ pub async fn load_segment_details(
             })?;
         let details = canonicalize_inverted_index_details(details)?;
         match &expected_details {
-            Some(expected) if expected != &details => {
+            Some(expected) if !inverted_index_details_semantically_equal(expected, &details) => {
                 return Err(Error::invalid_input(format!(
                     "FTS index {} has inconsistent inverted index details across segments",
                     meta.name
@@ -956,6 +984,22 @@ fn canonicalize_inverted_index_details(
 ) -> Result<InvertedIndexDetails> {
     let params = InvertedIndexParams::try_from(&details)?;
     InvertedIndexDetails::try_from(&params)
+}
+
+/// Compare canonicalized inverted-index details for shared semantic configuration.
+///
+/// `posting_format_version` records how a single segment physically stores
+/// postings, so mixed-version FTS segments may disagree on it without being
+/// incompatible. Every other field remains part of the equality check.
+fn inverted_index_details_semantically_equal(
+    left: &InvertedIndexDetails,
+    right: &InvertedIndexDetails,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.posting_format_version = None;
+    right.posting_format_version = None;
+    left == right
 }
 
 /// Read one segment's [`InvertedIndexParams`]
@@ -1065,5 +1109,30 @@ mod tests {
             canonicalize_inverted_index_details(legacy).unwrap(),
             canonicalize_inverted_index_details(current).unwrap()
         );
+    }
+
+    #[test]
+    fn inverted_details_equal_when_only_posting_format_version_differs() {
+        let left = canonicalize_inverted_index_details(
+            InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap(),
+        )
+        .unwrap();
+        let mut right = left.clone();
+        right.posting_format_version = Some(1);
+
+        assert_ne!(left, right);
+        assert!(inverted_index_details_semantically_equal(&left, &right));
+    }
+
+    #[test]
+    fn inverted_details_reject_with_position_mismatch() {
+        let left = canonicalize_inverted_index_details(
+            InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap(),
+        )
+        .unwrap();
+        let mut right = left.clone();
+        right.with_position = !left.with_position;
+
+        assert!(!inverted_index_details_semantically_equal(&left, &right));
     }
 }

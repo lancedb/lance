@@ -13,6 +13,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
+use super::row_ids::{ExternalFile, RowIdMeta};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -36,7 +37,7 @@ pub struct DataFile {
     pub fields: Arc<[i32]>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
     ///
-    /// Note that -1 is a possibility and it indices that the field has
+    /// Note that -1 is a possibility and it indicates that the field has
     /// no top-level column in the file.
     ///
     /// Columns that lack a field id may still exist as extra entries in
@@ -168,7 +169,7 @@ impl DataFile {
         full_schema.project_by_ids(&self.fields, false)
     }
 
-    pub fn is_legacy_file(&self) -> bool {
+    fn uses_v1_data_file_encoding(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
 
@@ -181,7 +182,7 @@ impl DataFile {
     }
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
-        if self.is_legacy_file() {
+        if self.uses_v1_data_file_encoding() {
             // A tombstone marks a field superseded by a later data file. It is
             // not a field id, so it carries no ordering; the live ids around it
             // must still be sorted and distinct.
@@ -454,38 +455,6 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
-/// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ExternalFile {
-    pub path: String,
-    pub offset: u64,
-    pub size: u64,
-}
-
-/// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub enum RowIdMeta {
-    Inline(Vec<u8>),
-    External(ExternalFile),
-}
-
-impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
-    type Error = Error;
-
-    fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
-        match value {
-            pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
-        }
-    }
-}
-
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -674,12 +643,6 @@ impl Fragment {
             .push(DataFile::new_legacy(path, schema, None, None));
     }
 
-    // True if this fragment is made up of legacy v1 files, false otherwise
-    pub fn has_legacy_files(&self) -> bool {
-        // If any file in a fragment is legacy then all files in the fragment must be
-        self.files[0].is_legacy_file()
-    }
-
     // Helper method to infer the Lance version from a set of fragments
     //
     // Returns None if there are no data files
@@ -768,7 +731,9 @@ impl From<&Fragment> for pb::DataFragment {
         });
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
-            RowIdMeta::Inline(data) => pb::data_fragment::RowIdSequence::InlineRowIds(data.clone()),
+            RowIdMeta::Inline(data) => {
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+            }
             RowIdMeta::External(file) => {
                 pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
                     path: file.path.clone(),

@@ -39,6 +39,39 @@ pub struct TransactionRebase<'a> {
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
 }
 
+/// Whether `operation` may make a nullability-affecting schema change: a
+/// projection or merge that does not assert `preserves_nullability`. A
+/// tightening projection scanned for nulls at its read version, and a merge
+/// may introduce a field that data staged against an earlier schema cannot
+/// safely omit; either is falsified by a concurrent value-write.
+fn may_alter_nullability(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Project {
+            preserves_nullability: false,
+            ..
+        } | Operation::Merge {
+            preserves_nullability: false,
+            ..
+        }
+    )
+}
+
+/// Whether `operation` can commit rows that falsify such a change: by writing
+/// a null into a scanned field, or by omitting a required column entirely (a
+/// stale append's fragments read as null for columns they predate). `Delete`
+/// only removes rows and `Rewrite` preserves the values it moves; `Project`
+/// already conflicts with projections and merges elsewhere.
+fn supplies_values(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Append { .. }
+            | Operation::Update { .. }
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
+    )
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -214,6 +247,23 @@ impl<'a> TransactionRebase<'a> {
         )
     }
 
+    #[track_caller]
+    fn data_replacement_field_removed_err(
+        &self,
+        field_id: i32,
+        fragment_id: u64,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "DataReplacement target field {} in fragment {} was dropped by concurrent {} at version {}.",
+                field_id, fragment_id, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
     /// Check whether the transaction conflicts with another transaction.
     /// Mutate the current [TransactionRebase] based on `other_transaction` to be used for
     /// eventually finishing the rebase process.
@@ -221,6 +271,15 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        // Either order: the claim was checked without the write's data.
+        let ours = &self.transaction.operation;
+        let theirs = &other_transaction.operation;
+        if (may_alter_nullability(ours) && supplies_values(theirs))
+            || (supplies_values(ours) && may_alter_nullability(theirs))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+
         let op = &self.transaction.operation;
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
@@ -557,6 +616,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => self.check_compacted_sstables_conflict(
                     other_compacted_sstables,
                     self_compacted_sstables,
@@ -638,8 +698,16 @@ impl<'a> TransactionRebase<'a> {
                     );
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids, so this should be fine.
-                Operation::Merge { .. } => Ok(()),
+                // Merge, reserve, and project don't change row ids. The MemWAL
+                // index is the exception: its install validates schema-dependent
+                // state, which a concurrent schema change invalidates.
+                Operation::Merge { .. } => {
+                    if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
@@ -738,6 +806,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
                     // as they can be rebased on each other
@@ -1044,11 +1113,28 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Project { schema, .. } => {
+                    // A project operation can drop fields.  If the project
+                    // dropped a field this operation was replacing then
+                    // we have a conflict.
+                    for replacement in replacements {
+                        for field in replacement.1.fields.iter() {
+                            if *field >= 0 && schema.field_by_id(*field).is_none() {
+                                return Err(self.data_replacement_field_removed_err(
+                                    *field,
+                                    replacement.0,
+                                    other_transaction,
+                                    other_version,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::Merge { .. } => {
                     // Merge rewrites the whole fragment list; always conflict
                     // (symmetric with check_merge_txn).
@@ -1299,8 +1385,15 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
-            Operation::CreateIndex { .. }
-            | Operation::ReserveFragments { .. }
+            // See the MemWAL exception in check_create_index_txn.
+            Operation::CreateIndex { new_indices, .. } => {
+                if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
@@ -1473,13 +1566,17 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Activation rebases like any other MemWAL state update; its preconditions
+        // are re-checked against the rebased index list when the commit applies.
         if let Operation::UpdateMemWalState {
             compacted_sstables: self_compacted_sstables,
+            ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
                     // the same shard's compacted SSTable
@@ -1884,6 +1981,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } = &mut self.transaction.operation
         {
             // Handle FRAG_REUSE_INDEX rebasing
@@ -1944,10 +2042,12 @@ impl<'a> TransactionRebase<'a> {
                     .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
                     .unwrap();
 
-                let current_meta = new_indices.remove(pos);
-                let mut details = load_mem_wal_index_details(current_meta)?;
+                let mut details = load_mem_wal_index_details(new_indices[pos].clone())?;
 
-                // Reconcile conflicting compacted_sstables by keeping each shard's higher generation.
+                // Reconcile conflicting compacted_sstables by keeping each shard's higher
+                // generation. Both sides are already-committed facts here, so the higher one
+                // is correct; rejecting a stale proposal is the job of apply-time validation
+                // against the latest state, which runs after this rebase.
                 // We own self so we can consume conflicting_mem_wal_compacted_sstables directly
                 for new_sstable in self.conflicting_mem_wal_compacted_sstables {
                     if let Some(existing) = details
@@ -1963,8 +2063,8 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
 
-                let new_meta = new_mem_wal_index_meta(dataset.manifest.version, details)?;
-                new_indices.push(new_meta);
+                // Replaced in place so the index list keeps its order.
+                new_indices[pos] = new_mem_wal_index_meta(dataset.manifest.version, details)?;
             }
 
             for singleton_name in [FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
@@ -2150,7 +2250,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::LanceFileVersion;
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2370,7 +2470,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2513,7 +2613,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2677,6 +2777,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
             },
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
@@ -2872,6 +2973,7 @@ mod tests {
                 Operation::Merge {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
                     schema: lance_core::datatypes::Schema::default(),
+                    preserves_nullability: true,
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
                 [
@@ -3274,6 +3376,7 @@ mod tests {
                 Operation::Merge {
                     fragments: vec![fragment1.clone()],
                     schema: lance_core::datatypes::Schema::default(),
+                    preserves_nullability: true,
                 },
                 Retryable,
             ),
@@ -3292,6 +3395,7 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
+                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -3494,6 +3598,134 @@ mod tests {
         }
     }
 
+    /// An append is the one value-write that rebases across a committed merge,
+    /// so a merge introducing a required field must claim: the append's
+    /// fragments omit the new column and its rows would read as null. A merge
+    /// without the claim keeps the long-standing behavior of appends passing
+    /// over nullable column adds. The reverse order conflicts regardless of
+    /// the claim, because a rebasing merge rewrites the whole fragment list.
+    #[test]
+    fn test_merge_claim_blocks_stale_append() {
+        for claims in [true, false] {
+            let merge = Operation::Merge {
+                fragments: vec![Fragment::new(0)],
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: !claims,
+            };
+            let append = Operation::Append {
+                fragments: vec![Fragment::new(1)],
+            };
+
+            let mut append_rebase = TransactionRebase {
+                transaction: Transaction::new(0, append.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
+            assert_eq!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                claims,
+                "append rebasing over merge/claims={claims}: got {result:?}"
+            );
+
+            let mut merge_rebase = TransactionRebase {
+                transaction: Transaction::new(0, merge, None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::from_iter([0]),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
+            assert!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                "merge rebasing over append/claims={claims}: got {result:?}"
+            );
+        }
+    }
+
+    /// A claim conflicts with any write that can supply values, either order.
+    #[test]
+    fn test_non_null_claim_barrier() {
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let file = || DataFile::new_legacy_from_fields("w.lance", vec![0], None);
+        let writers = [
+            (
+                "append",
+                Operation::Append {
+                    fragments: vec![Fragment::new(1)],
+                },
+            ),
+            (
+                "update",
+                Operation::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![],
+                    fields_modified: vec![0],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(UpdateMode::RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+            ),
+            (
+                "replacement",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, file())],
+                },
+            ),
+            (
+                "overlay",
+                Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![DataOverlayFile {
+                            data_file: file(),
+                            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                            committed_version: 0,
+                        }],
+                    }],
+                },
+            ),
+        ];
+
+        for (writer_name, writer) in &writers {
+            for claims in [true, false] {
+                let project = Operation::Project {
+                    schema: lance_core::datatypes::Schema::default(),
+                    preserves_nullability: !claims,
+                };
+                for (order, ours, theirs) in [
+                    ("project-rebasing", project.clone(), writer.clone()),
+                    ("writer-rebasing", writer.clone(), project.clone()),
+                ] {
+                    let mut rebase = TransactionRebase {
+                        transaction: Transaction::new(0, ours.clone(), None),
+                        initial_fragments: HashMap::new(),
+                        modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
+                        affected_rows: None,
+                        conflicting_frag_reuse_indices: Vec::new(),
+                        conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    };
+                    let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
+                    assert_eq!(
+                        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                        claims,
+                        "{writer_name}/claims={claims}/{order}: got {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[rstest::rstest]
     #[case::coverage_overlaps_moved_row(vec![0u32], true)]
@@ -3518,7 +3750,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(1);
@@ -3640,6 +3872,82 @@ mod tests {
         assert_eq!(
             new_indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter(expected_fragment_ids)
+        );
+    }
+
+    #[test]
+    fn test_mem_wal_install_conflicts_with_merge() {
+        let mem_wal_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: MEM_WAL_INDEX_NAME.to_string(),
+            fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let column_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "btree".to_string(),
+            ..mem_wal_index.clone()
+        };
+        let merge = Transaction::new(
+            0,
+            Operation::Merge {
+                fragments: vec![],
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        // Install rebasing over a committed Merge conflicts; a column index
+        // stays compatible.
+        for (index, conflicts) in [(mem_wal_index.clone(), true), (column_index, false)] {
+            let txn = Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let mut rebase = TransactionRebase {
+                transaction: txn,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&merge, 1);
+            assert_eq!(result.is_err(), conflicts, "{result:?}");
+        }
+
+        // And the reverse: a Merge rebasing over a committed install conflicts.
+        let install = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: merge,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&install, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
         );
     }
 
@@ -4427,6 +4735,7 @@ mod tests {
                 Operation::Merge {
                     fragments: vec![Fragment::new(0)],
                     schema: lance_core::datatypes::Schema::default(),
+                    preserves_nullability: true,
                 },
                 Retryable,
             ),
@@ -4487,6 +4796,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4495,6 +4805,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4525,6 +4836,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4533,6 +4845,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4564,6 +4877,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4572,6 +4886,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4603,6 +4918,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4611,6 +4927,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4661,6 +4978,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4686,6 +5004,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4732,6 +5051,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );

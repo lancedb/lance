@@ -5,7 +5,6 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
@@ -28,7 +27,7 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions as file_versions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -128,7 +127,9 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::feature_flags::{
+    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
+};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -196,7 +197,13 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Object stores for additional base paths, shared across clones.
+    pub(crate) base_object_stores: BaseObjectStores,
 }
+
+/// The `OnceCell` coalesces concurrent first resolutions into one build.
+pub(crate) type BaseObjectStores =
+    Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
 impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -221,6 +228,14 @@ pub struct Version {
 
     /// Key-value pairs of metadata.
     pub metadata: BTreeMap<String, String>,
+}
+
+/// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct VersionRef {
+    /// Version number within the current branch's history.
+    pub version: u64,
 }
 
 /// Convert Manifest to Data Version.
@@ -490,6 +505,16 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
+        self.set_manifest(manifest, manifest_location);
+        Ok(())
+    }
+
+    /// Replace the manifest, refreshing derived state. Base stores are kept
+    /// when `base_paths` is unchanged.
+    fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+        if manifest.base_paths != self.manifest.base_paths {
+            self.base_object_stores = Default::default();
+        }
         self.manifest = manifest;
         self.manifest_location = manifest_location;
         self.fragment_bitmap = Arc::new(
@@ -499,7 +524,6 @@ impl Dataset {
                 .map(|f| f.id as u32)
                 .collect(),
         );
-        Ok(())
     }
 
     /// Check out the latest version of the branch
@@ -549,7 +573,7 @@ impl Dataset {
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         let dataset = builder.execute(transaction).await?;
 
         // Create BranchContents after shallow_clone
@@ -574,8 +598,10 @@ impl Dataset {
     }
 
     fn already_checked_out(&self, location: &ManifestLocation, branch_name: Option<&str>) -> bool {
-        // We check the e_tag here just in case it has been overwritten. This can
-        // happen if the table has been dropped then re-created recently.
+        // The ETag is an opaque object-generation token, not a content hash.
+        // Comparing the token still prevents reusing this Dataset's manifest
+        // after the physical object was replaced, for example by a recent
+        // drop/recreate at the same URI and version.
         self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
@@ -717,6 +743,8 @@ impl Dataset {
             read_struct(object_reader.as_ref(), offset).await
         }?;
 
+        validate_mem_wal_index_catchup_flags(&manifest)?;
+
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
                 "This dataset cannot be read by this version of Lance. \
@@ -852,6 +880,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Default::default(),
         })
     }
 
@@ -1147,15 +1176,6 @@ impl Dataset {
     /// ```
     pub fn delta(&self) -> delta::DatasetDeltaBuilder {
         delta::DatasetDeltaBuilder::new(self.clone())
-    }
-
-    // TODO: Cache this
-    pub(crate) fn is_legacy_storage(&self) -> bool {
-        self.manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap()
-            == LanceFileVersion::Legacy
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
@@ -1670,15 +1690,7 @@ impl Dataset {
         )
         .await?;
 
-        self.manifest = Arc::new(manifest);
-        self.manifest_location = manifest_location;
-        self.fragment_bitmap = Arc::new(
-            self.manifest
-                .fragments
-                .iter()
-                .map(|f| f.id as u32)
-                .collect(),
-        );
+        self.set_manifest(Arc::new(manifest), manifest_location);
 
         Ok(())
     }
@@ -2064,6 +2076,7 @@ impl Dataset {
     ) -> Self {
         let mut cloned = self.clone();
         cloned.object_store = object_store;
+        cloned.base_object_stores = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2275,42 +2288,13 @@ impl Dataset {
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file).await?;
 
-        let lance_file_format = ConcreteFileVersion::from_footer_numbers(
-            file_metadata.major_version,
-            file_metadata.minor_version,
-        )?;
-        let file_version: LanceFileVersion = lance_file_format.into();
-
-        let is_structural = file_version >= LanceFileVersion::V2_1;
+        let lance_file_format = file_metadata.version;
         let physical_columns = file_metadata.column_metadatas.len();
         let has_footer_orphans = file_metadata.file_schema.fields.len() > physical_columns;
         let dataset_schema = self.schema();
         let mut represented_columns = 0usize;
         let mut column_names = Vec::new();
         let mut consumed_top_level_fields = 0usize;
-
-        fn physical_column_count(
-            field: &lance_core::datatypes::Field,
-            is_structural: bool,
-        ) -> usize {
-            if !is_structural {
-                return 1 + field
-                    .children
-                    .iter()
-                    .map(|child| physical_column_count(child, is_structural))
-                    .sum::<usize>();
-            }
-
-            if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
-                1
-            } else {
-                field
-                    .children
-                    .iter()
-                    .map(|child| physical_column_count(child, is_structural))
-                    .sum()
-            }
-        }
 
         fn field_contains_blob(field: &lance_core::datatypes::Field) -> bool {
             field.is_blob() || field.children.iter().any(field_contains_blob)
@@ -2341,38 +2325,6 @@ impl Dataset {
                 lance_core::datatypes::BLOB_DESC_FIELDS.len()
             } else {
                 0
-            }
-        }
-
-        fn collect_columns(
-            field: &lance_core::datatypes::Field,
-            is_structural: bool,
-            fields: &mut Vec<i32>,
-            column_indices: &mut Vec<i32>,
-            curr_column_idx: &mut i32,
-        ) {
-            let contributes = !is_structural
-                || field.children.is_empty()
-                || field.is_blob()
-                || field.is_packed_struct();
-            let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
-
-            if contributes {
-                fields.push(field.id);
-                column_indices.push(*curr_column_idx);
-                *curr_column_idx += 1;
-            }
-
-            if recurse {
-                for child in &field.children {
-                    collect_columns(
-                        child,
-                        is_structural,
-                        fields,
-                        column_indices,
-                        curr_column_idx,
-                    );
-                }
             }
         }
 
@@ -2429,7 +2381,7 @@ impl Dataset {
             };
             validate_file_field_matches_dataset(dataset_field, field, &field.name)?;
 
-            represented_columns += physical_column_count(field, is_structural);
+            represented_columns += file_versions::physical_column_count(lance_file_format, field);
             column_names.push(field.name.as_str());
             consumed_top_level_fields = idx + 1;
             idx += 1;
@@ -2462,23 +2414,17 @@ impl Dataset {
 
         let projected_ds_schema = self.schema().project(&column_names)?;
 
-        let mut fields = Vec::new();
-        let mut column_indices = Vec::new();
-        let mut curr_column_idx: i32 = 0;
-        for field in &projected_ds_schema.fields {
-            collect_columns(
-                field,
-                is_structural,
-                &mut fields,
-                &mut column_indices,
-                &mut curr_column_idx,
-            );
-        }
+        let (fields, column_indices) =
+            file_versions::data_file_columns(lance_file_format, &projected_ds_schema);
+        let represented_dataset_columns = column_indices
+            .iter()
+            .filter(|column_index| **column_index >= 0)
+            .count();
 
-        if curr_column_idx as usize != physical_columns {
+        if represented_dataset_columns != physical_columns {
             return Err(Error::invalid_input(format!(
                 "Schema mismatch: dataset projection maps to {} physical columns but file has {} columns",
-                curr_column_idx, physical_columns
+                represented_dataset_columns, physical_columns
             )));
         }
 
@@ -2523,16 +2469,35 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        let store_params = self.store_params_for_base(Some(base_path));
+        // Cores are cached without wrappers; each resolution decorates the
+        // shared core with the caller's wrapper.
+        let mut core_params = self.store_params_for_base(Some(base_path));
+        let wrapper = core_params.object_store_wrapper.take();
 
-        let (store, _) = ObjectStore::from_uri_and_params(
-            self.session.store_registry(),
-            &base_path.path,
-            &store_params,
-        )
-        .await?;
+        let cell = {
+            let mut stores = self.base_object_stores.lock().unwrap();
+            stores.entry(base_id).or_default().clone()
+        };
+        let core = cell
+            .get_or_try_init(|| async {
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    self.session.store_registry(),
+                    &base_path.path,
+                    &core_params,
+                )
+                .await?;
+                Ok::<_, Error>(store)
+            })
+            .await?;
 
-        Ok(store)
+        match wrapper {
+            Some(wrapper) => {
+                let mut store = core.as_ref().clone();
+                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
+                Ok(Arc::new(store))
+            }
+            None => Ok(core.clone()),
+        }
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
@@ -2672,6 +2637,37 @@ impl Dataset {
         // TODO: this API should support pagination
         versions.sort_by_key(|v| v.version);
 
+        Ok(versions)
+    }
+
+    /// Get the number of versions in the current version history.
+    ///
+    /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
+    /// deserialize every manifest.
+    pub async fn count_versions(&self) -> Result<u64> {
+        self.commit_handler
+            .list_manifest_locations(&self.base, &self.object_store, false)
+            .try_fold(0_u64, |count, _| async move { Ok(count + 1) })
+            .await
+    }
+
+    /// List lightweight references to all attached versions in the current branch's history.
+    ///
+    /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
+    /// deserialize every manifest. The references are sorted by version in ascending order.
+    /// Detached manifests are excluded; see [`Self::list_detached_manifests`].
+    ///
+    /// Use [`Self::latest_version_id`] instead when only the latest version is needed.
+    pub async fn version_refs(&self) -> Result<Vec<VersionRef>> {
+        let mut versions: Vec<_> = self
+            .commit_handler
+            .list_manifest_locations(&self.base, &self.object_store, false)
+            .map_ok(|location| VersionRef {
+                version: location.version,
+            })
+            .try_collect()
+            .await?;
+        versions.sort_unstable_by_key(|version| version.version);
         Ok(versions)
     }
 
@@ -3094,6 +3090,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3203,7 +3201,7 @@ impl Dataset {
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         builder.execute(transaction).await
     }
 
@@ -3322,7 +3320,7 @@ impl Dataset {
             .with_object_store(target_store.clone())
             .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         let new_ds = builder.execute(txn).await?;
         Ok(new_ds)
     }
@@ -3434,29 +3432,6 @@ impl Dataset {
     /// Please refer to the DataFusion documentation for supported SQL syntax.
     pub fn sql(&self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
-    }
-
-    /// Returns true if Lance supports writing this datatype with nulls.
-    pub(crate) fn lance_supports_nulls(&self, datatype: &DataType) -> bool {
-        match self
-            .manifest()
-            .data_storage_format
-            .lance_file_version()
-            .unwrap_or(LanceFileVersion::Legacy)
-            .resolve()
-        {
-            LanceFileVersion::Legacy => matches!(
-                datatype,
-                DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Binary
-                    | DataType::List(_)
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::FixedSizeList(_, _)
-            ),
-            LanceFileVersion::V2_0 => !matches!(datatype, DataType::Struct(..)),
-            _ => true,
-        }
     }
 }
 
@@ -3682,11 +3657,14 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
+        let preserves_nullability =
+            !schema_evolution::merge_introduces_required_field(self.schema(), &new_schema);
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
                 schema: new_schema,
+                preserves_nullability,
             },
             None,
         );

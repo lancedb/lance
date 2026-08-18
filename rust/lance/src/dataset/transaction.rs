@@ -17,22 +17,25 @@ use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::index_results_are_row_addrs;
-use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
+use crate::index::mem_wal::{
+    load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+};
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
-    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::{
-    datatypes::Fields,
-    version::{ConcreteFileVersion, LanceFileVersion},
-};
-use lance_index::mem_wal::CompactedSsTable;
+use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
+use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
+use lance_table::feature_flags::{
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
+};
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
@@ -51,7 +54,7 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -321,6 +324,48 @@ pub struct UpdateMap {
     pub replace: bool,
 }
 
+/// Non-system logical index name -> its physical segments, ordered by UUID.
+///
+/// Whole segment metadata rather than UUIDs alone: operations such as `Rewrite`
+/// prune a segment's fragment bitmap while keeping its UUID, so a UUID-only
+/// comparison would keep coverage for an index that no longer spans the same
+/// base fragments.
+type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
+
+/// What one physical index segment contributes to coverage.
+///
+/// Deliberately not the whole [`IndexMetadata`]. It rests on one contract:
+/// changing an index's physical contents mints a new UUID. Of the mutations
+/// sanctioned under an existing UUID, only the fragment bitmap changes which
+/// rows the index answers for -- an `Update` prunes it in place, and
+/// `migrate_indices` recalculates it -- so the UUID alone is not enough and the
+/// bitmap has to be compared too. The rest of the metadata, file lists and
+/// timestamps and inferred details, is filled in by migrations routinely;
+/// comparing it would withdraw coverage for no reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoverageIdentity {
+    uuid: Uuid,
+    fragment_bitmap: Option<RoaringBitmap>,
+}
+
+/// The version a transaction read, as the coverage derivation needs it.
+///
+/// An index covering every fragment live at this version holds every row
+/// compaction had copied into the base table by then, so it is caught up to
+/// that version's `compacted_sstables`. That is the only proof available:
+/// nothing maps a compaction generation to the fragments its rows landed in.
+///
+/// `read_version` is fixed for the life of a transaction and survives rebase,
+/// so the credit a commit can prove is stable across attempts. The recorded
+/// result may still differ between attempts, because a rebased attempt sees a
+/// different head: other commits move the compacted generations and the
+/// positions already recorded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadVersionState<'a> {
+    pub manifest: &'a Manifest,
+    pub indices: &'a [IndexMetadata],
+}
+
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
@@ -406,6 +451,12 @@ pub enum Operation {
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
+        /// Set when this merge makes no nullability-affecting schema change:
+        /// it introduces no field that data staged against an earlier schema
+        /// could not safely omit. Without the assertion the merge conflicts
+        /// with concurrent appends in either commit order, since a stale
+        /// append omits new columns entirely and its rows read as null.
+        preserves_nullability: bool,
     },
     /// Restore an old version of the database
     Restore { version: u64 },
@@ -455,8 +506,16 @@ pub enum Operation {
         updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
-    /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
+    /// Project to a new schema.
+    Project {
+        schema: Schema,
+        /// Set when this projection makes no nullability-affecting schema
+        /// change, as a rename or a drop does not. A nullability tightening
+        /// must not set this: its producer proved the claim by scanning at its
+        /// read version, so a concurrent write can falsify it and the
+        /// projection conflicts with value-writes in either commit order.
+        preserves_nullability: bool,
+    },
 
     /// Update the dataset configuration.
     UpdateConfig {
@@ -471,6 +530,12 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
+        /// Requests the one-way migration to required index catch-up.
+        ///
+        /// One-way because returning to legacy semantics — where a missing
+        /// coverage entry reads as "fully caught up" — is unsafe once any
+        /// SSTable has been retired against a recorded catch-up position.
+        require_index_catchup: bool,
     },
 
     /// Clone a dataset.
@@ -649,12 +714,18 @@ impl PartialEq for Operation {
                 Self::Merge {
                     fragments: a_fragments,
                     schema: a_schema,
+                    preserves_nullability: a_preserves,
                 },
                 Self::Merge {
                     fragments: b_fragments,
                     schema: b_schema,
+                    preserves_nullability: b_preserves,
                 },
-            ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            ) => {
+                compare_vec(a_fragments, b_fragments)
+                    && a_schema == b_schema
+                    && a_preserves == b_preserves
+            }
             (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
             (
                 Self::ReserveFragments { num_fragments: a },
@@ -697,7 +768,16 @@ impl PartialEq for Operation {
                     && a_inserted_rows_filter == b_inserted_rows_filter
                     && a_updated_fragment_offsets == b_updated_fragment_offsets
             }
-            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::Project {
+                    schema: a,
+                    preserves_nullability: a_preserves,
+                },
+                Self::Project {
+                    schema: b,
+                    preserves_nullability: b_preserves,
+                },
+            ) => a == b && a_preserves == b_preserves,
             (
                 Self::UpdateConfig {
                     config_updates: a_config,
@@ -1246,11 +1326,13 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
+                    require_index_catchup: a_activate,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
+                    require_index_catchup: b_activate,
                 },
-            ) => compare_vec(a_compacted, b_compacted),
+            ) => compare_vec(a_compacted, b_compacted) && a_activate == b_activate,
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
@@ -1752,12 +1834,12 @@ impl Transaction {
 
     fn data_storage_format_from_files(
         fragments: &[Fragment],
-        user_requested: Option<LanceFileVersion>,
+        user_requested: Option<ConcreteFileVersion>,
     ) -> Result<DataStorageFormat> {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested
-                && ConcreteFileVersion::from(user_requested) != file_version
+                && user_requested != file_version
             {
                 return Err(Error::invalid_input(format!(
                     "User requested data storage version ({}) does not match version in data files ({})",
@@ -1768,7 +1850,6 @@ impl Transaction {
         } else {
             // If no files use user-requested or default
             Ok(user_requested
-                .map(ConcreteFileVersion::from)
                 .map(DataStorageFormat::new)
                 .unwrap_or_default())
         }
@@ -1787,13 +1868,331 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        // Read below the reader validation boundary, so nothing else refuses a
+        // half-set manifest here: the flag reset would quietly drop the lone bit
+        // and republish an undefined state as legacy.
+        validate_mem_wal_index_catchup_flags(&manifest)?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        // A version from before catch-up was required carries MemWAL state this
+        // protocol never validated -- catch-up values activation deliberately
+        // cleared, or compaction progress it deliberately refused to trust.
+        // Keeping the bit would republish those as if this protocol had recorded
+        // them. Refuse instead: sanitizing is not possible here, because both
+        // fields would have to be re-derived from data Lance cannot see.
+        let current_requires = current_manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP
+            != 0
+            || current_manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+        let restored_requires = manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+            && manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+        if current_requires && !restored_requires {
+            return Err(Error::invalid_input(format!(
+                "Cannot restore version {version}: this table requires MemWAL index \
+                 catch-up and that version predates it, so its recorded catch-up and \
+                 compaction progress were never validated by this protocol"
+            )));
+        }
+        inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
         Ok((manifest, indices))
+    }
+
+    /// Require index catch-up on a table that has never required it.
+    ///
+    /// One-way, because returning to legacy semantics -- where a missing
+    /// coverage entry reads as "fully caught up" -- is unsafe once any SSTable
+    /// has been retired against a recorded catch-up position.
+    fn require_index_catchup(final_indices: &mut [IndexMetadata], new_version: u64) -> Result<()> {
+        let Some(pos) = final_indices
+            .iter()
+            .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            return Err(Error::invalid_input(format!(
+                "Cannot require MemWAL index catch-up: the {} system index does \
+                 not exist on this table",
+                MEM_WAL_INDEX_NAME
+            )));
+        };
+
+        let mut details = load_mem_wal_index_details(final_indices[pos].clone())?;
+
+        // The beta protocol wrote compaction progress that was never an active
+        // retirement record, and Lance cannot check those numbers against WAL
+        // shard manifests. Trusting them would let the first trim after
+        // activation delete SSTables no commit copied in, so a table carrying
+        // them must be drained through an explicit migration instead.
+        if !details.compacted_sstables.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot require MemWAL index catch-up: the table already records \
+                 SSTable compaction progress from the beta protocol, which cannot \
+                 be validated. Drain or reset the table first.",
+            ));
+        }
+
+        // Beta coverage was written under rules this protocol does not enforce,
+        // so it is not trustworthy. Left in place, a later compaction would find it
+        // already satisfied and could retire an SSTable that no index covers.
+        if details.index_catchup.is_empty() {
+            return Ok(());
+        }
+        details.index_catchup.clear();
+        final_indices[pos] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
+    }
+
+    /// Every non-system logical index, mapped to what determines its coverage.
+    ///
+    /// A logical index may be backed by several physical segments, so "did this
+    /// index change" is a question about the whole set. Sorted by UUID so the
+    /// two sides compare positionally.
+    pub(crate) fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
+        let mut by_name: LogicalIndexSegments = BTreeMap::new();
+        for idx in indices.iter().filter(|idx| !is_system_index(idx)) {
+            by_name
+                .entry(idx.name.clone())
+                .or_default()
+                .push(CoverageIdentity {
+                    uuid: idx.uuid,
+                    fragment_bitmap: idx.fragment_bitmap.clone(),
+                });
+        }
+        for segments in by_name.values_mut() {
+            segments.sort_unstable_by_key(|segment| segment.uuid);
+        }
+        by_name
+    }
+
+    /// Apply MemWAL index-coverage rules once the final index list is known.
+    ///
+    /// Coverage records that a base-table index contains the rows a compaction
+    /// copied in, and the WAL pod retires SSTables against it.
+    ///
+    /// It is derived, not reported. An index covering every fragment live at the
+    /// transaction's read version holds every row compaction had copied in by
+    /// then, so it is caught up to that version's `compacted_sstables`. That is
+    /// the only proof available: nothing maps a generation to the fragments its
+    /// rows landed in, so covering the table as the transaction read it is how
+    /// an index shows it covered those rows. Fragments appended since are a
+    /// later gap.
+    ///
+    /// Deriving rather than transmitting means no claim can go stale between
+    /// inspection and commit, the answer survives rebase (`read_version` is
+    /// fixed for a transaction's life), and any operation can earn coverage --
+    /// an ordinary reindex that fully covers no longer has to throw its work
+    /// away and wait for a repair.
+    ///
+    /// Only meaningful once catch-up is required, where a missing entry means
+    /// "not caught up" and the SSTables stay. A legacy table reads a missing
+    /// entry as "fully caught up", so this leaves it untouched rather than
+    /// making the table look more covered than it is.
+    pub(crate) fn apply_mem_wal_index_coverage(
+        final_indices: &mut [IndexMetadata],
+        segments_before: &LogicalIndexSegments,
+        read_version_state: Option<ReadVersionState<'_>>,
+        index_catchup_required: bool,
+        new_version: u64,
+    ) -> Result<()> {
+        if !index_catchup_required {
+            return Ok(());
+        }
+
+        let Some(pos) = final_indices
+            .iter()
+            .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            // The system index went away with this transaction (MemWAL disable,
+            // or an overwrite). There is no coverage left to maintain.
+            return Ok(());
+        };
+
+        let mut details = load_mem_wal_index_details(final_indices[pos].clone())?;
+
+        // Nothing has ever been compacted, so no index can be behind and there
+        // is no coverage to invalidate.
+        if details.compacted_sstables.is_empty() && details.index_catchup.is_empty() {
+            return Ok(());
+        }
+
+        let segments_after = Self::logical_index_segments(final_indices);
+        let catchup_before = std::mem::take(&mut details.index_catchup);
+
+        // Per shard: what this commit records as compacted, and the most the
+        // read version may credit. Generations compacted after that read landed
+        // in fragments no index under consideration has seen; the committed
+        // value caps it in turn, so a read version since rolled back cannot
+        // retire SSTables no live commit copied in.
+        let read_details = read_version_state
+            .map(|state| {
+                state
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .cloned()
+                    .map(load_mem_wal_index_details)
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        let shards: Vec<(Uuid, u64, u64)> = details
+            .compacted_sstables
+            .iter()
+            .map(|committed| {
+                let at_read = read_details
+                    .as_ref()
+                    .and_then(|read| {
+                        read.compacted_sstables
+                            .iter()
+                            .find(|s| s.shard_id == committed.shard_id)
+                    })
+                    .map_or(0, |s| s.generation);
+                (
+                    committed.shard_id,
+                    committed.generation,
+                    at_read.min(committed.generation),
+                )
+            })
+            .collect();
+
+        // Every fragment live when the transaction read the table. An index
+        // spanning all of them holds every row compacted by then.
+        let read_fragments: Option<RoaringBitmap> = read_version_state.map(|state| {
+            state
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect()
+        });
+
+        let covers_read_version = |segments: &[CoverageIdentity]| -> bool {
+            let Some(required) = read_fragments.as_ref() else {
+                return false;
+            };
+            if required.is_empty() {
+                // Subset-of-empty is trivially true, so this would credit every
+                // index on a table with no fragments. Refused because an empty
+                // fragment list is not only what an emptied table looks like:
+                // it is also what a manifest written before #8438 looks like,
+                // where UpdateMemWalState published no fragments at all. On
+                // such a table the SSTables are the last copy of those rows,
+                // and crediting coverage would retire them. The cost is that a
+                // genuinely emptied table keeps its SSTables.
+                return false;
+            }
+            let mut covered = RoaringBitmap::new();
+            for segment in segments {
+                match segment.fragment_bitmap.as_ref() {
+                    Some(bitmap) => covered |= bitmap,
+                    // An unknown bitmap cannot be shown to cover anything.
+                    None => return false,
+                }
+            }
+            required.is_subset(&covered)
+        };
+
+        let mut rebuilt: Vec<IndexCatchupProgress> = Vec::new();
+        for (name, after) in segments_after.iter() {
+            // Compared by [`CoverageIdentity`], not segment UUID: an Update
+            // that touches an indexed field prunes a segment's fragment bitmap
+            // in place while keeping its UUID, so a UUID-only comparison would
+            // carry a position forward that the index no longer earns.
+            let unchanged = segments_before.get(name) == Some(after);
+            let carried = unchanged
+                .then(|| catchup_before.iter().find(|e| e.index_name == *name))
+                .flatten();
+            let proven = covers_read_version(after);
+
+            if carried.is_none() && !proven {
+                // Changed, and nothing shows the new index covers the read
+                // version. No entry: a missing one reads as "not caught up".
+                continue;
+            }
+
+            let generations = shards
+                .iter()
+                .map(|&(shard_id, committed, creditable)| {
+                    let prior = carried
+                        .and_then(|entry| entry.caught_up_generation_for_shard(&shard_id))
+                        .unwrap_or(0);
+                    let credited = if proven { creditable } else { 0 };
+                    // Takes the better of what this commit proves and what an
+                    // unchanged index already held, so a commit reading an older
+                    // version does not lower a position it cannot re-prove. The
+                    // clamp is the exception: a position above what this commit
+                    // records as compacted describes rows no live commit copied
+                    // in.
+                    CompactedSsTable::new(shard_id, prior.max(credited).min(committed))
+                })
+                .collect::<Vec<_>>();
+            if generations.iter().all(|g| g.generation == 0) {
+                continue;
+            }
+            rebuilt.push(IndexCatchupProgress::new(name.clone(), generations));
+        }
+        rebuilt.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+
+        let mut before_sorted = catchup_before;
+        before_sorted.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+        if rebuilt == before_sorted {
+            return Ok(());
+        }
+
+        let dropped: Vec<&str> = before_sorted
+            .iter()
+            .map(|e| e.index_name.as_str())
+            .filter(|name| !rebuilt.iter().any(|kept| kept.index_name == *name))
+            .collect();
+        if !dropped.is_empty() {
+            // The first thing to check when SSTables stop becoming trimmable.
+            log::info!(
+                "MemWAL index catch-up invalidated at version {new_version} for {dropped:?}: \
+                 these indices changed and no longer cover the version this commit read"
+            );
+        }
+
+        details.index_catchup = rebuilt;
+        final_indices[pos] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
+    }
+
+    /// Drop coverage for indices a post-`build_manifest` step narrowed.
+    ///
+    /// The derivation runs while the manifest is being built, but the index list
+    /// is not final there: `migrate_indices` can recalculate a segment's
+    /// fragment bitmap and keep its UUID, so an index can narrow after its
+    /// position was decided. It reports which ones it touched rather than the
+    /// caller re-snapshotting every bitmap to find out. Only ever removes.
+    pub(crate) fn withdraw_coverage_invalidated_after_build(
+        indices: &mut [IndexMetadata],
+        changed: &[String],
+        new_version: u64,
+    ) -> Result<()> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let Some(pos) = indices
+            .iter()
+            .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            return Ok(());
+        };
+        let mut details = load_mem_wal_index_details(indices[pos].clone())?;
+        let before = details.index_catchup.len();
+        details
+            .index_catchup
+            .retain(|entry| !changed.contains(&entry.index_name));
+        if details.index_catchup.len() == before {
+            return Ok(());
+        }
+        log::info!(
+            "MemWAL index catch-up withdrawn at version {new_version} for {changed:?}: \
+             these indices were recalculated after their coverage was derived"
+        );
+        indices[pos] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -1805,6 +2204,29 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        self.build_manifest_with_read_version(
+            current_manifest,
+            current_indices,
+            transaction_file_path,
+            config,
+            None,
+        )
+    }
+
+    /// [`Self::build_manifest`] with the version this transaction read.
+    ///
+    /// Supplied by the commit path, which already materializes that version.
+    /// `None` where there is none to read -- dataset creation and detached
+    /// commits -- in which case no index can be shown to cover it and coverage
+    /// is left as the invalidation rules put it.
+    pub(crate) fn build_manifest_with_read_version(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_indices: Vec<IndexMetadata>,
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+        read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -1873,6 +2295,25 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+
+        // Both words must agree: a reader that keeps legacy semantics would read a
+        // missing entry as "fully caught up", so a half-set state is not safe mode.
+        let index_catchup_required = current_manifest
+            .map(|m| {
+                m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+                    && m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+            })
+            .unwrap_or(false);
+
+        // Snapshot taken before the operation rewrites the list, so coverage can
+        // be compared against what each logical index looked like going in. Only
+        // tables in safe mode maintain coverage, so every other commit -- and the
+        // segment clones this costs -- pays nothing.
+        let mem_wal_segments_before = (index_catchup_required
+            && final_indices
+                .iter()
+                .any(|idx| idx.name == MEM_WAL_INDEX_NAME))
+        .then(|| Self::logical_index_segments(&final_indices));
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
@@ -2012,6 +2453,13 @@ impl Transaction {
                         let Some(bitmap) = off_map.get(&fragment.id) else {
                             continue;
                         };
+                        // Defense-in-depth: only stamp fragments that were actually
+                        // rewritten. validate_operation enforces this invariant before
+                        // build_manifest is called; this guard catches any path that
+                        // bypasses validation.
+                        if !updated_by_id.contains_key(&fragment.id) {
+                            continue;
+                        }
                         if bitmap.is_empty() {
                             continue;
                         }
@@ -2020,6 +2468,27 @@ impl Transaction {
                         // last_updated stamp for rows that never had one.
                         if fragment.last_updated_at_version_meta.is_none() {
                             continue;
+                        }
+                        let max_allowed = existing_fragments
+                            .iter()
+                            .find(|f| f.id == fragment.id)
+                            .and_then(|f| f.physical_rows)
+                            .unwrap_or(1 << 24);
+                        if bitmap.len() as usize > max_allowed {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets cardinality {} exceeds fragment {} limit {}",
+                                bitmap.len(),
+                                fragment.id,
+                                max_allowed
+                            )));
+                        }
+                        if let Some(max_off) = bitmap.max()
+                            && max_off as usize >= max_allowed
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets max offset {} exceeds fragment {} limit {}",
+                                max_off, fragment.id, max_allowed
+                            )));
                         }
                         let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
@@ -2190,6 +2659,7 @@ impl Transaction {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let removed_uuids = removed_indices
@@ -2341,6 +2811,9 @@ impl Transaction {
                     // TODO(rmeng): check new file and fragment are the same length
 
                     let mut columns_covered = HashSet::new();
+                    // Set when an existing file covers exactly the replaced
+                    // fields, so the whole file swaps rather than part of it.
+                    let mut replaced_in_place = false;
                     for file in &mut new_frag.files {
                         if file.fields == new_file.fields
                             && file.file_major_version == new_file.file_major_version
@@ -2350,17 +2823,78 @@ impl Transaction {
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
                             file.base_id = new_file.base_id;
+                            replaced_in_place = true;
                         }
                         columns_covered.extend(file.fields.iter());
                     }
+                    // Reject a file whose version does not decode before any
+                    // arm publishes it.
+                    new_file.file_version()?;
+
                     // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
                     // Then it means it's a all-NULL column that is being replaced with real data
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_file
-                            .file_version()
-                            .expect("Expected valid file version");
+                        new_frag.files.push(new_file.clone());
+                    } else if !replaced_in_place
+                        && new_file.fields.iter().all(|field| {
+                            let mut covering = new_frag
+                                .files
+                                .iter()
+                                .filter(|file| file.fields.contains(field))
+                                .peekable();
+                            // Covered by something, and by nothing we cannot
+                            // tombstone. A field no file covers leaves the
+                            // mixed layout the error below reports.
+                            covering.peek().is_some()
+                                && covering.all(|file| {
+                                    file.file_version()
+                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                })
+                        })
+                    {
+                        // Tombstone the replaced fields where they live and
+                        // append the new file to answer for them, the idiom
+                        // `update_columns` uses. Compaction decides that layout,
+                        // so the fields may sit in one wider file or span
+                        // several.
+                        //
+                        // Legacy V1 is excluded: its reader derives the page table
+                        // offset from the first field in the metadata, so
+                        // tombstoning one field leaves its siblings decoding from
+                        // the wrong pages. A field a V1 file covers keeps
+                        // exact-match replacement.
+                        for file in &mut new_frag.files {
+                            // Same reason as the guard above.
+                            if file.file_version()? == ConcreteFileVersion::V1 {
+                                continue;
+                            }
+                            file.fields = file
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    if new_file.fields.contains(field) {
+                                        TOMBSTONE_FIELD_ID
+                                    } else {
+                                        *field
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into();
+                        }
+                        // Every data file must share at least one field with
+                        // the dataset schema: a file kept alive only by
+                        // tombstones or by ids the schema no longer defines is
+                        // unreachable to readers, uncollectable by cleanup,
+                        // and reported corrupt by validate().
+                        let live_ids = schema
+                            .fields_pre_order()
+                            .map(|field| field.id)
+                            .collect::<HashSet<i32>>();
+                        new_frag
+                            .files
+                            .retain(|file| file.fields.iter().any(|f| live_ids.contains(f)));
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -2371,13 +2905,22 @@ impl Transaction {
                         ));
                     }
 
-                    // New base values for these fields supersede any overlay
-                    // still shadowing them; tombstone the overlaid fields so the
-                    // replacement is not silently masked.
+                    // New base values supersede any overlay still shadowing
+                    // them, so tombstone the overlaid fields. An overlay
+                    // committed after this transaction's snapshot is the newer
+                    // value though -- the conflict resolver rebases these two
+                    // precisely because the overlay wins -- so it stays, and
+                    // being newer it stays last, preserving the ordering.
+                    let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
+                        .overlays
+                        .drain(..)
+                        .partition(|overlay| overlay.committed_version <= self.read_version);
                     lance_table::format::overlay::tombstone_overlay_fields(
-                        &mut new_frag.overlays,
+                        &mut superseded,
                         &replaced_fields,
                     );
+                    superseded.extend(newer);
+                    new_frag.overlays = superseded;
 
                     final_fragments.push(new_frag);
                 }
@@ -2473,7 +3016,11 @@ impl Transaction {
                     final_fragments.push(fragment);
                 }
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables, ..
+            } => {
+                // Updates the MemWAL index only; the fragments are unchanged.
+                final_fragments.extend(maybe_existing_fragments?.clone());
                 update_mem_wal_index_compacted_sstables(
                     &mut final_indices,
                     new_version,
@@ -2503,11 +3050,25 @@ impl Transaction {
         }
 
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
-            (None, Some(true)) => Some(LanceFileVersion::Legacy),
-            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
+            (None, Some(true)) => Some(ConcreteFileVersion::V1),
+            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
             (None, None) => None,
         };
+
+        // Applied once the final index list is known, so it sees exactly the
+        // indices this commit publishes rather than what any one operation arm
+        // intended.
+        if mem_wal_segments_before.is_some() {
+            let empty_segments = LogicalIndexSegments::new();
+            Self::apply_mem_wal_index_coverage(
+                &mut final_indices,
+                mem_wal_segments_before.as_ref().unwrap_or(&empty_segments),
+                read_version_state,
+                index_catchup_required,
+                new_version,
+            )?;
+        }
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
             // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
@@ -2521,8 +3082,7 @@ impl Transaction {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(ConcreteFileVersion::from(user_requested_version));
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
 
             prev_manifest
@@ -2553,6 +3113,51 @@ impl Transaction {
                 config.disable_transaction_file,
             )?;
         }
+        // Carried from the manifest this one is derived from. `new_from_previous`
+        // zeroes both feature words, so `apply_feature_flags` cannot see the
+        // previous state and every ordinary commit would otherwise drop the bit.
+        if let Some(current_manifest) = current_manifest {
+            inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
+        }
+
+        // Set after apply_feature_flags, which resets both flag words: activation
+        // is the one place the bit is turned on, and it must survive that reset.
+        if let Operation::UpdateMemWalState {
+            require_index_catchup: true,
+            ..
+        } = &self.operation
+        {
+            let reader_set = current_manifest
+                .map(|m| m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
+                .unwrap_or(false);
+            let writer_set = current_manifest
+                .map(|m| m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
+                .unwrap_or(false);
+            match (reader_set, writer_set) {
+                (false, false) => {
+                    Self::require_index_catchup(&mut final_indices, new_version)?;
+                    log::info!(
+                        "MemWAL index catch-up is now required at version {new_version}; a \
+                         missing catch-up entry means an index is behind, not caught up. \
+                         This is one-way."
+                    );
+                }
+                // Already active. A retry whose first attempt landed but lost its
+                // response must not clear coverage repaired since, so this keeps
+                // every recorded generation.
+                (true, true) => {}
+                _ => {
+                    return Err(Error::invalid_input(
+                        "Cannot require MemWAL index catch-up: the table has only one of \
+                         the reader and writer feature bits set, so its catch-up \
+                         semantics are undefined",
+                    ));
+                }
+            }
+            manifest.reader_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
+            manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
+        }
+
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
@@ -3270,7 +3875,7 @@ impl Transaction {
                         let combined_sequence = RowIdSequence::from(row_ids.as_slice());
 
                         let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                         *next_row_id += remaining_rows;
                     }
                     Ordering::Greater => {
@@ -3286,7 +3891,7 @@ impl Transaction {
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
                 let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                 *next_row_id += physical_rows;
             }
         }
@@ -3468,12 +4073,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fragments,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
+                preserves_nullability,
             })) => Operation::Merge {
                 fragments: fragments
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy required-field merge still conflicts and a legacy
+                // nullable merge over-conflicts, which only retries.
+                preserves_nullability,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -3488,6 +4098,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 update_mode,
                 inserted_rows,
                 updated_fragment_offsets,
+                updated_fragment_offset_bitmaps,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -3513,11 +4124,31 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(|ik| KeyExistenceFilter::try_from(&ik))
                     .transpose()?,
                 updated_fragment_offsets: {
-                    let m: HashMap<u64, RoaringBitmap> = updated_fragment_offsets
-                        .into_iter()
-                        .filter(|(_, list)| !list.values.is_empty())
-                        .map(|(id, list)| (id, RoaringBitmap::from_iter(list.values)))
-                        .collect();
+                    // Prefer field 10 (RoaringBitmap bytes); fall back to field 9 (UInt32List)
+                    // for manifests written before this change.
+                    let m: HashMap<u64, RoaringBitmap> =
+                        if !updated_fragment_offset_bitmaps.is_empty() {
+                            updated_fragment_offset_bitmaps
+                                .into_iter()
+                                .filter(|(_, bytes)| !bytes.is_empty())
+                                .map(|(id, bytes)| {
+                                    let bitmap = RoaringBitmap::deserialize_from(bytes.as_slice())
+                                        .map_err(|e| {
+                                            Error::invalid_input(format!(
+                                                "invalid updated_fragment_offset_bitmaps \
+                                                     for fragment {id}: {e}"
+                                            ))
+                                        })?;
+                                    Ok((id, bitmap))
+                                })
+                                .collect::<Result<HashMap<_, _>>>()?
+                        } else {
+                            updated_fragment_offsets
+                                .into_iter()
+                                .filter(|(_, list)| !list.values.is_empty())
+                                .map(|(id, list)| (id, RoaringBitmap::from_iter(list.values)))
+                                .collect()
+                        };
                     if m.is_empty() {
                         None
                     } else {
@@ -3525,11 +4156,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 },
             },
-            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
-                Operation::Project {
-                    schema: Schema::try_from(&Fields(schema))?,
-                }
-            }
+            Some(pb::transaction::Operation::Project(pb::transaction::Project {
+                schema,
+                preserves_nullability,
+            })) => Operation::Project {
+                schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy tightening still conflicts and a legacy rename
+                // over-conflicts, which only retries.
+                preserves_nullability,
+            },
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
                 // Check if new-style fields are present
                 let has_new_fields = update_config.config_updates.is_some()
@@ -3619,12 +4255,27 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { compacted_sstables },
+                pb::transaction::UpdateMemWalState {
+                    compacted_sstables,
+                    require_index_catchup,
+                },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
-                    .map(|m| CompactedSsTable::try_from(m).unwrap())
-                    .collect(),
+                    .map(CompactedSsTable::try_from)
+                    .collect::<Result<_>>()?,
+                // Absent is an ordinary progress update. Explicit `false` is
+                // refused rather than read as absent, so a caller cannot express
+                // "deactivate" -- the migration is one-way.
+                require_index_catchup: match require_index_catchup {
+                    Some(false) => {
+                        return Err(Error::invalid_input(
+                            "require_index_catchup cannot be false: MemWAL index catch-up \
+                             cannot stop being required once it is",
+                        ));
+                    }
+                    other => other.unwrap_or(false),
+                },
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -3815,13 +4466,16 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::IndexMetadata::from)
                     .collect(),
             }),
-            Operation::Merge { fragments, schema } => {
-                pb::transaction::Operation::Merge(pb::transaction::Merge {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                })
-            }
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Merge(pb::transaction::Merge {
+                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                schema: Fields::from(schema).0,
+                schema_metadata: Default::default(), // TODO: handle metadata
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
@@ -3856,24 +4510,31 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or(0),
                 inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
-                updated_fragment_offsets: updated_fragment_offsets
+                // Field 9: no longer written; kept empty for forward compat.
+                updated_fragment_offsets: HashMap::new(),
+                // Field 10: RoaringBitmap bytes.
+                updated_fragment_offset_bitmaps: updated_fragment_offsets
                     .as_ref()
                     .map(|UpdatedFragmentOffsets(m)| {
                         m.iter()
                             .filter(|(_, b)| !b.is_empty())
                             .map(|(frag_id, b)| {
-                                let values: Vec<u32> = b.iter().collect();
-                                (*frag_id, pb::transaction::UInt32List { values })
+                                let mut buf = Vec::new();
+                                b.serialize_into(&mut buf)
+                                    .expect("RoaringBitmap serialization cannot fail");
+                                (*frag_id, buf)
                             })
                             .collect::<HashMap<_, _>>()
                     })
                     .unwrap_or_default(),
             }),
-            Operation::Project { schema } => {
-                pb::transaction::Operation::Project(pb::transaction::Project {
-                    schema: Fields::from(schema).0,
-                })
-            }
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Project(pb::transaction::Project {
+                schema: Fields::from(schema).0,
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::UpdateConfig {
                 config_updates,
                 table_metadata_updates,
@@ -3917,12 +4578,18 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                require_index_catchup,
+            } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
+                    // Written only when requesting activation, so an ordinary
+                    // progress update stays byte-identical to before.
+                    require_index_catchup: require_index_catchup.then_some(true),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -4022,11 +4689,14 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
-        Operation::Project { schema } => {
+        Operation::Project { schema, .. } => {
             schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } => {
+        Operation::Merge {
+            fragments, schema, ..
+        } => {
             merge_fragments_valid(manifest, fragments)?;
+            merge_schema_valid(manifest, schema, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
@@ -4041,10 +4711,32 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         Operation::Update {
             updated_fragments,
             new_fragments,
+            updated_fragment_offsets,
+            update_mode,
             ..
         } => {
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
-            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)?;
+            // Key-presence check only applies to RewriteColumns: that is the only
+            // mode where build_manifest stamps version metadata using off_map keys,
+            // so a stray key can corrupt an unrelated fragment's metadata.
+            // Other modes (e.g. rewrite_rows) may supply offsets for fragments
+            // outside updated_fragments for their own purposes.
+            if matches!(update_mode, Some(UpdateMode::RewriteColumns))
+                && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
+            {
+                let updated_ids: HashSet<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                for &frag_id in off_map.keys() {
+                    if !updated_ids.contains(&frag_id) {
+                        return Err(Error::invalid_input(format!(
+                            "updatedFragmentOffsets key {} is not in updated_fragments; \
+                             offsets must reference only fragments being rewritten",
+                            frag_id
+                        )));
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -4074,11 +4766,20 @@ fn schema_fragments_valid(
     schema: &Schema,
     fragments: &[Fragment],
 ) -> Result<()> {
-    if let Some(manifest) = manifest
-        && manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy
-    {
-        return schema_fragments_legacy_valid(schema, fragments);
+    if let Some(manifest) = manifest {
+        return super::versions::validate_fragment_schema(
+            manifest.data_storage_format.lance_file_format(),
+            schema,
+            fragments,
+        );
     }
+    schema_fragments_modern_valid(schema, fragments)
+}
+
+pub(crate) fn schema_fragments_modern_valid(
+    _schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
     // validate that each data file at least contains one field.
     for fragment in fragments {
         for data_file in &fragment.files {
@@ -4096,7 +4797,7 @@ fn schema_fragments_valid(
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+pub(crate) fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
     for fragment in fragments {
@@ -4198,16 +4899,177 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     Ok(())
 }
 
+/// Validate that a Merge schema preserves the dataset's field id bindings.
+///
+/// Readers resolve columns by field id (name -> schema id -> DataFile::fields
+/// position), so renumbered ids silently rebind live columns to other columns'
+/// bytes. Shared ids must keep their field path. Their logical type,
+/// nullability, storage encoding, and dictionary may change only when every
+/// existing base or overlay file carrying the id is replaced and every
+/// proposed fragment materializes the id in a base data file. New ids must
+/// exceed the manifest's max so a dropped field's id is never reused. An
+/// existing path may move to a fresh id only when every proposed fragment
+/// materializes that id in a base data file (the `alter_columns` cast path).
+/// Omitting a field (dropping it) and updating field metadata remain legal.
+fn merge_schema_valid(
+    manifest: &Manifest,
+    new_schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    let prior_schema = &manifest.schema;
+    let new_fragment_map: HashMap<u64, &Fragment> = fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+
+    // Remap and semantic errors first: a renumbered schema usually violates
+    // both the shared-id and new-id clauses.
+    for field in new_schema.fields_pre_order() {
+        let Some(prior_field) = prior_schema.field_by_id(field.id) else {
+            continue;
+        };
+        let prior_path = prior_schema.field_path(field.id)?;
+        let new_path = new_schema.field_path(field.id)?;
+        if prior_path != new_path {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps field id {} from \"{}\" to \"{}\". \
+                 Merge must preserve the dataset's field ids: derive the new schema \
+                 from the dataset's current schema instead of renumbering fields.",
+                field.id, prior_path, new_path
+            )));
+        }
+        if let Some(changes) = shared_field_binding_changes(prior_field, field)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Merge operation changes field id {} (\"{}\") without rewriting it in \
+                 every existing fragment: {}. Merge must preserve each existing field's \
+                 logical type, nullability, storage encoding, and dictionary unless all \
+                 existing base and overlay files carrying that field are replaced.",
+                field.id, new_path, changes
+            )));
+        }
+    }
+
+    let max_field_id = manifest.max_field_id();
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_none() && field.id <= max_field_id {
+            let next_id_msg = match max_field_id.checked_add(1) {
+                Some(next_id) => format!("New fields must use ids of at least {}.", next_id),
+                None => {
+                    "No further field id can be allocated because ids are exhausted.".to_string()
+                }
+            };
+            return Err(Error::invalid_input(format!(
+                "Merge operation assigns id {} to new field \"{}\", but ids up to {} are \
+                 already used by current or dropped fields. {}",
+                field.id,
+                new_schema.field_path(field.id)?,
+                max_field_id,
+                next_id_msg
+            )));
+        }
+    }
+
+    let mut prior_paths = HashMap::with_capacity(prior_schema.fields_pre_order().count());
+    for field in prior_schema.fields_pre_order() {
+        prior_paths.insert(prior_schema.field_path(field.id)?, field);
+    }
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_some() {
+            continue;
+        }
+        let new_path = new_schema.field_path(field.id)?;
+        let Some(prior_field) = prior_paths.get(&new_path) else {
+            continue;
+        };
+        let materialized = fragments.iter().all(|fragment| {
+            fragment
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&field.id))
+        });
+        if !materialized {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps existing field \"{}\" from id {} to id {} without \
+                 rewriting its data. Every proposed fragment must materialize the new field \
+                 id in a base data file.",
+                new_path, prior_field.id, field.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_field_binding_fully_rewritten(
+    manifest: &Manifest,
+    new_fragment_map: &HashMap<u64, &Fragment>,
+    field_id: i32,
+) -> bool {
+    manifest.fragments.iter().all(|prior_fragment| {
+        let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
+            return false;
+        };
+
+        let is_materialized = new_fragment
+            .files
+            .iter()
+            .any(|file| file.fields.contains(&field_id));
+        if !is_materialized {
+            return false;
+        }
+
+        prior_fragment
+            .referenced_lance_files()
+            .filter(|file| file.fields.contains(&field_id))
+            .all(|prior_file| {
+                !new_fragment.referenced_lance_files().any(|new_file| {
+                    new_file.fields.contains(&field_id)
+                        && new_file.base_id == prior_file.base_id
+                        && new_file.path == prior_file.path
+                })
+            })
+    })
+}
+
+fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
+    let mut changes = Vec::with_capacity(4);
+    if prior.logical_type != new.logical_type {
+        changes.push(format!(
+            "logical type {} -> {}",
+            prior.logical_type, new.logical_type
+        ));
+    }
+    if prior.nullable != new.nullable {
+        changes.push(format!("nullable {} -> {}", prior.nullable, new.nullable));
+    }
+    if prior.encoding != new.encoding {
+        changes.push(format!(
+            "storage encoding {:?} -> {:?}",
+            prior.encoding, new.encoding
+        ));
+    }
+    if prior.dictionary != new.dictionary {
+        changes.push("dictionary".to_string());
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(changes.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use chrono::Utc;
     use futures::TryStreamExt;
-    use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
@@ -4225,6 +5087,7 @@ mod tests {
 
     use crate::Dataset;
     use crate::dataset::write::WriteParams;
+    use crate::dataset::{ColumnAlteration, NewColumnTransform};
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
@@ -4383,6 +5246,435 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    /// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+    /// dropped id stays referenced by the data files and max_field_id stays 3.
+    async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        dataset.drop_columns(&[dropped]).await.unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+        let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+        expected_ids.push(3);
+        assert_eq!(dataset.schema().field_ids(), expected_ids);
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+        dataset
+    }
+
+    /// Expected values of every column surviving `dropped`, plus d.
+    fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+        [
+            ("a", [1, 2]),
+            ("b", [10, 20]),
+            ("c", [100, 200]),
+            ("d", [5, 5]),
+        ]
+        .into_iter()
+        .filter(|(name, _)| *name != dropped)
+        .collect()
+    }
+
+    fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+        for (name, expected) in cols {
+            let col = &batch[*name];
+            assert_eq!(
+                col.as_primitive::<Int32Type>().values(),
+                expected,
+                "column {}",
+                name
+            );
+        }
+    }
+
+    async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        Dataset::commit(
+            Arc::new(dataset.clone()),
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            dataset.session(),
+            false,
+        )
+        .await
+    }
+
+    fn one_field_schema() -> LanceSchema {
+        LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap()
+    }
+
+    fn fragment_with_file_fields(id: u64, path: &str, fields: Vec<i32>) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields(path, fields, None));
+        fragment
+    }
+
+    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_file_fields(0, "f.lance", fields)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    // Which clause rejects the lossy round-trip depends on the hole's
+    // position: a hole before the last field remaps a shared id, while a
+    // hole at the end reuses the dropped id for the new field.
+    #[rstest::rstest]
+    #[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+    #[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+    #[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_field_ids(
+        #[case] dropped: &str,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(message.contains(expected), "unexpected error: {}", message);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_dropped_field_id_reuse() {
+        // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+        // accident covered above.
+        let dataset = dataset_with_dropped_column("memory://", "b").await;
+
+        let mut schema = dataset.schema().clone();
+        let mut field =
+            LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+        field.id = 1;
+        schema.fields.push(field);
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"e\"")
+                && message.contains("must use ids of at least 4"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_nested_field_ids() {
+        // A hole inside a struct shifts a nested leaf's id onto a field
+        // outside the struct on renumbering; the full-path comparison must
+        // catch the cross-parent remap.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+            ArrowField::new("z", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        Arc::new(Int32Array::from(vec![10, 20])),
+                    ],
+                    None,
+                )),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset.drop_columns(&["s.x"]).await.unwrap();
+        assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let survivors = surviving_columns(dropped);
+        let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+        let mut schema = dataset.schema().clone();
+        schema
+            .mut_field_by_id(first_id)
+            .unwrap()
+            .metadata
+            .insert("wm".into(), "42".into());
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert_eq!(
+            dataset
+                .schema()
+                .field(survivors[0].0)
+                .unwrap()
+                .metadata
+                .get("wm"),
+            Some(&"42".to_string())
+        );
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let mut survivors = surviving_columns(dropped);
+        let omitted = survivors.remove(0);
+        let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+        let schema = dataset.schema().project(&names).unwrap();
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert!(dataset.schema().field(omitted.0).is_none());
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_schema_only_path_remap() {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        let fresh_id = dataset.manifest.max_field_id() + 1;
+
+        let mut schema = dataset.schema().clone();
+        schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "remaps existing field \"a\" from id {} to id {}",
+                prior_id, fresh_id
+            )) && message.contains("base data file"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true, "logical type")]
+    #[case::nullability(DataType::Int32, false, "nullable")]
+    #[tokio::test]
+    async fn test_merge_rejects_shared_id_type_or_nullability_change(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let field_id = dataset.schema().field("a").unwrap().id;
+
+        let mut schema = dataset.schema().clone();
+        let field = schema.mut_field_by_id(field_id).unwrap();
+        field.logical_type = LogicalType::try_from(&data_type).unwrap();
+        field.nullable = nullable;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("changes field id {} (\"a\")", field_id))
+                && message.contains(expected),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true)]
+    #[case::nullability(DataType::Int32, false)]
+    #[test]
+    fn test_merge_shared_id_change_requires_full_rewrite(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+    ) {
+        let schema = one_field_schema();
+        let prior_fragments = vec![
+            fragment_with_file_fields(0, "old-0.lance", vec![0]),
+            fragment_with_file_fields(1, "old-1.lance", vec![0]),
+        ];
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].logical_type = LogicalType::try_from(&data_type).unwrap();
+        new_schema.fields[0].nullable = nullable;
+
+        let rewritten_fragments = vec![
+            fragment_with_file_fields(0, "new-0.lance", vec![0]),
+            fragment_with_file_fields(1, "new-1.lance", vec![0]),
+        ];
+        merge_schema_valid(&manifest, &new_schema, &rewritten_fragments).unwrap();
+
+        let partially_rewritten = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        let err = merge_schema_valid(&manifest, &new_schema, &partially_rewritten).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_merge_shared_id_change_rejects_retained_overlay() {
+        let schema = one_field_schema();
+        let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);
+        prior_fragment.overlays.push(DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("old-overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![prior_fragment.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].nullable = false;
+
+        let mut rewritten = fragment_with_file_fields(0, "new.lance", vec![0]);
+        rewritten.overlays = prior_fragment.overlays.clone();
+        let err = merge_schema_valid(&manifest, &new_schema, &[rewritten]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_rewritten_fresh_field_id() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
+        let mut rewritten_schema = schema.clone();
+        rewritten_schema.fields[0].id = 1;
+        let mut rewritten = manifest.fragments[0].clone();
+        rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
+        merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
+
+        let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+            .await
+            .unwrap();
+        let new_id = dataset.schema().field("a").unwrap().id;
+        assert_ne!(new_id, prior_id);
+        assert!(
+            dataset.get_fragments().iter().all(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .any(|file| file.fields.contains(&new_id))
+            }),
+            "alter_columns must materialize the fresh id in every fragment base file"
+        );
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_merge_rejects_max_field_id_overflow() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0, i32::MAX]);
+        assert_eq!(manifest.max_field_id(), i32::MAX);
+
+        let mut new_schema = schema;
+        let mut extra =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        extra.id = 1;
+        new_schema.fields.push(extra);
+
+        let err = merge_schema_valid(&manifest, &new_schema, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
+            "unexpected error: {}",
+            message
+        );
     }
 
     #[test]
@@ -4642,7 +5934,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50),
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4675,7 +5967,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // More physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4711,7 +6003,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // Less physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4750,7 +6042,7 @@ mod tests {
             Fragment {
                 id: 2,
                 physical_rows: Some(25), // Partial existing row IDs
-                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
@@ -5308,13 +6600,13 @@ mod tests {
     #[test]
     fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let data_file = DataFile::new(
             "data.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -5363,6 +6655,380 @@ mod tests {
             out.fragments[0].last_updated_at_version_meta.is_none(),
             "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
         );
+    }
+
+    #[test]
+    fn test_bitmap_cardinality_exceeds_physical_rows() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            LanceFileVersion::Stable.resolve(),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Bitmap with 10 offsets but fragment only has 5 physical rows.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter(0u32..10))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let result = tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cardinality"),
+            "expected cardinality error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_max_offset_exceeds_physical_rows() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            LanceFileVersion::Stable.resolve(),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Only 2 offsets (within cardinality) but max offset 100 exceeds physical_rows 5.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter([0u32, 100]))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let result = tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("max offset"),
+            "expected max offset error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_at_exact_physical_rows_boundary_succeeds() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            LanceFileVersion::Stable.resolve(),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // All 5 offsets on a 5-row fragment — exactly at the boundary, should succeed.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter(0u32..5))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )
+        .expect("bitmap at exact physical_rows boundary should succeed");
+    }
+
+    #[test]
+    fn test_updated_fragment_offsets_key_not_in_updated_fragments_is_rejected() {
+        // Fragment A is being rewritten; fragment B exists in the manifest but is
+        // NOT in updated_fragments. Supplying an offset key for B must be rejected
+        // so that B's version metadata cannot be stamped by an unrelated commit.
+        let make_fragment = |id: u64| {
+            let row_ids = RowIdSequence::from([id * 10].as_slice());
+            let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+            Fragment {
+                id,
+                files: vec![DataFile::new(
+                    format!("{id}.lance"),
+                    vec![0],
+                    vec![0],
+                    LanceFileVersion::Stable.resolve(),
+                    None,
+                    None,
+                )],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta,
+                physical_rows: Some(5),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            }
+        };
+
+        let frag_a = make_fragment(1);
+        let frag_b = make_fragment(2);
+        let manifest = make_stable_row_id_manifest(vec![frag_a.clone(), frag_b.clone()]);
+
+        // updated_fragments contains only A; offsets are keyed to B — must fail.
+        let off_map = HashMap::from([(frag_b.id, RoaringBitmap::from_iter([0u32, 1, 2]))]);
+        let operation = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![frag_a],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+        assert!(
+            err.to_string().contains("not in updated_fragments"),
+            "expected key-presence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_proto_round_trip_field_10() {
+        let off_map = HashMap::from([
+            (1u64, RoaringBitmap::from_iter([1u32, 3, 5])),
+            (2u64, RoaringBitmap::from_iter([0u32, 2, 4, 6])),
+        ]);
+        let tx = Transaction::new(
+            1,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map.clone())),
+            },
+            None,
+        );
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+
+        // Field 9 must be empty; field 10 must be populated.
+        if let Some(pb::transaction::Operation::Update(ref update)) = pb_tx.operation {
+            assert!(
+                update.updated_fragment_offsets.is_empty(),
+                "field 9 should be empty"
+            );
+            assert_eq!(update.updated_fragment_offset_bitmaps.len(), 2);
+        } else {
+            panic!("expected Update operation");
+        }
+
+        let tx2 = Transaction::try_from(pb_tx).unwrap();
+        if let Operation::Update {
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(m)),
+            ..
+        } = &tx2.operation
+        {
+            assert_eq!(m.len(), 2);
+            assert_eq!(*m.get(&1).unwrap(), off_map[&1]);
+            assert_eq!(*m.get(&2).unwrap(), off_map[&2]);
+        } else {
+            panic!("expected Update with offsets");
+        }
+    }
+
+    #[test]
+    fn test_proto_legacy_field_9_read() {
+        // Simulate a manifest written by old Lance: only field 9, no field 10.
+        let pb_tx = pb::Transaction {
+            read_version: 1,
+            uuid: "test".to_string(),
+            tag: String::new(),
+            transaction_properties: HashMap::new(),
+            operation: Some(pb::transaction::Operation::Update(
+                pb::transaction::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![],
+                    compacted_sstables: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: 1,
+                    inserted_rows: None,
+                    updated_fragment_offsets: HashMap::from([(
+                        1u64,
+                        pb::transaction::UInt32List {
+                            values: vec![1, 3, 5],
+                        },
+                    )]),
+                    updated_fragment_offset_bitmaps: HashMap::new(),
+                },
+            )),
+        };
+
+        let tx = Transaction::try_from(pb_tx).unwrap();
+        if let Operation::Update {
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(m)),
+            ..
+        } = &tx.operation
+        {
+            assert_eq!(m.len(), 1);
+            let bitmap = m.get(&1).unwrap();
+            let offsets: Vec<u32> = bitmap.iter().collect();
+            assert_eq!(offsets, vec![1, 3, 5]);
+        } else {
+            panic!("expected Update with offsets from legacy field 9");
+        }
+    }
+
+    #[test]
+    fn test_proto_field_10_takes_precedence_over_field_9() {
+        // When both fields present, field 10 wins.
+        let mut bitmap_bytes = Vec::new();
+        RoaringBitmap::from_iter([10u32, 20, 30])
+            .serialize_into(&mut bitmap_bytes)
+            .unwrap();
+
+        let pb_tx = pb::Transaction {
+            read_version: 1,
+            uuid: "test".to_string(),
+            tag: String::new(),
+            transaction_properties: HashMap::new(),
+            operation: Some(pb::transaction::Operation::Update(
+                pb::transaction::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![],
+                    compacted_sstables: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: 1,
+                    inserted_rows: None,
+                    // Field 9 has different values than field 10.
+                    updated_fragment_offsets: HashMap::from([(
+                        1u64,
+                        pb::transaction::UInt32List {
+                            values: vec![99, 100],
+                        },
+                    )]),
+                    updated_fragment_offset_bitmaps: HashMap::from([(1u64, bitmap_bytes)]),
+                },
+            )),
+        };
+
+        let tx = Transaction::try_from(pb_tx).unwrap();
+        if let Operation::Update {
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(m)),
+            ..
+        } = &tx.operation
+        {
+            let offsets: Vec<u32> = m.get(&1).unwrap().iter().collect();
+            assert_eq!(offsets, vec![10, 20, 30], "field 10 should take precedence");
+        } else {
+            panic!("expected Update with offsets from field 10");
+        }
     }
 
     /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
@@ -5676,7 +7342,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
@@ -5686,7 +7352,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([100u64, 101, 102, 103, 104].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let prev_fragment = Fragment {
             id: 0,
@@ -5718,6 +7384,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5753,7 +7420,7 @@ mod tests {
             "same.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -5762,7 +7429,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([200u64, 201, 202, 203, 204].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let uniform_v1 = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let meta_v1 = RowDatasetVersionMeta::from_sequence(&uniform_v1).unwrap();
@@ -5803,6 +7470,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5836,7 +7504,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
@@ -5878,6 +7546,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5907,7 +7576,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
@@ -5923,7 +7592,7 @@ mod tests {
             files: vec![mk_file("existing.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0).into())),
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5946,7 +7615,7 @@ mod tests {
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5957,6 +7626,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![existing_fragment, new_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -6009,7 +7679,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
@@ -6023,7 +7693,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6066,7 +7736,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq).into())),
                 physical_rows: Some(2),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
@@ -6078,7 +7748,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
@@ -6094,7 +7764,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6136,7 +7806,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6151,7 +7821,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6196,7 +7866,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6210,7 +7880,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6244,7 +7914,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6256,7 +7926,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6285,7 +7955,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6327,7 +7997,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                 vec![0xFFu8; 8].as_slice(),
@@ -6341,7 +8011,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6383,7 +8053,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
@@ -6404,7 +8074,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
@@ -6419,7 +8089,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6458,7 +8128,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
@@ -6471,7 +8141,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6520,7 +8190,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
@@ -6535,7 +8205,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6583,7 +8253,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
@@ -6595,7 +8265,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
@@ -6611,7 +8281,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6842,9 +8512,10 @@ mod tests {
     #[test]
     fn test_data_replacement_tombstones_overlaid_fields() {
         // A DataReplacement writing new base values for field 5 must stop any
-        // overlay from shadowing those cells: field 5 is tombstoned in place
+        // overlay already shadowing those cells: field 5 is tombstoned in place
         // (preserving the overlay's field 3), and an overlay covering only field
-        // 5 is dropped entirely.
+        // 5 is dropped entirely. Both overlays predate the transaction's read
+        // version, which is what makes the replacement the newer value.
         let mut fragment = Fragment::new(0);
         fragment.files = vec![
             DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
@@ -6857,12 +8528,12 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                     roaring::RoaringBitmap::from_iter([0u32]),
                 ]),
-                committed_version: 3,
+                committed_version: 1,
             },
             DataOverlayFile {
                 data_file: DataFile::new_legacy_from_fields("o5.lance", vec![5], None),
                 coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
-                committed_version: 3,
+                committed_version: 1,
             },
         ];
 
@@ -6901,6 +8572,224 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    /// Replace `fields` in `fragment` at `read_version`, against a manifest
+    /// at `manifest_version` whose schema declares field ids 3 ("x"), 4 ("a"),
+    /// 5 ("v") and 6 ("y").
+    fn replace_fields(
+        fragment: Fragment,
+        fields: Vec<i32>,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let mut lance_schema = LanceSchema::try_from(&schema).unwrap();
+        lance_schema.fields[0].id = 3;
+        lance_schema.fields[1].id = 4;
+        lance_schema.fields[2].id = 5;
+        lance_schema.fields[3].id = 6;
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.version = manifest_version;
+
+        let column_indices = (0..fields.len() as i32).collect();
+        let txn = Transaction::new(
+            read_version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new(
+                        "v-new.lance",
+                        fields,
+                        column_indices,
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                )],
+            },
+            None,
+        );
+        txn.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )
+        .map(|(manifest, _)| manifest.fragments[0].clone())
+    }
+
+    /// Replace field 5 in `fragment` at `read_version`, against a manifest at
+    /// `manifest_version`.
+    fn replace_field_5(
+        fragment: Fragment,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        replace_fields(fragment, vec![5], manifest_version, read_version)
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_subset_of_legacy_file() {
+        // The V1 reader derives its page table offset from the first field in
+        // the file metadata, so turning `[4, 5]` into `[-2, 5]` would leave
+        // field 4 decoding from field 5's pages. With no exact match to swap,
+        // the replacement must be rejected rather than corrupting the sibling.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields(
+            "wide.lance",
+            vec![4, 5],
+            None,
+        )];
+
+        let result = replace_field_5(fragment, 1, 1);
+        assert!(
+            result.is_err(),
+            "legacy subset replacement must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_tombstones_fields_spanning_files() {
+        // The replaced fields sit in two different wider files. Each file is
+        // tombstoned for the field it holds and survives on its remaining
+        // live one, with the new file answering for both.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new(
+                "cd.lance",
+                vec![5, 6],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+        ];
+
+        let fragment = replace_fields(fragment, vec![4, 5], 1, 1).unwrap();
+        let file = |path| {
+            fragment
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} survives on its live field"))
+        };
+        assert_eq!(file("ab.lance").fields.as_ref(), &[3, TOMBSTONE_FIELD_ID]);
+        assert_eq!(file("cd.lance").fields.as_ref(), &[TOMBSTONE_FIELD_ID, 6]);
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_fields_spanning_a_legacy_file() {
+        // Spanning is only resolvable while every covering file can be
+        // tombstoned. A V1 file holding one of the replaced fields cannot,
+        // so the replacement must be rejected rather than half applied.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
+        ];
+
+        let result = replace_fields(fragment, vec![4, 5], 1, 1);
+        assert!(
+            result.is_err(),
+            "spanning a legacy file must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_retombstones_wider_file() {
+        // A wider file carrying a tombstone from an earlier round is
+        // tombstoned again for the newly replaced field and survives on its
+        // remaining live field.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, TOMBSTONE_FIELD_ID, 5],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+
+        let fragment = replace_fields(fragment, vec![5], 1, 1).unwrap();
+        let wide = fragment
+            .files
+            .iter()
+            .find(|file| file.path == "wide.lance")
+            .expect("wider file survives on its live field");
+        assert_eq!(
+            wide.fields.as_ref(),
+            &[4, TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID]
+        );
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_preserves_overlay_newer_than_snapshot() {
+        // An overlay committed after this transaction read its snapshot holds
+        // the newer value; the conflict resolver rebases the two precisely
+        // because the overlay wins. Tombstoning it would discard a committed
+        // write, so only overlays the transaction could have seen are superseded.
+        let mut fragment = Fragment::new(0);
+        // One wider file, so the replacement takes the tombstone-and-append path.
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, 5],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new(
+                "newer.lance",
+                vec![5],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version: 7,
+        }];
+
+        // Staged against version 6, i.e. before the overlay landed.
+        let fragment = replace_field_5(fragment, 7, 6).unwrap();
+        assert!(fragment.files.iter().any(|f| f.path == "v-new.lance"));
+        assert_eq!(
+            fragment.overlays.len(),
+            1,
+            "overlay committed after the snapshot must survive"
+        );
+        assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
     }
 
     #[test]
@@ -6982,5 +8871,717 @@ mod tests {
             frag_reuse_index: None,
         };
         assert_ne!(overlay(1), rewrite);
+    }
+
+    #[test]
+    fn test_nullability_assertion_defaults_conservative() {
+        // A writer that predates the field encodes nothing, which decodes as
+        // false: no assertion, so a legacy tightening or required-field merge
+        // still conflicts. Only an explicit true skips the barrier.
+        for encoded in [false, true] {
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Project(
+                    pb::transaction::Project {
+                        schema: vec![],
+                        preserves_nullability: encoded,
+                    },
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Project { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
+                    fragments: vec![],
+                    schema: vec![],
+                    schema_metadata: Default::default(),
+                    preserves_nullability: encoded,
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Merge { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+        }
+    }
+
+    mod mem_wal_index_coverage {
+        use super::*;
+        use lance_index::mem_wal::{
+            CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
+        };
+        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
+
+        fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
+            IndexMetadata {
+                uuid,
+                name: name.to_string(),
+                fields: vec![0],
+                dataset_version: 1,
+                fragment_bitmap: Some(RoaringBitmap::from_iter(frags.iter().copied())),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+
+        fn mem_wal_index(details: MemWalIndexDetails) -> IndexMetadata {
+            crate::index::mem_wal::new_mem_wal_index_meta(1, details).unwrap()
+        }
+
+        fn coverage_for(indices: &[IndexMetadata], name: &str) -> Option<Vec<CompactedSsTable>> {
+            let meta = indices
+                .iter()
+                .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                .expect("mem wal index present");
+            load_mem_wal_index_details(meta.clone())
+                .unwrap()
+                .index_catchup
+                .into_iter()
+                .find(|entry| entry.index_name == name)
+                .map(|entry| entry.caught_up_generations)
+        }
+
+        fn compacted(shard: Uuid, generation: u64) -> Vec<CompactedSsTable> {
+            vec![CompactedSsTable::new(shard, generation)]
+        }
+
+        /// A manifest carrying exactly `frags`, standing in for the version a
+        /// transaction read.
+        fn manifest_with(frags: &[u32]) -> Manifest {
+            let fragments: Vec<Fragment> =
+                frags.iter().map(|id| Fragment::new(*id as u64)).collect();
+            Manifest::new(
+                Schema::default(),
+                Arc::new(fragments),
+                DataStorageFormat::default(),
+                Default::default(),
+            )
+        }
+
+        /// Drives the production path, so these exercise the real derivation.
+        fn apply(
+            after: &mut [IndexMetadata],
+            before: &[IndexMetadata],
+            read_frags: &[u32],
+            read_indices: &[IndexMetadata],
+            required: bool,
+        ) -> Result<()> {
+            let manifest = manifest_with(read_frags);
+            let segments_before = Transaction::logical_index_segments(before);
+            Transaction::apply_mem_wal_index_coverage(
+                after,
+                &segments_before,
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: read_indices,
+                }),
+                required,
+                2,
+            )
+        }
+
+        fn table(idx_frags: &[u32], uuid: Uuid, details: MemWalIndexDetails) -> Vec<IndexMetadata> {
+            vec![user_index("idx", uuid, idx_frags), mem_wal_index(details)]
+        }
+
+        fn progress(shard: Uuid, generation: u64) -> MemWalIndexDetails {
+            MemWalIndexDetails {
+                compacted_sstables: compacted(shard, generation),
+                ..Default::default()
+            }
+        }
+
+        fn progress_with_catchup(shard: Uuid, generation: u64, caught: u64) -> MemWalIndexDetails {
+            MemWalIndexDetails {
+                compacted_sstables: compacted(shard, generation),
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    compacted(shard, caught),
+                )],
+                ..Default::default()
+            }
+        }
+
+        /// An index spanning every fragment the transaction read is credited
+        /// with what that version had compacted.
+        #[test]
+        fn an_index_covering_the_read_version_is_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut after = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// An index short of the read version proves nothing, so it gets no
+        /// entry -- absence reads as "not caught up".
+        #[test]
+        fn an_index_short_of_the_read_version_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// The hazard that makes the comparison use whole metadata.
+        ///
+        /// `Operation::Update` prunes a segment's fragment bitmap in place when
+        /// it touches an indexed field, keeping the same UUID. A UUID-only
+        /// "unchanged" test carries the old position forward while the index
+        /// covers fewer fragments, and the WAL pod then trims on a position the
+        /// index no longer earns. Reachable from the ordinary SSTable merge.
+        #[test]
+        fn a_bitmap_pruned_in_place_does_not_keep_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
+            // Same UUID, fragment 1 pruned away.
+            let mut after = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(
+                coverage_for(&after, "idx"),
+                None,
+                "a shrunken index kept a position it no longer earns"
+            );
+        }
+
+        /// Carrying a position forward is not the same as extending it. An
+        /// index that has not moved still only holds the generations it caught
+        /// up to; the compaction that has landed since is in fragments it does
+        /// not span.
+        #[test]
+        fn an_unchanged_index_is_not_raised_beyond_what_it_proves() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            // Recorded at generation 2; generation 5 has since been folded in.
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 2));
+            let mut after = before.clone();
+            // Fragment 1 arrived with that compaction and this index lacks it.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
+        }
+
+        /// A recorded position above what this commit says was compacted is
+        /// clamped down. Nothing should produce one, but a position the base
+        /// table cannot back would retire SSTables whose rows are nowhere.
+        #[test]
+        fn a_carried_position_cannot_exceed_the_committed_progress() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 3, 9));
+            let mut after = before.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
+        }
+
+        /// An unchanged index keeps what it recorded even when this commit's
+        /// own snapshot cannot prove as much.
+        #[test]
+        fn an_unchanged_index_is_never_lowered() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 9, 9));
+            let mut after = before.clone();
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 9)));
+        }
+
+        /// Credit never exceeds what this commit records as compacted, so a
+        /// read version since rolled back cannot retire SSTables no live commit
+        /// copied in.
+        #[test]
+        fn credit_is_capped_by_the_committed_progress() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 9));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 3));
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
+        }
+
+        /// The cap is the read version's progress, not this commit's. A
+        /// compaction that landed while the index was being built put its rows
+        /// in fragments this transaction never inspected, so covering
+        /// everything it *did* read earns only what had been folded in by then.
+        #[test]
+        fn credit_never_reaches_past_the_read_version() {
+            let shard = Uuid::new_v4();
+            // Read at generation 2; generation 5 landed while this ran.
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 2));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
+        }
+
+        /// One segment with an unknown bitmap makes the whole index unproven,
+        /// even when its siblings happen to span everything. Coverage that
+        /// cannot be read is not coverage that can be relied on.
+        #[test]
+        fn an_index_with_an_unknown_segment_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let mut unknown = user_index("idx", Uuid::new_v4(), &[]);
+            unknown.fragment_bitmap = None;
+            let read = vec![
+                user_index("idx", Uuid::new_v4(), &[0, 1]),
+                unknown,
+                mem_wal_index(progress(shard, 5)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// A dropped index has no coverage left to gate anything.
+        #[test]
+        fn a_dropped_index_loses_its_entry() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let mut after = vec![mem_wal_index(progress_with_catchup(shard, 5, 5))];
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// An index created by this commit is credited if it spans the read
+        /// version -- it was built over those fragments, so it holds their
+        /// rows. This is what the advance model could not express: an ordinary
+        /// build that fully covers had to throw its work away and wait.
+        #[test]
+        fn a_new_index_covering_the_read_version_is_credited() {
+            let shard = Uuid::new_v4();
+            let before = vec![mem_wal_index(progress(shard, 5))];
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            // Covers the read version, but was not there when it was read.
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// A legacy table reads a missing entry as "fully caught up", so this
+        /// must leave it alone rather than make it look more covered.
+        #[test]
+        fn a_legacy_table_is_untouched() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, false).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// Two shards, only one of them compacted.
+        #[test]
+        fn each_shard_is_credited_independently() {
+            let merged = Uuid::new_v4();
+            let idle = Uuid::new_v4();
+            let details = MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(merged, 4),
+                    CompactedSsTable::new(idle, 0),
+                ],
+                ..Default::default()
+            };
+            let read = table(&[0], Uuid::new_v4(), details.clone());
+            let mut after = table(&[0], Uuid::new_v4(), details);
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            let coverage = coverage_for(&after, "idx").expect("credited");
+            assert_eq!(
+                coverage
+                    .iter()
+                    .find(|g| g.shard_id == merged)
+                    .map(|g| g.generation),
+                Some(4)
+            );
+            assert_eq!(
+                coverage
+                    .iter()
+                    .find(|g| g.shard_id == idle)
+                    .map(|g| g.generation),
+                Some(0)
+            );
+        }
+
+        /// Two indexes advance independently: one covering, one behind.
+        #[test]
+        fn indexes_are_credited_independently() {
+            let shard = Uuid::new_v4();
+            let read = vec![
+                user_index("fast", Uuid::new_v4(), &[0, 1]),
+                user_index("slow", Uuid::new_v4(), &[0]),
+                mem_wal_index(progress(shard, 6)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "fast"), Some(compacted(shard, 6)));
+            assert_eq!(coverage_for(&after, "slow"), None);
+        }
+
+        /// An index whose coverage is unknown cannot be shown to cover anything.
+        #[test]
+        fn an_index_without_a_bitmap_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let mut idx = user_index("idx", Uuid::new_v4(), &[0]);
+            idx.fragment_bitmap = None;
+            let read = vec![idx, mem_wal_index(progress(shard, 5))];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Nothing compacted means nothing to be behind on.
+        #[test]
+        fn no_compaction_progress_writes_no_entries() {
+            let before = table(&[0], Uuid::new_v4(), MemWalIndexDetails::default());
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// No MemWAL system index: nothing to maintain, and no error.
+        #[test]
+        fn a_table_without_mem_wal_is_a_no_op() {
+            let before = vec![user_index("idx", Uuid::new_v4(), &[0])];
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// No read version -- dataset creation, detached commits -- credits
+        /// nothing and lowers nothing.
+        #[test]
+        fn without_a_read_version_nothing_changes() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+            let mut after = before.clone();
+            let segments_before = Transaction::logical_index_segments(&before);
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, true, 2)
+                .unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// An untrained index covers nothing that exists, so a sibling's work
+        /// is no evidence for it.
+        #[test]
+        fn an_untrained_index_earns_nothing() {
+            let shard = Uuid::new_v4();
+            let read = vec![
+                user_index("untrained", Uuid::new_v4(), &[]),
+                user_index("trained", Uuid::new_v4(), &[0]),
+                mem_wal_index(progress(shard, 10)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "untrained"), None);
+            assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
+        }
+
+        /// Shards move independently within one index: one advances on this
+        /// commit's proof while another keeps the position it already had.
+        #[test]
+        fn a_shard_keeps_its_position_while_another_advances() {
+            let (advancing, quiet) = (Uuid::new_v4(), Uuid::new_v4());
+            let uuid = Uuid::new_v4();
+            let details = |advancing_gen: u64| MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(advancing, advancing_gen),
+                    CompactedSsTable::new(quiet, 10),
+                ],
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    vec![CompactedSsTable::new(quiet, 7)],
+                )],
+                ..Default::default()
+            };
+            // The quiet shard was never compacted as of the read, so nothing
+            // this commit proves reaches it -- it keeps its recorded 7.
+            let read = vec![
+                user_index("idx", uuid, &[0]),
+                mem_wal_index(MemWalIndexDetails {
+                    compacted_sstables: vec![CompactedSsTable::new(advancing, 9)],
+                    ..details(9)
+                }),
+            ];
+            let mut after = vec![user_index("idx", uuid, &[0]), mem_wal_index(details(10))];
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+
+            let mut coverage = coverage_for(&after, "idx").expect("credited");
+            coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
+            let mut expected = vec![
+                CompactedSsTable::new(advancing, 9),
+                CompactedSsTable::new(quiet, 7),
+            ];
+            expected.sort_unstable_by_key(|sstable| sstable.shard_id);
+            assert_eq!(coverage, expected);
+        }
+
+        /// The derivation drops coverage an index no longer earns, but it never
+        /// rejects the commit -- an ordinary index job must not be blocked by
+        /// a protocol it knows nothing about.
+        #[test]
+        fn an_ordinary_index_job_is_never_blocked() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            // Rebuilt over a subset -- the shape a partial reindex leaves.
+            let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// A reader's rule is that a missing entry means "not caught up", so an
+        /// index caught up to nothing must be absent rather than present at
+        /// generation zero -- otherwise it reads as known-and-covered.
+        #[test]
+        fn an_index_caught_up_to_nothing_gets_no_entry() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 0));
+            let mut after = before.clone();
+            // Does not span the read version, so nothing lifts it off zero.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Each shard carries its own position. Collapsing them to one value
+        /// would credit a lagging shard with a busier shard's progress.
+        #[test]
+        fn carried_positions_do_not_leak_between_shards() {
+            let (ahead, behind) = (Uuid::new_v4(), Uuid::new_v4());
+            let uuid = Uuid::new_v4();
+            let details = MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(ahead, 10),
+                    CompactedSsTable::new(behind, 10),
+                ],
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    vec![
+                        CompactedSsTable::new(ahead, 8),
+                        CompactedSsTable::new(behind, 2),
+                    ],
+                )],
+                ..Default::default()
+            };
+            let before = vec![user_index("idx", uuid, &[0]), mem_wal_index(details)];
+            let mut after = before.clone();
+            // Unchanged and unproven: both shards keep exactly what they had.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+
+            let mut coverage = coverage_for(&after, "idx").expect("carried");
+            coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
+            let mut expected = vec![
+                CompactedSsTable::new(ahead, 8),
+                CompactedSsTable::new(behind, 2),
+            ];
+            expected.sort_unstable_by_key(|sstable| sstable.shard_id);
+            assert_eq!(coverage, expected);
+        }
+
+        /// The derivation runs while the manifest is being built, but the
+        /// index list is not final there: `migrate_indices` recalculates a
+        /// segment's fragment bitmap and keeps its UUID. A position decided
+        /// before that must not survive the narrowing, or the WAL pod trims
+        /// against an index that no longer covers those rows.
+        #[test]
+        fn a_bitmap_narrowed_after_the_build_loses_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            // What migrate_indices leaves behind: same UUID, fewer fragments,
+            // and it says so.
+            let mut migrated = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+
+            Transaction::withdraw_coverage_invalidated_after_build(
+                &mut migrated,
+                &["idx".to_string()],
+                3,
+            )
+            .unwrap();
+
+            assert_eq!(coverage_for(&migrated, "idx"), None);
+        }
+
+        /// Migration routinely fills in file lists and inferred details. Those
+        /// do not change which rows an index answers for, so withdrawing on
+        /// them would drop coverage every commit for no reason.
+        #[test]
+        fn metadata_migration_that_does_not_narrow_keeps_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let mut migrated = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
+            migrated[0].files = Some(Vec::new());
+            migrated[0].created_at = Some(chrono::Utc::now());
+
+            // Nothing narrowed, so migration reports nothing.
+            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &[], 3).unwrap();
+
+            assert_eq!(coverage_for(&migrated, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// A commit that changes nothing must not churn the system index: a new
+        /// UUID on every append would invalidate its cache entry fleet-wide.
+        #[test]
+        fn an_unchanged_commit_does_not_rewrite_the_system_index() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+            let mut after = before.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+
+            let system_uuid = |indices: &[IndexMetadata]| {
+                indices
+                    .iter()
+                    .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .unwrap()
+                    .uuid
+            };
+            assert_eq!(system_uuid(&after), system_uuid(&before));
+        }
+
+        /// Activation is what puts a table on the protocol. A table that has
+        /// never compacted is clean.
+        #[test]
+        fn activation_accepts_a_clean_table() {
+            let mut indices = vec![mem_wal_index(MemWalIndexDetails::default())];
+            Transaction::require_index_catchup(&mut indices, 2).unwrap();
+        }
+
+        /// There is nothing to put on the protocol.
+        #[test]
+        fn activation_requires_the_mem_wal_index() {
+            let err = Transaction::require_index_catchup(&mut [], 2).unwrap_err();
+            assert!(err.to_string().contains("does not exist"), "{err}");
+        }
+
+        /// Coverage recorded under the beta rules was written to a different
+        /// contract; keeping it would let the first trim run unchecked.
+        #[test]
+        fn activation_clears_beta_coverage() {
+            let shard = Uuid::new_v4();
+            let mut indices = vec![mem_wal_index(MemWalIndexDetails {
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    compacted(shard, 100),
+                )],
+                ..Default::default()
+            })];
+
+            Transaction::require_index_catchup(&mut indices, 2).unwrap();
+
+            assert!(
+                load_mem_wal_index_details(indices[0].clone())
+                    .unwrap()
+                    .index_catchup
+                    .is_empty()
+            );
+        }
+
+        /// Beta compaction progress means SSTables were folded in without any
+        /// coverage rule. No later commit can prove which indexes hold them.
+        #[test]
+        fn activation_rejects_pre_existing_beta_compaction_progress() {
+            let mut indices = vec![mem_wal_index(progress(Uuid::new_v4(), 4))];
+            let err = Transaction::require_index_catchup(&mut indices, 2).unwrap_err();
+            assert!(err.to_string().contains("beta protocol"), "{err}");
+        }
+
+        fn config_transaction(current: &Manifest) -> Transaction {
+            Transaction::new(
+                current.version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            )
+        }
+
+        /// One bit without the other is a manifest no writer should produce:
+        /// a reader-only bit lets an unaware writer trim, a writer-only bit
+        /// lets an unaware reader serve rows no index holds.
+        #[test]
+        fn a_half_set_feature_bit_is_refused() {
+            for (reader, writer) in [
+                (FLAG_MEM_WAL_INDEX_CATCHUP, 0),
+                (0, FLAG_MEM_WAL_INDEX_CATCHUP),
+            ] {
+                let mut current = sample_manifest_with_fragments(0..1);
+                current.reader_feature_flags = reader;
+                current.writer_feature_flags = writer;
+
+                let err = config_transaction(&current)
+                    .build_manifest(
+                        Some(&current),
+                        vec![mem_wal_index(MemWalIndexDetails::default())],
+                        "txn",
+                        &ManifestWriteConfig::default(),
+                    )
+                    .unwrap_err();
+
+                assert!(err.to_string().contains("only one of"), "{err}");
+            }
+        }
+
+        /// A writer that knows nothing about catch-up must not silently take a
+        /// table off the protocol.
+        #[test]
+        fn an_ordinary_commit_keeps_the_feature_bit() {
+            let mut current = sample_manifest_with_fragments(0..1);
+            current.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+            current.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+
+            let (next, _) = config_transaction(&current)
+                .build_manifest(
+                    Some(&current),
+                    vec![mem_wal_index(MemWalIndexDetails::default())],
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap();
+
+            assert_ne!(next.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
+            assert_ne!(next.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
+        }
+
+        /// A commit with no read version still withdraws. It can prove nothing,
+        /// so an index it changed keeps no position -- the alternative leaves a
+        /// position describing an index that no longer exists.
+        #[test]
+        fn without_a_read_version_a_changed_index_still_loses_its_position() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let segments_before = Transaction::logical_index_segments(&before);
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, true, 2)
+                .unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Two attempts against the same read version agree, which is what makes
+        /// a rebase safe: `read_version` is fixed for a transaction's life.
+        #[test]
+        fn the_derivation_is_stable_across_attempts() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut first = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut second = first.clone();
+            apply(&mut first, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut second, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&first, "idx"), coverage_for(&second, "idx"));
+        }
     }
 }
