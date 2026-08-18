@@ -280,6 +280,11 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             .unwrap()
             .project(&["id"])
             .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "Expected BTree scalar index query for {predicate}:\n{plan}"
+        );
         let indexed = indexed_scan.try_into_batch().await.unwrap();
 
         let mut baseline_scan = dataset.scan();

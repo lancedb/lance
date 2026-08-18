@@ -1981,7 +1981,7 @@ impl ScalarIndexExpr {
                 let search_result = index
                     .search_with_options(
                         search.query.as_ref(),
-                        SearchOptions { track_nulls },
+                        SearchOptions::default().with_track_nulls(track_nulls),
                         metrics,
                     )
                     .await?;

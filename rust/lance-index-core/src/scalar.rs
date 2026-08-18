@@ -507,12 +507,26 @@ pub struct SearchOptions {
     ///
     /// Callers may disable this only when NULL rows cannot affect the final
     /// result, such as a top-level filter whose NULL results will be discarded.
-    pub track_nulls: bool,
+    track_nulls: bool,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
         Self { track_nulls: true }
+    }
+}
+
+impl SearchOptions {
+    /// Configure whether searches preserve rows where the query evaluates to
+    /// NULL. When disabled, implementations return only TRUE rows.
+    pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
+        self.track_nulls = track_nulls;
+        self
+    }
+
+    /// Whether searches preserve rows where the query evaluates to NULL.
+    pub fn track_nulls(&self) -> bool {
+        self.track_nulls
     }
 }
 

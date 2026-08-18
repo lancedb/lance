@@ -503,7 +503,7 @@ mod tests {
         let untracked = logical
             .search_with_options(
                 &query,
-                SearchOptions { track_nulls: false },
+                SearchOptions::default().with_track_nulls(false),
                 &NoOpMetricsCollector,
             )
             .await

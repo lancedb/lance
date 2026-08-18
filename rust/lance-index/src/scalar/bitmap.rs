@@ -694,7 +694,7 @@ impl ScalarIndex for BitmapIndex {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let tracked_null_rows = || {
-            if options.track_nulls && !self.null_map.is_empty() {
+            if options.track_nulls() && !self.null_map.is_empty() {
                 Some((*self.null_map).clone())
             } else {
                 None
@@ -2823,7 +2823,7 @@ mod tests {
         let result = index
             .search_with_options(
                 &query,
-                SearchOptions { track_nulls: false },
+                SearchOptions::default().with_track_nulls(false),
                 &NoOpMetricsCollector,
             )
             .await
