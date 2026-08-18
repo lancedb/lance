@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -47,6 +48,11 @@ struct SegmentEntry {
     seq_idx: usize,
     range: RangeInclusive<u64>,
     start_offset: u32,
+    /// Position of each row id in an unsorted [`U64Segment::Array`]. That
+    /// encoding answers `position` by walking the segment, so a lookup without
+    /// this map costs the segment length. The searchable encodings leave it
+    /// `None` and use `position` directly.
+    positions: Option<HashMap<u64, u32>>,
 }
 
 #[derive(Debug)]
@@ -64,6 +70,20 @@ fn segment_bounds(segment: &U64Segment) -> Option<RangeInclusive<u64>> {
     segment.range()
 }
 
+/// Row id to position map for an unsorted [`U64Segment::Array`], `None` for the
+/// encodings that `position` searches. The first position of a repeated id wins,
+/// which is what `position` returns.
+fn array_positions(segment: &U64Segment) -> Option<HashMap<u64, u32>> {
+    let U64Segment::Array(_) = segment else {
+        return None;
+    };
+    let mut positions = HashMap::with_capacity(segment.len());
+    for (position, row_id) in segment.iter().enumerate() {
+        positions.entry(row_id).or_insert(position as u32);
+    }
+    Some(positions)
+}
+
 impl FragmentEntry {
     fn new(source: &FragmentRowIdIndex) -> Option<Self> {
         let mut segments: Vec<SegmentEntry> = Vec::new();
@@ -75,6 +95,7 @@ impl FragmentEntry {
                     seq_idx,
                     range,
                     start_offset,
+                    positions: array_positions(segment),
                 });
             }
             start_offset += len;
@@ -100,7 +121,11 @@ impl FragmentEntry {
             if !entry.range.contains(&row_id) {
                 continue;
             }
-            let Some(position) = self.sequence.0[entry.seq_idx].position(row_id) else {
+            let position = match &entry.positions {
+                Some(positions) => positions.get(&row_id).map(|position| *position as usize),
+                None => self.sequence.0[entry.seq_idx].position(row_id),
+            };
+            let Some(position) = position else {
                 continue;
             };
             let row_offset = entry.start_offset + position as u32;
@@ -110,10 +135,6 @@ impl FragmentEntry {
             return Some(RowAddress::new_from_parts(self.fragment_id, row_offset));
         }
         None
-    }
-
-    fn covers(&self, row_id: u64) -> bool {
-        self.start <= row_id && row_id <= self.end
     }
 }
 
@@ -147,9 +168,9 @@ impl RowIdIndex {
     /// Get addresses for many row ids in one pass over the index.
     ///
     /// Returns one entry per input id, in input order (`None` for missing).
-    /// Sorts a working copy of the input so that neighbouring ids reach the same
-    /// fragment, and tries the fragment that answered last before searching the
-    /// candidates again.
+    /// Resolves each id through [`Self::get`], so both APIs return the same
+    /// address for the same id. Sorts a working copy of the input first, which
+    /// keeps neighbouring ids on the same fragment and its segments warm.
     pub fn get_many(&self, row_ids: &[u64]) -> Vec<Option<RowAddress>> {
         let mut out = vec![None; row_ids.len()];
         if row_ids.is_empty() {
@@ -159,22 +180,8 @@ impl RowIdIndex {
         let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..row_ids.len()).collect();
         sorted.sort_unstable_by_key(|&(row_id, _)| row_id);
 
-        let mut last: Option<usize> = None;
         for (row_id, orig_idx) in sorted {
-            if let Some(slot) = last
-                && self.fragments[slot].covers(row_id)
-                && let Some(address) = self.fragments[slot].resolve(row_id)
-            {
-                out[orig_idx] = Some(address);
-                continue;
-            }
-            for (slot, entry) in self.candidates(row_id) {
-                if let Some(address) = entry.resolve(row_id) {
-                    out[orig_idx] = Some(address);
-                    last = Some(slot);
-                    break;
-                }
-            }
+            out[orig_idx] = self.get(row_id);
         }
         out
     }
@@ -221,18 +228,30 @@ impl RowIdIndex {
 }
 
 impl DeepSizeOf for RowIdIndex {
-    /// Counts the tables this index owns. The row id sequences and deletion
-    /// vectors sit behind `Arc`s that the per-fragment caches also hold, and
-    /// each of those entries is charged to the cache that owns it.
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        let fragment_bytes = self.fragments.len() * std::mem::size_of::<FragmentEntry>();
-        let segment_bytes: usize = self
+    /// Charges the row id sequences and deletion vectors the index keeps alive
+    /// through its `Arc`s, so a cache that weighs this entry bounds every
+    /// allocation the entry retains.
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        let fragment_bytes: usize = self
             .fragments
             .iter()
-            .map(|entry| entry.segments.len() * std::mem::size_of::<SegmentEntry>())
+            .map(|entry| {
+                std::mem::size_of::<FragmentEntry>()
+                    + entry.sequence.deep_size_of_children(context)
+                    + entry.deletion_vector.deep_size_of_children(context)
+                    + entry
+                        .segments
+                        .iter()
+                        .map(|segment| {
+                            std::mem::size_of::<SegmentEntry>()
+                                + segment.positions.as_ref().map_or(0, |positions| {
+                                    positions.capacity() * std::mem::size_of::<(u64, u32)>()
+                                })
+                        })
+                        .sum::<usize>()
+            })
             .sum();
-        let bound_bytes = self.max_end.len() * std::mem::size_of::<u64>();
-        fragment_bytes + segment_bytes + bound_bytes
+        fragment_bytes + self.max_end.len() * std::mem::size_of::<u64>()
     }
 }
 
@@ -243,6 +262,40 @@ mod tests {
         prelude::{Just, Strategy, any},
         prop_assert, prop_assert_eq,
     };
+
+    #[test]
+    fn test_get_and_get_many_agree_on_a_duplicated_row_id() {
+        let make = |fragment_id, row_ids: &[u64]| FragmentRowIdIndex {
+            fragment_id,
+            row_id_sequence: Arc::new(RowIdSequence::from(row_ids)),
+            deletion_vector: Arc::new(DeletionVector::default()),
+        };
+        let index = RowIdIndex::new(&[make(1, &[0, 2]), make(2, &[1, 2])]).unwrap();
+
+        assert_eq!(index.get(2), index.get_many(&[0, 2])[1]);
+        assert_eq!(index.get(0), index.get_many(&[0, 2])[0]);
+        assert!(index.verify().is_err());
+    }
+
+    #[test]
+    fn test_unsorted_array_segment_resolves_every_position() {
+        let row_ids: Vec<u64> = (0..64_u64).rev().collect();
+        let index = RowIdIndex::new(&[FragmentRowIdIndex {
+            fragment_id: 7,
+            row_id_sequence: Arc::new(RowIdSequence::from(row_ids.as_slice())),
+            deletion_vector: Arc::new(DeletionVector::default()),
+        }])
+        .unwrap();
+
+        for (position, row_id) in row_ids.iter().enumerate() {
+            assert_eq!(
+                index.get(*row_id),
+                Some(RowAddress::new_from_parts(7, position as u32)),
+                "row id {row_id}"
+            );
+        }
+        assert_eq!(index.get(64), None);
+    }
 
     #[test]
     fn test_new_index() {
