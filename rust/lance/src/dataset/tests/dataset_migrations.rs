@@ -6,13 +6,14 @@ use std::vec;
 
 use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
+use lance_index::{IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
-use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
@@ -700,4 +701,75 @@ async fn test_migrate_to_stable_row_ids_with_deletions() {
     assert_eq!(dataset.manifest.next_row_id, 10);
 
     dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_blocked_by_index() {
+    // Create a 2-fragment dataset and build a BTree index on it.
+    let mut dataset = make_simple_dataset("memory://btree_blocked", 10).await;
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(10..20))],
+    )
+    .unwrap();
+    dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch2])
+        .await
+        .unwrap();
+
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("my_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Migration must be rejected because the BTree index exists.
+    let err = dataset
+        .migrate_to_stable_row_ids()
+        .await
+        .expect_err("migration should fail when indexes exist");
+
+    assert!(
+        err.to_string().contains("my_btree"),
+        "error should name the blocking index, got: {err}"
+    );
+
+    // After dropping the index the migration succeeds.
+    dataset.drop_index("my_btree").await.unwrap();
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+    assert!(dataset.manifest.uses_stable_row_ids());
+
+    // Re-create the index and verify it works correctly.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .filter("id = 15")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(results.num_rows(), 1);
+    let id_col = results["id"].as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(id_col.value(0), 15);
 }

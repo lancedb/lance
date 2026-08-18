@@ -3116,6 +3116,17 @@ impl Dataset {
             return Ok(());
         }
 
+        let indices = self.load_indices().await?;
+        if !indices.is_empty() {
+            let names: Vec<&str> = indices.iter().map(|idx| idx.name.as_str()).collect();
+            return Err(Error::invalid_input(format!(
+                "Cannot migrate to stable row IDs while indexes exist on the dataset. \
+                 Drop the following indexes first, then re-run the migration, and \
+                 recreate them afterwards: {}",
+                names.join(", ")
+            )));
+        }
+
         let mut fragments = self.manifest.fragments.as_ref().clone();
         let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
         let schema = self.manifest.schema.clone();
