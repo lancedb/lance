@@ -2092,17 +2092,15 @@ pub struct RewriteResult {
 async fn compaction_source_row_addresses(
     dataset: &Dataset,
     task: &RewriteResult,
-) -> Result<Vec<u64>> {
+) -> Result<RoaringTreemap> {
     if let Some(serialized) = &task.row_addrs {
-        return Ok(
-            RoaringTreemap::deserialize_from(&mut Cursor::new(serialized))?
-                .iter()
-                .collect(),
-        );
+        return Ok(RoaringTreemap::deserialize_from(&mut Cursor::new(
+            serialized,
+        ))?);
     }
 
     let dataset = Arc::new(dataset.clone());
-    let mut addresses = Vec::new();
+    let mut addresses = RoaringTreemap::new();
     for fragment in &task.original_fragments {
         let physical_rows = fragment.physical_rows.ok_or_else(|| {
             Error::invalid_input(format!(
@@ -2110,20 +2108,41 @@ async fn compaction_source_row_addresses(
                 fragment.id
             ))
         })?;
+        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+            Error::invalid_input(format!(
+                "Compacted fragment ID {} does not fit in a row address",
+                fragment.id
+            ))
+        })?;
+        let physical_rows = u64::try_from(physical_rows).map_err(|_| {
+            Error::invalid_input(format!(
+                "Compacted fragment {} row count does not fit in a row address range",
+                fragment.id
+            ))
+        })?;
+        if physical_rows > lance_core::utils::address::RowAddress::FRAGMENT_SIZE {
+            return Err(Error::invalid_input(format!(
+                "Compacted fragment {} has {} rows, exceeding the row address capacity",
+                fragment.id, physical_rows
+            )));
+        }
+        let first_address = u64::from(lance_core::utils::address::RowAddress::first_row(
+            fragment_id,
+        ));
+        let end_address = first_address.checked_add(physical_rows).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Compacted fragment {} row address range overflows",
+                fragment.id
+            ))
+        })?;
+        addresses.insert_range(first_address..end_address);
         let deletion_vector = FileFragment::new(dataset.clone(), fragment.clone())
             .get_deletion_vector()
             .await?;
-        for offset in 0..physical_rows as u32 {
-            if deletion_vector
-                .as_ref()
-                .is_some_and(|deleted| deleted.contains(offset))
-            {
-                continue;
+        if let Some(deleted) = deletion_vector {
+            for offset in deleted.iter() {
+                addresses.remove(first_address + u64::from(offset));
             }
-            addresses.push(
-                lance_core::utils::address::RowAddress::new_from_parts(fragment.id as u32, offset)
-                    .into(),
-            );
         }
     }
     Ok(addresses)
@@ -2686,11 +2705,7 @@ pub async fn commit_compaction(
             let source_row_addresses = compaction_source_row_addresses(dataset, &task).await?;
             cell_flag_changes.fragment_states.extend(
                 dataset
-                    .cell_flag_states_for_rewritten_rows(
-                        &task.new_fragments,
-                        &source_row_addresses,
-                        &HashMap::new(),
-                    )
+                    .cell_flag_states_for_compacted_rows(&task.new_fragments, &source_row_addresses)
                     .await?,
             );
         }

@@ -345,7 +345,13 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 20 * 1024 * 1024;
 pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 const MAX_INLINE_CELL_FLAG_TRANSACTION_BYTES: usize = 64 * 1024;
 
-fn should_inline_transaction(transaction: &pb::Transaction) -> bool {
+fn should_inline_transaction(
+    transaction: &pb::Transaction,
+    transaction_file_disabled: bool,
+) -> bool {
+    if transaction_file_disabled {
+        return true;
+    }
     let max_bytes = if transaction.cell_flag_transaction.is_some() {
         MAX_INLINE_CELL_FLAG_TRANSACTION_BYTES.min(MAX_INLINE_TRANSACTION_BYTES)
     } else {
@@ -440,7 +446,8 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
-    let inline_transaction = should_inline_transaction(&pb_transaction);
+    let inline_transaction =
+        should_inline_transaction(&pb_transaction, write_config.disable_transaction_file());
 
     let transaction_file = if !write_config.disable_transaction_file() {
         write_transaction_file(object_store, base_path, &pb_transaction).await?
@@ -1145,7 +1152,8 @@ pub(crate) async fn do_commit_detached_transaction(
 
     transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
-    let inline_transaction = should_inline_transaction(&pb_transaction);
+    let inline_transaction =
+        should_inline_transaction(&pb_transaction, write_config.disable_transaction_file());
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -1542,7 +1550,8 @@ pub(crate) async fn commit_transaction(
         // transaction.
         transaction.validate_internal_extensions()?;
         let pb_transaction = pb::Transaction::from(&transaction);
-        let inline_transaction = should_inline_transaction(&pb_transaction);
+        let inline_transaction =
+            should_inline_transaction(&pb_transaction, write_config.disable_transaction_file());
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
@@ -1807,6 +1816,7 @@ mod tests {
     use super::*;
 
     use crate::Dataset;
+    use crate::dataset::transaction::{CellFlagRegistration, CellFlagTransaction};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -2721,6 +2731,71 @@ mod tests {
         assert_eq!(manifest.version, 2);
         assert!(manifest.transaction_file.is_none());
         assert!(manifest.transaction_section.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_large_cell_flag_transaction_is_inline_when_transaction_file_is_disabled() {
+        use crate::utils::test::AmbiguousCommitHandler;
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader =
+            RecordBatchIterator::new(vec![Ok(simple_batch(&schema, vec![1, 2, 3]))], schema);
+        let dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+        let field_id = dataset.schema().field("x").unwrap().id;
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::Project {
+                schema: dataset.schema().clone(),
+                preserves_nullability: true,
+            },
+            None,
+        )
+        .with_cell_flag_transaction_for_dataset(
+            CellFlagTransaction {
+                registrations: vec![CellFlagRegistration {
+                    flag_id: dataset.manifest.next_cell_flag_id,
+                    field_id,
+                    name: "x".repeat(70 * 1024),
+                    initial_value: false,
+                }],
+                ..Default::default()
+            },
+            &dataset,
+        );
+        let write_config = ManifestWriteConfig::default().with_transaction_file_disabled();
+
+        let (manifest, _) = commit_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            handler.as_ref(),
+            &transaction,
+            &write_config,
+            &CommitConfig::default(),
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            manifest
+                .transaction_file
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(manifest.transaction_section.is_some());
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert!(reopened.manifest.transaction_file.is_none());
+        assert!(reopened.read_transaction().await.unwrap().is_some());
     }
 
     /// A commit that errors without landing keeps today's behavior:

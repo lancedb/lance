@@ -299,6 +299,7 @@ struct CleanupCellFlagRootKey {
     flag_id: u32,
     full_path: Path,
     size_bytes: u64,
+    memory_size_bytes: u64,
     inline_hash: Option<[u8; 32]>,
 }
 
@@ -375,6 +376,7 @@ impl CleanupIoContext {
             flag_id,
             full_path: full_path.clone(),
             size_bytes: file.size_bytes,
+            memory_size_bytes: file.memory_size_bytes,
             inline_hash: file
                 .inline_bytes
                 .as_deref()
@@ -2153,6 +2155,22 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first, &cached));
+
+        let mut mismatched_descriptor = state.root.clone();
+        mismatched_descriptor.memory_size_bytes += 1;
+        let error = context
+            .load_cell_flag_root(
+                &dataset.object_store,
+                &full_root_path,
+                &mismatched_descriptor,
+                state.flag_id,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("declares memory size"),
+            "{error}"
+        );
 
         let task = CleanupTask::new(
             &dataset,

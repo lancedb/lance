@@ -55,7 +55,8 @@ message Transaction {
     message RowChange {
       uint32 flag_id = 1;
       bool value = 2;
-      // Portable serialized RoaringTreemap of physical row addresses.
+      // Lance LCFR envelope of physical row addresses. The format is defined
+      // by the Cell Flags specification.
       bytes row_addresses = 3;
     }
 

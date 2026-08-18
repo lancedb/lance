@@ -263,8 +263,9 @@ message CellFlagFile {
   // remains authoritative for reachability, clone, and cleanup; readers may
   // use this copy to avoid a separate metadata request.
   optional bytes inline_bytes = 4;
-  // Upper bound retained for the decoded object. For bitmap objects this may
-  // exceed size_bytes when the adaptive encoding uses a dense bitset.
+  // Platform-independent conservative upper bound on memory retained while
+  // decoding and materializing the object. For bitmap objects this may exceed
+  // size_bytes when the adaptive encoding uses a dense bitset.
   uint64 memory_size_bytes = 5;
 }
 

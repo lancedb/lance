@@ -22,12 +22,22 @@ const CELL_FLAG_BITMAP_BITSET: u8 = 1;
 const CELL_FLAG_BITMAP_ZSTD_ROARING: u8 = 2;
 const CELL_FLAG_BITMAP_ZSTD_BITSET: u8 = 3;
 const CELL_FLAG_BITMAP_STRIDE: u8 = 4;
-const MAX_CELL_FLAG_BITMAP_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+// Mutation materialization has a 32 MiB input limit and reserves 1 MiB for
+// Roaring container overhead. Keep persisted states below that boundary so a
+// one-row change can always be represented instead of creating immutable state.
+const MAX_CELL_FLAG_BITMAP_MEMORY_BYTES: usize = 30 * 1024 * 1024;
 const CELL_FLAG_ROOT_MAGIC: &[u8; 4] = b"LCG1";
 const CELL_FLAG_ROOT_HEADER_BYTES: usize = 13;
 const CELL_FLAG_ROOT_RAW: u8 = 0;
 const CELL_FLAG_ROOT_ZSTD: u8 = 1;
-const MAX_CELL_FLAG_ROOT_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CELL_FLAG_ROOT_PROTO_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CELL_FLAG_ROOT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+// This format-level estimate is deliberately platform-independent. It covers
+// the protobuf fragment vector at up to twice its final length while decoding,
+// the typed fragment vector allocated during conversion, and fixed oneof/file
+// storage on 64-bit targets with headroom for allocator bookkeeping.
+const CELL_FLAG_ROOT_FRAGMENT_MEMORY_BYTES: usize = 512;
+const CELL_FLAG_ROOT_FIXED_MEMORY_BYTES: usize = 256;
 
 fn bitset_memory_size(bytes: usize) -> usize {
     // An array-backed Roaring container can use two bytes per set bit. A
@@ -119,15 +129,57 @@ pub fn encode_cell_flag_query_bitmap(bitmap: &RoaringBitmap) -> Vec<u8> {
     encoded
 }
 
-/// Encode a complete root, compressing repeated fragment metadata as one unit.
-pub fn encode_cell_flag_root(root: &pb::CellFlagRoot) -> Result<(Vec<u8>, usize)> {
-    use prost::Message;
-
-    let memory_size = root.encoded_len();
+fn cell_flag_root_memory_size(
+    root: &pb::CellFlagRoot,
+    encoded_size: usize,
+    decoded_size: usize,
+) -> Result<usize> {
+    let dynamic_bytes = root.fragments.iter().try_fold(0usize, |total, fragment| {
+        let bytes = match fragment.state.as_ref() {
+            Some(pb::cell_flag_fragment::State::Partial(file)) => file
+                .path
+                .len()
+                .checked_add(file.inline_bytes.as_ref().map_or(0, Vec::len)),
+            Some(pb::cell_flag_fragment::State::InlinePartial(bytes)) => Some(bytes.len()),
+            Some(pb::cell_flag_fragment::State::AllSet(_)) | None => Some(0),
+        }
+        .ok_or_else(|| Error::invalid_input("Cell flag root dynamic size overflow"))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::invalid_input("Cell flag root dynamic size overflow"))
+    })?;
+    let fragment_bytes = root
+        .fragments
+        .len()
+        .checked_mul(CELL_FLAG_ROOT_FRAGMENT_MEMORY_BYTES)
+        .ok_or_else(|| Error::invalid_input("Cell flag root fragment memory size overflow"))?;
+    let dynamic_bytes = dynamic_bytes
+        .checked_mul(2)
+        .ok_or_else(|| Error::invalid_input("Cell flag root dynamic memory size overflow"))?;
+    let memory_size = encoded_size
+        .checked_add(decoded_size)
+        .and_then(|bytes| bytes.checked_add(fragment_bytes))
+        .and_then(|bytes| bytes.checked_add(dynamic_bytes))
+        .and_then(|bytes| bytes.checked_add(CELL_FLAG_ROOT_FIXED_MEMORY_BYTES))
+        .ok_or_else(|| Error::invalid_input("Cell flag root memory size overflow"))?;
     if memory_size > MAX_CELL_FLAG_ROOT_MEMORY_BYTES {
         return Err(Error::invalid_input(format!(
             "Cell flag root memory size {} exceeds the {} byte limit",
             memory_size, MAX_CELL_FLAG_ROOT_MEMORY_BYTES
+        )));
+    }
+    Ok(memory_size)
+}
+
+/// Encode a complete root, compressing repeated fragment metadata as one unit.
+pub fn encode_cell_flag_root(root: &pb::CellFlagRoot) -> Result<(Vec<u8>, usize)> {
+    use prost::Message;
+
+    let decoded_size = root.encoded_len();
+    if decoded_size > MAX_CELL_FLAG_ROOT_PROTO_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Cell flag root protobuf size {} exceeds the {} byte limit",
+            decoded_size, MAX_CELL_FLAG_ROOT_PROTO_BYTES
         )));
     }
     let raw = root.encode_to_vec();
@@ -141,8 +193,9 @@ pub fn encode_cell_flag_root(root: &pb::CellFlagRoot) -> Result<(Vec<u8>, usize)
     let mut encoded = Vec::with_capacity(CELL_FLAG_ROOT_HEADER_BYTES + payload.len());
     encoded.extend_from_slice(CELL_FLAG_ROOT_MAGIC);
     encoded.push(encoding);
-    encoded.extend_from_slice(&(memory_size as u64).to_le_bytes());
+    encoded.extend_from_slice(&(decoded_size as u64).to_le_bytes());
     encoded.extend_from_slice(&payload);
+    let memory_size = cell_flag_root_memory_size(root, encoded.len(), decoded_size)?;
     Ok((encoded, memory_size))
 }
 
@@ -157,32 +210,32 @@ pub fn decode_cell_flag_root(bytes: &[u8]) -> Result<(pb::CellFlagRoot, usize)> 
             "Cell flag root has an invalid encoding header",
         ));
     }
-    let memory_size = u64::from_le_bytes(
+    let decoded_size = u64::from_le_bytes(
         bytes[5..CELL_FLAG_ROOT_HEADER_BYTES]
             .try_into()
             .expect("root header length checked"),
     );
-    let memory_size = usize::try_from(memory_size)
-        .map_err(|_| Error::invalid_input("Cell flag root memory size exceeds this platform"))?;
-    if memory_size > MAX_CELL_FLAG_ROOT_MEMORY_BYTES {
+    let decoded_size = usize::try_from(decoded_size)
+        .map_err(|_| Error::invalid_input("Cell flag root protobuf size exceeds this platform"))?;
+    if decoded_size > MAX_CELL_FLAG_ROOT_PROTO_BYTES {
         return Err(Error::invalid_input(format!(
-            "Cell flag root memory size {} exceeds the {} byte limit",
-            memory_size, MAX_CELL_FLAG_ROOT_MEMORY_BYTES
+            "Cell flag root protobuf size {} exceeds the {} byte limit",
+            decoded_size, MAX_CELL_FLAG_ROOT_PROTO_BYTES
         )));
     }
     let payload = &bytes[CELL_FLAG_ROOT_HEADER_BYTES..];
     let decoded = match bytes[4] {
         CELL_FLAG_ROOT_RAW => {
-            if payload.len() != memory_size {
+            if payload.len() != decoded_size {
                 return Err(Error::invalid_input(format!(
                     "Cell flag root has size {}, expected {}",
                     payload.len(),
-                    memory_size
+                    decoded_size
                 )));
             }
             payload.to_vec()
         }
-        CELL_FLAG_ROOT_ZSTD => zstd::bulk::decompress(payload, memory_size).map_err(|error| {
+        CELL_FLAG_ROOT_ZSTD => zstd::bulk::decompress(payload, decoded_size).map_err(|error| {
             Error::invalid_input(format!("Invalid compressed Cell flag root: {error}"))
         })?,
         encoding => {
@@ -192,8 +245,16 @@ pub fn decode_cell_flag_root(bytes: &[u8]) -> Result<(pb::CellFlagRoot, usize)> 
             )));
         }
     };
+    if decoded.len() != decoded_size {
+        return Err(Error::invalid_input(format!(
+            "Cell flag root decoded to {} bytes, expected {}",
+            decoded.len(),
+            decoded_size
+        )));
+    }
     let root = pb::CellFlagRoot::decode(decoded.as_slice())
         .map_err(|error| Error::invalid_input(format!("Invalid Cell flag root: {error}")))?;
+    let memory_size = cell_flag_root_memory_size(&root, bytes.len(), decoded_size)?;
     Ok((root, memory_size))
 }
 
@@ -354,9 +415,9 @@ fn decode_stride_bitmap(payload: &[u8], memory_size: usize) -> Result<RoaringBit
         RoaringBitmap::from_sorted_iter((0..count).map(|index| start + step.saturating_mul(index)))
             .map_err(|error| Error::invalid_input(format!("Invalid Cell flag stride: {error}")))?
     };
-    if bitmap.serialized_size() != memory_size {
+    if bitmap.serialized_size() > memory_size {
         return Err(Error::invalid_input(format!(
-            "Cell flag stride bitmap declares memory size {}, expected {}",
+            "Cell flag stride bitmap declares memory size {}, decoded representation requires {}",
             memory_size,
             bitmap.serialized_size()
         )));
@@ -866,6 +927,44 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_memory_limit_preserves_row_change_headroom() {
+        let mut bytes = Vec::with_capacity(CELL_FLAG_BITMAP_HEADER_BYTES);
+        bytes.extend_from_slice(CELL_FLAG_BITMAP_MAGIC);
+        bytes.push(CELL_FLAG_BITMAP_ROARING);
+        bytes.extend_from_slice(&(MAX_CELL_FLAG_BITMAP_MEMORY_BYTES as u64).to_le_bytes());
+        assert_eq!(
+            cell_flag_bitmap_memory_size(&bytes).unwrap(),
+            MAX_CELL_FLAG_BITMAP_MEMORY_BYTES
+        );
+
+        bytes[5..CELL_FLAG_BITMAP_HEADER_BYTES]
+            .copy_from_slice(&((MAX_CELL_FLAG_BITMAP_MEMORY_BYTES + 1) as u64).to_le_bytes());
+        assert!(cell_flag_bitmap_memory_size(&bytes).is_err());
+
+        let one_row = RoaringBitmap::from_iter([0]);
+        let empty = RoaringBitmap::new();
+        assert!(
+            MAX_CELL_FLAG_BITMAP_MEMORY_BYTES
+                + one_row.serialized_size()
+                + empty.serialized_size()
+                + 1024 * 1024
+                <= 32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn stride_bitmap_accepts_a_noncanonical_retained_memory_upper_bound() {
+        let bitmap = RoaringBitmap::from_iter(0..100);
+        let bytes = encode_cell_flag_bitmap(&bitmap);
+        assert_eq!(bytes[4], CELL_FLAG_BITMAP_STRIDE);
+
+        let declared_memory = cell_flag_bitmap_memory_size(&bytes).unwrap();
+        let decoded = decode_cell_flag_bitmap(&bytes).unwrap();
+        assert_eq!(decoded, bitmap);
+        assert!(decoded.serialized_size() < declared_memory);
+    }
+
+    #[test]
     fn query_bitmap_keeps_fast_roaring_decode_and_root_compresses_repetition() {
         let periodic = RoaringBitmap::from_iter((0..100_000).step_by(10));
         let query_bytes = encode_cell_flag_query_bitmap(&periodic);
@@ -890,9 +989,32 @@ mod tests {
         };
         let raw_size = prost::Message::encoded_len(&root);
         let (encoded, memory_size) = encode_cell_flag_root(&root).unwrap();
-        assert_eq!(memory_size, raw_size);
+        assert!(memory_size >= raw_size);
         assert!(encoded.len() * 4 < raw_size);
-        assert_eq!(decode_cell_flag_root(&encoded).unwrap(), (root, raw_size));
+        assert_eq!(
+            decode_cell_flag_root(&encoded).unwrap(),
+            (root, memory_size)
+        );
+    }
+
+    #[test]
+    fn root_memory_size_bounds_large_fragment_conversion() {
+        let root = pb::CellFlagRoot {
+            fragments: (0..100_000)
+                .map(|fragment_id| pb::CellFlagFragment {
+                    fragment_id,
+                    physical_rows: 1,
+                    state: Some(pb::cell_flag_fragment::State::AllSet(true)),
+                })
+                .collect(),
+        };
+
+        let (encoded, memory_size) = encode_cell_flag_root(&root).unwrap();
+        let (decoded, decoded_memory_size) = decode_cell_flag_root(&encoded).unwrap();
+        let retained_size = CellFlagRoot::try_from(decoded).unwrap().deep_size_of();
+
+        assert_eq!(decoded_memory_size, memory_size);
+        assert!(retained_size <= memory_size);
     }
 
     #[test]

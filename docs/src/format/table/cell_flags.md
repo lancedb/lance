@@ -45,6 +45,14 @@ message CellFlagState {
   CellFlagFile root = 2;
 }
 
+message CellFlagFile {
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional uint32 base_id = 3;
+  optional bytes inline_bytes = 4;
+  uint64 memory_size_bytes = 5;
+}
+
 message CellFlagRoot {
   repeated CellFlagFragment fragments = 1;
 }
@@ -61,7 +69,39 @@ message CellFlagFragment {
 }
 ```
 
-A missing fragment entry is `Empty`; `all_set=true` is `Full`; and either partial representation is a portable serialized 32-bit Roaring bitmap of physical row offsets. Partial bitmaps must be non-empty, non-full, and within `physical_rows`. Small sparse bitmaps may be embedded in a root. Small roots may also be copied into their manifest descriptor, while the referenced immutable root remains part of clone and cleanup reachability.
+A missing fragment entry is `Empty`; `all_set=true` is `Full`; and either partial representation is an `LCF1` adaptive bitmap of physical row offsets. Partial bitmaps must be non-empty, non-full, and within `physical_rows`. Small bitmaps may be embedded in a root. Small roots may also be copied into their manifest descriptor, while the referenced immutable root remains part of clone and cleanup reachability.
+
+All integers in the following binary envelopes are little-endian.
+
+### LCF1 bitmap envelope
+
+An `LCF1` object starts with the four ASCII bytes `LCF1`, a one-byte encoding discriminator, an eight-byte retained-memory upper bound, and the encoding payload. The retained-memory bound must not exceed 30 MiB. An external bitmap's `CellFlagFile.memory_size_bytes` must equal the envelope value.
+
+The encoding discriminators and payloads are:
+
+- `0`: a portable serialized 32-bit Roaring bitmap. The retained-memory value is the payload length.
+- `1`: an LSB0 dense bitset. Bit `i % 8` of byte `i / 8` represents offset `i`. For a payload of `n` bytes, the retained-memory value is `16 * n + 32 * ceil(n / 8192)`.
+- `2`: an eight-byte decoded length followed by a Zstandard-compressed portable Roaring bitmap. The decoded length equals the retained-memory value.
+- `3`: an eight-byte decoded bitset length followed by a Zstandard-compressed LSB0 bitset. The retained-memory value uses the dense-bitset formula above with the decoded length.
+- `4`: three `uint32` values `(start, step, count)`. It represents `start + i * step` for `0 <= i < count`. `step` and `count` are non-zero and the final value must fit in `uint32`. The retained-memory value is an upper bound for the reconstructed Roaring bitmap; representation normalization may make the decoded bitmap smaller than the declaration.
+
+Writers choose the smallest available payload. Query-bound inline bitmaps use only discriminator `0` or `2` so planning retains the direct Roaring decode path.
+
+### LCG1 root envelope
+
+An immutable root object starts with the four ASCII bytes `LCG1`, a one-byte encoding discriminator, an eight-byte decoded protobuf length, and the payload. Discriminator `0` stores the `CellFlagRoot` protobuf bytes directly and requires the payload length to equal the decoded length. Discriminator `1` stores a single Zstandard-compressed frame whose output length must equal the decoded length. The decoded protobuf length must not exceed 32 MiB.
+
+`CellFlagFile.memory_size_bytes` is not the protobuf length. It is the following platform-independent upper bound on the encoded input, protobuf decode, and protobuf-to-materialized-root conversion peak:
+
+```text
+encoded LCG1 length
++ decoded protobuf length
++ 512 * fragment count
++ 2 * dynamic byte length
++ 256
+```
+
+Dynamic byte length is the sum of every partial file path, partial file inline copy, and inline partial bitmap in the root. The bound must not exceed 64 MiB. Readers recompute it from the decoded root and require exact equality with the manifest descriptor.
 
 Unchanged snapshots reuse roots and bitmap objects. A sparse flag change rewrites only the affected fragment pages and that flag's root. Queries that do not reference Cell Flags do not load these objects.
 
@@ -81,6 +121,14 @@ Append, update, merge, and merge-insert operations may carry explicit flag chang
 - No value, NULL, omission, overlay coverage, or data-file rewrite infers state.
 
 The transaction protobuf carries one typed `cell_flag_transaction` sidecar. It records the dataset incarnation, registry changes, existing-row address changes, exact state for newly written fragments, field-ID transfers used by schema casts, the operation's complete existing-row rewrite or deletion set when rebasing needs it, and a fixed-size commitment to the public operation fields. The sidecar is internal replay and conflict-detection material, is hidden by language bindings, and does not introduce arbitrary per-row keys or policy callbacks. The source-compatible native Rust carrier uses a reserved in-memory property entry; protobuf and language-binding conversion extracts it into the typed sidecar and excludes it from application transaction properties. Callers that replace application properties or regenerate a UUID on a returned native transaction must use the carrier-preserving `Transaction` methods rather than reconstructing opaque internal entries.
+
+New-fragment partial states use the `LCF1` envelope. Existing-row changes use the `LCFR` envelope. `LCFR` starts with the four ASCII bytes `LCFR`, followed by a one-byte discriminator and its payload:
+
+- `0`: a portable serialized 64-bit Roaring treemap. The high 32 bits of each address are the fragment ID and the low 32 bits are the physical row offset.
+- `1`: a `uint32` fragment count followed by that many entries. Each entry is a strictly increasing `uint32` fragment ID, a `uint32` byte length, and one `LCF1` bitmap of local row offsets. No trailing bytes are permitted.
+- `2`: an eight-byte decoded length followed by one Zstandard-compressed discriminator-`1` payload. The decoded payload must not exceed 64 MiB.
+
+Writers compare the portable treemap and fragmented representation, choose the smaller one, and apply discriminator `2` only when Zstandard further reduces the fragmented payload.
 
 Concurrent registry edits conflict. Row changes use the existing mutation conflict machinery and the operation's read snapshot. Atomicity does not establish application-level freshness; systems that need freshness must validate their own source revision or read set.
 

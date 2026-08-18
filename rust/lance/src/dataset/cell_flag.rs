@@ -657,6 +657,7 @@ impl Dataset {
             source_uri: source_uri.to_string(),
             path: descriptor.root.path.clone(),
             size_bytes: descriptor.root.size_bytes,
+            memory_size_bytes: descriptor.root.memory_size_bytes,
             inline_hash: descriptor
                 .root
                 .inline_bytes
@@ -775,6 +776,7 @@ impl Dataset {
                     source_uri: source_uri.to_string(),
                     path: file.path.clone(),
                     size_bytes: file.size_bytes,
+                    memory_size_bytes: file.memory_size_bytes,
                     flag_id,
                     fragment_id: fragment.fragment_id,
                     physical_rows: fragment.physical_rows,
@@ -793,6 +795,7 @@ impl Dataset {
                     source_uri: self.uri.clone(),
                     path: "inline".to_string(),
                     size_bytes: bytes.len() as u64,
+                    memory_size_bytes: cell_flag_bitmap_memory_size(bytes)? as u64,
                     flag_id,
                     fragment_id: fragment.fragment_id,
                     physical_rows: fragment.physical_rows,
@@ -1102,6 +1105,107 @@ impl Dataset {
             &HashMap::new(),
         )
         .await
+    }
+
+    /// Remap flag membership for an order-preserving compaction without
+    /// materializing one source address per output row for every flag.
+    pub(crate) async fn cell_flag_states_for_compacted_rows(
+        &self,
+        new_fragments: &[lance_table::format::Fragment],
+        source_row_addresses: &RoaringTreemap,
+    ) -> Result<Vec<TransactionCellFlagFragmentState>> {
+        let output_rows = new_fragments.iter().try_fold(0_u64, |total, fragment| {
+            total
+                .checked_add(fragment_physical_rows(fragment)?)
+                .ok_or_else(|| Error::invalid_input("Compacted row count overflow"))
+        })?;
+        if output_rows != source_row_addresses.len() {
+            return Err(Error::internal(format!(
+                "Compacted fragments contain {} rows but {} source row addresses were captured",
+                output_rows,
+                source_row_addresses.len()
+            )));
+        }
+
+        let source_offsets_by_fragment = source_row_addresses.bitmaps().collect::<HashMap<_, _>>();
+        let source_fragments = source_offsets_by_fragment
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut output_ends = Vec::with_capacity(new_fragments.len());
+        let mut output_end = 0_u64;
+        for fragment in new_fragments {
+            output_end = output_end
+                .checked_add(fragment_physical_rows(fragment)?)
+                .ok_or_else(|| Error::invalid_input("Compacted row count overflow"))?;
+            output_ends.push(output_end);
+        }
+        let mut states = Vec::new();
+
+        for definition in &self.manifest.cell_flag_definitions {
+            let flag_id = definition.flag_id;
+            let Some(root) = self.load_cell_flag_root_shared(flag_id).await? else {
+                continue;
+            };
+            let source_states = select_cell_flag_fragments(&root, Some(&source_fragments));
+            if source_states.is_empty() {
+                continue;
+            }
+
+            let mut output_bitmaps = (0..new_fragments.len())
+                .map(|_| RoaringBitmap::new())
+                .collect::<Vec<_>>();
+            for source_state in source_states {
+                let fragment_id = u32::try_from(source_state.fragment_id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Cell flag fragment ID {} does not fit in a row address",
+                        source_state.fragment_id
+                    ))
+                })?;
+                match &source_state.state {
+                    CellFlagFragmentState::All => {
+                        if let Some(source_offsets) = source_offsets_by_fragment.get(&fragment_id) {
+                            remap_compacted_cell_flag_offsets(
+                                source_row_addresses,
+                                fragment_id,
+                                source_offsets,
+                                &output_ends,
+                                &mut output_bitmaps,
+                            )?;
+                        }
+                    }
+                    CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
+                        let source_offsets = self
+                            .load_cell_flag_bitmap_shared(flag_id, &source_state)
+                            .await?;
+                        remap_compacted_cell_flag_offsets(
+                            source_row_addresses,
+                            fragment_id,
+                            source_offsets.as_ref(),
+                            &output_ends,
+                            &mut output_bitmaps,
+                        )?;
+                    }
+                }
+            }
+
+            for (fragment, bitmap) in new_fragments.iter().zip(output_bitmaps) {
+                let physical_rows = fragment_physical_rows(fragment)?;
+                let state = if bitmap.is_empty() {
+                    CellFlagFragmentValue::None
+                } else if bitmap.len() == physical_rows {
+                    CellFlagFragmentValue::All
+                } else {
+                    CellFlagFragmentValue::Partial(bitmap)
+                };
+                states.push(TransactionCellFlagFragmentState {
+                    fragment_path: fragment_path(fragment)?.to_string(),
+                    flag_id,
+                    state,
+                });
+            }
+        }
+        Ok(states)
     }
 
     /// Build exact states for output rows that mix rewritten target rows and
@@ -1753,6 +1857,35 @@ fn fragment_physical_rows(fragment: &lance_table::format::Fragment) -> Result<u6
                 fragment.id
             ))
         })
+}
+
+fn remap_compacted_cell_flag_offsets(
+    source_row_addresses: &RoaringTreemap,
+    source_fragment_id: u32,
+    source_offsets: &RoaringBitmap,
+    output_ends: &[u64],
+    output_bitmaps: &mut [RoaringBitmap],
+) -> Result<()> {
+    let first_address = u64::from(RowAddress::first_row(source_fragment_id));
+    for source_offset in source_offsets.iter() {
+        let source_address = first_address + u64::from(source_offset);
+        if !source_row_addresses.contains(source_address) {
+            continue;
+        }
+        let output_position = source_row_addresses.rank(source_address) - 1;
+        let output_fragment = output_ends.partition_point(|end| *end <= output_position);
+        let output_start = output_fragment
+            .checked_sub(1)
+            .map_or(0, |previous| output_ends[previous]);
+        let output_bitmap = output_bitmaps.get_mut(output_fragment).ok_or_else(|| {
+            Error::internal("Compacted Cell Flag row maps outside the output fragments")
+        })?;
+        output_bitmap.insert(
+            u32::try_from(output_position - output_start)
+                .map_err(|_| Error::internal("Compacted Cell Flag offset exceeds u32"))?,
+        );
+    }
+    Ok(())
 }
 
 async fn materialize_fragment_bitmap(
@@ -3469,6 +3602,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_compaction_remaps_multiple_flags_across_output_fragments() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 4).await?;
+        let computed = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let reviewed = dataset
+            .register_cell_flag("value", "lancedb.reviewed", false)
+            .await?;
+
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id IN (0, 3, 5, 7)")?
+            .set_cell_flag("value", FLAG_NAME, true)?
+            .build()?
+            .execute()
+            .await?;
+        let result = UpdateBuilder::new(result.new_dataset)
+            .update_where("id IN (1, 2, 6)")?
+            .set_cell_flag("value", "lancedb.reviewed", true)?
+            .build()?
+            .execute()
+            .await?;
+        let dataset = result.new_dataset.as_ref();
+        let source_fragments = dataset.manifest.fragments.as_ref();
+        assert_eq!(source_fragments.len(), 2);
+
+        // Rows 2 and 4 are absent from this compaction result. The remaining
+        // source addresses retain their original order across both fragments.
+        let source_row_addresses = [
+            (source_fragments[0].id, 0),
+            (source_fragments[0].id, 1),
+            (source_fragments[0].id, 3),
+            (source_fragments[1].id, 1),
+            (source_fragments[1].id, 2),
+            (source_fragments[1].id, 3),
+        ]
+        .into_iter()
+        .map(|(fragment_id, offset)| {
+            u64::from(RowAddress::new_from_parts(fragment_id as u32, offset))
+        })
+        .collect::<RoaringTreemap>();
+
+        let mut output_fragments = source_fragments.to_vec();
+        output_fragments[0].id = 100;
+        output_fragments[0].physical_rows = Some(2);
+        output_fragments[0].files[0].path = "compacted-0.lance".to_string();
+        output_fragments[1].id = 101;
+        output_fragments[1].physical_rows = Some(4);
+        output_fragments[1].files[0].path = "compacted-1.lance".to_string();
+
+        let states = dataset
+            .cell_flag_states_for_compacted_rows(&output_fragments, &source_row_addresses)
+            .await?;
+        let state = |flag_id, fragment_path: &str| {
+            &states
+                .iter()
+                .find(|state| state.flag_id == flag_id && state.fragment_path == fragment_path)
+                .unwrap()
+                .state
+        };
+
+        assert_eq!(
+            state(computed.flag_id, "compacted-0.lance"),
+            &CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([0]))
+        );
+        assert_eq!(
+            state(computed.flag_id, "compacted-1.lance"),
+            &CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([0, 1, 3]))
+        );
+        assert_eq!(
+            state(reviewed.flag_id, "compacted-0.lance"),
+            &CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([1]))
+        );
+        assert_eq!(
+            state(reviewed.flag_id, "compacted-1.lance"),
+            &CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([2]))
+        );
+        assert_eq!(states.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn disjoint_compaction_reuses_cell_flag_root() -> Result<()> {
         for enable_stable_row_ids in [false, true] {
             let directory = TempStrDir::default();
@@ -3663,6 +3878,7 @@ mod tests {
             source_uri: dataset.cell_flag_source_uri(&descriptor)?.to_string(),
             path: descriptor.path.clone(),
             size_bytes: descriptor.size_bytes,
+            memory_size_bytes: descriptor.memory_size_bytes,
             inline_hash: descriptor
                 .inline_bytes
                 .as_deref()

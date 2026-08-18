@@ -112,6 +112,7 @@ pub struct CellFlagRootKey {
     pub source_uri: String,
     pub path: String,
     pub size_bytes: u64,
+    pub memory_size_bytes: u64,
     pub inline_hash: Option<[u8; 32]>,
 }
 
@@ -120,8 +121,8 @@ impl CacheKey for CellFlagRootKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/root/{}/{}/{}",
-            self.source_uri, self.path, self.size_bytes
+            "cell_flag/root/{}/{}/{}/{}",
+            self.source_uri, self.path, self.size_bytes, self.memory_size_bytes
         ))
     }
 
@@ -130,13 +131,14 @@ impl CacheKey for CellFlagRootKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 2)
+        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(&self.source_uri);
         builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);
+        builder.write_u64(self.memory_size_bytes);
         if let Some(inline_hash) = self.inline_hash {
             builder.write_some();
             builder.write_fixed_bytes(&inline_hash);
@@ -152,6 +154,7 @@ pub struct CellFlagBitmapKey {
     pub source_uri: String,
     pub path: String,
     pub size_bytes: u64,
+    pub memory_size_bytes: u64,
     pub flag_id: u32,
     pub fragment_id: u64,
     pub physical_rows: u64,
@@ -163,8 +166,13 @@ impl CacheKey for CellFlagBitmapKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/bitmap/{}/{}/{}/{}/{}",
-            self.source_uri, self.path, self.flag_id, self.fragment_id, self.size_bytes
+            "cell_flag/bitmap/{}/{}/{}/{}/{}/{}",
+            self.source_uri,
+            self.path,
+            self.flag_id,
+            self.fragment_id,
+            self.size_bytes,
+            self.memory_size_bytes
         ))
     }
 
@@ -173,13 +181,14 @@ impl CacheKey for CellFlagBitmapKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-bitmap-key", 2)
+        CacheKeySchema::new("lance.dataset.cell-flag-bitmap-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(&self.source_uri);
         builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);
+        builder.write_u64(self.memory_size_bytes);
         builder.write_u32(self.flag_id);
         builder.write_u64(self.fragment_id);
         builder.write_u64(self.physical_rows);
@@ -381,6 +390,44 @@ mod tests {
     use lance_table::rowids::write_row_ids;
 
     use super::*;
+
+    #[tokio::test]
+    async fn cell_flag_cache_keys_separate_declared_memory_sizes() {
+        let cache = LanceCache::with_capacity(4096);
+        let root_key = |memory_size_bytes| CellFlagRootKey {
+            source_uri: "memory://dataset".to_string(),
+            path: "_cell_flags/roots/0/root.root".to_string(),
+            size_bytes: 128,
+            memory_size_bytes,
+            inline_hash: None,
+        };
+        cache
+            .insert_with_key(
+                &root_key(256),
+                Arc::new(CellFlagRoot {
+                    fragments: Vec::new(),
+                }),
+            )
+            .await;
+        assert_ne!(root_key(256).key(), root_key(512).key());
+        assert!(cache.get_with_key(&root_key(512)).await.is_none());
+
+        let bitmap_key = |memory_size_bytes| CellFlagBitmapKey {
+            source_uri: "memory://dataset".to_string(),
+            path: "_cell_flags/bitmaps/0/0/bitmap.rbm".to_string(),
+            size_bytes: 64,
+            memory_size_bytes,
+            flag_id: 0,
+            fragment_id: 0,
+            physical_rows: 10,
+            inline_hash: None,
+        };
+        cache
+            .insert_with_key(&bitmap_key(128), Arc::new(RoaringBitmap::from_iter([1, 3])))
+            .await;
+        assert_ne!(bitmap_key(128).key(), bitmap_key(256).key());
+        assert!(cache.get_with_key(&bitmap_key(256)).await.is_none());
+    }
 
     #[tokio::test]
     async fn deletion_file_key_separates_storage_bases() {
