@@ -365,7 +365,7 @@ fn sum_4bit_hacc_dist_table_avx2(
                     );
                 }
             } else {
-                let mut chunk_dists = [0u32; BATCH_SIZE];
+                let mut chunk_dists = [MaybeUninit::<u32>::uninit(); BATCH_SIZE];
                 unsafe {
                     sum_hacc_dist_table_32bytes_batch_avx2(
                         &batch_codes[code_range],
@@ -373,6 +373,10 @@ fn sum_4bit_hacc_dist_table_avx2(
                         &mut chunk_dists,
                     );
                 }
+                // The kernel above initializes every temporary output slot.
+                let chunk_dists = unsafe {
+                    std::slice::from_raw_parts(chunk_dists.as_ptr().cast::<u32>(), BATCH_SIZE)
+                };
                 // The first code chunk initialized every output slot.
                 let batch_dists = unsafe {
                     std::slice::from_raw_parts_mut(
