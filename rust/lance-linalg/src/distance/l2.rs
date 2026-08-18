@@ -72,7 +72,6 @@ pub trait L2: Num {
 
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
-    assert_equal_lengths(from.len(), to.len());
     T::l2(from, to)
 }
 
@@ -85,15 +84,7 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// index an explicit f32 API.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
-    assert_equal_lengths(x.len(), y.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-            // SAFETY: guarded by the runtime AVX-512 detection above.
-            return unsafe { l2_f32_avx512(x, y) };
-        }
-    }
-    l2(x, y)
+    f32::l2(x, y)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -346,7 +337,11 @@ impl L2 for f32 {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `L2::l2` validation for every vector.
+            y.chunks_exact(dimension)
+                .map(move |v| l2_f32_dispatched(x, v))
         }
     }
 }
@@ -939,7 +934,6 @@ impl L2Prepared {
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
-    assert_equal_lengths(from.len(), to.len());
     l2(from, to)
 }
 
@@ -959,8 +953,6 @@ pub fn l2_distance_batch<'a, T: L2>(
     to: &'a [T],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    assert_batch_layout(from.len(), to.len(), dimension);
-
     T::l2_batch(from, to, dimension)
 }
 

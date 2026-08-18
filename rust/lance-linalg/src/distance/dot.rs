@@ -74,7 +74,6 @@ fn dot_scalar<
 /// Dot product.
 #[inline]
 pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
-    assert_equal_lengths(from.len(), to.len());
     T::dot(from, to)
 }
 
@@ -83,16 +82,7 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// needed on top of the generic [`dot`].
 #[inline]
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
-    assert_equal_lengths(x.len(), y.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        use lance_core::utils::cpu::SimdSupport;
-        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-            // SAFETY: guarded by the runtime AVX-512 detection above.
-            return unsafe { dot_f32_avx512(x, y) };
-        }
-    }
-    dot(x, y)
+    f32::dot(x, y)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -120,7 +110,6 @@ unsafe fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
 /// Negative [Dot] distance.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
-    assert_equal_lengths(from.len(), to.len());
     1.0 - T::dot(from, to)
 }
 
@@ -326,7 +315,12 @@ impl Dot for f32 {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            batch.chunks_exact(dimension).map(move |y| Self::dot(x, y))
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `Dot::dot` validation for every vector.
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| dot_f32_dispatched(x, y))
         }
     }
 }
@@ -789,7 +783,6 @@ pub fn dot_distance_batch<'a, T: Dot>(
     to: &'a [T],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    assert_batch_layout(from.len(), to.len(), dimension);
     Box::new(T::dot_batch(from, to, dimension).map(|d| 1.0 - d))
 }
 
