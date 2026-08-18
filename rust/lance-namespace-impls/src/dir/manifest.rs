@@ -810,6 +810,7 @@ struct TombstoneTableMutation {
     next_drop_epoch: Option<String>,
 }
 
+#[derive(Clone)]
 enum TombstoneTableResult {
     Owned(String),
     Existing(String),
@@ -4975,11 +4976,12 @@ impl LanceNamespace for ManifestNamespace {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DeleteObjectMutation,
-        LANCE_DATA_DIR, LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder,
-        ManifestEntry, ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow,
-        ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
-        ObjectType,
+        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DROP_EPOCH_OBJECT_ID,
+        DROP_TOMBSTONE_ID_PROPERTY, DeleteObjectMutation, DropTombstoneInfo, LANCE_DATA_DIR,
+        LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder, ManifestEntry,
+        ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow, ManifestRowValue,
+        ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME, ObjectType,
+        TombstoneTableResult,
     };
     use crate::DirectoryNamespaceBuilder;
     use arrow::datatypes::DataType;
