@@ -131,6 +131,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -3135,6 +3136,76 @@ impl Dataset {
         Ok(())
     }
 
+    /// Assign stable row ID sequences to fragments that do not yet have them.
+    /// Assigns a contiguous `RowIdSequence` to every fragment starting from row
+    /// ID 0 and returns the resulting `next_row_id` high-water mark.
+    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment]) -> Result<u64> {
+        let mut next_row_id = 0u64;
+        for fragment in fragments.iter_mut() {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                Error::internal(format!(
+                    "Fragment {} is missing physical_rows; cannot assign stable row IDs",
+                    fragment.id
+                ))
+            })? as u64;
+            let end = next_row_id
+                .checked_add(physical_rows)
+                .ok_or_else(|| Error::internal("Row ID overflow during stable row ID migration"))?;
+            let sequence = RowIdSequence::from(next_row_id..end);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+            next_row_id = end;
+        }
+        Ok(next_row_id)
+    }
+
+    /// Migrate a table to use stable row IDs.
+    ///
+    /// Stable row IDs assign a persistent identifier to each row that remains
+    /// stable across compaction operations. This enables more efficient updates
+    /// to secondary indices.
+    ///
+    /// A single Merge commit assigns row ID sequences to all fragments and
+    /// activates the stable row ID feature flag atomically. Because `Merge`
+    /// conflicts with all data-modifying operations, a successful commit
+    /// guarantees no concurrent write occurred — no separate validation step
+    /// is needed.
+    ///
+    /// **No retries are attempted.** Callers should quiesce concurrent writes
+    /// before running this migration. If a conflicting write is detected, this
+    /// method returns an error and the caller must retry.
+    ///
+    /// This method is idempotent: if the table already uses stable row IDs,
+    /// it returns `Ok(())` immediately.
+    pub async fn migrate_to_stable_row_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_stable_row_ids() {
+            return Ok(());
+        }
+
+        let mut fragments = self.manifest.fragments.as_ref().clone();
+        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        let schema = self.manifest.schema.clone();
+        let read_version = self.manifest.version;
+
+        let transaction = Transaction::new(
+            read_version,
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_row_id_migration_activation(next_row_id)
+            .execute(transaction)
+            .await?;
+
+        *self = new_ds;
+        Ok(())
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -3938,6 +4009,10 @@ pub(crate) struct ManifestWriteConfig {
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
     disable_transaction_file: bool,            // default false
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    migration_next_row_id: Option<u64>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -3949,6 +4024,7 @@ impl Default for ManifestWriteConfig {
             disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
+            migration_next_row_id: None,
         }
     }
 }
