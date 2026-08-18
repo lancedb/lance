@@ -27,6 +27,7 @@ lance-datafusion = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
+metrics = { workspace = true, optional = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
@@ -161,8 +162,8 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
-# Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
+# Publish object-store and MemWAL metrics via the `metrics` crate facade.
+metrics = ["dep:metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []

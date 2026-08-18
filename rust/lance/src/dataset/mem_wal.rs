@@ -37,6 +37,7 @@ mod hnsw;
 pub mod index;
 mod manifest;
 pub mod memtable;
+pub mod metrics;
 pub mod scanner;
 pub mod sharding;
 #[cfg(test)]

@@ -3611,6 +3611,9 @@ impl WriteStats {
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
         self.wal_flush_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+        // Also observed individually: the cumulative total above yields an
+        // average, which cannot show the tail an embedder alerts on.
+        super::metrics::record_flush_duration(super::metrics::KIND_WAL, duration);
     }
 
     /// Record WAL I/O duration (sub-component of WAL flush).
@@ -3636,6 +3639,7 @@ impl WriteStats {
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
         self.memtable_flush_rows
             .fetch_add(rows as u64, Ordering::Relaxed);
+        super::metrics::record_flush_duration(super::metrics::KIND_MEMTABLE, duration);
     }
 
     /// Get a snapshot of current statistics.
