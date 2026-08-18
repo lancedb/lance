@@ -4673,6 +4673,17 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
+        let expected_location = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
+        if expected_location.is_some() && !self.async_drop_enabled {
+            return Err(NamespaceError::Unsupported {
+                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
+            }
+            .into());
+        }
+
         // Get table info before deleting
         let table_info = self.query_manifest_for_table(&object_id).await?;
 
@@ -4682,6 +4693,41 @@ impl LanceNamespace for ManifestNamespace {
                 (table_uri, info.location)
             }
             None => {
+                if let Some(expected_location) = expected_location {
+                    let existing_tombstone =
+                        self.list_drop_tombstones()
+                            .await?
+                            .into_iter()
+                            .find(|tombstone| {
+                                tombstone.object_id == object_id
+                                    && Self::construct_full_uri(&self.root, &tombstone.location)
+                                        .is_ok_and(|location| {
+                                            Self::table_locations_match(
+                                                expected_location,
+                                                &location,
+                                            )
+                                        })
+                            });
+                    if let Some(tombstone) = existing_tombstone {
+                        let table_uri = Self::construct_full_uri(&self.root, &tombstone.location)?;
+                        return Ok(DeregisterTableResponse {
+                            id: request.id.clone(),
+                            location: Some(table_uri),
+                            properties: Some(HashMap::from([(
+                                DROP_TOMBSTONE_ID_PROPERTY.to_string(),
+                                tombstone.tombstone_id,
+                            )])),
+                            ..Default::default()
+                        });
+                    }
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Table '{}' was concurrently deregistered without a drop intent",
+                            object_id
+                        ),
+                    }
+                    .into());
+                }
                 return Err(NamespaceError::TableNotFound {
                     message: object_id.to_string(),
                 }
@@ -4689,10 +4735,6 @@ impl LanceNamespace for ManifestNamespace {
             }
         };
 
-        let expected_location = request
-            .context
-            .as_ref()
-            .and_then(|context| context.get(EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY));
         if expected_location.is_some()
             && !Self::is_generated_dir_name(&object_id, &manifest_location)
         {
@@ -4715,13 +4757,6 @@ impl LanceNamespace for ManifestNamespace {
             }
             .into());
         }
-        if expected_location.is_some() && !self.async_drop_enabled {
-            return Err(NamespaceError::Unsupported {
-                message: "Expected-location fencing requires async_drop_enabled=true".to_string(),
-            }
-            .into());
-        }
-
         let tombstone_id = if expected_location.is_some() {
             self.ensure_manifest_writable().await?;
             let tombstone_result = self
@@ -5593,17 +5628,26 @@ mod tests {
             .unwrap();
         let full_location =
             ManifestNamespace::construct_full_uri(temp_dir.to_str().unwrap(), &location).unwrap();
-        manifest_ns
-            .deregister_table(DeregisterTableRequest {
-                id: Some(vec!["table".to_string()]),
-                context: Some(HashMap::from([(
-                    super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
-                    full_location,
-                )])),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let request = DeregisterTableRequest {
+            id: Some(vec!["table".to_string()]),
+            context: Some(HashMap::from([(
+                super::EXPECTED_DEREGISTER_LOCATION_CONTEXT_KEY.to_string(),
+                full_location,
+            )])),
+            ..Default::default()
+        };
+        let first_response = manifest_ns.deregister_table(request.clone()).await.unwrap();
+        let retry_response = manifest_ns.deregister_table(request).await.unwrap();
+        assert_eq!(
+            first_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get(DROP_TOMBSTONE_ID_PROPERTY)),
+            retry_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get(DROP_TOMBSTONE_ID_PROPERTY))
+        );
         manifest_ns
             .remove_deregistered_table_marker(&location)
             .await;

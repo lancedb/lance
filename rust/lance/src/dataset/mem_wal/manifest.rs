@@ -47,10 +47,11 @@ use uuid::Uuid;
 
 use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest_path};
 
-// Prefixing the protobuf with field tag zero makes the record undecodable by
-// older readers, which fail closed instead of mapping a new enum value to
-// Active. New readers strip the envelope and restore `Dropped` explicitly.
-const DROPPED_MANIFEST_PREFIX: &[u8] = b"\0LANCE_DROPPED\0";
+// Committed drops remain wire-compatible with older readers: they see the
+// known `Sealed` status and refuse claims. New readers recognize and remove
+// this reserved entry before exposing shard field values.
+const DROPPED_MANIFEST_FIELD_ID: &str = "__lance_internal_drop_committed_v1";
+const DROPPED_MANIFEST_MAGIC: &[u8] = b"LANCE_DROPPED_V1";
 
 /// Version hint file structure.
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,12 +125,18 @@ impl ShardManifestStore {
             .await
             .map_err(|e| Error::io(format!("Failed to read manifest bytes: {}", e)))?;
 
-        let (bytes, dropped) = match bytes.strip_prefix(DROPPED_MANIFEST_PREFIX) {
-            Some(bytes) => (bytes, true),
-            None => (bytes.as_ref(), false),
-        };
-        let pb_manifest = pb::ShardManifest::decode(bytes)
+        let mut pb_manifest = pb::ShardManifest::decode(bytes)
             .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
+        let dropped = pb_manifest.shard_field_entries.iter().any(|entry| {
+            entry.field_id == DROPPED_MANIFEST_FIELD_ID
+                && entry.value.as_slice() == DROPPED_MANIFEST_MAGIC
+        });
+        if dropped {
+            pb_manifest.shard_field_entries.retain(|entry| {
+                !(entry.field_id == DROPPED_MANIFEST_FIELD_ID
+                    && entry.value.as_slice() == DROPPED_MANIFEST_MAGIC)
+            });
+        }
 
         let mut manifest = ShardManifest::try_from(pb_manifest)?;
         if dropped {
@@ -188,20 +195,26 @@ impl ShardManifestStore {
     /// Returns `Error::AlreadyExists` if another writer already wrote this version.
     #[instrument(name = "manifest_write", level = "debug", skip_all, fields(shard_id = %self.shard_id, version = manifest.version, epoch = manifest.writer_epoch))]
     pub async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
+        if manifest
+            .shard_field_values
+            .contains_key(DROPPED_MANIFEST_FIELD_ID)
+        {
+            return Err(Error::invalid_input(format!(
+                "shard field id '{DROPPED_MANIFEST_FIELD_ID}' is reserved"
+            )));
+        }
         let version = manifest.version;
         let filename = manifest_filename(version);
         let path = self.manifest_dir.clone().join(filename.as_str());
 
-        let pb_manifest = pb::ShardManifest::from(manifest);
+        let mut pb_manifest = pb::ShardManifest::from(manifest);
+        if manifest.status == ShardStatus::Dropped {
+            pb_manifest.shard_field_entries.push(pb::ShardFieldEntry {
+                field_id: DROPPED_MANIFEST_FIELD_ID.to_string(),
+                value: DROPPED_MANIFEST_MAGIC.to_vec(),
+            });
+        }
         let bytes = pb_manifest.encode_to_vec();
-        let bytes = if manifest.status == ShardStatus::Dropped {
-            let mut enveloped = Vec::with_capacity(DROPPED_MANIFEST_PREFIX.len() + bytes.len());
-            enveloped.extend_from_slice(DROPPED_MANIFEST_PREFIX);
-            enveloped.extend_from_slice(&bytes);
-            enveloped
-        } else {
-            bytes
-        };
 
         self.object_store
             .put_if_absent(&path, Bytes::from(bytes).into())
@@ -812,9 +825,10 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        assert!(
-            pb::ShardManifest::decode(raw).is_err(),
-            "an older protobuf-only reader must fail closed on a dropped fence"
+        let old_reader = pb::ShardManifest::decode(raw).unwrap();
+        assert_eq!(
+            old_reader.status, 1,
+            "an older reader must observe the known sealed status"
         );
         let err = manifest_store.claim_epoch(0).await.unwrap_err();
         assert!(

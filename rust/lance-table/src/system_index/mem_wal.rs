@@ -170,10 +170,11 @@ impl ShardStatus {
         }
     }
 
-    /// Map from the protobuf enum discriminant; unknown values decode as
-    /// `Active` (forward-compatible default).
+    /// Map from the protobuf enum discriminant; unknown non-zero values fail
+    /// closed as lifecycle fences.
     fn from_i32(v: i32) -> Self {
         match v {
+            0 => Self::Active,
             1 => Self::Sealed,
             // Unknown non-zero values are lifecycle fences, never Active.
             _ => Self::Sealed,
