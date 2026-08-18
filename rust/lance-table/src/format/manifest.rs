@@ -707,6 +707,10 @@ pub struct ManifestBuildConfig {
     pub storage_format: Option<DataStorageFormat>,
     /// Skip writing a detached transaction file for this commit.
     pub disable_transaction_file: bool,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    pub migration_next_row_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
