@@ -197,7 +197,8 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
-    /// Object stores for additional base paths, shared across clones.
+    /// Object stores for additional base paths, normally shared across clones.
+    /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
 }
 
@@ -2052,6 +2053,10 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
+        // Each wrapper application defines a new store lifetime. Keep base
+        // stores alive within the derived dataset without sharing stateful
+        // provider layers (such as an AIMD throttle) with other scopes.
+        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.inner =
@@ -2423,35 +2428,37 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        // Cores are cached without wrappers; each resolution decorates the
-        // shared core with the caller's wrapper.
-        let mut core_params = self.store_params_for_base(Some(base_path));
-        let wrapper = core_params.object_store_wrapper.take();
+        let store_params = self.store_params_for_base(Some(base_path));
 
         let cell = {
             let mut stores = self.base_object_stores.lock().unwrap();
             stores.entry(base_id).or_default().clone()
         };
-        let core = cell
+        let store = cell
             .get_or_try_init(|| async {
-                let (store, _) = ObjectStore::from_uri_and_params(
-                    self.session.store_registry(),
-                    &base_path.path,
-                    &core_params,
-                )
-                .await?;
+                // Wrappers define a request or execution scope. Keep the
+                // fully resolved store in this dataset's OnceCell, but do not
+                // also put it in the global registry: provider-local state
+                // such as GCS AIMD token buckets must not cross that scope.
+                let (store, _) = if store_params.object_store_wrapper.is_some() {
+                    ObjectStore::from_uri_and_params_uncached(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                } else {
+                    ObjectStore::from_uri_and_params(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                };
                 Ok::<_, Error>(store)
             })
             .await?;
-
-        match wrapper {
-            Some(wrapper) => {
-                let mut store = core.as_ref().clone();
-                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
-                Ok(Arc::new(store))
-            }
-            None => Ok(core.clone()),
-        }
+        Ok(store.clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
