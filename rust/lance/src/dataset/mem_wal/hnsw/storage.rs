@@ -454,7 +454,9 @@ impl VectorSource for VectorStoreSnapshot {
     }
 
     fn row_id(&self, id: u32) -> u64 {
-        assert!(
+        // HNSW only requests ids from its own graph, which is built from this
+        // snapshot's visible prefix. Keep this as a debug-only contract check.
+        debug_assert!(
             (id as usize) < self.visible_len,
             "vector id {id} is outside snapshot length {}",
             self.visible_len
@@ -463,7 +465,7 @@ impl VectorSource for VectorStoreSnapshot {
     }
 
     fn vector(&self, id: u32) -> &[f32] {
-        assert!(
+        debug_assert!(
             (id as usize) < self.visible_len,
             "vector id {id} is outside snapshot length {}",
             self.visible_len
