@@ -346,15 +346,21 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # macOS runner capacity is the scarcest in CI, so this job is kept as short
+      # as it can be. nextest runs each test in its own process and schedules
+      # across all cores, rather than one test binary at a time. Benchmarks are
+      # only compile-checked here, which build-no-lock already does on Linux;
+      # nothing about bench compilation is macOS-specific.
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
-      - name: Check benchmarks
-        run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
+          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest-4x
     defaults:
