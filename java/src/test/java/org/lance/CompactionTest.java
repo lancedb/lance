@@ -33,6 +33,7 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Optional;
@@ -147,6 +148,41 @@ public class CompactionTest {
     }
   }
 
+  @Test
+  public void testExcludedFragmentIds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_excluded_fragment_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+      testDataset.write(3, 10).close();
+      try (Dataset dataset = testDataset.write(4, 10)) {
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withExcludedFragmentIds(Arrays.asList(1L, 1L, 999L))
+                .build();
+
+        CompactionPlan plan = Compaction.planCompaction(dataset, options);
+
+        assertEquals(
+            Arrays.asList(1L, 1L, 999L), plan.getCompactionOptions().getExcludedFragmentIds());
+        assertEquals(1, plan.getCompactionTasks().size());
+        assertEquals(2, plan.getCompactionTasks().get(0).getTaskData().getFragments().size());
+        assertEquals(
+            2, plan.getCompactionTasks().get(0).getTaskData().getFragments().get(0).getId());
+        assertEquals(
+            3, plan.getCompactionTasks().get(0).getTaskData().getFragments().get(1).getId());
+
+        CompactionTask task = serializeAndDeserialize(plan.getCompactionTasks().get(0));
+        assertEquals(
+            Arrays.asList(1L, 1L, 999L), task.getCompactionOptions().getExcludedFragmentIds());
+      }
+    }
+  }
+
   @ParameterizedTest
   @EnumSource(CompactionMode.class)
   public void testCompactionModeRoundTrip(CompactionMode mode, @TempDir Path tempDir)
@@ -212,6 +248,7 @@ public class CompactionTest {
     // Fields absent from the old stream deserialize as unset.
     assertEquals(Optional.empty(), options.getMaxSourceRows());
     assertEquals(Optional.empty(), options.getMaxSourceBytes());
+    assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
   }
 
   private static <T> T serializeAndDeserialize(T object)

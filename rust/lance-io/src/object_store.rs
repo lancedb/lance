@@ -498,6 +498,28 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, true).await
+    }
+
+    /// Parse a URI and build a fresh object store outside the registry cache.
+    ///
+    /// The caller must retain the returned store for as long as its
+    /// provider-local state should be reused.
+    #[doc(hidden)]
+    pub async fn from_uri_and_params_uncached(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+    ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, false).await
+    }
+
+    async fn from_uri_and_params_impl(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+        use_registry_cache: bool,
+    ) -> Result<(Arc<Self>, Path)> {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
@@ -531,7 +553,11 @@ impl ObjectStore {
         }
         let url = uri_to_url(uri)?;
 
-        let store = registry.get_store(url.clone(), params).await?;
+        let store = if use_registry_cache {
+            registry.get_store(url.clone(), params).await?
+        } else {
+            registry.new_store(url.clone(), params).await?
+        };
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
         let path = provider.extract_path(&url)?;

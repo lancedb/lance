@@ -197,7 +197,14 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Object stores for additional base paths, normally shared across clones.
+    /// Applying new object store wrappers starts a fresh cache scope.
+    pub(crate) base_object_stores: BaseObjectStores,
 }
+
+/// The `OnceCell` coalesces concurrent first resolutions into one build.
+pub(crate) type BaseObjectStores =
+    Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
 impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -499,6 +506,16 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
+        self.set_manifest(manifest, manifest_location);
+        Ok(())
+    }
+
+    /// Replace the manifest, refreshing derived state. Base stores are kept
+    /// when `base_paths` is unchanged.
+    fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+        if manifest.base_paths != self.manifest.base_paths {
+            self.base_object_stores = Default::default();
+        }
         self.manifest = manifest;
         self.manifest_location = manifest_location;
         self.fragment_bitmap = Arc::new(
@@ -508,7 +525,6 @@ impl Dataset {
                 .map(|f| f.id as u32)
                 .collect(),
         );
-        Ok(())
     }
 
     /// Check out the latest version of the branch
@@ -865,6 +881,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Default::default(),
         })
     }
 
@@ -1628,15 +1645,7 @@ impl Dataset {
         )
         .await?;
 
-        self.manifest = Arc::new(manifest);
-        self.manifest_location = manifest_location;
-        self.fragment_bitmap = Arc::new(
-            self.manifest
-                .fragments
-                .iter()
-                .map(|f| f.id as u32)
-                .collect(),
-        );
+        self.set_manifest(Arc::new(manifest), manifest_location);
 
         Ok(())
     }
@@ -2022,6 +2031,7 @@ impl Dataset {
     ) -> Self {
         let mut cloned = self.clone();
         cloned.object_store = object_store;
+        cloned.base_object_stores = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2043,6 +2053,10 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
+        // Each wrapper application defines a new store lifetime. Keep base
+        // stores alive within the derived dataset without sharing stateful
+        // provider layers (such as an AIMD throttle) with other scopes.
+        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.inner =
@@ -2416,14 +2430,35 @@ impl Dataset {
         })?;
         let store_params = self.store_params_for_base(Some(base_path));
 
-        let (store, _) = ObjectStore::from_uri_and_params(
-            self.session.store_registry(),
-            &base_path.path,
-            &store_params,
-        )
-        .await?;
-
-        Ok(store)
+        let cell = {
+            let mut stores = self.base_object_stores.lock().unwrap();
+            stores.entry(base_id).or_default().clone()
+        };
+        let store = cell
+            .get_or_try_init(|| async {
+                // Wrappers define a request or execution scope. Keep the
+                // fully resolved store in this dataset's OnceCell, but do not
+                // also put it in the global registry: provider-local state
+                // such as GCS AIMD token buckets must not cross that scope.
+                let (store, _) = if store_params.object_store_wrapper.is_some() {
+                    ObjectStore::from_uri_and_params_uncached(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                } else {
+                    ObjectStore::from_uri_and_params(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                };
+                Ok::<_, Error>(store)
+            })
+            .await?;
+        Ok(store.clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.

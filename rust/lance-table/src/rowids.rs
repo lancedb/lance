@@ -430,9 +430,8 @@ impl RowIdSequence {
                     ids.mask(mask);
                     // Range-aware path: walk the bitmap's runs directly via
                     // iter_runs so the per-row cost collapses to per-run cost.
-                    // SAFETY: built from a u64 range; no Full entries possible.
                     let mut cur: Option<Range<u64>> = None;
-                    for (fragment, run) in unsafe { ids.iter_runs() } {
+                    for (fragment, run) in ids.iter_runs() {
                         let frag = u64::from(fragment);
                         let run_start = (frag << 32) | u64::from(*run.start());
                         let run_end_excl = (frag << 32) | (u64::from(*run.end()) + 1);
@@ -467,19 +466,17 @@ impl RowIdSequence {
                     sorted_holes.sort_unstable();
                     let mut next_holes_iter = sorted_holes.into_iter().peekable();
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
-                        |addr| {
-                            while let Some(next_hole) = next_holes_iter.peek() {
-                                if *next_hole < addr {
-                                    next_holes_iter.next();
-                                    holes_passed += 1;
-                                } else {
-                                    break;
-                                }
+                    ranges.extend(GroupingIterator::new(ids.into_addr_iter().map(|addr| {
+                        while let Some(next_hole) = next_holes_iter.peek() {
+                            if *next_hole < addr {
+                                next_holes_iter.next();
+                                holes_passed += 1;
+                            } else {
+                                break;
                             }
-                            addr - range.start + offset_start - holes_passed
-                        },
-                    )));
+                        }
+                        addr - range.start + offset_start - holes_passed
+                    })));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
                     let mut ids = RowAddrTreeMap::from(range.clone());
@@ -494,18 +491,16 @@ impl RowIdSequence {
                     let mut bitmap_iter = bitmap.iter();
                     let mut bitmap_iter_pos = 0;
                     let mut holes_passed = 0;
-                    ranges.extend(GroupingIterator::new(unsafe { ids.into_addr_iter() }.map(
-                        |addr| {
-                            let position_in_range = addr - range.start;
-                            while bitmap_iter_pos < position_in_range {
-                                if !bitmap_iter.next().unwrap() {
-                                    holes_passed += 1;
-                                }
-                                bitmap_iter_pos += 1;
+                    ranges.extend(GroupingIterator::new(ids.into_addr_iter().map(|addr| {
+                        let position_in_range = addr - range.start;
+                        while bitmap_iter_pos < position_in_range {
+                            if !bitmap_iter.next().unwrap() {
+                                holes_passed += 1;
                             }
-                            offset_start + position_in_range - holes_passed
-                        },
-                    )));
+                            bitmap_iter_pos += 1;
+                        }
+                        offset_start + position_in_range - holes_passed
+                    })));
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     // TODO: Could probably optimize the sorted array case to be O(N) instead of O(N log N)
