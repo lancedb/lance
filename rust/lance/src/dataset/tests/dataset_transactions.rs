@@ -2116,7 +2116,7 @@ mod composite {
                 // fragment by the token it was minted under.
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Local(0),
-                    field_ids: vec![0],
+                    field_ids: vec![Ref::Committed(0)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
@@ -2193,7 +2193,9 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::DropField(DropField { field: 0 }),
+                Action::DropField(DropField {
+                    field: Ref::Committed(0),
+                }),
                 Action::AddField(AddField {
                     local: 0,
                     parent: None,
@@ -2323,7 +2325,7 @@ mod composite {
                     "step",
                     vec![Action::TombstoneFieldData(TombstoneFieldData {
                         fragment: Ref::Committed(fragment_id),
-                        field_ids: vec![0],
+                        field_ids: vec![Ref::Committed(0)],
                         data_change: true,
                     })],
                 )])),
