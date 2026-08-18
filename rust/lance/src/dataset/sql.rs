@@ -8,13 +8,12 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::{
-    ast::{Expr, Ident, SelectItem, SetExpr, Statement},
-    dialect::GenericDialect,
-    parser::Parser,
+use datafusion::sql::{
+    parser::Statement as DFStatement,
+    sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement},
 };
 use futures::TryStreamExt;
-use lance_core::{ROW_ADDR, datatypes::BlobHandling};
+use lance_core::{ROW_ADDR, ROW_ID, datatypes::BlobHandling};
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -94,49 +93,58 @@ impl SqlQueryBuilder {
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
-        let df = match with_projected_row_addr(&self.sql, self.with_row_addr) {
-            Some(sql) => match ctx.sql(&sql).await {
-                Ok(df) => df,
-                Err(_) => ctx.sql(&self.sql).await?,
-            },
-            None => ctx.sql(&self.sql).await?,
+        let state = ctx.state();
+        let dialect = state.config_options().sql_parser.dialect;
+        let statement = state.sql_to_statement(&self.sql, &dialect)?;
+        let mut projected = statement.clone();
+        let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
+        let plan = if project_system_columns(&mut projected, &columns) {
+            match state.statement_to_plan(projected).await {
+                Ok(plan) => plan,
+                Err(_) => state.statement_to_plan(statement).await?,
+            }
+        } else {
+            state.statement_to_plan(statement).await?
         };
+        let df = ctx.execute_logical_plan(plan).await?;
         Ok(SqlQuery::new(df))
     }
 }
 
-fn with_projected_row_addr(sql: &str, enabled: bool) -> Option<String> {
-    if !enabled {
-        return None;
-    }
-    let [mut statement] = Parser::parse_sql(&GenericDialect, sql)
-        .ok()?
-        .try_into()
-        .ok()?;
-    let Statement::Query(query) = &mut statement else {
-        return None;
+fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)]) -> bool {
+    let DFStatement::Statement(statement) = statement else {
+        return false;
+    };
+    let Statement::Query(query) = statement.as_mut() else {
+        return false;
     };
     let SetExpr::Select(select) = query.body.as_mut() else {
-        return None;
+        return false;
     };
     if select.distinct.is_some() {
-        return None;
+        return false;
     }
 
-    let already_projected = select
+    let projected = select
         .projection
         .iter()
         .map(ToString::to_string)
-        .any(|item| item.ends_with('*') || item.rsplit('.').next() == Some(ROW_ADDR));
-    if already_projected {
-        return None;
+        .collect::<Vec<_>>();
+    let additions = columns
+        .iter()
+        .filter(|(enabled, name)| {
+            *enabled
+                && !projected
+                    .iter()
+                    .any(|item| item.ends_with('*') || item.rsplit('.').next() == Some(name))
+        })
+        .map(|(_, name)| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*name))))
+        .collect::<Vec<_>>();
+    if additions.is_empty() {
+        return false;
     }
-    select
-        .projection
-        .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
-            ROW_ADDR,
-        ))));
-    Some(statement.to_string())
+    select.projection.extend(additions);
+    true
 }
 
 pub struct SqlQuery {
@@ -247,11 +255,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sql_with_row_addr_includes_unprojected_row_addr() {
+    async fn test_sql_includes_unprojected_system_columns() {
         let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_dataset(
-                "memory://test_sql_implicit_row_addr",
+                "memory://test_sql_implicit_system_columns",
                 FragmentCount::from(1),
                 FragmentRowCount::from(2),
             )
@@ -260,6 +268,7 @@ mod tests {
 
         let batches = ds
             .sql("SELECT x FROM dataset")
+            .with_row_id(true)
             .with_row_addr(true)
             .build()
             .await
@@ -269,7 +278,10 @@ mod tests {
             .unwrap();
 
         let batch = &batches[0];
-        assert_eq!(batch.schema().fields().len(), 2);
+        assert_eq!(batch.schema().fields().len(), 3);
+        let row_id_index = batch.schema().index_of("_rowid").unwrap();
+        let row_ids = batch.column(row_id_index).as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.values(), &[0, 1]);
         let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
         let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
         assert_eq!(row_addrs.values(), &[0, 1]);
