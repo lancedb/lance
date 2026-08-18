@@ -125,26 +125,40 @@ fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)])
         return false;
     }
 
-    let projected = select
-        .projection
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let additions = columns
-        .iter()
-        .filter(|(enabled, name)| {
-            *enabled
-                && !projected
-                    .iter()
-                    .any(|item| item.ends_with('*') || item.rsplit('.').next() == Some(name))
-        })
-        .map(|(_, name)| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*name))))
-        .collect::<Vec<_>>();
-    if additions.is_empty() {
-        return false;
+    let mut changed = false;
+    for &(enabled, name) in columns {
+        if enabled
+            && !select
+                .projection
+                .iter()
+                .any(|item| projects_column(item, name))
+        {
+            select
+                .projection
+                .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))));
+            changed = true;
+        }
     }
-    select.projection.extend(additions);
-    true
+    changed
+}
+
+fn projects_column(item: &SelectItem, name: &str) -> bool {
+    match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident_matches(ident, name),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents
+            .last()
+            .is_some_and(|ident| ident_matches(ident, name)),
+        _ => false,
+    }
+}
+
+fn ident_matches(ident: &Ident, name: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == name
+    } else {
+        ident.value.eq_ignore_ascii_case(name)
+    }
 }
 
 pub struct SqlQuery {
@@ -199,8 +213,8 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
