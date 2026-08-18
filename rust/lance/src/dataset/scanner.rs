@@ -10086,6 +10086,18 @@ mod test {
             .unwrap();
         let dataset = &test_ds.dataset;
 
+        // Guard the premise of this test: `nprobes(num_partitions)` probes every
+        // partition, so the batch spans multiple streaming chunks only if the
+        // partition count exceeds the chunk size. If the default chunk size is
+        // ever raised past `num_partitions`, fail loudly here rather than let the
+        // test silently collapse to a single chunk and stop covering the seam.
+        let chunk_size = *crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
+        assert!(
+            num_partitions > chunk_size,
+            "test needs more partitions ({num_partitions}) than the streaming chunk size \
+             ({chunk_size}) to span multiple chunks",
+        );
+
         let (queries, query_values) = batch_knn_two_queries();
         let k = 2;
         let mut scan = dataset.scan();
