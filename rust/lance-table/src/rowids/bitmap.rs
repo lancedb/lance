@@ -9,6 +9,21 @@ pub struct Bitmap {
     pub len: usize,
 }
 
+/// Set bits in `data`, counted a word at a time.
+fn count_ones(data: &[u8]) -> usize {
+    let mut words = data.chunks_exact(8);
+    let full: usize = words
+        .by_ref()
+        .map(|word| u64::from_le_bytes(word.try_into().unwrap()).count_ones() as usize)
+        .sum();
+    let tail: usize = words
+        .remainder()
+        .iter()
+        .map(|byte| byte.count_ones() as usize)
+        .sum();
+    full + tail
+}
+
 impl std::fmt::Debug for Bitmap {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Bitmap {{ data: ")?;
@@ -65,7 +80,7 @@ impl Bitmap {
     }
 
     pub fn count_ones(&self) -> usize {
-        self.data.iter().map(|&x| x.count_ones() as usize).sum()
+        count_ones(&self.data)
     }
 
     pub fn count_zeros(&self) -> usize {
@@ -132,10 +147,7 @@ impl BitmapSlice<'_> {
             }
 
             // Middle bytes can just use count_ones
-            count += self.bitmap.data[first_byte + 1..last_byte]
-                .iter()
-                .map(|&x| x.count_ones() as usize)
-                .sum::<usize>();
+            count += count_ones(&self.bitmap.data[first_byte + 1..last_byte]);
             count
         }
     }
@@ -189,6 +201,17 @@ mod tests {
 
         let bitmap_slice = bitmap.slice(5, 5);
         assert_eq!(bitmap_slice.count_ones(), 2);
+    }
+
+    #[test]
+    fn test_count_ones_spans_words_and_tail() {
+        for len in [1_usize, 7, 8, 63, 64, 65, 130] {
+            let mut bitmap = Bitmap::new_empty(len);
+            for i in (0..len).step_by(3) {
+                bitmap.set(i);
+            }
+            assert_eq!(bitmap.count_ones(), len.div_ceil(3), "len {len}");
+        }
     }
 
     #[test]
