@@ -101,15 +101,11 @@ pub struct NullableDataBlock {
 }
 
 impl NullableDataBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let nulls = self.nulls.into_buffer();
-        let data = self.data.into_arrow(data_type, validate)?.into_builder();
+        let data = self.data.into_arrow_impl(data_type, true)?.into_builder();
         let data = data.null_bit_buffer(Some(nulls));
-        if validate {
-            Ok(data.build()?)
-        } else {
-            Ok(unsafe { data.build_unchecked() })
-        }
+        Ok(data.build()?)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -173,7 +169,7 @@ impl FixedWidthDataBlock {
         self,
         data_type: DataType,
         num_values: u64,
-        validate: bool,
+        _validate: bool,
     ) -> Result<ArrayData> {
         // Booleans expanded for full-zip (bits_per_value==8, one byte each) need re-packing to
         // Arrow's bit-packed format.
@@ -190,16 +186,16 @@ impl FixedWidthDataBlock {
             .add_buffer(data_buffer)
             .len(num_values as usize)
             .null_count(0);
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
-    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    /// Convert this block into Arrow data with full layout validation.
+    ///
+    /// The `validate` argument is retained for API compatibility. Conversion is
+    /// always validated because callers can construct this public type directly.
+    pub fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
-        self.do_into_arrow(data_type, root_num_values, validate)
+        self.do_into_arrow(data_type, root_num_values, true)
     }
 
     pub fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -510,13 +506,13 @@ impl FixedSizeListBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let num_values = self.num_values();
         let builder = match &data_type {
             DataType::FixedSizeList(child_field, _) => {
                 let child_data = self
                     .child
-                    .into_arrow(child_field.data_type().clone(), validate)?;
+                    .into_arrow_impl(child_field.data_type().clone(), true)?;
                 ArrayDataBuilder::new(data_type)
                     .add_child_data(child_data)
                     .len(num_values as usize)
@@ -524,11 +520,7 @@ impl FixedSizeListBlock {
             }
             _ => panic!("Expected FixedSizeList data type and got {:?}", data_type),
         };
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -993,12 +985,12 @@ pub struct StructDataBlock {
 }
 
 impl StructDataBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         if let DataType::Struct(fields) = &data_type {
             let mut builder = ArrayDataBuilder::new(DataType::Struct(fields.clone()));
             let mut num_rows = 0;
             for (field, child) in fields.iter().zip(self.children) {
-                let child_data = child.into_arrow(field.data_type().clone(), validate)?;
+                let child_data = child.into_arrow_impl(field.data_type().clone(), true)?;
                 num_rows = child_data.len();
                 builder = builder.add_child_data(child_data);
             }
@@ -1014,11 +1006,7 @@ impl StructDataBlock {
             };
 
             let builder = builder.len(num_rows);
-            if validate {
-                Ok(builder.build()?)
-            } else {
-                Ok(unsafe { builder.build_unchecked() })
-            }
+            Ok(builder.build()?)
         } else {
             Err(Error::internal(format!(
                 "Expected Struct, got {:?}",
@@ -1112,7 +1100,7 @@ impl DictionaryDataBlock {
         self,
         key_type: Box<DataType>,
         value_type: Box<DataType>,
-        validate: bool,
+        _validate: bool,
     ) -> Result<ArrayData> {
         let declared_key_bits = key_type.byte_width() as u64 * 8;
         if self.indices.bits_per_value != declared_key_bits {
@@ -1124,28 +1112,27 @@ impl DictionaryDataBlock {
                 ),
             ));
         }
-        let indices = self.indices.into_arrow((*key_type).clone(), validate)?;
+        let indices_num_values = self.indices.num_values;
+        let indices = self
+            .indices
+            .do_into_arrow((*key_type).clone(), indices_num_values, true)?;
         let dictionary = self
             .dictionary
-            .into_arrow((*value_type).clone(), validate)?;
+            .into_arrow_impl((*value_type).clone(), true)?;
 
         let builder = indices
             .into_builder()
             .add_child_data(dictionary)
             .data_type(DataType::Dictionary(key_type, value_type));
 
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         if let DataType::Dictionary(key_type, value_type) = data_type {
             self.into_arrow_dict(key_type, value_type, validate)
         } else {
-            self.decode()?.into_arrow(data_type, validate)
+            self.decode()?.into_arrow_impl(data_type, validate)
         }
     }
 
@@ -1196,8 +1183,15 @@ pub enum DataBlock {
 }
 
 impl DataBlock {
-    /// Convert self into an Arrow ArrayData
-    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    /// Convert self into an Arrow ArrayData with full layout validation.
+    ///
+    /// The `validate` argument is retained for API compatibility. Conversion is
+    /// always validated because callers can construct data blocks directly.
+    pub fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        self.into_arrow_impl(data_type, true)
+    }
+
+    fn into_arrow_impl(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         match self {
             Self::Empty() => Ok(new_empty_array(&data_type).to_data()),
             Self::Constant(inner) => inner.into_arrow(data_type, validate),
@@ -2509,6 +2503,26 @@ mod tests {
             message.contains("100000") && message.contains("data buffer size: 14 bytes"),
             "error must report the offending offset and the data buffer size: {message}"
         );
+    }
+
+    #[test]
+    fn public_fixed_width_conversion_always_validates_layout() {
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8; 4]),
+            bits_per_value: 32,
+            num_values: 2,
+            block_info: BlockInfo::new(),
+        };
+
+        for validate in [false, true] {
+            block
+                .clone()
+                .into_arrow(DataType::Int32, validate)
+                .expect_err("a short values buffer must be rejected");
+            DataBlock::FixedWidth(block.clone())
+                .into_arrow(DataType::Int32, validate)
+                .expect_err("a short values buffer must be rejected");
+        }
     }
 
     #[rstest]
