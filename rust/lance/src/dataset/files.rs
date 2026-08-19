@@ -1018,7 +1018,8 @@ mod tests {
             .unwrap();
         // Triggers a deletion file on one of the fragments.
         ds.delete("id = 1").await.unwrap();
-        ds.register_cell_flag("id", "reviewed", false)
+        let definition = ds
+            .register_cell_flag("id", "reviewed", false)
             .await
             .unwrap();
         let update = UpdateBuilder::new(Arc::new(ds))
@@ -1039,6 +1040,17 @@ mod tests {
             ds.get_fragments().len(),
             3,
             "expected 3 fragments from max_rows_per_file=2 over 6 rows"
+        );
+        let descriptor = ds.cell_flag_state(definition.flag_id).unwrap();
+        assert!(descriptor.root.path.is_empty());
+        assert!(
+            ds.load_cell_flag_root(definition.flag_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .fragments
+                .iter()
+                .all(|fragment| matches!(fragment.state, CellFlagFragmentState::InlinePartial(_)))
         );
 
         let tracked = collect_rows(ds.tracked_files().await).await;
@@ -1093,8 +1105,9 @@ mod tests {
             }
         }
 
-        // The latest manifest references one manifest, 3 data files, 1 deletion
-        // file, and the flag's root plus partial bitmap.
+        // The latest manifest references one manifest, 3 data files, and 1
+        // deletion file. The tiny flag bitmap and root are both inline, so
+        // there is no physical Cell Flag object to enumerate.
         assert_eq!(
             tracked_at_latest.get("manifest").map(Vec::len),
             Some(1),
@@ -1112,8 +1125,8 @@ mod tests {
         );
         assert_eq!(
             tracked_at_latest.get("cell flag file").map(Vec::len),
-            Some(2),
-            "expected one root and one partial bitmap at latest version"
+            None,
+            "inline Cell Flag state must not report nonexistent physical files"
         );
 
         // Path shapes are as documented (relative to base_uri, no leading slash).
@@ -1121,12 +1134,6 @@ mod tests {
             assert!(
                 p.starts_with("data/"),
                 "data file path {p:?} should start with data/"
-            );
-        }
-        for p in tracked_at_latest.get("cell flag file").unwrap() {
-            assert!(
-                p.starts_with("_cell_flags/"),
-                "cell flag file path {p:?} should start with _cell_flags/"
             );
         }
         let manifest_path = &tracked_at_latest.get("manifest").unwrap()[0];

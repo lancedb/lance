@@ -113,6 +113,7 @@ pub struct CellFlagRootKey {
     pub path: String,
     pub size_bytes: u64,
     pub memory_size_bytes: u64,
+    pub flag_id: u32,
     pub inline_hash: Option<[u8; 32]>,
 }
 
@@ -121,8 +122,8 @@ impl CacheKey for CellFlagRootKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/root/{}/{}/{}/{}",
-            self.source_uri, self.path, self.size_bytes, self.memory_size_bytes
+            "cell_flag/root/{}/{}/{}/{}/{}",
+            self.source_uri, self.path, self.size_bytes, self.memory_size_bytes, self.flag_id
         ))
     }
 
@@ -131,7 +132,7 @@ impl CacheKey for CellFlagRootKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 3)
+        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 4)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -139,6 +140,7 @@ impl CacheKey for CellFlagRootKey {
         builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);
         builder.write_u64(self.memory_size_bytes);
+        builder.write_u32(self.flag_id);
         if let Some(inline_hash) = self.inline_hash {
             builder.write_some();
             builder.write_fixed_bytes(&inline_hash);
@@ -394,23 +396,26 @@ mod tests {
     #[tokio::test]
     async fn cell_flag_cache_keys_separate_declared_memory_sizes() {
         let cache = LanceCache::with_capacity(4096);
-        let root_key = |memory_size_bytes| CellFlagRootKey {
+        let root_key = |memory_size_bytes, flag_id| CellFlagRootKey {
             source_uri: "memory://dataset".to_string(),
             path: "_cell_flags/roots/0/root.root".to_string(),
             size_bytes: 128,
             memory_size_bytes,
+            flag_id,
             inline_hash: None,
         };
         cache
             .insert_with_key(
-                &root_key(256),
+                &root_key(256, 0),
                 Arc::new(CellFlagRoot {
                     fragments: Vec::new(),
                 }),
             )
             .await;
-        assert_ne!(root_key(256).key(), root_key(512).key());
-        assert!(cache.get_with_key(&root_key(512)).await.is_none());
+        assert_ne!(root_key(256, 0).key(), root_key(512, 0).key());
+        assert!(cache.get_with_key(&root_key(512, 0)).await.is_none());
+        assert_ne!(root_key(256, 0).key(), root_key(256, 1).key());
+        assert!(cache.get_with_key(&root_key(256, 1)).await.is_none());
 
         let bitmap_key = |memory_size_bytes| CellFlagBitmapKey {
             source_uri: "memory://dataset".to_string(),

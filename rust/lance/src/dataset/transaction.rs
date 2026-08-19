@@ -62,6 +62,7 @@ use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Write,
+    mem::size_of,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -395,15 +396,41 @@ const CELL_FLAG_ROW_ADDRESSES_FRAGMENTED: u8 = 1;
 const CELL_FLAG_ROW_ADDRESSES_ZSTD_FRAGMENTED: u8 = 2;
 const MAX_CELL_FLAG_ROW_ADDRESSES_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY: u64 = 64 * 1024 * 1024;
+// Match lance_core::deepsize's BTreeMap estimate for the key, bitmap value,
+// and node pointers. The bitmap's portable size separately accounts for its
+// container payload.
+const CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES: usize =
+    size_of::<u32>() + size_of::<RoaringBitmap>() + 3 * size_of::<usize>();
 
-fn validate_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Result<()> {
-    let retained_bytes = addresses.serialized_size();
+fn cell_flag_row_address_retained_bytes(
+    bitmap_bytes: usize,
+    fragment_count: usize,
+) -> Result<usize> {
+    fragment_count
+        .checked_mul(CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES)
+        .and_then(|overhead| bitmap_bytes.checked_add(overhead))
+        .ok_or_else(|| Error::invalid_input("Cell flag row address retained size overflow"))
+}
+
+fn validate_cell_flag_row_address_retained_bytes(
+    bitmap_bytes: usize,
+    fragment_count: usize,
+) -> Result<usize> {
+    let retained_bytes = cell_flag_row_address_retained_bytes(bitmap_bytes, fragment_count)?;
     if retained_bytes > MAX_CELL_FLAG_ROW_ADDRESSES_BYTES {
         return Err(Error::invalid_input(format!(
             "Cell flag row addresses require {} retained bytes, maximum is {}",
             retained_bytes, MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
         )));
     }
+    Ok(retained_bytes)
+}
+
+fn validate_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Result<()> {
+    validate_cell_flag_row_address_retained_bytes(
+        addresses.serialized_size(),
+        addresses.bitmaps().count(),
+    )?;
     if addresses.len() > MAX_CELL_FLAG_ROW_ADDRESSES_CARDINALITY {
         return Err(Error::invalid_input(format!(
             "Cell flag row addresses contain {} rows, maximum is {}",
@@ -430,7 +457,10 @@ fn encode_cell_flag_row_addresses(addresses: &RoaringTreemap) -> Result<Vec<u8>>
             break;
         };
         let memory_size = cell_flag_bitmap_memory_size(&bytes)?;
-        let Some(next_memory) = fragmented_memory.checked_add(memory_size) else {
+        let Some(next_memory) = fragmented_memory
+            .checked_add(memory_size)
+            .and_then(|bytes| bytes.checked_add(CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES))
+        else {
             has_fragmented_candidate = false;
             break;
         };
@@ -519,6 +549,16 @@ fn decode_cell_flag_row_addresses(bytes: &[u8]) -> Result<RoaringTreemap> {
                     MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
                 )));
             }
+            let fragment_count = payload
+                .get(..8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("length checked")))
+                .ok_or_else(|| {
+                    Error::invalid_input("Cell flag row addresses are missing their fragment count")
+                })?;
+            let fragment_count = usize::try_from(fragment_count).map_err(|_| {
+                Error::invalid_input("Cell flag row address fragment count exceeds this platform")
+            })?;
+            validate_cell_flag_row_address_retained_bytes(payload.len(), fragment_count)?;
             let mut cursor = std::io::Cursor::new(payload);
             let addresses = RoaringTreemap::deserialize_from(&mut cursor).map_err(|error| {
                 Error::invalid_input(format!("Invalid Cell flag row addresses: {error}"))
@@ -583,9 +623,9 @@ fn decode_fragmented_cell_flag_row_addresses(payload: &[u8]) -> Result<RoaringTr
     }
     let mut cursor = 0usize;
     let fragment_count = read_cell_flag_row_address_u32(payload, &mut cursor)? as usize;
+    let mut retained_bytes = validate_cell_flag_row_address_retained_bytes(0, fragment_count)?;
     let mut addresses = RoaringTreemap::new();
     let mut previous_fragment = None;
-    let mut retained_bytes = 0usize;
     let mut cardinality = 0u64;
     for _ in 0..fragment_count {
         let fragment_id = read_cell_flag_row_address_u32(payload, &mut cursor)?;
@@ -7856,6 +7896,34 @@ mod tests {
         encoded.extend_from_slice(&(fragmented.len() as u64).to_le_bytes());
         encoded.extend_from_slice(&compressed);
         let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
+        assert!(error.to_string().contains("retained bytes"));
+    }
+
+    #[test]
+    fn cell_flag_row_addresses_reject_fragment_overhead_before_materialization() {
+        let stride_memory_size = 18;
+        let fragment_count = (MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+            / (stride_memory_size + CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES)
+            + 1) as u32;
+        let encoded = many_stride_fragment_row_addresses(fragment_count, stride_memory_size);
+        assert!(encoded.len() < MAX_CELL_FLAG_ROW_ADDRESSES_BYTES);
+        let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
+        assert!(error.to_string().contains("retained bytes"));
+
+        let mut singleton = Vec::new();
+        RoaringBitmap::from_iter([0])
+            .serialize_into(&mut singleton)
+            .unwrap();
+        let mut raw = Vec::with_capacity(5 + 8 + fragment_count as usize * (4 + singleton.len()));
+        raw.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+        raw.push(CELL_FLAG_ROW_ADDRESSES_ROARING);
+        raw.extend_from_slice(&u64::from(fragment_count).to_le_bytes());
+        for fragment_id in 0..fragment_count {
+            raw.extend_from_slice(&fragment_id.to_le_bytes());
+            raw.extend_from_slice(&singleton);
+        }
+        assert!(raw.len() < MAX_CELL_FLAG_ROW_ADDRESSES_BYTES);
+        let error = decode_cell_flag_row_addresses(&raw).unwrap_err();
         assert!(error.to_string().contains("retained bytes"));
     }
 

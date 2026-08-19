@@ -129,6 +129,7 @@ New-fragment partial states use the `LCF1` envelope. Existing-row changes use th
 - `2`: an eight-byte decoded length followed by one Zstandard-compressed discriminator-`1` payload. The decoded payload must not exceed 64 MiB.
 
 Writers compare the portable treemap and fragmented representation, choose the smaller one, and apply discriminator `2` only when Zstandard further reduces the fragmented payload.
+All three variants enforce a 64 MiB retained-memory budget before materializing the treemap. The estimate includes the portable bitmap payload and per-fragment map, bitmap, container, and allocator overhead; cardinality is independently limited to 64 Mi rows.
 
 Concurrent registry edits conflict. Row changes use the existing mutation conflict machinery and the operation's read snapshot. Atomicity does not establish application-level freshness; systems that need freshness must validate their own source revision or read set.
 

@@ -836,6 +836,7 @@ impl Dataset {
             path: descriptor.root.path.clone(),
             size_bytes: descriptor.root.size_bytes,
             memory_size_bytes: descriptor.root.memory_size_bytes,
+            flag_id,
             inline_hash: descriptor
                 .root
                 .inline_bytes
@@ -2186,6 +2187,57 @@ fn validate_fragment_value(
     Ok(())
 }
 
+struct InlineCellFlagManifestBudget {
+    used_bytes: usize,
+    max_bytes: usize,
+}
+
+impl InlineCellFlagManifestBudget {
+    fn from_states<'a>(
+        states: impl IntoIterator<Item = &'a CellFlagState>,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        let mut budget = Self {
+            used_bytes: 0,
+            max_bytes,
+        };
+        for state in states {
+            budget.reserve(Some(state))?;
+        }
+        Ok(budget)
+    }
+
+    fn inline_bytes(state: Option<&CellFlagState>) -> usize {
+        state
+            .and_then(|state| state.root.inline_bytes.as_ref())
+            .map_or(0, Vec::len)
+    }
+
+    /// Release the current descriptor while reserving every other flag's
+    /// inline root. The returned capacity is safe to use for its replacement.
+    fn release(&mut self, state: Option<&CellFlagState>) -> Result<usize> {
+        let bytes = Self::inline_bytes(state);
+        self.used_bytes = self.used_bytes.checked_sub(bytes).ok_or_else(|| {
+            Error::internal("Inline cell flag manifest budget accounting underflow")
+        })?;
+        Ok(self.max_bytes - self.used_bytes)
+    }
+
+    fn reserve(&mut self, state: Option<&CellFlagState>) -> Result<()> {
+        self.used_bytes = self
+            .used_bytes
+            .checked_add(Self::inline_bytes(state))
+            .ok_or_else(|| Error::internal("Inline cell flag manifest size overflow"))?;
+        if self.used_bytes > self.max_bytes {
+            return Err(Error::invalid_input(format!(
+                "Inline Cell Flag roots require {} bytes, maximum is {}",
+                self.used_bytes, self.max_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Reconcile one transaction with the current head's cell flag roots.
 ///
 /// This runs after conflict resolution and manifest construction on every
@@ -2603,9 +2655,16 @@ pub async fn apply_cell_flag_transaction(
     let has_exact_rewrite_sources = !exact_rewrite_group_by_source_fragment.is_empty();
 
     let mut descriptors = Vec::with_capacity(definitions.len());
-    let mut inline_manifest_bytes = 0usize;
+    let mut inline_manifest_budget = InlineCellFlagManifestBudget::from_states(
+        definitions
+            .iter()
+            .filter_map(|definition| current.cell_flag_state(definition.flag_id)),
+        MAX_INLINE_CELL_FLAG_MANIFEST_BYTES,
+    )?;
     for definition in &definitions {
         let flag_id = definition.flag_id;
+        let current_descriptor = current.cell_flag_state(flag_id);
+        let max_inline_bytes = inline_manifest_budget.release(current_descriptor)?;
         let has_explicit_state_change = registration_initial_values.contains_key(&flag_id)
             || overrides
                 .keys()
@@ -2673,20 +2732,8 @@ pub async fn apply_cell_flag_transaction(
             || append_only_adds_false_state
             || (has_exact_rewrite && !exact_rewrite_needs_state && !has_explicit_state_change)
         {
-            if let Some(descriptor) = current.cell_flag_state(flag_id) {
-                if let Some(bytes) = descriptor.root.inline_bytes.as_ref() {
-                    inline_manifest_bytes = inline_manifest_bytes
-                        .checked_add(bytes.len())
-                        .ok_or_else(|| {
-                            Error::internal("Inline cell flag manifest size overflow")
-                        })?;
-                    if inline_manifest_bytes > MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
-                        return Err(Error::invalid_input(format!(
-                            "Inline Cell Flag roots require {} bytes, maximum is {}",
-                            inline_manifest_bytes, MAX_INLINE_CELL_FLAG_MANIFEST_BYTES
-                        )));
-                    }
-                }
+            if let Some(descriptor) = current_descriptor {
+                inline_manifest_budget.reserve(Some(descriptor))?;
                 descriptors.push(descriptor.clone());
             }
             continue;
@@ -2906,15 +2953,11 @@ pub async fn apply_cell_flag_transaction(
                 CellFlagRoot {
                     fragments: states.into_values().collect(),
                 },
-                MAX_INLINE_CELL_FLAG_MANIFEST_BYTES.saturating_sub(inline_manifest_bytes),
+                max_inline_bytes,
             )
             .await?
         {
-            if let Some(bytes) = descriptor.root.inline_bytes.as_ref() {
-                inline_manifest_bytes = inline_manifest_bytes
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| Error::internal("Inline cell flag manifest size overflow"))?;
-            }
+            inline_manifest_budget.reserve(Some(&descriptor))?;
             descriptors.push(descriptor);
         }
     }
@@ -2970,6 +3013,33 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([1, 99])
         );
+    }
+
+    #[test]
+    fn inline_manifest_budget_reserves_unchanged_roots_before_rewrite() {
+        let state = |flag_id, bytes| CellFlagState {
+            flag_id,
+            root: CellFlagFile {
+                path: String::new(),
+                size_bytes: 0,
+                memory_size_bytes: bytes as u64,
+                base_id: None,
+                inline_bytes: Some(vec![0; bytes]),
+            },
+        };
+        let first = state(0, 49);
+        let second = state(1, 50);
+        let mut budget = InlineCellFlagManifestBudget::from_states([&first, &second], 100).unwrap();
+
+        // Replacing the first root has only 50 bytes available because the
+        // unchanged second root must remain reserved. A 51-byte replacement
+        // therefore has to be external rather than making the commit fail
+        // when the second descriptor is visited later.
+        assert_eq!(budget.release(Some(&first)).unwrap(), 50);
+        budget.reserve(None).unwrap();
+        assert_eq!(budget.release(Some(&second)).unwrap(), 100);
+        budget.reserve(Some(&second)).unwrap();
+        assert_eq!(budget.used_bytes, 50);
     }
 
     #[test]
@@ -3519,6 +3589,70 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("references unknown fragment"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_inline_root_is_namespaced_by_flag_id() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definitions = dataset
+            .register_cell_flags([
+                ("value", "first_namespace", false),
+                ("value", "second_namespace", false),
+            ])
+            .await?;
+        let fragment = dataset
+            .manifest
+            .fragments
+            .first()
+            .expect("dataset has one fragment");
+        let fragment_id = fragment.id;
+        let physical_rows = fragment_physical_rows(fragment)?;
+        let root = CellFlagRoot {
+            fragments: vec![CellFlagFragment {
+                fragment_id,
+                physical_rows,
+                state: CellFlagFragmentState::Partial(CellFlagFile {
+                    path: format!(
+                        "_cell_flags/bitmaps/{}/{}/{}.rbm",
+                        definitions[0].flag_id,
+                        fragment_id,
+                        Uuid::new_v4()
+                    ),
+                    size_bytes: 1,
+                    memory_size_bytes: 1,
+                    base_id: None,
+                    inline_bytes: None,
+                }),
+            }],
+        };
+        let (inline_bytes, memory_size) = encode_cell_flag_root(&pb::CellFlagRoot::from(&root))?;
+        let descriptor = CellFlagFile {
+            path: String::new(),
+            size_bytes: 0,
+            memory_size_bytes: memory_size as u64,
+            base_id: None,
+            inline_bytes: Some(inline_bytes),
+        };
+        Arc::make_mut(&mut dataset.manifest).cell_flag_states = definitions
+            .iter()
+            .map(|definition| CellFlagState {
+                flag_id: definition.flag_id,
+                root: descriptor.clone(),
+            })
+            .collect();
+
+        dataset
+            .load_cell_flag_root_shared(definitions[0].flag_id)
+            .await?
+            .expect("first flag root is valid");
+        let error = dataset
+            .load_cell_flag_root_shared(definitions[1].flag_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("expected flag ID 1"));
         Ok(())
     }
 
@@ -4286,6 +4420,7 @@ mod tests {
             path: descriptor.path.clone(),
             size_bytes: descriptor.size_bytes,
             memory_size_bytes: descriptor.memory_size_bytes,
+            flag_id: definition.flag_id,
             inline_hash: descriptor
                 .inline_bytes
                 .as_deref()
