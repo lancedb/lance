@@ -207,7 +207,6 @@ impl ObjectStoreProvider for AwsStoreProvider {
         Ok(ObjectStore {
             inner,
             scheme: String::from(base_path.scheme()),
-            local_path_prefix: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,

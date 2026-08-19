@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 // TODO: Clean up windows/unix stuff
@@ -44,11 +43,7 @@ pub fn to_local_path(path: &Path) -> String {
 
 /// Recursively remove a directory, specified by [`object_store::path::Path`].
 pub fn remove_dir_all(path: &Path) -> Result<()> {
-    remove_dir_all_at(PathBuf::from(to_local_path(path)), path)
-}
-
-pub(crate) fn remove_dir_all_at(local_path: PathBuf, path: &Path) -> Result<()> {
-    std::fs::remove_dir_all(local_path).map_err(|err| match err.kind() {
+    std::fs::remove_dir_all(to_local_path(path)).map_err(|err| match err.kind() {
         ErrorKind::NotFound => Error::not_found(path.to_string()),
         _ => Error::from(err),
     })?;
@@ -57,13 +52,12 @@ pub(crate) fn remove_dir_all_at(local_path: PathBuf, path: &Path) -> Result<()> 
 
 /// Remove eligible empty directories below `root` without following symbolic links.
 pub(crate) fn remove_empty_dirs(
-    local_root: PathBuf,
     root: &Path,
     retained_dirs: &HashSet<Path>,
     verified_dirs: &HashSet<Path>,
     unmodified_since: Option<DateTime<Utc>>,
 ) -> Result<()> {
-    let root_path = local_root;
+    let root_path = std::path::PathBuf::from(to_local_path(root));
     let root_metadata = match std::fs::symlink_metadata(&root_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),

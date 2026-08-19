@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
     DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
@@ -15,22 +15,20 @@ use url::Url;
 #[derive(Default, Debug)]
 pub struct FileStoreProvider;
 
-#[derive(Debug)]
-struct UncPath {
-    root: PathBuf,
-    relative_path: Path,
-    store_prefix: String,
-}
+#[cfg(windows)]
+mod windows {
+    use std::path::PathBuf;
 
-fn extract_unc_path(url: &Url) -> Result<Option<UncPath>> {
-    #[cfg(not(windows))]
-    {
-        let _ = url;
-        Ok(None)
+    use super::*;
+
+    #[derive(Debug)]
+    pub(super) struct UncPath {
+        pub(super) root: PathBuf,
+        pub(super) relative_path: Path,
+        pub(super) store_prefix: String,
     }
 
-    #[cfg(windows)]
-    {
+    pub(super) fn extract_unc_path(url: &Url) -> Result<Option<UncPath>> {
         let Some(host) = url.host_str().filter(|host| *host != "localhost") else {
             return Ok(None);
         };
@@ -76,16 +74,18 @@ impl ObjectStoreProvider for FileStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
-        let unc_path = extract_unc_path(&base_path)?;
-        let local_path_prefix = unc_path.as_ref().map(|path| path.root.clone());
-        let inner = match &local_path_prefix {
-            Some(prefix) => LocalFileSystem::new_with_prefix(prefix)?,
+
+        #[cfg(windows)]
+        let inner = match windows::extract_unc_path(&base_path)? {
+            Some(unc_path) => LocalFileSystem::new_with_prefix(unc_path.root)?,
             None => LocalFileSystem::new(),
         };
+        #[cfg(not(windows))]
+        let inner = LocalFileSystem::new();
+
         Ok(ObjectStore {
             inner: Arc::new(inner),
             scheme: base_path.scheme().to_owned(),
-            local_path_prefix,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
@@ -99,7 +99,8 @@ impl ObjectStoreProvider for FileStoreProvider {
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        if let Some(unc_path) = extract_unc_path(url)? {
+        #[cfg(windows)]
+        if let Some(unc_path) = windows::extract_unc_path(url)? {
             return Ok(unc_path.relative_path);
         }
         if let Ok(file_path) = url.to_file_path()
@@ -118,9 +119,12 @@ impl ObjectStoreProvider for FileStoreProvider {
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        Ok(extract_unc_path(url)?
-            .map(|path| path.store_prefix)
-            .unwrap_or_else(|| url.scheme().to_string()))
+        #[cfg(windows)]
+        if let Some(unc_path) = windows::extract_unc_path(url)? {
+            return Ok(unc_path.store_prefix);
+        }
+
+        Ok(url.scheme().to_string())
     }
 }
 
@@ -212,9 +216,12 @@ mod tests {
     #[cfg(windows)]
     fn test_unc_share_path() {
         let url = Url::parse("file://server/My%20Share/data/my-dataset.lance").unwrap();
-        let unc_path = extract_unc_path(&url).unwrap().unwrap();
+        let unc_path = windows::extract_unc_path(&url).unwrap().unwrap();
 
-        assert_eq!(unc_path.root, PathBuf::from(r"\\server\My Share"));
+        assert_eq!(
+            unc_path.root,
+            std::path::PathBuf::from(r"\\server\My Share")
+        );
         assert_eq!(unc_path.relative_path.as_ref(), "data/my-dataset.lance");
         assert_eq!(unc_path.store_prefix, "file$server/My%20Share");
     }

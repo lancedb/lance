@@ -92,7 +92,6 @@ impl ObjectStoreProvider for TencentStoreProvider {
         Ok(ObjectStore {
             scheme: "cos".to_string(),
             inner: opendal_store,
-            local_path_prefix: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
