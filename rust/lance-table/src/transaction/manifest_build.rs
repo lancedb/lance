@@ -10,7 +10,7 @@
 //! operation vocabulary it matches on, the index rules it applies, the row version
 //! metadata it stamps, the validation that runs before it.
 
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
@@ -856,6 +856,9 @@ impl Transaction {
                     !removed_uuids.contains(&existing_index.uuid)
                         && !new_uuids.contains(&existing_index.uuid)
                 });
+                for new_index in new_indices {
+                    new_index.validate_covering_fields()?;
+                }
                 final_indices.extend(new_indices.clone());
             }
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
@@ -1293,6 +1296,29 @@ impl Transaction {
                 config.disable_transaction_file,
             )?;
         }
+        // Set after apply_feature_flags, which resets both flag words -- and a
+        // `Manifest` only points at its index section, so the flag cannot be
+        // derived there.
+        //
+        // Derived fresh from `final_indices` on every commit, never inherited.
+        // Every manifest this reaches starts with both words zeroed -- `Manifest::new`
+        // and `new_from_previous` alike -- so there is no stale bit to clear, and
+        // dropping the last covering index lifts the fence by simply not setting
+        // it again. Inheriting it from the previous manifest instead would make
+        // the fence permanent.
+        //
+        // Both words: a reader that selects a vector index by membership of
+        // `fields` would answer a query on a merely-carried column with an index
+        // keyed on another one, and a writer that treats every entry of `fields`
+        // as keyed would mismaintain it.
+        if final_indices
+            .iter()
+            .any(|index| !index.covering_fields.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
@@ -2912,6 +2938,7 @@ mod tests {
                 uuid,
                 name: name.to_string(),
                 fields: vec![0],
+                covering_fields: vec![],
                 dataset_version: 1,
                 fragment_bitmap: Some(RoaringBitmap::from_iter(frags.iter().copied())),
                 index_details: None,

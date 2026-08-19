@@ -12,8 +12,10 @@ use crate::dataset::ROW_ID;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
+use crate::utils::test::covering;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -183,6 +185,280 @@ async fn test_create_index(
     let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
     assert_eq!(fragment_bitmap.len(), 1);
     assert!(fragment_bitmap.contains(0));
+}
+
+/// An index that merely *carries* a vector column must not be selected to
+/// answer an ANN query against that column.
+///
+/// Two traps this test is written to avoid:
+///   - `early_pruning` raises `minimum_nprobes`, which can mask selection
+///     differences behind a full scan of the partitions.
+///   - `num_partitions = 1` means the probe path is never reached at all (the
+///     fixture uses [`covering::NUM_PARTITIONS`]).
+/// Both make a broken selection rule look correct, so this asserts on the
+/// plan the scanner actually built, never on query results.
+#[tokio::test]
+async fn test_covered_vector_column_is_not_selected_for_ann() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_two_vector_column_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::declare_covering(&mut dataset, "vec", "payload_vec").await;
+
+    let query = generate_random_array(covering::DIMENSION as usize);
+
+    // An ANN query on the carried column must fall back to a flat scan.
+    let mut scan = dataset.scan();
+    // `use_index` stays on: the point is that selection declines this
+    // index, not that the caller disabled indexing.
+    scan.nearest("payload_vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("KNNVectorDistance"),
+        "expected a flat KNN plan for the covered column, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("ANNIvfPartition"),
+        "the covered column must not be served by the ANN index:\n{plan}"
+    );
+
+    // The keyed column still uses the index -- without this, the test would
+    // pass just as well against an index that was never selected at all.
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the keyed column must still use the index:\n{plan}"
+    );
+}
+
+/// A filtered `describe_indices` must still find a covered index by its keyed
+/// column. The matcher compares the caller's resolved field slice against the one
+/// column named by `for_column`, so a caller that passes all of `index.fields` --
+/// carried columns included -- pushes that slice past length one and gets a silent
+/// "no match" for every covered index.
+#[tokio::test]
+async fn test_describe_indices_filters_a_covered_index_by_its_keyed_field() {
+    use lance_index::IndexCriteria;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Baseline: the plain index is found, so a later miss is about covering.
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "precondition: the plain index is findable");
+
+    let (vec_id, _) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.len(),
+        1,
+        "a covered index must still be findable by its keyed column"
+    );
+    assert_eq!(
+        found[0].field_ids(),
+        &[vec_id as u32],
+        "and must advertise only the keyed column"
+    );
+
+    // The carried column is not searchable, so it must not match.
+    let carried = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("payload")))
+        .await
+        .unwrap();
+    assert!(
+        carried.is_empty(),
+        "a carried column must not advertise an index"
+    );
+}
+
+/// An unfiltered `optimize_indices()` is a table-wide request, so a covered index
+/// must not abort it -- that would block optimization of every other index on the
+/// table over one this build merely cannot rebuild. It is skipped with a warning.
+/// Only a caller that names the covered index gets an error (see
+/// `test_optimize_indices_rejects_a_covered_index`).
+///
+/// Both the current and the stale case are covered: erroring on the stale one
+/// aborts the loop before the replacements accumulated for the other groups are
+/// committed, leaving an unrelated index stale too.
+#[rstest]
+#[case::current(false)]
+#[case::stale(true)]
+#[tokio::test]
+async fn test_optimize_skips_a_covered_index_without_blocking_others(#[case] stale: bool) {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+
+    // A covered vector index, and a plain scalar index that optimize may touch.
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::create_btree_index(&mut dataset, "payload", Some("payload_idx")).await;
+
+    let (_, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    if stale {
+        // Now *both* groups have an unindexed fragment, so the covered group
+        // would genuinely be rebuilt -- this is where the refusal used to fire.
+        covering::append_vector_payload_rows(&mut dataset, 256).await;
+    }
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a covered index must not abort an unfiltered optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![payload_id]),
+        "the covered index must be left exactly as it was"
+    );
+
+    if stale {
+        let payload_idx = after
+            .iter()
+            .filter(|idx| idx.name == "payload_idx")
+            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+            .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+                acc |= bitmap;
+                acc
+            });
+        assert!(
+            payload_idx.contains(1),
+            "the unrelated index must still have been optimized onto the new fragment, got {payload_idx:?}"
+        );
+    } else {
+        assert_eq!(after.len(), 2, "both indices must survive");
+    }
+}
+
+/// The same skip, for a *scalar* covered index. The rule does not branch on index
+/// type, but scalar groups take their own no-work path a few lines below the
+/// covering gate, so a covered scalar index reaching that gate first is worth
+/// pinning separately from the vector case above.
+///
+/// The append is what gives this test teeth. Without it the covered group has no
+/// work either way, so the scalar no-work path below the gate produces the same
+/// observable outcome as the gate itself and the test passes with the gate
+/// removed entirely.
+#[tokio::test]
+async fn test_optimize_skips_a_stale_covered_scalar_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_three_int_column_dataset(&test_uri).await;
+    covering::create_btree_index(&mut dataset, "a", None).await;
+    covering::create_btree_index(&mut dataset, "b", None).await;
+
+    let (_, carried_id) = covering::declare_covering(&mut dataset, "a", "carried").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    // Both scalar groups now have an unindexed fragment, so the covered one
+    // would genuinely be rebuilt if the gate did not skip it first.
+    covering::append_three_int_column_rows(&mut dataset, 64).await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a stale covered scalar index must not abort optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![carried_id]),
+        "the covered scalar index must be left exactly as it was, not rebuilt"
+    );
+    // The unrelated scalar index was still maintained, so the skip is scoped to
+    // the covered group rather than aborting the loop.
+    let b_id = dataset.schema().field_id("b").unwrap();
+    let b_coverage = after
+        .iter()
+        .filter(|idx| idx.fields == vec![b_id])
+        .filter_map(|idx| idx.fragment_bitmap.as_ref())
+        .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+            acc |= bitmap;
+            acc
+        });
+    assert!(
+        b_coverage.contains(1),
+        "the unrelated scalar index must still have been optimized onto the new fragment, got {b_coverage:?}"
+    );
+}
+
+/// A caller that names the covered index asked for it specifically, so the
+/// refusal is loud rather than a skip.
+#[tokio::test]
+async fn test_optimize_indices_rejects_a_covered_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Nothing writes carried values, so the storage does not contain `payload`
+    // -- which is exactly why optimize must refuse: it rebuilds from a scan
+    // projecting the keyed field and `_rowid` only, and would republish the
+    // declaration on a segment that still has no payload.
+    let (vec_id, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    // Append AFTER declaring covering, so the group really would be rebuilt.
+    // Without it this would assert the refusal against an index optimize had no
+    // work for, and would keep passing if the refusal moved behind a no-work
+    // check.
+    covering::append_vector_payload_rows(&mut dataset, 256).await;
+
+    let before = dataset.load_indices().await.unwrap();
+    let before_uuid = before[0].uuid;
+    let covered_name = before[0].name.clone();
+
+    // Name the covered index: the refusal is reserved for a caller that targeted
+    // it. An unfiltered call skips it instead, which
+    // `test_optimize_skips_a_covered_index_without_blocking_others` covers.
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec![covered_name]))
+        .await
+        .expect_err("optimizing a targeted covered index must be refused");
+    assert!(
+        err.to_string().contains("declares covering fields"),
+        "unexpected message: {err}"
+    );
+
+    // Refused, not partially applied: the index is exactly as it was.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].uuid, before_uuid,
+        "a refused optimize must not replace the index"
+    );
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    assert_eq!(after[0].fields, vec![vec_id, payload_id]);
+
+    // The appended data above is unindexed, so this really is a case optimize
+    // would otherwise have merged -- the refusal is not the no-op path.
+    assert!(
+        after.iter().all(|idx| !idx.covering_fields.is_empty()),
+        "precondition: the only index is still the covered one"
+    );
 }
 
 #[rstest]
@@ -6195,4 +6471,102 @@ async fn test_load_segment_params_full_fidelity() {
         .downcast_ref::<InvertedIndex>()
         .expect("inverted index");
     assert_eq!(&read, opened.params());
+}
+
+/// Compaction of a covered index must succeed. `remap_index` rejected any
+/// index with more than one field, so this failed outright -- a covered
+/// dataset could be created but never compacted.
+#[tokio::test]
+async fn test_compaction_withdraws_a_covered_index_without_failing() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let test_uri = TempStrDir::default();
+    let dimension = 16;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        ),
+        ArrowField::new("payload", DataType::Int32, false),
+    ]));
+
+    let make_batch = |offset: i32| {
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                generate_random_array(256 * dimension as usize),
+                dimension,
+            )
+            .unwrap(),
+        );
+        let payload = Arc::new(Int32Array::from_iter_values(offset..offset + 256));
+        RecordBatch::try_new(schema.clone(), vec![vectors, payload]).unwrap()
+    };
+
+    // Two fragments, so compaction has something to compact.
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(0))], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(256))], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    let params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 50);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let vec_id = dataset.schema().field_id("vec").unwrap();
+    let payload_id = dataset.schema().field_id("payload").unwrap();
+    let current = dataset.load_indices().await.unwrap();
+    let mut covered = current[0].clone();
+    covered.fields = vec![vec_id, payload_id];
+    covered.covering_fields = vec![payload_id];
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![covered],
+            removed_indices: current.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert!(
+        fragments_before.len() > 1,
+        "precondition: there must be something to compact"
+    );
+
+    // Compaction of the table must not be blocked by an index it cannot remap.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .expect("compaction of a covered index must succeed");
+
+    let fragments_after: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_ne!(
+        fragments_after, fragments_before,
+        "compaction rewrote nothing, so the remap path never ran"
+    );
+
+    // The entry survives untouched -- withdrawal skips remapping rather than
+    // deleting metadata -- but it now covers none of the rewritten fragments, so
+    // no query can be answered from a payload the storage never held.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    let live: roaring::RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let effective = after[0].effective_fragment_bitmap(&live);
+    assert!(
+        effective.is_none_or(|bitmap| bitmap.is_empty()),
+        "a withdrawn covered index must stop covering fragments, got {:?}",
+        after[0].fragment_bitmap
+    );
 }

@@ -2957,6 +2957,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![],
+            covering_fields: vec![],
             name: "test".to_string(),
             dataset_version: 1,
             fragment_bitmap: Some(indexed_fragments),

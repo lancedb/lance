@@ -4782,7 +4782,7 @@ impl Scanner {
 
                 if requested_index_segments
                     .iter()
-                    .any(|idx| !idx.fields.contains(&column_id))
+                    .any(|idx| idx.fields.first() != Some(&column_id))
                 {
                     return Err(Error::invalid_input(format!(
                         "with_index_segments contained a segment that does not belong to vector column '{}'",
@@ -4834,7 +4834,17 @@ impl Scanner {
                         None
                     }
                 }
-            } else if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+            }
+            // An index can only answer a query on the column it is keyed on, which is
+            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
+            // merely carries values for, which it cannot search. Not a boundary derived
+            // from `covering_fields` either -- that is computed from a field older
+            // writers drop, so it would widen to the carried columns exactly when the
+            // declaration is lost.
+            else if let Some(index) = indices
+                .iter()
+                .find(|i| i.fields.first() == Some(&column_id))
+            {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
