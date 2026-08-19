@@ -16,13 +16,13 @@ dashmap = "6"
 datafusion.workspace = true
 lance.workspace = true
 lance-namespace.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
 lance-namespace-impls.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

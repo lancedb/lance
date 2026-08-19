@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -496,6 +499,68 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
     );
 }
 
+async fn write_multi_fragment_source(uri: &str) -> Dataset {
+    let batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 8,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+async fn tag_and_shallow_clone(source: &mut Dataset, clone_uri: &str) -> Dataset {
+    source
+        .tags()
+        .create("to_clone", source.version().version)
+        .await
+        .unwrap();
+    source
+        .shallow_clone(clone_uri, "to_clone", None)
+        .await
+        .unwrap()
+}
+
+fn registry_attempts(dataset: &Dataset) -> u64 {
+    let stats = dataset.session.store_registry().stats();
+    stats.hits + stats.misses
+}
+
+#[derive(Debug, Default)]
+struct CountingObjectStoreWrapper {
+    wraps: AtomicUsize,
+}
+
+impl WrappingObjectStore for CountingObjectStoreWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        self.wraps.fetch_add(1, Ordering::Relaxed);
+        original
+    }
+}
+
+impl CountingObjectStoreWrapper {
+    fn wraps(&self) -> usize {
+        self.wraps.load(Ordering::Relaxed)
+    }
+}
+
+fn first_base_id(dataset: &Dataset) -> u32 {
+    dataset.get_fragments()[0].metadata().files[0]
+        .base_id
+        .expect("shallow clone data files must reference the source base")
+}
+
 #[tokio::test]
 async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -503,17 +568,7 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let source_uri = file_object_store_uri(source_dir.path());
     let clone_uri = file_object_store_uri(clone_dir.path());
 
-    let batch = gen_batch()
-        .col("id", array::step::<Int32Type>())
-        .into_batch_rows(RowCount::from(64))
-        .unwrap();
-    let mut source = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-        &source_uri,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut source = write_multi_fragment_source(&source_uri).await;
     source
         .create_index(
             &["id"],
@@ -525,16 +580,7 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
         .await
         .unwrap();
     source.delete("id < 4").await.unwrap();
-    source
-        .tags()
-        .create("with_artifacts", source.version().version)
-        .await
-        .unwrap();
-
-    let cloned = source
-        .shallow_clone(&clone_uri, "with_artifacts", None)
-        .await
-        .unwrap();
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
     let base = cloned
         .manifest()
         .base_paths
@@ -576,6 +622,171 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let _ = tracker.incremental_stats();
     cloned.index_statistics("id_idx").await.unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_shallow_clone_reuses_base_object_store() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let base_id = first_base_id(&cloned);
+
+    let first = cloned.object_store(Some(base_id)).await.unwrap();
+    let second = cloned.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repeated lookups must reuse the cached base object store"
+    );
+
+    let third = cloned.clone().object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &third),
+        "dataset clones must share the base object store cache"
+    );
+
+    let tracker = Arc::new(IOTracker::default());
+    let wrapped =
+        cloned.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let wrapped_store = wrapped.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &wrapped_store),
+        "the wrapped clone must not serve the undecorated store"
+    );
+    let _ = tracker.incremental_stats();
+    wrapped.scan().try_into_batch().await.unwrap();
+    assert!(
+        tracker.incremental_stats().read_iops > 0,
+        "reads on the wrapped clone must go through the wrapper"
+    );
+
+    let fresh = DatasetBuilder::from_uri(&clone_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let attempts_before = registry_attempts(&fresh);
+    let stores = futures::future::try_join_all((0..8).map(|_| fresh.object_store(Some(base_id))))
+        .await
+        .unwrap();
+    assert!(
+        stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])),
+        "concurrent resolutions must share one store"
+    );
+    assert_eq!(
+        registry_attempts(&fresh) - attempts_before,
+        1,
+        "concurrent resolutions must resolve the store exactly once"
+    );
+
+    // A caller can derive wrapper-scoped datasets by applying the same shared
+    // wrapper to a cached dataset. Each derived dataset must retain one base
+    // store for its own lifetime without sharing it with another scope.
+    let shared_wrapper = Arc::new(CountingObjectStoreWrapper::default());
+    let scope_a =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let scope_b =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let wraps_before = shared_wrapper.wraps();
+    let attempts_before = registry_attempts(&fresh);
+
+    let scope_a_first = scope_a.object_store(Some(base_id)).await.unwrap();
+    let scope_a_second = scope_a.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_a_first, &scope_a_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+
+    let scope_b_first = scope_b.object_store(Some(base_id)).await.unwrap();
+    let scope_b_second = scope_b.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_b_first, &scope_b_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first, &scope_b_first),
+        "separate wrapper scopes must not share a stateful base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first.inner, &scope_b_first.inner),
+        "separate wrapper scopes must not share provider-local layers"
+    );
+    assert_eq!(
+        registry_attempts(&fresh) - attempts_before,
+        0,
+        "wrapper-scoped base stores must bypass the global registry cache"
+    );
+    assert_eq!(
+        shared_wrapper.wraps() - wraps_before,
+        2,
+        "each wrapper scope must build its base store exactly once"
+    );
+
+    let read = cloned.scan().try_into_batch().await.unwrap();
+    assert_eq!(read.num_rows(), 64);
+}
+
+#[tokio::test]
+async fn test_base_object_store_cache_invalidation() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let extra_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let mut cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let base_id = first_base_id(&cloned);
+    let store = cloned.object_store(Some(base_id)).await.unwrap();
+
+    let rebound = cloned.with_object_store(
+        cloned.object_store.clone(),
+        Some(ObjectStoreParams {
+            block_size: Some(32 * 1024),
+            ..Default::default()
+        }),
+    );
+    let rebound_store = rebound.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&store, &rebound_store),
+        "changed store params must not serve the previously cached base store"
+    );
+
+    cloned.delete("id = 0").await.unwrap();
+    let attempts_before = registry_attempts(&cloned);
+    let retained = cloned.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&store, &retained),
+        "commits that keep base_paths must keep the cache"
+    );
+    assert_eq!(
+        registry_attempts(&cloned) - attempts_before,
+        0,
+        "commits that keep base_paths must not re-resolve the store"
+    );
+
+    let with_extra = Arc::new(cloned)
+        .add_bases(
+            vec![lance_table::format::BasePath::new(
+                0,
+                file_object_store_uri(extra_dir.path()),
+                Some("extra".to_string()),
+                true,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    let attempts_before = registry_attempts(&with_extra);
+    with_extra.object_store(Some(base_id)).await.unwrap();
+    assert_eq!(
+        registry_attempts(&with_extra) - attempts_before,
+        1,
+        "base_paths changes must reset the cache and re-resolve the store"
+    );
 }
 
 #[cfg(feature = "azure")]
@@ -982,15 +1193,18 @@ async fn test_write_params(
     assert_eq!(dataset.count_fragments(), 10);
     for fragment in &fragments {
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
-        let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await
-            .unwrap();
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() as u32 {
-                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
+            let reader = crate::dataset::versions::open_v1_fragment_reader(
+                fragment,
+                dataset.schema(),
+                &FragReadConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() as u32 {
+                assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -1052,7 +1266,7 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
+        DataStorageFormat::new(data_storage_version.resolve())
     );
     assert!(!matches!(
         manifest.data_storage_format.version.to_manifest_string(),
@@ -1103,6 +1317,7 @@ async fn test_write_manifest(
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            migration_next_row_id: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1176,8 +1391,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .await
     .unwrap();
     assert_eq!(
-        manifest.data_storage_format.lance_file_version().unwrap(),
-        LanceFileVersion::V2_3
+        manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let append_batch = RecordBatch::try_new(
@@ -1199,12 +1414,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let actual = dataset.scan().try_into_batch().await.unwrap();
@@ -1246,12 +1457,8 @@ async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -1286,12 +1493,8 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        clone
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        clone.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -2129,6 +2332,53 @@ async fn append_dictionary(
 }
 
 #[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
+#[tokio::test]
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -2457,12 +2707,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 
     let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
@@ -2478,12 +2724,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 }
 

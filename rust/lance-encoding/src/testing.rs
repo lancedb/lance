@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
@@ -34,8 +35,7 @@ use crate::{
         try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
         try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
-        try_variable_packed_struct_per_value, try_variable_rle_block, try_variable_width_miniblock,
-        try_variable_width_per_value,
+        try_variable_rle_block, try_variable_width_miniblock, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -173,7 +173,7 @@ impl CompressionStrategy for TestCompressionStrategy {
                 reject_packed_struct_per_value(field, data)?
             }
             TestEncoding::StructuralU32 | TestEncoding::StructuralSparse => {
-                try_variable_packed_struct_per_value(Arc::new(self.clone()), field, data)?
+                try_packed_struct_per_value(Arc::new(self.clone()), field, data)?
             }
         };
         if let Some(compressor) = packed {

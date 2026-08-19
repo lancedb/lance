@@ -12,7 +12,9 @@ use futures::future::try_join_all;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
+use lance_index::scalar::{
+    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+};
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
@@ -142,10 +144,20 @@ impl ScalarIndex for LogicalScalarIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let results = try_join_all(
             self.segments
                 .iter()
-                .map(|segment| segment.search(query, metrics)),
+                .map(|segment| segment.search_with_options(query, options, metrics)),
         )
         .await?;
         combine_search_results(results)
@@ -366,11 +378,14 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::array;
+    use lance_datagen::{ArrayGeneratorExt, array};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
+    use lance_index::scalar::{
+        BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
+    };
+    use lance_select::{RowAddrTreeMap, RowSetOps};
 
     use crate::Dataset;
     use crate::dataset::WriteParams;
@@ -432,7 +447,10 @@ mod tests {
     async fn test_open_named_scalar_index_uses_all_btree_segments() {
         let test_dir = TempStrDir::default();
         let dataset = lance_datagen::gen_batch()
-            .col("value", array::step::<Int32Type>())
+            .col(
+                "value",
+                array::fill::<Int32Type>(7).with_nulls(&[true, false, true, true]),
+            )
             .into_dataset(
                 test_dir.as_str(),
                 FragmentCount::from(4),
@@ -473,6 +491,24 @@ mod tests {
             logical.calculate_included_frags().await.unwrap(),
             dataset.fragment_bitmap.as_ref().clone()
         );
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(99)));
+        let tracked = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(tracked) = tracked else {
+            panic!("BTree search should be exact");
+        };
+        assert!(tracked.true_rows().is_empty());
+        assert!(!tracked.null_rows().is_empty());
+
+        let untracked = logical
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked, SearchResult::exact(RowAddrTreeMap::default()));
 
         let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_btree")
             .await

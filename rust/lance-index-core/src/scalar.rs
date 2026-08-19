@@ -4,7 +4,7 @@
 //! Abstract scalar index traits and types for Lance index plugins
 
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -500,6 +500,36 @@ impl UpdateCriteria {
     }
 }
 
+/// Execution-time options for scalar index searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Preserve rows where the query evaluates to NULL.
+    ///
+    /// Callers may disable this only when NULL rows cannot affect the final
+    /// result, such as a top-level filter whose NULL results will be discarded.
+    track_nulls: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { track_nulls: true }
+    }
+}
+
+impl SearchOptions {
+    /// Configure whether searches preserve rows where the query evaluates to
+    /// NULL. When disabled, implementations return only TRUE rows.
+    pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
+        self.track_nulls = track_nulls;
+        self
+    }
+
+    /// Whether searches preserve rows where the query evaluates to NULL.
+    pub fn track_nulls(&self) -> bool {
+        self.track_nulls
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -511,6 +541,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Search the scalar index with execution-time options.
+    ///
+    /// Index implementations that do not need the options can rely on this
+    /// default implementation. The default preserves the behavior of
+    /// [`Self::search`].
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        _options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search(query, metrics).await
+    }
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids
@@ -554,6 +598,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Returns the value type expected by [`Self::update`], when the index has
+    /// a durable type contract for its training data.
+    ///
+    /// Wrapper indices use this to transform new data to the same type as the
+    /// loaded index instead of inferring a potentially different type from an
+    /// update batch. Index types without such a contract may return `None`.
+    fn training_data_type(&self) -> Option<DataType> {
+        None
+    }
 
     /// Global `[min, max]` of the indexed column from index metadata, without a
     /// scan, or `None` if this index type cannot supply a sound bound. When

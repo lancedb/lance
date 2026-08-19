@@ -13,6 +13,13 @@ pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
     "compound_peak_address_resolution_batch_size";
 pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
 pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
+pub const COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC: &str = "compound_should_skipped_windows";
+pub const COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC: &str =
+    "compound_should_bound_recomputations";
+pub const COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC: &str =
+    "compound_should_essential_evaluations";
+pub const COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC: &str =
+    "compound_should_non_essential_evaluations";
 
 /// A trait used by the index to report metrics
 ///
@@ -105,6 +112,18 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record a candidate-buffer high-water mark for compound FTS.
     fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}
+
+    /// Record pure-SHOULD compound FTS windows skipped using score bounds.
+    fn record_compound_should_skipped_windows(&self, _num_windows: usize) {}
+
+    /// Record score-bound recomputations for pure-SHOULD compound FTS windows.
+    fn record_compound_should_bound_recomputations(&self, _num_recomputations: usize) {}
+
+    /// Record essential-clause evaluations for pure-SHOULD compound FTS.
+    fn record_compound_should_essential_evaluations(&self, _num_evaluations: usize) {}
+
+    /// Record non-essential-clause evaluations for pure-SHOULD compound FTS.
+    fn record_compound_should_non_essential_evaluations(&self, _num_evaluations: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.

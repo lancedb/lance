@@ -129,6 +129,12 @@ impl TrainingRequest {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Overrides the scalar training scan's I/O budget without mutating process-wide state.
+    pub(crate) static TEST_TRAINING_IO_BUFFER_SIZE: u64;
+}
+
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
@@ -138,6 +144,10 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+    #[cfg(test)]
+    if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
+        scan.io_buffer_size(io_buffer_size);
+    }
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
 

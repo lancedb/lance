@@ -119,6 +119,18 @@ impl IndexMetadata {
         let fragment_bitmap = self.fragment_bitmap.as_ref()?;
         Some(fragment_bitmap - existing_fragments)
     }
+
+    /// True when the index reports matches as physical row addresses rather than row ids
+    /// (`ScalarIndex::results_are_row_addresses`).
+    ///
+    /// Such an index cannot follow its data through a rewrite: the addresses it stores
+    /// name fragments and offsets, and neither kind supports remap.
+    pub fn results_are_row_addrs(&self) -> bool {
+        self.index_details.as_ref().is_some_and(|details| {
+            details.type_url.ends_with("ZoneMapIndexDetails")
+                || details.type_url.ends_with("BloomFilterIndexDetails")
+        })
+    }
 }
 
 impl DeepSizeOf for IndexMetadata {

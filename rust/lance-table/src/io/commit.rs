@@ -239,9 +239,23 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token observed at `path`.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity. The generic
+    /// [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// workflow therefore neither persists nor validates it: COPY and external
+    /// index publication are not atomic, so an otherwise correct equivalent
+    /// materialization can make a stored token stale before it is published.
+    ///
+    /// When present, the token still distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
 }
 
@@ -1110,8 +1124,10 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory"
-        | "goosefs" => Ok(Arc::new(ConditionalPutCommitHandler)),
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "tos" | "shared-memory" | "goosefs" => {
+            Ok(Arc::new(ConditionalPutCommitHandler))
+        }
+        "cos" => Ok(Arc::new(TencentCosCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -1594,6 +1610,45 @@ impl Debug for ConditionalPutCommitHandler {
     }
 }
 
+/// A read-capable handler that prevents unsafe default commits to Tencent COS.
+///
+/// COS silently ignores its put-if-not-exists header on buckets that have ever
+/// had versioning enabled. Since that bucket history cannot be inferred from
+/// the URI or storage options, using [`ConditionalPutCommitHandler`] here can
+/// let concurrent writers overwrite the same manifest without reporting a
+/// conflict.
+struct TencentCosCommitHandler;
+
+#[async_trait::async_trait]
+impl CommitHandler for TencentCosCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    async fn commit(
+        &self,
+        _manifest: &mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: ManifestWriter,
+        _naming_scheme: ManifestNamingScheme,
+        _transaction: Option<Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        Err(CommitError::OtherError(Error::not_supported(
+            "Default writes to Tencent COS are disabled because COS does not reliably enforce \
+             put-if-not-exists after bucket versioning has ever been enabled. Provide a \
+             distributed commit_lock in Python or a custom CommitHandler in Rust.",
+        )))
+    }
+}
+
+impl Debug for TencentCosCommitHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TencentCosCommitHandler").finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
@@ -2031,7 +2086,6 @@ mod tests {
     #[case::az("az://bucket-a/ds")]
     #[case::abfss("abfss://bucket-a/ds")]
     #[case::oss("oss://bucket-a/ds")]
-    #[case::cos("cos://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
     #[case::goosefs("goosefs://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
@@ -2135,6 +2189,51 @@ mod tests {
         Box::pin(async move { Ok(WriteResult::default()) })
     }
 
+    fn test_manifest() -> Manifest {
+        use std::collections::HashMap;
+
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::format::DataStorageFormat;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
+            HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_cos_commit_requires_custom_handler() {
+        let handler = commit_handler_from_url("cos://bucket-a/ds", &None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
+
+        let mut manifest = test_manifest();
+        let error = handler
+            .commit(
+                &mut manifest,
+                None,
+                &Path::from("test"),
+                &ObjectStore::memory(),
+                succeeding_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let CommitError::OtherError(error) = error else {
+            panic!("expected a not-supported commit error");
+        };
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("distributed commit_lock"));
+    }
+
     /// A manifest writer that never completes, simulating a hung object store.
     fn hanging_manifest_writer<'a>(
         _object_store: &'a ObjectStore,
@@ -2153,15 +2252,8 @@ mod tests {
     /// still release the lock; otherwise it leaks until the lease's TTL expires.
     #[tokio::test]
     async fn test_commit_lock_released_on_cancellation() {
-        use std::collections::HashMap;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
-
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-
-        use crate::format::DataStorageFormat;
 
         let released = Arc::new(AtomicBool::new(false));
         let lock = TrackingLock {
@@ -2170,13 +2262,7 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let base_path = Path::from("test");
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
-            HashMap::new(),
-        );
+        let mut manifest = test_manifest();
 
         // The commit will hang on the manifest writer while holding the lock.
         // Cancel it the same way a commit timeout would: drop the future.
@@ -2210,15 +2296,8 @@ mod tests {
     /// lock via the drop-path best-effort release.
     #[tokio::test]
     async fn test_commit_lock_released_on_cancellation_during_release() {
-        use std::collections::HashMap;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
-
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-
-        use crate::format::DataStorageFormat;
 
         let release_calls = Arc::new(AtomicUsize::new(0));
         let released = Arc::new(AtomicBool::new(false));
@@ -2229,13 +2308,7 @@ mod tests {
 
         let object_store = ObjectStore::memory();
         let base_path = Path::from("test");
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
-            HashMap::new(),
-        );
+        let mut manifest = test_manifest();
 
         // The manifest writer succeeds, so the commit reaches the explicit
         // release, which hangs. Cancel it the same way a commit timeout would.

@@ -26,7 +26,10 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
+    path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -495,6 +498,28 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, true).await
+    }
+
+    /// Parse a URI and build a fresh object store outside the registry cache.
+    ///
+    /// The caller must retain the returned store for as long as its
+    /// provider-local state should be reused.
+    #[doc(hidden)]
+    pub async fn from_uri_and_params_uncached(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+    ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, false).await
+    }
+
+    async fn from_uri_and_params_impl(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+        use_registry_cache: bool,
+    ) -> Result<(Arc<Self>, Path)> {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
@@ -528,7 +553,11 @@ impl ObjectStore {
         }
         let url = uri_to_url(uri)?;
 
-        let store = registry.get_store(url.clone(), params).await?;
+        let store = if use_registry_cache {
+            registry.get_store(url.clone(), params).await?
+        } else {
+            registry.new_store(url.clone(), params).await?
+        };
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
         let path = provider.extract_path(&url)?;
@@ -829,6 +858,57 @@ impl ObjectStore {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
         Writer::shutdown(writer.as_mut()).await
+    }
+
+    /// Atomically creates an object without replacing an existing object.
+    ///
+    /// Local stores publish a uniquely named staging object with a conditional
+    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// is rejected because it can silently ignore conditional create requests.
+    ///
+    /// Returns [`object_store::Error::NotSupported`] without writing when the
+    /// backend cannot reliably provide put-if-absent semantics.
+    pub async fn put_if_absent(
+        &self,
+        path: &Path,
+        content: PutPayload,
+    ) -> object_store::Result<()> {
+        if self.scheme == "cos" {
+            return Err(object_store::Error::NotSupported {
+                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
+                         versioning has ever been enabled"
+                    .into(),
+            });
+        }
+
+        if self.is_local() {
+            let staging_path =
+                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            self.inner.put(&staging_path, content).await?;
+            let result = self.inner.rename_if_not_exists(&staging_path, path).await;
+            if result.is_err()
+                && let Err(error) = self.inner.delete(&staging_path).await
+            {
+                log::warn!(
+                    "Failed to remove staging object {} after atomic create failed: {}",
+                    staging_path,
+                    error
+                );
+            }
+            result
+        } else {
+            self.inner
+                .put_opts(
+                    path,
+                    content,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -1303,6 +1383,44 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent() {
+        let temp_dir = TempStrDir::default();
+        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let store = ObjectStore::local();
+        store
+            .put_if_absent(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"second").into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ));
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"first".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent_rejects_cos() {
+        let mut store = ObjectStore::memory();
+        store.scheme = "cos".to_string();
+        let path = Path::from("atomic-create");
+
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(!store.exists(&path).await.unwrap());
     }
 
     #[test]

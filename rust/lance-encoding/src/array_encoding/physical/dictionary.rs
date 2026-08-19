@@ -259,6 +259,16 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
             }
             _ => panic!("Expected dictionary data"),
         };
+        let declared_key_bits = key_type.byte_width() as u64 * 8;
+        if dict_data.indices.bits_per_value != declared_key_bits {
+            return Err(Error::invalid_input(format!(
+                "dictionary indices use {} bits but the declared {} key type uses {} bits; the normalized dictionary has {} values",
+                dict_data.indices.bits_per_value,
+                key_type,
+                declared_key_bits,
+                dict_data.dictionary.num_values()
+            )));
+        }
         let num_dictionary_items = dict_data.dictionary.num_values() as u32;
 
         let encoded_indices = self.indices_encoder.encode(

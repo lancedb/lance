@@ -82,7 +82,7 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
@@ -94,6 +94,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
+use super::versions;
 use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
@@ -102,17 +103,23 @@ use crate::index::DatasetIndexExt;
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
-use arrow_array::Array;
-use arrow_array::RecordBatch;
-use arrow_array::StructArray;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
-use arrow_buffer::NullBuffer;
+use arrow_array::{
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray, UInt32Array,
+};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{StreamExt, TryStreamExt};
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt, TryStreamExt};
+use lance_arrow::{list::ListArrayExt, r#struct::StructArrayExt};
 use lance_core::Error;
 use lance_core::datatypes::{
     BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling, BlobKind, BlobV2Layout,
+    Field as LanceField,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
@@ -123,12 +130,11 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-mod binary_copy;
+pub(super) mod binary_copy;
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
-use binary_copy::rewrite_files_binary_copy;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -264,6 +270,29 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum number of source rows to compact in a single run. Rows are
+    /// counted as live rows (physical rows minus soft-deleted rows). When
+    /// set, tasks are included in the plan until adding the next task would
+    /// exceed this limit.
+    /// Defaults to `None` (no limit).
+    pub max_source_rows: Option<usize>,
+    /// Maximum number of source bytes to compact in a single run, measured as
+    /// the total size of the source fragments' data and overlay files. When
+    /// set, tasks are included in the plan until adding the next task would
+    /// exceed this limit.
+    /// Blob v2 payloads live in separate blob files and are not counted, so
+    /// this is not a cap on total compaction I/O for datasets with blob
+    /// columns.
+    /// Defaults to `None` (no limit).
+    pub max_source_bytes: Option<u64>,
+    /// Fragment IDs to exclude from compaction planning.
+    ///
+    /// Excluded fragments act as boundaries between adjacent compaction candidates,
+    /// so fragments on opposite sides of an exclusion are never combined into the
+    /// same task. IDs that are duplicated or absent from the dataset are ignored.
+    /// Defaults to an empty list.
+    #[serde(default)]
+    pub excluded_fragment_ids: Vec<u32>,
     /// Maximum number of data overlay files a fragment may carry before it is
     /// fully compacted. When set, any fragment with more than this many overlays
     /// is rewritten into a fresh fragment with its overlays (and deletions)
@@ -302,6 +331,9 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_source_rows: None,
+            max_source_bytes: None,
+            excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
             transaction_properties: None,
         }
@@ -329,6 +361,8 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_source_rows`
+    /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
@@ -440,6 +474,22 @@ impl CompactionOptions {
                         ))
                     })?);
                 }
+                "max_source_rows" => {
+                    self.max_source_rows = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_bytes" => {
+                    self.max_source_bytes = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
                 "max_overlays_per_fragment" => {
                     // The default is `Some(10)`, so an explicit "none" is the only
                     // way to disable the trigger through the manifest config.
@@ -461,11 +511,28 @@ impl CompactionOptions {
         Ok(())
     }
 
-    pub fn validate(&mut self) {
+    pub fn validate(&mut self) -> Result<()> {
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
         }
+
+        for (name, value) in [
+            (
+                "max_source_fragments",
+                self.max_source_fragments.map(|v| v as u64),
+            ),
+            ("max_source_rows", self.max_source_rows.map(|v| v as u64)),
+            ("max_source_bytes", self.max_source_bytes),
+        ] {
+            if value == Some(0) {
+                return Err(Error::invalid_input(format!(
+                    "CompactionOptions::{} must be greater than 0 (use None for no limit)",
+                    name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the effective [`CompactionMode`], preferring the new
@@ -506,7 +573,8 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    can_use_binary_copy_impl(dataset, options, fragments)
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
@@ -514,13 +582,12 @@ async fn can_use_binary_copy(
         })
 }
 
-async fn can_use_binary_copy_impl(
+pub(super) async fn can_use_binary_copy_current(
     dataset: &Dataset,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> Result<bool> {
     use lance_file::reader::FileReader as LFReader;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
@@ -537,27 +604,10 @@ async fn can_use_binary_copy_impl(
         return Ok(false);
     }
 
-    let storage_ok = dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()
-        .map(|v| !matches!(v.resolve(), LanceFileVersion::Legacy))
-        .unwrap_or(false);
-    if !storage_ok {
-        log::debug!("Binary copy disabled: dataset uses legacy storage format");
-        return Ok(false);
-    }
-
     if fragments.is_empty() {
         log::debug!("Binary copy disabled: no fragments to compact");
         return Ok(false);
     }
-
-    let storage_file_version = dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()?
-        .resolve();
 
     if fragments[0].files.is_empty() {
         log::debug!(
@@ -568,8 +618,6 @@ async fn can_use_binary_copy_impl(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
-    let mut is_same_version = true;
-
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
@@ -580,13 +628,6 @@ async fn can_use_binary_copy_impl(
         }
 
         for data_file in &fragment.files {
-            let version_ok = data_file
-                .file_version()
-                .is_ok_and(|v| v == ConcreteFileVersion::from(storage_file_version));
-
-            if !version_ok {
-                is_same_version = false;
-            }
             if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
                 return Ok(false);
             }
@@ -621,11 +662,6 @@ async fn can_use_binary_copy_impl(
                 return Ok(false);
             }
         }
-    }
-
-    if !is_same_version {
-        log::debug!("Binary copy disabled: data files use different file versions");
-        return Ok(false);
     }
 
     Ok(true)
@@ -682,12 +718,17 @@ pub trait CompactionPlanner: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
+    excluded_fragment_ids: RoaringBitmap,
 }
 
 impl DefaultCompactionPlanner {
-    pub fn new(mut options: CompactionOptions) -> Self {
-        options.validate();
-        Self { options }
+    pub fn new(mut options: CompactionOptions) -> Result<Self> {
+        options.validate()?;
+        let excluded_fragment_ids = options.excluded_fragment_ids.iter().copied().collect();
+        Ok(Self {
+            options,
+            excluded_fragment_ids,
+        })
     }
 }
 
@@ -712,10 +753,15 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             "fragments in manifest are not sorted"
         );
         let mut fragment_metrics = futures::stream::iter(fragments)
-            .map(|fragment| async move {
-                match collect_metrics(&fragment).await {
-                    Ok(metrics) => Ok((fragment.metadata, metrics)),
-                    Err(e) => Err(e),
+            .map(|fragment| async {
+                if u32::try_from(fragment.id())
+                    .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id))
+                {
+                    Ok(None)
+                } else {
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| Some((fragment.metadata, metrics)))
                 }
             })
             .buffered(dataset.object_store.as_ref().io_parallelism());
@@ -735,7 +781,16 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut i = 0;
 
         while let Some(res) = fragment_metrics.next().await {
-            let (fragment, metrics) = res?;
+            let Some((fragment, metrics)) = res? else {
+                // Exclusions preserve adjacency semantics: they terminate the
+                // current bin instead of allowing candidates on either side to
+                // be planned together.
+                if let Some(bin) = current_bin.take() {
+                    candidate_bins.push(bin);
+                }
+                i += 1;
+                continue;
+            };
 
             let over_overlay_limit = self
                 .options
@@ -808,27 +863,22 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
+        let all_tasks: Vec<(TaskData, usize)> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| TaskData {
-                fragments: bin.fragments,
+            .map(|bin| {
+                let live_rows = bin.row_counts.iter().sum();
+                (
+                    TaskData {
+                        fragments: bin.fragments,
+                    },
+                    live_rows,
+                )
             })
             .collect();
 
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_frags <= max_frags
-                })
-                .collect()
-        } else {
-            all_tasks
-        };
+        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -854,7 +904,7 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    let planner = DefaultCompactionPlanner::new(options);
+    let planner = DefaultCompactionPlanner::new(options)?;
     compact_files_with_planner(dataset, remap_options, &planner).await
 }
 
@@ -928,6 +978,111 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
         physical_rows,
         num_deletions,
     })
+}
+
+/// Truncates a planned task list to the configured per-run source budgets
+/// (`max_source_fragments`, `max_source_rows`, `max_source_bytes`).
+///
+/// All configured budgets apply together: tasks are kept, in order, until
+/// adding the next task would exceed any one of them. The budgets are hard
+/// upper bounds, so if the first task already exceeds one of them the
+/// returned plan is empty and a warning is logged, since compaction would
+/// otherwise stall silently.
+///
+/// Each task is paired with the number of live rows in its source fragments.
+fn limit_tasks_to_source_budget(
+    options: &CompactionOptions,
+    schema: &lance_core::datatypes::Schema,
+    all_tasks: Vec<(TaskData, usize)>,
+) -> Result<Vec<TaskData>> {
+    if options.max_source_fragments.is_none()
+        && options.max_source_rows.is_none()
+        && options.max_source_bytes.is_none()
+    {
+        return Ok(all_tasks.into_iter().map(|(task, _)| task).collect());
+    }
+
+    // Only needed for the bytes budget: files whose fields are all absent
+    // from the current schema only back dropped columns, which compaction
+    // does not read.
+    let schema_field_ids: HashSet<i32> = if options.max_source_bytes.is_some() {
+        schema.field_ids().into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+
+    let num_candidate_tasks = all_tasks.len();
+    let mut total_fragments = 0_usize;
+    let mut total_rows = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut tasks = Vec::with_capacity(all_tasks.len());
+    for (task, live_rows) in all_tasks {
+        total_fragments += task.fragments.len();
+        total_rows = total_rows.saturating_add(live_rows);
+        if options.max_source_bytes.is_some() {
+            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+        }
+
+        let over_budget = options
+            .max_source_fragments
+            .is_some_and(|max| total_fragments > max)
+            || options.max_source_rows.is_some_and(|max| total_rows > max)
+            || options
+                .max_source_bytes
+                .is_some_and(|max| total_bytes > max);
+        if over_budget {
+            break;
+        }
+
+        tasks.push(task);
+    }
+
+    if tasks.is_empty() && num_candidate_tasks > 0 {
+        warn!(
+            "Compaction plan is empty: the first of {} candidate tasks already exceeds a source \
+             budget (max_source_fragments={:?}, max_source_rows={:?}, max_source_bytes={:?}); \
+             compaction cannot make progress until the budget is raised",
+            num_candidate_tasks,
+            options.max_source_fragments,
+            options.max_source_rows,
+            options.max_source_bytes
+        );
+    }
+
+    Ok(tasks)
+}
+
+/// Returns the total size in bytes of a task's source data and overlay files.
+///
+/// Files whose fields are all absent from `schema_field_ids` only back
+/// dropped columns; compaction does not read them, so they are neither
+/// counted nor required to have a recorded size.
+/// Only sizes recorded in the manifest are used: a missing size is an error
+/// rather than a metadata request against object storage, which would turn
+/// planning into one round trip per file. Deletion files are not counted.
+fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+    let mut total_bytes = 0_u64;
+    for fragment in &task.fragments {
+        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+        for data_file in fragment.files.iter().chain(overlay_files) {
+            if !data_file
+                .fields
+                .iter()
+                .any(|field_id| schema_field_ids.contains(field_id))
+            {
+                continue;
+            }
+            let size = data_file.file_size_bytes.get().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
+                     in the manifest; unset max_source_bytes to compact this dataset",
+                    data_file.path, fragment.id
+                ))
+            })?;
+            total_bytes = total_bytes.saturating_add(size.get());
+        }
+    }
+    Ok(total_bytes)
 }
 
 /// A plan for what groups of fragments to compact.
@@ -1054,22 +1209,21 @@ impl<'a> BlobV2Descriptor<'a> {
     }
 }
 
-/// Result of row classification for blob v2 compaction.
+/// Result of row classification for a blob v2 rewrite.
 struct RowClassification {
     row_classes: Vec<RowClass>,
-    blob_read_addrs: Vec<u64>,
+    data_blob_indices: Vec<usize>,
 }
 
 /// Classify each row of a blob v2 column as Null, External, or DataBlob.
 fn classify_rows(
     struct_arr: &StructArray,
     descriptor: &BlobV2Descriptor<'_>,
-    row_addrs: &arrow::array::UInt64Array,
     column_name: &str,
 ) -> Result<RowClassification> {
     let num_rows = struct_arr.len();
     let mut row_classes = Vec::with_capacity(num_rows);
-    let mut blob_read_addrs = Vec::with_capacity(num_rows);
+    let mut data_blob_indices = Vec::with_capacity(num_rows);
 
     for i in 0..num_rows {
         if struct_arr.is_null(i) || descriptor.kind_col.is_null(i) {
@@ -1085,14 +1239,14 @@ fn classify_rows(
                 row_classes.push(RowClass::External);
             } else {
                 row_classes.push(RowClass::DataBlob);
-                blob_read_addrs.push(row_addrs.value(i));
+                data_blob_indices.push(i);
             }
         }
     }
 
     Ok(RowClassification {
         row_classes,
-        blob_read_addrs,
+        data_blob_indices,
     })
 }
 
@@ -1102,20 +1256,82 @@ fn classify_rows(
 /// payloads in memory at once.
 async fn descriptor_to_logical_blob_array(
     dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    struct_arr: &StructArray,
     descriptor: &BlobV2Descriptor<'_>,
     classification: &RowClassification,
-    column_name: &str,
-    num_rows: usize,
-    null_buffer: Option<NullBuffer>,
+    row_addrs: &[u64],
+    field_name: &str,
 ) -> Result<StructArray> {
-    let blob_files = if classification.blob_read_addrs.is_empty() {
+    if struct_arr.len() != row_addrs.len() {
+        return Err(Error::internal(format!(
+            "Blob v2 field '{}' row count {} did not match row address count {}",
+            field_name,
+            struct_arr.len(),
+            row_addrs.len()
+        )));
+    }
+    let blob_files = if classification.data_blob_indices.is_empty() {
         Vec::new()
     } else {
-        super::blob::take_blobs_by_addresses(dataset, &classification.blob_read_addrs, column_name)
-            .await?
+        let indices = classification
+            .data_blob_indices
+            .iter()
+            .map(|index| {
+                u32::try_from(*index).map_err(|_| {
+                    Error::internal(format!(
+                        "Blob v2 row index {} in field '{}' does not fit in u32",
+                        index, field_name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = UInt32Array::from(indices);
+        let descriptions = arrow_select::take::take(struct_arr, &indices, None)?;
+        let descriptions = descriptions.as_struct();
+        let data_row_addrs = classification
+            .data_blob_indices
+            .iter()
+            .map(|index| row_addrs[*index])
+            .collect::<Vec<_>>();
+        super::blob::collect_blob_v2_descriptor_files(
+            dataset,
+            blob_field_id,
+            descriptions,
+            &data_row_addrs,
+        )
+        .await?
     };
 
-    let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, 0);
+    let data_capacity =
+        classification
+            .data_blob_indices
+            .iter()
+            .try_fold(0usize, |data_capacity, row_idx| {
+                if descriptor.size_col.is_null(*row_idx) {
+                    return Err(Error::internal(format!(
+                        "Non-null blob row {} in field '{}' is missing its size",
+                        row_idx, field_name
+                    )));
+                }
+                let size = usize::try_from(descriptor.size_col.value(*row_idx)).map_err(|_| {
+                    Error::internal(format!(
+                        "Blob size {} at row {} in field '{}' does not fit in usize",
+                        descriptor.size_col.value(*row_idx),
+                        row_idx,
+                        field_name
+                    ))
+                })?;
+                data_capacity.checked_add(size).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Total blob size in field '{}' exceeds usize",
+                        field_name
+                    ))
+                })
+            })?;
+
+    let num_rows = struct_arr.len();
+    let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, data_capacity);
     let mut uri_builder = StringBuilder::with_capacity(num_rows, 0);
     let mut out_position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
     let mut out_size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
@@ -1140,7 +1356,7 @@ async fn descriptor_to_logical_blob_array(
                     let base = dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
                         Error::internal(format!(
                             "External blob in column '{}' references unknown base_id {}",
-                            column_name, base_id
+                            field_name, base_id
                         ))
                     })?;
                     let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
@@ -1158,12 +1374,15 @@ async fn descriptor_to_logical_blob_array(
                 }
             }
             RowClass::DataBlob => {
-                let blob_file = blob_files[blob_file_idx].as_ref().ok_or_else(|| {
-                    Error::internal(format!(
-                        "Non-null blob row {} in column '{}' resolved to null",
-                        i, column_name
-                    ))
-                })?;
+                let blob_file = blob_files
+                    .get(blob_file_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Non-null blob row {} in field '{}' resolved to null",
+                            i, field_name
+                        ))
+                    })?;
                 let data = blob_file.read().await?;
                 blob_file_idx += 1;
                 data_builder.append_value(data.as_ref());
@@ -1182,8 +1401,439 @@ async fn descriptor_to_logical_blob_array(
             Arc::new(out_position_builder.finish()),
             Arc::new(out_size_builder.finish()),
         ],
-        null_buffer,
+        struct_arr.nulls().cloned(),
     )?)
+}
+
+fn transformed_arrow_field(field: &LanceField, data_type: ArrowDataType) -> Arc<ArrowField> {
+    let arrow_field = ArrowField::from(field);
+    arrow_field_with_data_type(&arrow_field, data_type)
+}
+
+fn arrow_field_with_data_type(field: &ArrowField, data_type: ArrowDataType) -> Arc<ArrowField> {
+    Arc::new(
+        ArrowField::new(field.name(), data_type, field.is_nullable())
+            .with_metadata(field.metadata().clone()),
+    )
+}
+
+pub(crate) fn field_contains_blob_v2(field: &LanceField) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
+
+enum BlobV2FieldRewritePlan {
+    Passthrough {
+        output_field: Arc<ArrowField>,
+    },
+    Blob {
+        field_id: u32,
+        field_name: String,
+        output_field: Arc<ArrowField>,
+    },
+    Struct {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        children: Vec<Self>,
+    },
+    List {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        child: Box<Self>,
+    },
+    LargeList {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        child: Box<Self>,
+    },
+}
+
+impl BlobV2FieldRewritePlan {
+    fn passthrough(field: &ArrowField) -> Self {
+        Self::Passthrough {
+            output_field: Arc::new(field.clone()),
+        }
+    }
+
+    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+        if !field_contains_blob_v2(field) {
+            return Ok(Self::passthrough(input_field));
+        }
+
+        if field.is_blob_v2() {
+            let field_id = u32::try_from(field.id).map_err(|_| {
+                Error::internal(format!(
+                    "Blob v2 field id {} for '{}' does not fit in u32",
+                    field.id, field.name
+                ))
+            })?;
+            let ArrowDataType::Struct(input_children) = input_field.data_type() else {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' has non-struct input type {:?}",
+                    field.name,
+                    input_field.data_type()
+                )));
+            };
+            let output_field = match BlobV2Layout::classify(input_children) {
+                Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
+                Some(BlobV2Layout::Descriptor) => {
+                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
+                }
+                Some(actual) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
+                        field.name
+                    )));
+                }
+                None => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{}' has unrecognized input layout {:?}; expected logical or descriptor layout during rewrite",
+                        field.name, input_children
+                    )));
+                }
+            };
+            return Ok(Self::Blob {
+                field_id,
+                field_name: field.name.clone(),
+                output_field,
+            });
+        }
+
+        match (field.data_type(), input_field.data_type()) {
+            (ArrowDataType::Struct(_), ArrowDataType::Struct(input_children)) => {
+                if field.children.len() != input_children.len() {
+                    return Err(Error::internal(format!(
+                        "Struct field '{}' expected {} children in blob rewrite plan, got {}",
+                        field.name,
+                        field.children.len(),
+                        input_children.len()
+                    )));
+                }
+                let children = field
+                    .children
+                    .iter()
+                    .zip(input_children.iter())
+                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .collect::<Result<Vec<_>>>()?;
+                let output_children = children
+                    .iter()
+                    .map(|child| child.output_field().clone())
+                    .collect::<Vec<_>>();
+                Ok(Self::Struct {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::Struct(output_children.into()),
+                    ),
+                    children,
+                })
+            }
+            (ArrowDataType::List(_), ArrowDataType::List(input_child)) => {
+                let child = field.children.first().ok_or_else(|| {
+                    Error::internal(format!(
+                        "List field '{}' is missing its child in blob rewrite plan",
+                        field.name
+                    ))
+                })?;
+                let child = Box::new(Self::try_new(child, input_child)?);
+                Ok(Self::List {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::List(child.output_field().clone()),
+                    ),
+                    child,
+                })
+            }
+            (ArrowDataType::LargeList(_), ArrowDataType::LargeList(input_child)) => {
+                let child = field.children.first().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Large list field '{}' is missing its child in blob rewrite plan",
+                        field.name
+                    ))
+                })?;
+                let child = Box::new(Self::try_new(child, input_child)?);
+                Ok(Self::LargeList {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::LargeList(child.output_field().clone()),
+                    ),
+                    child,
+                })
+            }
+            (logical_type, input_type) => Err(Error::invalid_input(format!(
+                "Field '{}' contains blob v2 descendants but logical type {:?} and input type {:?} do not form a supported rewrite container",
+                field.name, logical_type, input_type
+            ))),
+        }
+    }
+
+    fn output_field(&self) -> &Arc<ArrowField> {
+        match self {
+            Self::Passthrough { output_field }
+            | Self::Blob { output_field, .. }
+            | Self::Struct { output_field, .. }
+            | Self::List { output_field, .. }
+            | Self::LargeList { output_field, .. } => output_field,
+        }
+    }
+
+    fn transform<'a>(
+        &'a self,
+        dataset: &'a Arc<Dataset>,
+        array: ArrayRef,
+        row_addrs: Arc<[u64]>,
+    ) -> BoxFuture<'a, Result<ArrayRef>> {
+        async move {
+            match self {
+                Self::Passthrough { .. } => Ok(array),
+                Self::Blob {
+                    field_id,
+                    field_name,
+                    ..
+                } => {
+                    let struct_arr = array.as_struct();
+                    match BlobV2Layout::classify(struct_arr.fields()) {
+                        Some(BlobV2Layout::Logical) => Ok(array),
+                        Some(BlobV2Layout::Descriptor) => {
+                            let descriptor =
+                                BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
+                            let classification =
+                                classify_rows(struct_arr, &descriptor, field_name)?;
+                            let logical = descriptor_to_logical_blob_array(
+                                dataset,
+                                *field_id,
+                                struct_arr,
+                                &descriptor,
+                                &classification,
+                                row_addrs.as_ref(),
+                                field_name,
+                            )
+                            .await?;
+                            Ok(Arc::new(logical) as ArrayRef)
+                        }
+                        Some(actual) => Err(Error::invalid_input(format!(
+                            "Blob v2 field '{}' has {actual} layout; expected logical or descriptor layout during rewrite",
+                            field_name
+                        ))),
+                        None => Err(Error::invalid_input(format!(
+                            "Blob v2 field '{}' has unrecognized layout {:?}; expected logical or descriptor layout during rewrite",
+                            field_name,
+                            struct_arr.fields()
+                        ))),
+                    }
+                }
+                Self::Struct {
+                    field_name,
+                    output_field,
+                    children,
+                } => {
+                    let struct_arr = array.as_struct().normalize_slicing()?;
+                    let parent_nulls = struct_arr.nulls().cloned();
+                    let struct_arr = struct_arr.pushdown_nulls()?;
+                    if children.len() != struct_arr.num_columns() {
+                        return Err(Error::internal(format!(
+                            "Struct field '{}' expected {} children during blob rewrite, got {}",
+                            field_name,
+                            children.len(),
+                            struct_arr.num_columns()
+                        )));
+                    }
+                    let mut child_arrays = Vec::with_capacity(children.len());
+                    for (child, child_array) in children.iter().zip(struct_arr.columns()) {
+                        child_arrays.push(
+                            child
+                                .transform(dataset, child_array.clone(), row_addrs.clone())
+                                .await?,
+                        );
+                    }
+                    let ArrowDataType::Struct(output_fields) = output_field.data_type() else {
+                        return Err(Error::internal(format!(
+                            "Struct field '{}' rewrite plan has non-struct output type {:?}",
+                            field_name,
+                            output_field.data_type()
+                        )));
+                    };
+                    Ok(Arc::new(StructArray::try_new(
+                        output_fields.clone(),
+                        child_arrays,
+                        parent_nulls,
+                    )?) as ArrayRef)
+                }
+                Self::List {
+                    field_name, child, ..
+                } => {
+                    transform_blob_v2_list_array::<i32>(
+                        dataset,
+                        field_name,
+                        child,
+                        array.as_list::<i32>(),
+                        row_addrs,
+                    )
+                    .await
+                }
+                Self::LargeList {
+                    field_name, child, ..
+                } => {
+                    transform_blob_v2_list_array::<i64>(
+                        dataset,
+                        field_name,
+                        child,
+                        array.as_list::<i64>(),
+                        row_addrs,
+                    )
+                    .await
+                }
+            }
+        }
+        .boxed()
+    }
+}
+
+async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
+    dataset: &Arc<Dataset>,
+    field_name: &str,
+    child: &BlobV2FieldRewritePlan,
+    list_array: &GenericListArray<O>,
+    row_addrs: Arc<[u64]>,
+) -> Result<ArrayRef> {
+    let list_array = if list_array.null_count() > 0 {
+        list_array.filter_garbage_nulls()
+    } else {
+        list_array.clone()
+    };
+    let offsets = list_array.value_offsets();
+    let values_start = offsets[0].as_usize();
+    let values_end = offsets[list_array.len()].as_usize();
+    if values_end < values_start {
+        return Err(Error::internal(format!(
+            "List field '{}' has invalid offsets during blob rewrite",
+            field_name
+        )));
+    }
+
+    let values_len = values_end - values_start;
+    let mut normalized_offsets = Vec::with_capacity(list_array.len() + 1);
+    normalized_offsets.push(O::usize_as(0));
+    let mut child_row_addrs = Vec::with_capacity(values_len);
+    for row_idx in 0..list_array.len() {
+        let start = offsets[row_idx].as_usize();
+        let end = offsets[row_idx + 1].as_usize();
+        if end < start {
+            return Err(Error::internal(format!(
+                "List field '{}' has decreasing offsets during blob rewrite",
+                field_name
+            )));
+        }
+        let row_addr = row_addrs.get(row_idx).copied().ok_or_else(|| {
+            Error::internal(format!(
+                "List field '{}' row address count {} did not match row count {}",
+                field_name,
+                row_addrs.len(),
+                list_array.len()
+            ))
+        })?;
+        child_row_addrs.extend(std::iter::repeat_n(row_addr, end - start));
+        normalized_offsets.push(O::usize_as(end - values_start));
+    }
+
+    let values = list_array.values().slice(values_start, values_len);
+    let values = child
+        .transform(dataset, values, Arc::<[u64]>::from(child_row_addrs))
+        .await?;
+    let list_array = GenericListArray::<O>::try_new(
+        child.output_field().clone(),
+        OffsetBuffer::new(ScalarBuffer::from(normalized_offsets)),
+        values,
+        list_array.nulls().cloned(),
+    )?;
+    Ok(Arc::new(list_array))
+}
+
+pub(crate) struct BlobV2BatchRewritePlan {
+    row_addr_idx: usize,
+    columns: Vec<(usize, BlobV2FieldRewritePlan)>,
+    output_schema: SchemaRef,
+}
+
+impl BlobV2BatchRewritePlan {
+    pub(crate) fn try_new(
+        schema: &lance_core::datatypes::Schema,
+        input_schema: &ArrowSchema,
+        keep_row_addr: bool,
+    ) -> Result<Self> {
+        let row_addr_idx = input_schema
+            .column_with_name(lance_core::ROW_ADDR)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "_rowaddr column missing from batch for blob v2 rewrite, columns: {:?}",
+                    input_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?
+            .0;
+        let mut columns = Vec::with_capacity(input_schema.fields().len());
+        let mut output_fields = Vec::with_capacity(input_schema.fields().len());
+        for (column_idx, input_field) in input_schema.fields().iter().enumerate() {
+            if input_field.name() == lance_core::ROW_ADDR && !keep_row_addr {
+                continue;
+            }
+            let field_plan = if let Some(field) = schema.field(input_field.name()) {
+                BlobV2FieldRewritePlan::try_new(field, input_field)?
+            } else {
+                BlobV2FieldRewritePlan::passthrough(input_field)
+            };
+            output_fields.push(field_plan.output_field().as_ref().clone());
+            columns.push((column_idx, field_plan));
+        }
+
+        Ok(Self {
+            row_addr_idx,
+            columns,
+            output_schema: Arc::new(ArrowSchema::new_with_metadata(
+                output_fields,
+                input_schema.metadata().clone(),
+            )),
+        })
+    }
+
+    pub(crate) fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+
+    pub(crate) async fn transform_batch(
+        &self,
+        dataset: &Arc<Dataset>,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        let row_addrs: Arc<[u64]> = batch
+            .column(self.row_addr_idx)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into();
+        let mut output_columns = Vec::with_capacity(self.columns.len());
+        for (column_idx, field_plan) in &self.columns {
+            output_columns.push(
+                field_plan
+                    .transform(
+                        dataset,
+                        batch.column(*column_idx).clone(),
+                        row_addrs.clone(),
+                    )
+                    .await?,
+            );
+        }
+        Ok(RecordBatch::try_new(
+            self.output_schema.clone(),
+            output_columns,
+        )?)
+    }
 }
 
 pub(crate) async fn transform_blob_v2_batch(
@@ -1192,118 +1842,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let row_addr_idx = batch
-        .schema()
-        .column_with_name(lance_core::ROW_ADDR)
-        .ok_or_else(|| {
-            Error::internal(format!(
-                "_rowaddr column missing from batch for blob v2 compaction, columns: {:?}",
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .collect::<Vec<_>>()
-            ))
-        })?
-        .0;
-    let row_addrs = batch.column(row_addr_idx).as_primitive::<UInt64Type>();
-
-    let mut new_columns: Vec<Arc<dyn Array>> = Vec::new();
-    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-
-    let batch_schema = batch.schema();
-    for (col_idx, field) in batch_schema.fields().iter().enumerate() {
-        if field.name() == lance_core::ROW_ADDR && !keep_row_addr {
-            continue;
-        }
-
-        let lance_field = schema.field(field.name());
-        let is_blob_v2 = lance_field.is_some_and(|f| f.is_blob_v2());
-
-        if !is_blob_v2 {
-            new_columns.push(batch.column(col_idx).clone());
-            new_fields.push(field.clone());
-            continue;
-        }
-
-        let struct_arr = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "Blob v2 column '{}' expected StructArray, got {:?}",
-                    field.name(),
-                    batch.column(col_idx).data_type()
-                ))
-            })?;
-
-        match BlobV2Layout::classify(struct_arr.fields()) {
-            // Merge-insert may supply a logical blob v2 value directly from the
-            // source. It does not refer to a row in the target dataset.
-            Some(BlobV2Layout::Logical) => {
-                new_columns.push(batch.column(col_idx).clone());
-                new_fields.push(field.clone());
-                continue;
-            }
-            Some(BlobV2Layout::Descriptor) => {}
-            Some(actual) => {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 column '{}' has {actual} layout; expected logical or descriptor layout during compaction",
-                    field.name()
-                )));
-            }
-            None => {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 column '{}' has unrecognized layout {:?}; expected logical or descriptor layout during compaction",
-                    field.name(),
-                    struct_arr.fields()
-                )));
-            }
-        }
-
-        let column_name = field.name();
-        let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
-        let classification = classify_rows(struct_arr, &descriptor, row_addrs, column_name)?;
-        let num_rows = struct_arr.len();
-
-        let new_struct = descriptor_to_logical_blob_array(
-            dataset,
-            &descriptor,
-            &classification,
-            column_name,
-            num_rows,
-            struct_arr.nulls().cloned(),
-        )
-        .await?;
-
-        new_columns.push(Arc::new(new_struct));
-        let logical_field = arrow_schema::Field::from(lance_field.ok_or_else(|| {
-            Error::internal(format!(
-                "Blob v2 column '{}' missing from dataset schema during compaction",
-                field.name()
-            ))
-        })?);
-        new_fields.push(Arc::new(
-            arrow_schema::Field::new(
-                field.name(),
-                BLOB_V2_LOGICAL_TYPE.clone(),
-                field.is_nullable(),
-            )
-            .with_metadata(logical_field.metadata().clone()),
-        ));
-    }
-
-    let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-        new_fields
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect::<Vec<_>>(),
-        batch_schema.metadata().clone(),
-    ));
-
-    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    plan.transform_batch(dataset, batch).await
 }
 
 /// Build a scan reader for rewrite and optionally capture row IDs.
@@ -1551,7 +2091,7 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    let planner = DefaultCompactionPlanner::new(options.clone());
+    let planner = DefaultCompactionPlanner::new(options.clone())?;
     planner.plan(dataset).await
 }
 
@@ -1699,46 +2239,23 @@ async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let dataset_schema = dataset.schema().clone();
+            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+                dataset.schema(),
+                schema.as_ref(),
+                false,
+            )?);
+            let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
                 let dataset = dataset_arc.clone();
-                let schema = dataset_schema.clone();
+                let rewrite_plan = rewrite_plan.clone();
                 async move {
                     let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch, false)
+                    rewrite_plan
+                        .transform_batch(&dataset, batch)
                         .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }
             });
-            let transformed_schema = {
-                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-                for field in schema.fields().iter() {
-                    if field.name() == lance_core::ROW_ADDR {
-                        continue;
-                    }
-                    let lance_field = dataset.schema().field(field.name());
-                    if let Some(lance_field) = lance_field.filter(|f| f.is_blob_v2()) {
-                        let logical_field = arrow_schema::Field::from(lance_field);
-                        fields.push(Arc::new(
-                            arrow_schema::Field::new(
-                                field.name(),
-                                BLOB_V2_LOGICAL_TYPE.clone(),
-                                field.is_nullable(),
-                            )
-                            .with_metadata(logical_field.metadata().clone()),
-                        ));
-                    } else {
-                        fields.push(field.clone());
-                    }
-                }
-                Arc::new(arrow_schema::Schema::new_with_metadata(
-                    fields
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                    schema.metadata().clone(),
-                ))
-            };
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
                 transformed,
@@ -1770,7 +2287,9 @@ async fn rewrite_files(
     }
 
     if can_binary_copy {
-        new_fragments = rewrite_files_binary_copy(
+        let version = dataset.manifest.data_storage_format.lance_file_format();
+        new_fragments = versions::rewrite_files_binary_copy(
+            version,
             dataset.as_ref(),
             &fragments,
             &params,
@@ -4940,6 +5459,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_bloom_filter_index_with_defer_index_remap() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BloomFilter,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        assert_eq!(
+            dataset.count_rows(Some("id = 2".to_owned())).await.unwrap(),
+            1
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.filter("id = 2").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[id = 2]@id_idx(BloomFilter)"),
+            "Expected BloomFilter index query in plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
         let mut dataset = lance_datagen::gen_batch()
@@ -6724,7 +7290,7 @@ mod tests {
             ..Default::default()
         };
 
-        let planner = DefaultCompactionPlanner::new(options);
+        let planner = DefaultCompactionPlanner::new(options).unwrap();
         let plan = planner.plan(&dataset).await.unwrap();
 
         // Should create tasks to compact small fragments
@@ -6781,6 +7347,18 @@ mod tests {
                 "lance.compaction.index_remap_mode".to_string(),
                 "compact".to_string(),
             ),
+            (
+                "lance.compaction.max_source_fragments".to_string(),
+                "20".to_string(),
+            ),
+            (
+                "lance.compaction.max_source_rows".to_string(),
+                "1000000".to_string(),
+            ),
+            (
+                "lance.compaction.max_source_bytes".to_string(),
+                "1073741824".to_string(),
+            ),
         ]);
 
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -6796,6 +7374,9 @@ mod tests {
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
         // A non-default value proves the config string was actually parsed.
         assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
+        assert_eq!(opts.max_source_fragments, Some(20));
+        assert_eq!(opts.max_source_rows, Some(1_000_000));
+        assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
     }
 
     #[test]
@@ -6983,37 +7564,7 @@ mod tests {
     #[tokio::test]
     async fn test_max_source_fragments() {
         let test_dir = TempStrDir::default();
-        let test_uri = &test_dir;
-
-        let data = sample_data();
-        let schema = data.schema();
-
-        // Create 10 small fragments (100 rows each) via 10 appends
-        let write_params = WriteParams {
-            max_rows_per_file: 100,
-            ..Default::default()
-        };
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
-            test_uri,
-            Some(write_params.clone()),
-        )
-        .await
-        .unwrap();
-        for i in 1..10 {
-            let mut append_params = write_params.clone();
-            append_params.mode = WriteMode::Append;
-            Dataset::write(
-                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
-                test_uri,
-                Some(append_params),
-            )
-            .await
-            .unwrap();
-        }
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.get_fragments().len(), 10);
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
 
         // Plan without limit - all 10 fragments should be candidates.
         // Use a target that splits the 10 fragments into multiple tasks.
@@ -7084,6 +7635,180 @@ mod tests {
             after_second <= after_first,
             "expected progress: {after_second} should be <= {after_first}"
         );
+    }
+
+    /// Writes `sample_data` as 10 fragments of 100 rows each, deletes half of
+    /// fragment 0's rows, and puts a one-cell data overlay on it, so every
+    /// `max_source_*` planning budget is exercised against a dataset that
+    /// carries deleted rows and overlay files.
+    async fn dataset_with_ten_small_fragments(test_uri: &str) -> Dataset {
+        let data = sample_data();
+        let schema = data.schema();
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        for i in 1..10 {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+        }
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+        // Fragment 0 keeps 100 physical rows but only 50 live rows.
+        dataset.delete("a < 50").await.unwrap();
+        // The overlay shadows one surviving base value (offset 60, kept clear
+        // of the delete predicate) without adding any rows.
+        let dataset = commit_overlay(
+            dataset,
+            0,
+            &[0],
+            OverlayCoverage::dense(bitmap([60])),
+            vec![Arc::new(Int64Array::from(vec![60_000_i64]))],
+        )
+        .await;
+        assert_eq!(
+            dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+            1
+        );
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_excluded_fragments_are_planning_boundaries() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let excluded_fragment_id = 4;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 250,
+            excluded_fragment_ids: vec![excluded_fragment_id, excluded_fragment_id, u32::MAX],
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let planned_fragment_ids = plan
+            .tasks()
+            .iter()
+            .map(|task| {
+                task.fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            planned_fragment_ids,
+            vec![vec![0, 1, 2, 3], vec![5, 6, 7, 8, 9]]
+        );
+        assert!(
+            planned_fragment_ids
+                .iter()
+                .flatten()
+                .all(|fragment_id| *fragment_id != excluded_fragment_id)
+        );
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 9);
+        let remaining_fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert!(remaining_fragment_ids.contains(&excluded_fragment_id));
+    }
+
+    #[tokio::test]
+    async fn test_max_source_rows() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+        // The first task covers fragments 0..=2: 250 live rows (fragment 0
+        // keeps 50 after the deletes, and its overlay adds none) but 300
+        // physical rows. A budget between the two admits it and only it,
+        // proving the budget is enforced against live rows.
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_rows: Some(270),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        let physical_rows: usize = plan
+            .tasks()
+            .iter()
+            .flat_map(|t| &t.fragments)
+            .map(|f| f.physical_rows.unwrap())
+            .sum();
+        assert_eq!(physical_rows, 300);
+    }
+
+    #[tokio::test]
+    async fn test_max_source_bytes() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+        let first_task_base_bytes: u64 = dataset.get_fragments()[..3]
+            .iter()
+            .flat_map(|f| f.metadata.files.iter())
+            .map(|df| df.file_size_bytes.get().unwrap().get())
+            .sum();
+        let overlay_bytes = dataset.get_fragment(0).unwrap().metadata().overlays[0]
+            .data_file
+            .file_size_bytes
+            .get()
+            .unwrap()
+            .get();
+        assert!(first_task_base_bytes > 0 && overlay_bytes > 0);
+
+        // The first task covers fragments 0..=2 (target 250 rows). A budget of
+        // exactly their base bytes is exceeded once fragment 0's overlay file
+        // is counted, so the plan is empty: the budget is a hard upper bound,
+        // overlay bytes are part of a task's source, and deletion files are
+        // never counted.
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(first_task_base_bytes),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+
+        // Widening the budget by the overlay's bytes admits exactly the first
+        // task and nothing more.
+        let budget = first_task_base_bytes + overlay_bytes;
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(budget),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        let source_bytes: u64 = plan
+            .tasks()
+            .iter()
+            .flat_map(|t| &t.fragments)
+            .flat_map(|f| {
+                f.files
+                    .iter()
+                    .chain(f.overlays.iter().map(|o| &o.data_file))
+            })
+            .map(|df| df.file_size_bytes.get().unwrap().get())
+            .sum();
+        assert_eq!(source_bytes, budget);
     }
 
     #[tokio::test]
@@ -7607,6 +8332,58 @@ mod tests {
         let mut after = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
         after.sort_by_key(|(id, _)| *id);
         assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn test_blob_v2_rewrite_plan_skips_non_blob_list_subtree() {
+        let items_field = Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        );
+        let info_field = Field::new(
+            "info",
+            DataType::Struct(
+                vec![
+                    Arc::new(items_field),
+                    Arc::new(crate::blob_field("blob", true)),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let logical_arrow_schema = Schema::new(vec![info_field]);
+        let logical_schema =
+            lance_core::datatypes::Schema::try_from(&logical_arrow_schema).unwrap();
+        let mut input_schema = logical_schema.clone();
+        input_schema.fields[0].unload_blobs_recursive();
+        let input_field = Field::from(&input_schema.fields[0]);
+
+        let plan =
+            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
+            panic!("nested blob field should produce a struct rewrite plan");
+        };
+        assert!(matches!(
+            children[0],
+            BlobV2FieldRewritePlan::Passthrough { .. }
+        ));
+        assert!(matches!(children[1], BlobV2FieldRewritePlan::Blob { .. }));
+
+        let DataType::Struct(output_children) = plan.output_field().data_type() else {
+            panic!("nested blob rewrite plan should declare a struct output");
+        };
+        let DataType::Struct(input_children) = input_field.data_type() else {
+            panic!("nested blob input should be a struct");
+        };
+        assert_eq!(output_children[0], input_children[0]);
+        let DataType::Struct(blob_children) = output_children[1].data_type() else {
+            panic!("blob rewrite plan should declare a struct blob output");
+        };
+        assert_eq!(
+            BlobV2Layout::classify(blob_children),
+            Some(BlobV2Layout::Logical)
+        );
     }
 
     #[tokio::test]
@@ -8731,7 +9508,7 @@ mod tests {
         let filename = format!("{}.lance", Uuid::new_v4());
         let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let obj_writer = dataset.object_store.create(&path).await.unwrap();
-        let file_version = lance_file::version::ConcreteFileVersion::from(LanceFileVersion::Stable);
+        let file_version = LanceFileVersion::Stable.resolve();
         let mut writer = lance_file::versions::create_writer(
             file_version,
             obj_writer,
