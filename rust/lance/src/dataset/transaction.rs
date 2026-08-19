@@ -2209,6 +2209,7 @@ impl Transaction {
             transaction_file_path,
             config,
             None,
+            None,
         )
     }
 
@@ -2218,6 +2219,11 @@ impl Transaction {
     /// `None` where there is none to read -- dataset creation and detached
     /// commits -- in which case no index can be shown to cover it and coverage
     /// is left as the invalidation rules put it.
+    ///
+    /// `migration_next_row_id` is the watermark from
+    /// `migrate_to_stable_row_ids`. It stays on [`crate::dataset::ManifestWriteConfig`]
+    /// rather than [`ManifestBuildConfig`] because the latter lives in
+    /// `lance-table` and must not depend on dataset-level migration.
     pub(crate) fn build_manifest_with_read_version(
         &self,
         current_manifest: Option<&Manifest>,
@@ -2225,9 +2231,10 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
+        migration_next_row_id: Option<u64>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
-            && config.migration_next_row_id.is_none()
+            && migration_next_row_id.is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
@@ -2237,7 +2244,7 @@ impl Transaction {
             ));
         }
 
-        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
+        if migration_next_row_id.is_some() && !current_indices.is_empty() {
             let names: Vec<&str> = current_indices
                 .iter()
                 .map(|idx| idx.name.as_str())
@@ -2338,7 +2345,7 @@ impl Transaction {
                 (_, false) => None,
                 (Some(_), true) => {
                     // Migration activation: use the provided next_row_id.
-                    if let Some(migration_nri) = config.migration_next_row_id {
+                    if let Some(migration_nri) = migration_next_row_id {
                         Some(migration_nri)
                     } else {
                         return Err(Error::not_supported_source(

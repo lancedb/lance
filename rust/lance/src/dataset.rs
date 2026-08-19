@@ -4034,6 +4034,10 @@ impl ManifestWriteConfig {
         self.disable_transaction_file
     }
 
+    pub(crate) fn migration_next_row_id(&self) -> Option<u64> {
+        self.migration_next_row_id
+    }
+
     #[cfg(test)]
     pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
         self.disable_transaction_file = true;

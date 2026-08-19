@@ -1429,6 +1429,7 @@ pub(crate) async fn commit_transaction(
                 transaction_file,
                 &write_config.to_build_config(),
                 read_version_state,
+                write_config.migration_next_row_id(),
             )?,
         };
 
