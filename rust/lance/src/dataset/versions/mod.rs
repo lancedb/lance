@@ -713,7 +713,6 @@ pub(in crate::dataset) async fn filtered_read(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
-            let limit_pushed_down = scan_range.is_some();
             let plan = scanner
                 .new_filtered_read(
                     filter_plan,
@@ -725,7 +724,6 @@ pub(in crate::dataset) async fn filtered_read(
                 .await?;
             Ok(PlannedFilteredScan {
                 filter_pushed_down: true,
-                limit_pushed_down,
                 plan,
             })
         }

@@ -34,8 +34,7 @@
 //! ```
 //!
 //! The filter is pushed into the Lance scan leaf, the text search runs against the inverted index,
-//! and the vector search re-scores its matches — one plan, planned once. Note that this is *not*
-//! gated by [`is_enabled`](super::is_enabled): there is no imperative equivalent to fall back to.
+//! and the vector search re-scores its matches — one plan, planned once.
 
 use std::sync::Arc;
 
