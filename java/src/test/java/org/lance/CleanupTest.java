@@ -70,8 +70,7 @@ public class CleanupTest {
         assertEquals(4, dataset.listVersions().size());
 
         RemovalStats stats =
-            dataset.cleanupWithPolicy(
-                CleanupPolicy.builder().withVersions(List.of(2L)).build());
+            dataset.cleanupWithPolicy(CleanupPolicy.builder().withVersions(List.of(2L)).build());
 
         assertEquals(1L, stats.getOldVersions());
         assertEquals(3, dataset.listVersions().size());

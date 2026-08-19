@@ -108,8 +108,7 @@ public class CleanupPolicy {
 
     /** Set the exact dataset versions to clean. */
     public Builder withVersions(List<Long> versions) {
-      this.versions =
-          Optional.of(Collections.unmodifiableList(new ArrayList<>(versions)));
+      this.versions = Optional.of(Collections.unmodifiableList(new ArrayList<>(versions)));
       return this;
     }
 
