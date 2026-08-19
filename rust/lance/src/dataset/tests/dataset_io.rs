@@ -1317,6 +1317,7 @@ async fn test_write_manifest(
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            migration_next_row_id: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
