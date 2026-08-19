@@ -61,7 +61,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
@@ -1258,6 +1258,7 @@ impl IndexInformationProvider for ScalarIndexInfo {
         }
 
         let mut rows = RowAddrTreeMap::new();
+        let mut shared_partial_selections = HashMap::new();
         for (fragment_id, state) in fragments.iter() {
             match state {
                 FlagFragment::All => {
@@ -1273,7 +1274,12 @@ impl IndexInformationProvider for ScalarIndexInfo {
                     }
                 }
                 FlagFragment::Partial(bitmap) => {
-                    rows.insert_bitmap(*fragment_id, bitmap.as_ref().clone());
+                    let selection = shared_partial_selections
+                        .entry(Arc::as_ptr(bitmap) as usize)
+                        .or_insert_with(|| {
+                            Arc::new(RowAddrSelection::Partial(bitmap.as_ref().clone()))
+                        });
+                    rows.insert_shared_selection(*fragment_id, selection.clone());
                 }
             }
         }
