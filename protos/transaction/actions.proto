@@ -171,7 +171,9 @@ message Action {
     ConfigUpdate config_update = 8;
     AddOverlays add_overlays = 9;
     RefreshRowVersionMetadata refresh_row_version_metadata = 10;
-    UpdateCompactedSsTables update_compacted_sstables = 11;
+    // Named `update_compacted_ss_tables` rather than `..._sstables` so the
+    // generated oneof variant matches the message name.
+    UpdateCompactedSsTables update_compacted_ss_tables = 11;
     // -- Schema (field-level; no wholesale SetSchema) --
     DropField drop_field = 12;
     AlterField alter_field = 13;
