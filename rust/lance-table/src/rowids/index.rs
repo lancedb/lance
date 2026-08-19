@@ -112,6 +112,22 @@ impl FragmentEntry {
         })
     }
 
+    /// Row ids this fragment holds inside `lo..=hi`, in physical order.
+    fn ids_in_window(&self, lo: u64, hi: u64) -> impl Iterator<Item = u64> + '_ {
+        self.segments
+            .iter()
+            .filter(move |entry| *entry.range.start() <= hi && lo <= *entry.range.end())
+            .flat_map(|entry| self.sequence.0[entry.seq_idx].iter())
+            .filter(move |row_id| (lo..=hi).contains(row_id))
+    }
+
+    fn rows(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|entry| self.sequence.0[entry.seq_idx].len())
+            .sum()
+    }
+
     /// Address of `row_id` inside this fragment. `None` when the fragment does
     /// not hold the id, or holds it as a deleted row. A deleted id resolves the
     /// same way an absent one does, so the caller keeps looking in the remaining
@@ -154,6 +170,8 @@ impl RowIdIndex {
             max_end.push(running);
         }
 
+        reject_duplicate_row_ids(&fragments)?;
+
         Ok(Self { fragments, max_end })
     }
 
@@ -186,33 +204,6 @@ impl RowIdIndex {
         out
     }
 
-    /// Check that no row id is live in more than one fragment.
-    ///
-    /// This walks every live row id, so the cost follows the row count. `new`
-    /// leaves it out on purpose: a point lookup would otherwise pay for a full
-    /// pass over the index. Callers that want the guarantee run it as a
-    /// diagnostic.
-    pub fn verify(&self) -> Result<()> {
-        for (slot, entry) in self.fragments.iter().enumerate() {
-            for segment_entry in &entry.segments {
-                for row_id in entry.sequence.0[segment_entry.seq_idx].iter() {
-                    if entry.resolve(row_id).is_none() {
-                        continue;
-                    }
-                    let duplicated = self.candidates(row_id).any(|(other_slot, other)| {
-                        other_slot != slot && other.resolve(row_id).is_some()
-                    });
-                    if duplicated {
-                        return Err(Error::internal(format!(
-                            "row id index corrupt: stable row id {row_id} is live in multiple fragments"
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Fragments that can hold `row_id`, highest starting id first.
     fn candidates(&self, row_id: u64) -> impl Iterator<Item = (usize, &FragmentEntry)> {
         let upper = self
@@ -225,6 +216,37 @@ impl RowIdIndex {
             .take_while(move |(slot, _)| self.max_end[*slot] >= row_id)
             .filter(move |(_, entry)| entry.end >= row_id)
     }
+}
+
+/// Reject a row id that is live in two fragments.
+///
+/// Two fragments can only claim the same id where their row id ranges intersect,
+/// so this walks the intersecting pairs and only the ids inside each intersection.
+/// A dataset whose fragments hold disjoint ranges pays a range comparison per
+/// neighbour; one whose ranges all intersect pays a pass over the ids in them.
+fn reject_duplicate_row_ids(fragments: &[FragmentEntry]) -> Result<()> {
+    for (slot, left) in fragments.iter().enumerate() {
+        for right in fragments[slot + 1..]
+            .iter()
+            .take_while(|right| right.start <= left.end)
+        {
+            let lo = left.start.max(right.start);
+            let hi = left.end.min(right.end);
+            let (scanned, probed) = if left.rows() <= right.rows() {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            for row_id in scanned.ids_in_window(lo, hi) {
+                if scanned.resolve(row_id).is_some() && probed.resolve(row_id).is_some() {
+                    return Err(Error::internal(format!(
+                        "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl DeepSizeOf for RowIdIndex {
@@ -270,11 +292,11 @@ mod tests {
             row_id_sequence: Arc::new(RowIdSequence::from(row_ids)),
             deletion_vector: Arc::new(DeletionVector::default()),
         };
-        let index = RowIdIndex::new(&[make(1, &[0, 2]), make(2, &[1, 2])]).unwrap();
+        assert!(RowIdIndex::new(&[make(1, &[0, 2]), make(2, &[1, 2])]).is_err());
 
+        let index = RowIdIndex::new(&[make(1, &[0, 2]), make(2, &[1, 3])]).unwrap();
         assert_eq!(index.get(2), index.get_many(&[0, 2])[1]);
         assert_eq!(index.get(0), index.get_many(&[0, 2])[0]);
-        assert!(index.verify().is_err());
     }
 
     #[test]
@@ -838,8 +860,7 @@ mod tests {
                 },
             ];
 
-            let index = RowIdIndex::new(&fragment_indices).unwrap();
-            let error = index.verify().unwrap_err();
+            let error = RowIdIndex::new(&fragment_indices).unwrap_err();
             let is_internal = matches!(&error, Error::Internal { .. });
             let expected_message =
                 format!("stable row id {row_id} is live in multiple fragments");
