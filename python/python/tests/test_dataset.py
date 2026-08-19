@@ -454,13 +454,19 @@ def test_versions(tmp_path: Path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table1, base_dir)
 
-    assert len(lance.dataset(base_dir).versions()) == 1
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 1
+    assert dataset.version_refs() == [{"version": 1}]
+    assert dataset.latest_version == dataset.version_refs()[-1]["version"]
 
     table2 = pa.Table.from_pylist([{"s": "one"}, {"s": "two"}])
     time.sleep(1)
     lance.write_dataset(table2, base_dir, mode="overwrite")
 
-    assert len(lance.dataset(base_dir).versions()) == 2
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+    assert dataset.version_refs() == [{"version": 1}, {"version": 2}]
+    assert dataset.latest_version == dataset.version_refs()[-1]["version"]
 
     v1, v2 = lance.dataset(base_dir).versions()
     assert v1["version"] == 1
