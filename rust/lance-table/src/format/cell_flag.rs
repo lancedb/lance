@@ -49,20 +49,29 @@ fn bitset_memory_size(bytes: usize) -> usize {
         .saturating_add(bytes.div_ceil(8192).saturating_mul(32))
 }
 
+fn roaring_memory_size(bytes: usize) -> usize {
+    // Portable Roaring is compact enough that its byte length is not an upper
+    // bound on decoded Vec capacities and container allocations. Use the same
+    // conservative expansion as bitset reconstruction so every LCF1 variant
+    // declares one comparable retained-memory budget.
+    bitset_memory_size(bytes)
+}
+
 /// Encode a non-empty bitmap using the smaller of portable Roaring and a dense bitset.
 pub fn encode_cell_flag_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>> {
     let mut roaring = Vec::with_capacity(bitmap.serialized_size());
     bitmap
         .serialize_into(&mut roaring)
         .map_err(|error| Error::internal(format!("Failed to encode Cell flag bitmap: {error}")))?;
-    let roaring_memory_size = roaring.len();
+    let roaring_decoded_size = roaring.len();
+    let roaring_memory_size = roaring_memory_size(roaring_decoded_size);
     let compressed_roaring = zstd::bulk::compress(&roaring, 1).map_err(|error| {
         Error::internal(format!("Failed to compress Cell flag bitmap: {error}"))
     })?;
     let mut candidates = vec![(CELL_FLAG_BITMAP_ROARING, roaring_memory_size, roaring)];
     if compressed_roaring.len() + 8 < candidates[0].2.len() {
         let mut payload = Vec::with_capacity(compressed_roaring.len() + 8);
-        payload.extend_from_slice(&(roaring_memory_size as u64).to_le_bytes());
+        payload.extend_from_slice(&(roaring_decoded_size as u64).to_le_bytes());
         payload.extend_from_slice(&compressed_roaring);
         candidates.push((CELL_FLAG_BITMAP_ZSTD_ROARING, roaring_memory_size, payload));
     }
@@ -119,7 +128,8 @@ pub fn encode_cell_flag_query_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>> 
     bitmap.serialize_into(&mut roaring).map_err(|error| {
         Error::internal(format!("Failed to encode Cell flag query bitmap: {error}"))
     })?;
-    let memory_size = roaring.len();
+    let decoded_size = roaring.len();
+    let memory_size = roaring_memory_size(decoded_size);
     let compressed = zstd::bulk::compress(&roaring, 1).map_err(|error| {
         Error::internal(format!(
             "Failed to compress Cell flag query bitmap: {error}"
@@ -127,7 +137,7 @@ pub fn encode_cell_flag_query_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>> 
     })?;
     let (encoding, payload) = if compressed.len() + 8 < roaring.len() {
         let mut payload = Vec::with_capacity(compressed.len() + 8);
-        payload.extend_from_slice(&(memory_size as u64).to_le_bytes());
+        payload.extend_from_slice(&(decoded_size as u64).to_le_bytes());
         payload.extend_from_slice(&compressed);
         (CELL_FLAG_BITMAP_ZSTD_ROARING, payload)
     } else {
@@ -476,11 +486,11 @@ pub fn decode_cell_flag_bitmap(bytes: &[u8]) -> Result<RoaringBitmap> {
     let payload = &bytes[CELL_FLAG_BITMAP_HEADER_BYTES..];
     match bytes[4] {
         CELL_FLAG_BITMAP_ROARING => {
-            if memory_size != payload.len() {
+            let required_memory = roaring_memory_size(payload.len());
+            if memory_size != required_memory {
                 return Err(Error::invalid_input(format!(
                     "Cell flag Roaring bitmap declares memory size {}, expected {}",
-                    memory_size,
-                    payload.len()
+                    memory_size, required_memory
                 )));
             }
             RoaringBitmap::deserialize_from(&mut Cursor::new(payload)).map_err(|error| {
@@ -596,7 +606,12 @@ fn decode_stride_bitmap(payload: &[u8], memory_size: usize) -> Result<RoaringBit
         .checked_add(u64::from(step).saturating_mul(u64::from(count - 1)))
         .filter(|last| *last <= u64::from(u32::MAX))
         .ok_or_else(|| Error::invalid_input("Cell flag stride bitmap exceeds u32 offsets"))?;
-    let required_memory = stride_bitmap_serialized_size(start, step, count, last as u32)?;
+    let required_memory = roaring_memory_size(stride_bitmap_serialized_size(
+        start,
+        step,
+        count,
+        last as u32,
+    )?);
     if required_memory > memory_size {
         return Err(Error::invalid_input(format!(
             "Cell flag stride bitmap declares memory size {}, decoded representation requires {}",
@@ -611,11 +626,11 @@ fn decode_stride_bitmap(payload: &[u8], memory_size: usize) -> Result<RoaringBit
         RoaringBitmap::from_sorted_iter((0..count).map(|index| start + step.saturating_mul(index)))
             .map_err(|error| Error::invalid_input(format!("Invalid Cell flag stride: {error}")))?
     };
-    if bitmap.serialized_size() > memory_size {
+    let decoded_memory = roaring_memory_size(bitmap.serialized_size());
+    if decoded_memory > memory_size {
         return Err(Error::invalid_input(format!(
             "Cell flag stride bitmap declares memory size {}, decoded representation requires {}",
-            memory_size,
-            bitmap.serialized_size()
+            memory_size, decoded_memory
         )));
     }
     Ok(bitmap)
@@ -706,9 +721,9 @@ fn decode_zstd_cell_flag_bitmap_payload(payload: &[u8], memory_size: usize) -> R
     let decoded_size = usize::try_from(decoded_size).map_err(|_| {
         Error::invalid_input("Compressed Cell flag bitmap size exceeds this platform")
     })?;
-    if decoded_size != memory_size {
+    if roaring_memory_size(decoded_size) != memory_size {
         return Err(Error::invalid_input(format!(
-            "Compressed Cell flag bitmap declares decoded size {}, expected {}",
+            "Compressed Cell flag bitmap decoded size {} has an invalid memory declaration {}",
             decoded_size, memory_size
         )));
     }
@@ -1239,8 +1254,8 @@ mod tests {
         let empty = RoaringBitmap::new();
         assert!(
             MAX_CELL_FLAG_BITMAP_MEMORY_BYTES
-                + one_row.serialized_size()
-                + empty.serialized_size()
+                + roaring_memory_size(one_row.serialized_size())
+                + roaring_memory_size(empty.serialized_size())
                 + 1024 * 1024
                 <= 32 * 1024 * 1024
         );
@@ -1305,6 +1320,20 @@ mod tests {
         encoded.extend_from_slice(&17_u32.to_le_bytes());
         encoded.extend_from_slice(&((declared_memory * 8) as u32).to_le_bytes());
 
+        let error = decode_cell_flag_bitmap(&encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decoded representation requires")
+        );
+
+        let mut encoded = Vec::with_capacity(CELL_FLAG_BITMAP_HEADER_BYTES + 12);
+        encoded.extend_from_slice(CELL_FLAG_BITMAP_MAGIC);
+        encoded.push(CELL_FLAG_BITMAP_STRIDE);
+        encoded.extend_from_slice(&(16_793_618_u64).to_le_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+        encoded.extend_from_slice(&2_u32.to_le_bytes());
+        encoded.extend_from_slice(&67_108_865_u32.to_le_bytes());
         let error = decode_cell_flag_bitmap(&encoded).unwrap_err();
         assert!(
             error

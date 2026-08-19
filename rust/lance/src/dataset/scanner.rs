@@ -2822,11 +2822,14 @@ impl Scanner {
         }
 
         if let Some(filter) = &self.filter.expr_filter {
-            let references_cell_flag = match filter {
-                ExprFilter::Sql(sql) => sql.to_ascii_lowercase().contains("cell_flag"),
-                ExprFilter::Substrait(_) => true,
-                ExprFilter::Datafusion(expression) => expression_references_cell_flag(expression)?,
+            let expression = match filter {
+                ExprFilter::Datafusion(expression) => expression.clone(),
+                ExprFilter::Sql(_) | ExprFilter::Substrait(_) => {
+                    let filter_schema = self.filterable_schema()?;
+                    filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?
+                }
             };
+            let references_cell_flag = expression_references_cell_flag(&expression)?;
             if references_cell_flag {
                 return Ok(true);
             }
@@ -2849,6 +2852,19 @@ impl Scanner {
         }
 
         Ok(false)
+    }
+
+    fn normalize_expr_filter(&mut self) -> Result<bool> {
+        let Some(filter) = self.filter.expr_filter.as_ref() else {
+            return Ok(false);
+        };
+        if matches!(filter, ExprFilter::Datafusion(_)) {
+            return Ok(false);
+        }
+        let filter_schema = self.filterable_schema()?;
+        let expression = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
+        self.filter.expr_filter = Some(ExprFilter::Datafusion(expression));
+        Ok(true)
     }
 
     async fn bind_cell_flag_expressions(
@@ -3135,19 +3151,27 @@ impl Scanner {
 
     #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.cell_flags_bound && self.references_cell_flag()? {
+        if !self.cell_flags_bound {
             let mut bound = self.clone();
-            bound.cell_flags_bound = true;
-            let precomputed = bound.precompute_scalar_index_for_cell_flags().await?;
-            bound
-                .bind_cell_flag_expressions(
-                    precomputed
-                        .as_ref()
-                        .map(|(fragments, _)| fragments.as_slice()),
-                )
-                .await?;
-            bound.precomputed_scalar_index = precomputed.map(|(_, precomputed)| precomputed);
-            return Box::pin(bound.create_plan()).await;
+            let normalized_filter = bound.normalize_expr_filter()?;
+            if !bound.references_cell_flag()? {
+                if normalized_filter {
+                    bound.cell_flags_bound = true;
+                    return Box::pin(bound.create_plan()).await;
+                }
+            } else {
+                bound.cell_flags_bound = true;
+                let precomputed = bound.precompute_scalar_index_for_cell_flags().await?;
+                bound
+                    .bind_cell_flag_expressions(
+                        precomputed
+                            .as_ref()
+                            .map(|(fragments, _)| fragments.as_slice()),
+                    )
+                    .await?;
+                bound.precomputed_scalar_index = precomputed.map(|(_, precomputed)| precomputed);
+                return Box::pin(bound.create_plan()).await;
+            }
         }
 
         log::trace!("creating scanner plan");
@@ -7175,6 +7199,14 @@ mod test {
         assert!(!scanner.references_cell_flag().unwrap());
         scanner.filter("i > 10").unwrap();
         assert!(!scanner.references_cell_flag().unwrap());
+
+        scanner.filter("lower('CELL_FLAG') = 'cell_flag'").unwrap();
+        assert!(!scanner.references_cell_flag().unwrap());
+        assert!(scanner.normalize_expr_filter().unwrap());
+        assert!(matches!(
+            scanner.filter.expr_filter,
+            Some(ExprFilter::Datafusion(_))
+        ));
 
         scanner.filter_expr(cell_flag(col("i"), "computed"));
         assert!(scanner.references_cell_flag().unwrap());

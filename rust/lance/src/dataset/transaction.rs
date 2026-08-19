@@ -7886,7 +7886,10 @@ mod tests {
     fn fragmented_cell_flag_row_addresses_reject_cumulative_retained_memory() {
         let encoded = many_stride_fragment_row_addresses(65, 1024 * 1024);
         let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
-        assert!(error.to_string().contains("retained bytes"));
+        assert!(
+            error.to_string().contains("retained bytes"),
+            "unexpected error: {error}"
+        );
 
         let fragmented = &encoded[CELL_FLAG_ROW_ADDRESSES_MAGIC.len() + 1..];
         let compressed = zstd::bulk::compress(fragmented, 1).unwrap();
@@ -7901,29 +7904,60 @@ mod tests {
 
     #[test]
     fn cell_flag_row_addresses_reject_fragment_overhead_before_materialization() {
-        let stride_memory_size = 18;
+        let stride = encode_cell_flag_bitmap(&RoaringBitmap::from_iter([0, 65_536])).unwrap();
+        let stride_memory_size = cell_flag_bitmap_memory_size(&stride).unwrap();
         let fragment_count = (MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
             / (stride_memory_size + CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES)
             + 1) as u32;
         let encoded = many_stride_fragment_row_addresses(fragment_count, stride_memory_size);
         assert!(encoded.len() < MAX_CELL_FLAG_ROW_ADDRESSES_BYTES);
         let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
-        assert!(error.to_string().contains("retained bytes"));
+        assert!(
+            error.to_string().contains("retained bytes"),
+            "unexpected error: {error}"
+        );
 
         let mut singleton = Vec::new();
         RoaringBitmap::from_iter([0])
             .serialize_into(&mut singleton)
             .unwrap();
-        let mut raw = Vec::with_capacity(5 + 8 + fragment_count as usize * (4 + singleton.len()));
+        let raw_fragment_count = (MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+            / (singleton.len() + CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES)
+            + 1) as u32;
+        let mut raw =
+            Vec::with_capacity(5 + 8 + raw_fragment_count as usize * (4 + singleton.len()));
         raw.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
         raw.push(CELL_FLAG_ROW_ADDRESSES_ROARING);
-        raw.extend_from_slice(&u64::from(fragment_count).to_le_bytes());
-        for fragment_id in 0..fragment_count {
+        raw.extend_from_slice(&u64::from(raw_fragment_count).to_le_bytes());
+        for fragment_id in 0..raw_fragment_count {
             raw.extend_from_slice(&fragment_id.to_le_bytes());
             raw.extend_from_slice(&singleton);
         }
         assert!(raw.len() < MAX_CELL_FLAG_ROW_ADDRESSES_BYTES);
         let error = decode_cell_flag_row_addresses(&raw).unwrap_err();
+        assert!(error.to_string().contains("retained bytes"));
+    }
+
+    #[test]
+    fn fragmented_row_addresses_use_conservative_bitmap_memory_declarations() {
+        let bitmap = RoaringBitmap::from_sorted_iter((0..2049).map(|index| index * 31)).unwrap();
+        let fragment_bytes = encode_cell_flag_bitmap(&bitmap).unwrap();
+        let bitmap_memory = cell_flag_bitmap_memory_size(&fragment_bytes).unwrap();
+        assert!(bitmap_memory > bitmap.serialized_size());
+        let fragment_count = (MAX_CELL_FLAG_ROW_ADDRESSES_BYTES
+            / (bitmap_memory + CELL_FLAG_ROW_ADDRESS_FRAGMENT_MEMORY_BYTES)
+            + 1) as u32;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(CELL_FLAG_ROW_ADDRESSES_MAGIC);
+        encoded.push(CELL_FLAG_ROW_ADDRESSES_FRAGMENTED);
+        encoded.extend_from_slice(&fragment_count.to_le_bytes());
+        for fragment_id in 0..fragment_count {
+            encoded.extend_from_slice(&fragment_id.to_le_bytes());
+            encoded.extend_from_slice(&(fragment_bytes.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(&fragment_bytes);
+        }
+        assert!(encoded.len() < MAX_CELL_FLAG_ROW_ADDRESSES_BYTES);
+        let error = decode_cell_flag_row_addresses(&encoded).unwrap_err();
         assert!(error.to_string().contains("retained bytes"));
     }
 
