@@ -20,7 +20,7 @@ use datafusion::logical_expr::{
 
 use datafusion::prelude::col;
 use lance_core::{
-    ROW_ADDR, ROW_ID,
+    ROW_ADDR, ROW_ID, ROW_OFFSET,
     datatypes::{OnMissing, Projection},
 };
 use lance_index::scalar::inverted::{DOC_INDEX_COL, SCORE_COL};
@@ -28,6 +28,7 @@ use lance_index::vector::DIST_COL;
 
 use super::fts;
 use super::prepare::PreparedQueries;
+use super::row_offset::RowOffsetNode;
 use super::source::{LanceScanSource, ScanSourceOptions};
 use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
@@ -49,8 +50,18 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     let has_search = scanner.nearest.is_some() || prepared.full_text.is_some();
     let prefilter = scanner.prefilter && has_search;
 
+    // `_rowoffset` is computed above the scan rather than read from it, so a predicate on it only
+    // binds once that node is in place. A postfilter is covered below, where the node already goes;
+    // a prefilter sits on the scan itself, so it has to be covered here.
+    let filter_reads_row_offset = filter
+        .as_ref()
+        .is_some_and(|filter| filter.column_refs().iter().any(|c| c.name == ROW_OFFSET));
+
     let mut source = scan.clone();
     if prefilter && let Some(filter) = filter.clone() {
+        if filter_reads_row_offset {
+            source = extension(RowOffsetNode::try_new(source)?);
+        }
         source = LogicalPlanBuilder::new(source).filter(filter)?.build()?;
     }
 
@@ -198,6 +209,16 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     } else {
         LogicalPlanBuilder::new(source)
     };
+
+    // A row's offset is derived from its address alone, so this can sit below the sort and limit
+    // that the imperative path puts it above — the values come out the same either way. It has to
+    // sit below a postfilter that reads it, which is the reason it is added here rather than there.
+    if (scanner.projection_plan.must_add_row_offset || filter_reads_row_offset)
+        && !(prefilter && filter_reads_row_offset)
+    {
+        builder =
+            LogicalPlanBuilder::new(extension(RowOffsetNode::try_new(builder.plan().clone())?));
+    }
 
     // Postfilters, innermost first: an FTS `query_filter` runs before the expression filter,
     // matching `FilterPlan::refine_filter`.

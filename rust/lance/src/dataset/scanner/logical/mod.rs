@@ -87,6 +87,7 @@
 //! coverage     splitting a search across indexed and unindexed fragments
 //! scan_index   recording on each scan how it finds its rows (index query, or a take)
 //! planner      stage 4: dispatch to each node's lowering
+//! row_offset   the `_rowoffset` column, whose node is the one that needs a prefetch
 //! take/        late materialization
 //! vector/      node, rerank, rules, planner   <- five entry points
 //! fts/         node, rules, planner, prefetch <- the same five
@@ -101,9 +102,11 @@
 pub(super) mod builder;
 pub(super) mod context;
 pub(super) mod coverage;
+pub mod dataframe;
 pub(super) mod fts;
 pub(super) mod planner;
 pub(super) mod prepare;
+pub(super) mod row_offset;
 pub(super) mod rules;
 pub(super) mod scan_index;
 pub(super) mod source;
@@ -113,6 +116,7 @@ mod tests;
 pub(super) mod vector;
 
 pub use coverage::*;
+pub use row_offset::*;
 pub use rules::*;
 pub use scan_index::*;
 pub use take::*;
@@ -134,7 +138,6 @@ use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use lance_core::ROW_OFFSET;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
 
@@ -319,6 +322,7 @@ fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRul
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
         Arc::new(ExpandVectorRefine::new(context.clone())),
+        Arc::new(ResolveRowOffsets::new(context.clone())),
     ]);
     rules
 }
@@ -455,13 +459,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         nearest_query_count: _,
     } = scanner;
 
-    if reads_row_offset(scanner)? {
-        // `_rowoffset` is computed above the scan rather than read from it, so producing it needs a
-        // node this path does not have yet.
-        return Err(Error::not_supported_source(
-            "The logical scan planner cannot produce _rowoffset yet".into(),
-        ));
-    }
     if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
         // same reason: a search returns row ids, and a deleted row does not have one.
@@ -491,16 +488,4 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn reads_row_offset(scanner: &Scanner) -> Result<bool> {
-    let names_it = |expr: &datafusion::logical_expr::Expr| {
-        expr.column_refs().iter().any(|col| col.name == ROW_OFFSET)
-    };
-    Ok(scanner
-        .projection_plan
-        .requested_output_expr
-        .iter()
-        .any(|output| names_it(&output.expr))
-        || scanner.get_expr_filter()?.as_ref().is_some_and(names_it))
 }

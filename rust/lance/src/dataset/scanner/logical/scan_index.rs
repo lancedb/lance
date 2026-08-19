@@ -9,16 +9,16 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{provider_as_source, source_as_provider};
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{Extension, Filter, LogicalPlan};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use lance_select::mask::RowAddrTreeMap;
 use roaring::RoaringBitmap;
 
-use super::PrefilterSourceKind;
 use super::context::{OverlayStaleness, ScanPlanningContext};
 use super::source::{LanceScanSource, ScanRestriction};
+use super::{PrefilterSourceKind, RowOffsetNode};
 use crate::dataset::scanner::TakeOperation;
 
 /// Derive each Lance scan's scalar index query and record it on the scan's source.
@@ -255,6 +255,10 @@ impl OptimizerRule for ResolveTake {
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         match &plan {
             LogicalPlan::TableScan(_) => self.restrict_scan(plan),
+            // A `_rowoffset` predicate never reaches the scan: the column is computed by the node
+            // above it, and `PushDownFilter` does not push through an extension. Matching that pair
+            // is what lets those predicates become takes too.
+            LogicalPlan::Filter(_) => self.restrict_below_row_offsets(plan),
             _ => Ok(Transformed::no(plan)),
         }
     }
@@ -303,5 +307,51 @@ impl ResolveTake {
         Ok(Transformed::yes(map_lance_scan(&restricted, |source| {
             source.restricted_to(&ScanRestriction::Rows(rows.clone()))
         })?))
+    }
+
+    /// [`Self::restrict_scan`] for a predicate stranded above a [`RowOffsetNode`].
+    fn restrict_below_row_offsets(
+        &self,
+        plan: LogicalPlan,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Filter(filter) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let LogicalPlan::Extension(offsets) = filter.input.as_ref() else {
+            return Ok(Transformed::no(plan));
+        };
+        if offsets
+            .node
+            .as_any()
+            .downcast_ref::<RowOffsetNode>()
+            .is_none()
+        {
+            return Ok(Transformed::no(plan));
+        }
+        let [scan] = offsets.node.inputs()[..] else {
+            return Ok(Transformed::no(plan));
+        };
+        let restrictable = with_lance_source(scan, |source| source.options().rows.is_none());
+        if restrictable != Some(true) {
+            return Ok(Transformed::no(plan));
+        }
+        let Some((take, remainder)) = TakeOperation::try_from_expr(&filter.predicate) else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(rows) = self.rows_for(&take) else {
+            return Ok(Transformed::no(plan));
+        };
+        let restricted = map_lance_scan(scan, |source| {
+            source.restricted_to(&ScanRestriction::Rows(rows.clone()))
+        })?;
+        let offsets = LogicalPlan::Extension(Extension {
+            node: offsets
+                .node
+                .with_exprs_and_inputs(vec![], vec![restricted])?,
+        });
+        Ok(Transformed::yes(match remainder {
+            Some(remainder) => LogicalPlan::Filter(Filter::try_new(remainder, Arc::new(offsets))?),
+            None => offsets,
+        }))
     }
 }

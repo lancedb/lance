@@ -207,6 +207,10 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "logical_scan_planner"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
