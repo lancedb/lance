@@ -24,7 +24,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
@@ -6540,6 +6542,99 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Rebuilds dictionary chunks whose values array is empty.
+    ///
+    /// Such chunks are entirely null and keep their key validity through
+    /// `extract_validity` (stripping it would make key 0 an out-of-bounds
+    /// reference).  The nullness is already recorded in repdef, so their zeroed
+    /// keys are merged into an adjacent valued chunk without adding another
+    /// values array.  When every chunk is empty, a single placeholder value is
+    /// used.  Decoding never exposes the rebuilt keys because repdef retains the
+    /// real nullness.
+    fn rebuild_empty_dictionary_chunks(arrays: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if !arrays.iter().any(|array| {
+            array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+        }) {
+            return Ok(arrays);
+        }
+        let zeroed = |data_type: &DataType, len: usize| {
+            new_null_array(data_type, len)
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .map(make_array)
+        };
+        let rebuild =
+            |keys: Vec<ArrayRef>, data_type: &DataType, values: ArrayRef| -> Result<ArrayRef> {
+                let keys = keys.iter().map(|keys| keys.as_ref()).collect::<Vec<_>>();
+                let keys = arrow_select::concat::concat(&keys)?;
+                let data = keys
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .child_data(vec![values.to_data()])
+                    .build()?;
+                Ok(make_array(data))
+            };
+
+        let mut rebuilt = Vec::with_capacity(arrays.len());
+        let mut pending_keys = Vec::with_capacity(arrays.len());
+        let mut empty_data_type = None;
+        for array in arrays {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            if dictionary.values().is_empty() {
+                pending_keys.push(zeroed(dictionary.keys().data_type(), array.len())?);
+                empty_data_type.get_or_insert_with(|| array.data_type().clone());
+            } else if pending_keys.is_empty() {
+                rebuilt.push(array);
+            } else {
+                pending_keys.push(make_array(dictionary.keys().to_data()));
+                rebuilt.push(rebuild(
+                    std::mem::take(&mut pending_keys),
+                    array.data_type(),
+                    dictionary.values().clone(),
+                )?);
+            }
+        }
+
+        if pending_keys.is_empty() {
+            return Ok(rebuilt);
+        }
+        if let Some(array) = rebuilt.pop() {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            let mut keys = Vec::with_capacity(pending_keys.len() + 1);
+            keys.push(make_array(dictionary.keys().to_data()));
+            keys.append(&mut pending_keys);
+            rebuilt.push(rebuild(
+                keys,
+                array.data_type(),
+                dictionary.values().clone(),
+            )?);
+        } else {
+            let data_type = empty_data_type.ok_or_else(|| {
+                Error::internal("Missing data type for an empty dictionary chunk")
+            })?;
+            let DataType::Dictionary(_, value_type) = &data_type else {
+                return Err(Error::internal(format!(
+                    "Expected dictionary data type, got {data_type}"
+                )));
+            };
+            rebuilt.push(rebuild(pending_keys, &data_type, zeroed(value_type, 1)?)?);
+        }
+        Ok(rebuilt)
+    }
+
     // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -6548,6 +6643,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        let arrays = Self::rebuild_empty_dictionary_chunks(arrays)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
@@ -6609,6 +6705,15 @@ impl PrimitiveStructuralEncoder {
                 repdef.add_validity_bitmap(validity.clone());
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
+            }
+            // An empty values array means every key is null (there is no value a valid
+            // key could reference).  Stripping the validity would turn key 0 into an
+            // out-of-bounds reference, so keep the array unchanged; `do_flush` rebuilds
+            // it against a sibling chunk's dictionary before the page is encoded.
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
+            {
+                return Ok(array);
             }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
@@ -7011,10 +7116,16 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
-    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, check_round_trip_encoding_of_data,
+        check_round_trip_encoding_of_data_with_expected,
+    };
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
-        make_array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, FixedSizeListArray, Float32Array,
+        Int8Array, PrimitiveArray, StringArray, UInt8Array,
+        builder::StringDictionaryBuilder,
+        make_array, new_null_array,
+        types::{ArrowDictionaryKeyType, Int8Type, Int32Type},
     };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -7039,6 +7150,126 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[tokio::test]
+    async fn test_all_null_dictionary_round_trip() {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let dictionary = new_null_array(&data_type, 3);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &TestCases::default(), HashMap::new())
+            .await;
+    }
+
+    fn valued_dictionary<K: ArrowDictionaryKeyType>() -> ArrayRef {
+        let mut valued = StringDictionaryBuilder::<K>::new();
+        valued.append_value("a");
+        for _ in 0..7 {
+            valued.append_null();
+        }
+        Arc::new(valued.finish())
+    }
+
+    fn mixed_empty_dictionary_values() -> Vec<ArrayRef> {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        vec![
+            valued_dictionary::<Int32Type>(),
+            new_null_array(&data_type, 8),
+        ]
+    }
+
+    fn mixed_null_dictionary_values() -> Vec<ArrayRef> {
+        let keys = PrimitiveArray::<Int32Type>::from(vec![0; 8]);
+        let values = Arc::new(StringArray::from(vec![None::<&str>]));
+        let all_null = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        vec![valued_dictionary::<Int32Type>(), all_null]
+    }
+
+    fn mixed_sliced_int8_dictionary() -> Vec<ArrayRef> {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let all_null = new_null_array(&data_type, 10).slice(1, 8);
+        vec![valued_dictionary::<Int8Type>(), all_null]
+    }
+
+    fn mixed_full_int8_dictionary(values: ArrayRef) -> (Vec<ArrayRef>, ArrayRef) {
+        let keys = (0..=i8::MAX).collect::<Vec<_>>();
+        let valued = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                PrimitiveArray::<Int8Type>::from(keys.clone()),
+                values.clone(),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let expected = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                PrimitiveArray::<Int8Type>::from(
+                    keys.into_iter().map(Some).chain([None]).collect::<Vec<_>>(),
+                ),
+                values,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let data_type = valued.data_type().clone();
+        (vec![valued, new_null_array(&data_type, 1)], expected)
+    }
+
+    /// A full Int8 dictionary (128 values) has no spare key capacity, so merging the
+    /// all-null chunk into the page must not add a dictionary entry.
+    fn mixed_full_int8_utf8_dictionary() -> (Vec<ArrayRef>, ArrayRef) {
+        let values = Arc::new(StringArray::from(
+            (0..=i8::MAX)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        mixed_full_int8_dictionary(values)
+    }
+
+    fn mixed_full_int8_boolean_dictionary() -> (Vec<ArrayRef>, ArrayRef) {
+        let values = Arc::new(BooleanArray::from(
+            (0..=i8::MAX)
+                .map(|value| value % 2 == 0)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        mixed_full_int8_dictionary(values)
+    }
+
+    #[rstest::rstest]
+    #[case::empty_values(mixed_empty_dictionary_values())]
+    #[case::null_values(mixed_null_dictionary_values())]
+    #[case::sliced_int8(mixed_sliced_int8_dictionary())]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_round_trip(
+        #[case] dictionaries: Vec<ArrayRef>,
+    ) {
+        check_round_trip_encoding_of_data(dictionaries, &TestCases::default(), HashMap::new())
+            .await;
+    }
+
+    /// A full Int8 dictionary (128 values) has no spare key capacity, so merging the
+    /// all-null chunk into the page must not add a dictionary entry (that would widen
+    /// the stored indices past the declared key type and corrupt valid rows on decode).
+    ///
+    /// Restricted to the dense u16 encoding because full narrow dictionaries hit
+    /// pre-existing failures elsewhere, even without an all-null chunk: the legacy
+    /// array encoding's null normalization appends a null dictionary entry (overflowing
+    /// the key type), and the constant-capable structural encodings panic in scalar
+    /// extraction (`MutableArrayData` rejects an at-capacity dictionary).
+    #[rstest::rstest]
+    #[case::utf8(mixed_full_int8_utf8_dictionary())]
+    #[case::boolean(mixed_full_int8_boolean_dictionary())]
+    #[tokio::test]
+    async fn test_full_int8_dictionary_with_all_null_chunk_round_trip(
+        #[case] (dictionaries, expected): (Vec<ArrayRef>, ArrayRef),
+    ) {
+        check_round_trip_encoding_of_data_with_expected(
+            dictionaries,
+            Some(expected),
+            &TestCases::default()
+                .with_encoding(TestEncoding::StructuralU16)
+                .without_validation(),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
