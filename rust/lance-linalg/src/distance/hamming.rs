@@ -379,13 +379,31 @@ impl Default for PairwiseResult {
 
 /// Compute hamming distances for a query against multiple targets.
 /// Uses SIMD acceleration when available.
+///
+/// # Panics
+///
+/// Panics if `results` is not the same length as `targets`.
 #[inline]
 pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
-    debug_assert_eq!(targets.len(), results.len());
+    // The SIMD kernels below write through raw pointers with no bounds check, so
+    // this check has to survive release builds. As a `debug_assert_eq!` it let
+    // both x86 kernels write past the end of `results` in release, while the
+    // scalar fallback panicked on its indexed store.
+    let num_targets = targets.len();
+    let num_slots = results.len();
+    assert_eq!(
+        num_targets, num_slots,
+        "hamming_batch_u64 needs one result slot per target, \
+         got {num_targets} target(s) and {num_slots} slot(s)"
+    );
     hamming_batch_simd(query, targets, results);
 }
 
 /// SIMD-accelerated batch hamming distance computation.
+///
+/// `results.len()` must be at least `targets.len()`: the x86 kernels this
+/// dispatches to store through raw pointers with no bounds check. The only
+/// caller, `hamming_batch_u64`, asserts equality first.
 #[inline]
 fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
     #[cfg(target_arch = "x86_64")]
@@ -436,6 +454,11 @@ fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
 }
 
 /// AVX-512 VPOPCNTDQ: Process 8 x 64-bit values at once.
+///
+/// # Safety
+/// The host must support AVX-512F and AVX512VPOPCNTDQ, and `results.len()` must
+/// be at least `targets.len()`: each chunk stores 8 x u32 through a raw pointer
+/// with no bounds check.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512vpopcntdq")]
 unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -471,6 +494,11 @@ unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32])
 }
 
 /// AVX2 popcount using lookup table (Harley-Seal / PSHUFB method).
+///
+/// # Safety
+/// The host must support AVX2, and `results.len()` must be at least
+/// `targets.len()`: each chunk stores 4 x u32 through a raw pointer with no
+/// bounds check.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hamming_batch_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -1060,6 +1088,7 @@ pub fn cluster_pairwise_result(result: &PairwiseResult) -> ClusteringResult {
 mod tests {
     use super::*;
     use lance_arrow::FixedSizeListArrayExt;
+    use rstest::rstest;
 
     #[test]
     fn test_result_schemas_are_initialized_once() {
@@ -1109,6 +1138,33 @@ mod tests {
         assert_eq!(results[1], 1);
         assert_eq!(results[3], 2); // 0b11 has 2 bits set
         assert_eq!(results[7], 3); // 0b111 has 3 bits set
+    }
+
+    #[rstest]
+    // Fewer slots than targets is the case that used to write out of bounds: on
+    // an AVX2 host `hamming_batch_avx2` wrote 28 bytes past a 4-byte `results`.
+    #[case::one_slot_eight_targets(1)]
+    // A short final chunk still overruns, just by less.
+    #[case::seven_slots_eight_targets(7)]
+    // More slots than targets would leave the tail unwritten rather than
+    // overrun, but the contract is one slot per target either way.
+    #[case::nine_slots_eight_targets(9)]
+    // The `8` is the target count every case shares, so this one literal also
+    // pins which length the message reports first. A fourth case with a
+    // different target count has to move it out of the literal.
+    #[should_panic(expected = "needs one result slot per target, got 8 target(s) and ")]
+    fn test_hamming_batch_u64_rejects_mismatched_lengths(#[case] num_slots: usize) {
+        // No CPU feature gate: the assert precedes every kernel, so the panic
+        // happens on each host. An early return here would fail the test.
+        //
+        // A `debug_assert_eq!` carrying the same message still passes here when
+        // debug assertions are on, which is the profile `--profile ci` gives this
+        // crate; `cargo test --release -p lance-linalg --lib` (rust.yml) is what
+        // catches that revert.
+        let targets = vec![u64::MAX; 8];
+        let mut results = vec![0u32; num_slots];
+
+        hamming_batch_u64(0, &targets, &mut results);
     }
 
     #[test]
