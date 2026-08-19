@@ -2920,7 +2920,7 @@ impl Transaction {
         if !changes.row_changes.is_empty()
             && !matches!(
                 self.operation,
-                Operation::Update { .. } | Operation::Merge { .. } | Operation::Delete { .. }
+                Operation::Update { .. } | Operation::Merge { .. }
             )
         {
             return Err(Error::invalid_input(
@@ -8036,31 +8036,38 @@ mod tests {
 
     #[test]
     fn cell_flag_row_changes_must_match_a_public_row_mutation() {
-        let transaction = Transaction::new_from_version(
-            1,
+        let operations = [
             Operation::Append {
                 fragments: Vec::new(),
             },
-        )
-        .with_cell_flag_transaction(CellFlagTransaction {
-            row_changes: vec![CellFlagRowChange {
-                flag_id: 0,
-                value: true,
-                row_addresses: roaring::RoaringTreemap::from_iter([0_u64]),
-            }],
-            dataset_identity: Uuid::new_v4().to_string(),
-            ..Default::default()
-        })
-        .unwrap();
+            Operation::Delete {
+                updated_fragments: Vec::new(),
+                deleted_fragment_ids: Vec::new(),
+                predicate: "false".to_string(),
+            },
+        ];
+        for operation in operations {
+            let transaction = Transaction::new_from_version(1, operation)
+                .with_cell_flag_transaction(CellFlagTransaction {
+                    row_changes: vec![CellFlagRowChange {
+                        flag_id: 0,
+                        value: true,
+                        row_addresses: roaring::RoaringTreemap::from_iter([0_u64]),
+                    }],
+                    dataset_identity: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
 
-        let error = transaction.cell_flag_transaction().unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
-        assert!(
-            error
-                .to_string()
-                .contains("only valid for update and merge transactions"),
-            "got {error}"
-        );
+            let error = transaction.cell_flag_transaction().unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("only valid for update and merge transactions"),
+                "got {error}"
+            );
+        }
     }
 
     #[test]

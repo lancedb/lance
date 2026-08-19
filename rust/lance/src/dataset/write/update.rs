@@ -287,15 +287,13 @@ impl UpdateBuilder {
         }
         let mut read_expressions = self.updates.values().collect::<Vec<_>>();
         read_expressions.extend(self.condition.iter());
-        let read_cell_flag_ids =
-            resolve_cell_flag_expression_ids(self.dataset.as_ref(), &read_expressions)?;
+        resolve_cell_flag_expression_ids(self.dataset.as_ref(), &read_expressions)?;
 
         Ok(UpdateJob {
             dataset: self.dataset,
             condition: self.condition,
             updates: Arc::new(self.updates),
             cell_flag_values: Arc::new(self.cell_flag_values),
-            read_cell_flag_ids: Arc::new(read_cell_flag_ids),
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
             retry_started_at: None,
@@ -319,6 +317,7 @@ pub struct UpdateData {
     affected_rows: RowAddrTreeMap,
     source_row_addresses: Vec<u64>,
     num_updated_rows: u64,
+    read_cell_flag_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,13 +326,18 @@ pub struct UpdateJob {
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Expr>>,
     cell_flag_values: Arc<HashMap<u32, bool>>,
-    read_cell_flag_ids: Arc<Vec<u32>>,
     conflict_retries: u32,
     retry_timeout: Duration,
     retry_started_at: Option<Instant>,
 }
 
 impl UpdateJob {
+    fn resolve_cell_flag_read_ids(&self) -> Result<Vec<u32>> {
+        let mut expressions = self.updates.values().collect::<Vec<_>>();
+        expressions.extend(self.condition.iter());
+        resolve_cell_flag_expression_ids(self.dataset.as_ref(), &expressions)
+    }
+
     fn commit_builder(
         &self,
         dataset: Arc<Dataset>,
@@ -361,8 +365,11 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        let read_cell_flag_ids = self.resolve_cell_flag_read_ids()?;
         if self.updates.is_empty() {
-            return self.execute_flag_only_impl().await;
+            let mut data = self.execute_flag_only_impl().await?;
+            data.read_cell_flag_ids = read_cell_flag_ids;
+            return Ok(data);
         }
 
         let mut scanner = self.dataset.scan();
@@ -644,6 +651,7 @@ impl UpdateJob {
             affected_rows,
             source_row_addresses,
             num_updated_rows,
+            read_cell_flag_ids,
         })
     }
 
@@ -678,6 +686,7 @@ impl UpdateJob {
             affected_rows: RowAddrTreeMap::from(row_addrs.as_ref().clone()),
             source_row_addresses,
             num_updated_rows,
+            read_cell_flag_ids: Vec::new(),
         })
     }
 
@@ -686,6 +695,7 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        let read_flag_ids = update_data.read_cell_flag_ids.clone();
         if self.updates.is_empty() {
             let row_addresses = RoaringTreemap::from_iter(update_data.source_row_addresses);
             let row_changes = if row_addresses.is_empty() {
@@ -715,7 +725,7 @@ impl UpdateJob {
                 .with_cell_flag_transaction_for_dataset(
                     CellFlagTransaction {
                         row_changes,
-                        read_flag_ids: self.read_cell_flag_ids.as_ref().clone(),
+                        read_flag_ids,
                         ..Default::default()
                     },
                     dataset.as_ref(),
@@ -774,7 +784,7 @@ impl UpdateJob {
             .with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     fragment_states,
-                    read_flag_ids: self.read_cell_flag_ids.as_ref().clone(),
+                    read_flag_ids,
                     ..Default::default()
                 },
                 dataset.as_ref(),
@@ -1045,6 +1055,40 @@ mod tests {
             .unwrap()
             .expect("update transaction");
         assert!(committed.cell_flag_transaction().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_resolves_cell_flag_read_ids_for_each_attempt() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        let old_flag = dataset
+            .register_cell_flag("name", "reviewed", false)
+            .await
+            .unwrap();
+        let mut job = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("cell_flag(name, 'reviewed')")
+            .unwrap()
+            .set("id", "id + 1")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let first_attempt = job.clone().execute_impl().await.unwrap();
+        assert_eq!(first_attempt.read_cell_flag_ids, vec![old_flag.flag_id]);
+
+        dataset
+            .rename_cell_flag("name", "reviewed", "archived")
+            .await
+            .unwrap();
+        let new_flag = dataset
+            .register_cell_flag("name", "reviewed", false)
+            .await
+            .unwrap();
+        assert_ne!(old_flag.flag_id, new_flag.flag_id);
+
+        job.dataset = Arc::new(dataset);
+        let retried_attempt = job.execute_impl().await.unwrap();
+        assert_eq!(retried_attempt.read_cell_flag_ids, vec![new_flag.flag_id]);
     }
 
     #[rstest]

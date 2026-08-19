@@ -1968,12 +1968,13 @@ pub(super) fn resolve_target_cell_flag_expression_ids(
 }
 
 impl CellFlagExprBindings {
-    pub(crate) async fn try_new(
+    async fn try_new_impl(
         dataset: &Dataset,
         expressions: &[&Expr],
         selected_fragments: Option<&[lance_table::format::Fragment]>,
+        field_prefix: Option<&str>,
     ) -> Result<Option<Self>> {
-        let flag_ids = resolve_cell_flag_expression_ids(dataset, expressions)?;
+        let flag_ids = resolve_cell_flag_expression_ids_impl(dataset, expressions, field_prefix)?;
         if flag_ids.is_empty() {
             return Ok(None);
         }
@@ -2013,7 +2014,36 @@ impl CellFlagExprBindings {
         Ok(Some(Self { functions }))
     }
 
+    pub(crate) async fn try_new(
+        dataset: &Dataset,
+        expressions: &[&Expr],
+        selected_fragments: Option<&[lance_table::format::Fragment]>,
+    ) -> Result<Option<Self>> {
+        Self::try_new_impl(dataset, expressions, selected_fragments, None).await
+    }
+
+    pub(crate) async fn try_new_for_target(
+        dataset: &Dataset,
+        expressions: &[&Expr],
+        selected_fragments: Option<&[lance_table::format::Fragment]>,
+    ) -> Result<Option<Self>> {
+        Self::try_new_impl(dataset, expressions, selected_fragments, Some("target")).await
+    }
+
     pub(crate) fn bind(&self, expression: Expr, dataset: &Dataset) -> Result<Expr> {
+        self.bind_impl(expression, dataset, None)
+    }
+
+    pub(crate) fn bind_target(&self, expression: Expr, dataset: &Dataset) -> Result<Expr> {
+        self.bind_impl(expression, dataset, Some("target"))
+    }
+
+    fn bind_impl(
+        &self,
+        expression: Expr,
+        dataset: &Dataset,
+        field_prefix: Option<&str>,
+    ) -> Result<Expr> {
         let mut captured_error = None;
         let transformed = expression
             .transform(|node| {
@@ -2025,7 +2055,10 @@ impl CellFlagExprBindings {
                     }
                 };
                 let flag_id = if let Some((segments, name)) = public_call {
-                    match resolve_cell_flag(dataset, &segments, &name) {
+                    let segments = field_prefix
+                        .filter(|prefix| segments.first().is_some_and(|part| part == prefix))
+                        .map_or(segments.as_slice(), |_| &segments[1..]);
+                    match resolve_cell_flag(dataset, segments, &name) {
                         Ok((flag_id, _)) => flag_id,
                         Err(error) => {
                             captured_error = Some(error);
@@ -3028,8 +3061,8 @@ mod tests {
         MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
     };
     use crate::dataset::{
-        ColumnAlteration, CommitBuilder, InsertBuilder, NewColumnTransform, UpdateBuilder,
-        WriteMode, WriteParams,
+        ColumnAlteration, CommitBuilder, DeleteBuilder, InsertBuilder, NewColumnTransform,
+        UpdateBuilder, WriteMode, WriteParams,
     };
     use crate::index::DatasetIndexExt;
     use crate::utils::test::copy_test_data_to_tmp;
@@ -3290,6 +3323,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragment_staging_rejects_cell_flag_read_dependencies() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let fragment = dataset.get_fragment(0).expect("first fragment");
+
+        let delete_error = fragment
+            .clone()
+            .delete(&format!("cell_flag(value, '{}')", FLAG_NAME))
+            .await
+            .unwrap_err();
+        assert!(delete_error.to_string().contains("Fragment-level delete"));
+
+        let add_columns_error = fragment
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "copied_flag".to_string(),
+                    format!("cell_flag(value, '{}')", FLAG_NAME),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            add_columns_error
+                .to_string()
+                .contains("Fragment-level add_columns")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn batch_registration_is_atomic_and_uses_one_version() -> Result<()> {
         let directory = TempStrDir::default();
         let mut dataset = dataset_with_rows(&directory, 2).await?;
@@ -3511,6 +3579,16 @@ mod tests {
         assert_eq!(
             dataset.count_rows(Some("copied_flag".to_string())).await?,
             2
+        );
+        assert_eq!(
+            dataset
+                .read_transaction()
+                .await?
+                .expect("add_columns transaction")
+                .cell_flag_transaction()?
+                .expect("flag-reading add_columns carries a sidecar")
+                .read_flag_ids,
+            vec![0]
         );
 
         let result = UpdateBuilder::new(Arc::new(dataset))
@@ -4184,9 +4262,25 @@ mod tests {
                 .await?;
             let mut dataset = result.new_dataset.as_ref().clone();
 
-            dataset
-                .delete(&format!("id = 2 AND cell_flag(value, '{}')", FLAG_NAME))
-                .await?;
+            let staged = DeleteBuilder::new(
+                Arc::new(dataset.clone()),
+                format!("id = 2 AND cell_flag(value, '{}')", FLAG_NAME),
+            )
+            .execute_uncommitted()
+            .await?;
+            assert_eq!(
+                staged
+                    .transaction
+                    .cell_flag_transaction()?
+                    .expect("flag-reading delete carries a sidecar")
+                    .read_flag_ids,
+                vec![0]
+            );
+            let mut commit = CommitBuilder::new(Arc::new(dataset));
+            if let Some(affected_rows) = staged.affected_rows {
+                commit = commit.with_affected_rows(affected_rows);
+            }
+            dataset = commit.execute(staged.transaction).await?;
             compact_files(&mut dataset, CompactionOptions::default(), None).await?;
             assert_eq!(
                 flagged_ids(&dataset, "value", FLAG_NAME).await?,
@@ -4576,6 +4670,74 @@ mod tests {
             assert_eq!(delete_if_stats.num_deleted_rows, 1);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_merge_records_and_conflicts_on_cell_flag_reads() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 1")?
+            .set_cell_flag("value", FLAG_NAME, true)?
+            .build()?
+            .execute()
+            .await?;
+        let mut dataset = result.new_dataset.as_ref().clone();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+        let dataset = Arc::new(dataset);
+
+        let source_schema: Arc<Schema> = Arc::new(dataset.schema().into());
+        let source = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![111])),
+            ],
+        )?;
+        let mut builder = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])?;
+        builder
+            .when_matched(WhenMatched::UpdateIf(format!(
+                "cell_flag(target.value, '{}')",
+                FLAG_NAME
+            )))
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let staged = builder
+            .try_build()?
+            .execute_uncommitted(RecordBatchIterator::new([Ok(source)], source_schema))
+            .await?;
+        assert_eq!(
+            staged
+                .transaction
+                .cell_flag_transaction()?
+                .expect("flag-reading merge carries a sidecar")
+                .read_flag_ids,
+            vec![definition.flag_id]
+        );
+
+        let concurrent = UpdateBuilder::new(dataset)
+            .update_where("id = 7")?
+            .set_cell_flag("value", FLAG_NAME, true)?
+            .build()?
+            .execute()
+            .await?;
+        let mut commit = CommitBuilder::new(concurrent.new_dataset);
+        if let Some(affected_rows) = staged.affected_rows {
+            commit = commit.with_affected_rows(affected_rows);
+        }
+        let error = commit.execute(staged.transaction).await.unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
         Ok(())
     }
 

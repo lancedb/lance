@@ -47,7 +47,9 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
-use crate::dataset::cell_flag::resolve_target_cell_flag_expression_ids;
+use crate::dataset::cell_flag::{
+    CellFlagExprBindings, resolve_cell_flag_expression_ids, resolve_target_cell_flag_expression_ids,
+};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -347,17 +349,25 @@ fn combined_schema(schema: &Schema) -> Schema {
     Schema::new(vec![source, target])
 }
 
+fn combined_schema_with_row_addr(schema: &Schema) -> Schema {
+    let target = Field::new("target", DataType::Struct(schema.fields.clone()), false);
+    let source = Field::new("source", DataType::Struct(schema.fields.clone()), false);
+    Schema::new(vec![source, target, ROW_ADDR_FIELD.clone()])
+}
+
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
 // half, puts it into a struct, then takes the right half, and puts that into a struct.  This
 // makes the table match the "combined schema" so we can apply an "update if" expression
-fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
+fn unzip_batch(batch: &RecordBatch, schema: &Schema, with_row_addr: bool) -> RecordBatch {
     // The schema of the combined batches will be:
     // target_data_keys, target_data_non_keys, target_data_row_id, source_data_keys, source_data_non_keys
     // The keys and non_keys on both sides will be equal
-    let num_fields = batch.num_columns();
-    debug_assert_eq!(num_fields % 2, 1);
-    let half_num_fields = num_fields / 2;
-    let row_id_col = num_fields - 1;
+    let half_num_fields = schema.fields().len();
+    let row_id_col = half_num_fields * 2;
+    debug_assert_eq!(
+        batch.num_columns(),
+        row_id_col + 1 + usize::from(with_row_addr)
+    );
 
     let source_arrays = batch.columns()[0..half_num_fields].to_vec();
     let source = StructArray::new(schema.fields.clone(), source_arrays, None);
@@ -365,12 +375,14 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     let target_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
     let target = StructArray::new(schema.fields.clone(), target_arrays, None);
 
-    let combined_schema = combined_schema(schema);
-    RecordBatch::try_new(
-        Arc::new(combined_schema),
-        vec![Arc::new(source), Arc::new(target)],
-    )
-    .unwrap()
+    let mut columns = vec![Arc::new(source) as _, Arc::new(target) as _];
+    let combined_schema = if with_row_addr {
+        columns.push(batch.column(row_id_col + 1).clone());
+        combined_schema_with_row_addr(schema)
+    } else {
+        combined_schema(schema)
+    };
+    RecordBatch::try_new(Arc::new(combined_schema), columns).unwrap()
 }
 
 /// Format key values for error messages via extracting "on" column values from the given RecordBatch.
@@ -1062,28 +1074,38 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
-        let matched_condition = match &self.params.when_matched {
-            WhenMatched::UpdateIf(condition) => {
-                let dataset_schema: Schema = self.dataset.schema().into();
-                let planner = Planner::new(Arc::new(combined_schema(&dataset_schema)));
-                Some(planner.parse_filter(condition)?)
-            }
-            WhenMatched::UpdateIfExpr(condition) => Some(condition.clone()),
-            _ => None,
-        };
-        let mut read_conditions = matched_condition.iter().collect::<Vec<_>>();
-        if let WhenNotMatchedBySource::DeleteIf(condition) =
-            &self.params.delete_not_matched_by_source
-        {
-            read_conditions.push(condition);
-        }
         self.params.read_cell_flag_ids =
-            resolve_target_cell_flag_expression_ids(self.dataset.as_ref(), &read_conditions)?;
+            resolve_merge_insert_cell_flag_read_ids(self.dataset.as_ref(), &self.params)?;
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
         })
     }
+}
+
+fn resolve_merge_insert_cell_flag_read_ids(
+    dataset: &Dataset,
+    params: &MergeInsertParams,
+) -> Result<Vec<u32>> {
+    let matched_condition = match &params.when_matched {
+        WhenMatched::UpdateIf(condition) => {
+            let dataset_schema: Schema = dataset.schema().into();
+            let planner = Planner::new(Arc::new(combined_schema(&dataset_schema)));
+            Some(planner.parse_filter(condition)?)
+        }
+        WhenMatched::UpdateIfExpr(condition) => Some(condition.clone()),
+        _ => None,
+    };
+    let mut read_flag_ids = resolve_target_cell_flag_expression_ids(
+        dataset,
+        &matched_condition.iter().collect::<Vec<_>>(),
+    )?;
+    if let WhenNotMatchedBySource::DeleteIf(condition) = &params.delete_not_matched_by_source {
+        read_flag_ids.extend(resolve_cell_flag_expression_ids(dataset, &[condition])?);
+    }
+    read_flag_ids.sort_unstable();
+    read_flag_ids.dedup();
+    Ok(read_flag_ids)
 }
 
 /// Resolve the merge insert target bases against the base paths registered in
@@ -1340,7 +1362,7 @@ impl MergeInsertJob {
         );
         let schema = source.schema();
         let add_row_addr = match self.check_compatible_schema(&schema)? {
-            SchemaComparison::FullCompatible => false,
+            SchemaComparison::FullCompatible => !self.params.read_cell_flag_ids.is_empty(),
             SchemaComparison::Subschema => true,
         };
 
@@ -2594,8 +2616,7 @@ impl MergeInsertJob {
             && self.params.insert_not_matched
             && matches!(self.params.when_matched, WhenMatched::Delete);
 
-        let would_use_scalar_index = if self.params.read_cell_flag_ids.is_empty()
-            && self.params.use_index
+        let would_use_scalar_index = if self.params.use_index
             && !is_partial_delete_with_insert
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -2645,9 +2666,11 @@ impl MergeInsertJob {
     }
 
     async fn execute_uncommitted_impl(
-        self,
+        mut self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<UncommittedMergeInsert> {
+        self.params.read_cell_flag_ids =
+            resolve_merge_insert_cell_flag_read_ids(self.dataset.as_ref(), &self.params)?;
         // Check if we can use the fast path
         let can_use_fast_path = self.can_use_create_plan(provider.schema().as_ref()).await?;
 
@@ -2683,16 +2706,39 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+        let combined_schema = Arc::new(combined_schema(&source_schema));
+        let planner = Planner::new(combined_schema);
+        let matched_expression = match &self.params.when_matched {
+            WhenMatched::UpdateIf(condition) => Some(planner.parse_filter(condition)?),
+            WhenMatched::UpdateIfExpr(expression) => Some(expression.clone()),
+            _ => None,
+        };
+        let bound_match_condition = if let Some(expression) = matched_expression {
+            match CellFlagExprBindings::try_new_for_target(
+                self.dataset.as_ref(),
+                &[&expression],
+                None,
+            )
+            .await?
+            {
+                Some(bindings) => Some(bindings.bind_target(expression, self.dataset.as_ref())?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let joined = self.create_joined_stream(source).await?;
         let capture_cell_flag_sources = self
             .params
             .capture_cell_flag_sources(!self.dataset.manifest.cell_flag_states.is_empty());
+        let with_row_addr = !is_full_schema || !self.params.read_cell_flag_ids.is_empty();
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
-            !is_full_schema,
+            with_row_addr,
             self.dataset.manifest.uses_stable_row_ids(),
             capture_cell_flag_sources,
+            bound_match_condition,
         )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
@@ -3301,6 +3347,7 @@ impl Merger {
         with_row_addr: bool,
         enable_stable_row_ids: bool,
         capture_cell_flag_sources: bool,
+        bound_match_condition: Option<Expr>,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -3321,12 +3368,19 @@ impl Merger {
         };
         let match_filter_expr = match &params.when_matched {
             WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
-                let combined_schema = Arc::new(combined_schema(&schema));
+                let combined_schema = Arc::new(if with_row_addr {
+                    combined_schema_with_row_addr(&schema)
+                } else {
+                    combined_schema(&schema)
+                });
                 let planner = Planner::new(combined_schema.clone());
-                let expr = match &params.when_matched {
-                    WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
-                    WhenMatched::UpdateIfExpr(expr) => expr.clone(),
-                    _ => unreachable!(),
+                let expr = match bound_match_condition {
+                    Some(expression) => expression,
+                    None => match &params.when_matched {
+                        WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
+                        WhenMatched::UpdateIfExpr(expr) => expr.clone(),
+                        _ => unreachable!(),
+                    },
                 };
                 let expr = planner.optimize_expr(expr)?;
                 let match_expr = planner.create_physical_expr(&expr)?;
@@ -3589,7 +3643,7 @@ impl Merger {
                 let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
 
                 if let Some(match_filter) = match_filter_expr {
-                    let unzipped = unzip_batch(&matched, &self.schema);
+                    let unzipped = unzip_batch(&matched, &self.schema, self.with_row_addr);
                     let filtered = match_filter.evaluate(&unzipped)?;
                     match filtered {
                         ColumnarValue::Array(mask) => {
@@ -3788,7 +3842,7 @@ mod tests {
     };
     use arrow_array::{RecordBatch, record_batch};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -3834,7 +3888,8 @@ mod tests {
             .inserted_cell_flag_values
             .insert(0, true);
         assert!(explicit_flag_params.capture_cell_flag_sources(false));
-        let merger = Merger::try_new(params.clone(), schema.clone(), false, false, false).unwrap();
+        let merger =
+            Merger::try_new(params.clone(), schema.clone(), false, false, false, None).unwrap();
 
         merger.record_matched_output_sources(&[10, 11]);
         merger.record_inserted_output_sources(2).unwrap();
@@ -3843,7 +3898,7 @@ mod tests {
         assert!(captured.inserted_positions.is_empty());
         drop(captured);
 
-        let merger = Merger::try_new(params, schema, false, false, true).unwrap();
+        let merger = Merger::try_new(params, schema, false, false, true, None).unwrap();
         merger.record_matched_output_sources(&[10, 11]);
         merger.record_inserted_output_sources(2).unwrap();
         let captured = merger.output_source_row_ids.lock().unwrap();
@@ -3861,6 +3916,7 @@ mod tests {
             false,
             false,
             true,
+            None,
         )
         .unwrap();
         pure_insert
@@ -3870,6 +3926,143 @@ mod tests {
         assert!(captured.row_ids.is_empty());
         assert_eq!(captured.output_rows, 1_000_000);
         assert_eq!(captured.inserted_positions.len(), 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn merge_insert_resolves_cell_flag_read_ids_for_each_attempt() {
+        let batch = record_batch!(("id", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+        let source_schema = batch.schema();
+        let mut dataset = InsertBuilder::new("memory://merge_retry_flag_ids")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let old_flag = dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateIf(
+                "cell_flag(target.value, 'reviewed')".to_string(),
+            ))
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let mut job = builder.try_build().unwrap();
+        assert_eq!(job.params.read_cell_flag_ids, vec![old_flag.flag_id]);
+
+        dataset
+            .rename_cell_flag("value", "reviewed", "archived")
+            .await
+            .unwrap();
+        let new_flag = dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        assert_ne!(old_flag.flag_id, new_flag.flag_id);
+        job.dataset = Arc::new(dataset);
+
+        let source = record_batch!(("id", Int32, [1]), ("value", Int32, [11])).unwrap();
+        let staged = job
+            .execute_uncommitted(RecordBatchIterator::new([Ok(source)], source_schema))
+            .await
+            .unwrap();
+        assert_eq!(
+            staged
+                .transaction
+                .cell_flag_transaction()
+                .unwrap()
+                .expect("flag-reading merge carries a sidecar")
+                .read_flag_ids,
+            vec![new_flag.flag_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_if_preserves_dataset_field_named_target() {
+        let target_fields = Fields::from(vec![Field::new("value", DataType::Int32, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("target", DataType::Struct(target_fields.clone()), false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let target = StructArray::new(
+            target_fields,
+            vec![Arc::new(Int32Array::from(vec![10, 20]))],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(target),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://merge_delete_if_target_field")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let nested = dataset
+            .register_cell_flag("target.value", "reviewed", false)
+            .await
+            .unwrap();
+        let top_level = dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        let delete_if =
+            WhenNotMatchedBySource::delete_if(&dataset, "cell_flag(target.value, 'reviewed')")
+                .unwrap();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(delete_if);
+        let job = builder.try_build().unwrap();
+
+        assert_eq!(job.params.read_cell_flag_ids, vec![nested.flag_id]);
+        assert_ne!(nested.flag_id, top_level.flag_id);
+    }
+
+    #[tokio::test]
+    async fn indexed_cell_flag_merge_keeps_scalar_index_route() {
+        let batch = record_batch!(("id", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+        let source_schema = batch.schema();
+        let mut dataset = InsertBuilder::new("memory://indexed_cell_flag_merge_route")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateIf(
+                "cell_flag(target.value, 'reviewed')".to_string(),
+            ))
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+
+        assert_eq!(job.indexed_join_keys().await.unwrap().len(), 1);
+        assert!(
+            !job.can_use_create_plan(source_schema.as_ref())
+                .await
+                .unwrap(),
+            "an indexed Cell Flag condition must keep the candidate-probe path"
+        );
     }
 
     #[test]

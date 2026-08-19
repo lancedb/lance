@@ -282,6 +282,7 @@ pub(super) async fn add_columns_to_fragments(
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
+    allow_cell_flag_reads: bool,
 ) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool, Vec<u32>)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
@@ -338,6 +339,12 @@ pub(super) async fn add_columns_to_fragments(
                 dataset,
                 &exprs.iter().map(|(_, expr)| expr).collect::<Vec<_>>(),
             )?;
+            if !allow_cell_flag_reads && !read_cell_flag_ids.is_empty() {
+                return Err(Error::not_supported_source(
+                    "Fragment-level add_columns cannot use cell_flag expressions because the staged operation cannot carry Cell Flag read dependencies; use Dataset::add_columns"
+                        .into(),
+                ));
+            }
 
             let mut needed_columns = exprs
                 .iter()
@@ -533,6 +540,7 @@ pub(super) async fn add_columns(
             read_columns,
             &dataset.get_fragments(),
             batch_size,
+            true,
         )
         .await?;
 

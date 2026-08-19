@@ -70,6 +70,7 @@ use super::scanner::Scanner;
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::Dataset;
+use crate::dataset::cell_flag::expression_references_cell_flag;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
@@ -2188,6 +2189,7 @@ impl FileFragment {
             read_columns,
             std::slice::from_ref(self),
             batch_size,
+            false,
         )
         .await?;
         assert_eq!(fragments.len(), 1);
@@ -2463,6 +2465,12 @@ impl FileFragment {
         // We do this on the expression level after expression optimization has
         // occurred so we also catch expressions that are equivalent to `true`
         if let Some(predicate) = &scanner.get_expr_filter()? {
+            if expression_references_cell_flag(predicate)? {
+                return Err(Error::not_supported_source(
+                    "Fragment-level delete cannot use cell_flag expressions because the staged operation cannot carry Cell Flag read dependencies; use Dataset::delete"
+                        .into(),
+                ));
+            }
             if matches!(
                 predicate,
                 Expr::Literal(ScalarValue::Boolean(Some(false)), _)

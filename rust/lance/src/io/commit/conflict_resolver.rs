@@ -756,6 +756,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                Operation::Merge { .. } if self_is_flag_only_update => Ok(()),
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
@@ -1531,7 +1532,7 @@ impl<'a> TransactionRebase<'a> {
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
-        _other_cell_flag_conflict_scope: &CellFlagConflictScope,
+        other_cell_flag_conflict_scope: &CellFlagConflictScope,
     ) -> Result<()> {
         match &other_transaction.operation {
             // See the MemWAL exception in check_create_index_txn.
@@ -1557,6 +1558,14 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateBases { .. } => Ok(()),
 
+            Operation::Update { .. }
+                if is_flag_only_update_with_scope(
+                    &other_transaction.operation,
+                    other_cell_flag_conflict_scope,
+                ) =>
+            {
+                Ok(())
+            }
             Operation::Update { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
@@ -2798,17 +2807,15 @@ mod tests {
             TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
                 .await
                 .unwrap();
-        assert!(matches!(
-            invalidation_rebase.check_txn(&merge, dataset.manifest.version + 1),
-            Err(Error::RetryableCommitConflict { .. })
-        ));
+        invalidation_rebase
+            .check_txn(&merge, dataset.manifest.version + 1)
+            .unwrap();
         let mut merge_rebase = TransactionRebase::try_new(&dataset, merge, None)
             .await
             .unwrap();
-        assert!(matches!(
-            merge_rebase.check_txn(&invalidation, dataset.manifest.version + 1),
-            Err(Error::RetryableCommitConflict { .. })
-        ));
+        merge_rebase
+            .check_txn(&invalidation, dataset.manifest.version + 1)
+            .unwrap();
 
         let transaction_dataset_id = Uuid::new_v4().to_string();
         let flag_change = |flag_id, row_address| {

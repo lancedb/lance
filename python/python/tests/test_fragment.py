@@ -620,6 +620,22 @@ def test_fragment_update_columns_preserves_cell_flags(tmp_path):
     assert result["computed"].to_pylist() == [True, False]
 
 
+def test_fragment_delete_rejects_cell_flag_predicate(tmp_path):
+    dataset_uri = tmp_path / "test_fragment_delete_cell_flag"
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": pa.array([10, 20], pa.int32())}),
+        dataset_uri,
+    )
+    dataset.register_cell_flag("value", "reviewed")
+
+    with pytest.raises(OSError, match="Fragment-level delete"):
+        dataset.get_fragment(0).delete("cell_flag(value, 'reviewed')")
+
+    reopened = lance.dataset(dataset_uri)
+    assert reopened.version == dataset.version
+    assert reopened.count_rows() == 2
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset
