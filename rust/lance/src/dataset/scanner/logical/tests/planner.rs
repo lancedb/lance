@@ -10,6 +10,7 @@ use lance_datagen::{Dimension, array, gen_batch};
 use crate::Result;
 use crate::dataset::scanner::ColumnOrdering;
 
+use super::fts::*;
 use super::harness::*;
 
 #[tokio::test]
@@ -68,6 +69,55 @@ async fn test_ordering_by_an_unprojected_column() {
     )
     .await
     .unwrap();
+}
+
+/// A vector `query_filter` under a *compound* FTS query takes the other rerank branch: the FTS
+/// query is planned independently and joined to the vector results on `_rowid`. That join is the
+/// only stock DataFusion join in the whole plan, and its physical form decides the output order —
+/// so this asserts ordering, not just row membership.
+#[tokio::test]
+async fn test_vector_filter_prefiltering_a_compound_fts_search() {
+    use crate::dataset::scanner::QueryFilter;
+    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::scalar::inverted::query::PhraseQuery;
+
+    let dataset = fts_dataset().await;
+    // Prefiltered, so the vector search spends its 20 first and the phrase trims what is left.
+    let expected = hybrid_expectation(&dataset, contains_phrase("hello world"), 20, false).await;
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    let batch = scan_rows(&dataset, |scan| {
+        scan.project(&["s"])?
+            .with_row_id()
+            .prefilter(true)
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new("hello world".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))?
+            .filter_query(QueryFilter::Vector(vector_filter_query()))
+    })
+    .await
+    .unwrap();
+
+    let mut found = fixture.ids_of(&row_ids_of(&batch));
+    found.sort_unstable();
+    assert_eq!(found, expected);
+}
+
+/// An empty fragment selection is planned like any other: the search runs and the take, restricted
+/// to no fragments, returns nothing.
+#[tokio::test]
+async fn test_an_empty_fragment_selection_returns_nothing() {
+    let dataset = fts_dataset().await;
+    let batch = scan_rows(&dataset, |scan| {
+        scan.with_fragments(Vec::new());
+        scan.project(&["s"])?
+            .with_row_id()
+            .full_text_search(match_query("hello"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 /// A top-k whose result spans more than one output batch, at real parallelism. Regression test for

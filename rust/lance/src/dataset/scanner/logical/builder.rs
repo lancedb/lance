@@ -23,11 +23,13 @@ use lance_core::{
     ROW_ADDR, ROW_ID,
     datatypes::{OnMissing, Projection},
 };
+use lance_index::scalar::inverted::{DOC_INDEX_COL, SCORE_COL};
 use lance_index::vector::DIST_COL;
 
+use super::fts;
 use super::prepare::PreparedQueries;
 use super::source::{LanceScanSource, ScanSourceOptions};
-use super::{LanceTakeNode, TakeSettings, VectorRerankNode, VectorSearchNode};
+use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use crate::dataset::{Dataset, Scanner};
 use crate::io::exec::knn::QUERY_INDEX_COL;
@@ -44,9 +46,10 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     // Prefilter and postfilter are the same predicate on opposite sides of the search: restrict
     // the candidates, or trim the results. They are genuinely different queries under
     // approximation, which is why this is operator ordering and not a flag on the search node.
-    let prefilter = scanner.prefilter && scanner.nearest.is_some();
+    let has_search = scanner.nearest.is_some() || prepared.full_text.is_some();
+    let prefilter = scanner.prefilter && has_search;
 
-    let mut source = scan;
+    let mut source = scan.clone();
     if prefilter && let Some(filter) = filter.clone() {
         source = LogicalPlanBuilder::new(source).filter(filter)?.build()?;
     }
@@ -101,14 +104,76 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
 
     // A `query_filter` obeys the same prefilter/postfilter switch as an expression filter: below
     // the search it produces the candidates, above it trims the results.
-    let mut builder = if let Some(query) = &scanner.nearest {
-        let searched = {
-            let search = VectorSearchNode::try_new(source, scanner.dataset.clone(), query.clone())?;
-            extension(if scanner.is_batch_nearest {
-                search.with_batch_queries(scanner.nearest_query_count)?
-            } else {
-                search
-            })
+    let mut builder = if let Some(query) = &prepared.full_text {
+        let searched = match prepared.vector_filter.as_ref().filter(|_| prefilter) {
+            // Vector search first, then re-rank the survivors by BM25.
+            Some(vector_query) => {
+                let vector = extension(VectorSearchNode::try_new(
+                    source,
+                    scanner.dataset.clone(),
+                    vector_query.clone(),
+                )?);
+                fts::build_rerank(
+                    vector,
+                    scan,
+                    &scanner.dataset,
+                    query,
+                    search_limit(scanner),
+                    &take_settings(scanner),
+                )?
+            }
+            None => fts::build_source(source, &scanner.dataset, query, search_limit(scanner))?,
+        };
+        // Relevance order is the result's order, and it has to be restated above the take for the
+        // same reason a vector search's distance order does — see the comment below. Without it,
+        // `EnforceSorting` is entitled to drop whichever sort the FTS operators happened to
+        // produce, because nothing above them asks for an ordering.
+        //
+        // Row id breaks ties, so that two queries differing only in their limit agree on which of
+        // two equally relevant rows comes first.
+        with_take(
+            LogicalPlanBuilder::new(searched),
+            scanner,
+            &take_projection,
+            &postfilter_columns,
+        )?
+        .sort(vec![
+            col(SCORE_COL).sort(false, false),
+            col(ROW_ID).sort(true, false),
+        ])?
+    } else if let Some(query) = &scanner.nearest {
+        let searched = match prepared.fts_filter.as_ref().filter(|_| prefilter) {
+            // An FTS query used as a filter produces the candidate rows, whose vectors are then
+            // fetched and scored exactly. `with_resolution(Flat)` is what says "these candidates
+            // are the search space", so no rule may swap in the index.
+            Some(fts_query) => {
+                let mut candidates = fts::build_source(source, &scanner.dataset, fts_query, None)?;
+                if candidates
+                    .schema()
+                    .has_column_with_unqualified_name(DOC_INDEX_COL)
+                {
+                    candidates = fts::dedupe_rows(candidates)?;
+                }
+                let candidates = fts::take_column(
+                    candidates,
+                    &scanner.dataset,
+                    &query.column,
+                    &take_settings(scanner),
+                )?;
+                extension(
+                    VectorSearchNode::try_new(candidates, scanner.dataset.clone(), query.clone())?
+                        .with_resolution(VectorAccessPath::Flat),
+                )
+            }
+            None => {
+                let search =
+                    VectorSearchNode::try_new(source, scanner.dataset.clone(), query.clone())?;
+                extension(if scanner.is_batch_nearest {
+                    search.with_batch_queries(scanner.nearest_query_count)?
+                } else {
+                    search
+                })
+            }
         };
         let taken = with_take(
             LogicalPlanBuilder::new(searched),
@@ -134,8 +199,17 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         LogicalPlanBuilder::new(source)
     };
 
-    // Postfilters, innermost first, matching `FilterPlan::refine_filter`.
+    // Postfilters, innermost first: an FTS `query_filter` runs before the expression filter,
+    // matching `FilterPlan::refine_filter`.
     if !prefilter {
+        if let Some(query) = &prepared.fts_filter {
+            builder = LogicalPlanBuilder::new(fts::build_match_filter(
+                builder.plan().clone(),
+                &scanner.dataset,
+                query,
+                &take_settings(scanner),
+            )?);
+        }
         if let Some(query) = &prepared.vector_filter {
             builder = LogicalPlanBuilder::new(extension(VectorRerankNode::try_new(
                 builder.plan().clone(),
@@ -180,7 +254,7 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         )?;
     }
 
-    builder = builder.project(output_exprs(scanner)?)?;
+    builder = builder.project(output_exprs(scanner, prepared)?)?;
     Ok(builder.build()?)
 }
 
@@ -209,6 +283,18 @@ fn scan_leaf(scanner: &Scanner) -> Result<LogicalPlan> {
         LogicalPlanBuilder::scan(TABLE_NAME, provider_as_source(Arc::new(source)), None)?
             .build()?,
     )
+}
+
+/// The number of results the search itself should produce, before any post-filtering.
+///
+/// An offset means the search has to return `limit + offset` so the limit node has something to
+/// skip past; an offset with no limit means it cannot be bounded at all.
+fn search_limit(scanner: &Scanner) -> Option<usize> {
+    match (scanner.limit, scanner.offset) {
+        (Some(limit), Some(offset)) => Some((limit + offset) as usize),
+        (Some(limit), None) => Some(limit as usize),
+        (None, _) => None,
+    }
 }
 
 /// Insert late materialization above a search, unless the search already produced everything.
@@ -275,7 +361,7 @@ pub(super) fn extension(node: impl UserDefinedLogicalNodeCore) -> LogicalPlan {
 /// `ProjectionPlan` has already parsed and coerced these against the full schema, so they can be
 /// used as-is. An alias is only added when the output name differs from what the expression
 /// would be named anyway — a redundant `s AS s` survives optimization and shows up in `EXPLAIN`.
-fn output_exprs(scanner: &Scanner) -> Result<Vec<Expr>> {
+fn output_exprs(scanner: &Scanner, prepared: &PreparedQueries) -> Result<Vec<Expr>> {
     let mut exprs = scanner
         .projection_plan
         .requested_output_expr
@@ -295,12 +381,20 @@ fn output_exprs(scanner: &Scanner) -> Result<Vec<Expr>> {
             .any(|expr| expr.schema_name().to_string() == name)
     };
 
-    // `_distance` is appended even when the user did not ask for it. That is legacy behavior the
-    // imperative path implements in `calculate_final_projection`; replicating it here is what lets
-    // the two paths be compared row for row.
-    if scanner.autoproject_scoring_columns && scanner.nearest.is_some() && !named(&exprs, DIST_COL)
+    // The scoring columns are appended even when the user did not ask for them. That is legacy
+    // behavior the imperative path implements in `calculate_final_projection`; replicating it
+    // here is what lets the two paths be compared row for row.
+    if prepared.full_text.is_some() && prepared.element_granularity && !named(&exprs, DOC_INDEX_COL)
     {
-        exprs.push(col(DIST_COL));
+        exprs.push(col(DOC_INDEX_COL));
+    }
+    if scanner.autoproject_scoring_columns {
+        if scanner.nearest.is_some() && !named(&exprs, DIST_COL) {
+            exprs.push(col(DIST_COL));
+        }
+        if prepared.full_text.is_some() && !named(&exprs, SCORE_COL) {
+            exprs.push(col(SCORE_COL));
+        }
     }
 
     // Batch nearest exposes the query discriminator as the *first* output column, which is what
@@ -356,7 +450,8 @@ pub(super) fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         // `MaterializationStyle` is documented as affecting plain scans only, and a search plan
         // already takes its columns above the search. Splitting the read below it as well would
         // add a take that fetches the same columns for strictly more rows.
-        materialization_style: match scanner.nearest.is_some() {
+        materialization_style: match scanner.nearest.is_some() || scanner.full_text_query.is_some()
+        {
             true => MaterializationStyle::AllEarly,
             false => scanner.materialization_style.clone(),
         },
