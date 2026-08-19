@@ -24,7 +24,9 @@ endif
 # sharding across processes wins back time a single pytest process leaves idle.
 PYTEST_WORKERS ?=
 ifneq ($(strip $(PYTEST_WORKERS)),)
-  PYTEST_ARGS += -n $(PYTEST_WORKERS)
+  # loadgroup rather than the default scheduler so that tests sharing state on
+  # disk can be pinned to a single worker with @pytest.mark.xdist_group.
+  PYTEST_ARGS += -n $(PYTEST_WORKERS) --dist loadgroup
 endif
 
 help: ## Show this help
