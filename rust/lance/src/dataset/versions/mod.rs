@@ -323,24 +323,6 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_fragment_schema(
-    version: ConcreteFileVersion,
-    schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
-    match version {
-        ConcreteFileVersion::V1 => {
-            super::transaction::schema_fragments_legacy_valid(schema, fragments)
-        }
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            super::transaction::schema_fragments_modern_valid(schema, fragments)
-        }
-    }
-}
-
 pub async fn write_fragment(
     version: ConcreteFileVersion,
     builder: &FragmentCreateBuilder<'_>,
