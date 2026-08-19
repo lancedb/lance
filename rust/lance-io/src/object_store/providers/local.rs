@@ -21,6 +21,8 @@ mod windows {
 
     use super::*;
 
+    pub(super) const ENABLE_UNC_PATHS: bool = false;
+
     #[derive(Debug)]
     pub(super) struct UncPath {
         pub(super) root: PathBuf,
@@ -76,9 +78,13 @@ impl ObjectStoreProvider for FileStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
 
         #[cfg(windows)]
-        let inner = match windows::extract_unc_path(&base_path)? {
-            Some(unc_path) => LocalFileSystem::new_with_prefix(unc_path.root)?,
-            None => LocalFileSystem::new(),
+        let inner = if windows::ENABLE_UNC_PATHS {
+            match windows::extract_unc_path(&base_path)? {
+                Some(unc_path) => LocalFileSystem::new_with_prefix(unc_path.root)?,
+                None => LocalFileSystem::new(),
+            }
+        } else {
+            LocalFileSystem::new()
         };
         #[cfg(not(windows))]
         let inner = LocalFileSystem::new();
@@ -100,7 +106,9 @@ impl ObjectStoreProvider for FileStoreProvider {
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
         #[cfg(windows)]
-        if let Some(unc_path) = windows::extract_unc_path(url)? {
+        if windows::ENABLE_UNC_PATHS
+            && let Some(unc_path) = windows::extract_unc_path(url)?
+        {
             return Ok(unc_path.relative_path);
         }
         if let Ok(file_path) = url.to_file_path()
@@ -120,7 +128,9 @@ impl ObjectStoreProvider for FileStoreProvider {
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
         #[cfg(windows)]
-        if let Some(unc_path) = windows::extract_unc_path(url)? {
+        if windows::ENABLE_UNC_PATHS
+            && let Some(unc_path) = windows::extract_unc_path(url)?
+        {
             return Ok(unc_path.store_prefix);
         }
 
