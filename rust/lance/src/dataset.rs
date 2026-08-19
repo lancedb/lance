@@ -2735,8 +2735,6 @@ impl Dataset {
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
         let metadata = self.find_fragment(fragment_id as u64)?.clone();
-        // Cloning the dataset is the dominant cost of this call, so it happens
-        // only once the lookup has hit.
         Some(FileFragment::new(Arc::new(self.clone()), metadata))
     }
 
