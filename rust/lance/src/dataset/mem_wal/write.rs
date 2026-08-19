@@ -7556,6 +7556,65 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    /// A durable put returns only once its WAL flush landed, and the seal
+    /// fence resolves only once the sealed memtable reached L0 — so both
+    /// callbacks have fired by the time this asserts, without sleeping.
+    #[tokio::test]
+    async fn test_observer_sees_both_flush_kinds() {
+        #[derive(Debug, Default)]
+        struct CountingObserver {
+            wal_flushes: AtomicU64,
+            wal_bytes: AtomicU64,
+            memtable_flushes: AtomicU64,
+            memtable_rows: AtomicU64,
+        }
+
+        impl WalObserver for CountingObserver {
+            fn on_wal_flush(&self, _duration: Duration, bytes: usize) {
+                self.wal_flushes.fetch_add(1, Ordering::Relaxed);
+                self.wal_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+
+            fn on_memtable_flush(&self, _duration: Duration, rows: usize) {
+                self.memtable_flushes.fetch_add(1, Ordering::Relaxed);
+                self.memtable_rows.fetch_add(rows as u64, Ordering::Relaxed);
+            }
+        }
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let observer = Arc::new(CountingObserver::default());
+        let sink: Arc<dyn WalObserver> = observer.clone();
+        let config = ShardWriterConfig {
+            observer: Some(sink),
+            ..seal_fence_test_config(Uuid::new_v4())
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer
+            .force_seal_active()
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(observer.wal_flushes.load(Ordering::Relaxed) > 0);
+        assert!(observer.wal_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(observer.memtable_flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(observer.memtable_rows.load(Ordering::Relaxed), 10);
+
+        writer.close().await.unwrap();
+    }
+
     /// Durable writes so `put` returns only once the row is indexed and
     /// WAL-durable. Both fence tests tear the background tasks down before
     /// freezing, and a freeze still owing an index apply or a WAL append
