@@ -4639,6 +4639,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protobuf-src",
+ "rstest",
  "tokio",
  "tracing",
 ]
