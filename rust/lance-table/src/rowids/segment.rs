@@ -666,8 +666,8 @@ impl SegmentCursor<'_> {
             self.byte_idx = 0;
             self.ones_before = 0;
         }
-        // Bytes past `bitmap.len()` are zero-padded by construction
-        // (Bitmap::new_full), so popcount counts only valid positions.
+        // Deserialization rejects a bitmap whose padding bits are set, so
+        // popcount counts only valid positions.
         let mut remaining = i - self.ones_before;
         while let Some(&byte) = bitmap.data.get(self.byte_idx) {
             let ones = byte.count_ones() as usize;

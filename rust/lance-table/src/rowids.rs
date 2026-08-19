@@ -401,7 +401,13 @@ impl RowIdSequence {
                 cursor = cur_seg.map(|seg| seg.cursor());
             }
 
-            cursor.as_mut().unwrap().get(index - rows_passed)
+            let value = cursor.as_mut().unwrap().get(index - rows_passed);
+            debug_assert!(
+                value.is_some(),
+                "segment reported {cur_seg_len} rows but has no value at {}",
+                index - rows_passed
+            );
+            value
         })
     }
 
@@ -1260,7 +1266,40 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
+    fn test_selection_over_a_large_bitmap_segment() {
+        // A restart-per-index scan of this segment takes tens of seconds, so a
+        // regression to that shows up as a test that no longer finishes quickly.
+        const ROWS: usize = 1_000_000;
+        let mut bitmap = Bitmap::new_full(ROWS);
+        for hole in (0..ROWS).step_by(17) {
+            bitmap.clear(hole);
+        }
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..8),
+            U64Segment::RangeWithBitmap {
+                range: 1_000..(1_000 + ROWS as u64),
+                bitmap,
+            },
+        ]);
+        let live: Vec<u64> = sequence.iter().collect();
+
+        let all = sequence.select(0..live.len()).collect::<Vec<_>>();
+        assert_eq!(all, live);
+
+        // Byte-boundary and tail indices, read through one cursor.
+        let mut picks: Vec<usize> = [0, 7, 8, 9, 15, 16, 63, 64, 65]
+            .into_iter()
+            .chain((0..live.len()).step_by(9973))
+            .chain([live.len() - 1, live.len()])
+            .collect();
+        picks.sort_unstable();
+        let got = sequence.select(picks.iter().copied()).collect::<Vec<_>>();
+        let want: Vec<u64> = picks.iter().filter_map(|&i| live.get(i).copied()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[should_panic(expected = "Selection is not sorted")]
     fn test_selection_unsorted() {
         let sequence = RowIdSequence(vec![
             U64Segment::Range(0..5),
