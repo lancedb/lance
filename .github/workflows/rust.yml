@@ -378,12 +378,17 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # Same reasoning as mac-build: nextest schedules across all cores instead
+      # of running one test binary at a time, and build-no-lock already
+      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo test --profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
     # Verifies that lance-linalg's runtime SIMD dispatch still works
