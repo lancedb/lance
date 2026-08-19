@@ -83,7 +83,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
-    datasource::MemTable,
+    datasource::{MemTable, memory::MemorySourceConfig},
     execution::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
@@ -1353,7 +1353,7 @@ impl MergeInsertJob {
         &self,
         source: SendableRecordBatchStream,
         indexed_keys: Vec<(String, IndexMetadata)>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<(SendableRecordBatchStream, Option<Vec<Fragment>>)> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
         debug_assert!(
@@ -1395,6 +1395,46 @@ impl MergeInsertJob {
             lookups,
             index_mapper_input,
         ));
+
+        // Materialize candidate addresses only when a Cell Flag expression
+        // needs their fragment set. Ordinary indexed merges retain the
+        // existing single-plan execution path.
+        let (index_mapper, mut candidate_fragment_ids): (
+            Arc<dyn ExecutionPlan>,
+            Option<HashSet<u64>>,
+        ) = if self.params.read_cell_flag_ids.is_empty() {
+            (index_mapper, None)
+        } else {
+            let mapped_schema = index_mapper.schema();
+            let mapped_batches = execute_plan(
+                index_mapper,
+                LanceExecutionOptions {
+                    use_spilling: true,
+                    ..Default::default()
+                },
+            )?
+            .try_collect::<Vec<_>>()
+            .await?;
+            let candidate_row_ids = mapped_batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            let candidate_fragment_ids = resolve_row_ids(&self.dataset, candidate_row_ids)
+                .await?
+                .into_iter()
+                .map(|address| RowAddress::from(address).fragment_id() as u64)
+                .collect::<HashSet<_>>();
+            let index_mapper =
+                MemorySourceConfig::try_new_exec(&[mapped_batches], mapped_schema, None)?;
+            (index_mapper, Some(candidate_fragment_ids))
+        };
 
         // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
         //     the v1 reader cannot serve a FilteredReadExec)
@@ -1441,6 +1481,9 @@ impl MergeInsertJob {
         //      "unindexed" set is the union of fragments missing from any
         //      one of them.
         let unindexed_fragments = self.unindexed_fragments_for_keys(&indexed_keys).await?;
+        if let Some(candidate_fragment_ids) = &mut candidate_fragment_ids {
+            candidate_fragment_ids.extend(unindexed_fragments.iter().map(|fragment| fragment.id));
+        }
         if !unindexed_fragments.is_empty() {
             let mut builder = self.dataset.scan();
             if add_row_addr {
@@ -1510,13 +1553,32 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
-        execute_plan(
+        let stream = execute_plan(
             joined,
             LanceExecutionOptions {
                 use_spilling: true,
                 ..Default::default()
             },
-        )
+        )?;
+        let candidate_fragments = if let Some(fragment_ids) = candidate_fragment_ids {
+            let fragment_ids = fragment_ids
+                .into_iter()
+                .map(|fragment_id| {
+                    u32::try_from(fragment_id).map_err(|_| {
+                        Error::internal(format!(
+                            "Scalar-index candidate fragment ID {} exceeds u32",
+                            fragment_id
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut fragments = self.dataset.get_fragment_metadata_from_ids(&fragment_ids)?;
+            fragments.sort_unstable_by_key(|fragment| fragment.id);
+            Some(fragments)
+        } else {
+            None
+        };
+        Ok((stream, candidate_fragments))
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
@@ -1629,7 +1691,7 @@ impl MergeInsertJob {
     async fn create_joined_stream(
         &self,
         source: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<(SendableRecordBatchStream, Option<Vec<Fragment>>)> {
         if self.params.use_index
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -1642,9 +1704,10 @@ impl MergeInsertJob {
             // full tuple), so fall through to the correct full-table join.
             let indexed_keys = self.indexed_join_keys().await?;
             if indexed_keys.len() == self.params.on.len() {
-                return self
+                let (stream, candidate_fragments) = self
                     .create_indexed_scan_joined_stream(source, indexed_keys)
-                    .await;
+                    .await?;
+                return Ok((stream, candidate_fragments));
             }
         }
 
@@ -1657,7 +1720,7 @@ impl MergeInsertJob {
             );
         }
 
-        self.create_full_table_joined_stream(source).await
+        Ok((self.create_full_table_joined_stream(source).await?, None))
     }
 
     async fn update_fragments(
@@ -2706,6 +2769,7 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+        let (joined, selected_fragments) = self.create_joined_stream(source).await?;
         let dataset_schema: Schema = self.dataset.schema().into();
         let combined_schema = Arc::new(combined_schema(&dataset_schema));
         let planner = Planner::new(combined_schema);
@@ -2718,7 +2782,7 @@ impl MergeInsertJob {
             match CellFlagExprBindings::try_new_for_target(
                 self.dataset.as_ref(),
                 &[&expression],
-                None,
+                selected_fragments.as_deref(),
             )
             .await?
             {
@@ -2728,7 +2792,6 @@ impl MergeInsertJob {
         } else {
             None
         };
-        let joined = self.create_joined_stream(source).await?;
         let capture_cell_flag_sources = self
             .params
             .capture_cell_flag_sources(!self.dataset.manifest.cell_flag_states.is_empty());
@@ -4149,6 +4212,75 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![(1, 111), (2, 200)]);
+    }
+
+    #[tokio::test]
+    async fn indexed_cell_flag_merge_limits_bindings_to_candidate_fragments() {
+        let directory = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 11, 12, 13])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            &directory,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateIf(
+                "cell_flag(target.value, 'reviewed')".to_string(),
+            ))
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![22])),
+            ],
+        )
+        .unwrap();
+        let source = reader_to_stream(Box::new(RecordBatchIterator::new([Ok(source)], schema)));
+        let (_joined, candidate_fragments) = job.create_joined_stream(source).await.unwrap();
+
+        assert_eq!(
+            candidate_fragments
+                .expect("scalar-index route returns candidate fragments")
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
