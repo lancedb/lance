@@ -7,7 +7,7 @@ use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use lance_core::datatypes::BlobHandling;
 use lance_datafusion::udf::register_functions;
@@ -33,6 +33,12 @@ pub struct SqlQueryBuilder {
 
     /// Override how blob columns are materialized for this query.
     pub(crate) blob_handling: Option<BlobHandling>,
+
+    /// Override the maximum number of rows in each scan batch.
+    pub(crate) batch_size: Option<usize>,
+
+    /// Override the approximate maximum bytes in each scan batch.
+    pub(crate) batch_size_bytes: Option<u64>,
 }
 
 impl SqlQueryBuilder {
@@ -44,6 +50,8 @@ impl SqlQueryBuilder {
             with_row_id: false,
             with_row_addr: false,
             blob_handling: None,
+            batch_size: None,
+            batch_size_bytes: None,
         }
     }
 
@@ -79,13 +87,41 @@ impl SqlQueryBuilder {
         self
     }
 
+    /// Set the maximum number of rows produced by each query batch.
+    ///
+    /// When [`Self::batch_size_bytes`] is also set, both limits apply and the
+    /// one reached first determines the scan batch size.
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the approximate maximum number of bytes produced by each scan batch.
+    ///
+    /// When [`Self::batch_size`] is also set, both limits apply and the one
+    /// reached first determines the scan batch size.
+    pub fn batch_size_bytes(mut self, batch_size_bytes: u64) -> Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
+        self
+    }
+
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = SessionContext::new();
+        let ctx = if let Some(batch_size) = self.batch_size {
+            SessionContext::new_with_config(SessionConfig::new().with_batch_size(batch_size))
+        } else {
+            SessionContext::new()
+        };
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
         let mut provider = LanceTableProvider::new(self.dataset.clone(), row_id, row_addr);
         if let Some(blob_handling) = self.blob_handling {
             provider = provider.with_blob_handling(blob_handling);
+        }
+        if let Some(batch_size) = self.batch_size {
+            provider = provider.with_batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            provider = provider.with_batch_size_bytes(batch_size_bytes);
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
@@ -199,6 +235,32 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_batch_size() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_batch_size",
+                FragmentCount::from(2),
+                FragmentRowCount::from(25),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT x FROM dataset")
+            .batch_size(7)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 50);
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 7));
     }
 
     #[tokio::test]

@@ -40,6 +40,8 @@ pub struct LanceTableProvider {
     row_addr_idx: Option<usize>,
     ordered: bool,
     blob_handling: Option<lance_core::datatypes::BlobHandling>,
+    batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
 }
 
 impl LanceTableProvider {
@@ -71,6 +73,8 @@ impl LanceTableProvider {
             row_addr_idx,
             ordered,
             blob_handling: None,
+            batch_size: None,
+            batch_size_bytes: None,
         }
     }
 
@@ -92,6 +96,18 @@ impl LanceTableProvider {
         }
         self.full_schema = Arc::new(full_schema);
         self.blob_handling = Some(handling);
+        self
+    }
+
+    /// Overrides the maximum number of rows produced by each dataset scan batch.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Overrides the approximate maximum bytes produced by each dataset scan batch.
+    pub fn with_batch_size_bytes(mut self, batch_size_bytes: u64) -> Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
         self
     }
 
@@ -120,6 +136,12 @@ impl TableProvider for LanceTableProvider {
         let mut scan = self.dataset.scan();
         if let Some(handling) = self.blob_handling.clone() {
             scan.blob_handling(handling);
+        }
+        if let Some(batch_size) = self.batch_size {
+            scan.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scan.batch_size_bytes(batch_size_bytes);
         }
 
         match projection {

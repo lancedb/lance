@@ -5699,6 +5699,21 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+def test_dataset_sql_batch_size_rows(tmp_path: Path):
+    table = pa.table({"id": range(50)})
+    ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
+
+    batches = list(
+        ds.sql("SELECT * FROM dataset")
+        .batch_size(7)
+        .build()
+        .to_stream_reader()
+    )
+
+    assert sum(batch.num_rows for batch in batches) == 50
+    assert all(batch.num_rows <= 7 for batch in batches)
+
+
 def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""
     # Create a dataset with large repetitive strings to test cache_repetition_index
