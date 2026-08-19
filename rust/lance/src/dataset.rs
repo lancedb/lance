@@ -79,6 +79,7 @@ pub mod index;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
+pub mod optimize_columns;
 pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;

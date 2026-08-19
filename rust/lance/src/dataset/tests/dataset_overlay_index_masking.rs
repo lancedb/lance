@@ -32,6 +32,7 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+use crate::dataset::optimize_columns::{ColumnGroup, OptimizeColumnsOptions};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
@@ -250,6 +251,60 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
     // An untouched indexed value is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+#[tokio::test]
+async fn test_optimize_columns_prunes_legacy_index_without_fragment_bitmap() {
+    let mut dataset = create_base_dataset().await;
+    build_age_index(&mut dataset).await;
+
+    let mut dataset = commit_overlay(
+        dataset,
+        "legacy_index_age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    let mut legacy_indices = dataset.load_indices().await.unwrap().as_ref().clone();
+    legacy_indices[0].fragment_bitmap = None;
+    let metadata_key = crate::session::index_caches::IndexMetadataKey {
+        version: dataset.version().version,
+        store_identity: &dataset.object_store.store_prefix,
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&metadata_key, Arc::new(legacy_indices))
+        .await;
+    assert!(
+        dataset.load_indices().await.unwrap()[0]
+            .fragment_bitmap
+            .is_none()
+    );
+
+    dataset
+        .optimize_columns(OptimizeColumnsOptions {
+            groups: vec![ColumnGroup {
+                fields: vec!["age".to_string()],
+            }],
+            fragment_ids: Some(vec![0]),
+            max_concurrency: Some(1),
+        })
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let index = indices
+        .iter()
+        .find(|index| index.name == "age_idx")
+        .unwrap();
+    assert!(!index.fragment_bitmap.as_ref().unwrap().contains(0));
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 }
 
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is

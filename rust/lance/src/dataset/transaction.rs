@@ -266,6 +266,19 @@ pub struct Transaction {
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
 
+/// Files produced for one fragment by an [`Operation::OptimizeColumns`].
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct OptimizeColumnsGroup {
+    /// Fragment whose physical column providers are reorganized.
+    pub fragment_id: u64,
+    /// Live physical field ids provided by `new_files`.
+    pub field_ids: Vec<u32>,
+    /// Positionally aligned files replacing the selected field providers.
+    pub new_files: Vec<DataFile>,
+    /// Physical row count encoded in every new file.
+    pub physical_rows: u64,
+}
+
 /// Overlay files to append to a single fragment, in order (the last entry is
 /// newest). The overlays are appended to the fragment's existing `overlays`
 /// list rather than replacing it, so overlays written by concurrent commits are
@@ -438,6 +451,15 @@ pub enum Operation {
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },
+    /// Reorganize selected physical fields without changing logical values,
+    /// fragment ids, row addresses, deletion files, or row-version metadata.
+    OptimizeColumns {
+        /// Immutable dataset version through which base and overlay values were
+        /// materialized into `groups`.
+        materialized_through_version: u64,
+        /// Per-fragment provider changes.
+        groups: Vec<OptimizeColumnsGroup>,
+    },
     /// Attach overlay files to fragments, supplying new values for a subset of
     /// `(physical offset, field)` cells without rewriting the fragments' base
     /// data files. See [`DataOverlayFile`] and the Data Overlay Files
@@ -596,6 +618,7 @@ impl std::fmt::Display for Operation {
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+            Self::OptimizeColumns { .. } => write!(f, "OptimizeColumns"),
             Self::DataOverlay { .. } => write!(f, "DataOverlay"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
@@ -799,6 +822,16 @@ impl PartialEq for Operation {
                 Self::DataReplacement { replacements: a },
                 Self::DataReplacement { replacements: b },
             ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+            (
+                Self::OptimizeColumns {
+                    materialized_through_version: a_version,
+                    groups: a_groups,
+                },
+                Self::OptimizeColumns {
+                    materialized_through_version: b_version,
+                    groups: b_groups,
+                },
+            ) => a_version == b_version && a_groups == b_groups,
             // Handle all remaining combinations.
             // We spell out all combinations explicitly to prevent
             // us accidentally handling a new case in the wrong way.
@@ -1462,6 +1495,7 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::OptimizeColumns { .. }, _) | (_, Self::OptimizeColumns { .. }) => false,
         }
     }
 }
@@ -1638,6 +1672,7 @@ impl Operation {
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
+            Self::OptimizeColumns { .. } => "OptimizeColumns",
             Self::DataOverlay { .. } => "DataOverlay",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
@@ -2190,6 +2225,43 @@ impl Transaction {
              these indices were recalculated after their coverage was derived"
         );
         indices[pos] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
+    }
+
+    /// Reapply OptimizeColumns index pruning after legacy coverage migration.
+    ///
+    /// `migrate_indices` runs after [`Self::build_manifest`] and can replace an
+    /// unknown or corrupt fragment bitmap with the coverage stored in the index
+    /// files. That recovered coverage predates the overlays materialized by this
+    /// operation, so target fragments must be removed again before commit.
+    pub(crate) fn prune_optimize_columns_indices_after_migration(
+        &self,
+        indices: &mut [IndexMetadata],
+    ) -> Result<()> {
+        let Operation::OptimizeColumns { groups, .. } = &self.operation else {
+            return Ok(());
+        };
+
+        for group in groups {
+            let fragment_id = u32::try_from(group.fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "OptimizeColumns fragment id {} does not fit in index coverage",
+                    group.fragment_id
+                ))
+            })?;
+            for index in indices.iter_mut() {
+                let covers_rewritten_field = group.field_ids.iter().any(|field_id| {
+                    index
+                        .fields
+                        .iter()
+                        .any(|index_field| u32::try_from(*index_field).ok() == Some(*field_id))
+                });
+                if covers_rewritten_field && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+                {
+                    fragment_bitmap.remove(fragment_id);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2986,6 +3058,191 @@ impl Transaction {
                     &modified_fragments,
                     &replaced_fields,
                 );
+            }
+            Operation::OptimizeColumns {
+                materialized_through_version,
+                groups,
+            } => {
+                if *materialized_through_version != self.read_version {
+                    return Err(Error::invalid_input(format!(
+                        "OptimizeColumns materialized_through_version {} must equal transaction read_version {}",
+                        materialized_through_version, self.read_version
+                    )));
+                }
+                let existing_fragments = maybe_existing_fragments?;
+                let live_schema_ids = schema
+                    .fields_pre_order()
+                    .map(|field| field.id)
+                    .collect::<HashSet<_>>();
+                let existing_fragment_ids = existing_fragments
+                    .iter()
+                    .map(|fragment| fragment.id)
+                    .collect::<HashSet<_>>();
+                let mut groups_by_fragment: HashMap<u64, Vec<&OptimizeColumnsGroup>> =
+                    HashMap::new();
+
+                for group in groups {
+                    if !existing_fragment_ids.contains(&group.fragment_id) {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns targets fragment {}, which does not exist",
+                            group.fragment_id
+                        )));
+                    }
+                    if group.field_ids.is_empty() || group.new_files.is_empty() {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns group for fragment {} must contain fields and files",
+                            group.fragment_id
+                        )));
+                    }
+
+                    let expected_fields = group.field_ids.iter().copied().collect::<HashSet<_>>();
+                    if expected_fields.len() != group.field_ids.len() {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns group for fragment {} contains duplicate field ids",
+                            group.fragment_id
+                        )));
+                    }
+                    if expected_fields
+                        .iter()
+                        .any(|field| !live_schema_ids.contains(&(*field as i32)))
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns group for fragment {} contains a field absent from the current schema",
+                            group.fragment_id
+                        )));
+                    }
+
+                    let mut provided_fields = HashSet::new();
+                    for file in &group.new_files {
+                        if file.file_version()? == ConcreteFileVersion::V1 {
+                            return Err(Error::not_supported(format!(
+                                "OptimizeColumns cannot install legacy data file '{}'",
+                                file.path
+                            )));
+                        }
+                        for field in file.fields.iter().copied().filter(|field| *field >= 0) {
+                            let field = field as u32;
+                            if !provided_fields.insert(field) {
+                                return Err(Error::invalid_input(format!(
+                                    "OptimizeColumns files for fragment {} provide field {} more than once",
+                                    group.fragment_id, field
+                                )));
+                            }
+                        }
+                    }
+                    if provided_fields != expected_fields {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns files for fragment {} must collectively provide exactly field_ids",
+                            group.fragment_id
+                        )));
+                    }
+
+                    let existing_groups = groups_by_fragment.entry(group.fragment_id).or_default();
+                    if existing_groups.iter().any(|existing| {
+                        existing
+                            .field_ids
+                            .iter()
+                            .any(|field| expected_fields.contains(field))
+                    }) {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns groups for fragment {} overlap",
+                            group.fragment_id
+                        )));
+                    }
+                    existing_groups.push(group);
+                }
+
+                let mut pruned_index_inputs = Vec::with_capacity(groups_by_fragment.len());
+                for fragment in existing_fragments {
+                    let Some(fragment_groups) = groups_by_fragment.get(&fragment.id) else {
+                        final_fragments.push(fragment.clone());
+                        continue;
+                    };
+
+                    let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "OptimizeColumns target fragment {} has no physical row count",
+                            fragment.id
+                        ))
+                    })? as u64;
+                    if fragment_groups
+                        .iter()
+                        .any(|group| group.physical_rows != physical_rows)
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "OptimizeColumns output row count does not match fragment {} physical row count {}",
+                            fragment.id, physical_rows
+                        )));
+                    }
+
+                    let selected_fields = fragment_groups
+                        .iter()
+                        .flat_map(|group| group.field_ids.iter().copied())
+                        .collect::<HashSet<_>>();
+                    for file in &fragment.files {
+                        if file.file_version()? == ConcreteFileVersion::V1
+                            && file.fields.iter().any(|field| {
+                                *field >= 0 && selected_fields.contains(&(*field as u32))
+                            })
+                        {
+                            return Err(Error::not_supported(format!(
+                                "OptimizeColumns does not support legacy fragment {}",
+                                fragment.id
+                            )));
+                        }
+                    }
+
+                    let mut optimized = fragment.clone();
+                    for file in &mut optimized.files {
+                        file.fields = file
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                if *field >= 0 && selected_fields.contains(&(*field as u32)) {
+                                    TOMBSTONE_FIELD_ID
+                                } else {
+                                    *field
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into();
+                    }
+                    optimized.files.retain(|file| {
+                        file.fields
+                            .iter()
+                            .any(|field| live_schema_ids.contains(field))
+                    });
+                    optimized.files.extend(
+                        fragment_groups
+                            .iter()
+                            .flat_map(|group| group.new_files.iter().cloned()),
+                    );
+
+                    let selected_fields_vec = selected_fields.iter().copied().collect::<Vec<_>>();
+                    let (mut materialized, newer): (Vec<_>, Vec<_>) =
+                        optimized.overlays.drain(..).partition(|overlay| {
+                            overlay.committed_version <= *materialized_through_version
+                        });
+                    lance_table::format::overlay::tombstone_overlay_fields(
+                        &mut materialized,
+                        &selected_fields_vec,
+                    );
+                    materialized.extend(newer);
+                    optimized.overlays = materialized;
+
+                    pruned_index_inputs.push((optimized.clone(), selected_fields_vec));
+                    final_fragments.push(optimized);
+                }
+
+                // Apply against the latest manifest so indices created after the
+                // materialization snapshot are conservatively pruned as well.
+                for (fragment, fields) in pruned_index_inputs {
+                    Self::prune_updated_fields_from_indices(
+                        &mut final_indices,
+                        std::slice::from_ref(&fragment),
+                        &fields,
+                    );
+                }
             }
             Operation::DataOverlay { groups } => {
                 // Stamp each overlay with the version this commit is producing.
@@ -3944,6 +4201,34 @@ impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
     }
 }
 
+impl From<&OptimizeColumnsGroup> for pb::transaction::OptimizeColumnsGroup {
+    fn from(group: &OptimizeColumnsGroup) -> Self {
+        Self {
+            fragment_id: group.fragment_id,
+            field_ids: group.field_ids.clone(),
+            new_files: group.new_files.iter().map(pb::DataFile::from).collect(),
+            physical_rows: group.physical_rows,
+        }
+    }
+}
+
+impl TryFrom<pb::transaction::OptimizeColumnsGroup> for OptimizeColumnsGroup {
+    type Error = Error;
+
+    fn try_from(group: pb::transaction::OptimizeColumnsGroup) -> Result<Self> {
+        Ok(Self {
+            fragment_id: group.fragment_id,
+            field_ids: group.field_ids,
+            new_files: group
+                .new_files
+                .into_iter()
+                .map(DataFile::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            physical_rows: group.physical_rows,
+        })
+    }
+}
+
 impl From<&DataOverlayGroup> for pb::transaction::DataOverlayGroup {
     fn from(group: &DataOverlayGroup) -> Self {
         Self {
@@ -4272,6 +4557,18 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::OptimizeColumns(
+                pb::transaction::OptimizeColumns {
+                    materialized_through_version,
+                    groups,
+                },
+            )) => Operation::OptimizeColumns {
+                materialized_through_version,
+                groups: groups
+                    .into_iter()
+                    .map(OptimizeColumnsGroup::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+            },
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState {
                     compacted_sstables,
@@ -4588,6 +4885,16 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
+            Operation::OptimizeColumns {
+                materialized_through_version,
+                groups,
+            } => pb::transaction::Operation::OptimizeColumns(pb::transaction::OptimizeColumns {
+                materialized_through_version: *materialized_through_version,
+                groups: groups
+                    .iter()
+                    .map(pb::transaction::OptimizeColumnsGroup::from)
+                    .collect(),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -4753,6 +5060,25 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
                         )));
                     }
                 }
+            }
+            Ok(())
+        }
+        Operation::OptimizeColumns {
+            materialized_through_version,
+            groups,
+        } => {
+            if *materialized_through_version == 0
+                || *materialized_through_version > manifest.version
+            {
+                return Err(Error::invalid_input(format!(
+                    "OptimizeColumns materialized_through_version {} must be between 1 and current dataset version {}",
+                    materialized_through_version, manifest.version
+                )));
+            }
+            if groups.is_empty() {
+                return Err(Error::invalid_input(
+                    "OptimizeColumns must contain at least one group",
+                ));
             }
             Ok(())
         }
@@ -8809,6 +9135,146 @@ mod tests {
             "overlay committed after the snapshot must survive"
         );
         assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
+    }
+
+    #[test]
+    fn test_optimize_columns_uses_fixed_overlay_cutoff_and_preserves_row_metadata() {
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, 5],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        fragment.physical_rows = Some(2);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from([10_u64, 11].as_slice())).into(),
+        ));
+        fragment.created_at_version_meta = Some(
+            RowDatasetVersionMeta::from_sequence(&RowDatasetVersionSequence {
+                runs: vec![RowDatasetVersionRun {
+                    span: U64Segment::Range(0..2),
+                    version: 1,
+                }],
+            })
+            .unwrap(),
+        );
+        fragment.last_updated_at_version_meta = fragment.created_at_version_meta.clone();
+        fragment.overlays = vec![
+            overlay_with_field(5, 6),
+            DataOverlayFile {
+                data_file: DataFile::new(
+                    "newer.lance",
+                    vec![5],
+                    vec![0],
+                    ConcreteFileVersion::V2_0,
+                    None,
+                    None,
+                ),
+                coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([1u32])),
+                committed_version: 7,
+            },
+        ];
+        let metadata_before = (
+            fragment.row_id_meta.clone(),
+            fragment.created_at_version_meta.clone(),
+            fragment.last_updated_at_version_meta.clone(),
+        );
+
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let mut lance_schema = LanceSchema::try_from(&schema).unwrap();
+        lance_schema.fields[0].id = 3;
+        lance_schema.fields[1].id = 4;
+        lance_schema.fields[2].id = 5;
+        lance_schema.fields[3].id = 6;
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.version = 7;
+        let txn = Transaction::new(
+            6,
+            Operation::OptimizeColumns {
+                materialized_through_version: 6,
+                groups: vec![OptimizeColumnsGroup {
+                    fragment_id: 0,
+                    field_ids: vec![5],
+                    new_files: vec![DataFile::new(
+                        "optimized.lance",
+                        vec![5],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    )],
+                    physical_rows: 2,
+                }],
+            },
+            None,
+        );
+        let (result, _) = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        let fragment = &result.fragments[0];
+
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(fragment.overlays[0].committed_version, 7);
+        assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
+        assert!(
+            fragment
+                .files
+                .iter()
+                .any(|file| file.path == "optimized.lance")
+        );
+        assert_eq!(
+            (
+                fragment.row_id_meta.clone(),
+                fragment.created_at_version_meta.clone(),
+                fragment.last_updated_at_version_meta.clone(),
+            ),
+            metadata_before
+        );
+    }
+
+    #[test]
+    fn test_optimize_columns_operation_roundtrips() {
+        let transaction = Transaction::new(
+            4,
+            Operation::OptimizeColumns {
+                materialized_through_version: 4,
+                groups: vec![OptimizeColumnsGroup {
+                    fragment_id: 3,
+                    field_ids: vec![7, 8],
+                    new_files: vec![DataFile::new(
+                        "optimized.lance",
+                        vec![7, 8],
+                        vec![0, 1],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    )],
+                    physical_rows: 10,
+                }],
+            },
+            None,
+        );
+        let encoded = pb::Transaction::from(&transaction);
+        let decoded = Transaction::try_from(encoded).unwrap();
+        assert_eq!(decoded, transaction);
     }
 
     #[test]

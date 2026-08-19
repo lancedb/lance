@@ -1090,6 +1090,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
         let recovered_coverage = migrate_indices(dataset, &mut indices).await?;
+        transaction.prune_optimize_columns_indices_after_migration(&mut indices)?;
         Transaction::withdraw_coverage_invalidated_after_build(
             &mut indices,
             &recovered_coverage,
@@ -1452,6 +1453,7 @@ pub(crate) async fn commit_transaction(
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
         let recovered_coverage = migrate_indices(&dataset, &mut indices).await?;
+        transaction.prune_optimize_columns_indices_after_migration(&mut indices)?;
         Transaction::withdraw_coverage_invalidated_after_build(
             &mut indices,
             &recovered_coverage,

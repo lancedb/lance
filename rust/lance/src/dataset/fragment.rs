@@ -23,9 +23,10 @@ use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
-use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_arrow::{FieldExt, RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{
-    BlobHandling, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    BlobHandling, BlobV2Layout, NullabilityComparison, OnMissing, OnTypeMismatch,
+    SchemaCompareOptions,
 };
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
@@ -744,6 +745,153 @@ fn relax_nullability(field: &ArrowField) -> ArrowField {
         other => other.clone(),
     };
     ArrowField::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
+}
+
+fn arrow_field_with_data_type(field: &ArrowField, data_type: DataType) -> ArrowField {
+    ArrowField::new(field.name(), data_type, field.is_nullable())
+        .with_metadata(field.metadata().clone())
+}
+
+fn validate_blob_v2_write_field(field: &ArrowField) -> Result<()> {
+    if !field.is_blob_v2() {
+        return Err(Error::invalid_input(format!(
+            "field '{}' is not tagged as a blob v2 column",
+            field.name()
+        )));
+    }
+    let DataType::Struct(children) = field.data_type() else {
+        return Err(Error::invalid_input(format!(
+            "blob v2 field '{}' has non-struct type {}",
+            field.name(),
+            field.data_type()
+        )));
+    };
+    match BlobV2Layout::classify(children) {
+        Some(BlobV2Layout::Logical | BlobV2Layout::Prepared) => Ok(()),
+        actual => Err(Error::invalid_input(format!(
+            "blob v2 field '{}' has {} layout; expected logical or prepared writer input",
+            field.name(),
+            actual
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| "unrecognized".to_string())
+        ))),
+    }
+}
+
+/// Normalize accepted blob writer layouts to the dataset field shape so the
+/// regular schema comparison can continue to validate every non-blob detail.
+fn normalize_blob_v2_for_comparison(
+    source: &ArrowField,
+    target: Option<&ArrowField>,
+) -> Result<ArrowField> {
+    if let Some(target) = target
+        && target.is_blob_v2()
+    {
+        validate_blob_v2_write_field(source)?;
+        return Ok(target.clone());
+    }
+
+    let data_type = match source.data_type() {
+        DataType::Struct(source_children) => {
+            let target_children = target.and_then(|target| match target.data_type() {
+                DataType::Struct(children) => Some(children),
+                _ => None,
+            });
+            DataType::Struct(
+                source_children
+                    .iter()
+                    .map(|source_child| {
+                        let target_child = target_children.and_then(|children| {
+                            children
+                                .iter()
+                                .find(|target_child| target_child.name() == source_child.name())
+                                .map(AsRef::as_ref)
+                        });
+                        normalize_blob_v2_for_comparison(source_child, target_child).map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            )
+        }
+        DataType::List(source_child) => {
+            let target_child = target.and_then(|target| match target.data_type() {
+                DataType::List(child) => Some(child.as_ref()),
+                _ => None,
+            });
+            DataType::List(Arc::new(normalize_blob_v2_for_comparison(
+                source_child,
+                target_child,
+            )?))
+        }
+        DataType::LargeList(source_child) => {
+            let target_child = target.and_then(|target| match target.data_type() {
+                DataType::LargeList(child) => Some(child.as_ref()),
+                _ => None,
+            });
+            DataType::LargeList(Arc::new(normalize_blob_v2_for_comparison(
+                source_child,
+                target_child,
+            )?))
+        }
+        other => other.clone(),
+    };
+    Ok(arrow_field_with_data_type(source, data_type))
+}
+
+/// Build a name-ordered projection while retaining complete logical blob v2
+/// fields (`position` and `size`) needed to preserve external object slices.
+fn blob_aware_projection_field(source: &ArrowField, target: &ArrowField) -> Result<ArrowField> {
+    if target.is_blob_v2() {
+        validate_blob_v2_write_field(source)?;
+        return Ok(source.clone());
+    }
+
+    let data_type = match target.data_type() {
+        DataType::Struct(target_children) => {
+            let DataType::Struct(source_children) = source.data_type() else {
+                return Ok(target.clone());
+            };
+            DataType::Struct(
+                target_children
+                    .iter()
+                    .map(|target_child| {
+                        let source_child = source_children
+                            .iter()
+                            .find(|source_child| source_child.name() == target_child.name())
+                            .ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "field '{}' is missing child '{}'",
+                                    target.name(),
+                                    target_child.name()
+                                ))
+                            })?;
+                        blob_aware_projection_field(source_child, target_child).map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            )
+        }
+        DataType::List(target_child) => {
+            let DataType::List(source_child) = source.data_type() else {
+                return Ok(target.clone());
+            };
+            DataType::List(Arc::new(blob_aware_projection_field(
+                source_child,
+                target_child,
+            )?))
+        }
+        DataType::LargeList(target_child) => {
+            let DataType::LargeList(source_child) = source.data_type() else {
+                return Ok(target.clone());
+            };
+            DataType::LargeList(Arc::new(blob_aware_projection_field(
+                source_child,
+                target_child,
+            )?))
+        }
+        other => other.clone(),
+    };
+    Ok(arrow_field_with_data_type(target, data_type))
 }
 
 impl FileFragment {
@@ -2289,13 +2437,6 @@ impl FileFragment {
             metadata: schema.metadata.clone(),
         };
         let batch_schema = ArrowSchema::from(&writer_schema);
-        let projection_schema = ArrowSchema::new(
-            batch_schema
-                .fields()
-                .iter()
-                .map(|field| relax_nullability(field))
-                .collect::<Vec<_>>(),
-        );
 
         let file_version = self
             .dataset
@@ -2351,7 +2492,24 @@ impl FileFragment {
                 if let Some(duplicate) = duplicate_field_path(batch.schema_ref().fields(), "") {
                     return Err(self.schema_mismatch(format!("column '{duplicate}' appears twice")));
                 }
-                LanceSchema::try_from(batch.schema_ref().as_ref())
+                let normalized_fields = batch
+                    .schema_ref()
+                    .fields()
+                    .iter()
+                    .map(|source| {
+                        let target = batch_schema
+                            .fields()
+                            .iter()
+                            .find(|target| target.name() == source.name())
+                            .map(AsRef::as_ref);
+                        normalize_blob_v2_for_comparison(source, target).map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let normalized_schema = ArrowSchema::new_with_metadata(
+                    normalized_fields,
+                    batch.schema_ref().metadata().clone(),
+                );
+                LanceSchema::try_from(&normalized_schema)
                     .and_then(|staged| {
                         staged.check_compatible(
                             &writer_schema,
@@ -2363,6 +2521,28 @@ impl FileFragment {
                         )
                     })
                     .map_err(|mismatch| self.schema_mismatch(mismatch))?;
+
+                let projection_fields = batch_schema
+                    .fields()
+                    .iter()
+                    .map(|target| {
+                        let source = batch
+                            .schema_ref()
+                            .fields()
+                            .iter()
+                            .find(|source| source.name() == target.name())
+                            .ok_or_else(|| {
+                                self.schema_mismatch(format!(
+                                    "column '{}' is missing",
+                                    target.name()
+                                ))
+                            })?;
+                        blob_aware_projection_field(source, target)
+                            .map(|field| Arc::new(relax_nullability(&field)))
+                            .map_err(|error| self.schema_mismatch(error))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let projection_schema = ArrowSchema::new(projection_fields);
                 let batch = batch
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
