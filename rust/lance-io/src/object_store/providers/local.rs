@@ -29,6 +29,10 @@ mod windows {
     }
 
     pub(super) fn extract_unc_path(url: &Url) -> Result<Option<UncPath>> {
+        if url.scheme() != "file" {
+            return Ok(None);
+        }
+
         let Some(host) = url.host_str().filter(|host| *host != "localhost") else {
             return Ok(None);
         };
@@ -224,5 +228,13 @@ mod tests {
         );
         assert_eq!(unc_path.relative_path.as_ref(), "data/my-dataset.lance");
         assert_eq!(unc_path.store_prefix, "file$server/My%20Share");
+
+        let object_store_url =
+            Url::parse("file-object-store://server/My%20Share/data/my-dataset.lance").unwrap();
+        assert!(
+            windows::extract_unc_path(&object_store_url)
+                .unwrap()
+                .is_none()
+        );
     }
 }
