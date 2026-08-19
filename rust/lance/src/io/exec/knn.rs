@@ -126,6 +126,58 @@ async fn find_partitions_on_cpu(
         .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {}", e)))
 }
 
+/// Per-query IVF partition rankings: for each query, its probed-partition ids
+/// and the corresponding centroid distances, in query order.
+type BatchPartitionRankings = (Vec<Arc<UInt32Array>>, Vec<Arc<Float32Array>>);
+
+/// Rank every query vector in a batch against the IVF centroids on the CPU
+/// runtime.
+///
+/// [`VectorIndex::find_partitions`] is pure CPU work, and a wide batch over a
+/// large centroid set multiplies it enough to monopolize a Tokio worker and
+/// stall unrelated async progress. Dispatch the whole ranking loop as a single
+/// `spawn_cpu` job -- mirroring the single-query [`find_partitions_on_cpu`] --
+/// so it stays off the async executor threads.
+///
+/// `query.key` holds all `query_count` vectors concatenated and `dim` is the
+/// per-vector width. Returns each query's probed-partition list and the
+/// corresponding centroid distances, in query order.
+async fn find_partitions_batch_on_cpu(
+    index: Arc<dyn VectorIndex>,
+    query: Query,
+    query_count: usize,
+    dim: usize,
+) -> DataFusionResult<BatchPartitionRankings> {
+    spawn_cpu(move || -> Result<BatchPartitionRankings> {
+        let mut partitions_per_query = Vec::with_capacity(query_count);
+        let mut dists_per_query = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            // Probe a fixed number of partitions per query. The scanner only
+            // routes here when `minimum_nprobes == maximum_nprobes` and
+            // `minimum_nprobes > 0` (see `Scanner::batch_index_search_supported`),
+            // so this is exactly what the single-query path would search -- no
+            // adaptive `early_pruning` floor or late-search expansion applies,
+            // making the batch result identical to repeated single-query search.
+            // No clamp is needed: the gate rejects `nprobes(0)` (which the
+            // single-query path treats as "probe nothing") rather than silently
+            // searching one partition here.
+            debug_assert!(
+                single_query.minimum_nprobes > 0,
+                "batch node reached with nprobes(0); the scanner gate should have fallen back"
+            );
+            single_query.maximum_nprobes = Some(single_query.minimum_nprobes);
+            let (partitions, q_c_dists) = index.find_partitions(&single_query)?;
+            partitions_per_query.push(Arc::new(partitions));
+            dists_per_query.push(Arc::new(q_c_dists));
+        }
+        Ok((partitions_per_query, dists_per_query))
+    })
+    .await
+    .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {e}")))
+}
+
 fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusionResult<Query> {
     if index.metric_type() != DistanceType::Cosine {
         return Ok(query);
@@ -2620,30 +2672,32 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     dim,
                 )?;
 
-                let mut partitions_per_query = Vec::with_capacity(query_count);
-                let mut dists_per_query = Vec::with_capacity(query_count);
-                for query_index in 0..query_count {
-                    let mut single_query = normalized.clone();
-                    single_query.key = normalized.key.slice(query_index * dim, dim);
-                    // Probe a fixed number of partitions per query. The scanner
-                    // only routes here when `minimum_nprobes == maximum_nprobes`
-                    // and `minimum_nprobes > 0` (see
-                    // `Scanner::batch_index_search_supported`), so this is exactly
-                    // what the single-query path would search — no adaptive
-                    // `early_pruning` floor or late-search expansion applies,
-                    // making the batch result identical to repeated single-query
-                    // search. No clamp is needed: the gate rejects `nprobes(0)`
-                    // (which the single-query path treats as "probe nothing")
-                    // rather than silently searching one partition here.
-                    debug_assert!(
-                        single_query.minimum_nprobes > 0,
-                        "batch node reached with nprobes(0); the scanner gate should have fallen back"
-                    );
-                    single_query.maximum_nprobes = Some(single_query.minimum_nprobes);
-                    let (partitions, q_c_dists) = index.find_partitions(&single_query)?;
-                    partitions_per_query.push(Arc::new(partitions));
-                    dists_per_query.push(Arc::new(q_c_dists));
-                }
+                // Rank every query vector against the IVF centroids on the CPU
+                // runtime rather than inside this async future: the ranking is
+                // pure CPU and the batch width multiplies it, so a wide batch
+                // over a large centroid set could otherwise monopolize a Tokio
+                // worker. See `find_partitions_batch_on_cpu`.
+                let (partitions_per_query, dists_per_query) = find_partitions_batch_on_cpu(
+                    index.clone(),
+                    normalized.clone(),
+                    query_count,
+                    dim,
+                )
+                .await?;
+
+                // Record the partitions this delta actually reads. The batch
+                // node loads each probed partition once and scores every query
+                // that probes it, so the honest "partitions searched" count is
+                // the union across queries -- the shared I/O this node exists to
+                // save -- not the per-query sum. Mirrors the single-query
+                // ANNIvfSubIndexExec, which also records PARTITIONS_SEARCHED.
+                let distinct_partitions: RoaringBitmap = partitions_per_query
+                    .iter()
+                    .flat_map(|parts| parts.values().iter().copied())
+                    .collect();
+                metrics
+                    .partitions_searched
+                    .add(distinct_partitions.len() as usize);
 
                 let index_metrics: Arc<dyn MetricsCollector> =
                     Arc::new(metrics.index_metrics.clone());
@@ -3689,6 +3743,33 @@ mod tests {
         assert!(
             thread_name.contains("lance-cpu"),
             "expected find_partitions to run on the dedicated cpu runtime, got thread {thread_name}",
+        );
+    }
+
+    // Batch analogue of `test_find_partitions_runs_on_cpu_runtime`: the batch
+    // node's per-query centroid ranking multiplies the CPU cost, so it must also
+    // run on the dedicated cpu runtime rather than a Tokio async worker.
+    #[tokio::test]
+    async fn test_find_partitions_batch_runs_on_cpu_runtime() {
+        let thread_name = Arc::new(Mutex::new(None));
+        let index: Arc<dyn VectorIndex> = Arc::new(ThreadCapturingIndex {
+            thread_name: thread_name.clone(),
+            row_ids: Vec::new(),
+        });
+
+        // Two query vectors of dim 1 concatenated into one key.
+        let mut query = base_query();
+        query.key = Arc::new(Float32Array::from(vec![0.0f32, 1.0f32]));
+        let (partitions, dists) = find_partitions_batch_on_cpu(index, query, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2, "one partition list per query");
+        assert_eq!(dists.len(), 2, "one distance list per query");
+
+        let thread_name = thread_name.lock().unwrap().clone().unwrap();
+        assert!(
+            thread_name.contains("lance-cpu"),
+            "expected batch find_partitions to run on the dedicated cpu runtime, got thread {thread_name}",
         );
     }
 

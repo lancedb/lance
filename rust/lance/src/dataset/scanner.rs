@@ -5545,8 +5545,8 @@ impl Scanner {
     /// - no refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
-    /// - all target fragments indexed (or `fast_search`, which ignores
-    ///   unindexed fragments).
+    /// - every target fragment covered by the *selected* `index_segments` (or
+    ///   `fast_search`, which searches only the selected segments anyway).
     ///
     /// The fixed-nprobes requirement is a *correctness* gate, not just an
     /// optimization. The shared-scan path searches exactly `minimum_nprobes`
@@ -5625,11 +5625,47 @@ impl Scanner {
         if self.fast_search {
             return Ok(true);
         }
-        // The batch node only searches indexed partitions, so any unindexed
-        // target fragment would silently drop rows; fall back in that case.
-        let unindexed_fragments =
-            self.retain_target_fragments(self.dataset.unindexed_fragments(index_name).await?);
-        Ok(unindexed_fragments.is_empty())
+        // The batch node only searches the selected `index_segments`, so any
+        // target fragment those segments do not cover would silently drop rows
+        // (the single-query path re-scores such fragments on a flat fallback in
+        // `knn_combined`). Measure coverage against the selected segments -- not
+        // the whole logical index -- so a subset selected via
+        // `with_index_segments` cannot hide a fragment that an unselected
+        // segment happens to cover; fall back whenever any remain.
+        let uncovered_fragments = self
+            .fragments_missing_from_index_segments(index_name, index_segments)
+            .await?;
+        Ok(uncovered_fragments.is_empty())
+    }
+
+    /// Target fragments the given `index_segments` do not cover.
+    ///
+    /// The ANN scan reads only the selected segments' partitions, so these are
+    /// exactly the fragments the single-query path re-scores on a flat fallback
+    /// in [`Self::knn_combined`]. Coverage is measured against the *selected*
+    /// segments rather than every segment of the logical index (which
+    /// `Dataset::unindexed_fragments` would do): a caller may select a subset
+    /// via [`with_index_segments`](Self::with_index_segments) while another,
+    /// unselected segment covers one of the requested fragments.
+    async fn fragments_missing_from_index_segments(
+        &self,
+        index_name: &str,
+        index_segments: &[IndexMetadata],
+    ) -> Result<Vec<Fragment>> {
+        if let Some(target_fragments) = &self.fragments {
+            let indexed_fragments = self.get_indexed_frags(index_segments);
+            Ok(target_fragments
+                .iter()
+                .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
+                .cloned()
+                .collect())
+        } else if self.index_segments.is_some() {
+            // An explicit segment selection with no fragment restriction searches
+            // exactly those segments; there is nothing to fall back for.
+            Ok(Vec::new())
+        } else {
+            self.dataset.unindexed_fragments(index_name).await
+        }
     }
 
     async fn batch_indexed_vector_search(
@@ -5748,18 +5784,9 @@ impl Scanner {
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fallback_fragments = if let Some(target_fragments) = &self.fragments {
-            let indexed_fragments = self.get_indexed_frags(indexed_segments);
-            target_fragments
-                .iter()
-                .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else if self.index_segments.is_some() {
-            Vec::new()
-        } else {
-            self.dataset.unindexed_fragments(index_name).await?
-        };
+        let fallback_fragments = self
+            .fragments_missing_from_index_segments(index_name, indexed_segments)
+            .await?;
 
         let has_fallback = !fallback_fragments.is_empty();
         let has_stale = !stale_rows.is_empty();
@@ -9773,6 +9800,23 @@ mod test {
             plan
         );
 
+        // The batch node loads each probed partition once and scores every query
+        // that probes it, so it must report the *distinct* partitions read: with
+        // 2 partitions and nprobes(2), both queries probe both partitions, so the
+        // union is 2 -- not the per-query sum (2 queries x 2 = 4), and never 0
+        // (which is what a dropped metric would show). This guards the observed
+        // `partitions_searched` against silently regressing to either.
+        let analyzed = scan.analyze_plan().await.unwrap();
+        let batch_line = analyzed
+            .lines()
+            .find(|line| line.contains("ANNIvfBatch"))
+            .expect("analyzed plan should contain the ANNIvfBatch node");
+        assert!(
+            batch_line.contains("partitions_searched=2"),
+            "batch node must report the distinct partitions searched, got:\n{}",
+            batch_line
+        );
+
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
         assert_eq!(
@@ -10054,6 +10098,80 @@ mod test {
                 "nprobes(0) query {query_index}: batch rows must match single-query rows"
             );
         }
+    }
+
+    /// The shared-scan fast path is only equivalent to repeated single-query
+    /// search when the selected `index_segments` cover every requested fragment.
+    /// With one segment per fragment, requesting both fragments but selecting
+    /// only the first segment leaves fragment 1 covered solely by the
+    /// *unselected* segment: the batch node would search just the selected
+    /// segment and silently drop it. Eligibility must be computed from the
+    /// selected segments' coverage (as `knn_combined` does), not the whole
+    /// logical index, so the scanner falls back to the per-query loop, which
+    /// re-scores the uncovered fragment on the flat path and returns every row.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_partial_segment_selection_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        // One segment per fragment: segment_ids[0] covers fragment 0 (i=0..200),
+        // segment_ids[1] covers fragment 1 (i=200..400).
+        let segment_ids = test_ds.make_segmented_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let fragments = dataset.fragments();
+        assert_eq!(fragments.len(), 2, "base dataset should have two fragments");
+
+        let (queries, _query_values) = batch_knn_two_queries();
+        // k covers every row in both requested fragments (200 each), so a
+        // complete search returns 400 rows per query.
+        let k = 400;
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(2);
+        // Request both indexed fragments but select only the segment covering
+        // fragment 0; fragment 1 is covered only by the unselected segment.
+        scan.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
+        scan.with_index_segments(vec![segment_ids[0]]).unwrap();
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "a requested fragment outside the selected segments must force a fallback, \
+             not a shared scan that drops it, got:\n{plan}"
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_eq!(
+            batch.num_rows(),
+            2 * k,
+            "each query must return all 400 rows across both requested fragments"
+        );
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
+        for query_index in 0..2 {
+            let rows_for_query = query_indices
+                .iter()
+                .filter(|value| *value == Some(query_index))
+                .count();
+            assert_eq!(
+                rows_for_query, k,
+                "query_index {query_index} must cover both fragments (got {rows_for_query})"
+            );
+        }
+        // Fragment 0 (i in 0..200) comes from the selected segment; fragment 1
+        // (i in 200..400) must appear via the flat fallback.
+        let i_array = batch["i"].as_primitive::<Int32Type>();
+        assert!(
+            i_array
+                .iter()
+                .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (200..400).contains(&val))),
+            "results must include rows from both the selected segment and the flat-fallback fragment"
+        );
     }
 
     /// A wide batch probes more distinct partitions than one streaming chunk holds
