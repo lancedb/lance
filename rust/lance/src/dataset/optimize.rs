@@ -292,7 +292,9 @@ pub struct CompactionOptions {
     ///
     /// Excluded fragments act as boundaries between adjacent compaction candidates,
     /// so fragments on opposite sides of an exclusion are never combined into the
-    /// same task. IDs that are duplicated or absent from the dataset are ignored.
+    /// same task. To preserve row order without changing an excluded fragment's
+    /// identity, only candidates after the last present excluded fragment are
+    /// eligible. IDs that are duplicated or absent from the dataset are ignored.
     /// Defaults to an empty list.
     #[serde(default)]
     pub excluded_fragment_ids: Vec<u32>,
@@ -753,6 +755,17 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             fragments.windows(2).all(|pair| pair[0].id() < pair[1].id()),
             "fragments in manifest are not sorted"
         );
+        // Compaction replacements use fresh IDs, and stable manifests are ID-sorted.
+        // Rewriting at or before an excluded fragment would therefore require
+        // relabeling that fragment to keep its rows in place. Restrict planning to
+        // the suffix after the last exclusion so excluded identities stay unchanged.
+        let exclusion_suffix_start = fragments
+            .iter()
+            .rposition(|fragment| {
+                u32::try_from(fragment.id())
+                    .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id))
+            })
+            .map_or(0, |position| position + 1);
         let mut fragment_metrics = futures::stream::iter(fragments)
             .map(|fragment| async {
                 if u32::try_from(fragment.id())
@@ -864,8 +877,11 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        if let Some(max_frags) = self.options.max_source_fragments {
-            let suffix_start = dataset.manifest.fragments.len().saturating_sub(max_frags);
+        let budget_suffix_start = self.options.max_source_fragments.map_or(0, |max_frags| {
+            dataset.manifest.fragments.len().saturating_sub(max_frags)
+        });
+        let suffix_start = exclusion_suffix_start.max(budget_suffix_start);
+        if suffix_start > 0 {
             candidate_bins = candidate_bins
                 .into_iter()
                 .filter_map(|mut bin| {
@@ -8269,10 +8285,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            planned_fragment_ids,
-            vec![vec![0, 1, 2, 3], vec![5, 6, 7, 8, 9]]
-        );
+        assert_eq!(planned_fragment_ids, vec![vec![5, 6, 7, 8, 9]]);
         assert!(
             planned_fragment_ids
                 .iter()
@@ -8280,8 +8293,11 @@ mod tests {
                 .all(|fragment_id| *fragment_id != excluded_fragment_id)
         );
 
+        let before = dataset.scan().try_into_batch().await.unwrap();
         let metrics = compact_files(&mut dataset, options, None).await.unwrap();
-        assert_eq!(metrics.fragments_removed, 9);
+        assert_eq!(metrics.fragments_removed, 5);
+        let after = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(after, before);
         let remaining_fragment_ids = dataset
             .get_fragments()
             .iter()

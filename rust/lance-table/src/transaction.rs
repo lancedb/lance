@@ -5222,12 +5222,7 @@ mod tests {
         );
 
         let (rewritten, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let fragment_ids = rewritten
@@ -5261,7 +5256,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "update-txn",
-                &ManifestWriteConfig::default(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -5282,7 +5277,7 @@ mod tests {
                 Some(&updated),
                 vec![],
                 "rewrite-txn",
-                &ManifestWriteConfig::default(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -5307,12 +5302,7 @@ mod tests {
         let transaction = Transaction::new(manifest.version, operation, None);
 
         let (merged, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let fragment_ids = merged

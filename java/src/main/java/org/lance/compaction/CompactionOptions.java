@@ -347,8 +347,9 @@ public class CompactionOptions implements Serializable {
 
     /**
      * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
-     * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
-     * and unknown IDs are ignored.
+     * as boundaries, so fragments on opposite sides are not combined into the same task. To
+     * preserve row order, only candidates after the last present excluded fragment are eligible.
+     * Duplicate and unknown IDs are ignored.
      *
      * @throws IllegalArgumentException if an ID is negative or exceeds the unsigned 32-bit range
      */

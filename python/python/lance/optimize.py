@@ -118,6 +118,7 @@ class CompactionOptions(TypedDict):
     """
     Fragment IDs to exclude from compaction planning. Excluded fragments
     remain unchanged and act as boundaries, so fragments on opposite sides
-    are not combined into the same task. Duplicate and unknown IDs are
-    ignored. (default: None)
+    are not combined into the same task. To preserve row order, only candidates
+    after the last present excluded fragment are eligible. Duplicate and
+    unknown IDs are ignored. (default: None)
     """
