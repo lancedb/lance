@@ -285,7 +285,10 @@ fn optimizer_rules(
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
         Arc::new(PushDownLimit::new()),
-        // After `PushDownFilter`, so the predicate it reads has reached the scan.
+        // Both run after `PushDownFilter`, so the predicate they read has reached the scan. A row
+        // restriction and a scalar index query compete for the same slot on the read, and the
+        // restriction wins.
+        Arc::new(scan_index::ResolveTake::new(context.clone())),
         Arc::new(scan_index::ResolveScalarIndexQuery::new(context.clone())),
         Arc::new(OptimizeProjections::new()),
     ]
