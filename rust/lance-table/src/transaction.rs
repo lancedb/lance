@@ -5106,6 +5106,7 @@ mod tests {
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            migration_next_row_id: None,
         }
     }
 
