@@ -68,7 +68,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
@@ -88,6 +88,15 @@ const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
 const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
 /// LabelList index on the base_objects column for view dependencies
 const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
+/// Value field of the base_objects index, whose nested `List` type would
+/// otherwise allocate an inner field per use.
+static BASE_OBJECTS_VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| {
+    Field::new(
+        VALUE_COLUMN_NAME,
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        true,
+    )
+});
 // Each retry reloads and rewrites the full manifest. Match the regular Lance
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
@@ -1184,11 +1193,7 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ));
+        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
@@ -1376,11 +1381,7 @@ impl ManifestNamespace {
                 index_name: BASE_OBJECTS_INDEX_NAME,
                 column_name: "base_objects",
                 params: ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList),
-                field: Field::new(
-                    VALUE_COLUMN_NAME,
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                    true,
-                ),
+                field: BASE_OBJECTS_VALUE_FIELD.clone(),
                 stream: Self::base_objects_index_stream(base_objects_values, base_objects_row_ids),
             },
             &fragment_bitmap,

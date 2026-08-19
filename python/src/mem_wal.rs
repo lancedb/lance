@@ -966,6 +966,8 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
         "pending_wal_estimated_bytes",
         stats.pending_wal_estimated_bytes,
     )?;
+    dict.set_item("frozen_count", stats.frozen_count)?;
+    dict.set_item("frozen_bytes", stats.frozen_bytes)?;
     Ok(dict.into_any().unbind())
 }
 

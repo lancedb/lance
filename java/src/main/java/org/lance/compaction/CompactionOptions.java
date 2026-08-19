@@ -20,6 +20,9 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OptionalDataException;
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -47,6 +50,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceFragments;
   private Optional<Long> maxSourceRows;
   private Optional<Long> maxSourceBytes;
+  private List<Long> excludedFragmentIds;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -61,7 +65,8 @@ public class CompactionOptions implements Serializable {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes) {
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -75,6 +80,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceFragments = maxSourceFragments;
     this.maxSourceRows = maxSourceRows;
     this.maxSourceBytes = maxSourceBytes;
+    this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -100,6 +106,10 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getMaxSourceBytes() {
     return maxSourceBytes;
+  }
+
+  public List<Long> getExcludedFragmentIds() {
+    return excludedFragmentIds;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -150,6 +160,7 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceFragments", maxSourceFragments.orElse(null))
         .add("maxSourceRows", maxSourceRows.orElse(null))
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
+        .add("excludedFragmentIds", excludedFragmentIds)
         .toString();
   }
 
@@ -167,6 +178,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceFragments.orElse(null));
     output.writeObject(maxSourceRows.orElse(null));
     output.writeObject(maxSourceBytes.orElse(null));
+    output.writeObject(excludedFragmentIds);
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -192,6 +204,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
     this.maxSourceRows = readTrailingLong(input);
     this.maxSourceBytes = readTrailingLong(input);
+    this.excludedFragmentIds = readTrailingLongList(input);
   }
 
   /**
@@ -211,6 +224,20 @@ public class CompactionOptions implements Serializable {
     }
   }
 
+  @SuppressWarnings("unchecked")
+  private static List<Long> readTrailingLongList(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      List<Long> fragmentIds = (List<Long>) input.readObject();
+      return fragmentIds == null ? Collections.emptyList() : List.copyOf(fragmentIds);
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Collections.emptyList();
+    }
+  }
+
   /** Builder for CompactionOptions. */
   public static class Builder {
     private Optional<Long> targetRowsPerFragment = Optional.empty();
@@ -226,6 +253,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceFragments = Optional.empty();
     private Optional<Long> maxSourceRows = Optional.empty();
     private Optional<Long> maxSourceBytes = Optional.empty();
+    private List<Long> excludedFragmentIds = Collections.emptyList();
 
     private Builder() {}
 
@@ -318,6 +346,26 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
+     * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
+     * and unknown IDs are ignored.
+     *
+     * @throws IllegalArgumentException if an ID is negative or exceeds the unsigned 32-bit range
+     */
+    public Builder withExcludedFragmentIds(List<Long> excludedFragmentIds) {
+      Objects.requireNonNull(excludedFragmentIds, "excludedFragmentIds");
+      for (Long fragmentId : excludedFragmentIds) {
+        if (fragmentId == null || fragmentId < 0 || fragmentId > 0xFFFF_FFFFL) {
+          throw new IllegalArgumentException(
+              "excludedFragmentIds must contain values between 0 and 4294967295, got "
+                  + fragmentId);
+        }
+      }
+      this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
+      return this;
+    }
+
+    /**
      * A max source budget of zero admits no work and a negative value would wrap around to an
      * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
      * unset for no limit.
@@ -344,7 +392,8 @@ public class CompactionOptions implements Serializable {
           binaryCopyReadBatchBytes,
           maxSourceFragments,
           maxSourceRows,
-          maxSourceBytes);
+          maxSourceBytes,
+          excludedFragmentIds);
     }
   }
 }

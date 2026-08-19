@@ -698,8 +698,16 @@ impl<'a> TransactionRebase<'a> {
                     );
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids, so this should be fine.
-                Operation::Merge { .. } => Ok(()),
+                // Merge, reserve, and project don't change row ids. The MemWAL
+                // index is the exception: its install validates schema-dependent
+                // state, which a concurrent schema change invalidates.
+                Operation::Merge { .. } => {
+                    if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
@@ -1396,8 +1404,15 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
-            Operation::CreateIndex { .. }
-            | Operation::ReserveFragments { .. }
+            // See the MemWAL exception in check_create_index_txn.
+            Operation::CreateIndex { new_indices, .. } => {
+                if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
@@ -3916,6 +3931,82 @@ mod tests {
         assert_eq!(
             new_indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter(expected_fragment_ids)
+        );
+    }
+
+    #[test]
+    fn test_mem_wal_install_conflicts_with_merge() {
+        let mem_wal_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: MEM_WAL_INDEX_NAME.to_string(),
+            fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let column_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "btree".to_string(),
+            ..mem_wal_index.clone()
+        };
+        let merge = Transaction::new(
+            0,
+            Operation::Merge {
+                fragments: vec![],
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        // Install rebasing over a committed Merge conflicts; a column index
+        // stays compatible.
+        for (index, conflicts) in [(mem_wal_index.clone(), true), (column_index, false)] {
+            let txn = Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let mut rebase = TransactionRebase {
+                transaction: txn,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&merge, 1);
+            assert_eq!(result.is_err(), conflicts, "{result:?}");
+        }
+
+        // And the reverse: a Merge rebasing over a committed install conflicts.
+        let install = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: merge,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&install, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
         );
     }
 
