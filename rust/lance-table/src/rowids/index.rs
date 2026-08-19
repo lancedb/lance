@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{RowIdSequence, U64Segment};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
+
+/// Smallest [`U64Segment::Array`] that earns a position table. `position` scans
+/// that encoding, so below this length the scan is cheaper than the table.
+const ARRAY_POSITION_TABLE_MIN_LEN: usize = 1024;
+
+/// Row ids `new` is willing to walk to prove that no id is live in two
+/// fragments. Fragments whose ranges interleave produce a quadratic number of
+/// intersecting pairs, and walking them all costs more than the index build it
+/// guards. Above this budget `new` builds the index unchecked; [`RowIdIndex::validate`]
+/// runs the same check for a caller that wants it whatever the cost.
+const DUPLICATE_CHECK_ID_BUDGET: usize = 1 << 20;
 
 /// An index of row ids
 ///
@@ -22,17 +32,22 @@ use lance_core::{Error, Result};
 // (Implementation)
 // One entry per fragment holds the fragment row id sequence, its deletion
 // vector, and the row id range each segment of that sequence covers. A lookup
-// picks the fragments whose range can hold the id, then asks the covering
-// segment for the position of the id. Building the index reads segment bounds
-// only, so the build cost follows the segment count rather than the row count.
+// walks the fragments whose range can hold the id, then asks the covering
+// segment for the position of the id. Building the index reads each segment's
+// bounds and length, which is O(1) for a `Range` and a scan of the segment for
+// the encodings that store their ids.
 #[derive(Debug)]
 pub struct RowIdIndex {
     /// Fragments that hold at least one row id, sorted by their lowest row id.
     fragments: Vec<FragmentEntry>,
-    /// `max_end[i]` is the highest row id that `fragments[..=i]` cover. A lookup
-    /// walks back from the last fragment starting at or below the wanted id and
-    /// stops once this bound falls below it.
-    max_end: Vec<u64>,
+    /// Max-`end` tree over `fragments`, as an implicit heap: `end_tree[1]` is
+    /// the root and leaf `i` sits at `end_tree[len() / 2 + i]`. A lookup skips
+    /// any subtree whose highest `end` falls below the wanted id, so one wide
+    /// fragment no longer forces every lookup to walk the whole list.
+    end_tree: Vec<u64>,
+    /// True when no two fragments cover a common row id. Then an id resolves in
+    /// at most one fragment by construction, and `new` needs no further check.
+    ranges_disjoint: bool,
 }
 
 pub struct FragmentRowIdIndex {
@@ -48,11 +63,28 @@ struct SegmentEntry {
     seq_idx: usize,
     range: RangeInclusive<u64>,
     start_offset: u32,
-    /// Position of each row id in an unsorted [`U64Segment::Array`]. That
-    /// encoding answers `position` by walking the segment, so a lookup without
-    /// this map costs the segment length. The searchable encodings leave it
-    /// `None` and use `position` directly.
-    positions: Option<HashMap<u64, u32>>,
+    /// Row id to position, sorted by row id, for a long [`U64Segment::Array`],
+    /// filled by the first lookup that reaches this segment. `position` walks
+    /// that encoding end to end, so a table pays for itself; a segment nothing
+    /// ever looks up costs nothing. `None` for the encodings that search their
+    /// own structure, and for [`U64Segment::RangeWithBitmap`], whose `position`
+    /// counts set bits up to the offset — the previous index paid that count too.
+    positions: Option<OnceLock<Vec<(u64, u32)>>>,
+}
+
+impl SegmentEntry {
+    /// Position of `row_id` in this segment, or `None` if the segment lacks it.
+    fn position(&self, sequence: &RowIdSequence, row_id: u64) -> Option<usize> {
+        let segment = &sequence.0[self.seq_idx];
+        let Some(cell) = &self.positions else {
+            return segment.position(row_id);
+        };
+        let positions = cell.get_or_init(|| build_positions(segment));
+        positions
+            .binary_search_by_key(&row_id, |(id, _)| *id)
+            .ok()
+            .map(|found| positions[found].1 as usize)
+    }
 }
 
 #[derive(Debug)]
@@ -63,42 +95,51 @@ struct FragmentEntry {
     segments: Vec<SegmentEntry>,
     start: u64,
     end: u64,
+    /// Row ids the fragment holds, deleted ones included. Read once here so the
+    /// duplicate check does not recount segment lengths per pair.
+    rows: usize,
 }
 
-/// Row id bounds of a segment. `None` for an empty segment.
-fn segment_bounds(segment: &U64Segment) -> Option<RangeInclusive<u64>> {
-    segment.range()
+/// Whether a segment earns a position table: only a long unsorted array, whose
+/// `position` scans from the start.
+fn wants_position_table(segment: &U64Segment) -> bool {
+    matches!(segment, U64Segment::Array(_)) && segment.len() >= ARRAY_POSITION_TABLE_MIN_LEN
 }
 
-/// Row id to position map for an unsorted [`U64Segment::Array`], `None` for the
-/// encodings that `position` searches. The first position of a repeated id wins,
-/// which is what `position` returns.
-fn array_positions(segment: &U64Segment) -> Option<HashMap<u64, u32>> {
-    let U64Segment::Array(_) = segment else {
-        return None;
-    };
-    let mut positions = HashMap::with_capacity(segment.len());
-    for (position, row_id) in segment.iter().enumerate() {
-        positions.entry(row_id).or_insert(position as u32);
-    }
-    Some(positions)
+/// Row id to position, sorted by row id. The first position of a repeated id
+/// wins, which is what `position` returns.
+fn build_positions(segment: &U64Segment) -> Vec<(u64, u32)> {
+    let mut positions: Vec<(u64, u32)> = segment
+        .iter()
+        .enumerate()
+        .map(|(position, row_id)| (row_id, position as u32))
+        .collect();
+    positions.sort_unstable();
+    positions.dedup_by_key(|(row_id, _)| *row_id);
+    positions
 }
 
 impl FragmentEntry {
     fn new(source: &FragmentRowIdIndex) -> Option<Self> {
         let mut segments: Vec<SegmentEntry> = Vec::new();
         let mut start_offset: u32 = 0;
+        let mut rows: usize = 0;
         for (seq_idx, segment) in source.row_id_sequence.0.iter().enumerate() {
-            let len = segment.len() as u32;
-            if let Some(range) = segment_bounds(segment) {
-                segments.push(SegmentEntry {
-                    seq_idx,
-                    range,
-                    start_offset,
-                    positions: array_positions(segment),
-                });
+            let len = segment.len();
+            rows += len;
+            // `range()` reports the span of a holed encoding, so ask `len` which
+            // ids the segment actually holds before trusting those bounds.
+            if len > 0 {
+                if let Some(range) = segment.range() {
+                    segments.push(SegmentEntry {
+                        seq_idx,
+                        range,
+                        start_offset,
+                        positions: wants_position_table(segment).then(OnceLock::new),
+                    });
+                }
             }
-            start_offset += len;
+            start_offset += len as u32;
         }
         let start = segments.iter().map(|entry| *entry.range.start()).min()?;
         let end = segments.iter().map(|entry| *entry.range.end()).max()?;
@@ -109,23 +150,8 @@ impl FragmentEntry {
             segments,
             start,
             end,
+            rows,
         })
-    }
-
-    /// Row ids this fragment holds inside `lo..=hi`, in physical order.
-    fn ids_in_window(&self, lo: u64, hi: u64) -> impl Iterator<Item = u64> + '_ {
-        self.segments
-            .iter()
-            .filter(move |entry| *entry.range.start() <= hi && lo <= *entry.range.end())
-            .flat_map(|entry| self.sequence.0[entry.seq_idx].iter())
-            .filter(move |row_id| (lo..=hi).contains(row_id))
-    }
-
-    fn rows(&self) -> usize {
-        self.segments
-            .iter()
-            .map(|entry| self.sequence.0[entry.seq_idx].len())
-            .sum()
     }
 
     /// Address of `row_id` inside this fragment. `None` when the fragment does
@@ -137,11 +163,7 @@ impl FragmentEntry {
             if !entry.range.contains(&row_id) {
                 continue;
             }
-            let position = match &entry.positions {
-                Some(positions) => positions.get(&row_id).map(|position| *position as usize),
-                None => self.sequence.0[entry.seq_idx].position(row_id),
-            };
-            let Some(position) = position else {
+            let Some(position) = entry.position(&self.sequence, row_id) else {
                 continue;
             };
             let row_offset = entry.start_offset + position as u32;
@@ -151,6 +173,15 @@ impl FragmentEntry {
             return Some(RowAddress::new_from_parts(self.fragment_id, row_offset));
         }
         None
+    }
+
+    /// Row ids this fragment holds inside `lo..=hi`, in physical order.
+    fn ids_in_window(&self, lo: u64, hi: u64) -> impl Iterator<Item = u64> + '_ {
+        self.segments
+            .iter()
+            .filter(move |entry| *entry.range.start() <= hi && lo <= *entry.range.end())
+            .flat_map(|entry| self.sequence.0[entry.seq_idx].iter())
+            .filter(move |row_id| (lo..=hi).contains(row_id))
     }
 }
 
@@ -163,27 +194,34 @@ impl RowIdIndex {
             .collect();
         fragments.sort_unstable_by_key(|entry| entry.start);
 
-        let mut max_end = Vec::with_capacity(fragments.len());
-        let mut running = 0_u64;
+        let mut ranges_disjoint = true;
+        let mut covered_to: Option<u64> = None;
         for entry in &fragments {
-            running = running.max(entry.end);
-            max_end.push(running);
+            if covered_to.is_some_and(|end| entry.start <= end) {
+                ranges_disjoint = false;
+            }
+            covered_to = Some(covered_to.map_or(entry.end, |end| end.max(entry.end)));
         }
 
-        reject_duplicate_row_ids(&fragments)?;
-
-        Ok(Self { fragments, max_end })
+        let index = Self {
+            end_tree: build_end_tree(&fragments),
+            fragments,
+            ranges_disjoint,
+        };
+        if !index.ranges_disjoint && index.duplicate_check_ids() <= DUPLICATE_CHECK_ID_BUDGET {
+            index.validate()?;
+        }
+        Ok(index)
     }
 
     /// Get the address for a given row id.
     ///
     /// Will return None if the row id does not exist in the index.
     pub fn get(&self, row_id: u64) -> Option<RowAddress> {
-        self.candidates(row_id)
-            .find_map(|(_, entry)| entry.resolve(row_id))
+        self.find_map_candidate(row_id, |entry| entry.resolve(row_id))
     }
 
-    /// Get addresses for many row ids in one pass over the index.
+    /// Get addresses for many row ids.
     ///
     /// Returns one entry per input id, in input order (`None` for missing).
     /// Resolves each id through [`Self::get`], so both APIs return the same
@@ -204,76 +242,155 @@ impl RowIdIndex {
         out
     }
 
-    /// Fragments that can hold `row_id`, highest starting id first.
-    fn candidates(&self, row_id: u64) -> impl Iterator<Item = (usize, &FragmentEntry)> {
-        let upper = self
-            .fragments
-            .partition_point(|entry| entry.start <= row_id);
-        self.fragments[..upper]
-            .iter()
-            .enumerate()
-            .rev()
-            .take_while(move |(slot, _)| self.max_end[*slot] >= row_id)
-            .filter(move |(_, entry)| entry.end >= row_id)
-    }
-}
-
-/// Reject a row id that is live in two fragments.
-///
-/// Two fragments can only claim the same id where their row id ranges intersect,
-/// so this walks the intersecting pairs and only the ids inside each intersection.
-/// A dataset whose fragments hold disjoint ranges pays a range comparison per
-/// neighbour; one whose ranges all intersect pays a pass over the ids in them.
-fn reject_duplicate_row_ids(fragments: &[FragmentEntry]) -> Result<()> {
-    for (slot, left) in fragments.iter().enumerate() {
-        for right in fragments[slot + 1..]
-            .iter()
-            .take_while(|right| right.start <= left.end)
-        {
-            let lo = left.start.max(right.start);
-            let hi = left.end.min(right.end);
-            let (scanned, probed) = if left.rows() <= right.rows() {
-                (left, right)
-            } else {
-                (right, left)
-            };
-            for row_id in scanned.ids_in_window(lo, hi) {
-                if scanned.resolve(row_id).is_some() && probed.resolve(row_id).is_some() {
-                    return Err(Error::internal(format!(
-                        "row id index corrupt: stable row id {row_id} is live in multiple fragments"
-                    )));
+    /// Check that no row id is live in more than one fragment.
+    ///
+    /// Two fragments can only claim the same id where their ranges intersect, so
+    /// this walks the intersecting pairs and only the ids inside each
+    /// intersection. Fragments that interleave produce a quadratic number of
+    /// pairs; `new` runs this itself only while that work stays under
+    /// [`DUPLICATE_CHECK_ID_BUDGET`].
+    pub fn validate(&self) -> Result<()> {
+        if self.ranges_disjoint {
+            return Ok(());
+        }
+        for (slot, left) in self.fragments.iter().enumerate() {
+            for right in self.fragments[slot + 1..]
+                .iter()
+                .take_while(|right| right.start <= left.end)
+            {
+                let lo = left.start.max(right.start);
+                let hi = left.end.min(right.end);
+                let (scanned, probed) = if left.rows <= right.rows {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                for row_id in scanned.ids_in_window(lo, hi) {
+                    if scanned.resolve(row_id).is_some() && probed.resolve(row_id).is_some() {
+                        return Err(Error::internal(format!(
+                            "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+                        )));
+                    }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    /// Row ids [`Self::validate`] would walk.
+    fn duplicate_check_ids(&self) -> usize {
+        let mut ids: usize = 0;
+        for (slot, left) in self.fragments.iter().enumerate() {
+            for right in self.fragments[slot + 1..]
+                .iter()
+                .take_while(|right| right.start <= left.end)
+            {
+                ids = ids.saturating_add(left.rows.min(right.rows));
+                if ids > DUPLICATE_CHECK_ID_BUDGET {
+                    return ids;
+                }
+            }
+        }
+        ids
+    }
+
+    /// Apply `f` to the fragments that can hold `row_id`, highest starting id
+    /// first, and return its first `Some`. Descends the max-`end` tree, so a
+    /// fragment whose range cannot reach the id costs nothing.
+    fn find_map_candidate<T>(
+        &self,
+        row_id: u64,
+        mut f: impl FnMut(&FragmentEntry) -> Option<T>,
+    ) -> Option<T> {
+        let fragments = self.fragments.len();
+        if fragments == 0 {
+            return None;
+        }
+        // Only a fragment that starts at or below the id can hold it.
+        let upper = self
+            .fragments
+            .partition_point(|entry| entry.start <= row_id);
+        if upper == 0 {
+            return None;
+        }
+        let leaves = self.end_tree.len() / 2;
+        // Depth is log2(leaves) and each level leaves one sibling behind.
+        let mut stack = [(0usize, 0usize, 0usize); 96];
+        stack[0] = (1, 0, leaves);
+        let mut depth = 1;
+        while depth > 0 {
+            depth -= 1;
+            let (node, lo, hi) = stack[depth];
+            if lo >= upper || self.end_tree[node] < row_id {
+                continue;
+            }
+            if hi - lo == 1 {
+                if lo < fragments {
+                    if let Some(found) = f(&self.fragments[lo]) {
+                        return Some(found);
+                    }
+                }
+                continue;
+            }
+            let mid = (lo + hi) / 2;
+            // Push the left half first so the right half pops first: candidates
+            // arrive in descending slot order.
+            stack[depth] = (2 * node, lo, mid);
+            stack[depth + 1] = (2 * node + 1, mid, hi);
+            depth += 2;
+        }
+        None
+    }
+}
+
+/// Implicit max-`end` heap over `fragments`, padded to a power of two. Padding
+/// leaves hold 0, which prunes for every id above 0 and is filtered by slot.
+fn build_end_tree(fragments: &[FragmentEntry]) -> Vec<u64> {
+    if fragments.is_empty() {
+        return Vec::new();
+    }
+    let leaves = fragments.len().next_power_of_two();
+    let mut tree = vec![0_u64; 2 * leaves];
+    for (slot, entry) in fragments.iter().enumerate() {
+        tree[leaves + slot] = entry.end;
+    }
+    for node in (1..leaves).rev() {
+        tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+    }
+    tree
 }
 
 impl DeepSizeOf for RowIdIndex {
     /// Charges the row id sequences and deletion vectors the index keeps alive
     /// through its `Arc`s, so a cache that weighs this entry bounds every
-    /// allocation the entry retains.
+    /// allocation the entry retains. A sequence cached under its own key is
+    /// charged there as well: the two entries can be evicted independently, and
+    /// either one keeps the allocation alive on its own.
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let fragment_bytes: usize = self
             .fragments
             .iter()
             .map(|entry| {
-                std::mem::size_of::<FragmentEntry>()
-                    + entry.sequence.deep_size_of_children(context)
+                entry.sequence.deep_size_of_children(context)
                     + entry.deletion_vector.deep_size_of_children(context)
+                    + entry.segments.capacity() * std::mem::size_of::<SegmentEntry>()
                     + entry
                         .segments
                         .iter()
                         .map(|segment| {
-                            std::mem::size_of::<SegmentEntry>()
-                                + segment.positions.as_ref().map_or(0, |positions| {
+                            segment.positions.as_ref().and_then(OnceLock::get).map_or(
+                                0,
+                                |positions| {
                                     positions.capacity() * std::mem::size_of::<(u64, u32)>()
-                                })
+                                },
+                            )
                         })
                         .sum::<usize>()
             })
             .sum();
-        fragment_bytes + self.max_end.len() * std::mem::size_of::<u64>()
+        fragment_bytes
+            + self.fragments.capacity() * std::mem::size_of::<FragmentEntry>()
+            + self.end_tree.capacity() * std::mem::size_of::<u64>()
     }
 }
 
