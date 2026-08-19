@@ -963,15 +963,14 @@ mod tests {
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_transaction::CompositeOperation {
                     actions: vec![pb_transaction::UserAction {
-                        description: "refresh row versions".to_string(),
+                        description: "assert unique keys".to_string(),
                         actions: vec![pb_transaction::Action {
-                            action: Some(
-                                pb_transaction::action::Action::RefreshRowVersionMetadata(
-                                    pb_transaction::RefreshRowVersionMetadata {
-                                        fragment_ids: vec![1],
-                                    },
-                                ),
-                            ),
+                            action: Some(pb_transaction::action::Action::AssertUniqueKeys(
+                                pb_transaction::AssertUniqueKeys {
+                                    key_fields: vec![],
+                                    filter: None,
+                                },
+                            )),
                         }],
                     }],
                 },
