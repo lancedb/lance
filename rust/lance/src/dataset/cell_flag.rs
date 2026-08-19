@@ -1762,37 +1762,88 @@ pub async fn load_cell_flag_fragments(
         return Ok(HashMap::new());
     };
     let fragments = select_cell_flag_fragments(&root, selected_fragment_ids.as_deref());
-    let required_bytes = fragments.iter().try_fold(0usize, |total, fragment| {
+
+    struct BitmapLoad {
+        representative: CellFlagFragment,
+        fragment_ids: Vec<u32>,
+    }
+
+    let mut states = HashMap::with_capacity(fragments.len());
+    let mut bitmap_loads = Vec::with_capacity(fragments.len());
+    let mut inline_groups = HashMap::<(u64, Vec<u8>), Vec<u32>>::new();
+    for fragment in fragments {
+        let CellFlagFragment {
+            fragment_id,
+            physical_rows,
+            state,
+        } = fragment;
+        let fragment_id = u32::try_from(fragment_id).map_err(|_| {
+            Error::invalid_input(format!(
+                "Cell flag fragment ID {} does not fit in a row address",
+                fragment_id
+            ))
+        })?;
+        match state {
+            CellFlagFragmentState::All => {
+                states.insert(fragment_id, FlagFragment::All);
+            }
+            CellFlagFragmentState::InlinePartial(bytes) => {
+                inline_groups
+                    .entry((physical_rows, bytes))
+                    .or_default()
+                    .push(fragment_id);
+            }
+            CellFlagFragmentState::Partial(file) => {
+                bitmap_loads.push(BitmapLoad {
+                    representative: CellFlagFragment {
+                        fragment_id: u64::from(fragment_id),
+                        physical_rows,
+                        state: CellFlagFragmentState::Partial(file),
+                    },
+                    fragment_ids: vec![fragment_id],
+                });
+            }
+        }
+    }
+    for ((physical_rows, bytes), mut fragment_ids) in inline_groups {
+        fragment_ids.sort_unstable();
+        bitmap_loads.push(BitmapLoad {
+            representative: CellFlagFragment {
+                fragment_id: u64::from(fragment_ids[0]),
+                physical_rows,
+                state: CellFlagFragmentState::InlinePartial(bytes),
+            },
+            fragment_ids,
+        });
+    }
+
+    // Equal inline payloads describe the same immutable row-offset selection.
+    // Decode each distinct payload once and share it across matching fragments.
+    let required_bytes = bitmap_loads.iter().try_fold(0usize, |total, load| {
         total
-            .checked_add(cell_flag_query_memory_bytes(fragment)?)
+            .checked_add(cell_flag_query_memory_bytes(&load.representative)?)
             .ok_or_else(|| {
                 Error::invalid_input("Cell Flag query memory estimate overflow".to_string())
             })
     })?;
     reserve_cell_flag_query_memory(query_memory_bytes, required_bytes)?;
     let io_parallelism = dataset.object_store.io_parallelism().max(1);
-    futures::stream::iter(fragments)
-        .map(|fragment| async move {
-            let fragment_id = u32::try_from(fragment.fragment_id).map_err(|_| {
-                Error::invalid_input(format!(
-                    "Cell flag fragment ID {} does not fit in a row address",
-                    fragment.fragment_id
-                ))
-            })?;
-            let state = match &fragment.state {
-                CellFlagFragmentState::All => FlagFragment::All,
-                CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-                    let bitmap = dataset
-                        .load_cell_flag_bitmap_shared(flag_id, &fragment)
-                        .await?;
-                    FlagFragment::Partial(bitmap)
-                }
-            };
-            Ok::<(u32, FlagFragment), Error>((fragment_id, state))
+    let loaded = futures::stream::iter(bitmap_loads)
+        .map(|load| async move {
+            let bitmap = dataset
+                .load_cell_flag_bitmap_shared(flag_id, &load.representative)
+                .await?;
+            Ok::<_, Error>((load.fragment_ids, bitmap))
         })
         .buffer_unordered(io_parallelism)
-        .try_collect::<HashMap<_, _>>()
-        .await
+        .try_collect::<Vec<_>>()
+        .await?;
+    for (fragment_ids, bitmap) in loaded {
+        for fragment_id in fragment_ids {
+            states.insert(fragment_id, FlagFragment::Partial(bitmap.clone()));
+        }
+    }
+    Ok(states)
 }
 
 fn select_cell_flag_fragments(
@@ -3318,6 +3369,42 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("already registered")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_inline_fragment_bitmaps_share_one_decoded_allocation() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id % 2 = 0")?
+            .set_cell_flag("value", FLAG_NAME, true)?
+            .build()?
+            .execute()
+            .await?;
+        let dataset = result.new_dataset;
+
+        let fragments =
+            load_cell_flag_fragments(&dataset, definition.flag_id, None, &AtomicUsize::new(0))
+                .await?;
+        let bitmaps = fragments
+            .values()
+            .map(|fragment| match fragment {
+                FlagFragment::Partial(bitmap) => bitmap,
+                FlagFragment::All => panic!("periodic state must remain partial"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(bitmaps.len(), 4);
+        assert!(
+            bitmaps
+                .iter()
+                .skip(1)
+                .all(|bitmap| Arc::ptr_eq(bitmaps[0], bitmap))
         );
         Ok(())
     }
