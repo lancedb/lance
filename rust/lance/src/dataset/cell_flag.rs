@@ -1891,61 +1891,89 @@ pub struct CellFlagExprBindings {
     functions: HashMap<u32, Arc<ScalarUDF>>,
 }
 
+fn resolve_cell_flag_expression_ids_impl(
+    dataset: &Dataset,
+    expressions: &[&Expr],
+    field_prefix: Option<&str>,
+) -> Result<Vec<u32>> {
+    let mut flag_ids = HashSet::new();
+    let mut captured_error = None;
+    for expression in expressions {
+        expression
+            .apply(|node| {
+                match is_cell_flag_call(node) {
+                    Ok(Some((segments, name))) => {
+                        let segments = field_prefix
+                            .filter(|prefix| segments.first().is_some_and(|part| part == prefix))
+                            .map_or(segments.as_slice(), |_| &segments[1..]);
+                        match resolve_cell_flag(dataset, segments, &name) {
+                            Ok((flag_id, _)) => {
+                                flag_ids.insert(flag_id);
+                            }
+                            Err(error) => {
+                                captured_error = Some(error);
+                                return Ok(TreeNodeRecursion::Stop);
+                            }
+                        }
+                    }
+                    Ok(None) => match is_cell_flag_id_call(node) {
+                        Ok(Some(flag_id)) => {
+                            if dataset.cell_flag_definition_by_id(flag_id).is_none() {
+                                captured_error = Some(Error::invalid_input(format!(
+                                    "Internal cell flag transport references unknown flag ID {}",
+                                    flag_id
+                                )));
+                                return Ok(TreeNodeRecursion::Stop);
+                            }
+                            flag_ids.insert(flag_id);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            captured_error = Some(error);
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                    },
+                    Err(error) => {
+                        captured_error = Some(error);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .map_err(Error::from)?;
+        if captured_error.is_some() {
+            break;
+        }
+    }
+    if let Some(error) = captured_error {
+        return Err(error);
+    }
+    let mut flag_ids = flag_ids.into_iter().collect::<Vec<_>>();
+    flag_ids.sort_unstable();
+    Ok(flag_ids)
+}
+
+pub(super) fn resolve_cell_flag_expression_ids(
+    dataset: &Dataset,
+    expressions: &[&Expr],
+) -> Result<Vec<u32>> {
+    resolve_cell_flag_expression_ids_impl(dataset, expressions, None)
+}
+
+pub(super) fn resolve_target_cell_flag_expression_ids(
+    dataset: &Dataset,
+    expressions: &[&Expr],
+) -> Result<Vec<u32>> {
+    resolve_cell_flag_expression_ids_impl(dataset, expressions, Some("target"))
+}
+
 impl CellFlagExprBindings {
     pub(crate) async fn try_new(
         dataset: &Dataset,
         expressions: &[&Expr],
         selected_fragments: Option<&[lance_table::format::Fragment]>,
     ) -> Result<Option<Self>> {
-        let mut flag_ids = HashSet::new();
-        let mut captured_error = None;
-        for expression in expressions {
-            expression
-                .apply(|node| {
-                    match is_cell_flag_call(node) {
-                        Ok(Some((segments, name))) => {
-                            match resolve_cell_flag(dataset, &segments, &name) {
-                                Ok((flag_id, _)) => {
-                                    flag_ids.insert(flag_id);
-                                }
-                                Err(error) => {
-                                    captured_error = Some(error);
-                                    return Ok(TreeNodeRecursion::Stop);
-                                }
-                            }
-                        }
-                        Ok(None) => match is_cell_flag_id_call(node) {
-                            Ok(Some(flag_id)) => {
-                                if dataset.cell_flag_definition_by_id(flag_id).is_none() {
-                                    captured_error = Some(Error::invalid_input(format!(
-                                        "Internal cell flag transport references unknown flag ID {}",
-                                        flag_id
-                                    )));
-                                    return Ok(TreeNodeRecursion::Stop);
-                                }
-                                flag_ids.insert(flag_id);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                captured_error = Some(error);
-                                return Ok(TreeNodeRecursion::Stop);
-                            }
-                        },
-                        Err(error) => {
-                            captured_error = Some(error);
-                            return Ok(TreeNodeRecursion::Stop);
-                        }
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })
-                .map_err(Error::from)?;
-            if captured_error.is_some() {
-                break;
-            }
-        }
-        if let Some(error) = captured_error {
-            return Err(error);
-        }
+        let flag_ids = resolve_cell_flag_expression_ids(dataset, expressions)?;
         if flag_ids.is_empty() {
             return Ok(None);
         }
@@ -2253,7 +2281,7 @@ pub async fn apply_cell_flag_transaction(
     if transaction.cell_flag_rewrite_requires_affected_rows()
         && changes
             .as_ref()
-            .is_some_and(|changes| !changes.is_empty() && changes.affected_rows.is_none())
+            .is_some_and(|changes| changes.has_writes() && changes.affected_rows.is_none())
     {
         return Err(Error::invalid_input(
             "Cell Flag update with existing-row rewrites requires the complete affected-row set",
@@ -2269,6 +2297,16 @@ pub async fn apply_cell_flag_transaction(
                 .validate_cell_flag_transaction_identity(changes)?;
         } else {
             current.validate_cell_flag_transaction_identity(changes)?;
+        }
+        if let Some(flag_id) = changes
+            .read_flag_ids
+            .iter()
+            .find(|flag_id| current.cell_flag_definition_by_id(**flag_id).is_none())
+        {
+            return Err(Error::invalid_input(format!(
+                "Cell Flag transaction reads unknown flag ID {}",
+                flag_id
+            )));
         }
     }
     let changes = changes.unwrap_or_default();
@@ -2289,7 +2327,7 @@ pub async fn apply_cell_flag_transaction(
         };
         return Ok(());
     }
-    if current.manifest.cell_flag_dataset_id.is_none() && !changes.is_empty() {
+    if current.manifest.cell_flag_dataset_id.is_none() && changes.has_writes() {
         manifest.cell_flag_dataset_id = Some(changes.dataset_identity.clone());
     }
     if changes.is_empty() && current.manifest.cell_flag_definitions.is_empty() {
@@ -2976,6 +3014,8 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
     use lance_select::RowAddrTreeMap;
 
     use super::*;
@@ -2984,11 +3024,14 @@ mod tests {
         CompactionOptions, CompactionTask, IgnoreRemap, TaskData, commit_compaction, compact_files,
     };
     use crate::dataset::transaction::{CellFlagRowChange, RewriteGroup, TransactionBuilder};
-    use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    use crate::dataset::write::merge_insert::{
+        MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    };
     use crate::dataset::{
         ColumnAlteration, CommitBuilder, InsertBuilder, NewColumnTransform, UpdateBuilder,
         WriteMode, WriteParams,
     };
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::copy_test_data_to_tmp;
 
     const FLAG_NAME: &str = "lancedb.computed";
@@ -4141,7 +4184,9 @@ mod tests {
                 .await?;
             let mut dataset = result.new_dataset.as_ref().clone();
 
-            dataset.delete("id = 2").await?;
+            dataset
+                .delete(&format!("id = 2 AND cell_flag(value, '{}')", FLAG_NAME))
+                .await?;
             compact_files(&mut dataset, CompactionOptions::default(), None).await?;
             assert_eq!(
                 flagged_ids(&dataset, "value", FLAG_NAME).await?,
@@ -4400,6 +4445,18 @@ mod tests {
             assert_eq!(stats.num_inserted_rows, 1);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
 
+            let mut indexed_dataset = dataset.as_ref().clone();
+            indexed_dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await?;
+            let dataset = Arc::new(indexed_dataset);
+
             let conditional_source = RecordBatch::try_new(
                 source_schema.clone(),
                 vec![
@@ -4423,6 +4480,28 @@ mod tests {
                 )))
                 .await?;
             assert_eq!(conditional_stats.num_updated_rows, 1);
+            assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
+
+            let mut scanner = dataset.scan();
+            scanner.with_row_id();
+            let row_id_source = scanner.try_into_batch().await?;
+            let row_id_source_schema = row_id_source.schema();
+            let mut row_id_builder =
+                MergeInsertBuilder::try_new(dataset, vec![lance_core::ROW_ID.to_string()])?;
+            row_id_builder
+                .when_matched(WhenMatched::UpdateIf(format!(
+                    "cell_flag(target.value, '{}')",
+                    FLAG_NAME
+                )))
+                .when_not_matched(WhenNotMatched::DoNothing);
+            let (dataset, row_id_stats) = row_id_builder
+                .try_build()?
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(row_id_source)],
+                    row_id_source_schema,
+                )))
+                .await?;
+            assert_eq!(row_id_stats.num_updated_rows, 1);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
 
             let ordinary_source = RecordBatch::try_new(
@@ -4470,6 +4549,32 @@ mod tests {
             assert_eq!(stats.num_inserted_rows, 0);
             assert_eq!(dataset.manifest.fragments, fragments_before);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![1, 8]);
+
+            let delete_if_source = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![8])),
+                    Arc::new(Int32Array::from(vec![808])),
+                ],
+            )?;
+            let delete_if = WhenNotMatchedBySource::delete_if(
+                dataset.as_ref(),
+                &format!("cell_flag(value, '{}')", FLAG_NAME),
+            )?;
+            let mut delete_if_builder =
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?;
+            delete_if_builder
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .when_not_matched_by_source(delete_if);
+            let (dataset, delete_if_stats) = delete_if_builder
+                .try_build()?
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(delete_if_source)],
+                    source_schema.clone(),
+                )))
+                .await?;
+            assert_eq!(delete_if_stats.num_deleted_rows, 1);
+            assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
         }
         Ok(())
     }

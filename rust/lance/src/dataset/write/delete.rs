@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::cell_flag::resolve_cell_flag_expression_ids;
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction},
+    dataset::transaction::{CellFlagTransaction, Operation, Transaction},
     dataset::utils::make_rowid_capture_stream,
 };
 use datafusion::logical_expr::Expr;
@@ -210,12 +211,14 @@ impl DeleteBuilder {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            read_cell_flag_ids,
         } = data;
         let transaction = job.build_transaction(
             job.dataset.as_ref(),
             updated_fragments,
             deleted_fragment_ids,
-        );
+            read_cell_flag_ids,
+        )?;
         Ok(UncommittedDelete {
             transaction,
             affected_rows,
@@ -237,6 +240,7 @@ struct DeleteData {
     deleted_fragment_ids: Vec<u64>,
     affected_rows: Option<RowAddrTreeMap>,
     num_deleted_rows: u64,
+    read_cell_flag_ids: Vec<u32>,
 }
 
 impl DeleteJob {
@@ -245,7 +249,8 @@ impl DeleteJob {
         dataset: &Dataset,
         updated_fragments: Vec<Fragment>,
         deleted_fragment_ids: Vec<u64>,
-    ) -> Transaction {
+        read_cell_flag_ids: Vec<u32>,
+    ) -> Result<Transaction> {
         let predicate = match &self.filter {
             ExprFilter::Sql(s) => s.clone(),
             ExprFilter::Datafusion(expr) => expr.to_string(),
@@ -259,6 +264,13 @@ impl DeleteJob {
             predicate,
         };
         Transaction::new(dataset.manifest.version, operation, None)
+            .with_cell_flag_transaction_for_dataset(
+                CellFlagTransaction {
+                    read_flag_ids: read_cell_flag_ids,
+                    ..Default::default()
+                },
+                dataset,
+            )
     }
 }
 
@@ -282,9 +294,17 @@ impl RetryExecutor for DeleteJob {
             }
         }
 
+        let filter_expr = scanner.get_expr_filter()?;
+        let read_cell_flag_ids = match filter_expr.as_ref() {
+            Some(filter_expr) => {
+                resolve_cell_flag_expression_ids(self.dataset.as_ref(), &[filter_expr])?
+            }
+            None => Vec::new(),
+        };
+
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
-            if let Some(filter_expr) = scanner.get_expr_filter()? {
+            if let Some(filter_expr) = filter_expr {
                 if matches!(
                     filter_expr,
                     Expr::Literal(ScalarValue::Boolean(Some(false)), _)
@@ -349,6 +369,7 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            read_cell_flag_ids,
         })
     }
 
@@ -358,9 +379,14 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            read_cell_flag_ids,
         } = data;
-        let transaction =
-            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids);
+        let transaction = self.build_transaction(
+            dataset.as_ref(),
+            updated_fragments,
+            deleted_fragment_ids,
+            read_cell_flag_ids,
+        )?;
 
         let mut builder = CommitBuilder::new(dataset);
 

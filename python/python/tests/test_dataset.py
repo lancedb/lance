@@ -6760,7 +6760,7 @@ def test_cell_flag_alter_and_rowid_merge(tmp_path: Path):
     )
     stats = (
         dataset.merge_insert(on="_rowid")
-        .when_matched_update_all()
+        .when_matched_update_all("NOT cell_flag(target.embedding, 'computed')")
         .set_matched_cell_flag("embedding", "computed", True)
         .execute(source)
     )
@@ -6799,6 +6799,8 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
         (3, True),
     ]
 
+    dataset.create_scalar_index("id", "BTREE")
+
     stats = (
         dataset.merge_insert(on="id")
         .when_matched_update_all("cell_flag(target.value, 'computed')")
@@ -6822,6 +6824,7 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
         (2, False),
         (3, True),
     ]
+    dataset.drop_index(dataset.describe_indices()[0].name)
 
     dataset.merge(pa.table({"id": [1, 2], "ordinary": [101, 202]}), "id")
     assert [row for row, value in _flag_rows(dataset, field="value") if value] == [

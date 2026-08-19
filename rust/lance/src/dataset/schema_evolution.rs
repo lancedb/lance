@@ -6,7 +6,9 @@ use std::{
     sync::Arc,
 };
 
-use super::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
+use super::cell_flag::{
+    CellFlagExprBindings, expression_references_cell_flag, resolve_cell_flag_expression_ids,
+};
 use super::fragment::FileFragment;
 use super::{
     Dataset,
@@ -280,7 +282,7 @@ pub(super) async fn add_columns_to_fragments(
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
-) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool)> {
+) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool, Vec<u32>)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_format();
@@ -299,7 +301,8 @@ pub(super) async fn add_columns_to_fragments(
     super::versions::configure_new_column_optimizers(version, &mut optimizer);
     let transforms = optimizer.optimize(dataset, transforms)?;
 
-    let (output_schema, new_fragments, fragments_to_cleanup) = match transforms {
+    let (output_schema, new_fragments, fragments_to_cleanup, read_cell_flag_ids) = match transforms
+    {
         NewColumnTransform::BatchUDF(udf) => {
             check_names(udf.output_schema.as_ref())?;
             let result = add_columns_impl(
@@ -315,6 +318,7 @@ pub(super) async fn add_columns_to_fragments(
                 udf.output_schema,
                 result.fragments,
                 result.fragments_to_cleanup,
+                Vec::new(),
             ))
         }
         NewColumnTransform::SqlExpressions(expressions) => {
@@ -330,6 +334,10 @@ pub(super) async fn add_columns_to_fragments(
                     Ok((name, expr))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let read_cell_flag_ids = resolve_cell_flag_expression_ids(
+                dataset,
+                &exprs.iter().map(|(_, expr)| expr).collect::<Vec<_>>(),
+            )?;
 
             let mut needed_columns = exprs
                 .iter()
@@ -402,20 +410,25 @@ pub(super) async fn add_columns_to_fragments(
             let read_columns = Some(needed_columns);
             let result =
                 add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
-            Ok((output_schema, result.fragments, result.fragments_to_cleanup))
+            Ok((
+                output_schema,
+                result.fragments,
+                result.fragments_to_cleanup,
+                read_cell_flag_ids,
+            ))
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments.clone(), fragments))
+            Ok((output_schema, fragments.clone(), fragments, Vec::new()))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments.clone(), fragments))
+            Ok((output_schema, fragments.clone(), fragments, Vec::new()))
         }
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
@@ -439,7 +452,7 @@ pub(super) async fn add_columns_to_fragments(
 
             super::versions::validate_metadata_only_null_columns(version)?;
 
-            Ok((output_schema, fragments, Vec::new()))
+            Ok((output_schema, fragments, Vec::new(), Vec::new()))
         }
     }?;
 
@@ -459,6 +472,7 @@ pub(super) async fn add_columns_to_fragments(
         schema,
         fragments_to_cleanup,
         preserves_nullability,
+        read_cell_flag_ids,
     ))
 }
 
@@ -512,7 +526,7 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
-    let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
+    let (fragments, schema, _fragments_to_cleanup, preserves_nullability, read_cell_flag_ids) =
         add_columns_to_fragments(
             dataset,
             transforms,
@@ -527,7 +541,14 @@ pub(super) async fn add_columns(
         schema,
         preserves_nullability,
     };
-    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    let transaction = Transaction::new(dataset.manifest.version, operation, None)
+        .with_cell_flag_transaction_for_dataset(
+            CellFlagTransaction {
+                read_flag_ids: read_cell_flag_ids,
+                ..Default::default()
+            },
+            dataset,
+        )?;
     // Once the manifest commit has been attempted, an error does not prove
     // that the new files are unreferenced: the commit may have landed and only
     // its response (or a post-commit callback) may have failed. Leave files

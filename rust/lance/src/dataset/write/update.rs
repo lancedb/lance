@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
+use crate::dataset::cell_flag::{
+    CellFlagExprBindings, expression_references_cell_flag, resolve_cell_flag_expression_ids,
+};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::transaction::{CellFlagRowChange, CellFlagTransaction, Operation, Transaction};
@@ -283,12 +285,17 @@ impl UpdateBuilder {
                 planner.create_physical_expr(expression)?;
             }
         }
+        let mut read_expressions = self.updates.values().collect::<Vec<_>>();
+        read_expressions.extend(self.condition.iter());
+        let read_cell_flag_ids =
+            resolve_cell_flag_expression_ids(self.dataset.as_ref(), &read_expressions)?;
 
         Ok(UpdateJob {
             dataset: self.dataset,
             condition: self.condition,
             updates: Arc::new(self.updates),
             cell_flag_values: Arc::new(self.cell_flag_values),
+            read_cell_flag_ids: Arc::new(read_cell_flag_ids),
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
             retry_started_at: None,
@@ -320,6 +327,7 @@ pub struct UpdateJob {
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Expr>>,
     cell_flag_values: Arc<HashMap<u32, bool>>,
+    read_cell_flag_ids: Arc<Vec<u32>>,
     conflict_retries: u32,
     retry_timeout: Duration,
     retry_started_at: Option<Instant>,
@@ -707,6 +715,7 @@ impl UpdateJob {
                 .with_cell_flag_transaction_for_dataset(
                     CellFlagTransaction {
                         row_changes,
+                        read_flag_ids: self.read_cell_flag_ids.as_ref().clone(),
                         ..Default::default()
                     },
                     dataset.as_ref(),
@@ -765,6 +774,7 @@ impl UpdateJob {
             .with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     fragment_states,
+                    read_flag_ids: self.read_cell_flag_ids.as_ref().clone(),
                     ..Default::default()
                 },
                 dataset.as_ref(),

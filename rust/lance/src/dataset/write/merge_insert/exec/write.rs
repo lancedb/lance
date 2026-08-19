@@ -1083,7 +1083,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             let cell_flag_transaction = if !merge_state.capture_cell_flag_sources {
-                CellFlagTransaction::default()
+                CellFlagTransaction {
+                    read_flag_ids: params.read_cell_flag_ids.clone(),
+                    ..Default::default()
+                }
             } else {
                 let mut output_source_row_addrs = if merge_state.stable_row_ids {
                     let mut source_row_addrs = merge_state.updated_source_row_addrs;
@@ -1137,6 +1140,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                         &matched_flag_row_addrs,
                     ),
                     fragment_states,
+                    read_flag_ids: params.read_cell_flag_ids.clone(),
                     ..Default::default()
                 }
             };

@@ -386,12 +386,20 @@ impl<'a> TransactionRebase<'a> {
             let their_cell_flag_replacements = cell_flag_replacing_fragment_ids(theirs);
             if cell_flag_row_changes_conflict(our_cell_flags, &their_cell_flags)
                 || !our_cell_flags
+                    .read_flag_ids
+                    .is_disjoint(&their_cell_flags.written_flag_ids)
+                || !their_cell_flags
+                    .read_flag_ids
+                    .is_disjoint(&our_cell_flags.written_flag_ids)
+                || !our_cell_flags
                     .row_fragment_ids
                     .is_disjoint(&their_cell_flag_replacements)
                 || !their_cell_flags
                     .row_fragment_ids
                     .is_disjoint(&our_cell_flag_replacements)
                 || (our_cell_flags.changes_registry && their_cell_flags.changes_registry)
+                || (our_cell_flags.changes_registry && !their_cell_flags.read_flag_ids.is_empty())
+                || (their_cell_flags.changes_registry && !our_cell_flags.read_flag_ids.is_empty())
                 || (our_cell_flags.changes_registry
                     && (supplies_values(theirs)
                         || !their_cell_flag_replacements.is_empty()
@@ -748,7 +756,6 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Merge { .. } if self_is_flag_only_update => Ok(()),
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
@@ -1524,7 +1531,7 @@ impl<'a> TransactionRebase<'a> {
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
-        other_cell_flag_conflict_scope: &CellFlagConflictScope,
+        _other_cell_flag_conflict_scope: &CellFlagConflictScope,
     ) -> Result<()> {
         match &other_transaction.operation {
             // See the MemWAL exception in check_create_index_txn.
@@ -1551,14 +1558,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => Ok(()),
 
             Operation::Update { .. } => {
-                if is_flag_only_update_with_scope(
-                    &other_transaction.operation,
-                    other_cell_flag_conflict_scope,
-                ) {
-                    Ok(())
-                } else {
-                    Err(self.retryable_conflict_err(other_transaction, other_version))
-                }
+                Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
             | Operation::Delete { .. }
@@ -2798,15 +2798,17 @@ mod tests {
             TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
                 .await
                 .unwrap();
-        invalidation_rebase
-            .check_txn(&merge, dataset.manifest.version + 1)
-            .unwrap();
+        assert!(matches!(
+            invalidation_rebase.check_txn(&merge, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
         let mut merge_rebase = TransactionRebase::try_new(&dataset, merge, None)
             .await
             .unwrap();
-        merge_rebase
-            .check_txn(&invalidation, dataset.manifest.version + 1)
-            .unwrap();
+        assert!(matches!(
+            merge_rebase.check_txn(&invalidation, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
 
         let transaction_dataset_id = Uuid::new_v4().to_string();
         let flag_change = |flag_id, row_address| {
@@ -2832,6 +2834,31 @@ mod tests {
                 .check_txn(&compatible, dataset.manifest.version + 1)
                 .unwrap();
         }
+
+        let flag_read =
+            Transaction::new_from_version(dataset.manifest.version, invalidation.operation.clone())
+                .with_cell_flag_transaction(CellFlagTransaction {
+                    read_flag_ids: vec![1],
+                    dataset_identity: transaction_dataset_id.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+        let flag_write = flag_change(1, 2);
+        let mut read_rebase = TransactionRebase::try_new(&dataset, flag_read.clone(), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_rebase.check_txn(&flag_write, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
+        let mut write_rebase =
+            TransactionRebase::try_new(&dataset, flag_write, Some(&affected_rows))
+                .await
+                .unwrap();
+        assert!(matches!(
+            write_rebase.check_txn(&flag_read, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
 
         let mut overlapping_rebase =
             TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))

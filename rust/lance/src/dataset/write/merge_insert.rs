@@ -47,6 +47,7 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
+use crate::dataset::cell_flag::resolve_target_cell_flag_expression_ids;
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -607,6 +608,8 @@ struct MergeInsertParams {
     matched_cell_flag_values: BTreeMap<u32, bool>,
     // Explicit values for flags on newly inserted rows.
     inserted_cell_flag_values: BTreeMap<u32, bool>,
+    // Stable flag IDs read by the matched condition to decide persisted output.
+    read_cell_flag_ids: Vec<u32>,
 }
 
 impl MergeInsertParams {
@@ -748,6 +751,7 @@ impl MergeInsertBuilder {
                 target_all_bases: None,
                 matched_cell_flag_values: BTreeMap::new(),
                 inserted_cell_flag_values: BTreeMap::new(),
+                read_cell_flag_ids: Vec::new(),
             },
         })
     }
@@ -1058,6 +1062,23 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        let matched_condition = match &self.params.when_matched {
+            WhenMatched::UpdateIf(condition) => {
+                let dataset_schema: Schema = self.dataset.schema().into();
+                let planner = Planner::new(Arc::new(combined_schema(&dataset_schema)));
+                Some(planner.parse_filter(condition)?)
+            }
+            WhenMatched::UpdateIfExpr(condition) => Some(condition.clone()),
+            _ => None,
+        };
+        let mut read_conditions = matched_condition.iter().collect::<Vec<_>>();
+        if let WhenNotMatchedBySource::DeleteIf(condition) =
+            &self.params.delete_not_matched_by_source
+        {
+            read_conditions.push(condition);
+        }
+        self.params.read_cell_flag_ids =
+            resolve_target_cell_flag_expression_ids(self.dataset.as_ref(), &read_conditions)?;
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
@@ -2514,11 +2535,11 @@ impl MergeInsertJob {
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
-        if self.params.on.iter().any(|column| column == ROW_ID) {
-            return Ok(false);
-        }
         // Convert to lance schema for comparison
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
+        let data_source_schema = source_schema
+            .without_column(ROW_ID)
+            .without_column(ROW_ADDR);
+        let lance_schema = lance_core::datatypes::Schema::try_from(&data_source_schema)?;
         let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
@@ -2573,7 +2594,8 @@ impl MergeInsertJob {
             && self.params.insert_not_matched
             && matches!(self.params.when_matched, WhenMatched::Delete);
 
-        let would_use_scalar_index = if self.params.use_index
+        let would_use_scalar_index = if self.params.read_cell_flag_ids.is_empty()
+            && self.params.use_index
             && !is_partial_delete_with_insert
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -2785,6 +2807,7 @@ impl MergeInsertJob {
                     &matched_flag_row_addrs,
                 ),
                 fragment_states,
+                read_flag_ids: self.params.read_cell_flag_ids.clone(),
                 ..Default::default()
             };
 
@@ -2942,6 +2965,7 @@ impl MergeInsertJob {
             let cell_flag_changes = CellFlagTransaction {
                 row_changes,
                 fragment_states,
+                read_flag_ids: self.params.read_cell_flag_ids.clone(),
                 ..Default::default()
             };
 

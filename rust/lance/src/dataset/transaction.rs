@@ -342,19 +342,24 @@ pub(crate) struct CellFlagTransaction {
     pub row_changes: Vec<CellFlagRowChange>,
     pub fragment_states: Vec<CellFlagFragmentState>,
     pub transfers: Vec<CellFlagFieldTransfer>,
+    pub read_flag_ids: Vec<u32>,
     pub dataset_identity: String,
     pub affected_rows: Option<RowAddrTreeMap>,
     pub operation_digest: Option<[u8; 32]>,
 }
 
 impl CellFlagTransaction {
+    pub(crate) fn has_writes(&self) -> bool {
+        !self.registrations.is_empty()
+            || !self.renames.is_empty()
+            || !self.drops.is_empty()
+            || !self.row_changes.is_empty()
+            || !self.fragment_states.is_empty()
+            || !self.transfers.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.registrations.is_empty()
-            && self.renames.is_empty()
-            && self.drops.is_empty()
-            && self.row_changes.is_empty()
-            && self.fragment_states.is_empty()
-            && self.transfers.is_empty()
+        !self.has_writes() && self.read_flag_ids.is_empty()
     }
 
     pub(crate) fn row_change_rows(&self) -> RowAddrTreeMap {
@@ -374,6 +379,8 @@ pub(crate) struct CellFlagCommitScope {
 pub(crate) struct CellFlagConflictScope {
     pub row_fragment_ids: HashSet<u64>,
     pub row_addresses_by_flag: HashMap<u32, roaring::RoaringTreemap>,
+    pub read_flag_ids: HashSet<u32>,
+    pub written_flag_ids: HashSet<u32>,
     pub changes_registry: bool,
 }
 
@@ -381,6 +388,8 @@ impl CellFlagConflictScope {
     pub fn is_empty(&self) -> bool {
         self.row_fragment_ids.is_empty()
             && self.row_addresses_by_flag.is_empty()
+            && self.read_flag_ids.is_empty()
+            && self.written_flag_ids.is_empty()
             && !self.changes_registry
     }
 }
@@ -959,6 +968,7 @@ impl TryFrom<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
                     target_field_id: transfer.target_field_id,
                 })
                 .collect(),
+            read_flag_ids: value.read_flag_ids.clone(),
             dataset_identity: value.dataset_identity.clone(),
             affected_rows: value
                 .affected_rows
@@ -1098,6 +1108,12 @@ impl TryFrom<pb::transaction::CellFlagTransaction> for CellFlagTransaction {
                 target_field_id: transfer.target_field_id,
             })
             .collect();
+        let read_flag_ids = value.read_flag_ids;
+        if read_flag_ids.iter().collect::<HashSet<_>>().len() != read_flag_ids.len() {
+            return Err(Error::invalid_input(
+                "Cell Flag transaction contains duplicate read dependencies",
+            ));
+        }
         let affected_rows = if value.affected_rows.is_empty() {
             None
         } else {
@@ -1133,6 +1149,7 @@ impl TryFrom<pb::transaction::CellFlagTransaction> for CellFlagTransaction {
             row_changes,
             fragment_states,
             transfers,
+            read_flag_ids,
             dataset_identity: value.dataset_identity,
             affected_rows,
             operation_digest,
@@ -2903,7 +2920,7 @@ impl Transaction {
         if !changes.row_changes.is_empty()
             && !matches!(
                 self.operation,
-                Operation::Update { .. } | Operation::Merge { .. }
+                Operation::Update { .. } | Operation::Merge { .. } | Operation::Delete { .. }
             )
         {
             return Err(Error::invalid_input(
@@ -2930,6 +2947,16 @@ impl Transaction {
         if !changes.transfers.is_empty() && !matches!(self.operation, Operation::Merge { .. }) {
             return Err(Error::invalid_input(
                 "Cell Flag field transfers are only valid for merge transactions",
+            ));
+        }
+        if !changes.read_flag_ids.is_empty()
+            && !matches!(
+                self.operation,
+                Operation::Update { .. } | Operation::Delete { .. } | Operation::Merge { .. }
+            )
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag read dependencies are only valid for update, delete, and merge transactions",
             ));
         }
         if matches!(
@@ -3045,7 +3072,7 @@ impl Transaction {
                 && fields_modified.is_empty()
                 && !changes.row_changes.is_empty()
         );
-        let has_changes = !changes.is_empty();
+        let has_changes = changes.has_writes();
         Ok(CellFlagCommitScope {
             affected_rows: if is_flag_only {
                 Some(changes.row_change_rows())
@@ -3069,9 +3096,17 @@ impl Transaction {
             .flat_map(|addresses| addresses.iter())
             .map(|address| RowAddress::from(address).fragment_id() as u64)
             .collect();
+        let written_flag_ids = changes
+            .row_changes
+            .iter()
+            .map(|change| change.flag_id)
+            .chain(changes.fragment_states.iter().map(|state| state.flag_id))
+            .collect();
         Ok(CellFlagConflictScope {
             row_fragment_ids,
             row_addresses_by_flag,
+            read_flag_ids: changes.read_flag_ids.into_iter().collect(),
+            written_flag_ids,
             changes_registry: !changes.registrations.is_empty()
                 || !changes.renames.is_empty()
                 || !changes.drops.is_empty()
@@ -7760,6 +7795,7 @@ mod tests {
                 flag_id: 11,
                 state: CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([1, 3])),
             }],
+            read_flag_ids: vec![7, 11],
             dataset_identity: Uuid::new_v4().to_string(),
             affected_rows: Some(RowAddrTreeMap::from(row_addresses)),
             operation_digest: None,

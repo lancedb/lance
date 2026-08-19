@@ -2182,7 +2182,7 @@ impl FileFragment {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<(Fragment, Schema)> {
-        let (fragments, schema, _, _) = schema_evolution::add_columns_to_fragments(
+        let (fragments, schema, _, _, _) = schema_evolution::add_columns_to_fragments(
             self.dataset.as_ref(),
             transforms,
             read_columns,
