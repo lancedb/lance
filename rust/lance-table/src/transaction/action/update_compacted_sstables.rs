@@ -3,8 +3,8 @@
 
 //! Record which MemWAL SSTables have been compacted into the base table.
 
+use super::Footprint;
 use super::apply::ApplyState;
-use super::{Coordinate, Footprint};
 use crate::format::pb;
 use crate::system_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_core::deepsize::DeepSizeOf;
@@ -44,7 +44,7 @@ impl UpdateCompactedSsTables {
     /// both rewrite the whole index entry, so the later one would drop what the
     /// earlier one recorded.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::IndexName(MEM_WAL_INDEX_NAME.to_string()));
+        footprint.rewrite_index(MEM_WAL_INDEX_NAME.to_string());
     }
 }
 
@@ -219,5 +219,37 @@ mod tests {
         let theirs = footprint(vec![update(vec![(2, 5)])]);
 
         assert!(ours.conflicts_with(&theirs));
+    }
+
+    #[test]
+    fn test_recording_progress_conflicts_with_rebuilding_the_memwal_index() {
+        use crate::transaction::action::{AddIndexSegment, Ref};
+
+        // Recording progress rewrites the whole MemWAL entry, so it collides
+        // with a concurrent writer replacing that entry -- unlike a regular
+        // index, where two writers may hold disjoint segments.
+        let footprint = |actions| {
+            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+                "step", actions,
+            )]))
+        };
+
+        let progress = footprint(vec![update(vec![(1, 3)])]);
+        let rebuild = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
+            uuid: Uuid::from_u128(20),
+            name: MEM_WAL_INDEX_NAME.into(),
+            fields: vec![Ref::Committed(0)],
+            index_details: None,
+            index_version: 1,
+            covered_fragments: None,
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: true,
+        })]);
+
+        assert!(progress.conflicts_with(&rebuild));
+        assert!(rebuild.conflicts_with(&progress));
     }
 }

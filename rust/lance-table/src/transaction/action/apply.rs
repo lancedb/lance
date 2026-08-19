@@ -246,15 +246,31 @@ impl<'a> ApplyState<'a> {
     /// Drop an index segment by uuid. A removal that names a segment the
     /// dataset does not have is a mistake rather than a no-op: it means the
     /// operation was planned against a different set of segments.
-    pub(super) fn remove_index_segment(&mut self, uuid: Uuid) -> Result<()> {
-        let before = self.indices.len();
-        self.indices.retain(|index| index.uuid != uuid);
-        if self.indices.len() == before {
+    pub(super) fn remove_index_segment(&mut self, uuid: Uuid, name: &str) -> Result<()> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
             return Err(Error::invalid_input(format!(
                 "index segment {uuid} is not part of the dataset, so it cannot be removed"
             )));
-        }
+        };
+        self.indices.remove(position);
         Ok(())
+    }
+
+    /// Where the segment `uuid` lives, checking on the way that it really
+    /// belongs to `name`. A mismatch means the operation was planned against a
+    /// different set of segments, the same way a missing segment does.
+    fn index_segment_position(&self, uuid: Uuid, name: &str) -> Result<Option<usize>> {
+        let Some(position) = self.indices.iter().position(|index| index.uuid == uuid) else {
+            return Ok(None);
+        };
+        let found = &self.indices[position].name;
+        if found != name {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} belongs to index '{found}', but the action names it as part \
+                 of index '{name}'"
+            )));
+        }
+        Ok(Some(position))
     }
 
     /// Record MemWAL SSTable compaction progress, creating the MemWAL index
@@ -267,15 +283,17 @@ impl<'a> ApplyState<'a> {
         update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
     }
 
-    pub(super) fn index_segment_mut(&mut self, uuid: Uuid) -> Result<&mut IndexMetadata> {
-        self.indices
-            .iter_mut()
-            .find(|index| index.uuid == uuid)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
-                ))
-            })
+    pub(super) fn index_segment_mut(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+    ) -> Result<&mut IndexMetadata> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
+            )));
+        };
+        Ok(&mut self.indices[position])
     }
 
     /// Whether the dataset carries stable row ids, and with them the per-row

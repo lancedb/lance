@@ -469,6 +469,12 @@ message RemoveIndexSegment {
   // Data-change marker; see AddFragment.data_change. false marks removal of a
   // segment superseded by compaction, not a change to the indexed data.
   optional bool data_change = 2;
+  /*
+   * The logical index the segment belongs to. Carried so apply can check the
+   * removal was planned against the segment it actually names; a mismatch means
+   * the operation was built against a different set of segments.
+   */
+  string name = 3;
 }
 
 /*
@@ -485,6 +491,13 @@ message AdjustIndexCoverage {
   repeated Ref add_fragments = 2;
   // Committed fragment ids to drop from the segment's coverage.
   repeated uint64 remove_fragments = 3;
+  /*
+   * The logical index the segment belongs to. Conflict detection compares
+   * coverage across the segments of one index, so it needs the index this
+   * adjustment widens, not just the segment. Apply also checks the named
+   * segment really carries this name.
+   */
+  string name = 4;
 }
 
 /*
