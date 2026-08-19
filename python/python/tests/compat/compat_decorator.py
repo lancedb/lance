@@ -233,8 +233,14 @@ def compat_test(min_version: str = "0.16.0"):
             # Write data
             pass
     """
-    version = set([min_version, *VERSIONS])
-    versions = [v for v in version if Version(v) >= Version(min_version)]
+    # Sorted rather than taken straight off the set: set iteration order for
+    # strings depends on PYTHONHASHSEED, which differs per process, so every
+    # pytest-xdist worker would otherwise collect these parameters in its own
+    # order and xdist rejects the run as an inconsistent collection.
+    versions = sorted(
+        (v for v in {min_version, *VERSIONS} if Version(v) >= Version(min_version)),
+        key=Version,
+    )
 
     def decorator(cls):
         # Extract existing parametrize marks from the class
