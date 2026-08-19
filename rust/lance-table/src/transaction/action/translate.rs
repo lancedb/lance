@@ -269,7 +269,8 @@ mod tests {
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::system_index::mem_wal::{
-        CompactedSsTable, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
     };
     use crate::transaction::DataOverlayGroup;
     use crate::transaction::Transaction;
@@ -750,12 +751,15 @@ mod tests {
             compacted_sstables: vec![CompactedSsTable::new(Uuid::from_u128(1), 4)],
         };
 
-        let (legacy, legacy_indices) = build(&manifest, operation.clone(), Vec::new());
+        // Recording progress requires the table to already carry the index.
+        let existing =
+            vec![new_mem_wal_index_meta(manifest.version, MemWalIndexDetails::default()).unwrap()];
+        let (legacy, legacy_indices) = build(&manifest, operation.clone(), existing.clone());
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
         let (translated, translated_indices) = build(
             &manifest,
             Operation::CompositeOperation(CompositeOperation::new(actions)),
-            Vec::new(),
+            existing,
         );
 
         let progress = |indices: &[IndexMetadata]| {
@@ -768,9 +772,7 @@ mod tests {
                 .compacted_sstables
         };
         assert_eq!(progress(&translated_indices), progress(&legacy_indices));
-
-        assert!(legacy.fragments.is_empty());
-        assert_eq!(translated.fragments.len(), 1);
+        assert_eq!(translated.fragments, legacy.fragments);
     }
 
     #[test]
