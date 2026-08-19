@@ -5157,7 +5157,8 @@ impl Scanner {
     ///
     /// The check is field-aware (an overlay touching only unindexed fields excludes nothing) and
     /// version-gated (an overlay with `committed_version <= index.dataset_version` is already
-    /// incorporated by the index), via [`overlay_exclusion_offsets`].
+    /// incorporated by the index), via
+    /// [`lance_table::format::overlay::staleness::overlay_exclusion_offsets`].
     async fn overlay_stale_index_rows(
         &self,
         index_expr: &ScalarIndexExpr,

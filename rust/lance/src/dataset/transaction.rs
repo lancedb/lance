@@ -12,7 +12,6 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
-use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -20,9 +19,8 @@ use crate::index::index_results_are_row_addrs;
 use crate::index::mem_wal::{
     load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
-use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
-    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::deepsize::DeepSizeOf;
@@ -40,8 +38,8 @@ use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        overlay::DataOverlayFile, pb,
+        ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -1860,7 +1858,7 @@ impl Transaction {
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
         tx_path: &str,
         current_manifest: &Manifest,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
@@ -1872,7 +1870,7 @@ impl Transaction {
         // half-set manifest here: the flag reset would quietly drop the lone bit
         // and republish an undefined state as legacy.
         validate_mem_wal_index_catchup_flags(&manifest)?;
-        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+        manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         manifest.max_fragment_id = manifest
@@ -2203,7 +2201,7 @@ impl Transaction {
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         self.build_manifest_with_read_version(
             current_manifest,
@@ -2225,17 +2223,31 @@ impl Transaction {
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
+            && config.migration_next_row_id.is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::not_supported_source(
-                "Cannot enable stable row ids on existing dataset".into(),
+                "This dataset was not created with the stable row ids feature.  Please run `migrate_to_stable_row_ids` before attempting to use stable row ids".into(),
             ));
+        }
+
+        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
+            let names: Vec<&str> = current_indices
+                .iter()
+                .map(|idx| idx.name.as_str())
+                .collect();
+            return Err(Error::invalid_input(format!(
+                "Cannot migrate to stable row IDs while indexes exist on the dataset. \
+                 Drop the following indexes first, then re-run the migration, and \
+                 recreate them afterwards: {}",
+                names.join(", ")
+            )));
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -2316,7 +2328,8 @@ impl Transaction {
         .then(|| Self::logical_index_segments(&final_indices));
 
         let mut next_row_id = {
-            // Only use row ids if the feature flag is set already or
+            // Only use row ids if the feature flag is set already, or this is
+            // a migration activation that explicitly provides the next_row_id.
             match (current_manifest, config.use_stable_row_ids) {
                 (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
@@ -2324,9 +2337,14 @@ impl Transaction {
                 (None, true) => Some(0),
                 (_, false) => None,
                 (Some(_), true) => {
-                    return Err(Error::not_supported_source(
-                        "Cannot enable stable row ids on existing dataset".into(),
-                    ));
+                    // Migration activation: use the provided next_row_id.
+                    if let Some(migration_nri) = config.migration_next_row_id {
+                        Some(migration_nri)
+                    } else {
+                        return Err(Error::not_supported_source(
+                            "This dataset was not created with the stable row ids feature.  Please run `migrate_to_stable_row_ids` before attempting to use stable row ids".into(),
+                        ));
+                    }
                 }
             }
         };
@@ -3158,7 +3176,7 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
-        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+        manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
 
@@ -4696,6 +4714,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments, schema, ..
         } => {
             merge_fragments_valid(manifest, fragments)?;
+            merge_schema_valid(manifest, schema, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
@@ -4898,16 +4917,177 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     Ok(())
 }
 
+/// Validate that a Merge schema preserves the dataset's field id bindings.
+///
+/// Readers resolve columns by field id (name -> schema id -> DataFile::fields
+/// position), so renumbered ids silently rebind live columns to other columns'
+/// bytes. Shared ids must keep their field path. Their logical type,
+/// nullability, storage encoding, and dictionary may change only when every
+/// existing base or overlay file carrying the id is replaced and every
+/// proposed fragment materializes the id in a base data file. New ids must
+/// exceed the manifest's max so a dropped field's id is never reused. An
+/// existing path may move to a fresh id only when every proposed fragment
+/// materializes that id in a base data file (the `alter_columns` cast path).
+/// Omitting a field (dropping it) and updating field metadata remain legal.
+fn merge_schema_valid(
+    manifest: &Manifest,
+    new_schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    let prior_schema = &manifest.schema;
+    let new_fragment_map: HashMap<u64, &Fragment> = fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+
+    // Remap and semantic errors first: a renumbered schema usually violates
+    // both the shared-id and new-id clauses.
+    for field in new_schema.fields_pre_order() {
+        let Some(prior_field) = prior_schema.field_by_id(field.id) else {
+            continue;
+        };
+        let prior_path = prior_schema.field_path(field.id)?;
+        let new_path = new_schema.field_path(field.id)?;
+        if prior_path != new_path {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps field id {} from \"{}\" to \"{}\". \
+                 Merge must preserve the dataset's field ids: derive the new schema \
+                 from the dataset's current schema instead of renumbering fields.",
+                field.id, prior_path, new_path
+            )));
+        }
+        if let Some(changes) = shared_field_binding_changes(prior_field, field)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Merge operation changes field id {} (\"{}\") without rewriting it in \
+                 every existing fragment: {}. Merge must preserve each existing field's \
+                 logical type, nullability, storage encoding, and dictionary unless all \
+                 existing base and overlay files carrying that field are replaced.",
+                field.id, new_path, changes
+            )));
+        }
+    }
+
+    let max_field_id = manifest.max_field_id();
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_none() && field.id <= max_field_id {
+            let next_id_msg = match max_field_id.checked_add(1) {
+                Some(next_id) => format!("New fields must use ids of at least {}.", next_id),
+                None => {
+                    "No further field id can be allocated because ids are exhausted.".to_string()
+                }
+            };
+            return Err(Error::invalid_input(format!(
+                "Merge operation assigns id {} to new field \"{}\", but ids up to {} are \
+                 already used by current or dropped fields. {}",
+                field.id,
+                new_schema.field_path(field.id)?,
+                max_field_id,
+                next_id_msg
+            )));
+        }
+    }
+
+    let mut prior_paths = HashMap::with_capacity(prior_schema.fields_pre_order().count());
+    for field in prior_schema.fields_pre_order() {
+        prior_paths.insert(prior_schema.field_path(field.id)?, field);
+    }
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_some() {
+            continue;
+        }
+        let new_path = new_schema.field_path(field.id)?;
+        let Some(prior_field) = prior_paths.get(&new_path) else {
+            continue;
+        };
+        let materialized = fragments.iter().all(|fragment| {
+            fragment
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&field.id))
+        });
+        if !materialized {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps existing field \"{}\" from id {} to id {} without \
+                 rewriting its data. Every proposed fragment must materialize the new field \
+                 id in a base data file.",
+                new_path, prior_field.id, field.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_field_binding_fully_rewritten(
+    manifest: &Manifest,
+    new_fragment_map: &HashMap<u64, &Fragment>,
+    field_id: i32,
+) -> bool {
+    manifest.fragments.iter().all(|prior_fragment| {
+        let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
+            return false;
+        };
+
+        let is_materialized = new_fragment
+            .files
+            .iter()
+            .any(|file| file.fields.contains(&field_id));
+        if !is_materialized {
+            return false;
+        }
+
+        prior_fragment
+            .referenced_lance_files()
+            .filter(|file| file.fields.contains(&field_id))
+            .all(|prior_file| {
+                !new_fragment.referenced_lance_files().any(|new_file| {
+                    new_file.fields.contains(&field_id)
+                        && new_file.base_id == prior_file.base_id
+                        && new_file.path == prior_file.path
+                })
+            })
+    })
+}
+
+fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
+    let mut changes = Vec::with_capacity(4);
+    if prior.logical_type != new.logical_type {
+        changes.push(format!(
+            "logical type {} -> {}",
+            prior.logical_type, new.logical_type
+        ));
+    }
+    if prior.nullable != new.nullable {
+        changes.push(format!("nullable {} -> {}", prior.nullable, new.nullable));
+    }
+    if prior.encoding != new.encoding {
+        changes.push(format!(
+            "storage encoding {:?} -> {:?}",
+            prior.encoding, new.encoding
+        ));
+    }
+    if prior.dictionary != new.dictionary {
+        changes.push("dictionary".to_string());
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(changes.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use chrono::Utc;
     use futures::TryStreamExt;
-    use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
@@ -4924,7 +5104,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::Dataset;
+    use crate::dataset::ManifestWriteConfig;
     use crate::dataset::write::WriteParams;
+    use crate::dataset::{ColumnAlteration, NewColumnTransform};
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
@@ -5085,6 +5267,435 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+    /// dropped id stays referenced by the data files and max_field_id stays 3.
+    async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        dataset.drop_columns(&[dropped]).await.unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+        let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+        expected_ids.push(3);
+        assert_eq!(dataset.schema().field_ids(), expected_ids);
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+        dataset
+    }
+
+    /// Expected values of every column surviving `dropped`, plus d.
+    fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+        [
+            ("a", [1, 2]),
+            ("b", [10, 20]),
+            ("c", [100, 200]),
+            ("d", [5, 5]),
+        ]
+        .into_iter()
+        .filter(|(name, _)| *name != dropped)
+        .collect()
+    }
+
+    fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+        for (name, expected) in cols {
+            let col = &batch[*name];
+            assert_eq!(
+                col.as_primitive::<Int32Type>().values(),
+                expected,
+                "column {}",
+                name
+            );
+        }
+    }
+
+    async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        Dataset::commit(
+            Arc::new(dataset.clone()),
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            dataset.session(),
+            false,
+        )
+        .await
+    }
+
+    fn one_field_schema() -> LanceSchema {
+        LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap()
+    }
+
+    fn fragment_with_file_fields(id: u64, path: &str, fields: Vec<i32>) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields(path, fields, None));
+        fragment
+    }
+
+    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_file_fields(0, "f.lance", fields)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    // Which clause rejects the lossy round-trip depends on the hole's
+    // position: a hole before the last field remaps a shared id, while a
+    // hole at the end reuses the dropped id for the new field.
+    #[rstest::rstest]
+    #[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+    #[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+    #[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_field_ids(
+        #[case] dropped: &str,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(message.contains(expected), "unexpected error: {}", message);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_dropped_field_id_reuse() {
+        // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+        // accident covered above.
+        let dataset = dataset_with_dropped_column("memory://", "b").await;
+
+        let mut schema = dataset.schema().clone();
+        let mut field =
+            LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+        field.id = 1;
+        schema.fields.push(field);
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"e\"")
+                && message.contains("must use ids of at least 4"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_nested_field_ids() {
+        // A hole inside a struct shifts a nested leaf's id onto a field
+        // outside the struct on renumbering; the full-path comparison must
+        // catch the cross-parent remap.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+            ArrowField::new("z", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        Arc::new(Int32Array::from(vec![10, 20])),
+                    ],
+                    None,
+                )),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset.drop_columns(&["s.x"]).await.unwrap();
+        assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let survivors = surviving_columns(dropped);
+        let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+        let mut schema = dataset.schema().clone();
+        schema
+            .mut_field_by_id(first_id)
+            .unwrap()
+            .metadata
+            .insert("wm".into(), "42".into());
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert_eq!(
+            dataset
+                .schema()
+                .field(survivors[0].0)
+                .unwrap()
+                .metadata
+                .get("wm"),
+            Some(&"42".to_string())
+        );
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
+    #[tokio::test]
+    async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+        let mut survivors = surviving_columns(dropped);
+        let omitted = survivors.remove(0);
+        let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+        let schema = dataset.schema().project(&names).unwrap();
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert!(dataset.schema().field(omitted.0).is_none());
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_schema_only_path_remap() {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        let fresh_id = dataset.manifest.max_field_id() + 1;
+
+        let mut schema = dataset.schema().clone();
+        schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "remaps existing field \"a\" from id {} to id {}",
+                prior_id, fresh_id
+            )) && message.contains("base data file"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true, "logical type")]
+    #[case::nullability(DataType::Int32, false, "nullable")]
+    #[tokio::test]
+    async fn test_merge_rejects_shared_id_type_or_nullability_change(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let field_id = dataset.schema().field("a").unwrap().id;
+
+        let mut schema = dataset.schema().clone();
+        let field = schema.mut_field_by_id(field_id).unwrap();
+        field.logical_type = LogicalType::try_from(&data_type).unwrap();
+        field.nullable = nullable;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("changes field id {} (\"a\")", field_id))
+                && message.contains(expected),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true)]
+    #[case::nullability(DataType::Int32, false)]
+    #[test]
+    fn test_merge_shared_id_change_requires_full_rewrite(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+    ) {
+        let schema = one_field_schema();
+        let prior_fragments = vec![
+            fragment_with_file_fields(0, "old-0.lance", vec![0]),
+            fragment_with_file_fields(1, "old-1.lance", vec![0]),
+        ];
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].logical_type = LogicalType::try_from(&data_type).unwrap();
+        new_schema.fields[0].nullable = nullable;
+
+        let rewritten_fragments = vec![
+            fragment_with_file_fields(0, "new-0.lance", vec![0]),
+            fragment_with_file_fields(1, "new-1.lance", vec![0]),
+        ];
+        merge_schema_valid(&manifest, &new_schema, &rewritten_fragments).unwrap();
+
+        let partially_rewritten = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        let err = merge_schema_valid(&manifest, &new_schema, &partially_rewritten).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_merge_shared_id_change_rejects_retained_overlay() {
+        let schema = one_field_schema();
+        let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);
+        prior_fragment.overlays.push(DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("old-overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![prior_fragment.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].nullable = false;
+
+        let mut rewritten = fragment_with_file_fields(0, "new.lance", vec![0]);
+        rewritten.overlays = prior_fragment.overlays.clone();
+        let err = merge_schema_valid(&manifest, &new_schema, &[rewritten]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_rewritten_fresh_field_id() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
+        let mut rewritten_schema = schema.clone();
+        rewritten_schema.fields[0].id = 1;
+        let mut rewritten = manifest.fragments[0].clone();
+        rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
+        merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
+
+        let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+            .await
+            .unwrap();
+        let new_id = dataset.schema().field("a").unwrap().id;
+        assert_ne!(new_id, prior_id);
+        assert!(
+            dataset.get_fragments().iter().all(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .any(|file| file.fields.contains(&new_id))
+            }),
+            "alter_columns must materialize the fresh id in every fragment base file"
+        );
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_merge_rejects_max_field_id_overflow() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0, i32::MAX]);
+        assert_eq!(manifest.max_field_id(), i32::MAX);
+
+        let mut new_schema = schema;
+        let mut extra =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        extra.id = 1;
+        new_schema.fields.push(extra);
+
+        let err = merge_schema_valid(&manifest, &new_schema, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
     #[test]
     fn test_create_index_build_manifest_keeps_unremoved_same_name_indices() {
         let manifest = sample_manifest();
@@ -5106,7 +5717,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5141,7 +5752,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5193,7 +5804,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5229,7 +5840,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6055,7 +6666,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6117,7 +6728,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6179,7 +6790,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6241,7 +6852,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .expect("bitmap at exact physical_rows boundary should succeed");
     }
@@ -6802,7 +7413,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6888,7 +7499,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6964,7 +7575,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7044,7 +7655,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7113,7 +7724,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7183,7 +7794,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7242,7 +7853,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7301,7 +7912,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7346,7 +7957,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7386,7 +7997,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7431,7 +8042,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7509,7 +8120,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7561,7 +8172,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7625,7 +8236,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7700,7 +8311,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7892,7 +8503,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7969,7 +8580,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8032,7 +8643,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .map(|(manifest, _)| manifest.fragments[0].clone())
     }
@@ -8227,7 +8838,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8255,7 +8866,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -8936,7 +9547,7 @@ mod tests {
                         Some(&current),
                         vec![mem_wal_index(MemWalIndexDetails::default())],
                         "txn",
-                        &ManifestWriteConfig::default(),
+                        &ManifestWriteConfig::default().to_build_config(),
                     )
                     .unwrap_err();
 
@@ -8957,7 +9568,7 @@ mod tests {
                     Some(&current),
                     vec![mem_wal_index(MemWalIndexDetails::default())],
                     "txn",
-                    &ManifestWriteConfig::default(),
+                    &ManifestWriteConfig::default().to_build_config(),
                 )
                 .unwrap();
 

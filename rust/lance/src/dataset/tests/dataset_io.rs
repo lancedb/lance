@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -530,6 +533,28 @@ fn registry_attempts(dataset: &Dataset) -> u64 {
     stats.hits + stats.misses
 }
 
+#[derive(Debug, Default)]
+struct CountingObjectStoreWrapper {
+    wraps: AtomicUsize,
+}
+
+impl WrappingObjectStore for CountingObjectStoreWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        self.wraps.fetch_add(1, Ordering::Relaxed);
+        original
+    }
+}
+
+impl CountingObjectStoreWrapper {
+    fn wraps(&self) -> usize {
+        self.wraps.load(Ordering::Relaxed)
+    }
+}
+
 fn first_base_id(dataset: &Dataset) -> u32 {
     dataset.get_fragments()[0].metadata().files[0]
         .base_id
@@ -655,6 +680,49 @@ async fn test_shallow_clone_reuses_base_object_store() {
         registry_attempts(&fresh) - attempts_before,
         1,
         "concurrent resolutions must resolve the store exactly once"
+    );
+
+    // A caller can derive wrapper-scoped datasets by applying the same shared
+    // wrapper to a cached dataset. Each derived dataset must retain one base
+    // store for its own lifetime without sharing it with another scope.
+    let shared_wrapper = Arc::new(CountingObjectStoreWrapper::default());
+    let scope_a =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let scope_b =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let wraps_before = shared_wrapper.wraps();
+    let attempts_before = registry_attempts(&fresh);
+
+    let scope_a_first = scope_a.object_store(Some(base_id)).await.unwrap();
+    let scope_a_second = scope_a.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_a_first, &scope_a_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+
+    let scope_b_first = scope_b.object_store(Some(base_id)).await.unwrap();
+    let scope_b_second = scope_b.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_b_first, &scope_b_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first, &scope_b_first),
+        "separate wrapper scopes must not share a stateful base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first.inner, &scope_b_first.inner),
+        "separate wrapper scopes must not share provider-local layers"
+    );
+    assert_eq!(
+        registry_attempts(&fresh) - attempts_before,
+        0,
+        "wrapper-scoped base stores must bypass the global registry cache"
+    );
+    assert_eq!(
+        shared_wrapper.wraps() - wraps_before,
+        2,
+        "each wrapper scope must build its base store exactly once"
     );
 
     let read = cloned.scan().try_into_batch().await.unwrap();
@@ -1249,6 +1317,7 @@ async fn test_write_manifest(
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            migration_next_row_id: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

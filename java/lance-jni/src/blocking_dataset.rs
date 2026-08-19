@@ -3332,6 +3332,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let excluded_fragment_ids = env
+        .call_method(
+            &java_options,
+            "getExcludedFragmentIds",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3348,6 +3356,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         config,
     )
 }

@@ -205,6 +205,57 @@ impl ObjectStoreRegistry {
         Error::invalid_input(message)
     }
 
+    async fn build_store(
+        &self,
+        provider: Arc<dyn ObjectStoreProvider>,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        store_prefix: &str,
+    ) -> Result<Arc<ObjectStore>> {
+        let mut store = provider.new_store(base_path, params).await?;
+
+        store.inner = store.inner.traced();
+
+        // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
+        // `az$container@account`) so multiple stores on one cloud differ.
+        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, store_prefix);
+
+        if let Some(wrapper) = &params.object_store_wrapper {
+            store.inner = wrapper.wrap(store_prefix, store.inner);
+        }
+
+        // Always wrap with IO tracking
+        store.inner = store.io_tracker.wrap("", store.inner);
+
+        Ok(Arc::new(store))
+    }
+
+    /// Build a fresh object store without consulting or populating the cache.
+    ///
+    /// Callers should retain the returned [`Arc`] for as long as they want to
+    /// reuse provider-local state such as HTTP clients and rate limiters.
+    #[doc(hidden)]
+    pub async fn new_store(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<Arc<ObjectStore>> {
+        // Base-scoped storage options (`base_<id>.<key>`) are directives for
+        // other registered base paths; resolve them away before building a
+        // store for this location.
+        let params = params.scoped_to_base(None);
+        let params = params.as_ref();
+        let scheme = base_path.scheme();
+        let Some(provider) = self.get_provider(scheme) else {
+            return Err(self.scheme_not_found_error(scheme));
+        };
+        let store_prefix =
+            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+
+        self.build_store(provider, base_path, params, &store_prefix)
+            .await
+    }
+
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
@@ -261,22 +312,9 @@ impl ObjectStoreRegistry {
 
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let mut store = provider.new_store(base_path, params).await?;
-
-        store.inner = store.inner.traced();
-
-        // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
-        // `az$container@account`) so multiple stores on one cloud differ.
-        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, &cache_path);
-
-        if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-        }
-
-        // Always wrap with IO tracking
-        store.inner = store.io_tracker.wrap("", store.inner);
-
-        let store = Arc::new(store);
+        let store = self
+            .build_store(provider, base_path, params, &cache_path)
+            .await?;
 
         {
             // Insert the store into the cache
@@ -516,5 +554,19 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    #[tokio::test]
+    async fn test_new_store_bypasses_cache() {
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let first = registry.new_store(url.clone(), &params).await.unwrap();
+        let second = registry.new_store(url, &params).await.unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses, stats.active_stores), (0, 0, 0));
     }
 }
