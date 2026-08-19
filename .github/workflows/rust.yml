@@ -284,31 +284,20 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Resolve feature list
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
-          echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Build tests
         run: |
-          cargo nextest run --cargo-profile ci --locked --features ${ALL_FEATURES} --no-run
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          cargo nextest run --cargo-profile ci --locked --features ${ALL_FEATURES}
-      # nextest does not run doctests, and this is the only job that runs the
-      # full feature set, so it is where they have to stay covered.
-      - name: Run doctests
-        run: |
-          cargo test --profile ci --locked --features ${ALL_FEATURES} --doc
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          cargo test --profile ci --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
