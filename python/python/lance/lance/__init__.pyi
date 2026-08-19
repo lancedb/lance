@@ -483,6 +483,9 @@ class _Dataset:
     def register_cell_flag(
         self, field: str, name: str, initial_value: bool = False
     ) -> CellFlagDefinition: ...
+    def register_cell_flags(
+        self, registrations: Sequence[Tuple[str, str, bool]]
+    ) -> List[CellFlagDefinition]: ...
     def rename_cell_flag(self, field: str, name: str, new_name: str): ...
     def drop_cell_flag(self, field: str, name: str): ...
     def merge(
@@ -777,6 +780,7 @@ def _write_fragments(
     dataset_uri: str | Path | _Dataset,
     reader: ReaderLike,
     mode: str,
+    cell_flags: Optional[Dict[str, Dict[str, bool]]],
     max_rows_per_file: int,
     max_rows_per_group: int,
     max_bytes_per_file: int,
@@ -798,6 +802,7 @@ def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
     reader: ReaderLike,
     mode: str,
+    cell_flags: Optional[Dict[str, Dict[str, bool]]],
     max_rows_per_file: int,
     max_rows_per_group: int,
     max_bytes_per_file: int,

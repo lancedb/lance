@@ -79,9 +79,9 @@ An `LCF1` object starts with the four ASCII bytes `LCF1`, a one-byte encoding di
 
 The encoding discriminators and payloads are:
 
-- `0`: a portable serialized 32-bit Roaring bitmap. The retained-memory value is the payload length.
+- `0`: a portable serialized 32-bit Roaring bitmap. For a payload of `n` bytes, the retained-memory value is `16 * n + 32 * ceil(n / 8192)`.
 - `1`: an LSB0 dense bitset. Bit `i % 8` of byte `i / 8` represents offset `i`. For a payload of `n` bytes, the retained-memory value is `16 * n + 32 * ceil(n / 8192)`.
-- `2`: an eight-byte decoded length followed by a Zstandard-compressed portable Roaring bitmap. The decoded length equals the retained-memory value.
+- `2`: an eight-byte decoded length followed by a Zstandard-compressed portable Roaring bitmap. The retained-memory value uses the discriminator `0` formula above with the decoded length.
 - `3`: an eight-byte decoded bitset length followed by a Zstandard-compressed LSB0 bitset. The retained-memory value uses the dense-bitset formula above with the decoded length.
 - `4`: three `uint32` values `(start, step, count)`. It represents `start + i * step` for `0 <= i < count`. `step` and `count` are non-zero and the final value must fit in `uint32`. The retained-memory value is an upper bound for the reconstructed Roaring bitmap; representation normalization may make the decoded bitmap smaller than the declaration.
 

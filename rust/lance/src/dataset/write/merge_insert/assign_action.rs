@@ -79,7 +79,7 @@ fn qualify_unqualified_columns(expr: Expr, relation: &'static str) -> Result<Exp
 /// is a single "action" column, that describes what to do with each row.
 pub fn merge_insert_action(
     params: &MergeInsertParams,
-    schema: Option<&arrow_schema::Schema>,
+    update_if_condition: Option<Expr>,
 ) -> Result<Expr> {
     // Use a sentinel column to detect whether the source side contributed a row to the
     // join output.  This is NULL-safe: the sentinel is `true` for every source row and
@@ -107,26 +107,11 @@ pub fn merge_insert_action(
         WhenMatched::UpdateAll => {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
-        WhenMatched::UpdateIf(condition_str) => {
-            // Parse the condition with qualified column references enabled for fast path
-            if let Some(dataset_schema) = schema {
-                let planner = lance_datafusion::planner::Planner::new(std::sync::Arc::new(
-                    dataset_schema.clone(),
-                ))
-                .with_enable_relations(true);
-                let condition = planner.parse_filter(condition_str).map_err(|e| {
-                    crate::Error::invalid_input(format!(
-                        "Failed to parse UpdateIf condition: {}",
-                        e
-                    ))
-                })?;
-                cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
-            } else {
-                // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::internal(
-                    "Schema required for UpdateIf parsing",
-                ));
-            }
+        WhenMatched::UpdateIf(_) => {
+            let condition = update_if_condition.ok_or_else(|| {
+                crate::Error::internal("Parsed UpdateIf condition is required for the fast path")
+            })?;
+            cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIfExpr(condition) => {
             cases.push((

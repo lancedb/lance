@@ -53,7 +53,7 @@ use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
-    datafusion::dataframe::SessionContextExt,
+    datafusion::{dataframe::SessionContextExt, register_cell_flag_analyzer},
     dataset::{
         fragment::FileFragment,
         transaction::{
@@ -804,8 +804,7 @@ impl MergeInsertBuilder {
         if self
             .params
             .matched_cell_flag_values
-            .insert(definition.flag_id, value)
-            .is_some()
+            .contains_key(&definition.flag_id)
         {
             return Err(Error::invalid_input(format!(
                 "Cell flag '{}' for matched field '{}' is changed more than once",
@@ -813,6 +812,9 @@ impl MergeInsertBuilder {
                 field.as_ref()
             )));
         }
+        self.params
+            .matched_cell_flag_values
+            .insert(definition.flag_id, value);
         Ok(self)
     }
 
@@ -842,8 +844,7 @@ impl MergeInsertBuilder {
         if self
             .params
             .inserted_cell_flag_values
-            .insert(definition.flag_id, value)
-            .is_some()
+            .contains_key(&definition.flag_id)
         {
             return Err(Error::invalid_input(format!(
                 "Cell flag '{}' for inserted field '{}' is changed more than once",
@@ -851,6 +852,9 @@ impl MergeInsertBuilder {
                 field.as_ref()
             )));
         }
+        self.params
+            .inserted_cell_flag_values
+            .insert(definition.flag_id, value);
         Ok(self)
     }
 
@@ -2283,6 +2287,7 @@ impl MergeInsertJob {
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_ctx = SessionContext::new();
+        register_cell_flag_analyzer(&session_ctx);
         let binary_blob_field_ids = self
             .dataset
             .schema()
@@ -2352,18 +2357,25 @@ impl MergeInsertJob {
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
-        let mut df = scan_aliased
-            .join(
-                source_df_aliased,
-                join_type,
-                &on_cols_refs,
-                &on_cols_refs,
-                None,
-            )?
-            .with_column(
-                MERGE_ACTION_COLUMN,
-                merge_insert_action(&self.params, Some(&dataset_schema))?,
-            )?;
+        let df = scan_aliased.join(
+            source_df_aliased,
+            join_type,
+            &on_cols_refs,
+            &on_cols_refs,
+            None,
+        )?;
+        let update_if_condition = match &self.params.when_matched {
+            WhenMatched::UpdateIf(condition) => {
+                Some(df.parse_sql_expr(condition).map_err(|error| {
+                    Error::invalid_input(format!("Failed to parse UpdateIf condition: {}", error))
+                })?)
+            }
+            _ => None,
+        };
+        let mut df = df.with_column(
+            MERGE_ACTION_COLUMN,
+            merge_insert_action(&self.params, update_if_condition)?,
+        )?;
 
         // Partial-schema upsert: for every dataset column missing from the
         // source, add a synthetic unqualified column that copies the target

@@ -99,9 +99,14 @@ impl DeepSizeOf for bytes::Bytes {
 
 impl DeepSizeOf for roaring::RoaringBitmap {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-        // The portable representation closely tracks the container payload and
-        // avoids iterating every selected value merely to size a cache entry.
-        self.serialized_size()
+        let statistics = self.statistics();
+        let container_payload_bytes = statistics
+            .n_bytes_array_containers
+            .saturating_add(statistics.n_bytes_run_containers)
+            .saturating_add(statistics.n_bytes_bitset_containers);
+        let container_metadata_bytes = u64::from(statistics.n_containers).saturating_mul(32);
+        usize::try_from(container_payload_bytes.saturating_add(container_metadata_bytes))
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -442,6 +447,9 @@ mod tests {
         let size_b = b.deep_size_of_children(&mut ctx);
         assert_eq!(size_a, size_of::<u32>());
         assert_eq!(size_b, 0);
+
+        let bitmap = roaring::RoaringBitmap::from_iter([1, 1_000_000]);
+        assert!(bitmap.deep_size_of_children(&mut Context::new()) > bitmap.serialized_size());
     }
 
     #[test]

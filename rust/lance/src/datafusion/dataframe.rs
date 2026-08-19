@@ -1001,8 +1001,21 @@ impl AnalyzerRule for BindCellFlags {
 /// register_cell_flag_analyzer(&context);
 /// ```
 pub fn register_cell_flag_analyzer(context: &SessionContext) {
-    context.register_udf(CELL_FLAG_UDF.clone());
-    context.register_udf(CELL_FLAG_ID_UDF.clone());
+    let (has_cell_flag_udf, has_cell_flag_id_udf) = {
+        let state = context.state();
+        (
+            state.scalar_functions().contains_key(CELL_FLAG_UDF.name()),
+            state
+                .scalar_functions()
+                .contains_key(CELL_FLAG_ID_UDF.name()),
+        )
+    };
+    if !has_cell_flag_udf {
+        context.register_udf(CELL_FLAG_UDF.clone());
+    }
+    if !has_cell_flag_id_udf {
+        context.register_udf(CELL_FLAG_ID_UDF.clone());
+    }
     if context
         .state()
         .analyzer()
@@ -1076,7 +1089,9 @@ impl SessionContextExt for SessionContext {
         with_row_id: bool,
         with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame> {
-        register_cell_flag_analyzer(self);
+        if !dataset.cell_flag_definitions().is_empty() {
+            register_cell_flag_analyzer(self);
+        }
         self.read_table(Arc::new(LanceTableProvider::new(
             dataset,
             with_row_id,
@@ -1101,16 +1116,20 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{AsArray, BooleanArray, Int32Array, Int64Array, RecordBatch, RecordBatchIterator},
+        array::{
+            ArrayRef, AsArray, BooleanArray, Int32Array, Int64Array, RecordBatch,
+            RecordBatchIterator,
+        },
         datatypes::{DataType, Field, Schema},
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::{
         datasource::{MemTable, TableProvider, provider_as_source},
         functions_aggregate::count::count,
-        logical_expr::{JoinType, LogicalPlanBuilder},
+        logical_expr::{JoinType, LogicalPlanBuilder, Volatility, create_udf},
         prelude::{SessionContext, col},
     };
+    use datafusion_functions::utils::make_scalar_function;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::udf::{
         bound_cell_flag_snapshot, cell_flag, deferred_bound_cell_flag_udf,
@@ -1139,6 +1158,32 @@ mod tests {
             .unwrap();
 
         let ctx = SessionContext::new();
+        let custom_cell_flag = create_udf(
+            "cell_flag",
+            vec![DataType::Int32],
+            DataType::Int32,
+            Volatility::Immutable,
+            Arc::new(make_scalar_function(
+                |arguments: &[ArrayRef]| Ok(arguments[0].clone()),
+                vec![],
+            )),
+        );
+        ctx.register_udf(custom_cell_flag);
+        let registered_before = ctx
+            .state()
+            .scalar_functions()
+            .get("cell_flag")
+            .unwrap()
+            .clone();
+        ctx.read_lance(Arc::new(data.clone()), false, false)
+            .unwrap();
+        let registered_after = ctx
+            .state()
+            .scalar_functions()
+            .get("cell_flag")
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&registered_before, &registered_after));
 
         ctx.register_table(
             "foo",

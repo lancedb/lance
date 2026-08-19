@@ -2986,7 +2986,8 @@ mod tests {
     use crate::dataset::transaction::{CellFlagRowChange, RewriteGroup, TransactionBuilder};
     use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use crate::dataset::{
-        ColumnAlteration, CommitBuilder, InsertBuilder, UpdateBuilder, WriteMode, WriteParams,
+        ColumnAlteration, CommitBuilder, InsertBuilder, NewColumnTransform, UpdateBuilder,
+        WriteMode, WriteParams,
     };
     use crate::utils::test::copy_test_data_to_tmp;
 
@@ -3425,6 +3426,16 @@ mod tests {
         dataset
             .register_cell_flag("value", FLAG_NAME, false)
             .await?;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "mirror".to_string(),
+                    "false".to_string(),
+                )]),
+                None,
+                None,
+            )
+            .await?;
 
         let result = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id IN (1, 3)")?
@@ -3434,6 +3445,30 @@ mod tests {
             .await?;
         let dataset = result.new_dataset.as_ref().clone();
         assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![1, 3]);
+
+        let value_expression = format!("cell_flag(value, '{}')", FLAG_NAME);
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .set("mirror", &value_expression)?
+            .build()?
+            .execute()
+            .await?;
+        let mut dataset = result.new_dataset.as_ref().clone();
+        assert_eq!(dataset.count_rows(Some("mirror".to_string())).await?, 2);
+        assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![1, 3]);
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "copied_flag".to_string(),
+                    format!("cell_flag(value, '{}')", FLAG_NAME),
+                )]),
+                None,
+                None,
+            )
+            .await?;
+        assert_eq!(
+            dataset.count_rows(Some("copied_flag".to_string())).await?,
+            2
+        );
 
         let result = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 1")?
@@ -4342,8 +4377,18 @@ mod tests {
             builder
                 .when_matched(WhenMatched::UpdateAll)
                 .when_not_matched(WhenNotMatched::InsertAll)
-                .set_matched_cell_flag("value", FLAG_NAME, false)?
-                .set_inserted_cell_flag("value", FLAG_NAME, true)?;
+                .set_matched_cell_flag("value", FLAG_NAME, false)?;
+            assert!(
+                builder
+                    .set_matched_cell_flag("value", FLAG_NAME, true)
+                    .is_err()
+            );
+            builder.set_inserted_cell_flag("value", FLAG_NAME, true)?;
+            assert!(
+                builder
+                    .set_inserted_cell_flag("value", FLAG_NAME, false)
+                    .is_err()
+            );
             let (dataset, stats) = builder
                 .try_build()?
                 .execute_reader(Box::new(RecordBatchIterator::new(
@@ -4353,6 +4398,31 @@ mod tests {
                 .await?;
             assert_eq!(stats.num_updated_rows, 1);
             assert_eq!(stats.num_inserted_rows, 1);
+            assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
+
+            let conditional_source = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 8])),
+                    Arc::new(Int32Array::from(vec![111, 888])),
+                ],
+            )?;
+            let mut conditional_builder =
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?;
+            conditional_builder
+                .when_matched(WhenMatched::UpdateIf(format!(
+                    "cell_flag(target.value, '{}')",
+                    FLAG_NAME
+                )))
+                .when_not_matched(WhenNotMatched::DoNothing);
+            let (dataset, conditional_stats) = conditional_builder
+                .try_build()?
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(conditional_source)],
+                    source_schema.clone(),
+                )))
+                .await?;
+            assert_eq!(conditional_stats.num_updated_rows, 1);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![8]);
 
             let ordinary_source = RecordBatch::try_new(

@@ -6699,6 +6699,19 @@ def test_cell_flag_public_api(tmp_path: Path):
     with pytest.raises(TypeError, match="must be a bool"):
         dataset.update(where="id = 0", cell_flags={"embedding": {"computed": 1}})
 
+    dataset.add_columns(
+        {
+            "copied_flag": "cell_flag(embedding, 'computed')",
+            "mirror": "false",
+        }
+    )
+    expected_flags = [value for _, value in _flag_rows(dataset)]
+    derived_flags = dataset.to_table(columns=["id", "copied_flag"]).sort_by("id")
+    assert derived_flags["copied_flag"].to_pylist() == expected_flags
+    dataset.update(updates={"mirror": "cell_flag(embedding, 'computed')"})
+    mirrored_flags = dataset.to_table(columns=["id", "mirror"]).sort_by("id")
+    assert mirrored_flags["mirror"].to_pylist() == expected_flags
+
 
 def test_cell_flag_overwrite_preserves_field_identity(tmp_path: Path):
     dataset = lance.write_dataset(
@@ -6779,6 +6792,30 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
         "id",
         cell_flags={"value": {"computed": True}},
     )
+    assert _flag_rows(dataset, field="value") == [
+        (0, False),
+        (1, True),
+        (2, False),
+        (3, True),
+    ]
+
+    stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all("cell_flag(target.value, 'computed')")
+        .execute(
+            pa.table(
+                {
+                    "id": pa.array([0, 1], pa.int64()),
+                    "value": pa.array([100, 101], pa.int32()),
+                }
+            )
+        )
+    )
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 1,
+        "num_deleted_rows": 0,
+    }
     assert _flag_rows(dataset, field="value") == [
         (0, False),
         (1, True),

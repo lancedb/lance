@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use crate::dataset::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::transaction::{CellFlagRowChange, CellFlagTransaction, Operation, Transaction};
@@ -271,27 +272,22 @@ impl UpdateBuilder {
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
-        let mut updates = HashMap::new();
-
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-
-        for (column, expr) in self.updates {
-            let physical_expr = planner.create_physical_expr(&expr)?;
-            updates.insert(column, physical_expr);
-        }
-
-        if updates.is_empty() && self.cell_flag_values.is_empty() {
+        if self.updates.is_empty() && self.cell_flag_values.is_empty() {
             return Err(Error::invalid_input(
                 "No value updates or cell flag changes provided",
             ));
         }
-
-        let updates = Arc::new(updates);
+        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        for expression in self.updates.values() {
+            if !expression_references_cell_flag(expression)? {
+                planner.create_physical_expr(expression)?;
+            }
+        }
 
         Ok(UpdateJob {
             dataset: self.dataset,
             condition: self.condition,
-            updates,
+            updates: Arc::new(self.updates),
             cell_flag_values: Arc::new(self.cell_flag_values),
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
@@ -322,7 +318,7 @@ pub struct UpdateData {
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
-    updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
+    updates: Arc<HashMap<String, Expr>>,
     cell_flag_values: Arc<HashMap<u32, bool>>,
     conflict_retries: u32,
     retry_timeout: Duration,
@@ -377,7 +373,14 @@ impl UpdateJob {
             .schema()
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
-        if has_blob_v2_columns {
+        let needs_cell_flag_binding = self
+            .updates
+            .values()
+            .map(expression_references_cell_flag)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .any(|references| references);
+        if has_blob_v2_columns || needs_cell_flag_binding {
             scanner.with_row_address();
         }
         scanner.with_row_id();
@@ -397,7 +400,10 @@ impl UpdateJob {
 
         let scan_schema = stream.schema();
         let expected_schema: ArrowSchema = self.dataset.schema().into();
-        if !has_blob_v2_columns && scan_schema.as_ref() != &expected_schema {
+        if !has_blob_v2_columns
+            && !needs_cell_flag_binding
+            && scan_schema.as_ref() != &expected_schema
+        {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
                 expected_schema, scan_schema
@@ -408,7 +414,7 @@ impl UpdateJob {
             let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
                 self.dataset.schema(),
                 scan_schema.as_ref(),
-                false,
+                needs_cell_flag_binding,
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
             let dataset = self.dataset.clone();
@@ -429,6 +435,27 @@ impl UpdateJob {
             stream
         };
         let schema = stream.schema();
+
+        let bindings = CellFlagExprBindings::try_new(
+            self.dataset.as_ref(),
+            &self.updates.values().collect::<Vec<_>>(),
+            None,
+        )
+        .await?;
+        let planner = Planner::new(schema.clone());
+        let updates = self
+            .updates
+            .iter()
+            .map(|(column, expression)| {
+                let expression = if let Some(bindings) = &bindings {
+                    bindings.bind(expression.clone(), self.dataset.as_ref())?
+                } else {
+                    expression.clone()
+                };
+                Ok((column.clone(), planner.create_physical_expr(&expression)?))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let updates = Arc::new(updates);
 
         let updated_blob_columns = self
             .updates
@@ -466,7 +493,7 @@ impl UpdateJob {
             .await?
         };
 
-        let updates_ref = self.updates.clone();
+        let updates_ref = updates;
         let stream = stream
             .map(move |batch| {
                 let updates = updates_ref.clone();
@@ -497,7 +524,29 @@ impl UpdateJob {
                     Ok(batch)
                 }
             });
-        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream: SendableRecordBatchStream = if needs_cell_flag_binding {
+            let dataset_field_indices = expected_schema
+                .fields()
+                .iter()
+                .map(|field| schema.index_of(field.name()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let output_schema = Arc::new(expected_schema);
+            let projected = stream.map(move |batch_result| {
+                let batch = batch_result?;
+                let columns = dataset_field_indices
+                    .iter()
+                    .map(|index| batch.column(*index).clone())
+                    .collect();
+                Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(self.dataset.schema().into()),
+                projected,
+            ))
+        } else {
+            Box::pin(stream)
+        };
 
         let (mut new_fragments, _) = write_fragments_internal(
             self.dataset
@@ -508,7 +557,7 @@ impl UpdateJob {
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
-            Box::pin(stream),
+            stream,
             write_params,
             None, // TODO: support multiple bases for update
         )

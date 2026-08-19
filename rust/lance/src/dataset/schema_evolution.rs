@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use super::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
 use super::fragment::FileFragment;
 use super::{
     Dataset,
@@ -25,6 +26,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
@@ -329,20 +331,42 @@ pub(super) async fn add_columns_to_fragments(
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let needed_columns = exprs
+            let mut needed_columns = exprs
                 .iter()
                 .flat_map(|(_, expr)| Planner::column_names_in_expr(expr))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let read_schema = dataset.schema().project(&needed_columns)?;
-            let read_schema = Arc::new(ArrowSchema::from(&read_schema));
+            let needs_cell_flag_binding = exprs
+                .iter()
+                .map(|(_, expression)| expression_references_cell_flag(expression))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|references| references);
+            let projected_schema = dataset.schema().project(&needed_columns)?;
+            let mut read_schema = ArrowSchema::from(&projected_schema);
+            if needs_cell_flag_binding {
+                needed_columns.push(ROW_ADDR.to_string());
+                read_schema = read_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
+            }
+            let read_schema = Arc::new(read_schema);
+            let bindings = CellFlagExprBindings::try_new(
+                dataset,
+                &exprs.iter().map(|(_, expr)| expr).collect::<Vec<_>>(),
+                None,
+            )
+            .await?;
             // Need to re-create the planner with the read schema because physical
             // expressions use positional column references.
             let planner = Planner::new(read_schema.clone());
             let exprs = exprs
                 .into_iter()
                 .map(|(name, expr)| {
+                    let expr = if let Some(bindings) = &bindings {
+                        bindings.bind(expr, dataset)?
+                    } else {
+                        expr
+                    };
                     let expr = planner.create_physical_expr(&expr)?;
                     Ok((name, expr))
                 })
@@ -375,7 +399,7 @@ pub(super) async fn add_columns_to_fragments(
             };
             let mapper = Box::new(mapper);
 
-            let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
+            let read_columns = Some(needed_columns);
             let result =
                 add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
             Ok((output_schema, result.fragments, result.fragments_to_cleanup))
