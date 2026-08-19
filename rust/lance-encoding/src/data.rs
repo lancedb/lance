@@ -1837,6 +1837,8 @@ impl DataBlock {
         .map_or(Ok(()), Err)
     }
 
+    // `validate_full` also rescans UTF-8 contents and character boundaries on every flush.
+    // Encoding only needs a complete monotonicity and bounds proof before slicing offsets.
     fn validate_variable_width_layouts(array_data: &ArrayData) -> std::result::Result<(), String> {
         match array_data.data_type() {
             DataType::Binary | DataType::Utf8 => {
@@ -2286,30 +2288,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_string_array_data_offset() {
-        let array_data = ArrayData::builder(DataType::Utf8)
+    #[rstest]
+    #[case::utf8(
+        DataType::Utf8,
+        Buffer::from_slice_ref([0_i32, 5, 10]),
+        32,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5])
+    )]
+    #[case::large_utf8(
+        DataType::LargeUtf8,
+        Buffer::from_slice_ref([0_i64, 5, 10]),
+        64,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5])
+    )]
+    fn test_variable_width_array_data_offset(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+        #[case] bits_per_offset: u8,
+        #[case] expected_offsets: LanceBuffer,
+    ) {
+        let array_data = ArrayData::builder(data_type)
             .len(1)
             .offset(1)
-            .add_buffer(Buffer::from_slice_ref([0_i32, 5, 10]))
+            .add_buffer(offsets)
             .add_buffer(Buffer::from(b"helloworld"))
             .build()
             .unwrap();
 
         DataBlock::validate_array_data(&array_data, "text", 0).unwrap();
-        let data = super::arrow_binary_array_data_to_data_block(&[array_data], 1, 32);
+        let data = super::arrow_binary_array_data_to_data_block(&[array_data], 1, bits_per_offset);
 
         let data = data.as_variable_width().unwrap();
-        assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(vec![0_i32, 5]));
+        assert_eq!(data.offsets, expected_offsets);
         assert_eq!(data.data, LanceBuffer::copy_slice(b"world"));
     }
 
-    #[test]
-    fn test_invalid_string_offsets_rejected_before_encoding() {
+    #[rstest]
+    #[case::utf8(DataType::Utf8, Buffer::from_slice_ref([0_i32, -1]))]
+    #[case::large_utf8(DataType::LargeUtf8, Buffer::from_slice_ref([0_i64, -1]))]
+    fn test_invalid_string_offsets_rejected_before_encoding(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+    ) {
         let array_data = unsafe {
-            ArrayData::builder(DataType::Utf8)
+            ArrayData::builder(data_type)
                 .len(1)
-                .add_buffer(Buffer::from_slice_ref([0_i32, -1]))
+                .add_buffer(offsets)
                 .add_buffer(Buffer::from(b""))
                 .build_unchecked()
         };

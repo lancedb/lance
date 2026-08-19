@@ -491,19 +491,23 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case::array(TestEncoding::Array)]
-    #[case::structural(TestEncoding::StructuralU32)]
     fn test_nested_variable_width_offsets_are_validated_before_dispatch(
-        #[case] encoding: TestEncoding,
+        #[values(TestEncoding::Array, TestEncoding::StructuralU32)] encoding: TestEncoding,
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8)] item_type: ArrowDataType,
     ) {
+        let offsets = match &item_type {
+            ArrowDataType::Utf8 => Buffer::from_slice_ref([0_i32, 2, 1, 3]),
+            ArrowDataType::LargeUtf8 => Buffer::from_slice_ref([0_i64, 2, 1, 3]),
+            _ => unreachable!(),
+        };
         let child_data = unsafe {
-            ArrayData::builder(ArrowDataType::Utf8)
+            ArrayData::builder(item_type.clone())
                 .len(3)
-                .add_buffer(Buffer::from_slice_ref([0_i32, 2, 1, 3]))
+                .add_buffer(offsets)
                 .add_buffer(Buffer::from(b"abc"))
                 .build_unchecked()
         };
-        let item_field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
+        let item_field = Arc::new(ArrowField::new("item", item_type, false));
         let data_type = ArrowDataType::FixedSizeList(item_field, 1);
         let array_data = unsafe {
             ArrayData::builder(data_type.clone())
