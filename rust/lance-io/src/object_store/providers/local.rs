@@ -3,6 +3,8 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(any(windows, test))]
+use crate::object_store::LocalDirOperations;
 use crate::object_store::{
     DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -10,10 +12,35 @@ use crate::object_store::{
 use lance_core::Error;
 use lance_core::error::Result;
 use object_store::{local::LocalFileSystem, path::Path};
+#[cfg(any(windows, test))]
+use std::io::ErrorKind;
 use url::Url;
 
 #[derive(Default, Debug)]
 pub struct FileStoreProvider;
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct FileSystemDirOperations {
+    local_file_system: LocalFileSystem,
+}
+
+#[cfg(any(windows, test))]
+#[async_trait::async_trait]
+impl LocalDirOperations for FileSystemDirOperations {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        let local_path = self.local_file_system.path_to_filesystem(path)?;
+        let object_store_path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            std::fs::remove_dir_all(local_path).map_err(|error| match error.kind() {
+                ErrorKind::NotFound => Error::not_found(object_store_path),
+                _ => Error::from(error),
+            })
+        })
+        .await
+        .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))?
+    }
+}
 
 #[cfg(windows)]
 mod windows {
@@ -80,15 +107,27 @@ impl ObjectStoreProvider for FileStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
 
         #[cfg(windows)]
-        let inner = match windows::extract_unc_path(&base_path)? {
-            Some(unc_path) => LocalFileSystem::new_with_prefix(unc_path.root)?,
-            None => LocalFileSystem::new(),
+        let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
+            Some(unc_path) => {
+                let inner = LocalFileSystem::new_with_prefix(unc_path.root)?;
+                let operations = FileSystemDirOperations {
+                    local_file_system: inner.clone(),
+                };
+                (
+                    inner,
+                    Some(Arc::new(operations) as Arc<dyn LocalDirOperations>),
+                )
+            }
+            None => (LocalFileSystem::new(), None),
         };
         #[cfg(not(windows))]
         let inner = LocalFileSystem::new();
+        #[cfg(not(windows))]
+        let local_dir_operations = None;
 
         Ok(ObjectStore {
             inner: Arc::new(inner),
+            local_dir_operations,
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -134,9 +173,76 @@ impl ObjectStoreProvider for FileStoreProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{create_dir_all, write};
+    use std::path::Path as StdPath;
+
     use crate::object_store::uri_to_url;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
 
     use super::*;
+
+    fn rooted_local_store(root: &StdPath) -> ObjectStore {
+        let inner = LocalFileSystem::new_with_prefix(root).unwrap();
+        let local_dir_operations = Arc::new(FileSystemDirOperations {
+            local_file_system: inner.clone(),
+        });
+        ObjectStore {
+            inner: Arc::new(inner),
+            local_dir_operations: Some(local_dir_operations),
+            scheme: "file".to_owned(),
+            block_size: DEFAULT_LOCAL_BLOCK_SIZE,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
+            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+            download_retry_count: 0,
+            io_tracker: Default::default(),
+            store_prefix: "file$rooted-test".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rooted_remove_dir_all_removes_tree() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(dataset.join("nested")).unwrap();
+        write(dataset.join("nested/data"), "delete").unwrap();
+
+        rooted_local_store(&root)
+            .remove_dir_all(Path::from("dataset"))
+            .await
+            .unwrap();
+
+        assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rooted_remove_dir_all_does_not_follow_directory_symlink() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        let outside = sandbox.path().join("outside");
+        create_dir_all(&dataset).unwrap();
+        create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        write(&sentinel, "keep").unwrap();
+        symlink(&outside, dataset.join("link")).unwrap();
+
+        rooted_local_store(&root)
+            .remove_dir_all(Path::from("dataset"))
+            .await
+            .unwrap();
+
+        assert!(
+            sentinel.exists(),
+            "recursive deletion must not follow links"
+        );
+        assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
 
     #[test]
     fn test_file_store_path() {
