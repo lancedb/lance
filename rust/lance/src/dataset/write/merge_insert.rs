@@ -2706,7 +2706,8 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
-        let combined_schema = Arc::new(combined_schema(&source_schema));
+        let dataset_schema: Schema = self.dataset.schema().into();
+        let combined_schema = Arc::new(combined_schema(&dataset_schema));
         let planner = Planner::new(combined_schema);
         let matched_expression = match &self.params.when_matched {
             WhenMatched::UpdateIf(condition) => Some(planner.parse_filter(condition)?),
@@ -3826,7 +3827,10 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::io::commit::read_transaction_file;
     use crate::{
-        dataset::{InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            InsertBuilder, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         session::Session,
         utils::test::{
             DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
@@ -4063,6 +4067,88 @@ mod tests {
                 .unwrap(),
             "an indexed Cell Flag condition must keep the candidate-probe path"
         );
+    }
+
+    #[tokio::test]
+    async fn indexed_partial_merge_binds_flag_field_missing_from_source() {
+        let batch = record_batch!(
+            ("id", Int32, [1, 2]),
+            ("value", Int32, [10, 20]),
+            ("mirror", Int32, [100, 200])
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://indexed_partial_cell_flag_merge")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 1")
+            .unwrap()
+            .set_cell_flag("value", "reviewed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = result.new_dataset.as_ref().clone();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let source = record_batch!(("id", Int32, [1, 2]), ("mirror", Int32, [111, 222])).unwrap();
+        let source_schema = source.schema();
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateIf(
+                "cell_flag(target.value, 'reviewed')".to_string(),
+            ))
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let (dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source)],
+                source_schema,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 1);
+
+        let mut scanner = dataset.scan();
+        scanner.project(&["id", "mirror"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mirrors = batch
+            .column_by_name("mirror")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut rows = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(mirrors.values().iter().copied())
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 111), (2, 200)]);
     }
 
     #[test]
