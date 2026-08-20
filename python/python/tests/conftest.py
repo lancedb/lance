@@ -102,6 +102,27 @@ def pytest_configure(config):
         "compat: mark tests that run upgrade/downgrade compatibility checks",
     )
 
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput is not None:
+        from compat.compat_decorator import use_version_snapshot
+
+        use_version_snapshot(workerinput["lance_compat_versions"])
+
+
+def pytest_configure_node(node):
+    """Resolve the compat version list once, on the xdist controller.
+
+    The compat tests are parametrized over the pylance releases published to
+    PyPI and fury.io, and collecting `python/tests` imports them whether or not
+    --run-compat was passed. Left to itself every worker queries for that list
+    while collecting, so a request that times out or a release that lands
+    mid-run gives one worker a different parameter set, and xdist aborts the
+    whole run with "Different tests were collected".
+    """
+    from compat.compat_decorator import version_snapshot
+
+    node.workerinput["lance_compat_versions"] = version_snapshot()
+
 
 # tryfirst because xdist reads xdist_group off each item to build its scheduling
 # groups before ordinary pytest_collection_modifyitems hooks run; a mark added
