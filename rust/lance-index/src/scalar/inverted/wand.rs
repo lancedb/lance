@@ -4865,7 +4865,7 @@ fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
     }
 }
 
-fn next_up_f32(value: f32) -> f32 {
+pub(super) fn next_up_f32(value: f32) -> f32 {
     if !value.is_finite() {
         return value;
     }
