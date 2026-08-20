@@ -30,10 +30,11 @@ use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FOR
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::transaction::TRANSACTION_SCHEMA_SOURCE_RAW_ARROW;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -922,7 +923,8 @@ fn convert_schema_from_operation(
     dataset: Option<&mut BlockingDataset>,
     read_version: u64,
     replaces_all_identities: bool,
-) -> Result<(LanceSchema, HashMap<i32, i32>)> {
+    commit_allocator_is_authoritative: bool,
+) -> Result<LanceSchema> {
     let schema_ptr = env
         .call_method(
             java_operation,
@@ -935,12 +937,20 @@ fn convert_schema_from_operation(
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
 
     let arrow_schema = Schema::try_from(&c_schema)?;
-    let original_schema = LanceSchema::try_from(&arrow_schema).map_err(|e| {
+    let mut original_schema = LanceSchema::try_from(&arrow_schema).map_err(|e| {
         Error::input_error(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
             e
         ))
     })?;
+
+    if commit_allocator_is_authoritative {
+        original_schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        return Ok(original_schema);
+    }
 
     let schema = if let Some(dataset) = dataset {
         // Derive field ids based on the transaction read dataset schema.
@@ -968,63 +978,7 @@ fn convert_schema_from_operation(
         LanceSchema::from_arrow_schema(&arrow_schema, None, None, true, true)?
     };
 
-    let field_id_remap = original_schema
-        .fields_pre_order()
-        .zip(schema.fields_pre_order())
-        .filter_map(|(original, canonical)| {
-            (original.id >= 0 && original.id != canonical.id).then_some((original.id, canonical.id))
-        })
-        .collect();
-    Ok((schema, field_id_remap))
-}
-
-type DataFileIdentity = (Option<u32>, String);
-
-fn retained_file_identities(
-    dataset: Option<&mut BlockingDataset>,
-    read_version: u64,
-) -> Result<HashSet<DataFileIdentity>> {
-    let Some(dataset) = dataset else {
-        return Ok(HashSet::new());
-    };
-    let collect = |dataset: &BlockingDataset| {
-        dataset
-            .inner
-            .manifest()
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.referenced_lance_files())
-            .map(|file| (file.base_id, file.path.clone()))
-            .collect()
-    };
-    if dataset.inner.version().version == read_version {
-        Ok(collect(dataset))
-    } else {
-        let read_dataset = dataset.checkout_version(read_version)?;
-        Ok(collect(&read_dataset))
-    }
-}
-
-fn remap_fragment_field_ids(
-    fragments: &mut [Fragment],
-    field_id_remap: &HashMap<i32, i32>,
-    retained_files: &HashSet<DataFileIdentity>,
-) {
-    if field_id_remap.is_empty() {
-        return;
-    }
-    for fragment in fragments {
-        for file in fragment.referenced_lance_files_mut() {
-            if retained_files.contains(&(file.base_id, file.path.clone())) {
-                continue;
-            }
-            for field_id in Arc::make_mut(&mut file.fields) {
-                if let Some(canonical_id) = field_id_remap.get(field_id) {
-                    *field_id = *canonical_id;
-                }
-            }
-        }
-    }
+    Ok(schema)
 }
 
 trait SchemaExt {
@@ -1235,7 +1189,7 @@ fn convert_to_rust_operation(
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => {
-            let (schema, _) = convert_schema_from_operation(
+            let schema = convert_schema_from_operation(
                 env,
                 java_operation,
                 allocator.ok_or_else(|| {
@@ -1245,6 +1199,7 @@ fn convert_to_rust_operation(
                 })?,
                 dataset,
                 read_version,
+                false,
                 false,
             )?;
             Operation::Project {
@@ -1359,7 +1314,7 @@ fn convert_to_rust_operation(
             }
         }
         "Overwrite" => {
-            let mut fragments: Vec<Fragment> =
+            let fragments: Vec<Fragment> =
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
@@ -1372,7 +1327,7 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let (schema, field_id_remap) = convert_schema_from_operation(
+            let schema = convert_schema_from_operation(
                 env,
                 java_operation,
                 allocator.ok_or_else(|| {
@@ -1383,8 +1338,8 @@ fn convert_to_rust_operation(
                 dataset.as_deref_mut(),
                 read_version,
                 true,
+                true,
             )?;
-            remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -1526,12 +1481,11 @@ fn convert_to_rust_operation(
             Operation::DataReplacement { replacements }
         }
         "Merge" => {
-            let mut fragments: Vec<Fragment> =
+            let fragments: Vec<Fragment> =
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
-            let retained_files = retained_file_identities(dataset.as_deref_mut(), read_version)?;
-            let (schema, field_id_remap) = convert_schema_from_operation(
+            let schema = convert_schema_from_operation(
                 env,
                 java_operation,
                 allocator.ok_or_else(|| {
@@ -1542,8 +1496,8 @@ fn convert_to_rust_operation(
                 dataset,
                 read_version,
                 false,
+                true,
             )?;
-            remap_fragment_field_ids(&mut fragments, &field_id_remap, &retained_files);
             Operation::Merge {
                 fragments,
                 preserves_nullability: env
@@ -1859,7 +1813,6 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema,
     };
-    use lance_table::format::DataFile;
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
@@ -1926,30 +1879,6 @@ mod tests {
                 .unwrap();
 
         assert_eq!(schema.field("renamed").unwrap().id, 10);
-    }
-
-    #[test]
-    fn merge_remap_skips_retained_files() {
-        let mut retained = Fragment::new(0);
-        retained.files.push(DataFile::new_legacy_from_fields(
-            "retained.lance",
-            vec![0, 1, 2],
-            None,
-        ));
-        let mut rewritten = Fragment::new(1);
-        rewritten.files.push(DataFile::new_legacy_from_fields(
-            "new.lance",
-            vec![1, 2],
-            None,
-        ));
-        let mut fragments = vec![retained, rewritten];
-        let remap = HashMap::from([(1, 2), (2, 3)]);
-        let retained_files = HashSet::from([(None, "retained.lance".to_string())]);
-
-        remap_fragment_field_ids(&mut fragments, &remap, &retained_files);
-
-        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1, 2]);
-        assert_eq!(fragments[1].files[0].fields.as_ref(), &[2, 3]);
     }
 
     #[test]

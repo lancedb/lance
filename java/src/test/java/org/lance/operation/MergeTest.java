@@ -363,6 +363,74 @@ public class MergeTest extends OperationTestBase {
     }
   }
 
+  @Test
+  void testMergeRejectsAmbiguousRawArrowFieldIds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMergeRejectsAmbiguousRawArrowFieldIds").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      try (Dataset initialDataset = createAndAppendRows(testDataset, 2)) {
+        Field bField =
+            new Field(
+                "b", new FieldType(true, new ArrowType.Int(32, true), null, fieldMeta(3)), null);
+        Field cField =
+            new Field(
+                "c", new FieldType(true, new ArrowType.Int(32, true), null, fieldMeta(2)), null);
+        Schema newColumnsSchema = new Schema(Arrays.asList(bField, cField), null);
+        Schema evolvedSchema =
+            new Schema(
+                Arrays.asList(
+                    testDataset.getSchema().getFields().get(0),
+                    testDataset.getSchema().getFields().get(1),
+                    bField,
+                    cField),
+                null);
+
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(newColumnsSchema, allocator)) {
+          root.allocateNew();
+          IntVector bVector = (IntVector) root.getVector("b");
+          IntVector cVector = (IntVector) root.getVector("c");
+          bVector.setSafe(0, 10);
+          bVector.setSafe(1, 11);
+          cVector.setSafe(0, 20);
+          cVector.setSafe(1, 21);
+          root.setRowCount(2);
+
+          DataFile newDataFile =
+              writeLanceDataFile(
+                  dataset.allocator(), datasetPath, root, new int[] {2, 3}, new int[] {0, 1});
+          FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
+          List<DataFile> dataFiles = fragmentMeta.getFiles();
+          dataFiles.add(newDataFile);
+          FragmentMetadata evolvedFragment =
+              new FragmentMetadata(
+                  fragmentMeta.getId(),
+                  dataFiles,
+                  fragmentMeta.getPhysicalRows(),
+                  fragmentMeta.getDeletionFile(),
+                  fragmentMeta.getRowIdMeta());
+
+          try (Transaction transaction =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
+                  .operation(
+                      Merge.builder()
+                          .fragments(Collections.singletonList(evolvedFragment))
+                          .schema(evolvedSchema)
+                          .build())
+                  .build()) {
+            IllegalArgumentException error =
+                Assertions.assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new CommitBuilder(initialDataset).execute(transaction).close());
+            Assertions.assertTrue(error.getMessage().contains("ambiguous raw Arrow field IDs"));
+          }
+        }
+      }
+    }
+  }
+
   private Map<String, String> fieldMeta(int fieldId) {
     Map<String, String> idMeta = new HashMap<>();
     idMeta.put("lance:field_id", String.valueOf(fieldId));

@@ -5620,6 +5620,56 @@ def test_overwrite_rejects_ambiguous_raw_arrow_field_ids(tmp_path: Path):
         )
 
 
+def test_merge_rejects_ambiguous_raw_arrow_field_ids(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"old": pa.array([1, 2], pa.int32())}), tmp_path
+    )
+    staged = lance.fragment.LanceFragment.create(
+        tmp_path,
+        pa.table(
+            {
+                "b": pa.array([10, 11], pa.int32()),
+                "c": pa.array([20, 21], pa.int32()),
+            }
+        ),
+        mode="overwrite",
+    )
+    staged_file = staged.files[0]
+    canonical_file = lance.fragment.DataFile(
+        path=staged_file.path,
+        fields=[1, 2],
+        column_indices=staged_file.column_indices,
+        file_major_version=staged_file.file_major_version,
+        file_minor_version=staged_file.file_minor_version,
+        file_size_bytes=staged_file.file_size_bytes,
+        base_id=staged_file.base_id,
+    )
+    current = dataset.get_fragments()[0].metadata
+    merged = lance.fragment.FragmentMetadata(
+        id=current.id,
+        files=[*current.files, canonical_file],
+        physical_rows=current.physical_rows,
+        deletion_file=current.deletion_file,
+        row_id_meta=current.row_id_meta,
+    )
+    schema = pa.schema(
+        [
+            pa.field("old", pa.int32()),
+            pa.field("b", pa.int32(), metadata={b"lance:field_id": b"2"}),
+            pa.field("c", pa.int32(), metadata={b"lance:field_id": b"1"}),
+        ]
+    )
+
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([merged], schema)
+    with pytest.raises(OSError, match="ambiguous raw Arrow field IDs"):
+        lance.LanceDataset.commit(
+            dataset,
+            operation,
+            read_version=dataset.version,
+        )
+
+
 def test_schema_project_rename_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
     base_dir = tmp_path / "test"

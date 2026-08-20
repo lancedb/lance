@@ -94,7 +94,7 @@ pub fn canonicalize_stable_field_ids(
                 .collect();
             if raw_arrow_schema {
                 let field_id_remap =
-                    canonicalize_schema(Some(manifest), schema, false, false, false)?;
+                    canonicalize_schema(Some(manifest), schema, false, false, true)?;
                 remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
             }
             canonicalize_merge_replacements(manifest, schema, fragments, &retained_files)?;
@@ -1370,6 +1370,39 @@ mod tests {
         assert_eq!(schema.fields[0].id, 1);
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
         assert_eq!(fragments[0].files[1].fields.as_ref(), &[1]);
+    }
+
+    #[test]
+    fn canonicalize_merge_rejects_ambiguous_raw_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 0;
+        schema.fields[1].id = 2;
+        schema.fields[2].id = 1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut merged_fragment = manifest.fragments[0].clone();
+        merged_fragment.files.push(DataFile::new_legacy_from_fields(
+            "new.lance",
+            vec![1, 2],
+            None,
+        ));
+        let mut operation = Operation::Merge {
+            fragments: vec![merged_fragment],
+            schema,
+            preserves_nullability: true,
+        };
+
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }
 
     #[test]
