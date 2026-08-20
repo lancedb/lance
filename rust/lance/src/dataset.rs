@@ -4080,6 +4080,7 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
     // Every manifest write funnels through here, including restore and clone,
@@ -4093,7 +4094,14 @@ pub(crate) async fn write_manifest_file(
     // including through the delete that removes the offending rows, which is
     // the first step of repairing it. A repair still has to pass: it changes
     // the schema, and the schema it produces is valid.
-    if transaction.as_ref().is_none_or(|t| t.may_change_schema()) {
+    //
+    // The caller classifies the operation, rather than this reading it off
+    // `transaction`, which is None whenever the encoded bytes were too large
+    // to inline. Deriving it here would make the verdict depend on payload
+    // size, so the same operation would be exempt while small and validated
+    // once it spilled -- and a MemWAL table spills routinely, since its
+    // transactions carry mem-table state.
+    if may_change_schema {
         manifest
             .schema
             .verify_primary_key()
