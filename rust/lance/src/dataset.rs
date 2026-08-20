@@ -41,8 +41,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionaries,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
+    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -88,7 +88,28 @@ mod schema_evolution;
 pub mod sql;
 pub mod statistics;
 mod take;
-pub mod transaction;
+/// Transaction definitions for updating datasets
+///
+/// Prior to creating a new manifest, a transaction must be created representing
+/// the changes being made to the dataset. By representing them as incremental
+/// changes, we can detect whether concurrent operations are compatible with
+/// one another. We can also rebuild manifests when retrying committing a
+/// manifest.
+///
+/// The definitions live in [`lance_table::transaction`]: building a manifest from
+/// a transaction reads and writes only table metadata, so it belongs at the table
+/// layer. This module re-exports them at the path callers have always used.
+///
+/// For more details please refer to the
+/// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
+pub mod transaction {
+    pub use lance_table::transaction::{
+        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
+        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
+        validate_operation,
+    };
+}
 pub mod udtf;
 pub mod updater;
 mod utils;
@@ -131,6 +152,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -197,7 +219,8 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
-    /// Object stores for additional base paths, shared across clones.
+    /// Object stores for additional base paths, normally shared across clones.
+    /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
 }
 
@@ -2052,6 +2075,10 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
+        // Each wrapper application defines a new store lifetime. Keep base
+        // stores alive within the derived dataset without sharing stateful
+        // provider layers (such as an AIMD throttle) with other scopes.
+        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.inner =
@@ -2423,35 +2450,37 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        // Cores are cached without wrappers; each resolution decorates the
-        // shared core with the caller's wrapper.
-        let mut core_params = self.store_params_for_base(Some(base_path));
-        let wrapper = core_params.object_store_wrapper.take();
+        let store_params = self.store_params_for_base(Some(base_path));
 
         let cell = {
             let mut stores = self.base_object_stores.lock().unwrap();
             stores.entry(base_id).or_default().clone()
         };
-        let core = cell
+        let store = cell
             .get_or_try_init(|| async {
-                let (store, _) = ObjectStore::from_uri_and_params(
-                    self.session.store_registry(),
-                    &base_path.path,
-                    &core_params,
-                )
-                .await?;
+                // Wrappers define a request or execution scope. Keep the
+                // fully resolved store in this dataset's OnceCell, but do not
+                // also put it in the global registry: provider-local state
+                // such as GCS AIMD token buckets must not cross that scope.
+                let (store, _) = if store_params.object_store_wrapper.is_some() {
+                    ObjectStore::from_uri_and_params_uncached(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                } else {
+                    ObjectStore::from_uri_and_params(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                };
                 Ok::<_, Error>(store)
             })
             .await?;
-
-        match wrapper {
-            Some(wrapper) => {
-                let mut store = core.as_ref().clone();
-                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
-                Ok(Arc::new(store))
-            }
-            None => Ok(core.clone()),
-        }
+        Ok(store.clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
@@ -3125,6 +3154,76 @@ impl Dataset {
         // We need to re-open.
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
+        Ok(())
+    }
+
+    /// Assign stable row ID sequences to fragments that do not yet have them.
+    /// Assigns a contiguous `RowIdSequence` to every fragment starting from row
+    /// ID 0 and returns the resulting `next_row_id` high-water mark.
+    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment]) -> Result<u64> {
+        let mut next_row_id = 0u64;
+        for fragment in fragments.iter_mut() {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                Error::internal(format!(
+                    "Fragment {} is missing physical_rows; cannot assign stable row IDs",
+                    fragment.id
+                ))
+            })? as u64;
+            let end = next_row_id
+                .checked_add(physical_rows)
+                .ok_or_else(|| Error::internal("Row ID overflow during stable row ID migration"))?;
+            let sequence = RowIdSequence::from(next_row_id..end);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+            next_row_id = end;
+        }
+        Ok(next_row_id)
+    }
+
+    /// Migrate a table to use stable row IDs.
+    ///
+    /// Stable row IDs assign a persistent identifier to each row that remains
+    /// stable across compaction operations. This enables more efficient updates
+    /// to secondary indices.
+    ///
+    /// A single Merge commit assigns row ID sequences to all fragments and
+    /// activates the stable row ID feature flag atomically. Because `Merge`
+    /// conflicts with all data-modifying operations, a successful commit
+    /// guarantees no concurrent write occurred — no separate validation step
+    /// is needed.
+    ///
+    /// **No retries are attempted.** Callers should quiesce concurrent writes
+    /// before running this migration. If a conflicting write is detected, this
+    /// method returns an error and the caller must retry.
+    ///
+    /// This method is idempotent: if the table already uses stable row IDs,
+    /// it returns `Ok(())` immediately.
+    pub async fn migrate_to_stable_row_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_stable_row_ids() {
+            return Ok(());
+        }
+
+        let mut fragments = self.manifest.fragments.as_ref().clone();
+        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        let schema = self.manifest.schema.clone();
+        let read_version = self.manifest.version;
+
+        let transaction = Transaction::new(
+            read_version,
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_row_id_migration_activation(next_row_id)
+            .execute(transaction)
+            .await?;
+
+        *self = new_ds;
         Ok(())
     }
 
@@ -3931,6 +4030,10 @@ pub(crate) struct ManifestWriteConfig {
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
     disable_transaction_file: bool,            // default false
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    migration_next_row_id: Option<u64>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -3942,6 +4045,7 @@ impl Default for ManifestWriteConfig {
             disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
+            migration_next_row_id: None,
         }
     }
 }
@@ -3955,6 +4059,22 @@ impl ManifestWriteConfig {
     pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
         self.disable_transaction_file = true;
         self
+    }
+
+    /// Resolve into the config `Transaction::build_manifest` consumes.
+    ///
+    /// The timestamp is resolved here rather than during the build so it goes
+    /// through this crate's mockable `SystemTime`.
+    pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
+        ManifestBuildConfig {
+            auto_set_feature_flags: self.auto_set_feature_flags,
+            timestamp_nanos: timestamp_to_nanos(self.timestamp),
+            use_stable_row_ids: self.use_stable_row_ids,
+            use_legacy_format: self.use_legacy_format,
+            storage_format: self.storage_format.clone(),
+            disable_transaction_file: self.disable_transaction_file,
+            migration_next_row_id: self.migration_next_row_id,
+        }
     }
 }
 

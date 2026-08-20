@@ -455,6 +455,7 @@ impl PrimitiveFieldEncoder {
 
     // Creates an encode task, consuming all buffered data
     fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
+        DataBlock::validate_arrays(&arrays, &self.field.name)?;
         if arrays.len() == 1 {
             let array = arrays.into_iter().next().unwrap();
             let size_bytes = array.get_buffer_memory_size();

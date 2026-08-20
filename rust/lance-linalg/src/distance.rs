@@ -25,6 +25,31 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
+#[inline]
+fn assert_equal_lengths(left_len: usize, right_len: usize) {
+    assert_eq!(
+        left_len, right_len,
+        "distance inputs must have equal lengths: left={left_len}, right={right_len}"
+    );
+}
+
+#[inline]
+fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
+    assert!(
+        dimension > 0,
+        "distance dimension must be greater than zero"
+    );
+    assert_eq!(
+        vector_len, dimension,
+        "distance vector length must match dimension: vector={vector_len}, dimension={dimension}"
+    );
+    assert_eq!(
+        batch_len % dimension,
+        0,
+        "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
+    );
+}
+
 /// Number of distances computed per call into a runtime-selected batch kernel.
 ///
 /// Keeping a small output buffer amortizes the `#[target_feature]` call while
