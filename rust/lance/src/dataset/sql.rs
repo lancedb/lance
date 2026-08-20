@@ -7,6 +7,7 @@ use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::{
     parser::Statement as DFStatement,
@@ -62,6 +63,12 @@ impl SqlQueryBuilder {
 
     /// Specify if the query result should include the internal row id.
     /// If true, the query result will include an additional column named "_rowid".
+    ///
+    /// The column is appended automatically only for queries whose output rows
+    /// map one-to-one to dataset rows (plain projections/filters). For queries
+    /// that change row cardinality (i.e., DISTINCT, GROUP BY, aggregates, ...),
+    /// this flag makes "_rowid" available to reference explicitly in the SQL
+    /// text but does not append it to the result.
     pub fn with_row_id(mut self, row_id: bool) -> Self {
         self.with_row_id = row_id;
         self
@@ -69,6 +76,12 @@ impl SqlQueryBuilder {
 
     /// Specify if the query result should include the internal row address.
     /// If true, the query result will include an additional column named "_rowaddr".
+    ///
+    /// The column is appended automatically only for queries whose output rows
+    /// map one-to-one to dataset rows (plain projections/filters). For queries
+    /// that change row cardinality (i.e., DISTINCT, GROUP BY, aggregates, ...),
+    /// this flag makes "_rowaddr" available to reference explicitly in the SQL
+    /// text but does not append it to the result.
     pub fn with_row_addr(mut self, row_addr: bool) -> Self {
         self.with_row_addr = row_addr;
         self
@@ -98,16 +111,45 @@ impl SqlQueryBuilder {
         let statement = state.sql_to_statement(&self.sql, &dialect)?;
         let mut projected = statement.clone();
         let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
-        let plan = if project_system_columns(&mut projected, &columns) {
-            match state.statement_to_plan(projected).await {
-                Ok(plan) => plan,
-                Err(_) => state.statement_to_plan(statement).await?,
-            }
-        } else {
-            state.statement_to_plan(statement).await?
-        };
+        let plan = state.statement_to_plan(statement).await?;
+        // Append the requested system columns only when the plan proves that
+        // every output row maps one-to-one to a scanned source row; otherwise
+        // (aggregates, DISTINCT, joins, ...) the injection would be ambiguous
+        // or would change the query's relational results.
+        let plan =
+            if preserves_source_rows(&plan) && project_system_columns(&mut projected, &columns) {
+                match state.statement_to_plan(projected).await {
+                    Ok(plan) => plan,
+                    // The rewritten statement can still fail to plan in corner
+                    // cases (e.g. the user aliased another expression to the same
+                    // system column name). Fall back to the original plan so the
+                    // query runs, just without the extra columns.
+                    Err(_) => plan,
+                }
+            } else {
+                plan
+            };
         let df = ctx.execute_logical_plan(plan).await?;
         Ok(SqlQuery::new(df))
+    }
+}
+
+/// Returns true if every output row of the plan corresponds to exactly one
+/// row scanned from the source table, meaning appending system columns to the
+/// projection cannot change the values or cardinality of the other columns.
+///
+/// This is a conservative whitelist of row-preserving operators. Anything
+/// else (aggregates, DISTINCT, joins, unions, windows, ...) collapses,
+/// duplicates, or synthesizes rows, so system columns are not injected there.
+fn preserves_source_rows(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::Projection(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|p| preserves_source_rows(p)),
+        _ => false,
     }
 }
 
@@ -121,9 +163,6 @@ fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)])
     let SetExpr::Select(select) = query.body.as_mut() else {
         return false;
     };
-    if select.distinct.is_some() {
-        return false;
-    }
 
     let mut changed = false;
     for &(enabled, name) in columns {
@@ -218,6 +257,7 @@ mod tests {
     use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -299,6 +339,30 @@ mod tests {
         let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
         let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
         assert_eq!(row_addrs.values(), &[0, 1]);
+
+        // Filter/sort/limit chains preserve row identity, so injection still
+        // applies to them.
+        let batches = ds
+            .sql("SELECT x FROM dataset WHERE x >= 0 ORDER BY x DESC LIMIT 2")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(batch.schema().fields().len(), 3);
+        assert_eq!(
+            batch["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[1, 0]
+        );
+        assert_eq!(
+            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
+            &[1, 0]
+        );
     }
 
     #[tokio::test]
@@ -337,6 +401,53 @@ mod tests {
             batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
             &[0, 1]
         );
+    }
+
+    /// System columns must never be injected into queries whose output rows
+    /// are not one-to-one with dataset rows: under GROUP BY ALL or DISTINCT
+    /// the injected columns would become extra grouping/dedup keys and change
+    /// the relational results.
+    #[rstest]
+    #[case::group_by_all("SELECT x % 1 AS k, COUNT(*) AS n FROM dataset GROUP BY ALL ORDER BY k")]
+    #[case::group_by_expr("SELECT x % 1 AS k, COUNT(*) AS n FROM dataset GROUP BY k ORDER BY k")]
+    #[case::distinct("SELECT DISTINCT x % 1 AS k FROM dataset ORDER BY k")]
+    #[case::distinct_in_subquery(
+        "SELECT k FROM (SELECT DISTINCT x % 1 AS k FROM dataset) ORDER BY k"
+    )]
+    #[case::bare_aggregate("SELECT COUNT(*) AS n FROM dataset")]
+    #[tokio::test]
+    async fn test_sql_system_columns_skip_cardinality_changing_queries(#[case] sql: &str) {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_system_columns_cardinality",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let baseline = ds
+            .sql(sql)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let with_system_columns = ds
+            .sql(sql)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        pretty_assertions::assert_eq!(with_system_columns, baseline);
     }
 
     #[tokio::test]
