@@ -341,6 +341,20 @@ async fn test_deep_clone_repairs_legacy_schema_before_activation() {
 }
 
 #[tokio::test]
+async fn test_stable_field_id_migration_repairs_legacy_schema_before_activation() {
+    let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+
+    dataset.validate().await.unwrap();
+    assert!(dataset.manifest.uses_stable_field_ids());
+}
+
+#[tokio::test]
 async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
     // In v0.21.0 and earlier, delta indices had a bug where the fragment bitmap
     // could contain fragments that are part of other index deltas.

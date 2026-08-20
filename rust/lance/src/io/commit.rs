@@ -725,7 +725,7 @@ fn check_column_indices(manifest: &Manifest) -> Result<()> {
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
-fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We can short-circuit if there is only one file per fragment or no fragments.
     if manifest.fragments.iter().all(|f| f.files.len() <= 1) {
         return Ok(());

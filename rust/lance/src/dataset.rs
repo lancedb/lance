@@ -134,7 +134,7 @@ use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
     DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_transaction, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -3268,11 +3268,13 @@ impl Dataset {
             return Ok(());
         }
 
+        let mut repaired_manifest = self.manifest.as_ref().clone();
+        fix_schema(&mut repaired_manifest)?;
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
-                fragments: self.manifest.fragments.as_ref().clone(),
-                schema: self.manifest.schema.clone(),
+                fragments: repaired_manifest.fragments.as_ref().clone(),
+                schema: repaired_manifest.schema,
                 preserves_nullability: true,
             },
             None,

@@ -17,6 +17,13 @@ use std::collections::{HashMap, HashSet};
 
 type DataFileIdentity = (Option<u32>, String);
 
+#[derive(Default)]
+struct FieldIdRemap {
+    canonical_ids: HashSet<i32>,
+    explicit_ids: HashMap<i32, i32>,
+    standalone_ids: HashMap<i32, i32>,
+}
+
 /// Transient schema-metadata marker used by bindings for raw Arrow input.
 pub const TRANSACTION_SCHEMA_SOURCE_RAW_ARROW: &str = "lance:transaction_schema_source_raw_arrow";
 
@@ -71,7 +78,7 @@ pub fn canonicalize_stable_field_ids(
             let Some(manifest) = manifest else {
                 return Ok(());
             };
-            canonicalize_schema(Some(manifest), schema, false, false, false)?;
+            canonicalize_raw_project_schema(manifest, schema)?;
         }
         Operation::Merge {
             schema, fragments, ..
@@ -103,21 +110,21 @@ fn canonicalize_merge_replacements(
     fragments: &mut [Fragment],
     retained_files: &HashSet<DataFileIdentity>,
 ) -> Result<()> {
-    let retained_field_ids = manifest
-        .fragments
-        .iter()
-        .flat_map(|fragment| fragment.referenced_lance_files())
-        .flat_map(|file| file.fields.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-    let replaced_field_ids = fragments
-        .iter()
-        .flat_map(|fragment| fragment.referenced_lance_files())
-        .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
-        .flat_map(|file| file.fields.iter())
-        .copied()
-        .filter(|field_id| retained_field_ids.contains(field_id))
-        .collect::<HashSet<_>>();
+    let mut replaced_field_ids = HashSet::new();
+    for fragment in fragments.iter() {
+        let retained_field_ids = fragment
+            .referenced_lance_files()
+            .filter(|file| retained_files.contains(&(file.base_id, file.path.clone())))
+            .flat_map(|file| file.fields.iter().copied())
+            .collect::<HashSet<_>>();
+        replaced_field_ids.extend(
+            fragment
+                .referenced_lance_files()
+                .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
+                .flat_map(|file| file.fields.iter().copied())
+                .filter(|field_id| retained_field_ids.contains(field_id)),
+        );
+    }
     if replaced_field_ids.is_empty() {
         return Ok(());
     }
@@ -131,13 +138,15 @@ fn canonicalize_merge_replacements(
     schema.validate()?;
     schema.verify_primary_key()?;
 
-    let field_id_remap = original
-        .fields_pre_order()
-        .zip(schema.fields_pre_order())
-        .filter_map(|(original, canonical)| {
-            (original.id != canonical.id).then_some((original.id, canonical.id))
-        })
-        .collect();
+    let mut field_id_remap = FieldIdRemap::default();
+    for (original, canonical) in original.fields_pre_order().zip(schema.fields_pre_order()) {
+        field_id_remap.canonical_ids.insert(canonical.id);
+        if original.id >= 0 {
+            field_id_remap
+                .explicit_ids
+                .insert(original.id, canonical.id);
+        }
+    }
     remap_fragment_field_ids(fragments, &field_id_remap, retained_files);
     Ok(())
 }
@@ -156,13 +165,31 @@ fn clear_replaced_and_new_field_ids(
     }
 }
 
+fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> Result<()> {
+    let mut unmatched_fields = Vec::new();
+    for field in &mut schema.fields {
+        if !canonicalize_field(field, -1, &manifest.schema, None, false) {
+            unmatched_fields.push(field.name.clone());
+        }
+    }
+    if !unmatched_fields.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "Raw Arrow Project fields [{}] do not match existing field identities; Project cannot allocate new identities because it writes no data",
+            unmatched_fields.join(", ")
+        )));
+    }
+    schema.validate()?;
+    schema.verify_primary_key()?;
+    Ok(())
+}
+
 fn canonicalize_schema(
     manifest: Option<&Manifest>,
     schema: &mut Schema,
     replaces_all_identities: bool,
     allow_id_binding: bool,
     remap_standalone_ids: bool,
-) -> Result<HashMap<i32, i32>> {
+) -> Result<FieldIdRemap> {
     let original = schema.clone();
 
     let max_existing_id = manifest.map(Manifest::max_field_id);
@@ -177,23 +204,27 @@ fn canonicalize_schema(
     schema.validate()?;
     schema.verify_primary_key()?;
 
-    let mut field_id_remap = HashMap::new();
+    let mut field_id_remap = FieldIdRemap::default();
     for (ordinal, (original, canonical)) in original
         .fields_pre_order()
         .zip(schema.fields_pre_order())
         .enumerate()
     {
+        field_id_remap.canonical_ids.insert(canonical.id);
         // Standalone fragment writers assign zero-based IDs when raw Arrow
         // fields omit metadata. Overwrite may later commit those files against
         // an existing stable dataset, so preserve that source mapping too.
         if remap_standalone_ids {
-            field_id_remap.insert(ordinal as i32, canonical.id);
+            field_id_remap
+                .standalone_ids
+                .insert(ordinal as i32, canonical.id);
         }
         if original.id >= 0 {
-            field_id_remap.insert(original.id, canonical.id);
+            field_id_remap
+                .explicit_ids
+                .insert(original.id, canonical.id);
         }
     }
-    field_id_remap.retain(|source, canonical| source != canonical);
     Ok(field_id_remap)
 }
 
@@ -203,7 +234,7 @@ fn canonicalize_field(
     base_schema: &Schema,
     base_parent: Option<&Field>,
     allow_id_binding: bool,
-) {
+) -> bool {
     let same_name = match base_parent {
         Some(parent) => parent.children.iter().find(|base| base.name == field.name),
         None => base_schema
@@ -223,20 +254,24 @@ fn canonicalize_field(
 
     let Some(base_field) = base_field else {
         clear_field_ids(field);
-        return;
+        return false;
     };
 
     field.id = base_field.id;
     field.parent_id = parent_id;
+    let mut all_children_match = true;
     for child in &mut field.children {
-        canonicalize_field(
+        if !canonicalize_field(
             child,
             field.id,
             base_schema,
             Some(base_field),
             allow_id_binding,
-        );
+        ) {
+            all_children_match = false;
+        }
     }
+    all_children_match
 }
 
 fn clear_field_ids(field: &mut Field) {
@@ -249,19 +284,43 @@ fn clear_field_ids(field: &mut Field) {
 
 fn remap_fragment_field_ids(
     fragments: &mut [Fragment],
-    field_id_remap: &HashMap<i32, i32>,
+    field_id_remap: &FieldIdRemap,
     retained_files: &HashSet<DataFileIdentity>,
 ) {
-    if field_id_remap.is_empty() {
-        return;
-    }
     for fragment in fragments {
+        // A dataset-aware staged overwrite already uses canonical IDs. Require
+        // the whole fragment to cover the canonical schema before skipping so
+        // an overlapping source ID in one split file cannot mask a remap.
+        let canonical_fragment = !field_id_remap.standalone_ids.is_empty()
+            && fragment
+                .referenced_lance_files()
+                .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
+                .flat_map(|file| file.fields.iter().copied())
+                .filter(|field_id| *field_id >= 0)
+                .collect::<HashSet<_>>()
+                == field_id_remap.canonical_ids;
         for file in fragment.referenced_lance_files_mut() {
             if retained_files.contains(&(file.base_id, file.path.clone())) {
                 continue;
             }
+            if canonical_fragment {
+                continue;
+            }
+            let non_negative_ids = file
+                .fields
+                .iter()
+                .copied()
+                .filter(|field_id| *field_id >= 0);
+            let source_ids = if non_negative_ids
+                .clone()
+                .all(|field_id| field_id_remap.explicit_ids.contains_key(&field_id))
+            {
+                &field_id_remap.explicit_ids
+            } else {
+                &field_id_remap.standalone_ids
+            };
             for field_id in std::sync::Arc::make_mut(&mut file.fields) {
-                if let Some(canonical_id) = field_id_remap.get(field_id) {
+                if let Some(canonical_id) = source_ids.get(field_id) {
                     *field_id = *canonical_id;
                 }
             }
@@ -1074,7 +1133,46 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_raw_arrow_project_does_not_bind_by_field_id() {
+    fn canonicalize_overwrite_preserves_already_canonical_fragment_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 1;
+        schema.fields[1].id = 2;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![1, 2])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1, 2]);
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_project_rejects_unmatched_field() {
         let manifest = activated_manifest();
         let mut schema = one_field_schema();
         schema.fields[0].name = "renamed".to_string();
@@ -1087,17 +1185,9 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
-        let Operation::Project { schema, .. } = operation else {
-            unreachable!();
-        };
-        assert_eq!(schema.fields[0].id, 1);
-        assert!(
-            !schema
-                .metadata
-                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
-        );
+        assert!(err.to_string().contains("writes no data"), "{err}");
     }
 
     #[test]
@@ -1128,7 +1218,44 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_merge_allocates_fresh_identity_for_replaced_column() {
+    fn canonicalize_merge_preserves_identity_for_physical_rewrite() {
+        let mut manifest = activated_manifest();
+        Arc::make_mut(&mut manifest.fragments).push(fragment_with_file_fields(
+            1,
+            "retained.lance",
+            vec![0],
+        ));
+        let rewritten_fragment = fragment_with_file_fields(0, "replacement.lance", vec![0]);
+        let mut operation = Operation::Merge {
+            fragments: vec![rewritten_fragment, manifest.fragments[1].clone()],
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Merge {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+        assert_eq!(fragments[1].files[0].fields.as_ref(), &[0]);
+        validate_operation(
+            Some(&manifest),
+            &Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonicalize_merge_allocates_fresh_identity_for_overlaid_column() {
         let manifest = activated_manifest();
         let mut merged_fragment = manifest.fragments[0].clone();
         merged_fragment.files.push(DataFile::new_legacy_from_fields(
