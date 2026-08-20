@@ -485,6 +485,7 @@ pub struct FilteredReadGlobalMetrics {
     encoded_predicate_predicted_read_rows: Count,
     encoded_predicate_selected_rows: Count,
     encoded_predicate_selected_ranges: Count,
+    encoded_predicate_auto_planning: AsyncMutex<()>,
     encoded_predicate_auto_decision: OnceCell<EncodedPredicateAutoDecision>,
     io_metrics: IoMetrics,
 }
@@ -509,6 +510,7 @@ impl FilteredReadGlobalMetrics {
                 .new_count("encoded_predicate_selected_rows", 0),
             encoded_predicate_selected_ranges: metrics
                 .new_count("encoded_predicate_selected_ranges", 0),
+            encoded_predicate_auto_planning: AsyncMutex::new(()),
             encoded_predicate_auto_decision: OnceCell::new(),
             io_metrics: IoMetrics::new(metrics, 0),
         }
@@ -1650,6 +1652,20 @@ impl FilteredReadStream {
             return Ok(None);
         }
         global_metrics.encoded_predicate_attempts.add(1);
+        let mut auto_planning_guard = if mode == EncodedPredicateMode::Auto {
+            Some(global_metrics.encoded_predicate_auto_planning.lock().await)
+        } else {
+            None
+        };
+        if mode == EncodedPredicateMode::Auto
+            && let Some(decision) = global_metrics.encoded_predicate_auto_decision.get()
+        {
+            if !decision.apply {
+                global_metrics.encoded_predicate_rejected.add(1);
+                return Ok(None);
+            }
+            drop(auto_planning_guard.take());
+        }
         let predicate_projection = fragment_read_task
             .projection
             .as_ref()
@@ -1770,6 +1786,7 @@ impl FilteredReadStream {
                     })
                 })
                 .await?;
+            drop(auto_planning_guard.take());
             if decision.encoding != plan.encoding || !decision.apply {
                 global_metrics.encoded_predicate_rejected.add(1);
                 global_metrics
