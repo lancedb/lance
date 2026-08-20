@@ -824,6 +824,14 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
+        Ok(self.into_builder_chunked(None, None).await?.0)
+    }
+
+    async fn into_builder_chunked(
+        self,
+        chunk_tokens_override: Option<usize>,
+        max_list_children_override: Option<u64>,
+    ) -> Result<(InnerBuilder, usize)> {
         let mut builder = InnerBuilder::new_with_posting_tail_codec_and_block_size(
             self.id,
             self.inverted_list.has_positions(),
@@ -837,17 +845,31 @@ impl InvertedPartition {
         builder
             .posting_lists
             .reserve_exact(self.inverted_list.len());
-        for posting_list in self
+        let chunk_count = self
             .inverted_list
-            .read_all(self.inverted_list.has_positions())
-            .await?
-        {
-            let posting_list = posting_list?;
-            builder
-                .posting_lists
-                .push(posting_list.into_builder(&builder.docs));
-        }
-        Ok(builder)
+            .for_each_posting_list_chunked(
+                self.inverted_list.has_positions(),
+                chunk_tokens_override,
+                max_list_children_override,
+                |posting_list| {
+                    builder
+                        .posting_lists
+                        .push(posting_list.into_builder(&builder.docs));
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok((builder, chunk_count))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn into_builder_with_chunk_limits(
+        self,
+        chunk_tokens: usize,
+        max_list_children: u64,
+    ) -> Result<(InnerBuilder, usize)> {
+        self.into_builder_chunked(Some(chunk_tokens), Some(max_list_children))
+            .await
     }
 }
 
