@@ -5021,6 +5021,15 @@ mod tests {
         let mut ids = ids.values().to_vec();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3, 7]);
+
+        let mut deleted = dataset.clone();
+        deleted.delete("id = 1").await?;
+        assert_eq!(
+            deleted
+                .count_rows(Some(format!("cell_flag(value, '{}')", FLAG_NAME)))
+                .await?,
+            1
+        );
         Ok(())
     }
 

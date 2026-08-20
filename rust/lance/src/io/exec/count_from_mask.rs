@@ -370,6 +370,7 @@ impl CountFromMaskExec {
         context: Arc<datafusion::execution::context::TaskContext>,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
+        let has_materialized_prefilter = prefilter_mask.is_some();
         let prefilter = match (prefilter_input, prefilter_mask) {
             (None, mask) => mask,
             (Some(input), None) => Some(Self::load_prefilter(input, context.clone()).await?),
@@ -403,14 +404,37 @@ impl CountFromMaskExec {
                 }
             }
         } else {
-            let fragments_allow = Self::address_fragments_allow(&dataset, &fragments_covered)?;
             // Load the deletion mask for the covered fragments.
-            let deletion_mask =
-                match DatasetPreFilter::create_deletion_mask(dataset.clone(), fragments_covered) {
-                    Some(fut) => Some(fut.await?),
-                    None => None,
+            let deletion_mask = match DatasetPreFilter::create_deletion_mask(
+                dataset.clone(),
+                fragments_covered.clone(),
+            ) {
+                Some(fut) => Some(fut.await?),
+                None => None,
+            };
+            let combined = if has_materialized_prefilter {
+                let RowAddrMask::AllowList(mut selected) = prefilter.ok_or_else(|| {
+                    Error::internal(
+                        "CountFromMaskExec is missing its materialized prefilter".to_string(),
+                    )
+                })?
+                else {
+                    return Err(Error::internal(
+                        "CountFromMaskExec requires an allow-list materialized prefilter"
+                            .to_string(),
+                    ));
                 };
-            let combined = Self::combine_masks(fragments_allow, prefilter, deletion_mask);
+                selected.retain_fragments(fragments_covered.iter());
+                match deletion_mask {
+                    None => RowAddrMask::AllowList(selected),
+                    Some(deletion_mask) => {
+                        RowAddrMask::AllowList(selected) & (*deletion_mask).clone()
+                    }
+                }
+            } else {
+                let fragments_allow = Self::address_fragments_allow(&dataset, &fragments_covered)?;
+                Self::combine_masks(fragments_allow, prefilter, deletion_mask)
+            };
             Self::count_from_mask(&combined, dataset.as_ref())?
         };
 

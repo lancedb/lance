@@ -256,6 +256,7 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
                 _ => None,
             })
             .and_then(|selection| selection.row_addr_mask())
+            .filter(|mask| mask.allow_list().is_some())
             .cloned()
     };
     if prefilter_mask.is_some() {
