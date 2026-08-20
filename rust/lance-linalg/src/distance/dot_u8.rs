@@ -173,7 +173,7 @@ mod tests {
         0, 1, 7, 15, 16, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 1024, 4096, 4097,
     ];
 
-    fn check_all_backends(a: &[u8], b: &[u8], case: &str) {
+    fn check_default_backends(a: &[u8], b: &[u8], case: &str) {
         let reference = dot_u8_scalar(a, b);
 
         #[cfg(target_arch = "x86_64")]
@@ -182,17 +182,34 @@ mod tests {
                 let got = unsafe { x86::dot_u8_avx2(a, b) };
                 assert_eq!(got, reference, "avx2 [{case}] n={}", a.len());
             }
-
-            if is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx512bw")
-                && is_x86_feature_detected!("avx512vnni")
-            {
-                let got = unsafe { x86::dot_u8_avx512_vnni(a, b) };
-                assert_eq!(got, reference, "avx512_vnni [{case}] n={}", a.len());
-            }
         }
 
         assert_eq!(dot_u8(a, b), reference, "dispatch [{case}] n={}", a.len());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "requires runtime AVX-512F, AVX-512BW, and AVX-512VNNI support; see https://github.com/lance-format/lance/issues/8663"]
+    fn test_dot_u8_avx512_vnni() {
+        assert!(
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni"),
+            "test requires runtime AVX-512F, AVX-512BW, and AVX-512VNNI support"
+        );
+
+        let mut a = vec![0u8; 4097];
+        let mut b = vec![0u8; 4097];
+        for seed_idx in 0..4u32 {
+            let mut seed = 0xC0FFEE_u32.wrapping_add(seed_idx.wrapping_mul(7919));
+            for &n in SIZES {
+                fill_random(&mut a[..n], &mut seed);
+                fill_random(&mut b[..n], &mut seed);
+                let reference = dot_u8_scalar(&a[..n], &b[..n]);
+                let got = unsafe { x86::dot_u8_avx512_vnni(&a[..n], &b[..n]) };
+                assert_eq!(got, reference, "avx512_vnni [random] n={n}");
+            }
+        }
     }
 
     #[test]
@@ -205,7 +222,7 @@ mod tests {
             for &n in SIZES {
                 fill_random(&mut a[..n], &mut seed);
                 fill_random(&mut b[..n], &mut seed);
-                check_all_backends(&a[..n], &b[..n], "random");
+                check_default_backends(&a[..n], &b[..n], "random");
             }
         }
     }
@@ -218,21 +235,21 @@ mod tests {
         for &n in SIZES {
             a[..n].fill(u8::MAX);
             b[..n].fill(u8::MAX);
-            check_all_backends(&a[..n], &b[..n], "max*max");
+            check_default_backends(&a[..n], &b[..n], "max*max");
 
             a[..n].fill(u8::MAX);
             b[..n].fill(0);
-            check_all_backends(&a[..n], &b[..n], "max*0");
+            check_default_backends(&a[..n], &b[..n], "max*0");
 
             a[..n].fill(0);
             b[..n].fill(u8::MAX);
-            check_all_backends(&a[..n], &b[..n], "0*max");
+            check_default_backends(&a[..n], &b[..n], "0*max");
 
             for i in 0..n {
                 a[i] = if i & 1 == 0 { 0 } else { u8::MAX };
                 b[i] = if i & 1 == 0 { u8::MAX } else { 0 };
             }
-            check_all_backends(&a[..n], &b[..n], "alt 0/max");
+            check_default_backends(&a[..n], &b[..n], "alt 0/max");
         }
     }
 
@@ -245,11 +262,11 @@ mod tests {
             let mut seed = 0xDEAD_BEEF_u32;
             fill_random(&mut a[..n], &mut seed);
             b[..n].fill(0);
-            check_all_backends(&a[..n], &b[..n], "b=0");
+            check_default_backends(&a[..n], &b[..n], "b=0");
 
             a[..n].fill(0);
             fill_random(&mut b[..n], &mut seed);
-            check_all_backends(&a[..n], &b[..n], "a=0");
+            check_default_backends(&a[..n], &b[..n], "a=0");
         }
     }
 
@@ -261,7 +278,7 @@ mod tests {
         for &n in SIZES {
             a[..n].fill(1);
             b[..n].fill(1);
-            check_all_backends(&a[..n], &b[..n], "1*1");
+            check_default_backends(&a[..n], &b[..n], "1*1");
             assert_eq!(dot_u8_scalar(&a[..n], &b[..n]), n as u32);
         }
     }

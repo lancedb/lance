@@ -1663,10 +1663,12 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires runtime AVX-512F and AVX-512VPOPCNTDQ support; see https://github.com/lance-format/lance/issues/8663"]
     fn test_avx512_popcount() {
-        if !is_x86_feature_detected!("avx512vpopcntdq") || !is_x86_feature_detected!("avx512f") {
-            return;
-        }
+        assert!(
+            is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq"),
+            "test requires runtime AVX-512F and AVX-512VPOPCNTDQ support"
+        );
 
         let query = 0u64;
         let targets = vec![0u64, 1, 3, 7, 15, 31, 63, 127];

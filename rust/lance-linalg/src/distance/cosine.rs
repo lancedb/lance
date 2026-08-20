@@ -1547,16 +1547,19 @@ mod tests {
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
-        /// AVX-512-direct parity for the f32 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F so the test stays portable.
+        /// AVX-512-direct parity for the f32 cosine_fast kernel. The
+        /// conditional x86 CI pass runs this ignored test when AVX-512F is
+        /// available.
         #[cfg(target_arch = "x86_64")]
         #[test]
+        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_cosine_fast_f32_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
         ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
+            assert!(
+                std::is_x86_feature_detected!("avx512f"),
+                "test requires runtime AVX-512F support"
+            );
             prop_assume!(norm_l2(&x) > 1e-10);
             prop_assume!(norm_l2(&y) > 1e-10);
             let x_norm = norm_l2(&x);
@@ -1622,16 +1625,19 @@ mod tests {
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
-        /// AVX-512-direct parity for the f32 cosine_with_norms kernel.
-        /// Early-returns on hosts without AVX-512F.
+        /// AVX-512-direct parity for the f32 cosine_with_norms kernel. The
+        /// conditional x86 CI pass runs this ignored test when AVX-512F is
+        /// available.
         #[cfg(target_arch = "x86_64")]
         #[test]
+        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_cosine_with_norms_f32_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
         ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
+            assert!(
+                std::is_x86_feature_detected!("avx512f"),
+                "test requires runtime AVX-512F support"
+            );
             prop_assume!(norm_l2(&x) > 1e-10);
             prop_assume!(norm_l2(&y) > 1e-10);
             let x_norm = norm_l2(&x);
@@ -1697,16 +1703,19 @@ mod tests {
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
-        /// AVX-512-direct parity for the f64 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F.
+        /// AVX-512-direct parity for the f64 cosine_fast kernel. The
+        /// conditional x86 CI pass runs this ignored test when AVX-512F is
+        /// available.
         #[cfg(target_arch = "x86_64")]
         #[test]
+        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_cosine_fast_f64_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
         ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
+            assert!(
+                std::is_x86_feature_detected!("avx512f"),
+                "test requires runtime AVX-512F support"
+            );
             prop_assume!(norm_l2(&x) > 1e-20);
             prop_assume!(norm_l2(&y) > 1e-20);
             let x_norm = norm_l2(&x);
@@ -1794,17 +1803,19 @@ mod tests {
         }
 
         /// AVX-512-direct parity for the 8-lane cosine_once kernel. Verifies
-        /// the masked-load (mask 0x00FF) AVX-512 implementation produces
-        /// the same result as the scalar reference. Early-returns on hosts
-        /// without AVX-512F.
+        /// the masked-load (mask 0x00FF) AVX-512 implementation produces the
+        /// same result as the scalar reference. The conditional x86 CI pass
+        /// runs this ignored test when AVX-512F is available.
         #[cfg(target_arch = "x86_64")]
         #[test]
+        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_cosine_once_8_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
         ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
+            assert!(
+                std::is_x86_feature_detected!("avx512f"),
+                "test requires runtime AVX-512F support"
+            );
             prop_assume!(norm_l2(&x) > 1e-10);
             prop_assume!(norm_l2(&y) > 1e-10);
             let x_norm = norm_l2(&x);
@@ -1816,16 +1827,18 @@ mod tests {
 
         /// AVX-512-direct parity for the 16-lane cosine_once kernel. Verifies
         /// the full-width `__m512` load implementation produces the same
-        /// result as the scalar reference. Early-returns on hosts without
-        /// AVX-512F.
+        /// result as the scalar reference. The conditional x86 CI pass runs
+        /// this ignored test when AVX-512F is available.
         #[cfg(target_arch = "x86_64")]
         #[test]
+        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_cosine_once_16_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
         ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
+            assert!(
+                std::is_x86_feature_detected!("avx512f"),
+                "test requires runtime AVX-512F support"
+            );
             prop_assume!(norm_l2(&x) > 1e-10);
             prop_assume!(norm_l2(&y) > 1e-10);
             let x_norm = norm_l2(&x);
@@ -1992,13 +2005,16 @@ mod tests {
         check_cosine_batch_kernel(super::f32::cosine_batch_avx);
     }
 
-    /// AVX-512 batch kernel parity. Early-returns on hosts without AVX-512F.
+    /// AVX-512 batch kernel parity. The conditional x86 CI pass runs this
+    /// ignored test when AVX-512F is available.
     #[cfg(target_arch = "x86_64")]
     #[test]
+    #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
     fn test_cosine_batch_avx512_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx512f") {
-            return;
-        }
+        assert!(
+            std::is_x86_feature_detected!("avx512f"),
+            "test requires runtime AVX-512F support"
+        );
         check_cosine_batch_kernel(super::f32::cosine_batch_avx512);
     }
 }
