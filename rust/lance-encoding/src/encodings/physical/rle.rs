@@ -68,6 +68,7 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
+use crate::predicate::PrimitivePredicate;
 
 use lance_core::{Error, Result};
 
@@ -1562,6 +1563,47 @@ impl MiniBlockDecompressor for RleDecompressor {
             .checked_mul(self.bits_per_value)
             .map(|bits| bits.div_ceil(8))
     }
+
+    fn evaluate_primitive_predicate(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Option<DataBlock>> {
+        if self.bits_per_value != 32 || data.len() != 2 || num_values == 0 {
+            return Ok(None);
+        }
+        let mut data = data.into_iter();
+        let (values, lengths) =
+            self.decode_child_buffers(data.next().unwrap(), data.next().unwrap())?;
+        let length_size = self.run_length_width.bytes_per_value();
+        if !values.len().is_multiple_of(std::mem::size_of::<u32>())
+            || !lengths.len().is_multiple_of(length_size)
+        {
+            return Err(Error::invalid_input_source(
+                "Invalid 32-bit RLE buffers for encoded predicate".into(),
+            ));
+        }
+        let values = values.borrow_to_typed_slice::<u32>();
+        let length_chunks = lengths.as_ref().chunks_exact(length_size);
+        if values.len() != length_chunks.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Inconsistent RLE predicate buffers: {} values and {} lengths",
+                    values.len(),
+                    length_chunks.len()
+                )
+                .into(),
+            ));
+        }
+        let runs = values
+            .iter()
+            .copied()
+            .zip(length_chunks.map(|length| self.run_length_width.read_length(length) as usize));
+        let matches = predicate.evaluate_u32_runs(runs, num_values)?;
+        crate::predicate::record_direct_values(num_values);
+        Ok(Some(matches))
+    }
 }
 
 impl BlockDecompressor for RleDecompressor {
@@ -1858,9 +1900,11 @@ mod tests {
     use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
     use crate::{
         buffer::LanceBuffer,
-        compression::{BlockCompressor, BlockDecompressor},
+        compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor},
+        predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate},
     };
     use arrow_array::Int32Array;
+    use arrow_buffer::BooleanBuffer;
     use rstest::rstest;
 
     fn compress_miniblock(
@@ -1876,6 +1920,31 @@ mod tests {
             expanded.extend(std::iter::repeat_n(value, length));
         }
         expanded
+    }
+
+    #[test]
+    fn evaluates_u32_predicate_once_per_rle_run() {
+        let values = LanceBuffer::reinterpret_vec(vec![1_u32, 5, 9]);
+        let lengths = LanceBuffer::from(vec![3_u8, 2, 4]);
+        let predicate = PrimitivePredicate {
+            column: "value".to_string(),
+            operator: ComparisonOperator::GreaterThanOrEqual,
+            literal: PrimitiveLiteral::UInt32(5),
+        };
+        let actual = MiniBlockDecompressor::evaluate_primitive_predicate(
+            &RleDecompressor::new(32),
+            vec![values, lengths],
+            9,
+            &predicate,
+        )
+        .unwrap()
+        .unwrap();
+        let actual = actual.as_fixed_width_ref().unwrap();
+        let actual = BooleanBuffer::new(actual.data.clone().into_buffer(), 0, 9);
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            vec![false, false, false, true, true, true, true, true, true,]
+        );
     }
 
     #[test]

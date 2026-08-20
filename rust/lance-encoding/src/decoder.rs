@@ -256,6 +256,7 @@ use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
 use crate::format::pb21;
+use crate::predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -2171,12 +2172,39 @@ pub fn create_decode_stream(
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
     batch_size_bytes: Option<u64>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
+    create_decode_stream_with_filter(
+        schema,
+        num_rows,
+        batch_size,
+        is_structural,
+        should_validate,
+        spawn_structural_batch_decode_tasks,
+        rx,
+        batch_size_bytes,
+        &FilterExpression::no_filter(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_decode_stream_with_filter(
+    schema: &Schema,
+    num_rows: u64,
+    batch_size: u32,
+    is_structural: bool,
+    should_validate: bool,
+    spawn_structural_batch_decode_tasks: bool,
+    rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    batch_size_bytes: Option<u64>,
+    filter: &FilterExpression,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
-        let structural_decoder = StructuralStructDecoder::new(
+        let predicate = filter.as_primitive()?;
+        let structural_decoder = StructuralStructDecoder::new_with_predicate(
             arrow_schema.fields,
             should_validate,
             /*is_root=*/ true,
+            predicate.as_ref(),
         )?;
         Ok(StructuralBatchDecodeStream::new(
             rx,
@@ -2234,6 +2262,36 @@ pub fn create_decode_iterator(
     }
 }
 
+fn primitive_predicate_decode_schema(
+    target_schema: &Arc<Schema>,
+    filter: &FilterExpression,
+) -> Result<Arc<Schema>> {
+    let Some(predicate) = filter.as_primitive()? else {
+        return Ok(target_schema.clone());
+    };
+    if target_schema.fields.len() != 1 || target_schema.fields[0].name != predicate.column {
+        return Err(Error::invalid_input(format!(
+            "Encoded primitive predicate for '{}' requires an exact one-column projection",
+            predicate.column
+        )));
+    }
+    let expected_type = match predicate.literal {
+        PrimitiveLiteral::Int32(_) => DataType::Int32,
+        PrimitiveLiteral::UInt32(_) => DataType::UInt32,
+    };
+    if target_schema.fields[0].data_type() != expected_type {
+        return Err(Error::invalid_input(format!(
+            "Encoded primitive predicate for '{}' expected {:?}, got {:?}",
+            predicate.column,
+            expected_type,
+            target_schema.fields[0].data_type()
+        )));
+    }
+    let mut schema = target_schema.as_ref().clone();
+    schema.fields[0].logical_type = (&DataType::Boolean).try_into()?;
+    Ok(Arc::new(schema))
+}
+
 async fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -2245,6 +2303,13 @@ async fn create_scheduler_decoder(
     let num_rows = requested_rows.num_rows();
 
     let is_structural = column_infos[0].is_structural();
+    let predicate = filter.as_primitive()?;
+    if predicate.is_some() && !is_structural {
+        return Err(Error::not_supported_source(
+            "Encoded primitive predicates require structural (v2.1+) pages".into(),
+        ));
+    }
+    let decode_schema = primitive_predicate_decode_schema(&target_schema, &filter)?;
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = match mode.ok().as_deref() {
         Some("always") => true,
@@ -2254,8 +2319,8 @@ async fn create_scheduler_decoder(
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let decode_stream = create_decode_stream(
-        &target_schema,
+    let decode_stream = create_decode_stream_with_filter(
+        &decode_schema,
         num_rows,
         config.batch_size,
         is_structural,
@@ -2263,6 +2328,7 @@ async fn create_scheduler_decoder(
         spawn_structural_batch_decode_tasks,
         rx,
         config.batch_size_bytes,
+        &filter,
     )?;
 
     // The scheduler's `initialize` may perform I/O to load column metadata
@@ -2745,9 +2811,12 @@ pub trait StructuralSchedulingJob: std::fmt::Debug {
 /// as an arbitrary byte sequence.
 ///
 /// We recommend that encodings use Substrait for filters.
+#[derive(Debug, Clone)]
 pub struct FilterExpression(pub Bytes);
 
 impl FilterExpression {
+    const PRIMITIVE_PREDICATE_MAGIC: &'static [u8; 8] = b"LCPRED01";
+
     /// Create a filter expression that does not filter any data
     ///
     /// This is currently represented by an empty byte array.  Encoders
@@ -2759,6 +2828,92 @@ impl FilterExpression {
     /// Returns true if the filter is the same as the [`Self::no_filter`] filter
     pub fn is_noop(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Encodes an internal primitive predicate for the current-format decoder.
+    pub fn primitive(predicate: &PrimitivePredicate) -> Result<Self> {
+        let column = predicate.column.as_bytes();
+        let column_len = u32::try_from(column.len()).map_err(|_| {
+            Error::invalid_input("Encoded predicate column name is longer than u32::MAX")
+        })?;
+        let mut encoded =
+            Vec::with_capacity(Self::PRIMITIVE_PREDICATE_MAGIC.len() + 10 + column.len());
+        encoded.extend_from_slice(Self::PRIMITIVE_PREDICATE_MAGIC);
+        encoded.push(match predicate.literal {
+            PrimitiveLiteral::Int32(_) => 0,
+            PrimitiveLiteral::UInt32(_) => 1,
+        });
+        encoded.push(match predicate.operator {
+            ComparisonOperator::Equal => 0,
+            ComparisonOperator::NotEqual => 1,
+            ComparisonOperator::LessThan => 2,
+            ComparisonOperator::LessThanOrEqual => 3,
+            ComparisonOperator::GreaterThan => 4,
+            ComparisonOperator::GreaterThanOrEqual => 5,
+        });
+        encoded.extend_from_slice(&column_len.to_le_bytes());
+        encoded.extend_from_slice(column);
+        encoded.extend_from_slice(&match predicate.literal {
+            PrimitiveLiteral::Int32(value) => value.to_le_bytes(),
+            PrimitiveLiteral::UInt32(value) => value.to_le_bytes(),
+        });
+        Ok(Self(Bytes::from(encoded)))
+    }
+
+    /// Decodes an internal primitive predicate, returning `None` for other filter formats.
+    pub fn as_primitive(&self) -> Result<Option<PrimitivePredicate>> {
+        if !self.0.starts_with(Self::PRIMITIVE_PREDICATE_MAGIC) {
+            return Ok(None);
+        }
+        let encoded = self.0.as_ref();
+        let header_len = Self::PRIMITIVE_PREDICATE_MAGIC.len();
+        if encoded.len() < header_len + 10 {
+            return Err(Error::invalid_input(
+                "Truncated encoded primitive predicate",
+            ));
+        }
+        let literal_type = encoded[header_len];
+        let operator = match encoded[header_len + 1] {
+            0 => ComparisonOperator::Equal,
+            1 => ComparisonOperator::NotEqual,
+            2 => ComparisonOperator::LessThan,
+            3 => ComparisonOperator::LessThanOrEqual,
+            4 => ComparisonOperator::GreaterThan,
+            5 => ComparisonOperator::GreaterThanOrEqual,
+            value => {
+                return Err(Error::invalid_input(format!(
+                    "Unknown encoded primitive predicate operator {value}"
+                )));
+            }
+        };
+        let column_len =
+            u32::from_le_bytes(encoded[header_len + 2..header_len + 6].try_into().unwrap())
+                as usize;
+        let expected_len = header_len + 6 + column_len + 4;
+        if encoded.len() != expected_len {
+            return Err(Error::invalid_input(format!(
+                "Invalid encoded primitive predicate length: expected {expected_len}, got {}",
+                encoded.len()
+            )));
+        }
+        let column = std::str::from_utf8(&encoded[header_len + 6..header_len + 6 + column_len])
+            .map_err(|err| Error::invalid_input(format!("Invalid predicate column name: {err}")))?
+            .to_string();
+        let value = u32::from_le_bytes(encoded[expected_len - 4..].try_into().unwrap());
+        let literal = match literal_type {
+            0 => PrimitiveLiteral::Int32(value as i32),
+            1 => PrimitiveLiteral::UInt32(value),
+            value => {
+                return Err(Error::invalid_input(format!(
+                    "Unknown encoded primitive predicate literal type {value}"
+                )));
+            }
+        };
+        Ok(Some(PrimitivePredicate {
+            column,
+            operator,
+            literal,
+        }))
     }
 }
 
@@ -2880,8 +3035,41 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
     fn decode(self: Box<Self>) -> Result<DecodedPage>;
 }
 
+#[derive(Debug)]
+struct DecodePrimitivePredicateTask {
+    inner: Box<dyn DecodePageTask>,
+    predicate: PrimitivePredicate,
+}
+
+impl DecodePageTask for DecodePrimitivePredicateTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let decoded = self.inner.decode()?;
+        crate::predicate::record_fallback_values(decoded.data.num_values());
+        Ok(DecodedPage {
+            data: self.predicate.evaluate_block(&decoded.data)?,
+            repdef: decoded.repdef,
+        })
+    }
+}
+
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
+
+    /// Drains rows as a Boolean predicate result.
+    ///
+    /// Page implementations can override this to evaluate directly on encoded buffers. The
+    /// default keeps the fallback correct by decoding to a [`DataBlock`] before comparing.
+    fn drain_primitive_predicate(
+        &mut self,
+        num_rows: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Box<dyn DecodePageTask>> {
+        Ok(Box::new(DecodePrimitivePredicateTask {
+            inner: self.drain(num_rows)?,
+            predicate: predicate.clone(),
+        }))
+    }
+
     fn num_rows(&self) -> u64;
 }
 
@@ -2984,8 +3172,9 @@ pub async fn decode_batch(
     let is_structural = layout == EncodedBatchLayout::Structural;
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = !matches!(mode.ok().as_deref(), Some("never"));
-    let mut decode_stream = create_decode_stream(
-        &batch.schema,
+    let decode_schema = primitive_predicate_decode_schema(&batch.schema, filter)?;
+    let mut decode_stream = create_decode_stream_with_filter(
+        &decode_schema,
         batch.num_rows,
         batch.num_rows as u32,
         is_structural,
@@ -2993,6 +3182,7 @@ pub async fn decode_batch(
         spawn_structural_batch_decode_tasks,
         rx,
         None,
+        filter,
     )?;
     decode_stream.next().await.unwrap().task.await
 }
@@ -3002,6 +3192,57 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn primitive_predicate_decodes_boolean_projection() {
+        use crate::{
+            encoder::{EncodingOptions, encode_batch},
+            predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate},
+            testing::{TestEncoding, test_encoding_strategy},
+        };
+        use arrow_array::{BooleanArray, Int32Array};
+
+        let input = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int32Array::from(vec![-3, -1, 0, 2, 8])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = Arc::new(Schema::try_from(input.schema().as_ref()).unwrap());
+        let encoded = encode_batch(
+            &input,
+            schema,
+            test_encoding_strategy(TestEncoding::StructuralU16).as_ref(),
+            &EncodingOptions::default(),
+        )
+        .await
+        .unwrap();
+        let filter = FilterExpression::primitive(&PrimitivePredicate {
+            column: "value".to_string(),
+            operator: ComparisonOperator::GreaterThanOrEqual,
+            literal: PrimitiveLiteral::Int32(0),
+        })
+        .unwrap();
+
+        let actual = decode_batch(
+            &encoded,
+            &filter,
+            Arc::new(DecoderPlugins::default()),
+            true,
+            EncodedBatchLayout::Structural,
+            None,
+        )
+        .await
+        .unwrap();
+        let actual = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(false), Some(true), Some(true), Some(true),]
+        );
+    }
 
     #[derive(Debug)]
     struct FailingPageDecoder {

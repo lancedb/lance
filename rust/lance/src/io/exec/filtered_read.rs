@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
 };
-use datafusion_expr::Expr;
+use datafusion_expr::{Expr, Operator};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
@@ -42,6 +42,10 @@ use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+};
+use lance_encoding::{
+    decoder::FilterExpression,
+    predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate},
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
@@ -73,6 +77,54 @@ fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef
     let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
     let schema: ArrowSchema = (&schema).into();
     Arc::new(schema)
+}
+
+fn encoded_primitive_predicate(expr: &Expr) -> Option<PrimitivePredicate> {
+    if std::env::var("LANCE_ENCODED_PRIMITIVE_PREDICATE")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
+    {
+        return None;
+    }
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+    let (column, literal, operator) = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (Expr::Column(column), Expr::Literal(literal, _)) => (&column.name, literal, binary.op),
+        (Expr::Literal(literal, _), Expr::Column(column)) => {
+            (&column.name, literal, reverse_operator(binary.op)?)
+        }
+        _ => return None,
+    };
+    let operator = match operator {
+        Operator::Eq => ComparisonOperator::Equal,
+        Operator::NotEq => ComparisonOperator::NotEqual,
+        Operator::Lt => ComparisonOperator::LessThan,
+        Operator::LtEq => ComparisonOperator::LessThanOrEqual,
+        Operator::Gt => ComparisonOperator::GreaterThan,
+        Operator::GtEq => ComparisonOperator::GreaterThanOrEqual,
+        _ => return None,
+    };
+    let literal = match literal {
+        datafusion::scalar::ScalarValue::Int32(Some(value)) => PrimitiveLiteral::Int32(*value),
+        datafusion::scalar::ScalarValue::UInt32(Some(value)) => PrimitiveLiteral::UInt32(*value),
+        _ => return None,
+    };
+    Some(PrimitivePredicate {
+        column: column.clone(),
+        operator,
+        literal,
+    })
+}
+
+fn reverse_operator(operator: Operator) -> Option<Operator> {
+    match operator {
+        Operator::Eq | Operator::NotEq => Some(operator),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1396,6 +1448,96 @@ impl FilteredReadStream {
         }
     }
 
+    async fn try_encoded_predicate_ranges(
+        fragment_read_task: &ScopedFragmentRead,
+        predicate: &PrimitivePredicate,
+        global_metrics: &FilteredReadGlobalMetrics,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        if predicate.column.contains('.') {
+            return Ok(None);
+        }
+        let predicate_projection = fragment_read_task
+            .projection
+            .as_ref()
+            .clone()
+            .union_column(&predicate.column, OnMissing::Error)?;
+        let predicate_schema = Arc::new(
+            predicate_projection
+                .to_bare_schema()
+                .project(&[predicate.column.as_str()])?,
+        );
+        let mut predicate_reader = fragment_read_task
+            .fragment
+            .open(&predicate_schema, fragment_read_task.frag_read_config())
+            .await?;
+        if fragment_read_task.with_deleted_rows {
+            predicate_reader.with_make_deletions_null();
+        }
+        let filter = FilterExpression::primitive(predicate)?;
+        let mask_stream = predicate_reader
+            .read_ranges_predicate(
+                fragment_read_task.ranges.clone().into(),
+                fragment_read_task.batch_size,
+                predicate_schema,
+                filter,
+            )
+            .await;
+        let Some(mut mask_stream) = (match mask_stream {
+            Ok(stream) => stream,
+            Err(Error::NotSupported { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }) else {
+            return Ok(None);
+        };
+
+        let mut physical_rows = fragment_read_task
+            .ranges
+            .iter()
+            .flat_map(|range| range.clone());
+        let mut selected = RoaringBitmap::new();
+        while let Some(batch) = mask_stream.next().await {
+            let batch = match batch.await {
+                Ok(batch) => batch,
+                Err(Error::NotSupported { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let mask = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    Error::internal("Encoded predicate did not produce a Boolean mask")
+                })?;
+            for matches in mask.iter() {
+                let row = physical_rows.next().ok_or_else(|| {
+                    Error::internal("Encoded predicate produced more rows than requested")
+                })?;
+                if matches == Some(true) {
+                    selected.insert(u32::try_from(row).map_err(|_| {
+                        Error::internal(format!("Fragment physical row {row} exceeds u32::MAX"))
+                    })?);
+                }
+            }
+        }
+        if physical_rows.next().is_some() {
+            return Err(Error::internal(
+                "Encoded predicate produced fewer rows than requested",
+            ));
+        }
+        global_metrics.rows_scanned.add(
+            fragment_read_task
+                .ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>() as usize,
+        );
+        global_metrics.fragments_scanned.add(1);
+        global_metrics
+            .ranges_scanned
+            .add(fragment_read_task.ranges.len());
+        Ok(Some(bitmap_to_ranges(&selected)))
+    }
+
     // Reads a single fragment into a stream of batch tasks
     #[instrument(name = "read_fragment", level = "debug", skip_all)]
     async fn read_fragment(
@@ -1406,6 +1548,30 @@ impl FilteredReadStream {
     ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
         let output_schema =
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
+
+        // The reader expects sorted ranges and it may be possible to get non-sorted ranges if
+        // the row ids are not contiguous.
+        fragment_read_task.ranges.sort_by_key(|range| range.start);
+
+        let mut encoded_predicate_applied = false;
+        if let Some(predicate) = fragment_read_task
+            .filter
+            .as_ref()
+            .and_then(encoded_primitive_predicate)
+            && let Some(selected_ranges) = Self::try_encoded_predicate_ranges(
+                &fragment_read_task,
+                &predicate,
+                global_metrics.as_ref(),
+            )
+            .await?
+        {
+            fragment_read_task.ranges = selected_ranges;
+            fragment_read_task.filter = None;
+            encoded_predicate_applied = true;
+            if fragment_read_task.ranges.is_empty() {
+                return Ok(futures::stream::empty().boxed());
+            }
+        }
 
         if let Some(filter) = &fragment_read_task.filter {
             let filter_cols = Planner::column_names_in_expr(filter);
@@ -1442,10 +1608,6 @@ impl FilteredReadStream {
             fragment_reader.with_make_deletions_null();
         }
 
-        // The reader expects sorted ranges and it may be possible to get non-sorted ranges if
-        // the row ids are not contiguous
-        fragment_read_task.ranges.sort_by_key(|r| r.start);
-
         let physical_filter = fragment_read_task
             .filter
             .map(|filter| {
@@ -1459,7 +1621,7 @@ impl FilteredReadStream {
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
         // used in the scan anyways.
-        let fragment_counted = Arc::new(AtomicBool::new(false));
+        let fragment_counted = Arc::new(AtomicBool::new(encoded_predicate_applied));
         let range_tracker = Arc::new(Mutex::new(RangeMetricsTracker::new(
             fragment_read_task.ranges.clone(),
         )));
@@ -1474,8 +1636,12 @@ impl FilteredReadStream {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
+                let encoded_predicate_applied = encoded_predicate_applied;
                 let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
+                        if encoded_predicate_applied {
+                            return;
+                        }
                         let num_rows = batch.num_rows();
                         global_metrics.rows_scanned.add(num_rows);
                         if !fragment_counted.swap(true, Ordering::Relaxed) {
@@ -3667,6 +3833,60 @@ mod tests {
                 .all(|batch| batch.schema() == expected_schema),
             "output schema metadata was not preserved with filter {filter:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_encoded_predicate_reads_only_selected_payload_rows() {
+        use arrow_array::{Int32Array, UInt64Array};
+        use arrow_schema::{DataType, Field as ArrowField};
+
+        let tmp_path = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("predicate", DataType::Int32, true),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(-2),
+                    None,
+                    Some(0),
+                    Some(4),
+                    Some(9),
+                ])),
+                Arc::new(UInt64Array::from(vec![10, 11, 12, 13, 14])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(reader, tmp_path.as_str(), None)
+                .await
+                .unwrap(),
+        );
+        let projection = dataset
+            .empty_projection()
+            .union_column("payload", OnMissing::Error)
+            .unwrap();
+        let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+        let filter = planner.parse_filter("predicate >= 0").unwrap();
+        let options = FilteredReadOptions::new(projection)
+            .with_filter(Some(filter.clone()), Some(filter))
+            .unwrap();
+        let plan = FilteredReadExec::try_new(dataset, options, None).unwrap();
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&plan.schema(), &batches).unwrap();
+        assert_eq!(batch.schema().fields().len(), 1);
+        let payload = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        assert_eq!(payload.values().as_ref(), &[12, 13, 14]);
     }
 
     fn u32s(ranges: Vec<Range<u32>>) -> Arc<dyn Array> {

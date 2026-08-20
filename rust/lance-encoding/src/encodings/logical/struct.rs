@@ -19,6 +19,7 @@ use crate::{
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
+    predicate::PrimitivePredicate,
     repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
 use arrow_array::{Array, ArrayRef, StructArray, cast::AsArray};
@@ -239,9 +240,18 @@ pub struct StructuralStructDecoder {
 
 impl StructuralStructDecoder {
     pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Result<Self> {
+        Self::new_with_predicate(fields, should_validate, is_root, None)
+    }
+
+    pub fn new_with_predicate(
+        fields: Fields,
+        should_validate: bool,
+        is_root: bool,
+        predicate: Option<&PrimitivePredicate>,
+    ) -> Result<Self> {
         let children = fields
             .iter()
-            .map(|field| Self::field_to_decoder(field, should_validate))
+            .map(|field| Self::field_to_decoder(field, should_validate, predicate))
             .collect::<Result<Vec<_>>>()?;
         let data_type = DataType::Struct(fields.clone());
         Ok(Self {
@@ -255,19 +265,32 @@ impl StructuralStructDecoder {
     fn field_to_decoder(
         field: &Arc<arrow_schema::Field>,
         should_validate: bool,
+        predicate: Option<&PrimitivePredicate>,
     ) -> Result<Box<dyn StructuralFieldDecoder>> {
+        let field_predicate = predicate
+            .filter(|predicate| predicate.column.as_str() == field.name())
+            .cloned();
         match field.data_type() {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() || field.is_blob() {
-                    let decoder =
-                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    let decoder = StructuralPrimitiveFieldDecoder::new_with_predicate(
+                        &field.clone(),
+                        should_validate,
+                        field_predicate,
+                    );
                     Ok(Box::new(decoder))
                 } else {
-                    Ok(Box::new(Self::new(fields.clone(), should_validate, false)?))
+                    Ok(Box::new(Self::new_with_predicate(
+                        fields.clone(),
+                        should_validate,
+                        false,
+                        predicate,
+                    )?))
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
-                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                let child_decoder =
+                    Self::field_to_decoder(child_field, should_validate, predicate)?;
                 Ok(Box::new(StructuralListDecoder::new(
                     child_decoder,
                     field.data_type().clone(),
@@ -283,7 +306,8 @@ impl StructuralStructDecoder {
                 // degenerate.
                 validate_fixed_size_list_dimensions(field.name(), field.data_type())?;
                 // FixedSizeList containing Struct needs structural decoding
-                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                let child_decoder =
+                    Self::field_to_decoder(child_field, should_validate, predicate)?;
                 Ok(Box::new(StructuralFixedSizeListDecoder::new(
                     child_decoder,
                     field.data_type().clone(),
@@ -297,7 +321,8 @@ impl StructuralStructDecoder {
                             .into(),
                     ));
                 }
-                let child_decoder = Self::field_to_decoder(entries_field, should_validate)?;
+                let child_decoder =
+                    Self::field_to_decoder(entries_field, should_validate, predicate)?;
                 Ok(Box::new(StructuralMapDecoder::new(
                     child_decoder,
                     field.data_type().clone(),
@@ -306,10 +331,13 @@ impl StructuralStructDecoder {
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
             DataType::Union(_, _) => todo!(),
-            _ => Ok(Box::new(StructuralPrimitiveFieldDecoder::new(
-                field,
-                should_validate,
-            ))),
+            _ => Ok(Box::new(
+                StructuralPrimitiveFieldDecoder::new_with_predicate(
+                    field,
+                    should_validate,
+                    field_predicate,
+                ),
+            )),
         }
     }
 
