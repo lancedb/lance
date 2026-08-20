@@ -48,6 +48,7 @@ pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the 
 use arrow_array::OffsetSizeTrait;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
@@ -893,6 +894,35 @@ fn store_out_byte(out: &mut [u8], out_curr: usize, byte: u8) {
     }
 }
 
+/// Consume `FSST_ESC` at `in_curr` and emit its payload byte.
+///
+/// Returns `false` when the payload would leave the current value interval
+/// `[in_curr, in_end)`, including a dangling escape at the last byte.
+#[inline(always)]
+fn emit_escape(
+    compressed_strs: &[u8],
+    in_curr: &mut usize,
+    in_end: usize,
+    out: &mut [u8],
+    out_curr: &mut usize,
+) -> bool {
+    let payload_index = *in_curr + 1;
+    if payload_index >= in_end {
+        return false;
+    }
+    store_out_byte(out, *out_curr, compressed_strs[payload_index]);
+    *out_curr += 1;
+    *in_curr += 2;
+    true
+}
+
+fn missing_escape_payload_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "FSST escape is missing a payload byte inside the current value",
+    )
+}
+
 fn decompress_bulk<T: OffsetSizeTrait>(
     decoder: &FsstDecoder<T>,
     compressed_strs: &[u8],
@@ -914,6 +944,7 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     // - Offsets have been normalized with `to_usize` and checked to be non-decreasing
     //   and within `compressed_strs.len()`, so `in_curr + 4 <= in_end` implies the
     //   `read_unaligned::<u32>` is in bounds.
+    let corrupt_escape = Cell::new(false);
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
@@ -981,10 +1012,12 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                     in_curr += 1;
                     *out_curr += len;
 
-                    // escape byte
-                    in_curr += 2;
-                    store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
-                    *out_curr += 1;
+                    // ESC is the last byte of this 4-byte window; its payload is the next
+                    // byte and may lie outside the current value.
+                    if !emit_escape(compressed_strs, &mut in_curr, in_end, out, out_curr) {
+                        corrupt_escape.set(true);
+                        return;
+                    }
                 } else if first_escape_pos == 2 {
                     // 0th byte
                     code = compressed_strs[in_curr] as usize;
@@ -1000,7 +1033,7 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                     in_curr += 1;
                     *out_curr += len;
 
-                    // escape byte
+                    // payload is inside the 4-byte window (`in_curr + 4 <= in_end`)
                     in_curr += 2;
                     store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
@@ -1012,12 +1045,10 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                     in_curr += 1;
                     *out_curr += len;
 
-                    // escape byte
                     in_curr += 2;
                     store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
                 } else {
-                    // escape byte
                     in_curr += 2;
                     store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
@@ -1025,35 +1056,18 @@ fn decompress_bulk<T: OffsetSizeTrait>(
             }
         }
 
-        // handle the remaining bytes
-        if in_curr + 2 <= in_end {
-            store_out_byte(out, *out_curr, compressed_strs[in_curr + 1]);
-            if compressed_strs[in_curr] != FSST_ESC {
+        while in_curr < in_end {
+            if compressed_strs[in_curr] == FSST_ESC {
+                if !emit_escape(compressed_strs, &mut in_curr, in_end, out, out_curr) {
+                    corrupt_escape.set(true);
+                    return;
+                }
+            } else {
                 let code = compressed_strs[in_curr] as usize;
                 write_symbol(out, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += lens[code] as usize;
-                if compressed_strs[in_curr] != FSST_ESC {
-                    let code = compressed_strs[in_curr] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
-                    in_curr += 1;
-                    *out_curr += lens[code] as usize;
-                } else {
-                    in_curr += 2;
-                    store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
-                    *out_curr += 1;
-                }
-            } else {
-                in_curr += 2;
-                *out_curr += 1;
             }
-        }
-
-        if in_curr < in_end {
-            // last code cannot be an escape code
-            let code = compressed_strs[in_curr] as usize;
-            write_symbol(out, *out_curr, symbols[code]);
-            *out_curr += lens[code] as usize;
         }
     };
 
@@ -1071,6 +1085,9 @@ fn decompress_bulk<T: OffsetSizeTrait>(
         let in_curr = offsets[i - 1].as_usize();
         let in_end = offsets[i].as_usize();
         decompress(in_curr, in_end, &mut out_curr);
+        if corrupt_escape.get() {
+            return Err(missing_escape_payload_error());
+        }
         out_offsets[i] = encode_offset(out_curr)?;
     }
     out.resize(out_curr, 0);
@@ -1334,6 +1351,7 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         out_offsets_buf: &mut Vec<T>,
     ) -> io::Result<()> {
         if !self.decoder_switch_on {
+            validate_offsets(in_offsets_buf, in_buf.len())?;
             out_buf.resize(in_buf.len(), 0);
             out_buf.copy_from_slice(in_buf);
             out_offsets_buf.resize(in_offsets_buf.len(), T::from_usize(0).unwrap());
@@ -1971,5 +1989,115 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
             &mut out_offsets,
         )
         .unwrap();
+    }
+
+    fn switch_off_roundtrip() -> ([u8; FSST_SYMBOL_TABLE_SIZE], Vec<u8>, Vec<i32>) {
+        let input = b"raw";
+        let offsets = [0_i32, 3];
+        let mut table = [0_u8; FSST_SYMBOL_TABLE_SIZE];
+        let mut compressed = vec![0; input.len()];
+        let mut compressed_offsets = vec![0_i32; offsets.len()];
+        compress(
+            &mut table,
+            input,
+            &offsets,
+            &mut compressed,
+            &mut compressed_offsets,
+        )
+        .unwrap();
+        let st_info = u64::from_ne_bytes(table[..8].try_into().unwrap());
+        assert!(st_info & (1 << 24) == 0, "expected decoder_switch_on off");
+        (table, compressed, compressed_offsets)
+    }
+
+    #[test]
+    fn test_decompress_rejects_corrupt_offsets_when_switch_off() {
+        let (table, compressed, _) = switch_off_roundtrip();
+        let corrupt_offsets = [-1_i32, 99];
+        let mut out = vec![0; compressed.len()];
+        let mut out_offsets = vec![0_i32; corrupt_offsets.len()];
+        let err = decompress(
+            &table,
+            &compressed,
+            &corrupt_offsets,
+            &mut out,
+            &mut out_offsets,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_decompress_switch_off_accepts_valid_offsets() {
+        let (table, compressed, compressed_offsets) = switch_off_roundtrip();
+        let mut out = vec![0; compressed.len()];
+        let mut out_offsets = vec![0_i32; compressed_offsets.len()];
+        decompress(
+            &table,
+            &compressed,
+            &compressed_offsets,
+            &mut out,
+            &mut out_offsets,
+        )
+        .unwrap();
+        assert_eq!(out, compressed);
+        assert_eq!(out_offsets, compressed_offsets);
+    }
+
+    fn assert_missing_escape_payload(table: &[u8], bytes: &[u8], offsets: &[i32]) {
+        let mut out = vec![0_u8; bytes.len() * 8];
+        let mut out_offsets = vec![0_i32; offsets.len()];
+        let err = decompress(table, bytes, offsets, &mut out, &mut out_offsets).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("escape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_decompress_rejects_dangling_escape_in_scalar_tail() {
+        let (table, _, _) = compress_paragraph();
+        assert_missing_escape_payload(&table, &[0, FSST_ESC], &[0, 2]);
+        assert_missing_escape_payload(&table, &[FSST_ESC], &[0, 1]);
+    }
+
+    #[test]
+    fn test_decompress_rejects_dangling_escape_in_fast_path() {
+        let (table, _, _) = compress_paragraph();
+        // 4-byte window ending in ESC: payload sits at index 4, outside in_end.
+        assert_missing_escape_payload(&table, &[0, 0, 0, FSST_ESC], &[0, 4]);
+    }
+
+    #[test]
+    fn test_decompress_rejects_escape_payload_from_next_value() {
+        let (table, _, _) = compress_paragraph();
+        // First value ends on ESC; the next value's first byte must not be stolen as payload.
+        assert_missing_escape_payload(&table, &[0, 0, 0, FSST_ESC, b'X'], &[0, 4, 5]);
+    }
+
+    #[test]
+    fn test_decompress_accepts_escape_with_payload() {
+        let (table, _, _) = compress_paragraph();
+        let bytes = [FSST_ESC, b'A'];
+        let offsets = [0_i32, 2];
+        let mut out = vec![0_u8; bytes.len() * 8];
+        let mut out_offsets = vec![0_i32; offsets.len()];
+        decompress(&table, &bytes, &offsets, &mut out, &mut out_offsets).unwrap();
+        assert_eq!(&out[..], b"A");
+        assert_eq!(out_offsets, [0, 1]);
+    }
+
+    #[test]
+    fn test_decompress_accepts_fast_path_escape_with_payload() {
+        let (table, _, _) = compress_paragraph();
+        let bytes = [0, 0, 0, FSST_ESC, b'Z'];
+        let offsets = [0_i32, 5];
+        let mut out = vec![0_u8; bytes.len() * 8];
+        let mut out_offsets = vec![0_i32; offsets.len()];
+        decompress(&table, &bytes, &offsets, &mut out, &mut out_offsets).unwrap();
+        assert_eq!(out_offsets[0], 0);
+        assert_eq!(*out.last().unwrap(), b'Z');
+        assert_eq!(out_offsets[1], i32::try_from(out.len()).unwrap());
     }
 }
