@@ -17,9 +17,12 @@ import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.TestUtils;
 import org.lance.Transaction;
+import org.lance.ipc.LanceScanner;
 import org.lance.schema.LanceField;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -204,6 +207,21 @@ public class ProjectTest extends OperationTestBase {
         assertEquals(5, findField(fields, "c").getId());
         assertEquals(4, findField(fields, "b").getId());
         assertEquals(0, findField(fields, "x").getId());
+
+        try (LanceScanner scanner = projected.newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          assertEquals("c", root.getSchema().getFields().get(0).getName());
+          assertEquals("b", root.getSchema().getFields().get(1).getName());
+          assertEquals("x", root.getSchema().getFields().get(2).getName());
+          assertEquals(0L, root.getVector("c").getObject(0));
+          assertEquals(0L, root.getVector("b").getObject(0));
+          assertEquals(0L, root.getVector("x").getObject(0));
+          assertEquals(5L, root.getVector("c").getObject(1));
+          assertEquals(4L, root.getVector("b").getObject(1));
+          assertEquals(1L, root.getVector("x").getObject(1));
+        }
       }
     }
   }
