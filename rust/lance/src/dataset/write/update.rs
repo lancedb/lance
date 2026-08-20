@@ -175,7 +175,10 @@ impl UpdateBuilder {
         let is_json_string = schema
             .field_with_name(column.as_ref())
             .is_ok_and(is_json_field)
-            && matches!(&src_type, DataType::Utf8 | DataType::LargeUtf8);
+            && matches!(
+                &src_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            );
         if dest_type != src_type && !is_json_string {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
@@ -560,8 +563,22 @@ impl UpdateJob {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
             let schema = batch.schema();
             let new_values: ArrayRef = if schema.field_with_name(column).is_ok_and(is_json_field)
-                && matches!(new_values.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-            {
+                && matches!(
+                    new_values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) {
+                let new_values = if new_values.data_type() == &DataType::Utf8View {
+                    arrow_cast::cast(new_values.as_ref(), &DataType::Utf8).map_err(|error| {
+                        DataFusionError::ArrowError(
+                            Box::new(error),
+                            Some(format!(
+                                "convert Utf8View update for JSON column '{column}'"
+                            )),
+                        )
+                    })?
+                } else {
+                    new_values
+                };
                 let json_array = JsonArray::try_from(new_values).map_err(|error| {
                     DataFusionError::ArrowError(
                         Box::new(error),
@@ -889,8 +906,11 @@ mod tests {
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 
+    #[rstest]
+    #[case::utf8(r#"'{"after": true, "n": 2}'"#)]
+    #[case::utf8_view(r#"arrow_cast('{"after": true, "n": 2}', 'Utf8View')"#)]
     #[tokio::test]
-    async fn test_update_json_and_regular_columns() {
+    async fn test_update_json_and_regular_columns(#[case] json_expression: &str) {
         let mut metadata = HashMap::new();
         metadata.insert(
             ARROW_EXT_NAME_KEY.to_string(),
@@ -933,7 +953,7 @@ mod tests {
             .unwrap()
             .set("name", "'updated'")
             .unwrap()
-            .set("meta", r#"'{"after": true, "n": 2}'"#)
+            .set("meta", json_expression)
             .unwrap()
             .build()
             .unwrap()
