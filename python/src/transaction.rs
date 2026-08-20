@@ -996,11 +996,17 @@ fn extract_schema(schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
-    // Note: the field ids here are wrong.
-    Schema::try_from(arrow_schema).map_err(|e| {
+    let mut schema = Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
             e
         ))
-    })
+    })?;
+    // A raw Arrow schema is not an allocation authority. Assign a canonical
+    // standalone sequence; dataset commits will either match existing
+    // identities or reject it in favor of a dataset-derived LanceSchema.
+    schema
+        .try_reassign_field_ids(None)
+        .map_err(|e| PyValueError::new_err(format!("Failed to assign field ids: {e}")))?;
+    Ok(schema)
 }

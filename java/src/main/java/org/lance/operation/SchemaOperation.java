@@ -23,13 +23,18 @@ import java.util.Objects;
 /**
  * Schema related base operation.
  *
- * <p>Each field will be assigned a field id when transaction commits, in the following order:
+ * <p>For legacy datasets, each field is assigned a field id in the following order:
  *
  * <ol>
  *   <li>Parse from field metadata with key {@code lance:field_id}.
  *   <li>Otherwise, set field id from txn read version dataset's schema field (with the same name).
  *   <li>Otherwise, allocate based on the max field id of the dataset.
  * </ol>
+ *
+ * <p>New datasets use stable field IDs. On those datasets, metadata may identify an existing field
+ * for rename or reorder, but it cannot allocate a new identity. New IDs are assigned by the dataset
+ * allocator, and field mappings in fragments committed by the same operation are remapped to the
+ * canonical IDs.
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;

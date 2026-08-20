@@ -4,19 +4,22 @@
 use std::sync::Arc;
 use std::vec;
 
-use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::{
+    ColumnAlteration, InsertBuilder, NewColumnTransform, StableFieldIdMigrationMode,
+};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
+use lance_core::utils::tempfile::TempStrDir;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
-use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+use lance_table::feature_flags::{FLAG_STABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS};
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
+use arrow_array::{Float32Array, Int32Array, Int64Array, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
@@ -576,6 +579,202 @@ async fn make_simple_dataset(uri: &str, n: i64) -> Dataset {
     Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
+    let source_uri = TempStrDir::default();
+    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    assert!(dataset.manifest.uses_stable_field_ids());
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(0));
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+    let created_version = dataset.version().version;
+
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, created_version);
+
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::WritersOnly)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, created_version);
+}
+
+#[tokio::test]
+async fn test_stable_field_id_restore_boundary_and_high_water_mark() {
+    let source_uri = TempStrDir::default();
+    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    let activation_version = dataset.version().version;
+
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "new_field",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(1));
+
+    let mut activation_snapshot = dataset.checkout_version(activation_version).await.unwrap();
+    activation_snapshot.restore().await.unwrap();
+    assert_eq!(activation_snapshot.manifest.max_allocated_field_id, Some(1));
+    assert!(activation_snapshot.schema().field("new_field").is_none());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_preserves_stable_field_id_state() {
+    let source_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+
+    let cloned = dataset
+        .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cloned.manifest.max_allocated_field_id,
+        dataset.manifest.max_allocated_field_id
+    );
+    assert_ne!(
+        cloned.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+    assert_ne!(
+        cloned.manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_overwrite_replaces_all_stable_field_identities() {
+    let source_uri = TempStrDir::default();
+    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("replacement", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..10)),
+            Arc::new(Int64Array::from_iter_values(10..20)),
+        ],
+    )
+    .unwrap();
+    let overwritten = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        source_uri.as_str(),
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(overwritten.schema().field("id").unwrap().id, 1);
+    assert_eq!(overwritten.schema().field("replacement").unwrap().id, 2);
+    assert_eq!(overwritten.manifest.max_allocated_field_id, Some(2));
+    assert!(
+        overwritten
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.files.iter())
+            .all(|file| file.fields.iter().all(|field_id| *field_id >= 1))
+    );
+}
+
+#[tokio::test]
+async fn test_stable_field_id_rename_and_nullability_preserve_identity() {
+    let source_uri = TempStrDir::default();
+    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("id".to_string())
+            .rename("renamed".to_string())
+            .set_nullable(true)])
+        .await
+        .unwrap();
+
+    let renamed = dataset.schema().field("renamed").unwrap();
+    assert_eq!(renamed.id, 0);
+    assert!(renamed.nullable);
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(0));
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("renamed".to_string()).cast_to(DataType::Int32)])
+        .await
+        .unwrap();
+
+    assert_eq!(dataset.schema().field("renamed").unwrap().id, 1);
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(1));
+}
+
+#[tokio::test]
+async fn test_stable_field_id_multi_cast_uses_schema_order() {
+    let source_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![3, 4])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        source_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new("b".to_string()).cast_to(DataType::Int64),
+            ColumnAlteration::new("a".to_string()).cast_to(DataType::Int64),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(dataset.schema().field("a").unwrap().id, 2);
+    assert_eq!(dataset.schema().field("b").unwrap().id, 3);
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(3));
+    dataset.validate().await.unwrap();
 }
 
 #[tokio::test]

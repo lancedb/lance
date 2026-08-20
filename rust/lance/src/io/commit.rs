@@ -34,6 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
+use lance_table::feature_flags::{can_write_dataset, validate_stable_field_id_flags};
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
     is_detached_version, list_index_files_with_sizes, pb,
@@ -42,6 +43,10 @@ use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
+use lance_table::transaction::{
+    validate_detached_stable_field_ids, validate_operation, validate_stable_field_id_manifest,
+    validate_stable_field_id_transition,
+};
 use rand::{Rng, rng};
 
 use super::ObjectStore;
@@ -389,6 +394,12 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
+        if !can_write_dataset(source_manifest.writer_feature_flags) {
+            return Err(Error::not_supported(format!(
+                "Clone source cannot be written by this version of Lance. Flags: {}",
+                source_manifest.writer_feature_flags
+            )));
+        }
 
         if *is_shallow {
             let new_base_id = source_manifest
@@ -469,6 +480,12 @@ async fn do_commit_new_dataset(
         )?;
         (manifest, indices)
     };
+
+    if !manifest.uses_stable_field_ids() {
+        manifest.activate_stable_field_ids();
+        manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
+        manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
+    }
 
     let result = write_manifest_file(
         object_store,
@@ -727,13 +744,24 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
         return Ok(());
     }
 
+    if manifest.uses_stable_field_ids() {
+        return Err(Error::invalid_input(
+            "Cannot repair duplicate field IDs after stable field identity is activated; repair would change an existing identity",
+        ));
+    }
+
     // Now, we need to remap the field ids to be unique.
     let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
     let mut fields_with_duplicate_ids = fields_with_duplicate_ids.into_iter().collect::<Vec<_>>();
     fields_with_duplicate_ids.sort_unstable();
-    for (field_id_seed, field_id) in (manifest.max_field_id() + 1..).zip(fields_with_duplicate_ids)
-    {
-        old_field_id_mapping.insert(field_id, field_id_seed);
+    let next_field_ids = i64::from(manifest.max_field_id()) + 1..;
+    for (next_field_id, field_id) in next_field_ids.zip(fields_with_duplicate_ids) {
+        let assigned_field_id = i32::try_from(next_field_id).map_err(|_| {
+            Error::invalid_input(
+                "Cannot repair duplicate field IDs because the field-ID space is exhausted",
+            )
+        })?;
+        old_field_id_mapping.insert(field_id, assigned_field_id);
     }
 
     let mut fragments = manifest.fragments.as_ref().clone();
@@ -1033,6 +1061,16 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    if !can_write_dataset(dataset.manifest.writer_feature_flags) {
+        return Err(Error::not_supported(format!(
+            "This dataset cannot be written by this version of Lance. Flags: {}",
+            dataset.manifest.writer_feature_flags
+        )));
+    }
+    validate_stable_field_id_flags(&dataset.manifest)?;
+    validate_detached_stable_field_ids(&dataset.manifest, &transaction.operation)?;
+    validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1084,9 +1122,12 @@ pub(crate) async fn do_commit_detached_transaction(
         migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
         // fix_schema and check_storage_version are just for sanity-checking and consistency
         fix_schema(&mut manifest)?;
+        validate_stable_field_id_transition(&dataset.manifest, &manifest, &transaction.operation)?;
+        manifest.update_max_field_id();
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
+        validate_stable_field_id_manifest(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
         let recovered_coverage = migrate_indices(dataset, &mut indices).await?;
@@ -1391,6 +1432,15 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        if !can_write_dataset(dataset.manifest.writer_feature_flags) {
+            return Err(Error::not_supported(format!(
+                "This dataset cannot be written by this version of Lance. Flags: {}",
+                dataset.manifest.writer_feature_flags
+            )));
+        }
+        validate_stable_field_id_flags(&dataset.manifest)?;
+        validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
@@ -1444,10 +1494,13 @@ pub(crate) async fn commit_transaction(
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
 
         fix_schema(&mut manifest)?;
+        validate_stable_field_id_transition(&dataset.manifest, &manifest, &transaction.operation)?;
+        manifest.update_max_field_id();
 
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
+        validate_stable_field_id_manifest(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -2051,6 +2104,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_commit_path_checks_required_writer_flags() {
+        let (_test_dir, mut dataset) = get_empty_dataset().await;
+        Arc::make_mut(&mut dataset.manifest).writer_feature_flags |=
+            lance_table::feature_flags::FLAG_UNKNOWN;
+
+        let err = dataset
+            .update_config(HashMap::from([(
+                "test.required-writer-gate".to_string(),
+                Some("value".to_string()),
+            )]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_good_concurrent_config_writes() {
         let (_tmpdir, dataset) = get_empty_dataset().await;
         let original_num_config_keys = dataset.manifest.config.len();
@@ -2258,6 +2328,60 @@ mod tests {
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
+    }
+
+    #[test]
+    fn test_fix_schema_rejects_field_id_exhaustion() {
+        let mut field =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field.id = i32::MAX;
+        let schema = Schema {
+            fields: vec![field],
+            metadata: Default::default(),
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields("first", vec![i32::MAX], None),
+            DataFile::new_legacy_from_fields("second", vec![i32::MAX], None),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let err = fix_schema(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("space is exhausted"), "{err}");
+    }
+
+    #[test]
+    fn test_fix_schema_does_not_reassign_stable_field_identity() {
+        let mut field =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field.id = 0;
+        let schema = Schema {
+            fields: vec![field],
+            metadata: Default::default(),
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields("first", vec![0], None),
+            DataFile::new_legacy_from_fields("second", vec![0], None),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.activate_stable_field_ids();
+
+        let err = fix_schema(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("stable field identity"), "{err}");
+        assert_eq!(manifest.schema.field("a").unwrap().id, 0);
     }
 
     /// A CommitHandler that always fails with OtherError, used to simulate

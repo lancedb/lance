@@ -40,6 +40,8 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
     };
 
+    validate_stable_field_id_operation(manifest, operation)?;
+
     match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
@@ -94,6 +96,165 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             }
             Ok(())
         }
+        _ => Ok(()),
+    }
+}
+
+/// Validate stable-field-ID invariants that are independent of one operation.
+pub fn validate_stable_field_id_manifest(manifest: &Manifest) -> Result<()> {
+    let Some(max_allocated_field_id) = manifest.max_allocated_field_id else {
+        return Ok(());
+    };
+    let max_referenced_field_id = manifest.max_referenced_field_id();
+    if max_allocated_field_id < max_referenced_field_id {
+        return Err(Error::invalid_input(format!(
+            "Stable field-ID high-water mark {} is below referenced field ID {}",
+            max_allocated_field_id, max_referenced_field_id
+        )));
+    }
+    Ok(())
+}
+
+/// Validate newly referenced field IDs before advancing the high-water mark.
+///
+/// A data-only operation must not manufacture allocator state by putting an
+/// otherwise unknown ID in a data-file or overlay mapping. IDs above the parent
+/// high-water mark are legal only when the canonical successor schema contains
+/// that newly allocated identity. Overwrite has no retained physical state, so
+/// every non-negative reference must belong to its replacement schema.
+pub fn validate_stable_field_id_transition(
+    parent: &Manifest,
+    successor: &Manifest,
+    operation: &Operation,
+) -> Result<()> {
+    let Some(parent_max_field_id) = parent.max_allocated_field_id else {
+        return Ok(());
+    };
+    let Some(successor_max_field_id) = successor.max_allocated_field_id else {
+        return Err(Error::invalid_input(
+            "Stable field-ID activation marker is missing from the successor manifest",
+        ));
+    };
+    if successor_max_field_id < parent_max_field_id {
+        return Err(Error::invalid_input(format!(
+            "Stable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
+        )));
+    }
+    let successor_schema_ids = successor
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect::<HashSet<_>>();
+
+    if !matches!(operation, Operation::Restore { .. }) {
+        validate_dense_new_field_ids(
+            parent,
+            successor
+                .schema
+                .fields_pre_order()
+                .filter(|field| parent.schema.field_by_id(field.id).is_none()),
+        )?;
+    }
+
+    for field_id in successor
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+        .flat_map(|file| file.fields.iter())
+        .copied()
+        .filter(|field_id| *field_id >= 0)
+    {
+        if matches!(operation, Operation::Overwrite { .. })
+            && !successor_schema_ids.contains(&field_id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Overwrite references field ID {field_id}, which is not in its replacement schema"
+            )));
+        }
+        if field_id > parent_max_field_id && !successor_schema_ids.contains(&field_id) {
+            return Err(Error::invalid_input(format!(
+                "Data file or overlay references new field ID {field_id}, but the canonical successor schema does not contain that identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dense_new_field_ids<'a>(
+    manifest: &Manifest,
+    new_fields: impl Iterator<Item = &'a Field>,
+) -> Result<()> {
+    let expected_ids = i64::from(manifest.max_field_id()) + 1..;
+    for (expected, field) in expected_ids.zip(new_fields) {
+        if i64::from(field.id) != expected {
+            return Err(Error::invalid_input(format!(
+                "New field '{}' has ID {}, but stable field IDs must be densely allocated from {}",
+                field.name, field.id, expected
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation) -> Result<()> {
+    if !manifest.uses_stable_field_ids() {
+        return Ok(());
+    }
+    validate_stable_field_id_manifest(manifest)?;
+
+    let (schema, replaces_all_identities) = match operation {
+        Operation::Overwrite { schema, .. } => (schema, true),
+        Operation::Merge { schema, .. } | Operation::Project { schema, .. } => (schema, false),
+        _ => return Ok(()),
+    };
+    schema.validate()?;
+
+    if replaces_all_identities {
+        return validate_dense_new_field_ids(manifest, schema.fields_pre_order());
+    }
+
+    for field in schema.fields_pre_order() {
+        let Some(prior_field) = manifest.schema.field_by_id(field.id) else {
+            continue;
+        };
+        if field.parent_id != prior_field.parent_id {
+            return Err(Error::invalid_input(format!(
+                "Field ID {} moves from parent {} to parent {}; stable field identity cannot move between parents",
+                field.id, prior_field.parent_id, field.parent_id
+            )));
+        }
+        if field.logical_type != prior_field.logical_type {
+            return Err(Error::invalid_input(format!(
+                "Field ID {} changes logical type from {} to {}; type replacement must allocate a new field ID",
+                field.id, prior_field.logical_type, field.logical_type
+            )));
+        }
+    }
+
+    validate_dense_new_field_ids(
+        manifest,
+        schema
+            .fields_pre_order()
+            .filter(|field| manifest.schema.field_by_id(field.id).is_none()),
+    )
+}
+
+/// Reject detached schema changes once stable field identity is active.
+pub fn validate_detached_stable_field_ids(
+    manifest: &Manifest,
+    operation: &Operation,
+) -> Result<()> {
+    if !manifest.uses_stable_field_ids() {
+        return Ok(());
+    }
+    match operation {
+        Operation::Merge { schema, .. } if schema == &manifest.schema => Ok(()),
+        Operation::Merge { .. }
+        | Operation::Project { .. }
+        | Operation::Overwrite { .. }
+        | Operation::Restore { .. } => Err(Error::invalid_input(
+            "Detached commits cannot change schema after stable field IDs are activated",
+        )),
         _ => Ok(()),
     }
 }
@@ -528,6 +689,167 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    fn activated_manifest() -> Manifest {
+        let schema = one_field_schema();
+        let mut manifest = manifest_with_file_fields(schema, vec![0]);
+        manifest.activate_stable_field_ids();
+        manifest
+    }
+
+    #[test]
+    fn stable_field_ids_require_dense_allocation_above_high_water_mark() {
+        let mut manifest = activated_manifest();
+        manifest.max_allocated_field_id = Some(5);
+        let mut schema = manifest.schema.clone();
+        let mut new_field =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        new_field.id = 6;
+        schema.fields.push(new_field);
+        let valid = Operation::Project {
+            schema: schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(&manifest), &valid).unwrap();
+
+        schema.fields.last_mut().unwrap().id = 7;
+        let skipped = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+        let err = validate_operation(Some(&manifest), &skipped).unwrap_err();
+        assert!(
+            err.to_string().contains("densely allocated from 6"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_ids_require_fresh_identity_for_type_replacement() {
+        let manifest = activated_manifest();
+        let mut schema = manifest.schema.clone();
+        schema.fields[0].logical_type = LogicalType::try_from(&DataType::Float32).unwrap();
+        let operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+
+        assert!(err.to_string().contains("type replacement"), "{err}");
+    }
+
+    #[test]
+    fn stable_field_ids_require_overwrite_to_replace_every_identity() {
+        let manifest = activated_manifest();
+        let schema = manifest.schema.clone();
+        let operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("densely allocated from 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_manifest_rejects_high_water_mark_below_overlay_reference() {
+        let mut manifest = activated_manifest();
+        Arc::make_mut(&mut manifest.fragments)[0]
+            .overlays
+            .push(DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![7], None),
+                coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+                committed_version: 1,
+            });
+
+        let err = validate_stable_field_id_manifest(&manifest).unwrap_err();
+
+        assert!(
+            err.to_string().contains("below referenced field ID 7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_transition_rejects_file_only_allocator_advance() {
+        let manifest = activated_manifest();
+        let mut successor = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            Arc::new(vec![fragment_with_file_fields(0, "new.lance", vec![0, 1])]),
+        );
+        successor.max_allocated_field_id = manifest.max_allocated_field_id;
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        let err =
+            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("canonical successor schema"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_transition_rejects_decreasing_high_water_mark() {
+        let manifest = activated_manifest();
+        let mut successor = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            manifest.fragments.clone(),
+        );
+        successor.max_allocated_field_id = Some(manifest.max_field_id() - 1);
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        let err =
+            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("high-water mark decreases"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn detached_stable_field_ids_allow_data_only_merge_and_reject_schema_change() {
+        let manifest = activated_manifest();
+        let data_only = Operation::Merge {
+            fragments: manifest.fragments.as_ref().clone(),
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_detached_stable_field_ids(&manifest, &data_only).unwrap();
+
+        let mut changed_schema = manifest.schema.clone();
+        changed_schema.fields[0].name = "renamed".to_string();
+        let schema_change = Operation::Project {
+            schema: changed_schema,
+            preserves_nullability: true,
+        };
+        let err = validate_detached_stable_field_ids(&manifest, &schema_change).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Detached commits cannot change schema"),
+            "{err}"
+        );
     }
 
     #[rstest::rstest]

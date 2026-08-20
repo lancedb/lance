@@ -383,7 +383,7 @@ pub(super) async fn add_columns_to_fragments(
             return Err(e);
         }
     };
-    schema.set_field_id(Some(dataset.manifest.max_field_id()));
+    schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
 
     let preserves_nullability = !merge_introduces_required_field(dataset.schema(), &schema);
 
@@ -733,10 +733,9 @@ pub(super) async fn alter_columns(
     let mut new_schema = dataset.schema().clone();
 
     // Mapping of old to new fields that need to be casted.
-    let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut cast_sources: Vec<Field> = Vec::new();
     let mut tightens_nullability = false;
 
-    let mut next_field_id = dataset.manifest.max_field_id() + 1;
     let version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
@@ -783,10 +782,43 @@ pub(super) async fn alter_columns(
                 field_dest.nullable,
             );
             *field_dest = Field::try_from(&arrow_field)?;
-            field_dest.set_id(field_src.parent_id, &mut next_field_id);
+            // Keep the old id temporarily so the replacement can be located
+            // after every alteration has been applied. Fresh ids are assigned
+            // below in canonical schema order, independent of request order.
+            field_dest.id = field_src.id;
+            field_dest.parent_id = field_src.parent_id;
 
-            cast_fields.push((field_src.clone(), field_dest.clone()));
+            cast_sources.push(field_src.clone());
         }
+    }
+
+    let mut cast_fields = Vec::with_capacity(cast_sources.len());
+    if !cast_sources.is_empty() {
+        let destination_paths = cast_sources
+            .iter()
+            .map(|source| new_schema.field_path(source.id))
+            .collect::<Result<Vec<_>>>()?;
+
+        for source in &cast_sources {
+            new_schema
+                .mut_field_by_id(source.id)
+                .expect("cast source must still identify its replacement")
+                .id = -1;
+        }
+        new_schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
+
+        cast_fields = cast_sources
+            .into_iter()
+            .zip(destination_paths)
+            .map(|(source, path)| {
+                let destination = new_schema.field(&path).ok_or_else(|| {
+                    Error::internal(format!(
+                        "cast replacement field '{path}' disappeared while assigning field ids"
+                    ))
+                })?;
+                Ok((source, destination.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
     }
 
     new_schema.validate()?;
@@ -3613,6 +3645,7 @@ mod test {
             }),
         )
         .await?;
+        assert!(dataset.manifest.uses_stable_field_ids());
         assert_eq!(dataset.manifest.max_field_id(), 0);
 
         // Test we can add 1 column, drop it, then add another column. Validate
@@ -3627,7 +3660,7 @@ mod test {
         assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset.drop_columns(&["x"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset
             .add_columns(
@@ -3636,7 +3669,7 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 1);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_data = RecordBatch::try_new(
@@ -3648,7 +3681,7 @@ mod test {
         )?;
         assert_eq!(data, expected_data);
         dataset.drop_columns(&["y"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         // Test we can add 2 columns, drop 1, then add another column. Validate
         // the field ids are as expected.
@@ -3662,12 +3695,12 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset.drop_columns(&["b"]).await?;
         // Even though we dropped a column, we still have the fragment with a and
         // b. So it should still act as if that field id is still in play.
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset
             .add_columns(
@@ -3676,7 +3709,7 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 3);
+        assert_eq!(dataset.manifest.max_field_id(), 5);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = Arc::new(ArrowSchema::new(vec![

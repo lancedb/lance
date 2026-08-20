@@ -11,8 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    can_read_dataset, can_write_dataset, inherit_mem_wal_index_catchup,
+    validate_mem_wal_index_catchup_flags, validate_stable_field_id_flags,
 };
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
@@ -32,7 +33,9 @@ use crate::system_index::mem_wal::{
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
-use crate::transaction::validate::merge_fragment_physically_rewritten;
+use crate::transaction::validate::{
+    merge_fragment_physically_rewritten, validate_stable_field_id_manifest,
+};
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
     RewriteGroup, Transaction, UpdatedFragmentOffsets,
@@ -103,16 +106,42 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        if !can_read_dataset(manifest.reader_feature_flags) {
+            return Err(Error::not_supported(format!(
+                "Restore target cannot be read by this version of Lance. Flags: {}",
+                manifest.reader_feature_flags
+            )));
+        }
+        if !can_write_dataset(manifest.writer_feature_flags) {
+            return Err(Error::not_supported(format!(
+                "Restore target cannot be written by this version of Lance. Flags: {}",
+                manifest.writer_feature_flags
+            )));
+        }
         // Read below the reader validation boundary, so nothing else refuses a
         // half-set manifest here: the flag reset would quietly drop the lone bit
         // and republish an undefined state as legacy.
         validate_mem_wal_index_catchup_flags(&manifest)?;
+        validate_stable_field_id_flags(&manifest)?;
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        if current_manifest.uses_stable_field_ids() {
+            let Some(restored_max_field_id) = manifest.max_allocated_field_id else {
+                return Err(Error::invalid_input(format!(
+                    "Cannot restore version {version}: stable field IDs were activated after that version"
+                )));
+            };
+            manifest.max_allocated_field_id =
+                Some(restored_max_field_id.max(current_manifest.max_field_id()));
+            if current_manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0 {
+                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            }
+            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        }
         // A version from before catch-up was required carries MemWAL state this
         // protocol never validated -- catch-up values activation deliberately
         // cleared, or compaction progress it deliberately refused to trust.
@@ -1352,6 +1381,28 @@ impl Transaction {
             )
         };
 
+        if current_manifest.is_none() {
+            manifest.activate_stable_field_ids();
+            manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        }
+
+        if let Some(require_reader) = config.stable_field_id_migration_requires_reader {
+            if current_manifest
+                .map(|manifest| manifest.uses_stable_field_ids())
+                .unwrap_or(false)
+            {
+                return Err(Error::invalid_input(
+                    "Stable field IDs are already active for this dataset",
+                ));
+            }
+            manifest.activate_stable_field_ids();
+            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            if require_reader {
+                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            }
+        }
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -1368,9 +1419,8 @@ impl Transaction {
                 config.disable_transaction_file,
             )?;
         }
-        // Carried from the manifest this one is derived from. `new_from_previous`
-        // zeroes both feature words, so `apply_feature_flags` cannot see the
-        // previous state and every ordinary commit would otherwise drop the bit.
+        // Validate and explicitly carry the protocol across the derivation
+        // boundary. Constructors also preserve it as defense in depth.
         if let Some(current_manifest) = current_manifest {
             inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
         }
@@ -1416,6 +1466,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -1596,6 +1647,9 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        validate_stable_field_id_flags(&manifest)?;
+        validate_stable_field_id_manifest(&manifest)?;
+
         Ok((manifest, final_indices))
     }
 
@@ -1649,6 +1703,57 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn new_dataset_builds_with_stable_field_ids_by_default() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        schema.try_set_field_id(None).unwrap();
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![],
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+
+        let (manifest, _) = transaction
+            .build_manifest(None, vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(manifest.max_allocated_field_id, Some(0));
+        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+    }
+
+    #[test]
+    fn activation_sets_writer_gate_when_auto_flags_are_disabled() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.auto_set_feature_flags = false;
+        config.stable_field_id_migration_requires_reader = Some(false);
+
+        let (activated, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &config)
+            .unwrap();
+
+        assert!(activated.uses_stable_field_ids());
+        assert_eq!(activated.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(activated.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]

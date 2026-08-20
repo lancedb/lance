@@ -39,12 +39,18 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// invalidating the catch-up position recorded for that index, leaving a stale
 /// position behind. Both must refuse the table.
 pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
+/// Field IDs are allocated from a persistent high-water mark and are never reused.
+///
+/// This is always a writer requirement. It is also a reader requirement when an
+/// activation chooses fail-closed compatibility with pre-gate binaries.
+pub const FLAG_STABLE_FIELD_IDS: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 512;
 
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
 const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_STABLE_FIELD_IDS < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -72,6 +78,13 @@ pub fn apply_feature_flags(
         && manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
     {
         FLAG_MEM_WAL_INDEX_CATCHUP
+    } else {
+        0
+    };
+    let stable_field_ids_reader = if manifest.max_allocated_field_id.is_some()
+        && manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0
+    {
+        FLAG_STABLE_FIELD_IDS
     } else {
         0
     };
@@ -134,6 +147,11 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
+    if manifest.max_allocated_field_id.is_some() {
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        manifest.reader_feature_flags |= stable_field_ids_reader;
+    }
+
     manifest.reader_feature_flags |= mem_wal_index_catchup;
     manifest.writer_feature_flags |= mem_wal_index_catchup;
 
@@ -143,11 +161,10 @@ pub fn apply_feature_flags(
 /// Carry [`FLAG_MEM_WAL_INDEX_CATCHUP`] from the manifest a new one is derived
 /// from.
 ///
-/// [`apply_feature_flags`] carries this bit across its own reset, but it only
-/// ever sees one manifest. It cannot help where a *new* manifest is derived from
-/// an existing one -- `Manifest::new_from_previous` and `shallow_clone` both
-/// zero the feature words -- because the destination starts with nothing to
-/// carry. That transition is this function's job.
+/// [`apply_feature_flags`] carries this bit across its own reset, while this
+/// helper validates and explicitly carries the transition between source and
+/// destination manifests. Constructors preserve the bit as defense in depth,
+/// but callers must not depend on a constructor choice for protocol safety.
 ///
 /// A half-set state is refused rather than normalized: one bit set means a
 /// legacy reader or a legacy writer is still permitted, which is neither mode.
@@ -230,6 +247,24 @@ pub fn validate_mem_wal_index_catchup_flags(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a manifest whose stable-field-ID marker and required flags disagree.
+///
+/// The high-water mark is the activation marker and the writer bit is what
+/// keeps pre-feature writers away. Either one without the other is an unsafe,
+/// undefined state. The reader bit is optional migration policy, but cannot be
+/// set on a legacy manifest.
+pub fn validate_stable_field_id_flags(manifest: &Manifest) -> Result<()> {
+    let activated = manifest.max_allocated_field_id.is_some();
+    let reader = manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
+    let writer = manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
+    if activated != writer || (reader && !activated) {
+        return Err(Error::invalid_input(
+            "Manifest stable-field-ID high-water mark and reader/writer feature flags disagree",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +279,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_STABLE_FIELD_IDS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -320,6 +356,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_STABLE_FIELD_IDS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -399,7 +436,7 @@ mod tests {
         let mut source = empty_manifest();
         source.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
         source.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-        // What `Manifest::new_from_previous` hands us: both words zeroed.
+        // Model a destination assembled without protocol-specific inheritance.
         let mut destination = empty_manifest();
 
         inherit_mem_wal_index_catchup(&mut destination, &source).unwrap();
@@ -470,6 +507,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_feature_flags_sets_writer_gate_for_stable_field_ids() {
+        let mut manifest = empty_manifest();
+        manifest.activate_stable_field_ids();
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+    }
+
+    #[test]
+    fn apply_feature_flags_preserves_fail_closed_stable_field_id_gate() {
+        let mut manifest = empty_manifest();
+        manifest.activate_stable_field_ids();
+        manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+
+        // This runs more than once while committing a manifest. The reader
+        // requirement is migration policy, not something schema contents can
+        // derive, so it must survive every recomputation.
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+    }
+
     fn empty_manifest() -> Manifest {
         use crate::format::DataStorageFormat;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -495,5 +560,31 @@ mod tests {
         // The next bit up is still unknown, so allocating this one did not
         // silently widen what this build claims to understand.
         assert!(!can_read_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn the_stable_field_id_bit_is_below_the_unknown_boundary() {
+        assert!(can_read_dataset(FLAG_STABLE_FIELD_IDS));
+        assert!(can_write_dataset(FLAG_STABLE_FIELD_IDS));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn stable_field_id_marker_and_writer_gate_must_agree() {
+        let mut activated_without_gate = empty_manifest();
+        activated_without_gate.activate_stable_field_ids();
+        assert!(validate_stable_field_id_flags(&activated_without_gate).is_err());
+
+        let mut gate_without_marker = empty_manifest();
+        gate_without_marker.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        assert!(validate_stable_field_id_flags(&gate_without_marker).is_err());
+
+        let mut writer_only = empty_manifest();
+        writer_only.activate_stable_field_ids();
+        writer_only.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        validate_stable_field_id_flags(&writer_only).unwrap();
+
+        writer_only.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        validate_stable_field_id_flags(&writer_only).unwrap();
     }
 }

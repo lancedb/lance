@@ -1344,6 +1344,13 @@ pub(super) fn prepare_write_schema(
             OnMissing::Error,
             OnTypeMismatch::Error,
         )?
+    } else if let Some(dataset) = dataset
+        && matches!(params.mode, WriteMode::Overwrite)
+        && dataset.manifest.uses_stable_field_ids()
+    {
+        let mut schema = normalized_converted_schema;
+        schema.try_reassign_field_ids(Some(dataset.manifest.max_field_id()))?;
+        schema
     } else {
         normalized_converted_schema
     };

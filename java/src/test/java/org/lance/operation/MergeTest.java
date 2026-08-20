@@ -192,6 +192,10 @@ public class MergeTest extends OperationTestBase {
         int addressFieldId = maxFieldId + 20;
         int cityFieldId = maxFieldId + 30;
         int countryFieldId = maxFieldId + 40;
+        int canonicalAgeFieldId = maxFieldId + 1;
+        int canonicalAddressFieldId = maxFieldId + 2;
+        int canonicalCityFieldId = maxFieldId + 3;
+        int canonicalCountryFieldId = maxFieldId + 4;
 
         Field idField =
             new Field(
@@ -301,18 +305,18 @@ public class MergeTest extends OperationTestBase {
               // Verify field id.
               LanceField evolvedAgeField =
                   findField(evolvedDataset.getLanceSchema().fields(), "age");
-              Assertions.assertEquals(ageFieldId, evolvedAgeField.getId());
+              Assertions.assertEquals(canonicalAgeFieldId, evolvedAgeField.getId());
 
               LanceField evolvedAddressField =
                   findField(evolvedDataset.getLanceSchema().fields(), "address");
-              Assertions.assertEquals(addressFieldId, evolvedAddressField.getId());
+              Assertions.assertEquals(canonicalAddressFieldId, evolvedAddressField.getId());
 
               LanceField evolvedCityField = findField(evolvedAddressField.getChildren(), "city");
-              Assertions.assertEquals(cityFieldId, evolvedCityField.getId());
+              Assertions.assertEquals(canonicalCityFieldId, evolvedCityField.getId());
 
               LanceField evolvedCountryField =
                   findField(evolvedAddressField.getChildren(), "country");
-              Assertions.assertEquals(countryFieldId, evolvedCountryField.getId());
+              Assertions.assertEquals(canonicalCountryFieldId, evolvedCountryField.getId());
 
               // Verify merged data
               try (LanceScanner scanner = evolvedDataset.newScan()) {

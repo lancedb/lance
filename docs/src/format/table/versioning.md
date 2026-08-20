@@ -31,7 +31,8 @@ they should return an "unsupported" error on any read or write operation.
 | 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
 | 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
 | 128      | `FLAG_MEM_WAL_INDEX_CATCHUP`    | Yes             | Yes             | `index_catchup` is maintained on this table, so an index absent from it is *not* caught up. See [MemWAL](mem_wal.md). |
+| 256      | `FLAG_STABLE_FIELD_IDS`         | Conditional     | Yes             | The manifest carries a persistent field-ID high-water mark. The safe activation mode also requires readers; a controlled rollout may require writers only. See [Field IDs](schema.md#field-ids). |
 
 </div>
 
-Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
+Flags with bit values 512 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.

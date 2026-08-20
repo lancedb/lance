@@ -1250,7 +1250,7 @@ async fn test_write_manifest(
     let write_fut = require_send(write_fut);
     let mut dataset = write_fut.await.unwrap();
 
-    // Check it has no flags
+    // New datasets enable stable field IDs by default.
     let manifest = read_manifest(
         dataset.object_store.as_ref(),
         &dataset
@@ -1272,7 +1272,14 @@ async fn test_write_manifest(
         manifest.data_storage_format.version.to_manifest_string(),
         "stable" | "next"
     ));
-    assert_eq!(manifest.reader_feature_flags, 0);
+    assert_eq!(
+        manifest.reader_feature_flags,
+        feature_flags::FLAG_STABLE_FIELD_IDS
+    );
+    assert_eq!(
+        manifest.writer_feature_flags,
+        feature_flags::FLAG_STABLE_FIELD_IDS
+    );
 
     // Create one with deletions
     dataset.delete("i < 10").await.unwrap();
@@ -1293,11 +1300,11 @@ async fn test_write_manifest(
     .unwrap();
     assert_eq!(
         manifest.writer_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_STABLE_FIELD_IDS
     );
     assert_eq!(
         manifest.reader_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_STABLE_FIELD_IDS
     );
 
     // Write with custom manifest
@@ -1318,6 +1325,7 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            stable_field_id_migration_requires_reader: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1350,6 +1358,94 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_clone_and_restore_reject_unknown_writer_requirements() {
+    let source_uri = TempStrDir::default();
+    let shallow_clone_uri = TempStrDir::default();
+    let deep_clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let location = dataset
+        .commit_handler
+        .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+        .await
+        .unwrap();
+    let mut unknown_writer =
+        read_manifest(dataset.object_store.as_ref(), &location.path, location.size)
+            .await
+            .unwrap();
+    unknown_writer.version += 1;
+    unknown_writer.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let config = ManifestWriteConfig {
+        auto_set_feature_flags: false,
+        timestamp: None,
+        use_stable_row_ids: false,
+        use_legacy_format: None,
+        storage_format: None,
+        disable_transaction_file: false,
+        migration_next_row_id: None,
+        stable_field_id_migration_requires_reader: None,
+    };
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_writer,
+        None,
+        &config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut source = Dataset::open(&source_uri).await.unwrap();
+    let err = source
+        .shallow_clone(shallow_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    let err = source
+        .deep_clone(deep_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+    let unknown_version = unknown_writer.version;
+    let mut supported_head = unknown_writer.clone();
+    supported_head.version += 1;
+    supported_head.writer_feature_flags &= !feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut supported_head,
+        None,
+        &config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let latest = Dataset::open(&source_uri).await.unwrap();
+    let mut target = latest.checkout_version(unknown_version).await.unwrap();
+    let err = target.restore().await.unwrap_err();
+    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
 }
 
 #[tokio::test]

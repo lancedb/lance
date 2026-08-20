@@ -28,6 +28,12 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
+`max_allocated_field_id` is optional allocator state. Its presence activates the stable field-ID
+contract for this branch ancestry. It is a high-water mark: every non-negative field ID in the
+canonical manifest schema, base data-file mappings, and overlay mappings must be less than or equal
+to it, and a successor manifest must never lower it. Schema-preserving rewrites retain the value;
+new identities allocate above it with checked arithmetic. See [Field IDs](schema.md#field-ids).
+
 <details>
 <summary>Manifest protobuf message</summary>
 

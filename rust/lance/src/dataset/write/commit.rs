@@ -54,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// When `Some`, this commit atomically activates stable field IDs.
+    stable_field_id_migration_requires_reader: Option<bool>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -78,6 +80,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            stable_field_id_migration_requires_reader: None,
         }
     }
 
@@ -266,6 +269,14 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub(crate) fn with_stable_field_id_migration_activation(
+        mut self,
+        require_reader: bool,
+    ) -> Self {
+        self.stable_field_id_migration_requires_reader = Some(require_reader);
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -429,6 +440,8 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
+            stable_field_id_migration_requires_reader: self
+                .stable_field_id_migration_requires_reader,
             ..Default::default()
         };
 

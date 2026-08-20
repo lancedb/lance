@@ -150,6 +150,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
+    validate_stable_field_id_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -183,6 +184,20 @@ pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // so this should be enough for a few hundred columns. Other metadata is much
 // smaller.
 pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+
+/// Mixed-version compatibility policy for stable-field-ID activation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StableFieldIdMigrationMode {
+    /// Require both new readers and new writers. This is the safe default when
+    /// pre-gate binaries may still access the dataset.
+    #[default]
+    ReadersAndWriters,
+    /// Require new writers while allowing legacy readers.
+    ///
+    /// Use only after every pre-gate writer has been retired. Older binaries do
+    /// not universally check writer feature flags on every commit path.
+    WritersOnly,
+}
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -767,6 +782,7 @@ impl Dataset {
         }?;
 
         validate_mem_wal_index_catchup_flags(&manifest)?;
+        validate_stable_field_id_flags(&manifest)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -3227,6 +3243,50 @@ impl Dataset {
         Ok(())
     }
 
+    /// Activate monotonic, non-reusable field IDs for a legacy dataset.
+    ///
+    /// The activation commit records the current maximum referenced field ID as
+    /// a persistent high-water mark. Later schema changes allocate above it even
+    /// after fields and their files are dropped. New datasets already use this
+    /// contract by default. Activation is one-way and idempotent.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::StableFieldIdMigrationMode;
+    /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
+    /// dataset
+    ///     .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn migrate_to_stable_field_ids(
+        &mut self,
+        mode: StableFieldIdMigrationMode,
+    ) -> Result<()> {
+        if self.manifest.uses_stable_field_ids() {
+            return Ok(());
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments: self.manifest.fragments.as_ref().clone(),
+                schema: self.manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let require_reader = matches!(mode, StableFieldIdMigrationMode::ReadersAndWriters);
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_field_id_migration_activation(require_reader)
+            .execute(transaction)
+            .await?;
+        *self = new_ds;
+        Ok(())
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -3698,7 +3758,7 @@ impl Dataset {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(self.manifest.max_field_id()));
+        new_schema.try_set_field_id(Some(self.manifest.max_field_id()))?;
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -4034,6 +4094,9 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// When `Some`, this commit activates stable field IDs. `true` also sets
+    /// the reader feature bit for fail-closed mixed-version safety.
+    stable_field_id_migration_requires_reader: Option<bool>,
 }
 
 impl Default for ManifestWriteConfig {
@@ -4046,6 +4109,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            stable_field_id_migration_requires_reader: None,
         }
     }
 }
@@ -4074,6 +4138,8 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            stable_field_id_migration_requires_reader: self
+                .stable_field_id_migration_requires_reader,
         }
     }
 }
@@ -4090,6 +4156,7 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    manifest.update_max_field_id();
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it

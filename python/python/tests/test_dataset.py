@@ -5578,6 +5578,19 @@ def test_schema_project_drop_column(tmp_path: Path):
     assert tbl == expected
 
 
+def test_schema_project_raw_arrow_cannot_allocate_field_id(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": pa.array([1, 2], pa.int32())}), tmp_path
+    )
+    schema = pa.schema([pa.field("a", pa.int32(), metadata={b"lance:field_id": b"42"})])
+
+    project = lance.LanceOperation.Project(schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=dataset.version)
+
+    assert dataset.lance_schema.fields()[0].id() == 0
+    assert dataset.to_table() == pa.table({"a": pa.array([1, 2], pa.int32())})
+
+
 def test_schema_project_rename_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
     base_dir = tmp_path / "test"
