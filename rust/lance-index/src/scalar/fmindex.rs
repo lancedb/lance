@@ -23,10 +23,10 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
@@ -49,6 +49,17 @@ use crate::scalar::{
     RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
+
+/// Schema of one FM-index block batch.
+static BLOCK_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("node_id", DataType::UInt32, false),
+        Field::new("block_id", DataType::UInt32, false),
+        Field::new("words", DataType::LargeBinary, false),
+        Field::new("prefix_rank", DataType::UInt64, false),
+        Field::new("bit_len", DataType::UInt64, false),
+    ]))
+});
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
@@ -1108,7 +1119,7 @@ impl FMIndex {
             }
         }
         let refs: Vec<&[u8]> = words_b.iter().map(|v| v.as_slice()).collect();
-        let schema = Arc::new(Self::block_schema());
+        let schema = BLOCK_SCHEMA.clone();
         Ok(RecordBatch::try_new(
             schema,
             vec![
@@ -1119,16 +1130,6 @@ impl FMIndex {
                 Arc::new(UInt64Array::from(bl_b)),
             ],
         )?)
-    }
-
-    fn block_schema() -> arrow_schema::Schema {
-        arrow_schema::Schema::new(vec![
-            Field::new("node_id", DataType::UInt32, false),
-            Field::new("block_id", DataType::UInt32, false),
-            Field::new("words", DataType::LargeBinary, false),
-            Field::new("prefix_rank", DataType::UInt64, false),
-            Field::new("bit_len", DataType::UInt64, false),
-        ])
     }
 }
 
@@ -2104,7 +2105,7 @@ async fn write_fmindex(
     filename: &str,
     partition_fingerprint: Option<&str>,
 ) -> Result<IndexFile> {
-    let schema = Arc::new(FMIndex::block_schema());
+    let schema = BLOCK_SCHEMA.clone();
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
 

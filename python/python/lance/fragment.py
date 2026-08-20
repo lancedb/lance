@@ -39,6 +39,7 @@ from .lance import (
     RowIdSequence as RowIdSequence,
 )
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
+from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
@@ -394,6 +395,7 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -442,6 +444,9 @@ class LanceFragment(pa.dataset.Fragment):
         table_id : optional, List[str]
             The table identifier when using a namespace (e.g., ["my_table"]).
             Must be provided together with `namespace_client`.
+        session : optional, Session
+            A session to reuse across operations. The session holds shared
+            caches (metadata and index) and the object store registry.
 
         See Also
         --------
@@ -495,6 +500,7 @@ class LanceFragment(pa.dataset.Fragment):
             storage_options=storage_options,
             namespace_client=namespace_client,
             table_id=table_id,
+            session=session,
         )
 
     @property
@@ -1091,6 +1097,7 @@ if TYPE_CHECKING:
         allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> Transaction: ...
 
     @overload
@@ -1117,6 +1124,7 @@ if TYPE_CHECKING:
         allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -1143,6 +1151,7 @@ def write_fragments(
     allow_external_blob_outside_bases: bool = False,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -1251,6 +1260,9 @@ def write_fragments(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`.
+    session : optional, Session
+        A session to reuse across operations. The session holds shared caches
+        (metadata and index) and the object store registry.
 
     Returns
     -------
@@ -1287,6 +1299,12 @@ def write_fragments(
             base_store_params = dataset_uri._base_store_params
         if storage_options is None:
             storage_options = dataset_uri._storage_options
+        if session is not None and not session.is_same_as(dataset_uri.session()):
+            raise ValueError(
+                "The provided session is not the destination dataset's own "
+                "session. Please pass the dataset's session or omit the "
+                "'session' parameter."
+            )
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
@@ -1322,6 +1340,7 @@ def write_fragments(
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+        session=session,
     )
 
 

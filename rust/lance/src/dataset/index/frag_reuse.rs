@@ -107,7 +107,6 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         Operation::CreateIndex {
             new_indices: vec![new_index_meta],
             removed_indices: vec![frag_reuse_index_meta.clone()],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );

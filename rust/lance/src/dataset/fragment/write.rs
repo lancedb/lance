@@ -325,30 +325,27 @@ impl<'a> FragmentCreateBuilder<'a> {
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
-        let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        let accessor = self
-            .write_params
-            .and_then(|p| p.store_params.as_ref())
-            .and_then(|p| p.storage_options_accessor.clone());
-        if let Some(accessor) = accessor {
-            builder = builder.with_storage_options_accessor(accessor);
-        }
-        match builder.load().await {
-            Ok(dataset) => {
-                // Use the schema from the dataset, because it has the correct
-                // field ids.
-                Ok(Some(dataset.schema().clone()))
-            }
-            Err(Error::DatasetNotFound { .. }) => {
-                // If the dataset does not exist, we can use the schema from
-                // the reader.
-                Ok(None)
-            }
+        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+        match self.load_existing_dataset(&params).await {
+            // Use the schema from the dataset, because it has the correct
+            // field ids.
+            Ok(dataset) => Ok(Some(dataset.schema().clone())),
+            // If the dataset does not exist, we can use the schema from
+            // the reader.
+            Err(Error::DatasetNotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
     async fn existing_dataset(&self, params: &WriteParams) -> Result<Option<Dataset>> {
+        match self.load_existing_dataset(params).await {
+            Ok(dataset) => Ok(Some(dataset)),
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn load_existing_dataset(&self, params: &WriteParams) -> Result<Dataset> {
         let mut builder = DatasetBuilder::from_uri(self.dataset_uri).with_read_params(ReadParams {
             store_options: params.store_params.clone(),
             commit_handler: params.commit_handler.clone(),
@@ -360,11 +357,7 @@ impl<'a> FragmentCreateBuilder<'a> {
                 builder = builder.with_base_store_params(base_path, store_params.clone());
             }
         }
-        match builder.load().await {
-            Ok(dataset) => Ok(Some(dataset)),
-            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
+        builder.load().await
     }
 
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
@@ -383,7 +376,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
@@ -498,6 +491,52 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_create_with_session() {
+        let session = Arc::new(crate::session::Session::new(
+            0,
+            1024 * 1024,
+            Default::default(),
+        ));
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        // Keep the dataset alive: the registry only holds weak references, so
+        // the in-memory store survives through the dataset's strong reference.
+        let initial_batch =
+            record_batch!(("a", Int64, [1, 2, 3]), ("b", Utf8, ["a", "b", "c"])).unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute(vec![initial_batch])
+            .await
+            .unwrap();
+        // Drop a column so the surviving field id is non-trivial (!= 0).
+        dataset.drop_columns(&["a"]).await.unwrap();
+        let field_id = dataset.schema().field("b").unwrap().id;
+        assert_ne!(field_id, 0);
+
+        let append_batch = record_batch!(("b", Utf8, ["d", "e"])).unwrap();
+        let append_data =
+            RecordBatchIterator::new([Ok(append_batch.clone())], append_batch.schema());
+
+        let append_params = WriteParams {
+            session: Some(session.clone()),
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(dataset.uri())
+            .write_params(&append_params)
+            .write(append_data, None)
+            .await
+            .unwrap();
+
+        assert_eq!(fragment.files[0].fields.as_ref(), &[field_id]);
+        // The manifest load for schema inference went through the shared
+        // session's metadata cache.
+        assert!(session.metadata_cache_stats().await.num_entries > 0);
     }
 
     #[tokio::test]

@@ -461,8 +461,12 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         }
     } else {
-        let (manifest, indices) =
-            transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+        let (manifest, indices) = transaction.build_manifest(
+            None,
+            vec![],
+            &transaction_file,
+            &write_config.to_build_config(),
+        )?;
         (manifest, indices)
     };
 
@@ -909,8 +913,14 @@ fn must_recalculate_fragment_bitmap(
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 /// Indices might also be missing `files` (file sizes), so this function will collect them.
-async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
+///
+/// Returns the logical indices whose `fragment_bitmap` this replaced. Those are
+/// the only changes here that alter what an index covers, and the caller has to
+/// withdraw MemWAL catch-up for them: this runs after the coverage derivation,
+/// and it keeps the segment's UUID.
+async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<Vec<String>> {
     infer_missing_vector_details(dataset, indices).await;
+    let mut recovered_coverage = Vec::new();
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
@@ -928,7 +938,11 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let idx = dataset
                 .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
                 .await?;
-            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
+            let recalculated = idx.calculate_included_frags().await?;
+            if index.fragment_bitmap.as_ref() != Some(&recalculated) {
+                recovered_coverage.push(index.name.clone());
+            }
+            index.fragment_bitmap = Some(recalculated);
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
@@ -973,7 +987,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     }
 
-    Ok(())
+    Ok(recovered_coverage)
 }
 
 pub(crate) struct BadFragmentBitmapError {
@@ -1049,7 +1063,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    write_config,
+                    &write_config.to_build_config(),
                     &transaction_file,
                     &dataset.manifest,
                 )
@@ -1059,7 +1073,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
-                write_config,
+                &write_config.to_build_config(),
             )?,
         };
 
@@ -1073,7 +1087,14 @@ pub(crate) async fn do_commit_detached_transaction(
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
-        migrate_indices(dataset, &mut indices).await?;
+        // Runs after the coverage derivation and can replace a fragment bitmap
+        // while keeping its UUID, so anything it narrowed loses its position.
+        let recovered_coverage = migrate_indices(dataset, &mut indices).await?;
+        Transaction::withdraw_coverage_invalidated_after_build(
+            &mut indices,
+            &recovered_coverage,
+            manifest.version,
+        )?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1306,6 +1327,31 @@ pub(crate) async fn commit_transaction(
             dataset.clone()
         };
 
+    // The version this transaction read, captured before the retry loop moves
+    // `dataset` forward. MemWAL index catch-up is derived from it: an index
+    // covering every fragment live here holds every row compaction had copied
+    // in by then.
+    //
+    // Only tables on the protocol pay for the extra index load; the bit is on
+    // the manifest already in hand.
+    let read_version_dataset = dataset.clone();
+    let read_version_indices = if read_version_dataset.manifest.reader_feature_flags
+        & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
+        != 0
+    {
+        // The Arc is kept rather than cloned out: `load_indices` returns shared
+        // cached data, and this runs on every commit to an activated table.
+        Some(read_version_dataset.load_indices().await?)
+    } else {
+        None
+    };
+    let read_version_state = read_version_indices.as_ref().map(|indices| {
+        crate::dataset::transaction::ReadVersionState {
+            manifest: read_version_dataset.manifest.as_ref(),
+            indices: indices.as_slice(),
+        }
+    });
+
     let mut transaction = transaction.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
@@ -1371,17 +1417,18 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    write_config,
+                    &write_config.to_build_config(),
                     transaction_file,
                     &dataset.manifest,
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_read_version(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
-                write_config,
+                &write_config.to_build_config(),
+                read_version_state,
             )?,
         };
 
@@ -1402,7 +1449,14 @@ pub(crate) async fn commit_transaction(
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
 
-        migrate_indices(&dataset, &mut indices).await?;
+        // Runs after the coverage derivation and can replace a fragment bitmap
+        // while keeping its UUID, so anything it narrowed loses its position.
+        let recovered_coverage = migrate_indices(&dataset, &mut indices).await?;
+        Transaction::withdraw_coverage_invalidated_after_build(
+            &mut indices,
+            &recovered_coverage,
+            target_version,
+        )?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

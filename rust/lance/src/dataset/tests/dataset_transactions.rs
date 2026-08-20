@@ -6,20 +6,33 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{ManifestWriteConfig, TRANSACTIONS_DIR, write_manifest_file};
+use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
+use crate::dataset::{
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR,
+    write_manifest_file,
+};
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
+use lance_file::version::LanceFileVersion;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow_array::Array;
-use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use arrow_array::{
+    Int32Array, RecordBatchIterator, StringArray, StructArray,
+    types::{Int32Type, Int64Type},
+};
 use arrow_array::{RecordBatch, record_batch};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+use lance_core::Error;
+use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
+use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
 
 use crate::datafusion::LanceTableProvider;
@@ -394,7 +407,7 @@ async fn test_inline_transaction() {
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .unwrap();
     let location = write_manifest_file(
@@ -672,6 +685,16 @@ async fn test_list_detached_manifests() {
     // Now there should be one detached manifest
     let detached = dataset.list_detached_manifests().await.unwrap();
     assert_eq!(detached.len(), 1);
+    assert_eq!(
+        dataset
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
 
     // The detached version should have the high bit set
     let detached_version = detached[0].version;
@@ -936,4 +959,488 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert!(cloned.manifest.transaction_section.is_none());
     assert_ne!(cloned.manifest.transaction_file, source_tx_file);
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
+}
+
+/// Partial RewriteColumns refresh in `build_manifest`: only matched physical
+/// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
+/// untouched fragments keep both version sequences.
+#[tokio::test]
+async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch0 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader0 = RecordBatchIterator::new(vec![Ok(batch0)], schema.clone());
+    let write_params = WriteParams {
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::Stable),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader0, uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(100..108)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader1 = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+    dataset.append(reader1, None).await.unwrap();
+
+    let frags = dataset.get_fragments();
+    assert_eq!(
+        frags.len(),
+        2,
+        "expected two fragments (append creates a new fragment)"
+    );
+
+    async fn scan_row_versions(ds: &Dataset) -> HashMap<(u32, u32), (u64, u64)> {
+        let mut scanner = ds.scan();
+        scanner
+            .project(&[
+                ROW_ADDR,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ])
+            .unwrap();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut out = HashMap::new();
+        for batch in batches {
+            let addrs = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let last = batch
+                .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let created = batch
+                .column_by_name(ROW_CREATED_AT_VERSION)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            for row in 0..batch.num_rows() {
+                let addr = RowAddress::from(addrs.value(row));
+                out.insert(
+                    (addr.fragment_id(), addr.row_offset()),
+                    (last.value(row), created.value(row)),
+                );
+            }
+        }
+        out
+    }
+
+    let before = scan_row_versions(&dataset).await;
+    assert_eq!(before.len(), 16);
+
+    // Update only rows i in {2, 4, 6} within fragment 0 (physical offsets 2, 4, 6).
+    let update_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let update_batch = RecordBatch::try_new(
+        update_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![2, 4, 6])),
+            Arc::new(Int32Array::from(vec![99, 99, 99])),
+        ],
+    )
+    .unwrap();
+    let right: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(update_batch)].into_iter(),
+        update_schema,
+    ));
+
+    let mut frag0 = dataset.get_fragment(0).unwrap();
+    let u = frag0
+        .update_columns_with_offsets(right, "i", "i")
+        .await
+        .unwrap();
+    assert_eq!(u.matched_offsets.iter().count(), 3);
+    for off in [2_u32, 4, 6] {
+        assert!(u.matched_offsets.contains(off));
+    }
+
+    let updated_fragment_offsets = Some(UpdatedFragmentOffsets(HashMap::from([(
+        u.fragment.id,
+        u.matched_offsets,
+    )])));
+
+    let op = Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: vec![u.fragment],
+        new_fragments: vec![],
+        fields_modified: u.fields_modified,
+        compacted_sstables: Vec::new(),
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: Some(UpdateMode::RewriteColumns),
+        inserted_rows_filter: None,
+        updated_fragment_offsets,
+    };
+
+    let read_v = dataset.version().version;
+    let dataset = Dataset::commit(
+        uri,
+        op,
+        Some(read_v),
+        None,
+        None,
+        Arc::new(Session::default()),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let new_v = dataset.version().version;
+    assert_eq!(new_v, read_v + 1);
+
+    let after = scan_row_versions(&dataset).await;
+    for off in 0..8_u32 {
+        let key = (0, off);
+        let (last_before, created_before) = before[&key];
+        let (last_after, created_after) = after[&key];
+        assert_eq!(created_after, created_before);
+        if off == 2 || off == 4 || off == 6 {
+            assert_eq!(
+                last_after, new_v,
+                "matched row offset {off} should advance last_updated to new version"
+            );
+        } else {
+            assert_eq!(
+                last_after, last_before,
+                "unmatched row offset {off} in fragment 0 should keep last_updated"
+            );
+        }
+    }
+
+    for off in 0..8_u32 {
+        let key = (1, off);
+        assert_eq!(
+            after[&key], before[&key],
+            "fragment 1 row offset {off}: both version columns unchanged"
+        );
+    }
+}
+
+/// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+/// dropped id stays referenced by the data files and max_field_id stays 3.
+async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+        ArrowField::new("c", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+    dataset.drop_columns(&[dropped]).await.unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+    let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+    expected_ids.push(3);
+    assert_eq!(dataset.schema().field_ids(), expected_ids);
+    assert_eq!(dataset.manifest.max_field_id(), 3);
+    dataset
+}
+
+/// Expected values of every column surviving `dropped`, plus d.
+fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+    [
+        ("a", [1, 2]),
+        ("b", [10, 20]),
+        ("c", [100, 200]),
+        ("d", [5, 5]),
+    ]
+    .into_iter()
+    .filter(|(name, _)| *name != dropped)
+    .collect()
+}
+
+fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+    for (name, expected) in cols {
+        let col = &batch[*name];
+        assert_eq!(
+            col.as_primitive::<Int32Type>().values(),
+            expected,
+            "column {}",
+            name
+        );
+    }
+}
+
+async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+    let fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.metadata().clone())
+        .collect();
+    Dataset::commit(
+        Arc::new(dataset.clone()),
+        Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability: true,
+        },
+        Some(dataset.manifest.version),
+        None,
+        None,
+        dataset.session(),
+        false,
+    )
+    .await
+}
+
+// Which clause rejects the lossy round-trip depends on the hole's
+// position: a hole before the last field remaps a shared id, while a
+// hole at the end reuses the dropped id for the new field.
+#[rstest::rstest]
+#[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+#[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+#[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
+#[tokio::test]
+async fn test_merge_rejects_renumbered_field_ids(#[case] dropped: &str, #[case] expected: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let arrow_schema = ArrowSchema::from(dataset.schema());
+    let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+    assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+    let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(message.contains(expected), "unexpected error: {}", message);
+}
+
+#[tokio::test]
+async fn test_merge_rejects_dropped_field_id_reuse() {
+    // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+    // accident covered above.
+    let dataset = dataset_with_dropped_column("memory://", "b").await;
+
+    let mut schema = dataset.schema().clone();
+    let mut field = LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+    field.id = 1;
+    schema.fields.push(field);
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains("assigns id 1 to new field \"e\"")
+            && message.contains("must use ids of at least 4"),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[tokio::test]
+async fn test_merge_rejects_renumbered_nested_field_ids() {
+    // A hole inside a struct shifts a nested leaf's id onto a field
+    // outside the struct on renumbering; the full-path comparison must
+    // catch the cross-parent remap.
+    let struct_fields = Fields::from(vec![
+        ArrowField::new("x", DataType::Int32, true),
+        ArrowField::new("y", DataType::Int32, true),
+    ]);
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+        ArrowField::new("z", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int32Array::from(vec![10, 20])),
+                ],
+                None,
+            )),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset.drop_columns(&["s.x"]).await.unwrap();
+    assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+    let arrow_schema = ArrowSchema::from(dataset.schema());
+    let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+    assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+    let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[rstest::rstest]
+#[case::drop_a("a")]
+#[case::drop_b("b")]
+#[case::drop_c("c")]
+#[tokio::test]
+async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let survivors = surviving_columns(dropped);
+    let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+    let mut schema = dataset.schema().clone();
+    schema
+        .mut_field_by_id(first_id)
+        .unwrap()
+        .metadata
+        .insert("wm".into(), "42".into());
+
+    let dataset = commit_merge(&dataset, schema).await.unwrap();
+    assert_eq!(
+        dataset
+            .schema()
+            .field(survivors[0].0)
+            .unwrap()
+            .metadata
+            .get("wm"),
+        Some(&"42".to_string())
+    );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_columns(&batch, &survivors);
+}
+
+#[rstest::rstest]
+#[case::drop_a("a")]
+#[case::drop_b("b")]
+#[case::drop_c("c")]
+#[tokio::test]
+async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let mut survivors = surviving_columns(dropped);
+    let omitted = survivors.remove(0);
+    let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+    let schema = dataset.schema().project(&names).unwrap();
+
+    let dataset = commit_merge(&dataset, schema).await.unwrap();
+    assert!(dataset.schema().field(omitted.0).is_none());
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_columns(&batch, &survivors);
+}
+
+#[tokio::test]
+async fn test_merge_rejects_schema_only_path_remap() {
+    let dataset = dataset_with_dropped_column("memory://", "c").await;
+    let prior_id = dataset.schema().field("a").unwrap().id;
+    let fresh_id = dataset.manifest.max_field_id() + 1;
+
+    let mut schema = dataset.schema().clone();
+    schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "remaps existing field \"a\" from id {} to id {}",
+            prior_id, fresh_id
+        )) && message.contains("base data file"),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[rstest::rstest]
+#[case::logical_type(DataType::Float32, true, "logical type")]
+#[case::nullability(DataType::Int32, false, "nullable")]
+#[tokio::test]
+async fn test_merge_rejects_shared_id_type_or_nullability_change(
+    #[case] data_type: DataType,
+    #[case] nullable: bool,
+    #[case] expected: &str,
+) {
+    let dataset = dataset_with_dropped_column("memory://", "c").await;
+    let field_id = dataset.schema().field("a").unwrap().id;
+
+    let mut schema = dataset.schema().clone();
+    let field = schema.mut_field_by_id(field_id).unwrap();
+    field.logical_type = LogicalType::try_from(&data_type).unwrap();
+    field.nullable = nullable;
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("changes field id {} (\"a\")", field_id))
+            && message.contains(expected),
+        "unexpected error: {}",
+        message
+    );
+}
+
+/// The pure schema/fragment-shape half of this check lives in
+/// `lance_table::transaction`'s `test_merge_allows_rewritten_fresh_field_id`;
+/// this covers the `Dataset`-level effect of a rewrite that assigns a fresh
+/// field id.
+#[tokio::test]
+async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
+    let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+    let prior_id = dataset.schema().field("a").unwrap().id;
+    dataset
+        .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+    let new_id = dataset.schema().field("a").unwrap().id;
+    assert_ne!(new_id, prior_id);
+    assert!(
+        dataset.get_fragments().iter().all(|fragment| {
+            fragment
+                .metadata()
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&new_id))
+        }),
+        "alter_columns must materialize the fresh id in every fragment base file"
+    );
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
 }

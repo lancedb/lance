@@ -47,6 +47,8 @@ pub struct Updater {
     /// The adapter to convert the logical data to physical data.
     schema_adapter: Option<SchemaAdapter>,
 
+    allow_external_blob_outside_bases: bool,
+
     finished: bool,
 
     deletion_restorer: DeletionRestorer,
@@ -102,6 +104,7 @@ impl Updater {
             // The schema adapter needs the data schema, not the logical schema, so it can't be
             // created until after the first batch is read.
             schema_adapter: None,
+            allow_external_blob_outside_bases: false,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
@@ -153,7 +156,19 @@ impl Updater {
             .data_storage_format
             .lance_file_format();
 
-        versions::open_update_writer(data_storage_version, self.dataset(), &schema).await
+        versions::open_update_writer(
+            data_storage_version,
+            self.dataset(),
+            &schema,
+            self.allow_external_blob_outside_bases,
+        )
+        .await
+    }
+
+    /// Allow trusted existing external blob references to pass through an update rewrite.
+    /// Callers must separately validate any newly supplied references before writing.
+    pub(super) fn allow_external_blob_outside_bases(&mut self) {
+        self.allow_external_blob_outside_bases = true;
     }
 
     /// Update one batch.
