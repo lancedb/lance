@@ -107,29 +107,14 @@ impl SqlQueryBuilder {
         let statement = state.sql_to_statement(&self.sql, &dialect)?;
         let mut projected = statement.clone();
         let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
-        let requested_names: Vec<&str> = columns
-            .iter()
-            .filter(|(enabled, _)| *enabled)
-            .map(|(_, name)| *name)
-            .collect();
         let plan = state.statement_to_plan(statement).await?;
-        // Append the requested system columns only when the plan proves that
-        // every output row maps one-to-one to a scanned source row (otherwise
-        // aggregates, DISTINCT, joins, ... would be ambiguous or change the
-        // query's relational results) and that no intermediate projection
-        // shadows the system column names (otherwise the injected identifiers
-        // would bind to derived expressions instead of the real metadata).
-        let plan = if safe_to_inject_system_columns(&plan, &requested_names)
+        let plan = if safe_to_inject_system_columns(&plan, &columns)
             && project_system_columns(&mut projected, &columns)
         {
-            match state.statement_to_plan(projected).await {
-                Ok(plan) => plan,
-                // The rewritten statement can still fail to plan in corner
-                // cases (e.g. the user aliased another expression to the same
-                // system column name). Fall back to the original plan so the
-                // query runs, just without the extra columns.
-                Err(_) => plan,
-            }
+            // Fall back to the original plan when the rewritten statement
+            // fails to plan (e.g. another expression aliased to a system
+            // column name), so the query still runs without the extra columns.
+            state.statement_to_plan(projected).await.unwrap_or(plan)
         } else {
             plan
         };
@@ -138,20 +123,17 @@ impl SqlQueryBuilder {
     }
 }
 
-/// Returns true when injecting the system columns in `names` into the
-/// query's top-level SELECT list is provably safe. Two properties must hold:
+/// Returns true when appending the enabled system columns to the query's
+/// top-level SELECT list is provably safe:
 ///
-/// 1. Row identity: every output row corresponds to exactly one row scanned
-///    from the source table, so the injection cannot change the values or
-///    cardinality of the other columns. This is a conservative whitelist of
-///    row-preserving operators; anything else (aggregates, DISTINCT, joins,
-///    unions, windows, ...) collapses, duplicates, or synthesizes rows.
-/// 2. Name lineage: no intermediate projection redefines a system column
-///    name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery). The
-///    injected identifiers resolve by name in the outer scope, so a shadowed
-///    name would bind them to a derived expression and return arbitrary
-///    values as row metadata.
-fn safe_to_inject_system_columns(plan: &LogicalPlan, names: &[&str]) -> bool {
+/// 1. Row identity: every output row maps to exactly one scanned source row
+///    (whitelist of row-preserving operators; aggregates, DISTINCT, joins,
+///    unions, ... collapse, duplicate, or synthesize rows), so the injection
+///    cannot change the other columns' values or cardinality.
+/// 2. Name lineage: no intermediate projection redefines an enabled system
+///    column name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery), so
+///    the injected identifiers can only bind to the real scan columns.
+fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -> bool {
     match plan {
         LogicalPlan::TableScan(_) => true,
         LogicalPlan::Projection(projection) => {
@@ -160,7 +142,11 @@ fn safe_to_inject_system_columns(plan: &LogicalPlan, names: &[&str]) -> bool {
                 .fields()
                 .iter()
                 .zip(&projection.expr)
-                .filter(|(field, _)| names.contains(&field.name().as_str()))
+                .filter(|(field, _)| {
+                    columns
+                        .iter()
+                        .any(|&(enabled, name)| enabled && field.name().as_str() == name)
+                })
                 .any(|(field, expr)| {
                     let mut expr = expr;
                     while let LogicalExpr::Alias(alias) = expr {
@@ -168,7 +154,7 @@ fn safe_to_inject_system_columns(plan: &LogicalPlan, names: &[&str]) -> bool {
                     }
                     !matches!(expr, LogicalExpr::Column(column) if &column.name == field.name())
                 });
-            !shadows_system_column && safe_to_inject_system_columns(&projection.input, names)
+            !shadows_system_column && safe_to_inject_system_columns(&projection.input, columns)
         }
         LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
@@ -176,7 +162,7 @@ fn safe_to_inject_system_columns(plan: &LogicalPlan, names: &[&str]) -> bool {
         | LogicalPlan::SubqueryAlias(_) => plan
             .inputs()
             .iter()
-            .all(|input| safe_to_inject_system_columns(input, names)),
+            .all(|input| safe_to_inject_system_columns(input, columns)),
         _ => false,
     }
 }
@@ -352,117 +338,65 @@ mod tests {
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
     }
 
-    #[tokio::test]
-    async fn test_sql_includes_unprojected_system_columns() {
-        let ds = gen_batch()
-            .col("x", array::step::<Int32Type>())
-            .into_dataset(
-                "memory://test_sql_implicit_system_columns",
-                FragmentCount::from(1),
-                FragmentRowCount::from(2),
-            )
-            .await
-            .unwrap();
-
-        let batches = ds
-            .sql("SELECT x FROM dataset")
-            .with_row_id(true)
-            .with_row_addr(true)
-            .build()
-            .await
-            .unwrap()
-            .into_batch_records()
-            .await
-            .unwrap();
-
-        let batch = &batches[0];
-        assert_eq!(batch.schema().fields().len(), 3);
-        let row_id_index = batch.schema().index_of("_rowid").unwrap();
-        let row_ids = batch.column(row_id_index).as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.values(), &[0, 1]);
-        let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
-        let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
-        assert_eq!(row_addrs.values(), &[0, 1]);
-
-        // Filter/sort/limit chains preserve row identity, so injection still
-        // applies to them.
-        let batches = ds
-            .sql("SELECT x FROM dataset WHERE x >= 0 ORDER BY x DESC LIMIT 2")
-            .with_row_id(true)
-            .with_row_addr(true)
-            .build()
-            .await
-            .unwrap()
-            .into_batch_records()
-            .await
-            .unwrap();
-
-        let batch = &batches[0];
-        assert_eq!(batch.schema().fields().len(), 3);
-        assert_eq!(
-            batch["_rowid"].as_primitive::<UInt64Type>().values(),
-            &[1, 0]
-        );
-        assert_eq!(
-            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
-            &[1, 0]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sql_wildcard_includes_system_columns_once() {
-        let ds = gen_batch()
-            .col("x", array::step::<Int32Type>())
-            .into_dataset(
-                "memory://test_sql_wildcard_system_columns",
-                FragmentCount::from(1),
-                FragmentRowCount::from(2),
-            )
-            .await
-            .unwrap();
-
-        let batches = ds
-            .sql("SELECT * FROM dataset")
-            .with_row_id(true)
-            .with_row_addr(true)
-            .build()
-            .await
-            .unwrap()
-            .into_batch_records()
-            .await
-            .unwrap();
-
-        let batch = &batches[0];
-        assert_eq!(
-            batch.schema().field_names(),
-            vec!["x", "_rowid", "_rowaddr"]
-        );
-        assert_eq!(
-            batch["_rowid"].as_primitive::<UInt64Type>().values(),
-            &[0, 1]
-        );
-        assert_eq!(
-            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
-            &[0, 1]
-        );
-    }
-
+    /// Requested system columns are appended after the user's columns when
+    /// injection is safe, are not duplicated when already projected under any
+    /// accepted spelling, and are skipped when a subquery alias shadows them
+    /// (the injected identifiers would bind to the derived expressions and
+    /// return arbitrary values as row metadata).
     #[rstest]
-    #[case::lowercase("SELECT x, _rowid FROM dataset", vec!["x", "_rowid"])]
-    #[case::unquoted_uppercase("SELECT x, _ROWID FROM dataset", vec!["x", "_rowid"])]
-    #[case::quoted(r#"SELECT x, "_rowid" FROM dataset"#, vec!["x", "_rowid"])]
-    #[case::table_qualified("SELECT x, dataset._rowid FROM dataset", vec!["x", "_rowid"])]
-    #[case::expression_reference("SELECT _rowid + 1 AS y FROM dataset", vec!["y", "_rowid"])]
-    #[case::system_column_only("SELECT _rowid FROM dataset", vec!["_rowid"])]
+    #[case::plain("SELECT x FROM dataset", vec!["x", "_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::filter_sort_limit(
+        "SELECT x FROM dataset WHERE x >= 0 ORDER BY x DESC LIMIT 2",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![1, 0]
+    )]
+    #[case::wildcard("SELECT * FROM dataset", vec!["x", "_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::already_projected(
+        "SELECT x, _rowid, _rowaddr FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::unquoted_uppercase(
+        "SELECT x, _ROWID, _ROWADDR FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::quoted(
+        r#"SELECT x, "_rowid", "_rowaddr" FROM dataset"#,
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::table_qualified(
+        "SELECT x, dataset._rowid, dataset._rowaddr FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::expression_reference(
+        "SELECT _rowid + 1 AS y FROM dataset",
+        vec!["y", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::system_columns_only("SELECT _rowid FROM dataset", vec!["_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::passthrough_subquery(
+        "SELECT x FROM (SELECT x, _rowid, _rowaddr FROM dataset) s",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::shadowed_subquery(
+        "SELECT x FROM (SELECT x, (_rowid + 1) AS _rowid, (_rowaddr + 1) AS _rowaddr FROM dataset) s",
+        vec!["x"],
+        vec![]
+    )]
     #[tokio::test]
-    async fn test_sql_system_column_spellings(
+    async fn test_sql_system_column_injection(
         #[case] sql: &str,
         #[case] expected_columns: Vec<&str>,
+        #[case] expected_row_ids: Vec<u64>,
     ) {
         let ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_dataset(
-                "memory://test_sql_system_column_spellings",
+                "memory://test_sql_system_column_injection",
                 FragmentCount::from(1),
                 FragmentRowCount::from(2),
             )
@@ -472,6 +406,7 @@ mod tests {
         let batches = ds
             .sql(sql)
             .with_row_id(true)
+            .with_row_addr(true)
             .build()
             .await
             .unwrap()
@@ -481,68 +416,15 @@ mod tests {
 
         let batch = &batches[0];
         assert_eq!(batch.schema().field_names(), expected_columns);
-        assert_eq!(
-            batch["_rowid"].as_primitive::<UInt64Type>().values(),
-            &[0, 1]
-        );
-    }
-
-    /// A derived subquery can alias arbitrary expressions to the reserved
-    /// system column names. Injected identifiers resolve by name in the outer
-    /// scope, so injection must be skipped there; otherwise the query would
-    /// return derived values as row metadata.
-    #[tokio::test]
-    async fn test_sql_system_columns_not_injected_when_shadowed() {
-        let ds = gen_batch()
-            .col("x", array::step::<Int32Type>())
-            .into_dataset(
-                "memory://test_sql_system_columns_shadowed",
-                FragmentCount::from(1),
-                FragmentRowCount::from(2),
-            )
-            .await
-            .unwrap();
-
-        let batches = ds
-            .sql(
-                "SELECT x FROM (SELECT x, (_rowid + 1) AS _rowid, (_rowaddr + 1) AS _rowaddr \
-                 FROM dataset) s",
-            )
-            .with_row_id(true)
-            .with_row_addr(true)
-            .build()
-            .await
-            .unwrap()
-            .into_batch_records()
-            .await
-            .unwrap();
-        assert_eq!(batches[0].schema().field_names(), vec!["x"]);
-
-        // A subquery that passes the real scan columns through unchanged is
-        // safe: injection still applies and returns the actual metadata.
-        let batches = ds
-            .sql("SELECT x FROM (SELECT x, _rowid, _rowaddr FROM dataset) s")
-            .with_row_id(true)
-            .with_row_addr(true)
-            .build()
-            .await
-            .unwrap()
-            .into_batch_records()
-            .await
-            .unwrap();
-        let batch = &batches[0];
-        assert_eq!(
-            batch.schema().field_names(),
-            vec!["x", "_rowid", "_rowaddr"]
-        );
-        assert_eq!(
-            batch["_rowid"].as_primitive::<UInt64Type>().values(),
-            &[0, 1]
-        );
-        assert_eq!(
-            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
-            &[0, 1]
-        );
+        for name in ["_rowid", "_rowaddr"] {
+            if expected_columns.contains(&name) {
+                assert_eq!(
+                    batch[name].as_primitive::<UInt64Type>().values().as_ref(),
+                    expected_row_ids.as_slice(),
+                    "unexpected values for column {name}",
+                );
+            }
+        }
     }
 
     /// System columns must never be injected into queries whose output rows
