@@ -4,7 +4,6 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Gcs};
 
 use object_store::{
@@ -13,6 +12,7 @@ use object_store::{
 };
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
