@@ -1531,10 +1531,8 @@ fn score_sum_cannot_compete(
     upper_bound_factor: f64,
     floor_mode: CompetitiveFloorMode,
 ) -> bool {
-    floor_mode.rejects_upper_bound(
-        (f64::from(partial_score) + remaining_upper_bound) * upper_bound_factor,
-        floor,
-    )
+    let upper_bound = (f64::from(partial_score) + remaining_upper_bound) * upper_bound_factor;
+    floor_mode.rejects_upper_bound(f64::from(outward_f32_upper_bound(upper_bound)), floor)
 }
 
 type ScoreContribution = ((u32, u32), f32);
@@ -4913,8 +4911,14 @@ fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
         (count + 1, sum + f64::from(score))
     });
     let widened = exact * score_sum_upper_bound_factor(num_scores);
-    let rounded = widened as f32;
-    if f64::from(rounded) < widened {
+    outward_f32_upper_bound(widened)
+}
+
+/// Round a wide score bound to the least `f32` that still covers it.
+#[inline]
+pub(super) fn outward_f32_upper_bound(value: f64) -> f32 {
+    let rounded = value as f32;
+    if f64::from(rounded) < value {
         next_up_f32(rounded)
     } else {
         rounded
@@ -5059,6 +5063,22 @@ mod tests {
             threshold,
             score_sum_upper_bound_factor(3),
             CompetitiveFloorMode::Exclusive,
+        ));
+    }
+
+    #[test]
+    fn two_clause_inclusive_bound_rounds_outward_at_f32_boundary() {
+        let partial_score = 1.0_f32;
+        let remaining_upper_bound = f32::from_bits(0x3380_0001);
+        let floor = partial_score + remaining_upper_bound;
+
+        assert_eq!(floor.to_bits(), 0x3f80_0001);
+        assert!(!score_sum_cannot_compete(
+            partial_score,
+            f64::from(remaining_upper_bound),
+            floor,
+            score_sum_upper_bound_factor(2),
+            CompetitiveFloorMode::Inclusive,
         ));
     }
 

@@ -3,6 +3,48 @@
 
 use super::*;
 
+/// Query-level inputs for a grouped-term score upper bound.
+///
+/// The exact grouped score multiplies and then sums every expansion term in a
+/// stable order. Computing the bound from the `f32` sum of query weights can
+/// round below that score, so retain the `f64` sum and widen once for the term
+/// multiplications plus the final `f32` additions.
+#[derive(Debug, Clone, Copy)]
+struct GroupedScoreUpperBound {
+    query_weight: f32,
+    exact_query_weight_sum: f64,
+    rounding_factor: f64,
+}
+
+impl GroupedScoreUpperBound {
+    fn new(query_weights: impl Iterator<Item = f32>) -> Self {
+        let mut query_weight = 0.0_f32;
+        let mut exact_query_weight_sum = 0.0_f64;
+        let mut num_terms = 0usize;
+        for weight in query_weights {
+            query_weight += weight;
+            exact_query_weight_sum += f64::from(weight);
+            num_terms += 1;
+        }
+        Self {
+            query_weight,
+            exact_query_weight_sum,
+            // Two extra stages cover each term's rounded BM25 evaluation and
+            // multiplication before the grouped f32 sum.
+            rounding_factor: score_sum_upper_bound_factor(num_terms.saturating_add(2)),
+        }
+    }
+
+    #[inline]
+    fn score(self, union_freq: u32, doc_length: u32, scorer: &MemBM25Scorer) -> f32 {
+        outward_f32_upper_bound(
+            self.exact_query_weight_sum
+                * f64::from(scorer.doc_weight(union_freq, doc_length))
+                * self.rounding_factor,
+        )
+    }
+}
+
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
     // 0 for legacy format
@@ -162,7 +204,7 @@ impl InvertedPartition {
 
     #[inline]
     fn grouped_score_upper_bound(
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         union_freq: u32,
         doc_length: u32,
         scorer: &MemBM25Scorer,
@@ -170,7 +212,7 @@ impl InvertedPartition {
         // BM25's document weight is monotonic in frequency and every IDF is
         // non-negative. Scoring the summed frequency with the summed IDF is
         // therefore an upper bound on the sum of the individual term scores.
-        query_weight * scorer.doc_weight(union_freq, doc_length)
+        score_upper_bound.score(union_freq, doc_length, scorer)
     }
 
     fn grouped_block_max_scores(
@@ -178,7 +220,7 @@ impl InvertedPartition {
         frequencies: &[u32],
         block_size: usize,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Vec<f32> {
         doc_ids
@@ -190,7 +232,7 @@ impl InvertedPartition {
                     .zip(frequencies)
                     .map(|(doc_id, freq)| {
                         Self::grouped_score_upper_bound(
-                            query_weight,
+                            score_upper_bound,
                             *freq,
                             docs.scoring_num_tokens(*doc_id),
                             scorer,
@@ -204,7 +246,7 @@ impl InvertedPartition {
     fn union_plain_posting_lists(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let mut freqs_by_row_id = BTreeMap::new();
@@ -221,7 +263,7 @@ impl InvertedPartition {
         let mut max_score = 0.0_f32;
         for (row_id, freq) in freqs_by_row_id {
             max_score = max_score.max(Self::grouped_score_upper_bound(
-                query_weight,
+                score_upper_bound,
                 freq,
                 docs.num_tokens_by_row_id(row_id),
                 scorer,
@@ -240,7 +282,7 @@ impl InvertedPartition {
     fn union_plain_posting_lists_with_positions(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let mut positions_by_row_id = BTreeMap::<u64, Vec<u32>>::new();
@@ -272,7 +314,7 @@ impl InvertedPartition {
             positions.sort_unstable();
             let frequency = positions.len() as u32;
             max_score = max_score.max(Self::grouped_score_upper_bound(
-                query_weight,
+                score_upper_bound,
                 frequency,
                 docs.num_tokens_by_row_id(row_id),
                 scorer,
@@ -296,7 +338,7 @@ impl InvertedPartition {
     fn union_compressed_posting_lists(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let block_size = postings
@@ -343,7 +385,7 @@ impl InvertedPartition {
             &frequencies,
             block_size,
             docs,
-            query_weight,
+            score_upper_bound,
             scorer,
         );
         let batch = builder.to_batch(block_max_scores)?;
@@ -355,7 +397,7 @@ impl InvertedPartition {
     fn union_compressed_posting_lists_with_positions(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let block_size = postings
@@ -407,7 +449,7 @@ impl InvertedPartition {
             &frequencies,
             block_size,
             docs,
-            query_weight,
+            score_upper_bound,
             scorer,
         );
         let batch = builder.to_batch(block_max_scores)?;
@@ -420,7 +462,7 @@ impl InvertedPartition {
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
         with_positions: bool,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let has_plain = postings
@@ -433,18 +475,23 @@ impl InvertedPartition {
             (true, true) => Err(Error::index(
                 "cannot union mixed plain and compressed posting lists".to_owned(),
             )),
-            (true, false) if with_positions => {
-                Self::union_plain_posting_lists_with_positions(postings, docs, query_weight, scorer)
+            (true, false) if with_positions => Self::union_plain_posting_lists_with_positions(
+                postings,
+                docs,
+                score_upper_bound,
+                scorer,
+            ),
+            (true, false) => {
+                Self::union_plain_posting_lists(postings, docs, score_upper_bound, scorer)
             }
-            (true, false) => Self::union_plain_posting_lists(postings, docs, query_weight, scorer),
             (false, true) if with_positions => Self::union_compressed_posting_lists_with_positions(
                 postings,
                 docs,
-                query_weight,
+                score_upper_bound,
                 scorer,
             ),
             (false, true) => {
-                Self::union_compressed_posting_lists(postings, docs, query_weight, scorer)
+                Self::union_compressed_posting_lists(postings, docs, score_upper_bound, scorer)
             }
             (false, false) => Ok(PostingList::Plain(PlainPostingList::new(
                 ScalarBuffer::from(Vec::<u64>::new()),
@@ -617,7 +664,9 @@ impl InvertedPartition {
                     })
                     .collect::<Vec<_>>();
                 let terms = Arc::<[GroupedTermScorer]>::from(terms);
-                let query_weight = terms.iter().map(GroupedTermScorer::query_weight).sum();
+                let score_upper_bound =
+                    GroupedScoreUpperBound::new(terms.iter().map(GroupedTermScorer::query_weight));
+                let query_weight = score_upper_bound.query_weight;
                 grouped_expansions.push(GroupedExpansionTerms {
                     position,
                     terms: terms.clone(),
@@ -633,7 +682,7 @@ impl InvertedPartition {
                     postings,
                     docs,
                     is_phrase_query,
-                    query_weight,
+                    score_upper_bound,
                     impact_scorer,
                 )?;
                 if posting.is_empty() && (is_and_query || is_phrase_query) {
@@ -799,5 +848,115 @@ impl InvertedPartition {
                 .push(posting_list.into_builder(&builder.docs));
         }
         Ok(builder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::plain(false)]
+    #[case::v3_compressed(true)]
+    fn grouped_union_bound_covers_exact_grouped_score(#[case] compressed: bool) {
+        let num_docs = 1_975_725usize;
+        let total_tokens = num_docs as u64 * u64::from(u32::MAX);
+        let token_names = ["t0", "t1"];
+        let token_docs = [1_970_713usize, 334_819];
+        let frequencies = [138_872u32, 794_767];
+        let doc_length = frequencies.into_iter().sum::<u32>();
+        let scorer = Arc::new(MemBM25Scorer::new(
+            total_tokens,
+            num_docs,
+            token_names
+                .into_iter()
+                .zip(token_docs)
+                .map(|(token, docs)| (token.to_owned(), docs))
+                .collect(),
+        ));
+        let query_weights = token_names.map(|token| scorer.query_weight(token));
+        let exact_score = query_weights.into_iter().zip(frequencies).fold(
+            0.0_f32,
+            |score, (query_weight, frequency)| {
+                score + query_weight * scorer.doc_weight(frequency, doc_length)
+            },
+        );
+        let query_weight = query_weights.into_iter().sum::<f32>();
+        let score_upper_bound = GroupedScoreUpperBound::new(query_weights.into_iter());
+        let union_frequency = frequencies.into_iter().sum::<u32>();
+        let naive_proxy_bound = query_weight * scorer.doc_weight(union_frequency, doc_length);
+        let term_postings = query_weights
+            .into_iter()
+            .zip(frequencies)
+            .map(|(query_weight, frequency)| {
+                let max_score = query_weight * scorer.doc_weight(frequency, doc_length);
+                if compressed {
+                    let mut builder =
+                        PostingListBuilder::new_with_block_size(false, MAX_POSTING_BLOCK_SIZE);
+                    builder.add(0, PositionRecorder::Count(frequency));
+                    let batch = builder.to_batch(vec![max_score]).unwrap();
+                    let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+                    let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+                    PostingList::from_batch(&batch, Some(max_score), Some(length)).unwrap()
+                } else {
+                    PostingList::Plain(PlainPostingList::new(
+                        ScalarBuffer::from(vec![0u64]),
+                        ScalarBuffer::from(vec![frequency as f32]),
+                        Some(max_score),
+                        None,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        let grouped_terms = term_postings
+            .iter()
+            .zip(query_weights)
+            .map(|(posting, query_weight)| GroupedTermScorer::new(query_weight, posting))
+            .collect::<Arc<[GroupedTermScorer]>>();
+        let mut documents = DocSet::default();
+        documents.append(0, doc_length);
+        let loaded_documents = LoadedDocLengths::Legacy(Arc::new(documents.clone()));
+        let union_posting = InvertedPartition::union_posting_lists(
+            term_postings,
+            &loaded_documents,
+            false,
+            score_upper_bound,
+            &scorer,
+        )
+        .unwrap();
+        let grouped_bound = union_posting.max_score().unwrap();
+
+        assert_eq!(exact_score.to_bits(), 0x407a_4aa8);
+        assert_eq!(naive_proxy_bound.to_bits(), 0x407a_4aa7);
+        assert!(grouped_bound >= exact_score);
+
+        let posting = PostingIterator::with_query_weight(
+            "group".to_owned(),
+            0,
+            0,
+            query_weight,
+            union_posting,
+            1,
+        )
+        .with_grouped_terms(grouped_terms);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![posting],
+            &documents,
+            scorer,
+            &params,
+            &metrics,
+        );
+        cursor.set_min_competitive_score(exact_score).unwrap();
+
+        assert_eq!(cursor.next().unwrap(), Some(0));
+        assert_eq!(
+            cursor.current_score().unwrap().to_bits(),
+            exact_score.to_bits()
+        );
     }
 }
