@@ -1821,6 +1821,29 @@ impl ShardWriter {
         )
         .await?;
 
+        // Publish the read cursor once, now that replay knows the tip. The
+        // tailer used to write this per entry, but a tailer holds no claim;
+        // here it rides the epoch holder's normal commit path. Best-effort:
+        // it is a hint for other readers, and `position_hint_seed` already
+        // tolerates it lagging behind `replay_after_wal_entry_position`.
+        let replayed_through = next_wal_position.saturating_sub(1);
+        if replayed_through > manifest.wal_entry_position_last_seen
+            && let Err(error) = manifest_store
+                .commit_update(epoch, |current| ShardManifest {
+                    version: current.next_version(),
+                    wal_entry_position_last_seen: current
+                        .wal_entry_position_last_seen
+                        .max(replayed_through),
+                    ..current.clone()
+                })
+                .await
+        {
+            warn!(
+                "failed to publish WAL read cursor {} for shard {}: {}",
+                replayed_through, shard_id, error
+            );
+        }
+
         // Mark the active memtable's replayed batches durable. They came *from*
         // the WAL, and replay has already re-derived its indexes over them.
         //
@@ -2487,7 +2510,7 @@ impl ShardWriter {
     /// may not appear. Fencing does not rely on this — [`Self::check_fenced`]
     /// always reads storage.
     pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
-        self.manifest_store.read_latest().await
+        self.manifest_store.latest().await
     }
 
     /// The shard's manifest store.
@@ -7087,7 +7110,7 @@ mod tests {
         // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
         let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let pre = manifest_store.read_latest().await.unwrap().unwrap();
+        let pre = manifest_store.latest().await.unwrap().unwrap();
         assert!(
             !pre.sstables.is_empty(),
             "writer A's close() should have stamped an SSTable"
@@ -7103,13 +7126,13 @@ mod tests {
         let (compactor_epoch, _) = manifest_store.claim_epoch(pre.shard_spec_id).await.unwrap();
         manifest_store
             .commit_update(compactor_epoch, |current| ShardManifest {
-                version: current.version + 1,
+                version: current.next_version(),
                 sstables: vec![],
                 ..current.clone()
             })
             .await
             .unwrap();
-        let post = manifest_store.read_latest().await.unwrap().unwrap();
+        let post = manifest_store.latest().await.unwrap().unwrap();
         assert!(
             post.sstables.is_empty(),
             "compactor drain should have left sstables empty"
@@ -7734,7 +7757,7 @@ mod tests {
         writer
             .manifest_store
             .commit_update(writer.epoch(), |current| ShardManifest {
-                version: current.version + 1,
+                version: current.next_version(),
                 current_generation: sealed + 2,
                 ..current.clone()
             })
@@ -8427,7 +8450,7 @@ mod shard_writer_tests {
         let manifest_store =
             super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
         let manifest = manifest_store
-            .read_latest()
+            .latest()
             .await
             .expect("Failed to read manifest")
             .expect("Manifest should exist");
@@ -9093,7 +9116,7 @@ mod shard_writer_tests {
         let manifest_store =
             super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
         let manifest = manifest_store
-            .read_latest()
+            .latest()
             .await
             .expect("Failed to read manifest")
             .expect("Manifest should exist");

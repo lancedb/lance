@@ -1139,7 +1139,7 @@ impl MemTableFlusher {
                 });
 
                 ShardManifest {
-                    version: current.version + 1,
+                    version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(result.covered_wal_entry_position, 1);
 
         // Verify manifest was updated
-        let updated_manifest = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated_manifest = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(updated_manifest.version, 2);
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
@@ -1403,7 +1403,7 @@ mod tests {
             1,
             "pre-commit warm fires exactly once"
         );
-        let updated = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(
             updated.sstables.len(),
             1,

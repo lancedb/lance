@@ -217,6 +217,17 @@ pub struct ShardManifest {
     pub status: ShardStatus,
 }
 
+impl ShardManifest {
+    /// The version a manifest built on this one must carry.
+    ///
+    /// Manifest versions are CAS-allocated and must stay gap-free: a reader
+    /// scans forward and stops at the first version it cannot find, so a gap
+    /// hides everything past it.
+    pub fn next_version(&self) -> u64 {
+        self.version + 1
+    }
+}
+
 impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
