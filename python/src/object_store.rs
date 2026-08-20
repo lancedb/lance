@@ -42,10 +42,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods};
 
+use lance_io::object_store::providers::memory::MemoryStoreProvider;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry,
 };
-use lance_io::object_store::providers::memory::MemoryStoreProvider;
 
 /// Name that every capsule passed to [`PyObjectStoreProvider::from_capsule`]
 /// must carry. External wheels create their capsule with this exact name so a
@@ -103,7 +103,7 @@ impl ObjectStoreProvider for PyProviderBridge {
 ///   wheel (see the module docs on the `PyCapsule` handoff and its lockstep
 ///   build requirement). This is how an out-of-tree Rust provider registers
 ///   itself without living in the Lance source tree.
-#[pyclass(name = "_ObjectStoreProvider", module = "_lib")]
+#[pyclass(name = "_ObjectStoreProvider", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct PyObjectStoreProvider {
     pub(crate) inner: Arc<dyn ObjectStoreProvider>,
@@ -142,13 +142,18 @@ impl PyObjectStoreProvider {
     /// source and toolchain as this one.
     #[staticmethod]
     fn from_capsule(capsule: &Bound<'_, PyCapsule>) -> PyResult<Self> {
+        // pyo3 0.28's `PyCapsule::name()` yields a `CapsuleName`; `as_cstr` is
+        // unsafe only because the name pointer's lifetime is not tied to the
+        // capsule. Our capsule names are statically allocated, and we use the
+        // borrow immediately (compare, or copy into an owned String), so the
+        // pointer is valid for the duration of each use.
         match capsule.name()? {
-            Some(name) if name == PROVIDER_CAPSULE_NAME => {}
+            Some(name) if unsafe { name.as_cstr() } == PROVIDER_CAPSULE_NAME => {}
             other => {
                 return Err(PyValueError::new_err(format!(
                     "expected a PyCapsule named {:?}, got {:?}",
                     PROVIDER_CAPSULE_NAME.to_string_lossy(),
-                    other.map(|c| c.to_string_lossy().into_owned()),
+                    other.map(|c| unsafe { c.as_cstr() }.to_string_lossy().into_owned()),
                 )));
             }
         }
@@ -156,9 +161,12 @@ impl PyObjectStoreProvider {
         // SAFETY: by the capsule-name contract above, the capsule carries an
         // `Arc<dyn ObjectStoreProvider>` built against the identical lance-io /
         // object_store types (same source, rustc, and resolved dependency
-        // versions). Cloning the `Arc` bumps the strong count; the capsule
-        // retains its own reference and its destructor drops that on GC.
-        let provider = unsafe { capsule.reference::<Arc<dyn ObjectStoreProvider>>() };
+        // versions). The name was validated above, so we retrieve the pointer
+        // (`pointer_checked` re-verifies the capsule is non-null and valid),
+        // dereference it only long enough to clone the `Arc` (bumping the
+        // strong count); the capsule keeps its own reference and drops it on GC.
+        let ptr = capsule.pointer_checked(None)?;
+        let provider = unsafe { ptr.cast::<Arc<dyn ObjectStoreProvider>>().as_ref() };
         Ok(Self {
             inner: provider.clone(),
         })
@@ -179,7 +187,7 @@ impl PyObjectStoreProvider {
 /// Pass an instance as the `store_registry` argument of `Session(...)` to
 /// make its schemes visible to `lance.dataset(uri, session=...)` and
 /// `lance.write_dataset(..., uri, session=...)`.
-#[pyclass(name = "_ObjectStoreRegistry", module = "_lib")]
+#[pyclass(name = "_ObjectStoreRegistry", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct PyObjectStoreRegistry {
     pub(crate) inner: Arc<ObjectStoreRegistry>,
