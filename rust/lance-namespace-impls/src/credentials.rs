@@ -85,7 +85,6 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_core::utils::parse::str_is_truthy;
 use lance_io::object_store::uri_to_url;
 use lance_namespace::models::Identity;
 
@@ -377,7 +376,7 @@ pub fn detect_provider_from_uri(uri: &str) -> &'static str {
 pub fn has_credential_vendor_config(properties: &HashMap<String, String>) -> bool {
     properties
         .get(ENABLED)
-        .map(|v| str_is_truthy(v))
+        .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
@@ -484,6 +483,7 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
+    use lance_core::utils::parse::str_is_truthy;
     use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
