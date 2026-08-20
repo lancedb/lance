@@ -22,6 +22,7 @@ import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
 import org.lance.schema.LanceField;
 import org.lance.schema.LanceSchema;
+import org.lance.schema.SqlExpressions;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -37,13 +38,18 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Stream;
 
 public class MergeTest extends OperationTestBase {
 
@@ -426,6 +432,59 @@ public class MergeTest extends OperationTestBase {
                     () -> new CommitBuilder(initialDataset).execute(transaction).close());
             Assertions.assertTrue(error.getMessage().contains("ambiguous raw Arrow field IDs"));
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testLegacyMergeInheritsNonContiguousFieldIds(@TempDir Path tempDir) throws Exception {
+    Path source =
+        Path.of("..", "test_data", "v0.10.5", "corrupt_schema").toAbsolutePath().normalize();
+    Path datasetPath = tempDir.resolve("legacy");
+    copyDirectory(source, datasetPath);
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset legacy = Dataset.open(datasetPath.toString(), allocator)) {
+      legacy.dropColumns(Collections.singletonList("y"));
+      long baseVersion = legacy.version();
+      legacy.addColumns(
+          new SqlExpressions.Builder().withExpression("z", "x + 1").build(), Optional.empty());
+
+      Merge generated;
+      try (Transaction transaction = legacy.readTransaction().orElseThrow()) {
+        generated = (Merge) transaction.operation();
+      }
+
+      try (Dataset restored = legacy.checkoutVersion(baseVersion)) {
+        restored.restore();
+        try (Transaction transaction =
+                new Transaction.Builder()
+                    .readVersion(restored.version())
+                    .operation(
+                        Merge.builder()
+                            .fragments(generated.fragments())
+                            .schema(generated.schema())
+                            .build())
+                    .build();
+            Dataset merged = new CommitBuilder(restored).execute(transaction)) {
+          Assertions.assertEquals(0, findField(merged.getLanceSchema().fields(), "x").getId());
+          Assertions.assertEquals(4, findField(merged.getLanceSchema().fields(), "b").getId());
+          Assertions.assertEquals(5, findField(merged.getLanceSchema().fields(), "c").getId());
+          Assertions.assertEquals(6, findField(merged.getLanceSchema().fields(), "z").getId());
+        }
+      }
+    }
+  }
+
+  private void copyDirectory(Path source, Path target) throws IOException {
+    try (Stream<Path> paths = Files.walk(source)) {
+      for (Path path : (Iterable<Path>) paths::iterator) {
+        Path destination = target.resolve(source.relativize(path));
+        if (Files.isDirectory(path)) {
+          Files.createDirectories(destination);
+        } else {
+          Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
         }
       }
     }
