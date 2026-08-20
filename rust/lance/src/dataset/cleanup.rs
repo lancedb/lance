@@ -65,7 +65,10 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -676,9 +679,11 @@ impl<'a> CleanupTask<'a> {
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
         let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
+        let files_outside_base = AtomicUsize::new(0);
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
+            let files_outside_base_ref = &files_outside_base;
             self.dataset
                 .object_store
                 .read_dir_all(&dir, unmodified_since)
@@ -701,6 +706,7 @@ impl<'a> CleanupTask<'a> {
                         obj_meta,
                         maybe_in_progress,
                         inspection_ref,
+                        files_outside_base_ref,
                     );
                     future::ready(file_to_remove)
                 })
@@ -829,6 +835,17 @@ impl<'a> CleanupTask<'a> {
                 .await?;
         }
 
+        let num_files_outside_base = files_outside_base.load(Ordering::Relaxed);
+        if num_files_outside_base > 0 {
+            warn!(
+                num_files = num_files_outside_base,
+                base = self.dataset.base.as_ref(),
+                "Skipped files the store listed outside the dataset base; cleanup cannot \
+                 classify them, so they stay while the store reports those locations. \
+                 Enable debug logging to see each path."
+            );
+        }
+
         let cleanup_result = cleanup_result.into_inner().unwrap();
 
         let span = Span::current();
@@ -858,14 +875,17 @@ impl<'a> CleanupTask<'a> {
         obj_meta: ObjectMeta,
         maybe_in_progress: bool,
         inspection: &CleanupInspection,
+        files_outside_base: &AtomicUsize,
     ) -> Result<Option<CleanupFile>> {
         let path = obj_meta.location;
         // Every listing here is rooted at the dataset base, so a path outside it means the
         // object store reported something unexpected.  Propagating would strand a pass that
         // `remove_stream` has already partly executed, so leave the file alone as we do for
-        // every other shape we cannot classify.  `debug!` rather than `warn!` because a store
-        // that misreports one path misreports every path of that kind.
+        // every other shape we cannot classify.  A store that misreports one path misreports
+        // every path of that kind, so the per-file detail stays at `debug!` and
+        // `delete_unreferenced_files` warns once with the count.
         let Ok(relative_path) = strip_prefix(&path, &self.dataset.base) else {
+            files_outside_base.fetch_add(1, Ordering::Relaxed);
             debug!(
                 path = path.as_ref(),
                 base = self.dataset.base.as_ref(),
@@ -1980,9 +2000,11 @@ mod tests {
             self.load_dataset(&branch_ds.uri).await
         }
 
-        /// The metadata the dataset's listing reports, as the cleanup pass sees it:
-        /// after any `object_meta_policy` rewrite, and after the `unmodified_since`
-        /// filter that decides which entries reach the classifier.
+        /// Everything one `read_dir_all` over the dataset root reports, after any
+        /// `object_meta_policy` rewrite and after the given `unmodified_since` cutoff.
+        ///
+        /// Not what cleanup classifies: cleanup lists five named subtrees rather than the
+        /// whole root, and exempts `_indices` from the cutoff.
         async fn listed_metas(
             &self,
             unmodified_since: Option<DateTime<Utc>>,
@@ -2169,20 +2191,19 @@ mod tests {
         // location would fail `read_manifest` long before this classifier runs, so a
         // partial rewrite is the shape that actually reaches it.
         //
-        // The rewrite has to carry the fixture's recorded write time across to the new
-        // location. Policies run in `HashMap` iteration order, so if this one ran before
-        // `add_recorded_file_time` the rewritten location would miss that lookup, keep
-        // its real filesystem mtime, and be dropped by `read_dir_all`'s
-        // `unmodified_since` cutoff before the classifier ever saw it — leaving this
-        // test green without exercising anything. Carrying the time over makes the
-        // outcome the same in either order, since the copy is idempotent.
+        // The rewritten location is deliberately both outside the base and shaped like a
+        // root-relative path under `data`. That makes the test discriminate in both
+        // directions: the guard skips it because it is not under the base, while the
+        // fallback this commit removed would have handed back `data/outside-base/x.lance`,
+        // passed the `starts_with("data")` check below, missed the referenced set, and
+        // handed the file to `remove_stream` as a deletion candidate. A location like
+        // `elsewhere/x.lance` would not discriminate, because the pre-existing "not in the
+        // data directory" arm already leaves those alone.
         //
-        // If you change how listings are filtered and this test still passes, confirm it
-        // still covers the guard by replacing the `let Ok(..) else` in
-        // `cleanup_file_if_not_referenced` with `strip_prefix(..)?` — this test must fail
-        // with an `Internal` error naming an `elsewhere/` path, and must pass again once
-        // the guard is restored.
-        let recorded_times = fixture.mock_store.last_modified_times.clone();
+        // A day before the epoch, where the mock clock starts, so the rewritten entry clears
+        // whatever `unmodified_since` cutoff cleanup computes and stays below
+        // `verification_threshold`.
+        let relocated_time = DateTime::UNIX_EPOCH - TimeDelta::try_days(1).unwrap();
         fixture
             .mock_store
             .policy
@@ -2193,33 +2214,33 @@ mod tests {
                 Arc::new(move |_, meta| {
                     let mut meta = meta;
                     if meta.location.extension() == Some("lance") {
-                        if let Some(recorded) = recorded_times.lock().unwrap().get(&meta.location) {
-                            meta.last_modified = *recorded;
-                        }
                         let filename = meta.location.filename().expect("data file has a name");
-                        meta.location = Path::from(format!("elsewhere/{filename}"));
+                        meta.location = Path::from(format!("data/outside-base/{filename}"));
+                        meta.last_modified = relocated_time;
                     }
                     Ok(meta)
                 }),
             );
 
         let before_count = fixture.count_files().await.unwrap();
-        // The relocated entry has to survive the cutoff cleanup itself applies, or the
-        // classifier never sees it and every assertion below passes vacuously. Cleanup
-        // filters on `earliest_retained_manifest_time`, which for this fixture is the
-        // retained manifest's own timestamp, so use that rather than the policy's
-        // `before_timestamp` — the latter is two mock days later and would let the
-        // assertion pass on entries cleanup would have skipped.
-        let retained_manifest_time = fixture.open().await.unwrap().manifest.timestamp();
-        let relocated_is_listed = fixture
-            .listed_metas(Some(retained_manifest_time))
+        // `cleanup_unreferenced_data_files` above is the positive control: same fixture and
+        // call without the rewrite, and it asserts the orphan is collected.
+        assert_eq!(
+            before_count.num_data_files, 2,
+            "the overwrite must leave one live data file and one orphan"
+        );
+        // The epoch is the strictest cutoff cleanup can reach, since the mock clock starts
+        // there and no cutoff at all means no filter.
+        let relocated = fixture
+            .listed_metas(Some(DateTime::UNIX_EPOCH))
             .await
             .unwrap()
             .iter()
-            .any(|meta| meta.location.as_ref().starts_with("elsewhere/"));
-        assert!(
-            relocated_is_listed,
-            "the rewritten location must reach the classifier for this test to mean anything"
+            .filter(|meta| meta.location.as_ref().starts_with("data/outside-base/"))
+            .count();
+        assert_eq!(
+            relocated, 2,
+            "both data files must reach the classifier for this test to mean anything"
         );
 
         let removed = fixture
