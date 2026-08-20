@@ -41,6 +41,7 @@ use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -1489,9 +1490,7 @@ impl Transaction {
                                 field
                                     .metadata
                                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                                    .filter(|s| {
-                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
-                                    })
+                                    .filter(|s| str_is_truthy(s))
                                     .map(|_| 0)
                             });
                         // Also set unenforced clustering key based on updated

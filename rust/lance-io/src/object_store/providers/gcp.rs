@@ -20,7 +20,7 @@ use crate::object_store::{
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
-
+use lance_core::utils::parse::str_is_truthy;
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
 
@@ -109,7 +109,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v.as_str() == "true")
+            .map(|v| str_is_truthy(v.as_str()))
             .unwrap_or(false);
 
         let accessor = params.get_accessor();
