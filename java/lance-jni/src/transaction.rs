@@ -916,14 +916,26 @@ fn convert_to_rust_transaction(
         .build())
 }
 
+#[derive(Clone, Copy)]
+enum RawArrowFieldIdMode {
+    AssignMissing,
+    // Preserve the distinction between explicit IDs and fields without identity metadata.
+    ExplicitOnly,
+}
+
+struct SchemaConversionOptions {
+    replaces_all_identities: bool,
+    commit_allocator_is_authoritative: bool,
+    raw_field_id_mode: RawArrowFieldIdMode,
+}
+
 fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
     java_allocator: &JObject,
     dataset: Option<&mut BlockingDataset>,
     read_version: u64,
-    replaces_all_identities: bool,
-    commit_allocator_is_authoritative: bool,
+    options: SchemaConversionOptions,
 ) -> Result<(LanceSchema, HashMap<i32, i32>)> {
     let schema_ptr = env
         .call_method(
@@ -937,12 +949,24 @@ fn convert_schema_from_operation(
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
 
     let arrow_schema = Schema::try_from(&c_schema)?;
-    let mut original_schema = LanceSchema::try_from(&arrow_schema).map_err(|e| {
-        Error::input_error(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
-    })?;
+    let mut original_schema =
+        if matches!(options.raw_field_id_mode, RawArrowFieldIdMode::ExplicitOnly) {
+            LanceSchema {
+                fields: arrow_schema
+                    .fields
+                    .iter()
+                    .map(|field| Field::try_from(field.as_ref()))
+                    .collect::<lance_core::Result<_>>()?,
+                metadata: arrow_schema.metadata.clone(),
+            }
+        } else {
+            LanceSchema::try_from(&arrow_schema).map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to convert Arrow schema to Lance schema: {}",
+                    e
+                ))
+            })?
+        };
 
     let read_context = match dataset {
         Some(dataset) if dataset.inner.version().version == read_version => Some((
@@ -961,7 +985,7 @@ fn convert_schema_from_operation(
         None => None,
     };
 
-    if commit_allocator_is_authoritative
+    if options.commit_allocator_is_authoritative
         && read_context
             .as_ref()
             .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
@@ -979,7 +1003,7 @@ fn convert_schema_from_operation(
             Some(read_schema),
             Some(max_field_id),
             stable_field_ids,
-            replaces_all_identities,
+            options.replaces_all_identities,
         )?
     } else {
         // New datasets use stable field IDs by default, so Arrow metadata is
@@ -1264,8 +1288,11 @@ fn convert_to_rust_operation(
                 })?,
                 dataset.as_deref_mut(),
                 read_version,
-                false,
-                false,
+                SchemaConversionOptions {
+                    replaces_all_identities: false,
+                    commit_allocator_is_authoritative: true,
+                    raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
+                },
             )?;
             Operation::Project {
                 preserves_nullability: env
@@ -1402,8 +1429,11 @@ fn convert_to_rust_operation(
                 })?,
                 dataset.as_deref_mut(),
                 read_version,
-                true,
-                true,
+                SchemaConversionOptions {
+                    replaces_all_identities: true,
+                    commit_allocator_is_authoritative: true,
+                    raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
+                },
             )?;
             remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
             Operation::Overwrite {
@@ -1561,8 +1591,11 @@ fn convert_to_rust_operation(
                 })?,
                 dataset.as_deref_mut(),
                 read_version,
-                false,
-                true,
+                SchemaConversionOptions {
+                    replaces_all_identities: false,
+                    commit_allocator_is_authoritative: true,
+                    raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
+                },
             )?;
             let retained_files = if field_id_remap.is_empty() {
                 HashSet::new()

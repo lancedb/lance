@@ -168,7 +168,7 @@ fn clear_replaced_and_new_field_ids(
 fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> Result<()> {
     let mut unmatched_fields = Vec::new();
     for field in &mut schema.fields {
-        if !canonicalize_field(field, -1, &manifest.schema, None, false) {
+        if !canonicalize_field(field, -1, &manifest.schema, None, true) {
             unmatched_fields.push(field.name.clone());
         }
     }
@@ -250,7 +250,9 @@ fn canonicalize_field(
         .flatten()
         .filter(|base| base.parent_id == parent_id);
     let base_field = if allow_id_binding && field.id >= 0 {
-        by_id.filter(|base| base.logical_type == field.logical_type)
+        by_id
+            .filter(|base| base.logical_type == field.logical_type)
+            .or_else(|| same_name.filter(|base| base.logical_type == field.logical_type))
     } else {
         same_name.filter(|base| base.logical_type == field.logical_type)
     };
@@ -1266,6 +1268,7 @@ mod tests {
         let manifest = activated_manifest();
         let mut schema = one_field_schema();
         schema.fields[0].name = "renamed".to_string();
+        schema.fields[0].id = -1;
         schema.metadata.insert(
             TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
             String::new(),
@@ -1278,6 +1281,29 @@ mod tests {
         let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
         assert!(err.to_string().contains("writes no data"), "{err}");
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_project_preserves_explicit_existing_identity() {
+        let manifest = activated_manifest();
+        let mut schema = one_field_schema();
+        schema.fields[0].name = "renamed".to_string();
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Project { schema, .. } = operation else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].name, "renamed");
+        assert_eq!(schema.fields[0].id, 0);
     }
 
     #[test]
