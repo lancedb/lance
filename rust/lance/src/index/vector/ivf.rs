@@ -6328,12 +6328,45 @@ mod tests {
         );
     }
 
+    /// Build a deterministic float16 vector column whose values span `[0, scale)`.
+    fn f16_vectors(num_rows: usize, dim: usize, scale: f32) -> Float16Array {
+        let base = generate_random_array_with_seed::<Float32Type>(num_rows * dim, [22; 32]);
+        Float16Array::from_iter_values(base.values().iter().map(|&v| f16::from_f32(v * scale)))
+    }
+
+    /// Brute-force the `k` nearest row ids for `query` over a flat float16 column.
+    fn f16_ground_truth(
+        values: &Float16Array,
+        query: &Float16Array,
+        dim: usize,
+        k: usize,
+        distance_type: DistanceType,
+    ) -> HashSet<u64> {
+        let values = Float32Array::from_iter_values(values.values().iter().map(|v| v.to_f32()));
+        let fsl = FixedSizeListArray::try_new_from_values(values, dim as i32).unwrap();
+        let query = query.values().iter().map(|v| v.to_f32()).collect_vec();
+        ground_truth(&fsl, &query, k, distance_type)
+            .into_iter()
+            .map(|(_, row)| row as u64)
+            .collect()
+    }
+
+    /// A float16 sum saturates at 65504, so the magnitude of the vectors decides whether the
+    /// k-means centroid update overflows: with 2 partitions each centroid sums ~500 vectors,
+    /// and at `scale = 1000` that sum used to become `inf`, making every L2 distance `+inf`,
+    /// leaving every cluster empty and hanging the build in `split_clusters`.
+    #[rstest]
+    #[case::unit_scale(1.0)]
+    #[case::large_values(1000.0)]
     #[tokio::test]
-    async fn test_create_ivf_flat_f16() {
+    async fn test_create_ivf_flat_f16(#[case] scale: f32) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
         const DIM: usize = 32;
+        const NUM_ROWS: usize = 1000;
+        const NUM_PARTITIONS: usize = 2;
+        const K: usize = 10;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -6343,23 +6376,27 @@ mod tests {
             true,
         )]));
 
-        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let arr = f16_vectors(NUM_ROWS, DIM, scale);
+        let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let params = VectorIndexParams::ivf_flat(NUM_PARTITIONS, MetricType::L2);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
 
-        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
+        // Probing every partition makes the search exhaustive, so the recall check below is an
+        // assertion about the centroids being sane rather than about partitioning quality.
+        let query = Float16Array::from_iter_values(arr.values()[..DIM].iter().copied());
         let results = dataset
             .scan()
-            .nearest("vector", &query, 5)
+            .with_row_id()
+            .nearest("vector", &query, K)
             .unwrap()
+            .minimum_nprobes(NUM_PARTITIONS)
             .try_into_stream()
             .await
             .unwrap()
@@ -6367,13 +6404,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].num_rows(), 5);
+        assert_eq!(results[0].num_rows(), K);
         let schema = results[0].schema();
         let field = schema.field(0);
         let DataType::FixedSizeList(item, _) = field.data_type() else {
             panic!("vector column should remain fixed size list");
         };
         assert_eq!(item.data_type(), &DataType::Float16);
+
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert!(
+            dists.values().iter().all(|d| d.is_finite()),
+            "overflowed centroids leak into the distances: {:?}",
+            dists.values()
+        );
+
+        let row_ids = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let gt = f16_ground_truth(&arr, &query, DIM, K, DistanceType::L2);
+        let recall = row_ids.intersection(&gt).count() as f32 / K as f32;
+        assert!(recall >= 0.9, "recall: {recall}, scale: {scale}");
+    }
+
+    /// Training rejects data where fewer than `k` vectors can be assigned to a centroid, which
+    /// is safe only because every training entry point filters non-finite rows first (see
+    /// `filter_finite_training_data`). Without that filter the random centroid seeding could
+    /// draw an all-NaN set and fail a build that has plenty of usable vectors, so pin the
+    /// interaction here: a column that is almost entirely NaN still indexes off the rest.
+    #[rstest]
+    #[case::mostly_nan(0.9)]
+    #[case::almost_all_nan(0.99)]
+    #[tokio::test]
+    async fn test_create_ivf_flat_with_nan_rows(#[case] nan_fraction: f64) {
+        const DIM: usize = 16;
+        const NUM_ROWS: usize = 1000;
+        const NUM_PARTITIONS: usize = 4;
+
+        let nan_rows = (NUM_ROWS as f64 * nan_fraction) as usize;
+        let values = (0..NUM_ROWS).flat_map(|row| {
+            (0..DIM).map(move |dim| {
+                if row < nan_rows {
+                    f32::NAN
+                } else {
+                    ((row * DIM + dim) % 97) as f32 / 97.0
+                }
+            })
+        });
+        let arr = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(values),
+            DIM as i32,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            arr.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Centroid seeding is random, so build repeatedly: a single success proves little.
+        let params = VectorIndexParams::ivf_flat(NUM_PARTITIONS, MetricType::L2);
+        for attempt in 0..5 {
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "attempt {attempt} failed with {} of {NUM_ROWS} rows usable: {e}",
+                        NUM_ROWS - nan_rows
+                    )
+                });
+        }
+    }
+
+    /// The `dot` metric skips residuals, so the PQ codebook is trained on the raw vectors and
+    /// hits the same f16 centroid overflow one level below the IVF partitioning.
+    #[tokio::test]
+    async fn test_create_ivf_pq_f16_dot_large_values() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const DIM: usize = 32;
+        const NUM_ROWS: usize = 1000;
+        const NUM_PARTITIONS: usize = 2;
+        const K: usize = 10;
+        // With 256 PQ centroids over 1000 rows a sub-quantizer cluster holds ~4 vectors, so
+        // the sub-vector sums overflow f16 once the values reach ~20000.
+        const SCALE: f32 = 40000.0;
+        // 8 sub-vectors, i.e. 4 dimensions each. Quantizing 8 dimensions into one code word
+        // leaves an error comparable to the spread of the dot products being ranked, which
+        // puts recall right at the assertion threshold; 4 dimensions clears it comfortably.
+        const NUM_SUB_VECTORS: usize = 8;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = f16_vectors(NUM_ROWS, DIM, SCALE);
+        let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::Dot,
+            IvfBuildParams::new(NUM_PARTITIONS),
+            PQBuildParams::new(NUM_SUB_VECTORS, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float16Array::from_iter_values(arr.values()[..DIM].iter().copied());
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", &query, K)
+            .unwrap()
+            .minimum_nprobes(NUM_PARTITIONS)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), K);
+
+        let dists = results[0]
+            .column_by_name("_distance")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert!(
+            dists.values().iter().all(|d| d.is_finite()),
+            "overflowed PQ codebook leaks into the distances: {:?}",
+            dists.values()
+        );
+
+        let row_ids = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let gt = f16_ground_truth(&arr, &query, DIM, K, DistanceType::Dot);
+        let recall = row_ids.intersection(&gt).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "recall: {recall}");
     }
 
     #[tokio::test]

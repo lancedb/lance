@@ -10,7 +10,7 @@
 //!
 
 use core::f32;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
@@ -32,8 +32,7 @@ use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
 use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
 use log::{info, warn};
-use num_traits::One;
-use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Num, NumCast, ToPrimitive};
 use rand::prelude::*;
 use rayon::prelude::*;
 use {
@@ -191,38 +190,48 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
     }
 }
 
-/// Split one big cluster into two smaller clusters. After split, each
-/// cluster has approximately half of the vectors.
-fn split_clusters<T: Float + MulAssign>(
-    n: usize,
-    cnts: &mut [usize],
-    centroids: &mut [T],
-    dim: usize,
-) {
+/// Reseed every empty cluster by splitting the largest cluster in two. After a split, each
+/// half holds approximately half of the donor's vectors, and the two centroids are pushed
+/// apart by `eps` so the next assignment step can separate them again.
+///
+/// Donors are taken largest-first, breaking ties on the smaller cluster id, so the result is
+/// reproducible. Splitting stops as soon as no cluster has more than one vector left to
+/// donate: the remaining empty clusters simply stay empty, which the caller already tolerates.
+fn split_clusters<T: Float + MulAssign>(cnts: &mut [usize], centroids: &mut [T], dim: usize) {
     let eps = T::from(1.0 / 1024.0).unwrap();
-    let mut rng = SmallRng::from_os_rng();
-    for i in 0..cnts.len() {
-        if cnts[i] == 0 {
-            let mut j = 0;
-            loop {
-                let p = (cnts[j] as f32 - 1.0) / (n - cnts.len()) as f32;
-                if rng.random::<f32>() < p {
-                    break;
-                }
-                j += 1;
-                j %= cnts.len();
-            }
 
-            cnts[i] = cnts[j] / 2;
-            cnts[j] -= cnts[i];
-            for k in 0..dim {
-                if k % 2 == 0 {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + eps);
-                    centroids[j * dim + k] *= T::one() - eps;
-                } else {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - eps);
-                    centroids[j * dim + k] *= T::one() + eps;
-                }
+    // Max-heap of (cluster size, cluster id). `Reverse` on the id makes the smaller id win a
+    // tie. Entries are only ever pushed with their current size, so the heap never goes stale.
+    let mut donors = cnts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &cnt)| cnt > 1)
+        .map(|(id, &cnt)| (cnt, Reverse(id)))
+        .collect::<BinaryHeap<_>>();
+
+    for i in 0..cnts.len() {
+        if cnts[i] > 0 {
+            continue;
+        }
+        let Some((donor_size, Reverse(j))) = donors.pop() else {
+            return;
+        };
+
+        cnts[i] = donor_size / 2;
+        cnts[j] = donor_size - cnts[i];
+        for k in 0..dim {
+            if k % 2 == 0 {
+                centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + eps);
+                centroids[j * dim + k] *= T::one() - eps;
+            } else {
+                centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - eps);
+                centroids[j * dim + k] *= T::one() + eps;
+            }
+        }
+
+        for half in [i, j] {
+            if cnts[half] > 1 {
+                donors.push((cnts[half], Reverse(half)));
             }
         }
     }
@@ -324,6 +333,30 @@ pub trait KMeansAlgo<T: Num> {
     ) -> KMeans;
 }
 
+/// Narrow finished centroids from the `f64` accumulator back into the storage type.
+///
+/// The centroid update must not run in the storage type. An `f16` sum saturates at 65504, so a
+/// cluster holding a few hundred vectors of magnitude ~1000 sums to `inf`; an `f16` cluster
+/// size above 65504 saturates as well, turning the division into `inf * 0 = NaN`. Either way
+/// the centroid stops being finite, no vector can be assigned to it, and the model collapses.
+/// `f64` holds every sum an `f16`, `f32` or `f64` cluster can produce.
+fn narrow_centroids<T: ArrowNumericType>(centroids: Vec<f64>) -> Vec<T::Native>
+where
+    T::Native: Float,
+{
+    // `split_clusters` scales a donor centroid by `1 + 1/1024`, which can push a value sitting
+    // at the top of the storage range past its maximum. Clamp so a split never turns a finite
+    // centroid into an infinite one.
+    let max = T::Native::max_value().to_f64().unwrap();
+    centroids
+        .into_iter()
+        .map(|value| {
+            <T::Native as NumCast>::from(value.clamp(-max, max))
+                .expect("a centroid clamped to the storage range is representable")
+        })
+        .collect()
+}
+
 pub struct KMeansAlgoFloat<T: ArrowNumericType>
 where
     T::Native: Float + Num,
@@ -399,7 +432,9 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = vec![T::Native::zero(); k * dimension];
+        // Sums, division and the split perturbation all happen in f64; the centroids are
+        // narrowed back to the storage type once, at the end. See [`narrow_centroids`].
+        let mut centroids = vec![0f64; k * dimension];
 
         let mut num_cpus = get_num_compute_intensive_cpus();
         if k < num_cpus || k < 16 {
@@ -424,7 +459,10 @@ where
                             let local_id = cluster_id - start;
                             let centroid =
                                 &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                            centroid
+                                .iter_mut()
+                                .zip(vector)
+                                .for_each(|(c, v)| *c += v.to_f64().unwrap());
                         }
                     });
             });
@@ -434,7 +472,7 @@ where
             .zip(cluster_sizes.par_iter())
             .for_each(|(centroid, &cnt)| {
                 if cnt > 0 {
-                    let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
+                    let norm = 1.0 / cnt as f64;
                     centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
@@ -459,13 +497,9 @@ where
             }
         }
 
-        split_clusters(
-            data.len() / dimension,
-            cluster_sizes,
-            &mut centroids,
-            dimension,
-        );
+        split_clusters(cluster_sizes, &mut centroids, dimension);
 
+        let centroids = narrow_centroids::<T>(centroids);
         KMeans {
             centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
             dimension,
@@ -775,8 +809,11 @@ impl KMeans {
         // the data is `num_partitions * sample_rate` vectors,
         // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
         // so we need to sample the sampled data again here.
-        // we have to limit the number of data to avoid division underflow,
-        // the threshold 512 is chosen because the minimal normal f16 value will be 0 if divided by 1024.
+        // the 512 threshold was originally picked to keep f16 centroid updates from
+        // underflowing; that is now handled by [`narrow_centroids`]. What is left is a
+        // bound on training cost, and a crude one: it keeps the leading rows rather than
+        // sampling, so the hierarchical path (which trains with k=hierarchical_k) trains on a
+        // prefix of the data.
         let data = if data.len() >= k * 512 {
             data.slice(0, k * 512)
         } else {
@@ -846,6 +883,26 @@ impl KMeans {
                     Some(&cluster_sizes),
                     index.as_ref(),
                 );
+
+                // A vector is left unassigned when every distance to it is NaN or infinite.
+                // Every empty cluster is reseeded from a cluster with at least two members
+                // (see `split_clusters`), so below `k` assigned vectors the model can no
+                // longer be repaired -- and at that point the input is degenerate rather
+                // than merely hard to cluster.
+                let assigned = membership.iter().filter(|id| id.is_some()).count();
+                if assigned < k {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "KMeans: only {} of {} vectors could be assigned to a centroid, fewer \
+                         than k={}. The {} training data likely contains NaN or infinite \
+                         values, zero-length vectors under a normalizing metric, or values \
+                         large enough that {} distances overflow.",
+                        assigned,
+                        n,
+                        k,
+                        T::DATA_TYPE,
+                        params.distance_type,
+                    )));
+                }
 
                 adjusted_balance_factor =
                     compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
@@ -1772,13 +1829,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_split_clusters_reseeds_empty_clusters() {
+        const DIM: usize = 2;
+        let initial_cnts = [0_usize, 0, 8, 4];
+        let initial_centroids = [0.0_f32, 0.0, 0.0, 0.0, 10.0, 10.0, 20.0, 20.0];
+
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut cnts = initial_cnts;
+            let mut centroids = initial_centroids;
+            split_clusters(&mut cnts, &mut centroids, DIM);
+            runs.push((cnts, centroids));
+        }
+
+        let (cnts, centroids) = runs[0];
+        assert!(
+            cnts.iter().all(|&cnt| cnt > 0),
+            "every cluster should be reseeded: {cnts:?}"
+        );
+        assert_eq!(
+            cnts.iter().sum::<usize>(),
+            initial_cnts.iter().sum::<usize>(),
+            "splitting must preserve the total number of vectors"
+        );
+        assert!(centroids.iter().all(|v| v.is_finite() && *v != 0.0));
+        assert_eq!(runs[0], runs[1], "donor selection must be deterministic");
+    }
+
+    #[test]
+    fn test_split_clusters_stops_when_donors_run_out() {
+        // Three vectors cannot seed five clusters. Splitting must fill what it can and leave
+        // the rest empty rather than looking for a donor that does not exist.
+        const DIM: usize = 2;
+        let mut cnts = [3_usize, 0, 0, 0, 0];
+        let mut centroids = [1.0_f32; 5 * DIM];
+
+        split_clusters(&mut cnts, &mut centroids, DIM);
+
+        assert_eq!(cnts, [1, 1, 1, 0, 0]);
+        assert!(centroids.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_split_clusters_stops_without_donor() {
+        // Every distance being non-finite leaves all clusters empty. There is nothing to
+        // split, and the old probabilistic donor search spun forever on this input.
+        const DIM: usize = 2;
+        let mut cnts = [0_usize; 4];
+        let mut centroids = [1.0_f32; 4 * DIM];
+
+        split_clusters(&mut cnts, &mut centroids, DIM);
+
+        assert_eq!(cnts, [0; 4]);
+        assert_eq!(centroids, [1.0; 4 * DIM]);
+    }
+
+    #[test]
+    fn test_narrow_centroids_clamps_to_finite() {
+        // `split_clusters` scales a donor centroid by `1 + 1/1024`, so a cluster whose mean
+        // sits at the top of the f16 range would otherwise be narrowed to +/-inf.
+        let over = f16::MAX.to_f64() * (1.0 + 1.0 / 1024.0);
+        assert_eq!(
+            narrow_centroids::<Float16Type>(vec![over, -over]),
+            vec![f16::MAX, f16::MIN]
+        );
+        // A type whose range already covers the accumulator is passed through untouched.
+        assert_eq!(narrow_centroids::<Float32Type>(vec![1.5]), vec![1.5f32]);
+    }
+
+    #[tokio::test]
+    async fn test_train_kmeans_rejects_unassignable_data() {
+        // NaN vectors make every distance non-finite, so argmin assigns nothing. This is not
+        // f16-specific: it reproduces on f32 and used to hang inside `split_clusters`.
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_VALUES: usize = 8 * K;
+
+        let values = Float32Array::from_iter_values(repeat_n(f32::NAN, NUM_VALUES * DIM));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let err = KMeans::new_with_params(&fsl, K, &KMeansParams::default())
+            .expect_err("training on unassignable data should fail instead of hanging");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could be assigned") && msg.contains(&K.to_string()),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_train_kmeans_f16_large_values() {
+        // Regression test: 1024 vectors over 4 clusters means ~256 vectors per centroid, and
+        // summing 256 values of magnitude ~1000 in f16 saturates at 65504. The infinite
+        // centroids made every L2 distance +inf, which left every cluster empty.
+        const DIM: usize = 16;
+        const K: usize = 4;
+        const NUM_VALUES: usize = 1024;
+        const SCALE: f32 = 1000.0;
+
+        let mut rng = SmallRng::seed_from_u64(42);
+        let values = Float16Array::from_iter_values(
+            repeat_n((), NUM_VALUES * DIM).map(|_| f16::from_f32(rng.random::<f32>() * SCALE)),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            ..Default::default()
+        };
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
+        for &value in centroids {
+            let value = value.to_f32();
+            assert!(
+                value.is_finite() && (0.0..=SCALE).contains(&value),
+                "centroid outside the range of the training data: {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_to_kmeans_f16_cluster_larger_than_f16_max() {
+        // A cluster can hold more vectors than f16 can count: `f16::from_usize(70_000)` is
+        // `inf`, so the old reciprocal was 0 and the centroid was zeroed out (and became NaN
+        // instead when the sum had already saturated to `inf`). PQ codebook training reaches
+        // cluster sizes like this with its default sample rate.
+        const DIM: usize = 2;
+        const K: usize = 2;
+        const BIG_CLUSTER: usize = 70_000;
+
+        let mut values = vec![f16::from_f32(3.0); BIG_CLUSTER * DIM];
+        values.extend(repeat_n(f16::from_f32(7.0), DIM));
+        let mut membership = vec![Some(0_u32); BIG_CLUSTER];
+        membership.push(Some(1));
+        let mut cluster_sizes = vec![BIG_CLUSTER, 1];
+
+        let kmeans = KMeansAlgoFloat::<Float16Type>::to_kmeans(
+            &values,
+            DIM,
+            K,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+
+        let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
+        assert_eq!(
+            centroids,
+            &[f16::from_f32(3.0); DIM]
+                .into_iter()
+                .chain([f16::from_f32(7.0); DIM])
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn test_float16_underflow_fix() {
-        // This test verifies the fix for float16 division underflow
-        // When training k-means on many float16 vectors with small k,
-        // without limiting the data size, dividing centroids by count
-        // can underflow to 0,
-        // The fix limits data to k * 512 to prevent this
+        // Training k-means on many float16 vectors with a small k puts a large number of
+        // vectors in every cluster. Dividing the centroid sum by that count used to underflow
+        // to 0 in f16; the centroid update now runs in f64 (see [`narrow_centroids`]).
         const DIM: usize = 2;
         const K: usize = 2;
         const NUM_VALUES: usize = K * 65536; // Many vectors to trigger the issue
