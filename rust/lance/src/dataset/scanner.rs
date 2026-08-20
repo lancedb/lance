@@ -495,7 +495,7 @@ impl FilterPlan {
         if self.refine_query_filter {
             match &self.query_filter {
                 Some(QueryFilter::Fts(fts_query)) => {
-                    let cols = if fts_query.columns().is_empty() {
+                    let cols = if fts_query.query.is_missing_column() {
                         let indexed_columns = fts_indexed_columns(dataset.clone()).await?;
                         let q = fill_fts_query_column(&fts_query.query, &indexed_columns, false)?;
                         q.columns()
@@ -3553,15 +3553,12 @@ impl Scanner {
                 .await
             }
             FtsQuery::Boolean(bool_query) => {
-                for query in bool_query.must.iter() {
-                    if !self
-                        .fragments_covered_by_fts_query_helper(query, accum)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
-                }
-                for query in &bool_query.should {
+                for query in bool_query
+                    .must
+                    .iter()
+                    .chain(&bool_query.should)
+                    .chain(&bool_query.must_not)
+                {
                     if !self
                         .fragments_covered_by_fts_query_helper(query, accum)
                         .await?
@@ -3852,7 +3849,7 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {
         let mut resolved = query.clone();
-        if resolved.columns().is_empty() {
+        if resolved.query.is_missing_column() {
             if Self::query_requests_list_element(&resolved.query) {
                 return Err(Error::invalid_input(
                     "ListElement FTS queries must explicitly specify a field path".to_string(),
