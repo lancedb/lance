@@ -607,6 +607,7 @@ async fn test_insert_balanced_subschemas() {
     let options = WriteParams {
         enable_stable_row_ids: true,
         enable_v2_manifest_paths: true,
+        data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
     let mut dataset = Dataset::write(empty_reader, &test_uri, Some(options))
@@ -748,7 +749,7 @@ async fn test_datafile_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -856,7 +857,7 @@ async fn test_datafile_partial_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         partial_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2179,7 +2180,7 @@ async fn test_data_replacement_advances_row_lineage() {
         .create(&Path::from("data/lineage_replacement.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2285,7 +2286,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         .create(&Path::from("data/replacement.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         single_col_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2463,7 +2464,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
     let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2567,7 +2568,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         .create(&Path::from("data/replacement_inv.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         value_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2692,7 +2693,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2869,7 +2870,7 @@ async fn test_vector_index_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
