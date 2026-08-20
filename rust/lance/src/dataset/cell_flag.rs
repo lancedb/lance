@@ -3113,7 +3113,7 @@ mod tests {
     };
     use crate::dataset::{
         ColumnAlteration, CommitBuilder, DeleteBuilder, InsertBuilder, NewColumnTransform,
-        UpdateBuilder, WriteMode, WriteParams,
+        UpdateBuilder, WriteMode, WriteParams, scanner::AggregateExpr,
     };
     use crate::index::DatasetIndexExt;
     use crate::utils::test::copy_test_data_to_tmp;
@@ -4985,6 +4985,19 @@ mod tests {
             "{pushed_plan}"
         );
         assert_eq!(flagged_ids(dataset, "value", FLAG_NAME).await?, vec![1, 3]);
+
+        let mut count = dataset.scan();
+        count.filter(&format!("cell_flag(value, '{}')", FLAG_NAME))?;
+        count.aggregate(AggregateExpr::builder().count_star().build())?;
+        let count_plan = count.explain_plan(false).await?;
+        assert!(count_plan.contains("CountFromMask"), "{count_plan}");
+        assert!(!count_plan.contains("ScalarIndexQuery"), "{count_plan}");
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("cell_flag(value, '{}')", FLAG_NAME)))
+                .await?,
+            2
+        );
 
         let mut fallback = dataset.scan();
         fallback.project(&["id"])?;

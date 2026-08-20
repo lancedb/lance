@@ -1533,6 +1533,12 @@ impl ExactRowSelection {
         &self.fragment_bitmap
     }
 
+    /// Return the exact row-address mask when this selection is address-based.
+    #[doc(hidden)]
+    pub fn row_addr_mask(&self) -> Option<&RowAddrMask> {
+        self.results_are_row_addresses.then_some(&self.rows)
+    }
+
     fn nullable_result(&self) -> NullableIndexExprResult {
         let mask = match self.rows.clone() {
             RowAddrMask::AllowList(rows) => {

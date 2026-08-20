@@ -61,6 +61,10 @@ pub struct CountFromMaskExec {
     /// Optional [`super::scalar_index::ScalarIndexExec`] producing the row-
     /// address mask to count.
     prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+    /// An already materialized row-address prefilter. Snapshot-native exact
+    /// selections can use this instead of converting every address to a row
+    /// ID only for this executor to count the mask again.
+    prefilter_mask: Option<RowAddrMask>,
     /// Restrict the count to this fragment subset. `None` means "every
     /// fragment in the dataset." The optimizer rule uses this to scope the
     /// pushdown branch of a partial-coverage split plan to the indexed
@@ -109,9 +113,31 @@ impl CountFromMaskExec {
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
         restrict_to_fragments: Option<RoaringBitmap>,
     ) -> Result<Self> {
+        Self::try_new_restricted_with_mask(
+            dataset,
+            aggregate_funcs,
+            prefilter_input,
+            None,
+            restrict_to_fragments,
+        )
+    }
+
+    pub(crate) fn try_new_restricted_with_mask(
+        dataset: Arc<Dataset>,
+        aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
+        prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+        prefilter_mask: Option<RowAddrMask>,
+        restrict_to_fragments: Option<RoaringBitmap>,
+    ) -> Result<Self> {
         if aggregate_funcs.is_empty() {
             return Err(Error::invalid_input(
                 "CountFromMaskExec requires at least one aggregate".to_string(),
+            ));
+        }
+        if prefilter_input.is_some() && prefilter_mask.is_some() {
+            return Err(Error::invalid_input(
+                "CountFromMaskExec accepts either a prefilter input or a materialized mask"
+                    .to_string(),
             ));
         }
 
@@ -138,6 +164,7 @@ impl CountFromMaskExec {
             dataset,
             aggregate_funcs,
             prefilter_input,
+            prefilter_mask,
             restrict_to_fragments,
             schema,
             properties,
@@ -338,13 +365,19 @@ impl CountFromMaskExec {
         dataset: Arc<Dataset>,
         aggregate_funcs_len: usize,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+        prefilter_mask: Option<RowAddrMask>,
         restrict_to_fragments: Option<RoaringBitmap>,
         context: Arc<datafusion::execution::context::TaskContext>,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
-        let prefilter = match prefilter_input {
-            None => None,
-            Some(input) => Some(Self::load_prefilter(input, context.clone()).await?),
+        let prefilter = match (prefilter_input, prefilter_mask) {
+            (None, mask) => mask,
+            (Some(input), None) => Some(Self::load_prefilter(input, context.clone()).await?),
+            (Some(_), Some(_)) => {
+                return Err(Error::internal(
+                    "CountFromMaskExec received two prefilter sources".to_string(),
+                ));
+            }
         };
 
         // Anchor the deletion mask against either every dataset fragment or
@@ -424,6 +457,7 @@ impl ExecutionPlan for CountFromMaskExec {
             dataset: self.dataset.clone(),
             aggregate_funcs: self.aggregate_funcs.clone(),
             prefilter_input,
+            prefilter_mask: self.prefilter_mask.clone(),
             restrict_to_fragments: self.restrict_to_fragments.clone(),
             schema: self.schema.clone(),
             properties: self.properties.clone(),
@@ -441,6 +475,7 @@ impl ExecutionPlan for CountFromMaskExec {
             self.dataset.clone(),
             self.aggregate_funcs.len(),
             self.prefilter_input.clone(),
+            self.prefilter_mask.clone(),
             self.restrict_to_fragments.clone(),
             context,
             schema.clone(),

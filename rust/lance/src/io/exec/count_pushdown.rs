@@ -211,7 +211,7 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     let target_fragments = fragment_scope
         .clone()
         .unwrap_or_else(|| dataset_fragments.clone());
-    let prefilter_input = filtered_read.index_input().cloned();
+    let mut prefilter_input = filtered_read.index_input().cloned();
 
     // If there is a prefilter, inspect its ScalarIndexExpr leaves:
     //   - Refuse to fire if any leaf is inexact (`needs_recheck`). The
@@ -241,6 +241,27 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         }
     };
 
+    // Snapshot-native exact selections already carry their result in physical
+    // row-address space. On datasets without stable row IDs, preserve that
+    // mask instead of routing it through ScalarIndexExec, which would expand
+    // every selected address into a row-ID set before we count it again.
+    let prefilter_mask = if dataset.manifest().uses_stable_row_ids() {
+        None
+    } else {
+        prefilter_input
+            .as_ref()
+            .and_then(|input| input.downcast_ref::<ScalarIndexExec>())
+            .and_then(|exec| match exec.expr() {
+                ScalarIndexExpr::Query(search) => search.exact_row_selection(),
+                _ => None,
+            })
+            .and_then(|selection| selection.row_addr_mask())
+            .cloned()
+    };
+    if prefilter_mask.is_some() {
+        prefilter_input = None;
+    }
+
     let aggr_exprs: Vec<Arc<AggregateFunctionExpr>> = agg.aggr_expr().to_vec();
 
     // Decide on the plan shape. Three cases:
@@ -254,10 +275,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
-            let exec = CountFromMaskExec::try_new_restricted(
+            let exec = CountFromMaskExec::try_new_restricted_with_mask(
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
+                prefilter_mask,
                 fragment_scope,
             )?;
             let schema = exec.schema();
@@ -266,10 +288,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         Some(coverage) if (&target_fragments - &coverage).is_empty() => {
             // Prefilter exists and the index covers every targeted fragment —
             // safe to push the whole count down.
-            let exec = CountFromMaskExec::try_new_restricted(
+            let exec = CountFromMaskExec::try_new_restricted_with_mask(
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
+                prefilter_mask,
                 fragment_scope,
             )?;
             let schema = exec.schema();
@@ -283,10 +306,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
                 return Ok(None);
             }
             let uncovered = &target_fragments - &coverage;
-            let pushdown_exec = CountFromMaskExec::try_new_restricted(
+            let pushdown_exec = CountFromMaskExec::try_new_restricted_with_mask(
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
+                prefilter_mask,
                 Some(covered),
             )?;
             let partial_state_schema = pushdown_exec.schema();
