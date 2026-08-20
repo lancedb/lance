@@ -1930,14 +1930,11 @@ impl DirectoryNamespace {
             })
         };
 
-        // Negative limits are ignored (treated as "no limit") rather than
-        // clamped, matching `apply_pagination`.
         let limit = limit
             .filter(|limit| *limit >= 0)
             .map(|limit| limit as usize);
 
         let mut table_versions: Vec<TableVersion> = Vec::new();
-        // Push `meta` if it is a committed manifest; returns whether it was.
         let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| -> bool {
             let Some(filename) = meta.location.filename() else {
                 return false;
@@ -1956,15 +1953,10 @@ impl DirectoryNamespace {
             true
         };
 
-        // Detect the naming scheme from the first entry that parses as a
-        // committed manifest, not the first raw entry: the commit protocol
-        // deliberately leaves non-manifest objects in `_versions/` (e.g. a
-        // staging blob `{manifest}-<uuid>` retained after an ambiguous publish
-        // failure), and its inverted key sorts ahead of the newest committed
-        // manifest on a lexically-ordered store. Detecting from the raw first
-        // entry would misclassify the stream and silently disable the
-        // early-stop below. V2 filenames are a fixed 29 chars
-        // (`{u64::MAX - version:020}.manifest`); V1 filenames vary in length.
+        // Detect the naming scheme from the first committed manifest, not the
+        // first raw entry: retained staging blobs (`{manifest}-<uuid>`) sort
+        // ahead of it and would misclassify the stream as non-V2. V2 filenames
+        // are a fixed 29 chars (`{u64::MAX - version:020}.manifest`).
         let mut first_manifest_filename_len = None;
         while first_manifest_filename_len.is_none() {
             match stream.try_next().await.map_err(list_err)? {
@@ -1979,15 +1971,10 @@ impl DirectoryNamespace {
         }
         let is_v2_naming = first_manifest_filename_len == Some(29);
 
-        // On a lexically-ordered store the list stream already arrives in a
-        // fixed order: V2 filenames invert the version (`u64::MAX - version`),
-        // so ascending keys mean descending versions. When the caller wants
-        // that same order, the stream is already sorted and we can stop after
-        // `limit` committed manifests instead of collecting every entry. This
-        // is the hot path for `get_latest_version` (descending, limit 1): a
-        // table with many versions would otherwise paginate the whole
-        // `_versions/` directory (one list page per ~1k objects) on every
-        // resolution.
+        // V2 filenames invert the version, so a lexically-ordered stream
+        // arrives newest-first; when that matches the requested order, stop
+        // after `limit` manifests instead of paginating the whole directory
+        // (the `get_latest_version` hot path: descending, limit 1).
         let list_is_ordered = self.object_store.list_is_lexically_ordered;
         let stream_matches_request = list_is_ordered
             && if is_v2_naming {
@@ -2006,10 +1993,8 @@ impl DirectoryNamespace {
             }
         }
 
-        // The early-stop path already yields entries in the requested order;
-        // only the collected-everything path needs an explicit sort. The first
-        // manifest is pushed during scheme detection regardless of the limit,
-        // so re-enforce the limit either way (covers limit=0).
+        // Scheme detection pushes the first manifest regardless of the limit,
+        // so re-enforce the limit on both paths (covers limit=0).
         if let Some(n) = early_stop_at {
             table_versions.truncate(n);
         } else {
@@ -6341,10 +6326,8 @@ mod tests {
         (namespace, temp_dir)
     }
 
-    /// `list_versions_under` has two paths: a streaming early-stop path on
-    /// lexically-ordered stores when the stream order matches the requested
-    /// order, and a collect-then-sort path otherwise. Both must return the
-    /// same, correctly-ordered results for every descending/limit combination.
+    /// The early-stop path (ordered stores) and the collect-then-sort path
+    /// must return the same results for every descending/limit combination.
     #[tokio::test]
     async fn test_list_versions_under_ordering_and_limit() {
         use lance_table::io::commit::ManifestNamingScheme;
@@ -6355,11 +6338,9 @@ mod tests {
                 let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
                 ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
             }
-            // Non-manifest objects the commit protocol leaves in `_versions/`:
-            // a staging blob retained after an ambiguous publish failure (its
-            // inverted key sorts ahead of every committed manifest) and a
-            // detached manifest (sorts after). Both must be excluded from
-            // results without breaking naming-scheme detection.
+            // A retained staging blob (sorts ahead of every committed
+            // manifest) and a detached manifest (sorts after) must be excluded
+            // without breaking naming-scheme detection.
             let staging = Path::parse(format!(
                 "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
                 ManifestNamingScheme::V2.manifest_path(&table_path, 8)
@@ -6378,7 +6359,6 @@ mod tests {
                 r.iter().map(|t| t.version).collect()
             }
 
-            // descending + limit: early-stop path on ordered stores.
             let got = ns
                 .list_versions_under(&table_path, true, Some(1))
                 .await
@@ -6390,15 +6370,12 @@ mod tests {
                 .unwrap();
             assert_eq!(versions(&got), vec![7, 6, 5]);
 
-            // ascending + limit: stream order does not match on ordered
-            // stores (V2 inverts), so this exercises collect-then-sort.
             let got = ns
                 .list_versions_under(&table_path, false, Some(2))
                 .await
                 .unwrap();
             assert_eq!(versions(&got), vec![1, 2]);
 
-            // no limit: full listing, both directions.
             let got = ns
                 .list_versions_under(&table_path, true, None)
                 .await
@@ -6410,7 +6387,6 @@ mod tests {
                 .unwrap();
             assert_eq!(versions(&got), vec![1, 2, 3, 4, 5, 6, 7]);
 
-            // limit edge cases: zero and beyond the version count.
             let got = ns
                 .list_versions_under(&table_path, true, Some(0))
                 .await
@@ -6422,8 +6398,7 @@ mod tests {
                 .unwrap();
             assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
 
-            // negative limit: ignored (treated as no limit), matching
-            // `apply_pagination`.
+            // Negative limits are ignored, matching `apply_pagination`.
             let got = ns
                 .list_versions_under(&table_path, true, Some(-1))
                 .await
@@ -6431,8 +6406,6 @@ mod tests {
             assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
         }
 
-        // Ordered store (memory://): descending requests take the early-stop
-        // path without listing the whole directory.
         let ns_mem = DirectoryNamespaceBuilder::new("memory://lv-test")
             .build()
             .await
@@ -6440,18 +6413,14 @@ mod tests {
         assert!(ns_mem.object_store.list_is_lexically_ordered);
         seed_and_check(&ns_mem).await;
 
-        // Unordered store (local fs): always collect-then-sort.
         let (ns_fs, _tmp) = create_test_namespace().await;
         assert!(!ns_fs.object_store.list_is_lexically_ordered);
         seed_and_check(&ns_fs).await;
     }
 
-    /// Regression test for the `get_latest_version` hot path: a retained
-    /// staging blob sorts lexically ahead of the newest committed V2 manifest,
-    /// so naming-scheme detection must skip it — detecting from the raw first
-    /// entry misclassifies the stream as non-V2 and silently degrades a
-    /// `descending, limit=1` query back to consuming the whole `_versions/`
-    /// directory. Asserts the consumption bound: staging entry + one manifest.
+    /// A retained staging blob sorts ahead of the newest committed manifest;
+    /// if scheme detection reads it, the `descending, limit=1` hot path falls
+    /// back to consuming the whole directory. Asserts the consumption bound.
     #[tokio::test]
     async fn test_list_versions_under_early_stop_bounded_consumption() {
         use lance_io::object_store::providers::memory::MemoryStoreProvider;
@@ -6572,8 +6541,7 @@ mod tests {
             let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
             ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
         }
-        // Retained staging blob for the next version: sorts ahead of every
-        // committed manifest, so it is the first raw entry in the listing.
+        // Sorts ahead of every committed manifest: the first raw entry.
         let staging = Path::parse(format!(
             "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
             ManifestNamingScheme::V2.manifest_path(&table_path, 101)
