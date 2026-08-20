@@ -48,7 +48,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
-use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
@@ -2912,6 +2912,9 @@ impl Dataset {
         rt().spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
+            validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let result = object_store.remove_dir_all(path).await;
 
             match result {

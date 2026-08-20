@@ -5204,6 +5204,31 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         ignore_not_found: Optional[bool] = None,
     ) -> None:
+        """Delete a dataset and everything under ``base_uri``.
+
+        To limit the damage a mistyped or misconfigured path can do, ``base_uri``
+        must be a dataset root, meaning it holds a manifest that can be read, or a
+        namespace declare/deregister marker. Anything else raises
+        :class:`ValueError`, including a path that holds only data files or only
+        unreadable manifests: such leftovers need an explicit storage-level delete.
+
+        Note that a path which passes this check is deleted in full, including any
+        unmanaged files kept next to the dataset.
+
+        Parameters
+        ----------
+        base_uri : str or Path
+            Root of the dataset to delete.
+        storage_options : optional, dict
+            Extra options for the storage backend.
+        ignore_not_found : optional, bool
+            If True, return successfully when ``base_uri`` does not exist.
+
+        Raises
+        ------
+        ValueError
+            If ``base_uri`` is not a Lance dataset root.
+        """
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
     def get_ivf_model(self, index_name: str):

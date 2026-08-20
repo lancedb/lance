@@ -665,10 +665,19 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Drop a Dataset.
+   * Drop a Dataset, deleting everything under {@code path} recursively.
+   *
+   * <p>To limit the damage a mistyped or misconfigured path can do, {@code path} must be a dataset
+   * root, meaning it holds a manifest that can be read, or a namespace declare/deregister marker.
+   * Anything else throws {@link IllegalArgumentException}, including a path that holds only data
+   * files or only unreadable manifests: such leftovers need an explicit storage-level delete.
+   *
+   * <p>Note that a path which passes this check is deleted in full, including any unmanaged files
+   * kept next to the dataset.
    *
    * @param path The file path of the dataset
    * @param storageOptions Storage options
+   * @throws IllegalArgumentException if {@code path} is not a Lance dataset root
    */
   public static native void drop(String path, Map<String, String> storageOptions);
 
