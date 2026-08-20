@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
             .await
         }
         _ => Err(Error::invalid_input(
-            "usage: encoded_predicate_bench prepare <uri> <rows> <rows_per_batch> | run <uri> <column> <operator> <literal> <baseline|encoded> <iterations>",
+            "usage: encoded_predicate_bench prepare <uri> <rows> <rows_per_batch> | run <uri> <column> <operator> <literal> <baseline|auto|encoded> <iterations>",
         )),
     }
 }
@@ -144,8 +144,13 @@ async fn run(
 ) -> Result<()> {
     match mode {
         "baseline" => unsafe { std::env::set_var("LANCE_ENCODED_PRIMITIVE_PREDICATE", "0") },
+        "auto" => unsafe { std::env::set_var("LANCE_ENCODED_PRIMITIVE_PREDICATE", "auto") },
         "encoded" => unsafe { std::env::set_var("LANCE_ENCODED_PRIMITIVE_PREDICATE", "1") },
-        _ => return Err(Error::invalid_input("mode must be baseline or encoded")),
+        _ => {
+            return Err(Error::invalid_input(
+                "mode must be baseline, auto, or encoded",
+            ));
+        }
     }
     if !matches!(operator, "=" | "!=" | "<" | "<=" | ">" | ">=") {
         return Err(Error::invalid_input("unsupported comparison operator"));

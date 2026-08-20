@@ -49,6 +49,37 @@ pub struct PrimitivePredicate {
     pub literal: PrimitiveLiteral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Physical encoding used by a direct primitive predicate kernel.
+pub enum PrimitivePredicateEncoding {
+    /// A structural constant page.
+    Constant,
+    /// Miniblock run-length encoding.
+    Rle,
+    /// Miniblock inline or out-of-line bitpacking.
+    Bitpacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Predicate outcome known from page metadata without reading page data.
+pub enum PrimitivePredicateOutcome {
+    /// Page data must be inspected to determine the outcome.
+    Unknown,
+    /// Every requested non-null value matches and the page has no nulls.
+    AlwaysTrue,
+    /// No value can match, including nulls.
+    AlwaysFalse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Metadata-only plan for direct primitive predicate evaluation.
+pub struct PrimitivePredicatePlan {
+    /// Encoding implemented by the direct kernel.
+    pub encoding: PrimitivePredicateEncoding,
+    /// Outcome when it can be proven from inline page metadata.
+    pub outcome: PrimitivePredicateOutcome,
+}
+
 static DIRECT_VALUES: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_VALUES: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -161,7 +192,8 @@ impl PrimitivePredicate {
         Ok(boolean_block(matches, num_values))
     }
 
-    pub(crate) fn matches_u32(&self, value: u32) -> bool {
+    /// Returns whether a physical 32-bit value matches this predicate.
+    pub fn matches_u32(&self, value: u32) -> bool {
         match self.literal {
             PrimitiveLiteral::Int32(literal) => compare(value as i32, literal, self.operator),
             PrimitiveLiteral::UInt32(literal) => compare(value, literal, self.operator),

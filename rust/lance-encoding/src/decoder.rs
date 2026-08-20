@@ -218,7 +218,9 @@ use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{
+    ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt32Array,
+};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::future::{BoxFuture, MaybeDone, maybe_done};
@@ -256,7 +258,10 @@ use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
 use crate::format::pb21;
-use crate::predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate};
+use crate::predicate::{
+    ComparisonOperator, PrimitiveLiteral, PrimitivePredicate, PrimitivePredicateEncoding,
+    PrimitivePredicateOutcome, PrimitivePredicatePlan,
+};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -459,6 +464,130 @@ impl ColumnInfo {
             .first()
             .map(|page| page.encoding.is_structural())
             .unwrap_or(false)
+    }
+
+    /// Returns a metadata-only plan when every page uses the same direct predicate encoding.
+    pub fn primitive_predicate_plan(
+        &self,
+        data_type: &DataType,
+        nullable: bool,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Option<PrimitivePredicatePlan>> {
+        let mut combined: Option<PrimitivePredicatePlan> = None;
+        for page in self.page_infos.iter().filter(|page| page.num_rows > 0) {
+            let Some(page_plan) =
+                primitive_predicate_page_plan(page, data_type, nullable, predicate)?
+            else {
+                return Ok(None);
+            };
+            combined = Some(match combined {
+                None => page_plan,
+                Some(previous) if previous.encoding == page_plan.encoding => {
+                    PrimitivePredicatePlan {
+                        encoding: previous.encoding,
+                        outcome: if previous.outcome == page_plan.outcome {
+                            previous.outcome
+                        } else {
+                            PrimitivePredicateOutcome::Unknown
+                        },
+                    }
+                }
+                Some(_) => return Ok(None),
+            });
+        }
+        Ok(combined)
+    }
+}
+
+fn primitive_predicate_page_plan(
+    page: &PageInfo,
+    data_type: &DataType,
+    nullable: bool,
+    predicate: &PrimitivePredicate,
+) -> Result<Option<PrimitivePredicatePlan>> {
+    use pb21::compressive_encoding::Compression;
+    use pb21::page_layout::Layout;
+
+    let PageEncoding::Structural(layout) = &page.encoding else {
+        return Ok(None);
+    };
+    match layout.layout.as_ref() {
+        Some(Layout::ConstantLayout(constant)) => {
+            let outcome = if let Some(inline) = &constant.inline_value {
+                let scalar = lance_arrow::scalar::decode_scalar_from_inline_value(
+                    data_type,
+                    inline.as_ref(),
+                )?;
+                let value = match predicate.literal {
+                    PrimitiveLiteral::Int32(_) => {
+                        let Some(values) = scalar.as_any().downcast_ref::<Int32Array>() else {
+                            return Ok(None);
+                        };
+                        values.value(0) as u32
+                    }
+                    PrimitiveLiteral::UInt32(_) => {
+                        let Some(values) = scalar.as_any().downcast_ref::<UInt32Array>() else {
+                            return Ok(None);
+                        };
+                        values.value(0)
+                    }
+                };
+                if predicate.matches_u32(value) {
+                    if !nullable || constant.num_def_values == 0 {
+                        PrimitivePredicateOutcome::AlwaysTrue
+                    } else {
+                        PrimitivePredicateOutcome::Unknown
+                    }
+                } else {
+                    PrimitivePredicateOutcome::AlwaysFalse
+                }
+            } else {
+                PrimitivePredicateOutcome::Unknown
+            };
+            Ok(Some(PrimitivePredicatePlan {
+                encoding: PrimitivePredicateEncoding::Constant,
+                outcome,
+            }))
+        }
+        Some(Layout::MiniBlockLayout(miniblock)) if miniblock.dictionary.is_none() => {
+            let compression = miniblock
+                .value_compression
+                .as_ref()
+                .and_then(|encoding| encoding.compression.as_ref());
+            let (encoding, outcome) = match compression {
+                Some(Compression::Constant(constant)) => {
+                    let outcome = if let Some(value) = &constant.value {
+                        let Ok(value) = <[u8; 4]>::try_from(value.as_ref()) else {
+                            return Ok(None);
+                        };
+                        if predicate.matches_u32(u32::from_le_bytes(value)) {
+                            if !nullable {
+                                PrimitivePredicateOutcome::AlwaysTrue
+                            } else {
+                                PrimitivePredicateOutcome::Unknown
+                            }
+                        } else {
+                            PrimitivePredicateOutcome::AlwaysFalse
+                        }
+                    } else {
+                        PrimitivePredicateOutcome::AlwaysFalse
+                    };
+                    (PrimitivePredicateEncoding::Constant, outcome)
+                }
+                Some(Compression::Rle(_)) => (
+                    PrimitivePredicateEncoding::Rle,
+                    PrimitivePredicateOutcome::Unknown,
+                ),
+                Some(Compression::InlineBitpacking(_))
+                | Some(Compression::OutOfLineBitpacking(_)) => (
+                    PrimitivePredicateEncoding::Bitpacked,
+                    PrimitivePredicateOutcome::Unknown,
+                ),
+                _ => return Ok(None),
+            };
+            Ok(Some(PrimitivePredicatePlan { encoding, outcome }))
+        }
+        _ => Ok(None),
     }
 }
 

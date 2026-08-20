@@ -45,7 +45,10 @@ use lance_datafusion::utils::{
 };
 use lance_encoding::{
     decoder::FilterExpression,
-    predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate},
+    predicate::{
+        ComparisonOperator, PrimitiveLiteral, PrimitivePredicate, PrimitivePredicateEncoding,
+        PrimitivePredicateOutcome, PrimitivePredicatePlan,
+    },
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
@@ -62,7 +65,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
 
 use crate::Dataset;
-use crate::dataset::fragment::{FileFragment, FragReadConfig};
+use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -80,11 +83,6 @@ fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef
 }
 
 fn encoded_primitive_predicate(expr: &Expr) -> Option<PrimitivePredicate> {
-    if std::env::var("LANCE_ENCODED_PRIMITIVE_PREDICATE")
-        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
-    {
-        return None;
-    }
     let Expr::BinaryExpr(binary) = expr else {
         return None;
     };
@@ -114,6 +112,110 @@ fn encoded_primitive_predicate(expr: &Expr) -> Option<PrimitivePredicate> {
         operator,
         literal,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodedPredicateMode {
+    Auto,
+    Disabled,
+    Forced,
+}
+
+fn encoded_predicate_mode() -> EncodedPredicateMode {
+    encoded_predicate_mode_from_value(
+        std::env::var("LANCE_ENCODED_PRIMITIVE_PREDICATE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn encoded_predicate_mode_from_value(value: Option<&str>) -> EncodedPredicateMode {
+    match value.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "disabled" => EncodedPredicateMode::Disabled,
+        "1" | "true" | "force" | "forced" => EncodedPredicateMode::Forced,
+        _ => EncodedPredicateMode::Auto,
+    }
+}
+
+const ENCODED_PREDICATE_AUTO_SAMPLE_ROWS: u64 = 64 * 1024;
+const ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS: u64 = 8;
+const ENCODED_PREDICATE_RANGE_AMPLIFICATION_ROWS: u64 = 1024;
+
+fn total_range_rows(ranges: &[Range<u64>]) -> u64 {
+    ranges.iter().map(|range| range.end - range.start).sum()
+}
+
+fn ordinal_range_slice(ranges: &[Range<u64>], mut offset: u64, mut length: u64) -> Vec<Range<u64>> {
+    let mut selected = Vec::new();
+    for range in ranges {
+        let range_len = range.end - range.start;
+        if offset >= range_len {
+            offset -= range_len;
+            continue;
+        }
+        let start = range.start + offset;
+        let take = length.min(range.end - start);
+        selected.push(start..start + take);
+        length -= take;
+        offset = 0;
+        if length == 0 {
+            break;
+        }
+    }
+    selected
+}
+
+fn encoded_predicate_sample_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+    let total_rows = total_range_rows(ranges);
+    if total_rows <= ENCODED_PREDICATE_AUTO_SAMPLE_ROWS {
+        return ranges.to_vec();
+    }
+
+    let window_rows =
+        ENCODED_PREDICATE_AUTO_SAMPLE_ROWS.div_ceil(ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS);
+    let max_start = total_rows - window_rows;
+    let mut sampled = Vec::new();
+    for window in 0..ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS {
+        let offset = window * max_start / (ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS - 1);
+        sampled.extend(ordinal_range_slice(ranges, offset, window_rows));
+    }
+    sampled.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(sampled.len());
+    for range in sampled {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn encoded_predicate_auto_accepts(
+    encoding: PrimitivePredicateEncoding,
+    sampled_rows: u64,
+    selected_rows: u64,
+    selected_ranges: usize,
+) -> bool {
+    if sampled_rows == 0 || selected_rows == 0 {
+        return true;
+    }
+    let predicted_read_rows = encoded_predicate_predicted_read_rows(selected_rows, selected_ranges);
+    let predicted_read_fraction = predicted_read_rows as f64 / sampled_rows as f64;
+    let maximum_read_fraction = match encoding {
+        PrimitivePredicateEncoding::Constant => return false,
+        PrimitivePredicateEncoding::Rle => 0.8,
+        PrimitivePredicateEncoding::Bitpacked => 0.55,
+    };
+    predicted_read_fraction <= maximum_read_fraction
+}
+
+fn encoded_predicate_predicted_read_rows(selected_rows: u64, selected_ranges: usize) -> u64 {
+    selected_rows.saturating_add(
+        (selected_ranges as u64).saturating_mul(ENCODED_PREDICATE_RANGE_AMPLIFICATION_ROWS),
+    )
 }
 
 fn reverse_operator(operator: Operator) -> Option<Operator> {
@@ -271,6 +373,12 @@ struct ScopedFragmentRead {
     scan_scheduler: Arc<ScanScheduler>,
 }
 
+struct EncodedPredicateSelection {
+    ranges: Vec<Range<u64>>,
+    selected_rows: u64,
+    predicate_scan_counted: bool,
+}
+
 impl ScopedFragmentRead {
     fn frag_read_config(&self) -> FragReadConfig {
         let mut config = FragReadConfig::default()
@@ -362,6 +470,15 @@ pub struct FilteredReadGlobalMetrics {
     fragments_scanned: Count,
     ranges_scanned: Count,
     rows_scanned: Count,
+    encoded_predicate_attempts: Count,
+    encoded_predicate_applied: Count,
+    encoded_predicate_rejected: Count,
+    encoded_predicate_sample_rows: Count,
+    encoded_predicate_sample_selected_rows: Count,
+    encoded_predicate_sample_selected_ranges: Count,
+    encoded_predicate_predicted_read_rows: Count,
+    encoded_predicate_selected_rows: Count,
+    encoded_predicate_selected_ranges: Count,
     io_metrics: IoMetrics,
 }
 
@@ -371,6 +488,20 @@ impl FilteredReadGlobalMetrics {
             fragments_scanned: metrics.new_count(FRAGMENTS_SCANNED_METRIC, 0),
             ranges_scanned: metrics.new_count(RANGES_SCANNED_METRIC, 0),
             rows_scanned: metrics.new_count(ROWS_SCANNED_METRIC, 0),
+            encoded_predicate_attempts: metrics.new_count("encoded_predicate_attempts", 0),
+            encoded_predicate_applied: metrics.new_count("encoded_predicate_applied", 0),
+            encoded_predicate_rejected: metrics.new_count("encoded_predicate_rejected", 0),
+            encoded_predicate_sample_rows: metrics.new_count("encoded_predicate_sample_rows", 0),
+            encoded_predicate_sample_selected_rows: metrics
+                .new_count("encoded_predicate_sample_selected_rows", 0),
+            encoded_predicate_sample_selected_ranges: metrics
+                .new_count("encoded_predicate_sample_selected_ranges", 0),
+            encoded_predicate_predicted_read_rows: metrics
+                .new_count("encoded_predicate_predicted_read_rows", 0),
+            encoded_predicate_selected_rows: metrics
+                .new_count("encoded_predicate_selected_rows", 0),
+            encoded_predicate_selected_ranges: metrics
+                .new_count("encoded_predicate_selected_ranges", 0),
             io_metrics: IoMetrics::new(metrics, 0),
         }
     }
@@ -1448,39 +1579,16 @@ impl FilteredReadStream {
         }
     }
 
-    async fn try_encoded_predicate_ranges(
-        fragment_read_task: &ScopedFragmentRead,
+    async fn evaluate_encoded_predicate_ranges(
+        predicate_reader: &FragmentReader,
+        ranges: Vec<Range<u64>>,
+        batch_size: u32,
+        predicate_schema: Arc<lance_core::datatypes::Schema>,
         predicate: &PrimitivePredicate,
-        global_metrics: &FilteredReadGlobalMetrics,
     ) -> Result<Option<Vec<Range<u64>>>> {
-        if predicate.column.contains('.') {
-            return Ok(None);
-        }
-        let predicate_projection = fragment_read_task
-            .projection
-            .as_ref()
-            .clone()
-            .union_column(&predicate.column, OnMissing::Error)?;
-        let predicate_schema = Arc::new(
-            predicate_projection
-                .to_bare_schema()
-                .project(&[predicate.column.as_str()])?,
-        );
-        let mut predicate_reader = fragment_read_task
-            .fragment
-            .open(&predicate_schema, fragment_read_task.frag_read_config())
-            .await?;
-        if fragment_read_task.with_deleted_rows {
-            predicate_reader.with_make_deletions_null();
-        }
         let filter = FilterExpression::primitive(predicate)?;
         let mask_stream = predicate_reader
-            .read_ranges_predicate(
-                fragment_read_task.ranges.clone().into(),
-                fragment_read_task.batch_size,
-                predicate_schema,
-                filter,
-            )
+            .read_ranges_predicate(ranges.clone().into(), batch_size, predicate_schema, filter)
             .await;
         let Some(mut mask_stream) = (match mask_stream {
             Ok(stream) => stream,
@@ -1490,10 +1598,7 @@ impl FilteredReadStream {
             return Ok(None);
         };
 
-        let mut physical_rows = fragment_read_task
-            .ranges
-            .iter()
-            .flat_map(|range| range.clone());
+        let mut physical_rows = ranges.iter().flat_map(|range| range.clone());
         let mut selected = RoaringBitmap::new();
         while let Some(batch) = mask_stream.next().await {
             let batch = match batch.await {
@@ -1524,18 +1629,204 @@ impl FilteredReadStream {
                 "Encoded predicate produced fewer rows than requested",
             ));
         }
-        global_metrics.rows_scanned.add(
-            fragment_read_task
-                .ranges
-                .iter()
-                .map(|range| range.end - range.start)
-                .sum::<u64>() as usize,
+        Ok(Some(bitmap_to_ranges(&selected)))
+    }
+
+    async fn try_encoded_predicate_ranges(
+        fragment_read_task: &ScopedFragmentRead,
+        predicate: &PrimitivePredicate,
+        mode: EncodedPredicateMode,
+        global_metrics: &FilteredReadGlobalMetrics,
+    ) -> Result<Option<EncodedPredicateSelection>> {
+        if predicate.column.contains('.') {
+            return Ok(None);
+        }
+        global_metrics.encoded_predicate_attempts.add(1);
+        let predicate_projection = fragment_read_task
+            .projection
+            .as_ref()
+            .clone()
+            .union_column(&predicate.column, OnMissing::Error)?;
+        let predicate_schema = Arc::new(
+            predicate_projection
+                .to_bare_schema()
+                .project(&[predicate.column.as_str()])?,
         );
+        let mut predicate_reader = fragment_read_task
+            .fragment
+            .open(&predicate_schema, fragment_read_task.frag_read_config())
+            .await?;
+        if fragment_read_task.with_deleted_rows {
+            predicate_reader.with_make_deletions_null();
+        }
+        let plan = match predicate_reader
+            .primitive_predicate_plan(predicate_schema.clone(), predicate.clone())
+            .await
+        {
+            Ok(plan) => plan,
+            Err(Error::NotSupported { .. }) => None,
+            Err(error) => return Err(error),
+        };
+
+        if let Some(PrimitivePredicatePlan { outcome, .. }) = plan {
+            match outcome {
+                PrimitivePredicateOutcome::AlwaysFalse => {
+                    global_metrics.encoded_predicate_applied.add(1);
+                    return Ok(Some(EncodedPredicateSelection {
+                        ranges: Vec::new(),
+                        selected_rows: 0,
+                        predicate_scan_counted: false,
+                    }));
+                }
+                // Deleted rows become null in the predicate projection and therefore do not
+                // match, even when every stored value does.
+                PrimitivePredicateOutcome::AlwaysTrue if !fragment_read_task.with_deleted_rows => {
+                    let selected_rows = total_range_rows(&fragment_read_task.ranges);
+                    global_metrics.encoded_predicate_applied.add(1);
+                    global_metrics
+                        .encoded_predicate_selected_rows
+                        .add(selected_rows as usize);
+                    global_metrics
+                        .encoded_predicate_selected_ranges
+                        .add(fragment_read_task.ranges.len());
+                    return Ok(Some(EncodedPredicateSelection {
+                        ranges: fragment_read_task.ranges.clone(),
+                        selected_rows,
+                        predicate_scan_counted: false,
+                    }));
+                }
+                PrimitivePredicateOutcome::AlwaysTrue | PrimitivePredicateOutcome::Unknown => {}
+            }
+        }
+
+        if mode == EncodedPredicateMode::Auto && plan.is_none() {
+            global_metrics.encoded_predicate_rejected.add(1);
+            global_metrics
+                .io_metrics
+                .record(&fragment_read_task.scan_scheduler);
+            return Ok(None);
+        }
+
+        let mut predicate_scan_rows = 0_u64;
+        let mut predicate_scan_ranges = 0_usize;
+        let selected_ranges = if mode == EncodedPredicateMode::Auto {
+            let plan = plan.expect("auto mode requires a metadata plan");
+            if plan.encoding == PrimitivePredicateEncoding::Constant {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            }
+            let sample_ranges = encoded_predicate_sample_ranges(&fragment_read_task.ranges);
+            let sampled_rows = total_range_rows(&sample_ranges);
+            global_metrics
+                .encoded_predicate_sample_rows
+                .add(sampled_rows as usize);
+            let Some(sample_selection) = Self::evaluate_encoded_predicate_ranges(
+                &predicate_reader,
+                sample_ranges.clone(),
+                fragment_read_task.batch_size,
+                predicate_schema.clone(),
+                predicate,
+            )
+            .await?
+            else {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            };
+            let sample_selected_rows = total_range_rows(&sample_selection);
+            global_metrics
+                .encoded_predicate_sample_selected_rows
+                .add(sample_selected_rows as usize);
+            global_metrics
+                .encoded_predicate_sample_selected_ranges
+                .add(sample_selection.len());
+            global_metrics.encoded_predicate_predicted_read_rows.add(
+                encoded_predicate_predicted_read_rows(sample_selected_rows, sample_selection.len())
+                    as usize,
+            );
+            if !encoded_predicate_auto_accepts(
+                plan.encoding,
+                sampled_rows,
+                sample_selected_rows,
+                sample_selection.len(),
+            ) {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            }
+            predicate_scan_rows += sampled_rows;
+            predicate_scan_ranges += sample_ranges.len();
+            if sample_ranges == fragment_read_task.ranges {
+                sample_selection
+            } else {
+                let Some(full_selection) = Self::evaluate_encoded_predicate_ranges(
+                    &predicate_reader,
+                    fragment_read_task.ranges.clone(),
+                    fragment_read_task.batch_size,
+                    predicate_schema,
+                    predicate,
+                )
+                .await?
+                else {
+                    global_metrics.encoded_predicate_rejected.add(1);
+                    global_metrics
+                        .io_metrics
+                        .record(&fragment_read_task.scan_scheduler);
+                    return Ok(None);
+                };
+                predicate_scan_rows += total_range_rows(&fragment_read_task.ranges);
+                predicate_scan_ranges += fragment_read_task.ranges.len();
+                full_selection
+            }
+        } else {
+            let Some(selection) = Self::evaluate_encoded_predicate_ranges(
+                &predicate_reader,
+                fragment_read_task.ranges.clone(),
+                fragment_read_task.batch_size,
+                predicate_schema,
+                predicate,
+            )
+            .await?
+            else {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            };
+            predicate_scan_rows = total_range_rows(&fragment_read_task.ranges);
+            predicate_scan_ranges = fragment_read_task.ranges.len();
+            selection
+        };
+
+        let selected_rows = total_range_rows(&selected_ranges);
+        global_metrics.encoded_predicate_applied.add(1);
+        global_metrics
+            .encoded_predicate_selected_rows
+            .add(selected_rows as usize);
+        global_metrics
+            .encoded_predicate_selected_ranges
+            .add(selected_ranges.len());
+        global_metrics
+            .rows_scanned
+            .add(predicate_scan_rows as usize);
+        global_metrics.ranges_scanned.add(predicate_scan_ranges);
         global_metrics.fragments_scanned.add(1);
         global_metrics
-            .ranges_scanned
-            .add(fragment_read_task.ranges.len());
-        Ok(Some(bitmap_to_ranges(&selected)))
+            .io_metrics
+            .record(&fragment_read_task.scan_scheduler);
+        Ok(Some(EncodedPredicateSelection {
+            ranges: selected_ranges,
+            selected_rows,
+            predicate_scan_counted: true,
+        }))
     }
 
     // Reads a single fragment into a stream of batch tasks
@@ -1553,21 +1844,28 @@ impl FilteredReadStream {
         // the row ids are not contiguous.
         fragment_read_task.ranges.sort_by_key(|range| range.start);
 
-        let mut encoded_predicate_applied = false;
-        if let Some(predicate) = fragment_read_task
-            .filter
-            .as_ref()
-            .and_then(encoded_primitive_predicate)
-            && let Some(selected_ranges) = Self::try_encoded_predicate_ranges(
+        let mode = encoded_predicate_mode();
+        let mut predicate_scan_counted = false;
+        if mode != EncodedPredicateMode::Disabled
+            && let Some(predicate) = fragment_read_task
+                .filter
+                .as_ref()
+                .and_then(encoded_primitive_predicate)
+            && let Some(selection) = Self::try_encoded_predicate_ranges(
                 &fragment_read_task,
                 &predicate,
+                mode,
                 global_metrics.as_ref(),
             )
             .await?
         {
-            fragment_read_task.ranges = selected_ranges;
+            fragment_read_task.ranges = selection.ranges;
             fragment_read_task.filter = None;
-            encoded_predicate_applied = true;
+            predicate_scan_counted = selection.predicate_scan_counted;
+            debug_assert_eq!(
+                selection.selected_rows,
+                total_range_rows(&fragment_read_task.ranges)
+            );
             if fragment_read_task.ranges.is_empty() {
                 return Ok(futures::stream::empty().boxed());
             }
@@ -1621,7 +1919,7 @@ impl FilteredReadStream {
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
         // used in the scan anyways.
-        let fragment_counted = Arc::new(AtomicBool::new(encoded_predicate_applied));
+        let fragment_counted = Arc::new(AtomicBool::new(predicate_scan_counted));
         let range_tracker = Arc::new(Mutex::new(RangeMetricsTracker::new(
             fragment_read_task.ranges.clone(),
         )));
@@ -1636,10 +1934,10 @@ impl FilteredReadStream {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
-                let encoded_predicate_applied = encoded_predicate_applied;
+                let predicate_scan_counted = predicate_scan_counted;
                 let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
-                        if encoded_predicate_applied {
+                        if predicate_scan_counted {
                             return;
                         }
                         let num_rows = batch.num_rows();
@@ -3514,6 +3812,84 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn test_encoded_predicate_modes() {
+        assert_eq!(
+            encoded_predicate_mode_from_value(None),
+            EncodedPredicateMode::Auto
+        );
+        assert_eq!(
+            encoded_predicate_mode_from_value(Some("auto")),
+            EncodedPredicateMode::Auto
+        );
+        assert_eq!(
+            encoded_predicate_mode_from_value(Some("0")),
+            EncodedPredicateMode::Disabled
+        );
+        assert_eq!(
+            encoded_predicate_mode_from_value(Some("false")),
+            EncodedPredicateMode::Disabled
+        );
+        assert_eq!(
+            encoded_predicate_mode_from_value(Some("1")),
+            EncodedPredicateMode::Forced
+        );
+        assert_eq!(
+            encoded_predicate_mode_from_value(Some("forced")),
+            EncodedPredicateMode::Forced
+        );
+    }
+
+    #[test]
+    fn test_encoded_predicate_auto_gate() {
+        assert!(encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Rle,
+            65_536,
+            32_768,
+            8,
+        ));
+        assert!(!encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Rle,
+            65_536,
+            60_000,
+            8,
+        ));
+        assert!(encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Bitpacked,
+            65_536,
+            8_192,
+            8,
+        ));
+        assert!(!encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Bitpacked,
+            65_536,
+            64,
+            64,
+        ));
+        assert!(encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Bitpacked,
+            65_536,
+            0,
+            0,
+        ));
+        assert!(!encoded_predicate_auto_accepts(
+            PrimitivePredicateEncoding::Constant,
+            65_536,
+            1,
+            1,
+        ));
+    }
+
+    #[test]
+    fn test_encoded_predicate_stratified_sample() {
+        let ranges = vec![0..50_000, 60_000..210_000];
+        let sampled = encoded_predicate_sample_ranges(&ranges);
+        assert_eq!(total_range_rows(&sampled), 65_536);
+        assert_eq!(sampled.first().unwrap().start, 0);
+        assert_eq!(sampled.last().unwrap().end, 210_000);
+        assert!(sampled.windows(2).all(|pair| pair[0].end < pair[1].start));
+    }
+
     #[derive(Clone, Default)]
     struct MaskToOffsetRangesCounter {
         count: Arc<AtomicUsize>,
@@ -3835,8 +4211,39 @@ mod tests {
         );
     }
 
+    async fn execute_encoded_predicate_test_scan(
+        dataset: Arc<Dataset>,
+        filter: &str,
+    ) -> (usize, MetricsSet) {
+        let projection = dataset
+            .empty_projection()
+            .union_column("payload", OnMissing::Error)
+            .unwrap();
+        let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+        let filter = planner.parse_filter(filter).unwrap();
+        let options = FilteredReadOptions::new(projection)
+            .with_filter(Some(filter.clone()), Some(filter))
+            .unwrap();
+        let plan = Arc::new(FilteredReadExec::try_new(dataset, options, None).unwrap());
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let output_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        (output_rows, plan.metrics().unwrap())
+    }
+
+    fn metric_value(metrics: &MetricsSet, name: &str) -> usize {
+        metrics
+            .sum_by_name(name)
+            .map(|value| value.as_usize())
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
-    async fn test_encoded_predicate_reads_only_selected_payload_rows() {
+    async fn test_encoded_predicate_filter_correctness() {
         use arrow_array::{Int32Array, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField};
 
@@ -3887,6 +4294,131 @@ mod tests {
             .column(0)
             .as_primitive::<arrow_array::types::UInt64Type>();
         assert_eq!(payload.values().as_ref(), &[12, 13, 14]);
+    }
+
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_plans_current_encodings() {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField};
+
+        let tmp_path = TempStrDir::default();
+        let num_rows = 200_000_u64;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("bitpack", DataType::UInt32, false),
+            ArrowField::new("rle", DataType::UInt32, false),
+            ArrowField::new("constant", DataType::UInt32, false),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..num_rows).map(|row| (row % 1024) as u32),
+                )),
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..num_rows).map(|row| (row / 4096) as u32),
+                )),
+                Arc::new(UInt32Array::from_iter_values((0..num_rows).map(|_| 7))),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: num_rows as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset.clone(), "constant = 8").await;
+        assert_eq!(output_rows, 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_selected_rows"), 0);
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset.clone(), "constant = 7").await;
+        assert_eq!(output_rows, num_rows as usize);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_rows"),
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset.clone(), "rle = 1").await;
+        assert_eq!(output_rows, 4096);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "bitpack = 1").await;
+        assert_eq!(output_rows, 196);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_rows"),
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_short_circuits_constant_layout() {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp_path = TempStrDir::default();
+        let num_rows = 10_000_u64;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("constant", DataType::UInt32, false),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values((0..num_rows).map(|_| 7))),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset.clone(), "constant = 8").await;
+        assert_eq!(output_rows, 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_sample_rows"), 0);
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "constant = 7").await;
+        assert_eq!(output_rows, num_rows as usize);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_sample_rows"), 0);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_selected_rows"),
+            num_rows as usize
+        );
     }
 
     fn u32s(ranges: Vec<Range<u32>>) -> Arc<dyn Array> {

@@ -41,6 +41,7 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::predicate::{PrimitivePredicate, PrimitivePredicatePlan};
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
 };
@@ -132,6 +133,15 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         _projection: Arc<lance_core::datatypes::Schema>,
         _filter: FilterExpression,
     ) -> BoxFuture<'_, Result<Option<ReadBatchTaskStream>>> {
+        async { Ok(None) }.boxed()
+    }
+
+    /// Returns a metadata-only plan for a one-column primitive predicate projection.
+    fn primitive_predicate_plan(
+        &self,
+        _projection: Arc<lance_core::datatypes::Schema>,
+        _predicate: PrimitivePredicate,
+    ) -> BoxFuture<'_, Result<Option<PrimitivePredicatePlan>>> {
         async { Ok(None) }.boxed()
     }
     /// Reads all rows from the file, returning as a stream of tasks
@@ -435,6 +445,24 @@ mod v2_adapter {
                     })
                     .boxed();
                 Ok(Some(tasks))
+            }
+            .boxed()
+        }
+
+        fn primitive_predicate_plan(
+            &self,
+            projection: Arc<Schema>,
+            predicate: PrimitivePredicate,
+        ) -> BoxFuture<'_, Result<Option<PrimitivePredicatePlan>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .primitive_predicate_plan(projection, &predicate)
+                    .await
             }
             .boxed()
         }
@@ -3450,6 +3478,29 @@ impl FragmentReader {
             return Ok(None);
         };
         Ok(Some(tasks.map(|task| task.task).boxed()))
+    }
+
+    /// Returns a metadata-only plan for a one-column encoded primitive predicate.
+    pub(crate) async fn primitive_predicate_plan(
+        &self,
+        projection: Arc<Schema>,
+        predicate: PrimitivePredicate,
+    ) -> Result<Option<PrimitivePredicatePlan>> {
+        if self.overlay.is_some() || projection.fields.len() != 1 {
+            return Ok(None);
+        }
+        let field_id = projection.fields[0].id;
+        let mut readers = self
+            .readers
+            .iter()
+            .filter(|reader| reader.projection().field_by_id(field_id).is_some());
+        let Some(reader) = readers.next() else {
+            return Ok(None);
+        };
+        if readers.next().is_some() {
+            return Ok(None);
+        }
+        reader.primitive_predicate_plan(projection, predicate).await
     }
 
     /// Reads a range and concatenates the result into one batch.
