@@ -1930,40 +1930,20 @@ impl DirectoryNamespace {
             })
         };
 
-        // Read the first entry to detect the naming scheme. V2 filenames are a
-        // fixed 29 chars (`{u64::MAX - version:020}.manifest`); V1 filenames
-        // vary in length.
-        let first = stream.try_next().await.map_err(list_err)?;
-        let is_v2_naming = first
-            .as_ref()
-            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
-
-        // On a lexically-ordered store the list stream already arrives in a
-        // fixed order: V2 filenames invert the version (`u64::MAX - version`),
-        // so ascending keys mean descending versions. When the caller wants
-        // that same order, the stream is already sorted and we can stop after
-        // `limit` entries instead of collecting every manifest. This is the
-        // hot path for `get_latest_version` (descending, limit 1): a table with
-        // many versions would otherwise paginate the whole `_versions/`
-        // directory (one list page per ~1k objects) on every resolution.
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
-        let stream_matches_request = list_is_ordered
-            && if is_v2_naming {
-                descending
-            } else {
-                !descending
-            };
-        let early_stop_at = limit
-            .filter(|_| stream_matches_request)
-            .map(|limit| limit.max(0) as usize);
+        // Negative limits are ignored (treated as "no limit") rather than
+        // clamped, matching `apply_pagination`.
+        let limit = limit
+            .filter(|limit| *limit >= 0)
+            .map(|limit| limit as usize);
 
         let mut table_versions: Vec<TableVersion> = Vec::new();
-        let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| {
+        // Push `meta` if it is a committed manifest; returns whether it was.
+        let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| -> bool {
             let Some(filename) = meta.location.filename() else {
-                return;
+                return false;
             };
             let Some(actual_version) = Self::manifest_version_from_filename(filename) else {
-                return;
+                return false;
             };
             out.push(TableVersion {
                 version: actual_version as i64,
@@ -1973,22 +1953,63 @@ impl DirectoryNamespace {
                 timestamp_millis: Some(meta.last_modified.timestamp_millis()),
                 metadata: None,
             });
+            true
         };
 
-        if let Some(meta) = first {
-            push_meta(meta, &mut table_versions);
+        // Detect the naming scheme from the first entry that parses as a
+        // committed manifest, not the first raw entry: the commit protocol
+        // deliberately leaves non-manifest objects in `_versions/` (e.g. a
+        // staging blob `{manifest}-<uuid>` retained after an ambiguous publish
+        // failure), and its inverted key sorts ahead of the newest committed
+        // manifest on a lexically-ordered store. Detecting from the raw first
+        // entry would misclassify the stream and silently disable the
+        // early-stop below. V2 filenames are a fixed 29 chars
+        // (`{u64::MAX - version:020}.manifest`); V1 filenames vary in length.
+        let mut first_manifest_filename_len = None;
+        while first_manifest_filename_len.is_none() {
+            match stream.try_next().await.map_err(list_err)? {
+                Some(meta) => {
+                    let filename_len = meta.location.filename().map(|f| f.len());
+                    if push_meta(meta, &mut table_versions) {
+                        first_manifest_filename_len = filename_len;
+                    }
+                }
+                None => break,
+            }
         }
+        let is_v2_naming = first_manifest_filename_len == Some(29);
+
+        // On a lexically-ordered store the list stream already arrives in a
+        // fixed order: V2 filenames invert the version (`u64::MAX - version`),
+        // so ascending keys mean descending versions. When the caller wants
+        // that same order, the stream is already sorted and we can stop after
+        // `limit` committed manifests instead of collecting every entry. This
+        // is the hot path for `get_latest_version` (descending, limit 1): a
+        // table with many versions would otherwise paginate the whole
+        // `_versions/` directory (one list page per ~1k objects) on every
+        // resolution.
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let stream_matches_request = list_is_ordered
+            && if is_v2_naming {
+                descending
+            } else {
+                !descending
+            };
+        let early_stop_at = limit.filter(|_| stream_matches_request);
+
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {
             match stream.try_next().await.map_err(list_err)? {
-                Some(meta) => push_meta(meta, &mut table_versions),
+                Some(meta) => {
+                    push_meta(meta, &mut table_versions);
+                }
                 None => break,
             }
         }
 
         // The early-stop path already yields entries in the requested order;
         // only the collected-everything path needs an explicit sort. The first
-        // entry is pushed unconditionally, so re-enforce the limit either way
-        // (covers limit=0).
+        // manifest is pushed during scheme detection regardless of the limit,
+        // so re-enforce the limit either way (covers limit=0).
         if let Some(n) = early_stop_at {
             table_versions.truncate(n);
         } else {
@@ -1998,7 +2019,7 @@ impl DirectoryNamespace {
                 table_versions.sort_by_key(|v| v.version);
             }
             if let Some(limit) = limit {
-                table_versions.truncate(limit.max(0) as usize);
+                table_versions.truncate(limit);
             }
         }
 
@@ -6334,6 +6355,25 @@ mod tests {
                 let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
                 ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
             }
+            // Non-manifest objects the commit protocol leaves in `_versions/`:
+            // a staging blob retained after an ambiguous publish failure (its
+            // inverted key sorts ahead of every committed manifest) and a
+            // detached manifest (sorts after). Both must be excluded from
+            // results without breaking naming-scheme detection.
+            let staging = Path::parse(format!(
+                "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
+                ManifestNamingScheme::V2.manifest_path(&table_path, 8)
+            ))
+            .unwrap();
+            ns.object_store
+                .put(&staging, b"s".as_slice())
+                .await
+                .unwrap();
+            let detached = table_path.clone().join(VERSIONS_DIR).join("d123.manifest");
+            ns.object_store
+                .put(&detached, b"d".as_slice())
+                .await
+                .unwrap();
             fn versions(r: &[TableVersion]) -> Vec<i64> {
                 r.iter().map(|t| t.version).collect()
             }
@@ -6381,6 +6421,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+
+            // negative limit: ignored (treated as no limit), matching
+            // `apply_pagination`.
+            let got = ns
+                .list_versions_under(&table_path, true, Some(-1))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
         }
 
         // Ordered store (memory://): descending requests take the early-stop
@@ -6396,6 +6444,162 @@ mod tests {
         let (ns_fs, _tmp) = create_test_namespace().await;
         assert!(!ns_fs.object_store.list_is_lexically_ordered);
         seed_and_check(&ns_fs).await;
+    }
+
+    /// Regression test for the `get_latest_version` hot path: a retained
+    /// staging blob sorts lexically ahead of the newest committed V2 manifest,
+    /// so naming-scheme detection must skip it — detecting from the raw first
+    /// entry misclassifies the stream as non-V2 and silently degrades a
+    /// `descending, limit=1` query back to consuming the whole `_versions/`
+    /// directory. Asserts the consumption bound: staging entry + one manifest.
+    #[tokio::test]
+    async fn test_list_versions_under_early_stop_bounded_consumption() {
+        use lance_io::object_store::providers::memory::MemoryStoreProvider;
+        use lance_table::io::commit::ManifestNamingScheme;
+
+        #[derive(Debug)]
+        struct EntryCountingStore {
+            target: Arc<dyn OSObjectStore>,
+            entries_listed: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for EntryCountingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "EntryCountingStore({})", self.target)
+            }
+        }
+
+        #[async_trait]
+        impl OSObjectStore for EntryCountingStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                bytes: PutPayload,
+                opts: PutOptions,
+            ) -> OSResult<PutResult> {
+                self.target.put_opts(location, bytes, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOptions,
+            ) -> OSResult<Box<dyn MultipartUpload>> {
+                self.target.put_multipart_opts(location, opts).await
+            }
+
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+                self.target.get_opts(location, options).await
+            }
+
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, OSResult<Path>>,
+            ) -> BoxStream<'static, OSResult<Path>> {
+                self.target.delete_stream(locations)
+            }
+
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+                let entries_listed = self.entries_listed.clone();
+                self.target
+                    .list(prefix)
+                    .inspect(move |_| {
+                        entries_listed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .boxed()
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+                self.target.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+                self.target.copy_opts(from, to, opts).await
+            }
+        }
+
+        #[derive(Debug)]
+        struct EntryCountingMemoryProvider {
+            entries_listed: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl lance_io::object_store::ObjectStoreProvider for EntryCountingMemoryProvider {
+            async fn new_store(
+                &self,
+                base_path: Url,
+                params: &ObjectStoreParams,
+            ) -> Result<ObjectStore> {
+                let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
+                store.inner = Arc::new(EntryCountingStore {
+                    target: store.inner.clone(),
+                    entries_listed: self.entries_listed.clone(),
+                });
+                Ok(store)
+            }
+
+            fn extract_path(&self, url: &Url) -> Result<Path> {
+                MemoryStoreProvider.extract_path(url)
+            }
+
+            fn calculate_object_store_prefix(
+                &self,
+                url: &Url,
+                storage_options: Option<&HashMap<String, String>>,
+            ) -> Result<String> {
+                MemoryStoreProvider.calculate_object_store_prefix(url, storage_options)
+            }
+        }
+
+        let entries_listed = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "memory-object-store",
+            Arc::new(EntryCountingMemoryProvider {
+                entries_listed: entries_listed.clone(),
+            }),
+        );
+        let session = Arc::new(Session::new(0, 0, registry));
+        let ns = DirectoryNamespaceBuilder::new("memory-object-store://lv-count")
+            .session(session)
+            .build()
+            .await
+            .unwrap();
+        assert!(ns.object_store.list_is_lexically_ordered);
+
+        let table_path = ns.base_path.clone().join("lv_count.lance");
+        for v in 1..=100u64 {
+            let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
+            ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+        }
+        // Retained staging blob for the next version: sorts ahead of every
+        // committed manifest, so it is the first raw entry in the listing.
+        let staging = Path::parse(format!(
+            "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
+            ManifestNamingScheme::V2.manifest_path(&table_path, 101)
+        ))
+        .unwrap();
+        ns.object_store
+            .put(&staging, b"s".as_slice())
+            .await
+            .unwrap();
+
+        let consumed_before = entries_listed.load(Ordering::SeqCst);
+        let got = ns
+            .list_versions_under(&table_path, true, Some(1))
+            .await
+            .unwrap();
+        let consumed = entries_listed.load(Ordering::SeqCst) - consumed_before;
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].version, 100);
+        assert_eq!(
+            consumed, 2,
+            "latest-version query must consume only the staging entry plus the \
+             first committed manifest, not the whole directory (consumed {} of \
+             101 entries)",
+            consumed
+        );
     }
 
     #[derive(Debug)]
