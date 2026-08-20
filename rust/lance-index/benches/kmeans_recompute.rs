@@ -12,8 +12,11 @@ fn bench_recompute_centroids(c: &mut Criterion) {
     let mut group = c.benchmark_group("kmeans_recompute_centroids");
 
     let cases = [
-        ("input_partitioned", 128 * 1024, 128, 256),
-        ("large_centroid_grid", 65_536, 1024, 4096),
+        ("default_ivf_high_dim", 16_384, 1024, 64),
+        ("low_sample_high_dim", 512, 1024, 256),
+        ("default_pq_subvector", 65_536, 64, 256),
+        ("max_sample_low_dim", 128 * 1024, 128, 256),
+        ("large_incremental_ivf", 65_536, 1024, 4096),
     ];
 
     for (name, num_vectors, dimension, k) in cases {
