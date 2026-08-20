@@ -5711,6 +5711,21 @@ def test_dataset_sql_batch_size_rows(tmp_path: Path):
     assert all(batch.num_rows <= 7 for batch in batches)
 
 
+@pytest.mark.parametrize("batch_size", [0, 2**32])
+def test_dataset_sql_rejects_invalid_batch_size(tmp_path: Path, batch_size: int):
+    ds = lance.write_dataset(
+        pa.table({"id": range(3)}), tmp_path / "test_sql_invalid_batch_size"
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 4294967295"):
+        (
+            ds.sql("SELECT * FROM dataset")
+            .batch_size(batch_size)
+            .build()
+            .to_batch_records()
+        )
+
+
 def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""
     # Create a dataset with large repetitive strings to test cache_repetition_index

@@ -3,6 +3,7 @@
 
 use crate::Dataset;
 use crate::datafusion::LanceTableProvider;
+use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
@@ -39,16 +40,6 @@ pub struct SqlQueryBuilder {
 
     /// Override the approximate maximum bytes in each scan batch.
     pub(crate) batch_size_bytes: Option<u64>,
-}
-
-fn validate_batch_size(batch_size: usize) -> lance_core::Result<()> {
-    if batch_size == 0 || u32::try_from(batch_size).is_err() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "batch_size must be between 1 and {}, got {batch_size}",
-            u32::MAX
-        )));
-    }
-    Ok(())
 }
 
 impl SqlQueryBuilder {
@@ -190,10 +181,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::Dataset;
     use crate::dataset::ReadParams;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::write::WriteParams;
+    use crate::{Dataset, Error};
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
@@ -281,6 +272,35 @@ mod tests {
 
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 50);
         assert!(batches.iter().all(|batch| batch.num_rows() <= 7));
+    }
+
+    #[tokio::test]
+    async fn test_sql_rejects_invalid_batch_size() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_rejects_invalid_batch_size",
+                FragmentCount::from(1),
+                FragmentRowCount::from(3),
+            )
+            .await
+            .unwrap();
+
+        for batch_size in [0, u32::MAX as usize + 1] {
+            let error = ds
+                .sql("SELECT x FROM dataset")
+                .batch_size(batch_size)
+                .build()
+                .await
+                .err()
+                .expect("invalid batch size should be rejected");
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("batch_size must be between 1 and {}", u32::MAX))
+            );
+        }
     }
 
     #[tokio::test]

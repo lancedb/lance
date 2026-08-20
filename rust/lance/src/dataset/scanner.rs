@@ -137,6 +137,22 @@ use lance_datafusion::substrait::parse_substrait;
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
 
+pub(crate) fn validate_batch_size(batch_size: usize) -> Result<u32> {
+    let validated = u32::try_from(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        ))
+    })?;
+    if validated == 0 {
+        return Err(Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        )));
+    }
+    Ok(validated)
+}
+
 enum FtsOverlayPlan {
     Unchanged(Option<Vec<IndexMetadata>>),
     RowLevel {
@@ -1455,6 +1471,8 @@ impl Scanner {
 
     /// Set the maximum number of rows per batch.
     ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive.
+    ///
     /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
     /// both limits apply and the one reached first determines the batch size.
@@ -2593,6 +2611,10 @@ impl Scanner {
             ));
         }
 
+        if let Some(batch_size) = self.batch_size {
+            validate_batch_size(batch_size)?;
+        }
+
         if self.strict_batch_size
             && let Some(batch_size_bytes) = self
                 .resolved_file_reader_options()
@@ -3141,7 +3163,7 @@ impl Scanner {
         }
 
         if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(batch_size as u32);
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
         }
 
         // Bound the decode fan-out by `batch_readahead`.
@@ -6239,7 +6261,7 @@ impl Scanner {
                 read_options = read_options.with_deleted_rows()?;
             }
             if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(batch_size as u32);
+                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
             }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
