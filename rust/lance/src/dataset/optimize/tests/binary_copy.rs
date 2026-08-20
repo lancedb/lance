@@ -53,6 +53,51 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 }
 
 #[tokio::test]
+async fn test_binary_copy_does_not_reuse_singleton_tail() {
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..130))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 60,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let input_paths = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.files[0].path.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dataset.get_fragments().len(), 1);
+    assert!(!input_paths.contains(&dataset.manifest.fragments[0].files[0].path));
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 130);
+}
+
+#[tokio::test]
 async fn test_binary_copy_packed_struct_column_mapping() {
     for version in NON_LEGACY_VERSIONS {
         do_test_binary_copy_packed_struct_column_mapping(version).await;
@@ -650,6 +695,88 @@ async fn test_binary_copy_fallback_to_common_compaction() {
 }
 
 #[tokio::test]
+async fn test_binary_copy_unsupported_layout_try_falls_back_and_force_errors() {
+    use bytes::Bytes;
+
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema),
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let mut rewritten_sizes = Vec::new();
+    for (index, fragment) in dataset.manifest.fragments.iter().enumerate() {
+        let data_file = &fragment.files[0];
+        let path = dataset
+            .data_file_dir(data_file)
+            .unwrap()
+            .join(data_file.path.as_str());
+        let mut writer = lance_file::versions::create_writer(
+            lance_file::version::ConcreteFileVersion::V2_1,
+            dataset.object_store.create(&path).await.unwrap(),
+            dataset.schema().clone(),
+            lance_file::writer::FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&data.slice(index * 2, 2)).await.unwrap();
+        writer
+            .add_global_buffer(Bytes::from_static(b"unsupported"))
+            .await
+            .unwrap();
+        rewritten_sizes.push(writer.finish().await.unwrap().size_bytes);
+    }
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    for (fragment, size_bytes) in Arc::make_mut(&mut manifest.fragments)
+        .iter_mut()
+        .zip(rewritten_sizes)
+    {
+        fragment.files[0].file_size_bytes = lance_io::utils::CachedFileSize::new(size_bytes);
+    }
+
+    let mut force_dataset = dataset.clone();
+    let error = compact_files(
+        &mut force_dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("global buffers"), "{error}");
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), data);
+}
+
+#[tokio::test]
 async fn test_can_use_binary_copy_schema_consistency_ok() {
     let test_dir = TempStrDir::default();
     let test_uri = &test_dir;
@@ -711,16 +838,10 @@ async fn test_can_use_binary_copy_schema_mismatch() {
         df.column_indices = indices.into();
     }
     assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
-
-    // Also introduce a version mismatch and ensure rejection
-    if let Some(df) = frags.get_mut(0).and_then(|f| f.files.get_mut(0)) {
-        df.file_minor_version = if df.file_minor_version == 1 { 2 } else { 1 };
-    }
-    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]
-async fn test_can_use_binary_copy_version_mismatch() {
+async fn test_binary_copy_eligibility_defers_file_version_to_concat() {
     let test_dir = TempStrDir::default();
     let test_uri = &test_dir;
     let data = sample_data();
@@ -734,7 +855,9 @@ async fn test_can_use_binary_copy_version_mismatch() {
         .await
         .unwrap();
 
-    // Append additional data and then mark its files as a newer format version (v2.1).
+    // Append additional data and then make the manifest's declared file version
+    // stale. Eligibility is intentionally metadata-light: concat_files reads
+    // the real footer once and remains the authority for exact-version checks.
     let reader_append = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     dataset.append(reader_append, None).await.unwrap();
 
@@ -760,7 +883,7 @@ async fn test_can_use_binary_copy_version_mismatch() {
         file.file_minor_version = v21_minor;
     }
 
-    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
+    assert!(can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]

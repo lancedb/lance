@@ -173,7 +173,7 @@ impl StructuralFileSink {
         self.column_metadata = vec![initial_column_metadata(); num_columns as usize];
     }
 
-    pub fn initialize_with_external_metadata(
+    pub(crate) fn initialize_with_external_metadata(
         &mut self,
         column_metadata: Vec<pbfile::ColumnMetadata>,
     ) {
@@ -343,7 +343,7 @@ impl StructuralFileSink {
         Ok(start)
     }
 
-    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         const ZERO_PADDING: [u8; PAGE_BUFFER_ALIGNMENT] = [0; PAGE_BUFFER_ALIGNMENT];
         let position = self.tell().await?;
         let padding = (PAGE_BUFFER_ALIGNMENT - position as usize % PAGE_BUFFER_ALIGNMENT)
@@ -697,7 +697,7 @@ impl EncodingPipeline {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
-    pub fn initialize_with_external_metadata(&mut self, schema: Schema, rows_written: u64) {
+    pub(crate) fn initialize_with_external_metadata(&mut self, schema: Schema, rows_written: u64) {
         self.schema = Some(schema);
         self.rows_written = rows_written;
     }

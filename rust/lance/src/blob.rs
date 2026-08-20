@@ -168,7 +168,7 @@ fn prepared_to_logical_blob_lance_field(field: &LanceField) -> Result<LanceField
     if field.is_blob_v2() {
         let arrow_field = Field::from(field);
         match blob_v2_layout(&arrow_field) {
-            Some(BlobV2Layout::Prepared) => {
+            Some(BlobV2Layout::Prepared | BlobV2Layout::Logical) => {
                 let mut normalized = field.clone();
                 let mut logical_children = logical_blob_lance_children()?;
                 for (logical_child, prepared_child) in
@@ -180,7 +180,6 @@ fn prepared_to_logical_blob_lance_field(field: &LanceField) -> Result<LanceField
                 normalized.children = logical_children;
                 return Ok(normalized);
             }
-            Some(BlobV2Layout::Logical) => return Ok(field.clone()),
             _ => {
                 return Err(blob_v2_shape_error(
                     &arrow_field,

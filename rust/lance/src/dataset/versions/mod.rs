@@ -201,17 +201,6 @@ pub async fn write_fragments_direct(
     .await
 }
 
-fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
-    for fragment in fragments {
-        for data_file in &fragment.files {
-            if data_file.file_version()? != expected {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
 pub async fn can_use_binary_copy(
     version: ConcreteFileVersion,
     dataset: &Dataset,
@@ -224,9 +213,6 @@ pub async fn can_use_binary_copy(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
-            if !binary_copy_files_match(fragments, version)? {
-                return Ok(false);
-            }
             super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
         }
     }
@@ -238,11 +224,13 @@ pub async fn rewrite_files_binary_copy(
     fragments: &[Fragment],
     params: &WriteParams,
     read_batch_bytes: Option<usize>,
-) -> Result<Vec<Fragment>> {
+) -> Result<super::optimize::binary_copy::BinaryCopyOutcome> {
     match version {
-        ConcreteFileVersion::V1 => Err(Error::not_supported(
-            "binary-copy compaction is not supported for Lance file version 1".to_string(),
-        )),
+        ConcreteFileVersion::V1 => Ok(
+            super::optimize::binary_copy::BinaryCopyOutcome::Unsupported(
+                lance_file::concat::FileConcatReason::LegacyVersion,
+            ),
+        ),
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
