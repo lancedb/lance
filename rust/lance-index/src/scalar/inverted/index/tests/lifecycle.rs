@@ -360,6 +360,86 @@ async fn test_merge_segments_preserves_format_version(
     Ok(())
 }
 
+/// Segments built with different posting-encoding format versions must be
+/// mergeable: after an upgrade a pre-existing V1 index is maintained alongside
+/// newly written V2/V3 delta segments. The merge should succeed (not reject on
+/// "different posting tail codecs"/"different format versions"), re-encode every
+/// segment to the highest version present, and keep all documents searchable.
+#[tokio::test]
+async fn test_merge_segments_across_format_versions() -> Result<()> {
+    let v1_dir = TempObjDir::default();
+    let v3_dir = TempObjDir::default();
+    let dest_dir = TempObjDir::default();
+    let make_store = |dir: &TempObjDir| {
+        Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            (*dir).clone(),
+            Arc::new(LanceCache::no_cache()),
+        ))
+    };
+
+    // Same tokenization params + block size, different posting encodings.
+    let v1_index = write_single_partition_index(
+        make_store(&v1_dir),
+        InvertedIndexParams::default()
+            .block_size(LEGACY_BLOCK_SIZE)?
+            .format_version(InvertedListFormatVersion::V1),
+        TokenSetFormat::Fst,
+        "hello",
+        100,
+    )
+    .await?;
+    let v3_index = write_single_partition_index(
+        make_store(&v3_dir),
+        InvertedIndexParams::default()
+            .block_size(LEGACY_BLOCK_SIZE)?
+            .format_version(InvertedListFormatVersion::V3),
+        TokenSetFormat::Fst,
+        "world",
+        200,
+    )
+    .await?;
+    assert_eq!(v1_index.format_version(), InvertedListFormatVersion::V1);
+    assert_eq!(v3_index.format_version(), InvertedListFormatVersion::V3);
+
+    let dest_store = make_store(&dest_dir);
+    let created = InvertedIndex::merge_segments(
+        &[v1_index, v3_index],
+        empty_doc_stream(),
+        dest_store.as_ref(),
+        None,
+        crate::progress::noop_progress(),
+    )
+    .await?;
+
+    // Merged segment is written at the highest version present (V3).
+    assert_eq!(
+        created.index_version,
+        InvertedListFormatVersion::V3.index_version()
+    );
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(merged.format_version(), InvertedListFormatVersion::V3);
+
+    // Documents from both source segments survive and remain searchable.
+    for (token, expected_row) in [("hello", 100_u64), ("world", 200_u64)] {
+        let tokens = Arc::new(Tokens::new(vec![token.to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let (row_ids, _) = merged
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await?;
+        assert_eq!(row_ids, vec![expected_row]);
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()> {
     let src_dir_1 = TempObjDir::default();

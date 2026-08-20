@@ -319,6 +319,26 @@ impl InvertedIndexBuilder {
                 if partition_builder.is_empty() {
                     continue;
                 }
+                // A source partition read from disk carries its own on-disk
+                // encoding (older segments may be V1/Fixed32 while the target is
+                // V2/V3/VarintDelta). Its `encoded_blocks` cannot be written under
+                // a different codec, so it can't simply become `merged` directly.
+                // Instead always fold it into a fresh builder created with the
+                // target format: `merge_from` decodes each posting to logical
+                // entries and re-encodes them with the target codec, yielding a
+                // single consistent format regardless of segment order.
+                let target_builder = |partition_builder: &InnerBuilder| {
+                    InnerBuilder::new_with_format_version_and_block_size(
+                        partition_builder.id(),
+                        partition_builder.with_position(),
+                        partition_builder.token_set_format(),
+                        self.format_version,
+                        self.params.block_size,
+                    )
+                };
+                let mut normalized = target_builder(&partition_builder);
+                normalized.merge_from(partition_builder)?;
+                let partition_builder = normalized;
                 match &mut merged {
                     Some(merged) => {
                         let would_exceed_memory = merged
@@ -906,6 +926,14 @@ impl InnerBuilder {
         self.id
     }
 
+    pub(crate) fn with_position(&self) -> bool {
+        self.with_position
+    }
+
+    pub(crate) fn token_set_format(&self) -> TokenSetFormat {
+        self.token_set_format
+    }
+
     fn set_id(&mut self, id: u64) {
         self.id = id;
     }
@@ -996,18 +1024,12 @@ impl InnerBuilder {
                 self.token_set_format, token_set_format
             )));
         }
-        if self.format_version != format_version {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched FTS format versions: {:?} vs {:?}",
-                self.format_version, format_version
-            )));
-        }
-        if self.posting_tail_codec != posting_tail_codec {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched posting tail codecs: {:?} vs {:?}",
-                self.posting_tail_codec, posting_tail_codec
-            )));
-        }
+        // `format_version`/`posting_tail_codec` intentionally may differ. This
+        // merge reads `other`'s already-decoded entries (doc_id/freq/positions)
+        // and re-encodes them with `self`'s codec below, so the source encoding
+        // is irrelevant. Rejecting a mismatch here would break maintaining a
+        // pre-upgrade V1 index alongside newer V2/V3 delta segments.
+        let _ = (format_version, posting_tail_codec);
         if self.block_size != block_size {
             return Err(Error::index(format!(
                 "cannot merge partitions with mismatched FTS block sizes: {} vs {}",

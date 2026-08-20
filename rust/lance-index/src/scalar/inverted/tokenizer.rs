@@ -920,6 +920,27 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Whether two parameter sets describe compatible index segments that may be
+    /// merged into one.
+    ///
+    /// Every field that affects tokenization or the on-disk token/posting layout
+    /// (block size included) must match. Fields that are purely about the posting
+    /// *encoding* (`format_version`) or per-run resources (`memory_limit_mb`,
+    /// `num_workers`) are excluded: mixed-encoding segments are decoded with their
+    /// own format and re-encoded to a single target during the merge, so requiring
+    /// them to match here would wrongly reject maintaining a pre-existing index
+    /// (e.g. a V1 index built before an upgrade) alongside newer V2/V3 deltas.
+    pub fn is_compatible_for_merge(&self, other: &Self) -> bool {
+        let merge_relevant = |params: &Self| {
+            let mut params = params.clone();
+            params.format_version = None;
+            params.memory_limit_mb = None;
+            params.num_workers = None;
+            params
+        };
+        merge_relevant(self) == merge_relevant(other)
+    }
+
     /// Resolve the requested FTS format version, falling back to the default for
     /// the configured analyzer and block size.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {

@@ -152,8 +152,17 @@ impl InvertedIndex {
             ));
         };
 
+        // `params` (which includes block_size) and `token_set_format` must match:
+        // they determine how text is tokenized and how the token set is laid out,
+        // so segments built with different values cannot be combined. In contrast,
+        // `format_version`/`posting_tail_codec` only govern the on-disk posting
+        // encoding. Each segment is decoded with its own codec when read into an
+        // in-memory builder (see `InvertedPartition::into_builder`), so mixed-format
+        // segments can be merged and re-encoded to a single target format. Merging
+        // across those older-format segments is required after an upgrade, when a
+        // pre-existing V1/V2 index is maintained alongside newly written V2/V3 deltas.
         for segment in segments.iter().skip(1) {
-            if segment.params != first.params {
+            if !segment.params.is_compatible_for_merge(&first.params) {
                 return Err(Error::index(
                     "cannot merge inverted index segments with different parameters".to_string(),
                 ));
@@ -164,33 +173,40 @@ impl InvertedIndex {
                         .to_string(),
                 ));
             }
-            if segment.format_version() != first.format_version() {
-                return Err(Error::index(
-                    "cannot merge inverted index segments with different format versions"
-                        .to_string(),
-                ));
-            }
-            if segment.posting_tail_codec() != first.posting_tail_codec() {
-                return Err(Error::index(
-                    "cannot merge inverted index segments with different posting tail codecs"
-                        .to_string(),
-                ));
-            }
         }
+
+        // Re-encode every segment to the highest format version present. Because
+        // `params` (and thus block_size) is identical across segments, the maximum
+        // is guaranteed to be compatible with that block_size. `token_set_format`
+        // is also identical (checked above), so the segment carrying the highest
+        // format version also carries the resulting merged index version.
+        let target_segment = segments
+            .iter()
+            .max_by_key(|segment| segment.format_version().index_version())
+            .unwrap_or(first);
+        let target_format_version = target_segment.format_version();
 
         let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
         builder = builder
             .with_token_set_format(first.token_set_format)
-            .with_format_version(first.format_version());
+            .with_format_version(target_format_version);
         let files = builder
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
 
-        let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
+        // Persist the details for the format we actually wrote, not `first`'s.
+        // Otherwise a V1 `first` would stamp posting_format_version=1 onto files
+        // re-encoded as the (higher) target version, and readers would pick the
+        // wrong decoder.
+        let target_params = first
+            .params
+            .clone()
+            .format_version(target_format_version);
+        let details = pbold::InvertedIndexDetails::try_from(&target_params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: first.index_version(),
+            index_version: target_segment.index_version(),
             files,
         })
     }
