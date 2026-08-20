@@ -216,12 +216,20 @@ impl BasicTrainer for InvertedIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary => (),
-            DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
-            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::LargeBinary => (),
+            DataType::List(f)
+                if matches!(
+                    f.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) => (),
+            DataType::LargeList(f)
+                if matches!(
+                    f.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) => (),
 
             _ => return Err(Error::invalid_input_source(format!(
-                "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
+                "An inverted index can only be created on a Utf8, LargeUtf8, or Utf8View field/list or LargeBinary field. Column has type {:?}",
                 field.data_type()
             )
                 .into()))
@@ -350,11 +358,31 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 mod tests {
     use super::*;
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use rstest::rstest;
 
     #[test]
     fn test_plugin_version_tracks_v3_capability_gate() {
         let plugin = InvertedIndexPlugin;
         assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
+    }
+
+    #[rstest]
+    #[case::utf8_view(DataType::Utf8View)]
+    #[case::list_utf8_view(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Utf8View,
+        true,
+    ))))]
+    #[case::large_list_utf8_view(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::Utf8View,
+        true,
+    ))))]
+    fn test_new_training_request_supports_utf8_view(#[case] data_type: DataType) {
+        let plugin = InvertedIndexPlugin;
+        let field = Field::new("text", data_type, true);
+
+        plugin.new_training_request("{}", &field).unwrap();
     }
 
     #[test]

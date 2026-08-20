@@ -471,7 +471,11 @@ pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> 
     match arr.data_type() {
         DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
         DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
-        _ => panic!("Expecting Utf8 or LargeUtf8, found {:?}", arr.data_type()),
+        DataType::Utf8View => Box::new(arr.as_string_view().iter()),
+        _ => panic!(
+            "Expecting Utf8, LargeUtf8, or Utf8View, found {:?}",
+            arr.data_type()
+        ),
     }
 }
 
@@ -1585,8 +1589,18 @@ impl BufferExt for arrow_buffer::Buffer {
 mod tests {
     use super::*;
     use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
-    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
+    use arrow_array::{ListArray, StringArray, StringViewArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
+
+    #[test]
+    fn test_iter_str_array_utf8_view() {
+        let array = StringViewArray::from(vec![Some("alpha"), None, Some("beta")]);
+
+        assert_eq!(
+            iter_str_array(&array).collect::<Vec<_>>(),
+            vec![Some("alpha"), None, Some("beta")]
+        );
+    }
 
     #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {

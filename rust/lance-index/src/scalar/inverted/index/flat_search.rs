@@ -33,11 +33,8 @@ pub fn flat_full_text_search(
     };
 
     match batches[0][doc_col].data_type() {
-        DataType::Utf8 => {
-            do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer, phrase_slop)
-        }
-        DataType::LargeUtf8 => {
-            do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer, phrase_slop)
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            do_flat_full_text_search(batches, doc_col, query, tokenizer, phrase_slop)
         }
         DataType::List(_) => {
             do_flat_full_text_search_list::<i32>(batches, doc_col, query, tokenizer, phrase_slop)
@@ -52,7 +49,7 @@ pub fn flat_full_text_search(
     }
 }
 
-pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
+pub(super) fn do_flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
@@ -66,11 +63,13 @@ pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
-        let doc_array = batch[doc_col].as_string::<Offset>();
-        for i in 0..row_id_array.len() {
-            let doc = doc_array.value(i);
+        let doc_array = &batch[doc_col];
+        for (doc, row_id) in iter_str_array(doc_array).zip(row_id_array.values()) {
+            let Some(doc) = doc else {
+                continue;
+            };
             if document_matches_flat_query(doc, &mut tokenizer, &query_tokens, phrase_slop)? {
-                results.push(row_id_array.value(i));
+                results.push(*row_id);
             }
         }
     }
@@ -94,7 +93,7 @@ pub(super) fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_list::<ListOffset>();
         match doc_array.value_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => {}
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {}
             data_type => {
                 return Err(Error::invalid_input(format!(
                     "unsupported list item data type {} for inverted index",
@@ -476,7 +475,7 @@ pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
 ) -> DataFusionResult<()> {
     let doc_array = doc_col.as_list::<ListOffset>();
     match doc_array.value_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => {}
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {}
         data_type => {
             return Err(datafusion_common::DataFusionError::Execution(format!(
                 "unsupported list item data type {} for flat full text search",
