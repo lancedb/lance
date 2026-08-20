@@ -7,7 +7,7 @@ use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::{
     parser::Statement as DFStatement,
@@ -107,44 +107,76 @@ impl SqlQueryBuilder {
         let statement = state.sql_to_statement(&self.sql, &dialect)?;
         let mut projected = statement.clone();
         let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
+        let requested_names: Vec<&str> = columns
+            .iter()
+            .filter(|(enabled, _)| *enabled)
+            .map(|(_, name)| *name)
+            .collect();
         let plan = state.statement_to_plan(statement).await?;
         // Append the requested system columns only when the plan proves that
-        // every output row maps one-to-one to a scanned source row; otherwise
-        // (aggregates, DISTINCT, joins, ...) the injection would be ambiguous
-        // or would change the query's relational results.
-        let plan =
-            if preserves_row_identity(&plan) && project_system_columns(&mut projected, &columns) {
-                match state.statement_to_plan(projected).await {
-                    Ok(plan) => plan,
-                    // The rewritten statement can still fail to plan in corner
-                    // cases (e.g. the user aliased another expression to the same
-                    // system column name). Fall back to the original plan so the
-                    // query runs, just without the extra columns.
-                    Err(_) => plan,
-                }
-            } else {
-                plan
-            };
+        // every output row maps one-to-one to a scanned source row (otherwise
+        // aggregates, DISTINCT, joins, ... would be ambiguous or change the
+        // query's relational results) and that no intermediate projection
+        // shadows the system column names (otherwise the injected identifiers
+        // would bind to derived expressions instead of the real metadata).
+        let plan = if safe_to_inject_system_columns(&plan, &requested_names)
+            && project_system_columns(&mut projected, &columns)
+        {
+            match state.statement_to_plan(projected).await {
+                Ok(plan) => plan,
+                // The rewritten statement can still fail to plan in corner
+                // cases (e.g. the user aliased another expression to the same
+                // system column name). Fall back to the original plan so the
+                // query runs, just without the extra columns.
+                Err(_) => plan,
+            }
+        } else {
+            plan
+        };
         let df = ctx.execute_logical_plan(plan).await?;
         Ok(SqlQuery::new(df))
     }
 }
 
-/// Returns true if every output row of the plan corresponds to exactly one
-/// row scanned from the source table, meaning appending system columns to the
-/// projection cannot change the values or cardinality of the other columns.
+/// Returns true when injecting the system columns in `names` into the
+/// query's top-level SELECT list is provably safe. Two properties must hold:
 ///
-/// This is a conservative whitelist of row-preserving operators. Anything
-/// else (aggregates, DISTINCT, joins, unions, windows, ...) collapses,
-/// duplicates, or synthesizes rows, so system columns are not injected there.
-fn preserves_row_identity(plan: &LogicalPlan) -> bool {
+/// 1. Row identity: every output row corresponds to exactly one row scanned
+///    from the source table, so the injection cannot change the values or
+///    cardinality of the other columns. This is a conservative whitelist of
+///    row-preserving operators; anything else (aggregates, DISTINCT, joins,
+///    unions, windows, ...) collapses, duplicates, or synthesizes rows.
+/// 2. Name lineage: no intermediate projection redefines a system column
+///    name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery). The
+///    injected identifiers resolve by name in the outer scope, so a shadowed
+///    name would bind them to a derived expression and return arbitrary
+///    values as row metadata.
+fn safe_to_inject_system_columns(plan: &LogicalPlan, names: &[&str]) -> bool {
     match plan {
         LogicalPlan::TableScan(_) => true,
-        LogicalPlan::Projection(_)
-        | LogicalPlan::Filter(_)
+        LogicalPlan::Projection(projection) => {
+            let shadows_system_column = projection
+                .schema
+                .fields()
+                .iter()
+                .zip(&projection.expr)
+                .filter(|(field, _)| names.contains(&field.name().as_str()))
+                .any(|(field, expr)| {
+                    let mut expr = expr;
+                    while let LogicalExpr::Alias(alias) = expr {
+                        expr = &alias.expr;
+                    }
+                    !matches!(expr, LogicalExpr::Column(column) if &column.name == field.name())
+                });
+            !shadows_system_column && safe_to_inject_system_columns(&projection.input, names)
+        }
+        LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
-        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|p| preserves_row_identity(p)),
+        | LogicalPlan::SubqueryAlias(_) => plan
+            .inputs()
+            .iter()
+            .all(|input| safe_to_inject_system_columns(input, names)),
         _ => false,
     }
 }
@@ -154,8 +186,8 @@ fn preserves_row_identity(plan: &LogicalPlan) -> bool {
 /// Returns true if the statement was modified.
 ///
 /// Only rewrites top-level `SELECT` statements; the caller must separately
-/// verify that the query preserves row identity (see
-/// [`preserves_row_identity`]) before planning the rewritten statement.
+/// verify that the injection is safe (see [`safe_to_inject_system_columns`])
+/// before planning the rewritten statement.
 fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)]) -> bool {
     let DFStatement::Statement(statement) = statement else {
         return false;
@@ -451,6 +483,64 @@ mod tests {
         assert_eq!(batch.schema().field_names(), expected_columns);
         assert_eq!(
             batch["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+    }
+
+    /// A derived subquery can alias arbitrary expressions to the reserved
+    /// system column names. Injected identifiers resolve by name in the outer
+    /// scope, so injection must be skipped there; otherwise the query would
+    /// return derived values as row metadata.
+    #[tokio::test]
+    async fn test_sql_system_columns_not_injected_when_shadowed() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_system_columns_shadowed",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql(
+                "SELECT x FROM (SELECT x, (_rowid + 1) AS _rowid, (_rowaddr + 1) AS _rowaddr \
+                 FROM dataset) s",
+            )
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        assert_eq!(batches[0].schema().field_names(), vec!["x"]);
+
+        // A subquery that passes the real scan columns through unchanged is
+        // safe: injection still applies and returns the actual metadata.
+        let batches = ds
+            .sql("SELECT x FROM (SELECT x, _rowid, _rowaddr FROM dataset) s")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        assert_eq!(
+            batch.schema().field_names(),
+            vec!["x", "_rowid", "_rowaddr"]
+        );
+        assert_eq!(
+            batch["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+        assert_eq!(
+            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
             &[0, 1]
         );
     }
