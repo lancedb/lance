@@ -198,10 +198,7 @@ impl InvertedIndex {
         // Otherwise a V1 `first` would stamp posting_format_version=1 onto files
         // re-encoded as the (higher) target version, and readers would pick the
         // wrong decoder.
-        let target_params = first
-            .params
-            .clone()
-            .format_version(target_format_version);
+        let target_params = first.params.clone().format_version(target_format_version);
         let details = pbold::InvertedIndexDetails::try_from(&target_params)?;
 
         Ok(CreatedIndex {
