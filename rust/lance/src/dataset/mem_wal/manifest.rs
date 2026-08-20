@@ -65,17 +65,11 @@ pub struct ShardManifestStore {
     manifest_scan_batch_size: usize,
     /// The last manifest this store durably wrote, served to [`Self::read_latest`].
     ///
-    /// Populated *only* by [`Self::write`], never by a read. Authority comes
-    /// from having written the value: `claim_epoch` plus the WAL fence sentinel
-    /// make the epoch holder the only writer permitted to commit, so what we
-    /// wrote is the latest until we lose the claim — which surfaces as a
-    /// PUT-IF-NOT-EXISTS collision and clears this. A store that has never
-    /// written has no such claim and always reads through, so a reader-only
-    /// handle (a drop-reconcile probe, a WAL tailer) still observes the writer.
-    ///
-    /// Callers that must see a *peer's* commit even on the writer's own
-    /// handle — [`Self::check_fenced`], [`Self::claim_epoch`] — use
-    /// [`Self::read_latest_uncached`].
+    /// Only [`Self::write`] populates it: the epoch holder is the sole
+    /// permitted writer, so what it wrote stays latest until a
+    /// PUT-IF-NOT-EXISTS collision proves otherwise. Reads never cache, so a
+    /// reader-only handle still observes the writer. To see a peer's commit on
+    /// the writer's own handle, use [`Self::read_latest_uncached`].
     latest: RwLock<Option<ShardManifest>>,
 }
 
@@ -110,13 +104,19 @@ impl ShardManifestStore {
     }
 
     /// Publish `manifest` as the latest. Only ever called after a durable write.
+    ///
+    /// Never regresses: the flush task and the tailer's cursor updates share one
+    /// handle, so two writes can win their CAS in one order and return to their
+    /// callers in the other.
     fn cache(&self, manifest: &ShardManifest) {
-        *self.latest.write().expect("manifest cache lock") = Some(manifest.clone());
+        let mut latest = self.latest.write().expect("manifest cache lock");
+        if latest.as_ref().is_none_or(|c| manifest.version > c.version) {
+            *latest = Some(manifest.clone());
+        }
     }
 
-    /// Drop the cached manifest so the next read goes to storage. Called when a
-    /// write collides, which is the one signal that another writer may have moved
-    /// the shard past us.
+    /// Drop the cache on a write collision — the one signal that another
+    /// writer may have moved the shard past us.
     fn invalidate(&self) {
         *self.latest.write().expect("manifest cache lock") = None;
     }
@@ -124,12 +124,10 @@ impl ShardManifestStore {
     /// Read the latest manifest version, serving this store's own last commit
     /// from memory when it has one.
     ///
-    /// Every scan of the version space costs `2 + manifest_scan_batch_size`
-    /// object-store requests — the terminating batch of HEADs is all misses by
-    /// construction — so the read path must not pay for it per request. A miss
-    /// deliberately does *not* populate the cache: only a write earns the right
-    /// to be cached (see `latest`). Callers that need to observe a *peer's*
-    /// commit want [`Self::read_latest_uncached`].
+    /// A storage scan costs `2 + manifest_scan_batch_size` object-store
+    /// requests, too much to pay on every read. A miss does not populate the
+    /// cache; only a write does. To observe a peer's commit, use
+    /// [`Self::read_latest_uncached`].
     ///
     /// Returns `None` if no manifest exists (new shard).
     pub async fn read_latest(&self) -> Result<Option<ShardManifest>> {
@@ -254,8 +252,7 @@ impl ShardManifestStore {
                 }
             })?;
 
-        // The write landed, so this is now the latest and every later
-        // `read_latest` can be served from memory.
+        // The write landed, so this is now the latest.
         self.cache(manifest);
 
         // Best-effort update version hint (failures are logged as warnings)
@@ -435,9 +432,8 @@ impl ShardManifestStore {
         const MAX_CLAIM_RETRIES: usize = 16;
         let mut last_write_err: Option<Error> = None;
         for _ in 0..MAX_CLAIM_RETRIES {
-            // Uncached throughout: a claim exists to discover another writer's
-            // epoch, and on retry the cache would replay the version we just
-            // lost the race on.
+            // Uncached: a claim exists to discover another writer's epoch, and
+            // on retry the cache would replay the version we just lost on.
             let current = self.read_latest_uncached().await?;
 
             // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
@@ -522,8 +518,8 @@ impl ShardManifestStore {
     /// is higher than the local epoch, the writer has been fenced.
     #[instrument(name = "manifest_check_fenced", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn check_fenced(&self, local_epoch: u64) -> Result<()> {
-        // Uncached on purpose: a fence is by definition another process's write,
-        // which our own cache can never show us.
+        // Uncached: a fence is another process's write, which our cache
+        // can never show us.
         let current = self.read_latest_uncached().await?;
         Self::check_fenced_against(&current, local_epoch, self.shard_id)
     }
@@ -640,9 +636,7 @@ mod tests {
         }
     }
 
-    /// A peer's claim must be visible to `check_fenced` even though our own
-    /// write left a manifest cached. This is the property the cache is allowed
-    /// to break and must not.
+    /// A warm cache must not hide a successor's claim from `check_fenced`.
     #[tokio::test]
     async fn check_fenced_sees_a_peer_through_a_warm_cache() {
         let (store, base_path, _temp_dir) = create_local_store().await;
@@ -650,7 +644,7 @@ mod tests {
         let incumbent = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         let successor = ShardManifestStore::new(store, &base_path, shard_id, 2);
 
-        // Claiming writes a manifest, which is what warms the cache.
+        // Claiming writes a manifest, warming the cache.
         let (epoch, _) = incumbent.claim_epoch(0).await.unwrap();
         assert!(incumbent.cached().is_some(), "the claim write must cache");
 
@@ -662,9 +656,8 @@ mod tests {
         );
     }
 
-    /// A handle that has only ever read must not pin what it read. Only a write
-    /// earns a cache entry — otherwise a reader (a WAL tailer polling for a
-    /// cursor update, a drop-reconcile probe) would never observe the writer.
+    /// Reads must not cache, or a reader-only handle (a WAL tailer, a
+    /// drop-reconcile probe) would never observe the writer.
     #[tokio::test]
     async fn a_reader_only_store_never_caches() {
         let (store, base_path, _temp_dir) = create_local_store().await;
@@ -708,8 +701,8 @@ mod tests {
         );
     }
 
-    /// A losing `commit_update` re-reads from storage rather than replaying the
-    /// version it just lost on, so it converges instead of spinning.
+    /// A losing `commit_update` re-reads from storage, so it converges instead
+    /// of spinning on the version it lost on.
     #[tokio::test]
     async fn commit_update_recovers_from_a_stale_cache() {
         let (store, base_path, _temp_dir) = create_local_store().await;
@@ -720,8 +713,7 @@ mod tests {
         let (epoch, _) = ours.claim_epoch(0).await.unwrap();
         ours.read_latest().await.unwrap().unwrap();
 
-        // A same-epoch commit through another handle: our cache now points at a
-        // version that is no longer the latest.
+        // A same-epoch commit through another handle stales our cache.
         peer.commit_update(epoch, |c| ShardManifest {
             version: c.version + 1,
             current_generation: 7,
@@ -745,6 +737,29 @@ mod tests {
         assert_eq!(
             ours.read_latest_uncached().await.unwrap().unwrap().version,
             updated.version
+        );
+    }
+
+    /// A write whose CAS won earlier but returned later must not publish its
+    /// older manifest over the newer one.
+    #[tokio::test]
+    async fn a_late_write_never_regresses_the_cache() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let older = create_test_manifest(shard_id, 1, 1);
+        let newer = create_test_manifest(shard_id, 2, 1);
+        manifest_store.write(&older).await.unwrap();
+        manifest_store.write(&newer).await.unwrap();
+
+        // The straggler resolving after the newer write already cached.
+        manifest_store.cache(&older);
+
+        assert_eq!(
+            manifest_store.read_latest().await.unwrap().unwrap().version,
+            2,
+            "the cache must hold the newest version this store wrote"
         );
     }
 

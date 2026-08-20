@@ -2482,16 +2482,19 @@ impl ShardWriter {
     }
 
     /// Get the current shard manifest.
+    ///
+    /// Served from this writer's own last manifest commit, so a peer's commit
+    /// may not appear. Fencing does not rely on this — [`Self::check_fenced`]
+    /// always reads storage.
     pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
         self.manifest_store.read_latest().await
     }
 
     /// The shard's manifest store.
     ///
-    /// Exposed so an embedder drives its own manifest commits through the same
-    /// instance the writer uses. A second `ShardManifestStore` over the same
-    /// shard would keep a second cache, and neither would see the other's
-    /// commits.
+    /// Embedders must commit through this instance: a second
+    /// `ShardManifestStore` over the same shard keeps its own cache, and
+    /// neither would see the other's commits.
     pub fn manifest_store(&self) -> Arc<ShardManifestStore> {
         self.manifest_store.clone()
     }
