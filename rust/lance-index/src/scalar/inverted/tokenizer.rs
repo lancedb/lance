@@ -931,14 +931,53 @@ impl InvertedIndexParams {
     /// them to match here would wrongly reject maintaining a pre-existing index
     /// (e.g. a V1 index built before an upgrade) alongside newer V2/V3 deltas.
     pub fn is_compatible_for_merge(&self, other: &Self) -> bool {
-        let merge_relevant = |params: &Self| {
-            let mut params = params.clone();
-            params.format_version = None;
-            params.memory_limit_mb = None;
-            params.num_workers = None;
-            params
-        };
-        merge_relevant(self) == merge_relevant(other)
+        // Destructure so any field added later is a compile error until its merge
+        // relevance is decided here, rather than silently defaulting to "must
+        // match". The three ignored fields are encoding-only (`format_version`)
+        // or per-run resources (`memory_limit_mb`, `num_workers`).
+        let Self {
+            document_granularity,
+            lance_tokenizer,
+            base_tokenizer,
+            language,
+            with_position,
+            max_token_length,
+            lower_case,
+            stem,
+            remove_stop_words,
+            custom_stop_words,
+            ascii_folding,
+            min_ngram_length,
+            max_ngram_length,
+            prefix_only,
+            block_size,
+            split_identifiers,
+            split_on_numerics,
+            preserve_original,
+            index_operators,
+            memory_limit_mb: _,
+            num_workers: _,
+            format_version: _,
+        } = self;
+        *document_granularity == other.document_granularity
+            && *lance_tokenizer == other.lance_tokenizer
+            && *base_tokenizer == other.base_tokenizer
+            && *language == other.language
+            && *with_position == other.with_position
+            && *max_token_length == other.max_token_length
+            && *lower_case == other.lower_case
+            && *stem == other.stem
+            && *remove_stop_words == other.remove_stop_words
+            && *custom_stop_words == other.custom_stop_words
+            && *ascii_folding == other.ascii_folding
+            && *min_ngram_length == other.min_ngram_length
+            && *max_ngram_length == other.max_ngram_length
+            && *prefix_only == other.prefix_only
+            && *block_size == other.block_size
+            && *split_identifiers == other.split_identifiers
+            && *split_on_numerics == other.split_on_numerics
+            && *preserve_original == other.preserve_original
+            && *index_operators == other.index_operators
     }
 
     /// Resolve the requested FTS format version, falling back to the default for

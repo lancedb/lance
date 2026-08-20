@@ -320,25 +320,29 @@ impl InvertedIndexBuilder {
                     continue;
                 }
                 // A source partition read from disk carries its own on-disk
-                // encoding (older segments may be V1/Fixed32 while the target is
-                // V2/V3/VarintDelta). Its `encoded_blocks` cannot be written under
-                // a different codec, so it can't simply become `merged` directly.
-                // Instead always fold it into a fresh builder created with the
-                // target format: `merge_from` decodes each posting to logical
-                // entries and re-encodes them with the target codec, yielding a
-                // single consistent format regardless of segment order.
-                let target_builder = |partition_builder: &InnerBuilder| {
-                    InnerBuilder::new_with_format_version_and_block_size(
+                // encoding. When it already matches the target format it can be
+                // used as-is (the common single-format optimize/delta-merge path,
+                // with no re-encoding). When it differs (older V1/Fixed32 segment
+                // vs a V2/V3/VarintDelta target) its `encoded_blocks` cannot be
+                // written under the target codec, so fold it into a fresh builder
+                // in the target format: `merge_from` decodes each posting to
+                // logical entries and re-encodes them with the target codec.
+                let partition_builder = if partition_builder.format_version() == self.format_version
+                    && partition_builder.posting_tail_codec()
+                        == self.format_version.posting_tail_codec()
+                {
+                    partition_builder
+                } else {
+                    let mut normalized = InnerBuilder::new_with_format_version_and_block_size(
                         partition_builder.id(),
                         partition_builder.with_position(),
                         partition_builder.token_set_format(),
                         self.format_version,
                         self.params.block_size,
-                    )
+                    );
+                    normalized.merge_from(partition_builder)?;
+                    normalized
                 };
-                let mut normalized = target_builder(&partition_builder);
-                normalized.merge_from(partition_builder)?;
-                let partition_builder = normalized;
                 match &mut merged {
                     Some(merged) => {
                         let would_exceed_memory = merged
@@ -934,6 +938,14 @@ impl InnerBuilder {
         self.token_set_format
     }
 
+    pub(crate) fn format_version(&self) -> InvertedListFormatVersion {
+        self.format_version
+    }
+
+    pub(crate) fn posting_tail_codec(&self) -> PostingTailCodec {
+        self.posting_tail_codec
+    }
+
     fn set_id(&mut self, id: u64) {
         self.id = id;
     }
@@ -1004,8 +1016,13 @@ impl InnerBuilder {
             id: _,
             with_position,
             token_set_format,
-            format_version,
-            posting_tail_codec,
+            // `format_version`/`posting_tail_codec` intentionally may differ:
+            // `other`'s already-decoded entries (doc_id/freq/positions) are
+            // re-encoded with `self`'s codec below, so the source encoding is
+            // irrelevant. Rejecting a mismatch here would break maintaining a
+            // pre-upgrade V1 index alongside newer V2/V3 delta segments.
+            format_version: _,
+            posting_tail_codec: _,
             block_size,
             tokens,
             posting_lists,
@@ -1024,12 +1041,6 @@ impl InnerBuilder {
                 self.token_set_format, token_set_format
             )));
         }
-        // `format_version`/`posting_tail_codec` intentionally may differ. This
-        // merge reads `other`'s already-decoded entries (doc_id/freq/positions)
-        // and re-encodes them with `self`'s codec below, so the source encoding
-        // is irrelevant. Rejecting a mismatch here would break maintaining a
-        // pre-upgrade V1 index alongside newer V2/V3 delta segments.
-        let _ = (format_version, posting_tail_codec);
         if self.block_size != block_size {
             return Err(Error::index(format!(
                 "cannot merge partitions with mismatched FTS block sizes: {} vs {}",

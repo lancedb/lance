@@ -183,7 +183,7 @@ impl InvertedIndex {
         let target_segment = segments
             .iter()
             .max_by_key(|segment| segment.format_version().index_version())
-            .unwrap_or(first);
+            .expect("segments is non-empty; checked above");
         let target_format_version = target_segment.format_version();
 
         let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
