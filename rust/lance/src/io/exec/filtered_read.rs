@@ -137,8 +137,8 @@ fn encoded_predicate_mode_from_value(value: Option<&str>) -> EncodedPredicateMod
     }
 }
 
-const ENCODED_PREDICATE_AUTO_SAMPLE_ROWS: u64 = 64 * 1024;
-const ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS: u64 = 8;
+const ENCODED_PREDICATE_AUTO_SAMPLE_ROWS: u64 = 32 * 1024;
+const ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS: u64 = 2;
 const ENCODED_PREDICATE_RANGE_AMPLIFICATION_ROWS: u64 = 1024;
 
 fn total_range_rows(ranges: &[Range<u64>]) -> u64 {
@@ -3911,7 +3911,7 @@ mod tests {
     fn test_encoded_predicate_stratified_sample() {
         let ranges = vec![0..50_000, 60_000..210_000];
         let sampled = encoded_predicate_sample_ranges(&ranges);
-        assert_eq!(total_range_rows(&sampled), 65_536);
+        assert_eq!(total_range_rows(&sampled), 32_768);
         assert_eq!(sampled.first().unwrap().start, 0);
         assert_eq!(sampled.last().unwrap().end, 210_000);
         assert!(sampled.windows(2).all(|pair| pair[0].end < pair[1].start));
@@ -4378,7 +4378,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            50_000
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
 
         let (output_rows, metrics) =
@@ -4394,7 +4394,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            50_000
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
 
         let (output_rows, metrics) =
@@ -4404,7 +4404,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            50_000
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
     }
 
