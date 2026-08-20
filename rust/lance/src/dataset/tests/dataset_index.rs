@@ -46,7 +46,9 @@ use lance_index::metrics::{
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
     COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
     COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
+    CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
+    CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -971,24 +973,34 @@ async fn create_fragmented_fts_index_with_order(
     with_position: bool,
     reverse_segments: bool,
 ) {
+    let mut fragment_groups = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| vec![fragment.id() as u32])
+        .collect::<Vec<_>>();
+    if reverse_segments {
+        fragment_groups.reverse();
+    }
+    create_fragmented_fts_index_with_groups(dataset, column, with_position, fragment_groups).await;
+}
+
+async fn create_fragmented_fts_index_with_groups(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    fragment_groups: Vec<Vec<u32>>,
+) {
     let index_name = format!("{column}_idx");
     let columns = [column];
     let params = InvertedIndexParams::default().with_position(with_position);
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect::<Vec<_>>();
-    let mut segments = Vec::with_capacity(fragment_ids.len());
-    for fragment_id in &fragment_ids {
+    let expected_segments = fragment_groups.len();
+    let mut segments = Vec::with_capacity(expected_segments);
+    for fragment_ids in fragment_groups {
         let mut builder = dataset
             .create_index_builder(&columns, IndexType::Inverted, &params)
             .name(index_name.clone())
-            .fragments(vec![*fragment_id]);
+            .fragments(fragment_ids);
         segments.push(builder.execute_uncommitted().await.unwrap());
-    }
-    if reverse_segments {
-        segments.reverse();
     }
     dataset
         .commit_existing_index_segments(&index_name, column, segments)
@@ -1000,7 +1012,7 @@ async fn create_fragmented_fts_index_with_order(
             .await
             .unwrap()
             .unwrap();
-    assert_eq!(segments.len(), fragment_ids.len());
+    assert_eq!(segments.len(), expected_segments);
 }
 
 fn compound_multimatch_query() -> FtsQuery {
@@ -1043,6 +1055,16 @@ async fn compound_fts_results(
         .collect()
 }
 
+fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().map(|score| score.to_bits()))
+        .collect()
+}
+
 async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
     let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
     assert!(
@@ -1069,6 +1091,625 @@ fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec
             .then_with(|| left_row_id.cmp(right_row_id))
     });
     expected
+}
+
+const CROSS_COLUMN_COMPOUND_FTS_SCORER: &str = "CrossColumnCompoundFtsScorer";
+
+fn independent_compound_fts_oracle<'a>(
+    dataset: &'a Dataset,
+    query: &'a FtsQuery,
+) -> Pin<Box<dyn Future<Output = HashMap<u64, f32>> + Send + 'a>> {
+    Box::pin(async move {
+        match query {
+            FtsQuery::Match(_) | FtsQuery::Phrase(_) => {
+                compound_fts_results(dataset, query.clone(), None)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            FtsQuery::MultiMatch(query) => {
+                let mut result = HashMap::new();
+                for match_query in &query.match_queries {
+                    let leaf = FtsQuery::Match(match_query.clone());
+                    for (row_id, score) in independent_compound_fts_oracle(dataset, &leaf).await {
+                        result
+                            .entry(row_id)
+                            .and_modify(|current| {
+                                if score > *current {
+                                    *current = score;
+                                }
+                            })
+                            .or_insert(score);
+                    }
+                }
+                result
+            }
+            FtsQuery::Boost(query) => {
+                let mut result =
+                    independent_compound_fts_oracle(dataset, query.positive.as_ref()).await;
+                let negative =
+                    independent_compound_fts_oracle(dataset, query.negative.as_ref()).await;
+                for (row_id, negative_score) in negative {
+                    if let Some(score) = result.get_mut(&row_id) {
+                        *score -= query.negative_boost * negative_score;
+                    }
+                }
+                result
+            }
+            FtsQuery::Boolean(query) => {
+                let mut required = None::<HashMap<u64, f32>>;
+                for clause in &query.must {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    if let Some(required) = required.as_mut() {
+                        required.retain(|row_id, score| {
+                            clause.get(row_id).is_some_and(|clause_score| {
+                                *score += *clause_score;
+                                true
+                            })
+                        });
+                    } else {
+                        required = Some(clause);
+                    }
+                }
+
+                let has_required = required.is_some();
+                let mut result = required.unwrap_or_default();
+                for clause in &query.should {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    for (row_id, clause_score) in clause {
+                        if has_required {
+                            if let Some(score) = result.get_mut(&row_id) {
+                                *score += clause_score;
+                            }
+                        } else {
+                            *result.entry(row_id).or_insert(0.0) += clause_score;
+                        }
+                    }
+                }
+
+                for clause in &query.must_not {
+                    for row_id in independent_compound_fts_oracle(dataset, clause)
+                        .await
+                        .keys()
+                    {
+                        result.remove(row_id);
+                    }
+                }
+                result
+            }
+        }
+    })
+}
+
+fn sorted_compound_fts_oracle(result: HashMap<u64, f32>) -> Vec<(u64, f32)> {
+    result
+        .into_iter()
+        .sorted_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_row_id.cmp(right_row_id))
+        })
+        .collect()
+}
+
+fn assert_scored_rows_close(case_name: &str, actual: &[(u64, f32)], expected: &[(u64, f32)]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{case_name} returned a different number of rows"
+    );
+    for ((actual_row_id, actual_score), (expected_row_id, expected_score)) in
+        actual.iter().zip(expected)
+    {
+        assert_eq!(
+            actual_row_id, expected_row_id,
+            "{case_name} returned rows in the wrong order"
+        );
+        let tolerance = 1.0e-5 * expected_score.abs().max(1.0);
+        assert!(
+            (actual_score - expected_score).abs() <= tolerance,
+            "{case_name} returned score {actual_score} for row {actual_row_id}, expected {expected_score}"
+        );
+    }
+}
+
+async fn assert_compound_matches_independent_oracle(
+    dataset: &Dataset,
+    case_name: &str,
+    query: &FtsQuery,
+    limit: usize,
+) -> Vec<(u64, f32)> {
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(dataset, query).await);
+    assert!(
+        expected.len() > limit,
+        "{case_name} must have candidates beyond k"
+    );
+    expected.truncate(limit);
+    let actual = compound_fts_results(dataset, query.clone(), Some(limit as i64)).await;
+    assert_scored_rows_close(case_name, &actual, &expected);
+    expected
+}
+
+async fn compound_fts_plan(dataset: &Dataset, query: FtsQuery, limit: usize) -> String {
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(limit as i64), None).unwrap();
+    scanner.explain_plan(false).await.unwrap()
+}
+
+async fn write_cross_column_compound_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha quick brown fox",
+                "alpha quick fox brown",
+                "quick brown fox",
+                "tie",
+                "alpha blocked",
+                "noise",
+                "alpha quick brown",
+                "tie",
+                "alpha",
+                "noise"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "gamma",
+                "gamma gamma optional",
+                "gamma",
+                "tiebody",
+                "gamma blocked",
+                "gamma optional",
+                "noise",
+                "tiebody",
+                "optional",
+                "blocked"
+            ]
+        ),
+        ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let phrase = || {
+        PhraseQuery::new("quick brown".to_owned())
+            .with_column(Some("title".to_owned()))
+            .into()
+    };
+    let phrase_approximation: FtsQuery = MatchQuery::new("quick brown".to_owned())
+        .with_column(Some("title".to_owned()))
+        .with_operator(Operator::And)
+        .into();
+    let phrase_query = phrase();
+    let phrase_matches = independent_compound_fts_oracle(&dataset, &phrase_query).await;
+    let approximation_matches =
+        independent_compound_fts_oracle(&dataset, &phrase_approximation).await;
+    assert!(
+        approximation_matches.len() > phrase_matches.len(),
+        "the fixture must include an approximation hit rejected by phrase confirmation"
+    );
+
+    let nested_required: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let staged_required_optional: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 1.0)),
+        (Occur::Should, compound_match_query("optional", "body", 4.0)),
+    ])
+    .into();
+    let cases: Vec<(&str, FtsQuery, usize)> = vec![
+        (
+            "must_sum",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            2,
+        ),
+        (
+            "should_sum",
+            BooleanQuery::new([
+                (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            3,
+        ),
+        ("required_optional", staged_required_optional.clone(), 3),
+        (
+            "must_not",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+                (
+                    Occur::MustNot,
+                    compound_match_query("blocked", "title", 1_000_000.0),
+                ),
+            ])
+            .into(),
+            3,
+        ),
+        (
+            "phrase_two_phase",
+            BooleanQuery::new([
+                (Occur::Must, phrase()),
+                (Occur::Must, compound_match_query("gamma", "body", 1.0)),
+            ])
+            .into(),
+            1,
+        ),
+        (
+            "boost",
+            BoostQuery::new(
+                compound_match_query("gamma", "body", 3.0),
+                compound_match_query("alpha", "title", 2.0),
+                Some(0.5),
+            )
+            .into(),
+            3,
+        ),
+        (
+            "nested",
+            BooleanQuery::new([
+                (Occur::Must, nested_required),
+                (Occur::Should, phrase()),
+                (Occur::MustNot, compound_match_query("blocked", "body", 1.0)),
+            ])
+            .into(),
+            3,
+        ),
+    ];
+
+    let mut plans = Vec::with_capacity(cases.len());
+    for (case_name, query, limit) in cases {
+        assert_compound_matches_independent_oracle(&dataset, case_name, &query, limit).await;
+        plans.push((case_name, compound_fts_plan(&dataset, query, limit).await));
+    }
+
+    for (case_name, plan) in plans {
+        assert!(
+            plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+            "{case_name} should use the cross-column scorer:\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashJoinExec"),
+            "{case_name} should not materialize an intermediate hash join:\n{plan}"
+        );
+    }
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(
+            staged_required_optional.clone(),
+        ))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let staged_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
+        Some(&0)
+    );
+    assert!(
+        stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_CANDIDATES_METRIC)
+            .is_some_and(|candidates| *candidates > 0),
+        "required+optional execution should materialize staged candidates"
+    );
+
+    dataset
+        .prewarm_index_with_options(
+            "title_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+    dataset
+        .prewarm_index_with_options(
+            "body_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(staged_required_optional))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let resident_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&0),
+        "prewarmed cross-column queries should use the resident bounded coordinator"
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        resident_results, staged_results,
+        "resident and staged cross-column scans must return identical ordered row ids and score bits"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_uses_one_scalar_prefilter_mask() {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed_batch = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed_batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    assert!(expected.len() > LIMIT);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "filtered cross-column search should use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+        "the shared prefilter should be built from the BTree scalar index:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        1,
+        "the cross-column scorer should have one shared scalar prefilter:\n{plan}"
+    );
+
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("scalar_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_tie_uses_final_row_id() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("tie", "title", 1.0)),
+        (Occur::Must, compound_match_query("tiebody", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[0].1, expected[1].1);
+    assert!(expected[0].0 < expected[1].0);
+
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("equal_score_row_id_tie", &actual, &expected[..1]);
+    let plan = compound_fts_plan(&dataset, query, 1).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "equal-score cross-column search should use the cross-column scorer:\n{plan}"
+    );
+}
+
+async fn assert_cross_column_layout_uses_fast_path(dataset: &Dataset, case_name: &str) {
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    assert_compound_matches_independent_oracle(dataset, case_name, &query, 2).await;
+    let plan = compound_fts_plan(dataset, query, 2).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "{case_name} should align independent segment layouts by row address:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_handles_independent_segment_layouts() {
+    let mut reordered = write_cross_column_compound_dataset().await;
+    let fragment_ids = reordered
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "body",
+        true,
+        vec![vec![fragment_ids[1]], vec![fragment_ids[0]]],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&reordered, "reordered_segments").await;
+
+    let mut differently_split = write_cross_column_compound_dataset().await;
+    let fragment_ids = differently_split
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "body",
+        true,
+        vec![fragment_ids],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&differently_split, "differently_split_segments")
+        .await;
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
+    let initial = arrow_array::record_batch!(
+        ("title", Utf8, ["old alpha", "old noise"]),
+        ("body", Utf8, ["old gamma", "old noise"])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["fresh alpha"]),
+        ("body", Utf8, ["fresh gamma"])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "title", 1.0)),
+        (Occur::Must, compound_match_query("fresh", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 1, "the appended row must be the only hit");
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("incomplete_coverage", &actual, &expected);
+
+    let plan = compound_fts_plan(&dataset, query, 1).await;
+    assert!(
+        !plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "incomplete column coverage must not use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("BooleanQuery"),
+        "incomplete column coverage should retain the exact fallback:\n{plan}"
+    );
 }
 
 #[tokio::test]
@@ -1217,8 +1858,12 @@ async fn test_boolean_must_scores_sum_across_execution_paths() {
     scanner.limit(Some(LIMIT as i64), None).unwrap();
     let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        plan.contains("HashJoinExec"),
-        "cross-column MUST should exercise the exact fallback:\n{plan}"
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column MUST should exercise the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "cross-column MUST should not materialize an intermediate hash join:\n{plan}"
     );
 }
 
@@ -1281,7 +1926,39 @@ async fn test_nested_multimatch_limit_propagation() {
             .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
         "the exhaustive result should include a deterministic score tie"
     );
-    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+    assert_compound_matches_independent_oracle(&dataset, "nested_multimatch_must", &must_query, 2)
+        .await;
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut staged_scanner = dataset.scan();
+    staged_scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(must_query.clone()))
+        .unwrap();
+    staged_scanner.limit(Some(2), None).unwrap();
+    staged_scanner.try_into_batch().await.unwrap();
+    let staged_stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
+        Some(&0)
+    );
 
     let should_query: FtsQuery = BooleanQuery::new([
         (Occur::Should, compound_multimatch_query()),
@@ -1291,21 +1968,27 @@ async fn test_nested_multimatch_limit_propagation() {
         ),
     ])
     .into();
-    assert_compound_fts_top_k(&dataset, should_query.clone(), 2).await;
-    let mut fallback_scanner = dataset.scan();
-    fallback_scanner
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_should",
+        &should_query,
+        2,
+    )
+    .await;
+    let mut scanner = dataset.scan();
+    scanner
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(should_query))
         .unwrap();
-    fallback_scanner.limit(Some(2), None).unwrap();
-    let fallback_plan = fallback_scanner.explain_plan(false).await.unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        fallback_plan.contains("BooleanQuery"),
-        "cross-column compound FTS should retain its exact fallback:\n{fallback_plan}"
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column compound FTS should use the cross-column scorer:\n{plan}"
     );
     assert!(
-        !fallback_plan.contains("CompoundFtsScorer"),
-        "cross-column compound FTS is not yet supported by the scorer tree:\n{fallback_plan}"
+        !plan.contains("HashJoinExec"),
+        "cross-column compound FTS should not materialize intermediate joins:\n{plan}"
     );
 
     let boost_query: FtsQuery = BoostQuery::new(
@@ -1314,9 +1997,22 @@ async fn test_nested_multimatch_limit_propagation() {
         Some(1.0),
     )
     .into();
-    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_boost",
+        &boost_query,
+        2,
+    )
+    .await;
 
-    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
+    let multimatch_query = compound_multimatch_query();
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "cross_column_multimatch",
+        &multimatch_query,
+        1,
+    )
+    .await;
 }
 
 #[tokio::test]
