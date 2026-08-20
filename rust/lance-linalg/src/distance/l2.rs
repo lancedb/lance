@@ -1217,19 +1217,17 @@ mod tests {
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts.
-        /// The conditional x86 CI pass runs this ignored test when AVX-512F
-        /// is available.
+        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
+        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
+        /// hosts without AVX-512F.
         #[cfg(target_arch = "x86_64")]
         #[test]
-        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_l2_f64_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
         ) {
-            assert!(
-                std::is_x86_feature_detected!("avx512f"),
-                "test requires runtime AVX-512F support"
-            );
+            if !std::is_x86_feature_detected!("avx512f") {
+                return Ok(());
+            }
             let scalar = l2_f64_scalar(&x, &y);
             let avx512 = unsafe { x86::l2_f64_avx512(&x, &y) };
             prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-6));
@@ -1272,14 +1270,12 @@ mod tests {
         /// AVX-512F-capable hosts.
         #[cfg(target_arch = "x86_64")]
         #[test]
-        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_l2_f32_scalar_vs_avx512_parity(
             (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
         ) {
-            assert!(
-                std::is_x86_feature_detected!("avx512f"),
-                "test requires runtime AVX-512F support"
-            );
+            if !std::is_x86_feature_detected!("avx512f") {
+                return Ok(());
+            }
             let scalar = l2_f32_scalar(&x, &y);
             let avx512 = unsafe { x86::l2_f32_avx512(&x, &y) };
             prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-3));
@@ -1523,12 +1519,10 @@ mod tests {
         not(all(target_feature = "avx2", target_feature = "fma"))
     ))]
     #[test]
-    #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
     fn test_l2_batch_avx512_matches_scalar() {
-        assert!(
-            std::is_x86_feature_detected!("avx512f"),
-            "test requires runtime AVX-512F support"
-        );
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
         check_l2_batch_kernel(x86::l2_batch_f32_avx512);
     }
 }

@@ -549,19 +549,18 @@ mod tests {
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts.
-        /// The conditional x86 CI pass runs this ignored test when AVX-512F
-        /// is available.
+        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
+        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
+        /// hosts without AVX-512F so the test stays portable; CI runners with
+        /// AVX-512F exercise the `_mm512_*` path.
         #[cfg(target_arch = "x86_64")]
         #[test]
-        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_l2_norm_f64_scalar_vs_avx512_parity(
             data in prop::collection::vec(arbitrary_f64(), 4..4048)
         ) {
-            assert!(
-                std::is_x86_feature_detected!("avx512f"),
-                "test requires runtime AVX-512F support"
-            );
+            if !std::is_x86_feature_detected!("avx512f") {
+                return Ok(());
+            }
             let scalar = norm_l2_f64_scalar(&data);
             let avx512 = unsafe { x86::norm_l2_f64_avx512(&data) };
             prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-6));
@@ -601,18 +600,16 @@ mod tests {
 
         /// AVX-512-direct parity for the f32 L2-norm kernel. Explicitly
         /// compares the scalar fallback against the native AVX-512 inner
-        /// kernel on AVX-512F-capable hosts. The conditional x86 CI pass runs
-        /// this ignored test when AVX-512F is available.
+        /// kernel on AVX-512F-capable hosts. Early-returns on hosts without
+        /// AVX-512F; CI runners with AVX-512F exercise the `_mm512_*` path.
         #[cfg(target_arch = "x86_64")]
         #[test]
-        #[ignore = "requires runtime AVX-512F support; see https://github.com/lance-format/lance/issues/8663"]
         fn test_norm_l2_f32_scalar_vs_avx512_parity(
             data in prop::collection::vec(arbitrary_f32(), 4..4048)
         ) {
-            assert!(
-                std::is_x86_feature_detected!("avx512f"),
-                "test requires runtime AVX-512F support"
-            );
+            if !std::is_x86_feature_detected!("avx512f") {
+                return Ok(());
+            }
             let scalar = norm_l2_f32_scalar(&data);
             let avx512 = unsafe { x86::norm_l2_f32_avx512(&data) };
             prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-3));
