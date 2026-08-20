@@ -5704,10 +5704,7 @@ def test_dataset_sql_batch_size_rows(tmp_path: Path):
     ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
 
     batches = list(
-        ds.sql("SELECT * FROM dataset")
-        .batch_size(7)
-        .build()
-        .to_stream_reader()
+        ds.sql("SELECT * FROM dataset").batch_size(7).build().to_stream_reader()
     )
 
     assert sum(batch.num_rows for batch in batches) == 50
