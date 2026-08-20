@@ -140,6 +140,7 @@ fn encoded_predicate_mode_from_value(value: Option<&str>) -> EncodedPredicateMod
 const ENCODED_PREDICATE_AUTO_SAMPLE_ROWS: u64 = 32 * 1024;
 const ENCODED_PREDICATE_AUTO_SAMPLE_WINDOWS: u64 = 2;
 const ENCODED_PREDICATE_RANGE_AMPLIFICATION_ROWS: u64 = 1024;
+const ENCODED_PREDICATE_MAX_SELECTED_RANGES: usize = 4096;
 
 fn total_range_rows(ranges: &[Range<u64>]) -> u64 {
     ranges.iter().map(|range| range.end - range.start).sum()
@@ -203,19 +204,35 @@ fn encoded_predicate_auto_accepts(
         return true;
     }
     let predicted_read_rows = encoded_predicate_predicted_read_rows(selected_rows, selected_ranges);
-    let predicted_read_fraction = predicted_read_rows as f64 / sampled_rows as f64;
-    let maximum_read_fraction = match encoding {
-        PrimitivePredicateEncoding::Constant => return false,
-        PrimitivePredicateEncoding::Rle => 0.8,
-        PrimitivePredicateEncoding::Bitpacked => 0.55,
-    };
-    predicted_read_fraction <= maximum_read_fraction
+    encoded_predicate_maximum_read_rows(encoding, sampled_rows)
+        .is_some_and(|maximum_read_rows| predicted_read_rows <= maximum_read_rows)
 }
 
 fn encoded_predicate_predicted_read_rows(selected_rows: u64, selected_ranges: usize) -> u64 {
     selected_rows.saturating_add(
         (selected_ranges as u64).saturating_mul(ENCODED_PREDICATE_RANGE_AMPLIFICATION_ROWS),
     )
+}
+
+fn encoded_predicate_maximum_read_rows(
+    encoding: PrimitivePredicateEncoding,
+    total_rows: u64,
+) -> Option<u64> {
+    match encoding {
+        PrimitivePredicateEncoding::Constant => None,
+        PrimitivePredicateEncoding::Rle => Some(total_rows.saturating_mul(4) / 5),
+        PrimitivePredicateEncoding::Bitpacked => Some(total_rows.saturating_mul(11) / 20),
+    }
+}
+
+fn encoded_predicate_selection_exceeds_limit(
+    selected_rows: u64,
+    selected_ranges: usize,
+    limit: EncodedPredicateRangeLimit,
+) -> bool {
+    selected_ranges > limit.maximum_ranges
+        || encoded_predicate_predicted_read_rows(selected_rows, selected_ranges)
+            > limit.maximum_read_rows
 }
 
 fn reverse_operator(operator: Operator) -> Option<Operator> {
@@ -379,10 +396,15 @@ struct EncodedPredicateSelection {
     predicate_scan_counted: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct EncodedPredicateAutoDecision {
-    encoding: PrimitivePredicateEncoding,
-    apply: bool,
+enum EncodedPredicateRangeEvaluation {
+    Selection(Vec<Range<u64>>),
+    AmplificationLimitExceeded,
+}
+
+#[derive(Clone, Copy)]
+struct EncodedPredicateRangeLimit {
+    maximum_read_rows: u64,
+    maximum_ranges: usize,
 }
 
 impl ScopedFragmentRead {
@@ -485,8 +507,6 @@ pub struct FilteredReadGlobalMetrics {
     encoded_predicate_predicted_read_rows: Count,
     encoded_predicate_selected_rows: Count,
     encoded_predicate_selected_ranges: Count,
-    encoded_predicate_auto_planning: AsyncMutex<()>,
-    encoded_predicate_auto_decision: OnceCell<EncodedPredicateAutoDecision>,
     io_metrics: IoMetrics,
 }
 
@@ -510,8 +530,6 @@ impl FilteredReadGlobalMetrics {
                 .new_count("encoded_predicate_selected_rows", 0),
             encoded_predicate_selected_ranges: metrics
                 .new_count("encoded_predicate_selected_ranges", 0),
-            encoded_predicate_auto_planning: AsyncMutex::new(()),
-            encoded_predicate_auto_decision: OnceCell::new(),
             io_metrics: IoMetrics::new(metrics, 0),
         }
     }
@@ -1595,7 +1613,8 @@ impl FilteredReadStream {
         batch_size: u32,
         predicate_schema: Arc<lance_core::datatypes::Schema>,
         predicate: &PrimitivePredicate,
-    ) -> Result<Option<Vec<Range<u64>>>> {
+        limit: Option<EncodedPredicateRangeLimit>,
+    ) -> Result<Option<EncodedPredicateRangeEvaluation>> {
         let filter = FilterExpression::primitive(predicate)?;
         let mask_stream = predicate_reader
             .read_ranges_predicate(ranges.clone().into(), batch_size, predicate_schema, filter)
@@ -1609,7 +1628,8 @@ impl FilteredReadStream {
         };
 
         let mut physical_rows = ranges.iter().flat_map(|range| range.clone());
-        let mut selected = RoaringBitmap::new();
+        let mut selected = Vec::<Range<u64>>::new();
+        let mut selected_rows = 0_u64;
         while let Some(batch) = mask_stream.next().await {
             let batch = match batch.await {
                 Ok(batch) => batch,
@@ -1628,9 +1648,28 @@ impl FilteredReadStream {
                     Error::internal("Encoded predicate produced more rows than requested")
                 })?;
                 if matches == Some(true) {
-                    selected.insert(u32::try_from(row).map_err(|_| {
-                        Error::internal(format!("Fragment physical row {row} exceeds u32::MAX"))
-                    })?);
+                    let row_end = row.checked_add(1).ok_or_else(|| {
+                        Error::internal("Encoded predicate row offset exceeds u64::MAX")
+                    })?;
+                    if let Some(previous) = selected.last_mut()
+                        && previous.end == row
+                    {
+                        previous.end = row_end;
+                    } else {
+                        selected.push(row..row_end);
+                    }
+                    selected_rows += 1;
+                    if let Some(limit) = limit
+                        && encoded_predicate_selection_exceeds_limit(
+                            selected_rows,
+                            selected.len(),
+                            limit,
+                        )
+                    {
+                        return Ok(Some(
+                            EncodedPredicateRangeEvaluation::AmplificationLimitExceeded,
+                        ));
+                    }
                 }
             }
         }
@@ -1639,7 +1678,7 @@ impl FilteredReadStream {
                 "Encoded predicate produced fewer rows than requested",
             ));
         }
-        Ok(Some(bitmap_to_ranges(&selected)))
+        Ok(Some(EncodedPredicateRangeEvaluation::Selection(selected)))
     }
 
     async fn try_encoded_predicate_ranges(
@@ -1652,20 +1691,6 @@ impl FilteredReadStream {
             return Ok(None);
         }
         global_metrics.encoded_predicate_attempts.add(1);
-        let mut auto_planning_guard = if mode == EncodedPredicateMode::Auto {
-            Some(global_metrics.encoded_predicate_auto_planning.lock().await)
-        } else {
-            None
-        };
-        if mode == EncodedPredicateMode::Auto
-            && let Some(decision) = global_metrics.encoded_predicate_auto_decision.get()
-        {
-            if !decision.apply {
-                global_metrics.encoded_predicate_rejected.add(1);
-                return Ok(None);
-            }
-            drop(auto_planning_guard.take());
-        }
         let predicate_projection = fragment_read_task
             .projection
             .as_ref()
@@ -1734,75 +1759,89 @@ impl FilteredReadStream {
         let mut predicate_scan_ranges = 0_usize;
         let selected_ranges = if mode == EncodedPredicateMode::Auto {
             let plan = plan.expect("auto mode requires a metadata plan");
-            let decision = global_metrics
-                .encoded_predicate_auto_decision
-                .get_or_try_init(|| async {
-                    if plan.encoding == PrimitivePredicateEncoding::Constant {
-                        return Ok::<_, Error>(EncodedPredicateAutoDecision {
-                            encoding: plan.encoding,
-                            apply: false,
-                        });
-                    }
-                    let sample_ranges = encoded_predicate_sample_ranges(&fragment_read_task.ranges);
-                    let sampled_rows = total_range_rows(&sample_ranges);
-                    global_metrics
-                        .encoded_predicate_sample_rows
-                        .add(sampled_rows as usize);
-                    let Some(sample_selection) = Self::evaluate_encoded_predicate_ranges(
-                        &predicate_reader,
-                        sample_ranges,
-                        fragment_read_task.batch_size,
-                        predicate_schema.clone(),
-                        predicate,
-                    )
-                    .await?
-                    else {
-                        return Ok(EncodedPredicateAutoDecision {
-                            encoding: plan.encoding,
-                            apply: false,
-                        });
-                    };
-                    let sample_selected_rows = total_range_rows(&sample_selection);
-                    global_metrics
-                        .encoded_predicate_sample_selected_rows
-                        .add(sample_selected_rows as usize);
-                    global_metrics
-                        .encoded_predicate_sample_selected_ranges
-                        .add(sample_selection.len());
-                    global_metrics.encoded_predicate_predicted_read_rows.add(
-                        encoded_predicate_predicted_read_rows(
-                            sample_selected_rows,
-                            sample_selection.len(),
-                        ) as usize,
-                    );
-                    Ok(EncodedPredicateAutoDecision {
-                        encoding: plan.encoding,
-                        apply: encoded_predicate_auto_accepts(
-                            plan.encoding,
-                            sampled_rows,
-                            sample_selected_rows,
-                            sample_selection.len(),
-                        ),
-                    })
-                })
-                .await?;
-            drop(auto_planning_guard.take());
-            if decision.encoding != plan.encoding || !decision.apply {
+            if plan.encoding == PrimitivePredicateEncoding::Constant {
                 global_metrics.encoded_predicate_rejected.add(1);
                 global_metrics
                     .io_metrics
                     .record(&fragment_read_task.scan_scheduler);
                 return Ok(None);
             }
-            let Some(full_selection) = Self::evaluate_encoded_predicate_ranges(
+
+            let sample_ranges = encoded_predicate_sample_ranges(&fragment_read_task.ranges);
+            let sampled_rows = total_range_rows(&sample_ranges);
+            global_metrics
+                .encoded_predicate_sample_rows
+                .add(sampled_rows as usize);
+            let Some(sample_evaluation) = Self::evaluate_encoded_predicate_ranges(
+                &predicate_reader,
+                sample_ranges,
+                fragment_read_task.batch_size,
+                predicate_schema.clone(),
+                predicate,
+                None,
+            )
+            .await?
+            else {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            };
+            let EncodedPredicateRangeEvaluation::Selection(sample_selection) = sample_evaluation
+            else {
+                unreachable!("sample evaluation does not have an amplification limit");
+            };
+            let sample_selected_rows = total_range_rows(&sample_selection);
+            global_metrics
+                .encoded_predicate_sample_selected_rows
+                .add(sample_selected_rows as usize);
+            global_metrics
+                .encoded_predicate_sample_selected_ranges
+                .add(sample_selection.len());
+            global_metrics.encoded_predicate_predicted_read_rows.add(
+                encoded_predicate_predicted_read_rows(sample_selected_rows, sample_selection.len())
+                    as usize,
+            );
+            if !encoded_predicate_auto_accepts(
+                plan.encoding,
+                sampled_rows,
+                sample_selected_rows,
+                sample_selection.len(),
+            ) {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            }
+
+            let fragment_rows = total_range_rows(&fragment_read_task.ranges);
+            let full_evaluation_limit = EncodedPredicateRangeLimit {
+                maximum_read_rows: encoded_predicate_maximum_read_rows(
+                    plan.encoding,
+                    fragment_rows,
+                )
+                .expect("constant encoding was rejected before full evaluation"),
+                maximum_ranges: ENCODED_PREDICATE_MAX_SELECTED_RANGES,
+            };
+            let Some(full_evaluation) = Self::evaluate_encoded_predicate_ranges(
                 &predicate_reader,
                 fragment_read_task.ranges.clone(),
                 fragment_read_task.batch_size,
                 predicate_schema,
                 predicate,
+                Some(full_evaluation_limit),
             )
             .await?
             else {
+                global_metrics.encoded_predicate_rejected.add(1);
+                global_metrics
+                    .io_metrics
+                    .record(&fragment_read_task.scan_scheduler);
+                return Ok(None);
+            };
+            let EncodedPredicateRangeEvaluation::Selection(full_selection) = full_evaluation else {
                 global_metrics.encoded_predicate_rejected.add(1);
                 global_metrics
                     .io_metrics
@@ -1813,12 +1852,13 @@ impl FilteredReadStream {
             predicate_scan_ranges += fragment_read_task.ranges.len();
             full_selection
         } else {
-            let Some(selection) = Self::evaluate_encoded_predicate_ranges(
+            let Some(evaluation) = Self::evaluate_encoded_predicate_ranges(
                 &predicate_reader,
                 fragment_read_task.ranges.clone(),
                 fragment_read_task.batch_size,
                 predicate_schema,
                 predicate,
+                None,
             )
             .await?
             else {
@@ -1827,6 +1867,9 @@ impl FilteredReadStream {
                     .io_metrics
                     .record(&fragment_read_task.scan_scheduler);
                 return Ok(None);
+            };
+            let EncodedPredicateRangeEvaluation::Selection(selection) = evaluation else {
+                unreachable!("forced evaluation does not have an amplification limit");
             };
             predicate_scan_rows = total_range_rows(&fragment_read_task.ranges);
             predicate_scan_ranges = fragment_read_task.ranges.len();
@@ -3905,6 +3948,14 @@ mod tests {
             1,
             1,
         ));
+
+        let limit = EncodedPredicateRangeLimit {
+            maximum_read_rows: 10_000,
+            maximum_ranges: 8,
+        };
+        assert!(!encoded_predicate_selection_exceeds_limit(1_808, 8, limit));
+        assert!(encoded_predicate_selection_exceeds_limit(1_809, 8, limit));
+        assert!(encoded_predicate_selection_exceeds_limit(1, 9, limit));
     }
 
     #[test]
@@ -4378,7 +4429,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+            4 * ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
 
         let (output_rows, metrics) =
@@ -4394,7 +4445,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+            4 * ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
 
         let (output_rows, metrics) =
@@ -4404,7 +4455,7 @@ mod tests {
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+            4 * ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
         );
     }
 
@@ -4456,6 +4507,189 @@ mod tests {
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_selected_rows"),
             num_rows as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_preserves_nullable_constant_layout_filter() {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp_path = TempStrDir::default();
+        let num_rows = 10_000_u64;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("predicate", DataType::Int32, true),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter(
+                    (0..num_rows).map(|row| row.is_multiple_of(2).then_some(7)),
+                )),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset.clone(), "predicate = 7").await;
+        assert_eq!(output_rows, num_rows as usize / 2);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_sample_rows"), 0);
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "predicate = 8").await;
+        assert_eq!(output_rows, 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
+    }
+
+    #[rstest]
+    #[case::fragmented_first(true)]
+    #[case::fragmented_last(false)]
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_decides_per_fragment(#[case] fragmented_first: bool) {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp_path = TempStrDir::default();
+        let rows_per_fragment = 50_000_u64;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("predicate", DataType::UInt32, false),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let no_match = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..rows_per_fragment).map(|row| (row % 1024) as u32),
+                )),
+                Arc::new(UInt64Array::from_iter_values(0..rows_per_fragment)),
+            ],
+        )
+        .unwrap();
+        let fragmented = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..rows_per_fragment).map(|row| if row.is_multiple_of(2) { 2048 } else { 0 }),
+                )),
+                Arc::new(UInt64Array::from_iter_values(
+                    rows_per_fragment..2 * rows_per_fragment,
+                )),
+            ],
+        )
+        .unwrap();
+        let batches = if fragmented_first {
+            vec![Ok(fragmented), Ok(no_match)]
+        } else {
+            vec![Ok(no_match), Ok(fragmented)]
+        };
+        let reader = RecordBatchIterator::new(batches, schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: rows_per_fragment as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "predicate = 2048").await;
+        assert_eq!(output_rows, rows_per_fragment as usize / 2);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_rows"),
+            2 * ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_caps_full_fragment_amplification() {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{DataType, Field as ArrowField};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp_path = TempStrDir::default();
+        let num_rows = 50_000_u64;
+        let sample_window_rows = ENCODED_PREDICATE_AUTO_SAMPLE_ROWS / 2;
+        let fragmented_end = num_rows - sample_window_rows;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("predicate", DataType::UInt32, false),
+            ArrowField::new("payload", DataType::UInt64, false),
+        ]));
+        let predicate = UInt32Array::from_iter_values((0..num_rows).map(|row| {
+            if (sample_window_rows..fragmented_end).contains(&row) && row.is_multiple_of(2) {
+                2048
+            } else {
+                (row % 1024) as u32
+            }
+        }));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(predicate),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "predicate = 2048").await;
+        assert_eq!(
+            output_rows,
+            ((fragmented_end - sample_window_rows) / 2) as usize
+        );
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_rows"),
+            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+        );
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_selected_rows"),
+            0
+        );
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_selected_ranges"),
+            0
         );
     }
 

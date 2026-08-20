@@ -533,7 +533,7 @@ fn primitive_predicate_page_plan(
                     }
                 };
                 if predicate.matches_u32(value) {
-                    if !nullable || constant.num_def_values == 0 {
+                    if !nullable {
                         PrimitivePredicateOutcome::AlwaysTrue
                     } else {
                         PrimitivePredicateOutcome::Unknown
