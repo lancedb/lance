@@ -692,10 +692,12 @@ impl Writer {
     /// of rows in those buffers.
     pub(crate) fn initialize_with_external_metadata(
         &mut self,
-        schema: lance_core::datatypes::Schema,
+        mut schema: lance_core::datatypes::Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,
         rows_written: u64,
     ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.num_columns = column_metadata.len() as u32;
         self.column_metadata = column_metadata;

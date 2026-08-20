@@ -697,7 +697,13 @@ impl EncodingPipeline {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
-    pub(crate) fn initialize_with_external_metadata(&mut self, schema: Schema, rows_written: u64) {
+    pub(crate) fn initialize_with_external_metadata(
+        &mut self,
+        mut schema: Schema,
+        rows_written: u64,
+    ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.rows_written = rows_written;
     }

@@ -1103,8 +1103,7 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() && read_config.with_row_id
-        {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -1183,8 +1182,7 @@ impl FileFragment {
             Result::Ok(readers)
         };
         let deletion_vec_load = self.get_deletion_vector();
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() && read_config.with_row_id
-        {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )

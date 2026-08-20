@@ -753,6 +753,63 @@ mod tests {
         assert_eq!(reuse_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[rstest::rstest]
+    #[case(ConcreteFileVersion::V2_0)]
+    #[case(ConcreteFileVersion::V2_1)]
+    #[case(ConcreteFileVersion::V2_2)]
+    #[case(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn concat_preserves_schema_metadata(#[case] version: ConcreteFileVersion) {
+        let store = Arc::new(ObjectStore::local());
+        let first_path = TempObjFile::default();
+        let second_path = TempObjFile::default();
+        let output_path = TempObjFile::default();
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+        let mut schema = Schema::try_from(batch.schema_ref().as_ref()).unwrap();
+        schema
+            .metadata
+            .insert("review-key".into(), "review-value".into());
+        let schema = Arc::new(schema);
+
+        for path in [&first_path, &second_path] {
+            let mut writer = versions::create_writer(
+                version,
+                store.create(path).await.unwrap(),
+                schema.as_ref().clone(),
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            writer.write_batch(&batch).await.unwrap();
+            writer.finish().await.unwrap();
+        }
+        let inputs = vec![
+            input(store.clone(), &first_path, 2).await,
+            input(store.clone(), &second_path, 2).await,
+        ];
+        let result = concat_files(
+            &FileConcatTarget::new(version, schema),
+            &inputs,
+            {
+                let store = store.clone();
+                let output_path = output_path.clone();
+                move || async move { store.create(&output_path).await }
+            },
+            FileConcatOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, FileConcatResult::Written(_)));
+
+        let output = input(store, &output_path, 4).await;
+        let metadata = FileReader::read_all_metadata(&output.scheduler)
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.file_schema.metadata.get("review-key"),
+            Some(&"review-value".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_does_not_create_output() {
         let store = Arc::new(ObjectStore::local());
