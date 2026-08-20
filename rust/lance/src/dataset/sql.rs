@@ -41,6 +41,16 @@ pub struct SqlQueryBuilder {
     pub(crate) batch_size_bytes: Option<u64>,
 }
 
+fn validate_batch_size(batch_size: usize) -> lance_core::Result<()> {
+    if batch_size == 0 || u32::try_from(batch_size).is_err() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        )));
+    }
+    Ok(())
+}
+
 impl SqlQueryBuilder {
     pub fn new(dataset: Dataset, sql: &str) -> Self {
         Self {
@@ -89,6 +99,8 @@ impl SqlQueryBuilder {
 
     /// Set the maximum number of rows produced by each query batch.
     ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive.
+    ///
     /// When [`Self::batch_size_bytes`] is also set, both limits apply and the
     /// one reached first determines the scan batch size.
     pub fn batch_size(mut self, batch_size: usize) -> Self {
@@ -106,6 +118,10 @@ impl SqlQueryBuilder {
     }
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
+        if let Some(batch_size) = self.batch_size {
+            validate_batch_size(batch_size)?;
+        }
+
         let ctx = if let Some(batch_size) = self.batch_size {
             SessionContext::new_with_config(SessionConfig::new().with_batch_size(batch_size))
         } else {
