@@ -534,7 +534,6 @@ mod tests {
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
         testing::{TestCases, check_specific_random},
-        version::LanceFileVersion,
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -688,18 +687,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case::simple(simple_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct(nested_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_list(struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_large_list(struct_with_large_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_map(struct_with_map_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::simple(simple_struct_fields(), 2)]
+    #[case::nested_struct(nested_struct_fields(), 2)]
+    #[case::struct_with_list(struct_with_list_fields(), 2)]
+    #[case::struct_with_large_list(struct_with_large_list_fields(), 2)]
+    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2)]
+    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2)]
+    #[case::struct_with_map(struct_with_map_fields(), 2)]
     #[test_log::test(tokio::test)]
     async fn test_fsl_struct_random(
         #[case] struct_fields: Fields,
         #[case] dimension: i32,
-        #[case] min_version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
@@ -710,7 +708,7 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        let test_cases = TestCases::basic().with_min_file_version(min_version);
+        let test_cases = TestCases::basic().with_u32_structural_encodings();
         check_specific_random(field, test_cases).await;
     }
 

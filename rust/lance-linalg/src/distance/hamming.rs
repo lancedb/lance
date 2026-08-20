@@ -7,7 +7,7 @@
 //! including SIMD-accelerated pairwise hamming distance for binary hashes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::cast::AsArray;
@@ -20,6 +20,27 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
 use crate::{Error, Result};
+
+/// Schema of a Hamming distance-pair batch.
+static DISTANCE_PAIR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id_a", DataType::UInt64, false),
+        Field::new("row_id_b", DataType::UInt64, false),
+        Field::new("distance", DataType::UInt32, false),
+    ]))
+});
+
+/// Schema of a Hamming clustering-result batch.
+static CLUSTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("representative", DataType::UInt64, false),
+        Field::new(
+            "duplicates",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+            false,
+        ),
+    ]))
+});
 
 pub trait Hamming {
     /// Hamming distance between two vectors.
@@ -339,11 +360,7 @@ impl PairwiseResult {
 
     /// Convert to Arrow RecordBatch, consuming self.
     pub fn into_record_batch(self) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id_a", DataType::UInt64, false),
-            Field::new("row_id_b", DataType::UInt64, false),
-            Field::new("distance", DataType::UInt32, false),
-        ]));
+        let schema = DISTANCE_PAIR_SCHEMA.clone();
 
         let row_id_a = Arc::new(UInt64Array::from(self.row_id_a));
         let row_id_b = Arc::new(UInt64Array::from(self.row_id_b));
@@ -915,14 +932,7 @@ impl ClusteringResult {
 
     /// Get the schema for clustering result batches.
     pub fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("representative", DataType::UInt64, false),
-            Field::new(
-                "duplicates",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-                false,
-            ),
-        ]))
+        CLUSTER_SCHEMA.clone()
     }
 
     /// Convert to Arrow RecordBatch with columns:
@@ -1050,6 +1060,20 @@ pub fn cluster_pairwise_result(result: &PairwiseResult) -> ClusteringResult {
 mod tests {
     use super::*;
     use lance_arrow::FixedSizeListArrayExt;
+
+    #[test]
+    fn test_result_schemas_are_initialized_once() {
+        // These schemas are handed out per call and per batch, so they are
+        // shared rather than rebuilt. Pointer equality is what distinguishes a
+        // shared schema from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(
+            &ClusteringResult::schema(),
+            &ClusteringResult::schema()
+        ));
+
+        let batch = PairwiseResult::default().into_record_batch();
+        assert!(Arc::ptr_eq(&batch.schema(), &DISTANCE_PAIR_SCHEMA));
+    }
 
     #[test]
     fn test_hamming() {

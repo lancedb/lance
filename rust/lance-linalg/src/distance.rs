@@ -25,79 +25,221 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
-/// What a per-batch distance kernel yields.
+#[inline]
+fn assert_equal_lengths(left_len: usize, right_len: usize) {
+    assert_eq!(
+        left_len, right_len,
+        "distance inputs must have equal lengths: left={left_len}, right={right_len}"
+    );
+}
+
+#[inline]
+fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
+    assert!(
+        dimension > 0,
+        "distance dimension must be greater than zero"
+    );
+    assert_eq!(
+        vector_len, dimension,
+        "distance vector length must match dimension: vector={vector_len}, dimension={dimension}"
+    );
+    assert_eq!(
+        batch_len % dimension,
+        0,
+        "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
+    );
+}
+
+/// Number of distances computed per call into a runtime-selected batch kernel.
 ///
-/// The two batch paths produce different shapes: the build-baseline path maps
-/// lazily over the batch and allocates nothing, while a `#[target_feature]`
-/// kernel must collect eagerly because it cannot be inlined into a lazy
-/// closure. A concrete enum keeps both statically dispatched.
-///
-/// Only sub-AVX2 builds need this. On an AVX2-baseline build the batch methods
-/// return the bare `Map` instead, because any wrapper — trait object or enum —
-/// loses `TrustedLen` (so `.collect()` stops preallocating) and loses
-/// `Map::fold`'s inlined loop. Benchmarks showed that costing 2.5x on the dim-8
-/// batch, far more than the per-vector dispatch it was meant to remove.
+/// Keeping a small output buffer amortizes the `#[target_feature]` call while
+/// avoiding the allocation and full-batch materialization that dominate the
+/// common dimension-8 case.
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-pub(crate) enum BatchIter<L> {
-    /// Lazy per-vector map. No allocation.
-    Lazy(L),
-    /// Eagerly collected by a `#[target_feature]` kernel.
-    Eager(std::vec::IntoIter<f32>),
+const BATCH_BUFFER_SIZE: usize = 64;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+
+/// Runtime-selected target-feature tier for a batch kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+#[derive(Clone, Copy)]
+pub(crate) enum BatchKind {
+    Scalar,
+    Avx,
+    AvxFma,
+    Avx512,
+}
+
+/// Per-vector operations used when a batch consumer can be folded directly.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+pub(crate) trait BatchOperation {
+    fn fold_scalar<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
+    where
+        F: FnMut(B, f32) -> B;
+
+    unsafe fn fold_avx<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
+    where
+        F: FnMut(B, f32) -> B;
+
+    unsafe fn fold_avx_fma<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
+    where
+        F: FnMut(B, f32) -> B;
+
+    unsafe fn fold_avx512<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
+    where
+        F: FnMut(B, f32) -> B;
+}
+
+/// Allocation-free iterator over a runtime-selected f32 distance kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+pub(crate) struct BatchIter<'a, O> {
+    key: &'a [f32],
+    batch: &'a [f32],
+    dimension: usize,
+    kernel: BatchKernel,
+    kind: BatchKind,
+    buffer: [f32; BATCH_BUFFER_SIZE],
+    buffer_index: usize,
+    buffer_len: usize,
+    operation: std::marker::PhantomData<O>,
 }
 
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
+impl<'a, O> BatchIter<'a, O> {
+    /// Creates an iterator after the caller has verified `kernel`'s CPU feature
+    /// requirements.
+    ///
+    /// # Safety
+    /// The host must support every target feature required by `kernel`.
+    #[inline]
+    pub(crate) unsafe fn new(
+        key: &'a [f32],
+        batch: &'a [f32],
+        dimension: usize,
+        kernel: BatchKernel,
+        kind: BatchKind,
+    ) -> Self {
+        // Match `chunks_exact` validation before the buffered iterator performs
+        // division by the dimension.
+        let _ = batch.chunks_exact(dimension);
+        Self {
+            key,
+            batch,
+            dimension,
+            kernel,
+            kind,
+            buffer: [0.0; BATCH_BUFFER_SIZE],
+            buffer_index: 0,
+            buffer_len: 0,
+            operation: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        let num_vectors = (self.batch.len() / self.dimension).min(BATCH_BUFFER_SIZE);
+        if num_vectors == 0 {
+            return false;
+        }
+
+        let num_values = num_vectors * self.dimension;
+        let (input, remaining) = self.batch.split_at(num_values);
+        // SAFETY: `new` requires the caller to verify the selected kernel's
+        // target features before constructing the iterator.
+        unsafe {
+            (self.kernel)(
+                self.key,
+                input,
+                self.dimension,
+                &mut self.buffer[..num_vectors],
+            );
+        }
+        self.batch = remaining;
+        self.buffer_index = 0;
+        self.buffer_len = num_vectors;
+        true
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+impl<O: BatchOperation> Iterator for BatchIter<'_, O> {
     type Item = f32;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Lazy(iter) => iter.next(),
-            Self::Eager(iter) => iter.next(),
+        if self.buffer_index == self.buffer_len && !self.refill() {
+            return None;
         }
+        let value = self.buffer[self.buffer_index];
+        self.buffer_index += 1;
+        Some(value)
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Lazy(iter) => iter.size_hint(),
-            Self::Eager(iter) => iter.size_hint(),
-        }
+        let len = self.len();
+        (len, Some(len))
     }
 
-    /// Delegated, not defaulted. `Map` overrides `fold` to drive the underlying
-    /// `ChunksExact` in one inlined, auto-vectorized loop; the default `fold`
-    /// would instead call `next()` per element, paying an enum branch and
-    /// losing that loop. On the dim-8 batch that costs ~2.5x.
+    /// Processes each filled buffer directly so consumers such as `sum` do not
+    /// pay a refill check for every distance.
     #[inline]
-    fn fold<B, F>(self, init: B, f: F) -> B
+    fn fold<B, F>(self, init: B, mut f: F) -> B
     where
         F: FnMut(B, Self::Item) -> B,
     {
-        match self {
-            Self::Lazy(iter) => iter.fold(init, f),
-            Self::Eager(iter) => iter.fold(init, f),
+        let accumulator = self.buffer[self.buffer_index..self.buffer_len]
+            .iter()
+            .copied()
+            .fold(init, &mut f);
+
+        // SAFETY: `new` requires the caller to verify the selected tier's
+        // target features. Each helper runs the complete remaining loop in
+        // that target-feature context, avoiding intermediate output writes.
+        match self.kind {
+            BatchKind::Scalar => {
+                O::fold_scalar(self.key, self.batch, self.dimension, accumulator, f)
+            }
+            BatchKind::Avx => unsafe {
+                O::fold_avx(self.key, self.batch, self.dimension, accumulator, f)
+            },
+            BatchKind::AvxFma => unsafe {
+                O::fold_avx_fma(self.key, self.batch, self.dimension, accumulator, f)
+            },
+            BatchKind::Avx512 => unsafe {
+                O::fold_avx512(self.key, self.batch, self.dimension, accumulator, f)
+            },
         }
     }
 
-    /// `for_each`, `sum` and `collect` all route through `fold`, so delegating
-    /// it covers them too. (`try_fold` cannot be overridden on stable: its
-    /// `Try` bound is unstable.)
     #[inline]
-    fn for_each<F>(self, f: F)
+    fn for_each<F>(self, mut f: F)
     where
         F: FnMut(Self::Item),
     {
-        match self {
-            Self::Lazy(iter) => iter.for_each(f),
-            Self::Eager(iter) => iter.for_each(f),
-        }
+        self.fold((), |(), value| f(value));
     }
 }
 
@@ -105,13 +247,10 @@ impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-impl<L: ExactSizeIterator<Item = f32>> ExactSizeIterator for BatchIter<L> {
+impl<O: BatchOperation> ExactSizeIterator for BatchIter<'_, O> {
     #[inline]
     fn len(&self) -> usize {
-        match self {
-            Self::Lazy(iter) => iter.len(),
-            Self::Eager(iter) => iter.len(),
-        }
+        self.buffer_len - self.buffer_index + self.batch.len() / self.dimension
     }
 }
 
@@ -208,23 +347,69 @@ pub fn multivec_distance(
     vectors: &ListArray,
     distance_type: DistanceType,
 ) -> Result<Vec<f32>> {
-    let dim = if let DataType::FixedSizeList(_, dim) = vectors.value_type() {
-        dim as usize
-    } else {
-        return Err(ArrowError::InvalidArgumentError(
-            "vectors must be a list of fixed size list".to_string(),
-        ));
-    };
-
-    // check the query vectors type first
-    // because we don't want to check the vectors type for each vector
-    match query.data_type() {
-        DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::UInt8 => {}
+    let (element_type, dim) = match vectors.value_type() {
+        DataType::FixedSizeList(field, dim) => (field.data_type().clone(), dim as usize),
         _ => {
             return Err(ArrowError::InvalidArgumentError(
-                "query must be a float array or binary array".to_string(),
+                "vectors must be a list of fixed size list".to_string(),
             ));
         }
+    };
+
+    // Validate the query once, up front, rather than per vector. The type and
+    // metric checks below prevent an arrow downcast panic or the `unreachable!`
+    // dispatch arm — the dispatch picks its kernel type from the query's dtype
+    // and then downcasts the *stored* values to that same type. The dim, null
+    // and length checks prevent a `chunks_exact` panic and, worse, silently
+    // wrong results: a short query yields no sub-vectors and scores every row
+    // `1.0`, and a null slot is scored from whatever the values buffer holds.
+    let query_type = query.data_type();
+    // Which element types have a kernel here at all. `Int8` is a valid vector
+    // element type elsewhere in the stack (`l2_distance_arrow_batch` and its
+    // siblings have an `Int8` arm) but has no multivector kernel, so it is
+    // rejected for the type, not the metric.
+    let type_supported = matches!(
+        query_type,
+        DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
+    );
+    if !type_supported {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "multivec_distance: unsupported vector element type {query_type}"
+        )));
+    }
+    let metric_supported = match query_type {
+        DataType::UInt8 => distance_type == DistanceType::Hamming,
+        _ => matches!(
+            distance_type,
+            DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
+        ),
+    };
+    if !metric_supported {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "multivec_distance: distance type {distance_type} does not support query type {query_type}"
+        )));
+    }
+    if *query_type != element_type {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "multivec_distance: query type {query_type} does not match the stored vector type {element_type}"
+        )));
+    }
+    if dim == 0 {
+        return Err(ArrowError::InvalidArgumentError(
+            "multivec_distance: stored vectors have dimension 0".to_string(),
+        ));
+    }
+    if query.null_count() > 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "multivec_distance: query must not contain nulls, got {} null(s)",
+            query.null_count()
+        )));
+    }
+    if query.is_empty() || !query.len().is_multiple_of(dim) {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "multivec_distance: query length {} must be a positive multiple of the vector dimension {dim}",
+            query.len()
+        )));
     }
 
     let mut dists = Vec::with_capacity(vectors.len());
@@ -316,10 +501,172 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::types::Float32Type;
-    use arrow_array::{Float32Array, ListArray};
+    use arrow_array::types::{Float16Type, Float32Type, Int8Type};
+    use arrow_array::{Float32Array, Int8Array, ListArray, PrimitiveArray, UInt8Array};
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::Field;
+    use half::f16;
+
+    /// Build a single-row `List<FixedSizeList<T, dim>>` holding one sub-vector.
+    fn multivec_of<T: ArrowPrimitiveType>(values: Vec<T::Native>, dim: i32) -> ListArray {
+        let inner = PrimitiveArray::<T>::from_iter_values(values);
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", T::DATA_TYPE, true)),
+            dim,
+            Arc::new(inner),
+            None,
+        )
+        .unwrap();
+        let offsets = OffsetBuffer::from_lengths([1_usize]);
+        let field = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+        ListArray::try_new(field, offsets, Arc::new(fsl), None).unwrap()
+    }
+
+    /// The `(query dtype, distance type)` pre-check and the dispatch must agree.
+    /// `UInt8` is only valid with Hamming, and the float types only with the
+    /// float metrics; a mismatch must be an error rather than a panic in the
+    /// dispatch arm or inside an arrow downcast.
+    #[test]
+    fn test_multivec_distance_rejects_dtype_metric_mismatch() {
+        let f32_vectors = multivec_of::<Float32Type>(vec![1.0, 2.0], 2);
+        let u8_vectors = multivec_of::<UInt8Type>(vec![1, 2], 2);
+
+        let u8_query: Arc<dyn Array> = Arc::new(UInt8Array::from(vec![1_u8, 2]));
+        let f32_query: Arc<dyn Array> = Arc::new(Float32Array::from(vec![1.0_f32, 2.0]));
+
+        // Query and stored types MATCH in each case, so only the metric is wrong
+        // — otherwise the element-type check would reject these first and this
+        // test would pass with the metric guard deleted.
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = multivec_distance(u8_query.as_ref(), &u8_vectors, dt).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
+                "UInt8 query with {dt} must be rejected for the metric, got: {err}"
+            );
+        }
+
+        let err =
+            multivec_distance(f32_query.as_ref(), &f32_vectors, DistanceType::Hamming).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
+            "Float32 query with hamming must be rejected for the metric, got: {err}"
+        );
+    }
+
+    /// `Int8` is a valid vector element type elsewhere in the crate but has no
+    /// multivector kernel, so it must be rejected for the type, not the metric.
+    #[test]
+    fn test_multivec_distance_rejects_unsupported_element_type() {
+        let i8_vectors = multivec_of::<Int8Type>(vec![1, 2], 2);
+        let i8_query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![1_i8, 2]));
+
+        let err = multivec_distance(i8_query.as_ref(), &i8_vectors, DistanceType::L2).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("unsupported vector element type")),
+            "Int8 must be rejected for the element type, got: {err}"
+        );
+    }
+
+    /// The query's element type must match the stored vectors': the dispatch
+    /// picks `T` from the query and then downcasts the stored array to the same
+    /// `T` without checking it.
+    #[test]
+    fn test_multivec_distance_rejects_element_type_mismatch() {
+        let f16_vectors =
+            multivec_of::<Float16Type>(vec![f16::from_f32(1.0), f16::from_f32(2.0)], 2);
+        let f32_query: Arc<dyn Array> = Arc::new(Float32Array::from(vec![1.0_f32, 2.0]));
+
+        let err =
+            multivec_distance(f32_query.as_ref(), &f16_vectors, DistanceType::L2).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not match the stored vector type")),
+            "Float32 query against a Float16 column must be rejected, got: {err}"
+        );
+    }
+
+    /// A query length that is not a positive multiple of `dim` is structurally
+    /// invalid: `chunks_exact` would silently drop the tail, and a query shorter
+    /// than `dim` would yield no sub-vectors at all and score every row `1.0`.
+    #[test]
+    fn test_multivec_distance_rejects_bad_query_length() {
+        let vectors = multivec_of::<Float32Type>(vec![1.0, 2.0], 2);
+
+        for bad in [vec![7.0_f32], vec![7.0, 7.0, 999.0], vec![]] {
+            let len = bad.len();
+            let query: Arc<dyn Array> = Arc::new(Float32Array::from(bad));
+            let err = multivec_distance(query.as_ref(), &vectors, DistanceType::L2).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must be a positive multiple")),
+                "query of length {len} against dim 2 must be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// A zero-dimension column would panic in `chunks_exact(0)`; it gets its own
+    /// message rather than blaming the query's length.
+    #[test]
+    fn test_multivec_distance_rejects_zero_dim() {
+        let values = Float32Array::from(Vec::<f32>::new());
+        let fsl = FixedSizeListArray::try_new_with_length(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            0,
+            Arc::new(values),
+            None,
+            1,
+        )
+        .unwrap();
+        let field = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+        let vectors = ListArray::try_new(
+            field,
+            OffsetBuffer::from_lengths([1_usize]),
+            Arc::new(fsl),
+            None,
+        )
+        .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from(vec![1.0_f32, 2.0]));
+
+        let err = multivec_distance(query.as_ref(), &vectors, DistanceType::L2).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(m)
+                if m.contains("stored vectors have dimension 0")
+                    && !m.contains("positive multiple")),
+            "a zero-dim column must be rejected on its own terms, got: {err}"
+        );
+    }
+
+    /// A null query slot is read from the raw values buffer, so it would be
+    /// silently scored as whatever the buffer holds.
+    #[test]
+    fn test_multivec_distance_rejects_null_query() {
+        let vectors = multivec_of::<Float32Type>(vec![1.0, 2.0], 2);
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from(vec![Some(1.0_f32), None]));
+
+        let err = multivec_distance(query.as_ref(), &vectors, DistanceType::L2).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+            "a query with nulls must be rejected, got: {err}"
+        );
+    }
+
+    /// The guards must not reject the combinations that do work: `UInt8` with
+    /// Hamming is the one non-float path through this function.
+    ///
+    /// Note the expected value is `1.0 - hamming`, matching what the function
+    /// computes. Unlike the float paths — which accumulate `1.0 - distance` and
+    /// so end up with a distance again — the Hamming path accumulates a raw
+    /// distance, so `1.0 - sim` inverts its ranking. That inversion is
+    /// pre-existing and out of scope here; this test pins current behavior
+    /// rather than endorsing it.
+    #[test]
+    fn test_multivec_distance_accepts_u8_hamming() {
+        let vectors = multivec_of::<UInt8Type>(vec![0b0000_1111, 0b0000_0000], 2);
+        let query: Arc<dyn Array> = Arc::new(UInt8Array::from(vec![0b0000_1111_u8, 0b0000_0001]));
+
+        let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::Hamming).unwrap();
+        assert_eq!(dists.len(), 1);
+        // One differing bit between the query and the single stored sub-vector.
+        assert_eq!(dists[0], 1.0 - 1.0);
+    }
 
     #[test]
     fn test_multivec_distance_empty_row_is_nan() {

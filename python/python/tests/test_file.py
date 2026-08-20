@@ -87,7 +87,30 @@ def test_multiple_close(tmp_path):
     writer = LanceFileWriter(str(path), schema)
     writer.write_batch(pa.table({"a": [1, 2, 3]}))
     writer.close()
+    size_bytes = writer.size_bytes
+    # The second close is a no-op and must not clear the recorded size
     writer.close()
+    assert writer.size_bytes == size_bytes
+
+
+@pytest.mark.parametrize("num_rows", [0, 3])
+def test_size_bytes(tmp_path, num_rows):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    assert writer.size_bytes is None
+    writer.write_batch(pa.table({"a": list(range(num_rows))}))
+    assert writer.close() == num_rows
+    # Even an empty file has a footer, so the size is always positive
+    assert writer.size_bytes > 0
+    assert writer.size_bytes == os.path.getsize(path)
+
+
+def test_size_bytes_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
 
 
 def test_version(tmp_path):

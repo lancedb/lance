@@ -13,7 +13,7 @@ use crate::data::{
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -471,7 +471,11 @@ impl BlockCompressor for ValueEncoder {
 }
 
 impl MiniBlockCompressor for ValueEncoder {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
@@ -606,6 +610,15 @@ impl MiniBlockDecompressor for ValueDecompressor {
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 struct FslDecompressorValidityBuilder {
@@ -734,6 +747,15 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl PerValueCompressor for ValueEncoder {
@@ -775,7 +797,7 @@ mod tests {
         encodings::{
             logical::primitive::{
                 fullzip::{PerValueCompressor, PerValueDataBlock},
-                miniblock::MiniBlockCompressor,
+                miniblock::{MiniBlockCompressionContext, MiniBlockCompressor},
             },
             physical::value::ValueDecompressor,
         },
@@ -784,10 +806,13 @@ mod tests {
             FnArrayGeneratorProvider, TestCases, check_basic_random,
             check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
         },
-        version::LanceFileVersion,
     };
 
     use super::ValueEncoder;
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -834,7 +859,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -845,7 +870,7 @@ mod tests {
             (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
         ));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -877,7 +902,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
@@ -923,7 +948,7 @@ mod tests {
                 let test_cases = TestCases::default()
                     .with_page_sizes(vec![1000, 2000, 3000, 60000])
                     .with_batch_size(batch_size)
-                    .with_min_file_version(LanceFileVersion::V2_1);
+                    .with_structural_encodings();
 
                 check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
             }
@@ -969,7 +994,8 @@ mod tests {
         let starting_data = DataBlock::from_array(sample_list.clone());
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -1030,7 +1056,7 @@ mod tests {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
-        let result = MiniBlockCompressor::compress(&encoder, starting_data);
+        let result = MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data);
 
         let err = result.expect_err("wide values should not be encodable as miniblock");
         assert!(
@@ -1072,6 +1098,11 @@ mod tests {
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
 
         let num_values = data.num_values;
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_values),
+            None,
+            "nullable FSL output uses multiple buffers and requires the fallback estimate"
+        );
         let decompressed =
             FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
 
@@ -1092,7 +1123,7 @@ mod tests {
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
@@ -1110,7 +1141,7 @@ mod tests {
         let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_batch_size(1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
@@ -1142,7 +1173,8 @@ mod tests {
         );
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()
@@ -1217,7 +1249,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("flat")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit configuration and automatic fallback scenarios
         // 1. Test explicit "none" compression to force flat encoding

@@ -52,8 +52,8 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -61,7 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
+    vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -70,7 +71,6 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -79,6 +79,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
+    scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -97,6 +98,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::fts::FtsTokenizerOptions;
 use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
@@ -591,27 +593,7 @@ impl MergeInsertBuilder {
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        metadata.fields,
-        index_details,
-        metadata.index_version,
-        metadata.dataset_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -1121,7 +1103,13 @@ impl Dataset {
 
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
-        Ok(self.ds.manifest().data_storage_format.version.clone())
+        Ok(self
+            .ds
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+            .to_string())
     }
 
     #[getter(has_stable_row_ids)]
@@ -1296,6 +1284,13 @@ impl Dataset {
 
                 let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
                 let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+                let document_granularity = match full_text_query.get_item("document_granularity")? {
+                    Some(value) if !value.is_none() => Some(
+                        DocumentGranularity::try_from(value.extract::<String>()?.as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    ),
+                    _ => None,
+                };
 
                 if is_phrase {
                     // Remove the surrounding quotes for phrase queries
@@ -1303,8 +1298,20 @@ impl Dataset {
                 }
 
                 let query: FtsQuery = match (is_phrase, is_multi_match) {
-                    (false, _) => MatchQuery::new(query).into(),
-                    (true, false) => PhraseQuery::new(query).into(),
+                    (false, _) => {
+                        let mut query = MatchQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
+                    (true, false) => {
+                        let mut query = PhraseQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
                     (true, true) => {
                         return Err(PyValueError::new_err(
                             "Phrase queries cannot be used with multiple columns.",
@@ -2026,6 +2033,19 @@ impl Dataset {
         Ok(pyvers)
     }
 
+    fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        let py = self_.py();
+        self_
+            .list_version_refs()?
+            .iter()
+            .map(|version| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", version.version)?;
+                dict.into_py_any(py)
+            })
+            .collect()
+    }
+
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
         Ok(self.ds.version().version)
@@ -2551,6 +2571,7 @@ impl Dataset {
                 if let Some(kwargs) = kwargs {
                     let allowed_kwargs = [
                         "analyzer",
+                        "document_granularity",
                         "with_position",
                         "base_tokenizer",
                         "language",
@@ -2585,116 +2606,21 @@ impl Dataset {
                         }
                     }
 
-                    let analyzer: Option<String> = kwargs
-                        .get_item("analyzer")?
-                        .map(|value| value.extract())
-                        .transpose()?;
-                    let base_tokenizer: Option<String> = kwargs
-                        .get_item("base_tokenizer")?
-                        .map(|value| value.extract())
-                        .transpose()?;
-
-                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
-                        (Some("text"), Some("code")) => {
-                            return Err(PyValueError::new_err(
-                                "base_tokenizer='code' requires analyzer='code'",
-                            ));
-                        }
-                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
-                            return Err(PyValueError::new_err(format!(
-                                "analyzer='code' requires base_tokenizer='code', got '{}'",
-                                base_tokenizer
-                            )));
-                        }
-                        _ => {}
-                    }
-
-                    let uses_code_analyzer = match analyzer.as_deref() {
-                        Some("code") => true,
-                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
-                        Some(_) => true,
-                    };
-                    if !uses_code_analyzer {
-                        for flag in [
-                            "split_identifiers",
-                            "split_on_numerics",
-                            "preserve_original",
-                            "index_operators",
-                        ] {
-                            if let Some(value) = kwargs.get_item(flag)?
-                                && value.extract::<bool>()?
-                            {
-                                return Err(PyValueError::new_err(
-                                    "code analyzer flags require analyzer='code'",
-                                ));
-                            }
-                        }
-                    }
-
-                    if let Some(analyzer) = analyzer {
-                        params = params
-                            .analyzer(&analyzer)
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    params = FtsTokenizerOptions::from_kwargs(kwargs)?.apply(params)?;
+                    if let Some(document_granularity) = kwargs.get_item("document_granularity")? {
+                        let document_granularity: String = document_granularity.extract()?;
+                        params = params.document_granularity(
+                            DocumentGranularity::try_from(document_granularity.as_str())
+                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                        );
                     }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
-                    }
-                    if let Some(base_tokenizer) = base_tokenizer {
-                        params = params.base_tokenizer(base_tokenizer);
-                    }
-                    if let Some(language) = kwargs.get_item("language")? {
-                        let language: PyBackedStr =
-                            language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|err| {
-                            PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {}",
-                                language, err
-                            ))
-                        })?;
-                    }
-                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params = params.max_token_length(max_token_length.extract()?);
-                    }
-                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params = params.lower_case(lower_case.extract()?);
-                    }
-                    if let Some(stem) = kwargs.get_item("stem")? {
-                        params = params.stem(stem.extract()?);
-                    }
-                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params = params.remove_stop_words(remove_stop_words.extract()?);
-                    }
-                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(custom_stop_words.extract()?);
-                    }
-                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params = params.ascii_folding(ascii_folding.extract()?);
-                    }
-                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
-                        params = params.ngram_min_length(min_ngram_length.extract()?);
-                    }
-                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
-                        params = params.ngram_max_length(max_ngram_length.extract()?);
-                    }
-                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
-                        params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
                     if let Some(block_size) = kwargs.get_item("block_size")? {
                         params = params
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                    }
-                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
-                        params = params.split_identifiers(split_identifiers.extract()?);
-                    }
-                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
-                        params = params.split_on_numerics(split_on_numerics.extract()?);
-                    }
-                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
-                        params = params.preserve_original(preserve_original.extract()?);
-                    }
-                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
-                        params = params.index_operators(index_operators.extract()?);
                     }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
@@ -4163,6 +4089,23 @@ impl SqlQueryBuilder {
         }
     }
 
+    #[pyo3(signature = (blob_handling))]
+    fn blob_handling(&self, blob_handling: &str) -> PyResult<Self> {
+        let blob_handling = match blob_handling {
+            "all_binary" => BlobHandling::AllBinary,
+            "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+            "all_descriptions" => BlobHandling::AllDescriptions,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                )));
+            }
+        };
+        Ok(Self {
+            builder: self.builder.clone().blob_handling(blob_handling),
+        })
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {
@@ -4524,6 +4467,10 @@ impl Dataset {
         rt().block_on(None, self.ds.versions())?.infer_error()
     }
 
+    fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
+        rt().block_on(None, self.ds.version_refs())?.infer_error()
+    }
+
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
         rt().block_on(None, self.ds.tags().list())?.infer_error()
     }
@@ -4728,6 +4675,9 @@ pub fn get_write_params(
         }
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
+        }
+        if let Some(session) = get_dict_opt::<Session>(options, "session")? {
+            p.session = Some(session.inner.clone());
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
@@ -5290,7 +5240,8 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0, document_granularity=None))]
+    #[allow(clippy::too_many_arguments)]
     fn match_query(
         query: String,
         column: String,
@@ -5299,30 +5250,48 @@ impl PyFullTextQuery {
         max_expansions: usize,
         operator: &str,
         prefix_length: u32,
+        document_granularity: Option<&str>,
     ) -> PyResult<Self> {
+        let mut query = MatchQuery::new(query)
+            .with_column(Some(column))
+            .with_boost(boost)
+            .with_fuzziness(fuzziness)
+            .with_max_expansions(max_expansions)
+            .with_operator(
+                Operator::try_from(operator)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+            )
+            .with_prefix_length(prefix_length);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: MatchQuery::new(query)
-                .with_column(Some(column))
-                .with_boost(boost)
-                .with_fuzziness(fuzziness)
-                .with_max_expansions(max_expansions)
-                .with_operator(
-                    Operator::try_from(operator)
-                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
-                )
-                .with_prefix_length(prefix_length)
-                .into(),
+            inner: query.into(),
         })
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column, slop))]
-    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop, document_granularity=None))]
+    fn phrase_query(
+        query: String,
+        column: String,
+        slop: u32,
+        document_granularity: Option<&str>,
+    ) -> PyResult<Self> {
+        let mut query = PhraseQuery::new(query)
+            .with_column(Some(column))
+            .with_slop(slop);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: PhraseQuery::new(query)
-                .with_column(Some(column))
-                .with_slop(slop)
-                .into(),
+            inner: query.into(),
         })
     }
 

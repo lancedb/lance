@@ -44,6 +44,7 @@ from ..dataset import (
     Transaction,
     UpdateResult,
     Version,
+    VersionRef,
 )
 from ..fragment import (
     DataFile,
@@ -62,6 +63,9 @@ from .fragment import (
 )
 from .fragment import (
     RowIdMeta as RowIdMeta,
+)
+from .fragment import (
+    RowIdSequence as RowIdSequence,
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
@@ -106,6 +110,37 @@ def register_lance_metrics_recorder() -> bool: ...
 def lance_metrics_catalog() -> List[MetricDescription]: ...
 def snapshot_lance_metrics() -> List[MetricPoint]: ...
 
+class FtsToken:
+    text: str
+    position: int
+    def __repr__(self) -> str: ...
+
+def tokenize(
+    query: str,
+    *,
+    analyzer: Optional[Literal["text", "code"]] = None,
+    base_tokenizer: Optional[str] = None,
+    language: Optional[str] = None,
+    max_token_length: Optional[int] = 40,
+    lower_case: Optional[bool] = None,
+    stem: Optional[bool] = None,
+    remove_stop_words: Optional[bool] = None,
+    custom_stop_words: Optional[List[str]] = None,
+    ascii_folding: Optional[bool] = None,
+    min_ngram_length: Optional[int] = None,
+    max_ngram_length: Optional[int] = None,
+    prefix_only: Optional[bool] = None,
+    split_identifiers: Optional[bool] = None,
+    split_on_numerics: Optional[bool] = None,
+    preserve_original: Optional[bool] = None,
+    index_operators: Optional[bool] = None,
+) -> List[FtsToken]:
+    """Tokenize an FTS query without an index.
+
+    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    """
+    ...
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
@@ -134,6 +169,12 @@ class CleanupExplanation:
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
 
+class LanceFileWriteSummary:
+    num_rows: int
+    size_bytes: int
+
+    def __repr__(self) -> str: ...
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -148,7 +189,7 @@ class LanceFileWriter:
         max_page_bytes: Optional[int],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
-    def finish(self) -> int: ...
+    def finish(self) -> LanceFileWriteSummary: ...
     def add_schema_metadata(self, key: str, value: str) -> None: ...
     def add_global_buffer(self, data: bytes) -> int: ...
 
@@ -278,6 +319,23 @@ class LanceColumnStatistics:
     size_bytes: int
 
 class _Session:
+    def __init__(
+        self,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_backend: Optional[str | Dict[str, Any]] = None,
+        metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+    ) -> None:
+        """Create a Lance session.
+
+        Cache backends may be backend URI strings such as
+        ``"moka://?capacity=1048576"`` or dictionaries such as
+        ``{"kind": "moka", "options": {"capacity": "1048576"}}``.
+        ``index_cache_backend`` is mutually exclusive with
+        ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
+        exclusive with ``metadata_cache_size_bytes``.
+        """
+        ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
 
@@ -288,6 +346,8 @@ class LanceBlobFile:
     def tell(self) -> int: ...
     def size(self) -> int: ...
     def readall(self) -> bytes: ...
+    def read_range(self, offset: int, length: int) -> bytes: ...
+    def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
 
 class _Dataset:
@@ -427,6 +487,7 @@ class _Dataset:
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
+    def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
     def checkout_version(
@@ -686,6 +747,7 @@ class _Fragment:
     def physical_rows(self) -> int: ...
     @property
     def num_deletions(self) -> int: ...
+    def validate(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...
@@ -712,6 +774,7 @@ def _write_fragments(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -732,6 +795,7 @@ def _write_fragments_transaction(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
@@ -892,6 +956,31 @@ class ScanStatistics:
     indices_loaded: int
     parts_loaded: int
     index_comparisons: int
+    index_cache_hits: int
+    """Number of index cache page lookups where the loader was not executed
+    in this scan. Counts both true cache hits on already-populated entries
+    and coalesced concurrent loads (a follower attached to another caller's
+    in-flight load).
+
+    Instrumented boundaries in this release: BTree, IVF v2 (write-cache scan
+    path), inverted posting list (grouped and per-token) and its per-token
+    metadata, inverted phrase positions, bitmap (Equals / Range / IsIn),
+    ngram, rtree.
+
+    Caveats:
+
+    * IVF v2 streaming scans and legacy v1 IVF partitions bypass the cache
+      by design and are therefore reported as a miss on every call.
+    * A cold posting-list lookup on the grouped inverted layout can record
+      up to two misses (group + per-token metadata) for a single term.
+
+    Uninstrumented paths (HNSW graph pages, quantizer codebooks) do not
+    contribute to either counter."""
+    index_cache_misses: int
+    """Number of index cache page lookups where the loader ran (the page was
+    not resident and had to be materialised, typically from storage). See
+    the sibling ``index_cache_hits`` for the paired counter and the list of
+    instrumented boundaries."""
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.

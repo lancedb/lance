@@ -16,7 +16,7 @@ use crate::index::scalar::infer_scalar_index_details;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::ConcreteFileVersion;
 use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
+use super::versions;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetIndexRemapperOptions {}
@@ -157,18 +158,12 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 }
 
-/// Extract the lance file version from a dataset, floored at V2_0.
+/// Select the exact file version used for index files in this dataset version.
 ///
 /// Index files should never use the legacy format. If the dataset uses legacy
-/// format or doesn't have a version set, V2_0 is used as the minimum.
-pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
-    dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()
-        .ok()
-        .map(|v| v.resolve().max(LanceFileVersion::V2_0))
-        .unwrap_or(LanceFileVersion::V2_0)
+/// format, V2_0 is selected explicitly by the dataset composition table.
+pub(crate) fn dataset_format_version(dataset: &Dataset) -> ConcreteFileVersion {
+    versions::index_file_version(dataset.manifest.data_storage_format.lance_file_format())
 }
 
 #[async_trait]
@@ -203,9 +198,9 @@ mod tests {
     use super::*;
     use crate::dataset::WriteParams;
     use crate::dataset::transaction::{Operation, Transaction};
-    use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
+    use crate::index::{DatasetIndexExt, IntoIndexSegment};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
@@ -323,22 +318,10 @@ mod tests {
         let segments = segments
             .iter()
             .map(|segment| {
-                crate::index::IndexSegment::new(
-                    segment.uuid,
-                    segment
-                        .fragment_bitmap
-                        .as_ref()
-                        .expect("test segment metadata should have fragment coverage")
-                        .iter(),
-                    segment.fields.iter().copied(),
-                    segment
-                        .index_details
-                        .as_ref()
-                        .expect("test segment metadata should have index details")
-                        .clone(),
-                    segment.index_version,
-                    segment.dataset_version,
-                )
+                segment
+                    .clone()
+                    .into_index_segment()
+                    .expect("test segment metadata should convert to an index segment")
             })
             .collect::<Vec<_>>();
 

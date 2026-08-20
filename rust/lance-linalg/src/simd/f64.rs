@@ -45,6 +45,11 @@ impl std::fmt::Debug for f64x4 {
 
 impl From<&[f64]> for f64x4 {
     fn from(value: &[f64]) -> Self {
+        assert!(
+            value.len() >= 4,
+            "f64x4 requires at least 4 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -389,6 +394,11 @@ impl std::fmt::Debug for f64x8 {
 
 impl From<&[f64]> for f64x8 {
     fn from(value: &[f64]) -> Self {
+        assert!(
+            value.len() >= 8,
+            "f64x8 requires at least 8 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -733,6 +743,12 @@ impl SubAssign for f64x8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_slice_conversion_rejects_short_input() {
+        assert!(std::panic::catch_unwind(|| f64x4::from(&[0.0; 3][..])).is_err());
+        assert!(std::panic::catch_unwind(|| f64x8::from(&[0.0; 7][..])).is_err());
+    }
 
     #[test]
     fn test_f64x4_basic_ops() {

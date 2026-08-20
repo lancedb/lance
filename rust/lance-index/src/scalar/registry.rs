@@ -10,7 +10,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use lance_core::{
     Result,
-    cache::{CacheKey, LanceCache, UnsizedCacheKey},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
     deepsize::DeepSizeOf,
 };
 
@@ -355,5 +355,13 @@ impl UnsizedCacheKey for ScalarIndexCacheKey {
 
     fn type_name() -> &'static str {
         "ScalarIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.registry.scalar-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 }

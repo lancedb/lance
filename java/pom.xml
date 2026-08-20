@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>10.0.0-beta.2</version>
+    <version>11.0.0-beta.15</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -29,6 +29,7 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>18.3.0</arrow.version>
+        <opentelemetry.version>1.64.0</opentelemetry.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.43.0</spotless.version>
@@ -122,6 +123,11 @@
             <artifactId>jackson-databind</artifactId>
             <version>2.15.2</version>
         </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
         <!-- AWS SDK for S3 integration testing -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -133,6 +139,18 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>auth</artifactId>
             <version>2.20.26</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <version>${opentelemetry.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

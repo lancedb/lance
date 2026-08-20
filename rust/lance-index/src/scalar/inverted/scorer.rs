@@ -73,6 +73,12 @@ pub(super) fn bm25_doc_weight_with_norm(freq: u32, doc_norm: f32) -> f32 {
 pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
+// The f32 multiply/add/divide sequence in `bm25_doc_weight_with_norm` can
+// round one ULP above the mathematical K1 + 1 limit.  Keep two ULPs of room so
+// every scorer-independent pruning bound remains conservative after its final
+// multiplication by the query weight.
+pub(super) const BM25_DOC_WEIGHT_UPPER_BOUND: f32 = f32::from_bits((K1 + 1.0).to_bits() + 2);
+
 #[inline]
 fn bm25_doc_norm(doc_tokens: u32, avg_doc_length: f32) -> f32 {
     let doc_tokens = doc_tokens as f32;
@@ -149,7 +155,7 @@ impl Scorer for MemBM25Scorer {
     }
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
-        Some(K1 + 1.0)
+        Some(BM25_DOC_WEIGHT_UPPER_BOUND)
     }
 
     fn doc_weight_cache_key(&self) -> Option<u64> {
@@ -164,24 +170,20 @@ pub struct IndexBM25Scorer<'a> {
 }
 
 impl<'a> IndexBM25Scorer<'a> {
-    /// Sync constructor. Reads each partition's cached `total_tokens` via
-    /// `LazyDocSet::total_tokens_cached()`; callers must have already
-    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
-    /// `total_tokens_num`). Panics with a clear message otherwise — this
-    /// is the wand-scoring path where the contract is statically known.
+    /// Sync constructor.  Query setup populates immutable partition stats
+    /// before entering the CPU-only WAND executor.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens: u64 = partitions
+        let stats = partitions
             .iter()
-            .map(|p| {
-                p.docs.total_tokens_cached().expect(
-                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
-                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
-                     `total_tokens_num` first",
+            .map(|partition| {
+                partition.docs.cached_stats().expect(
+                    "IndexBM25Scorer::new requires partition stats to be loaded before WAND",
                 )
             })
-            .sum();
+            .collect::<Vec<_>>();
+        let num_docs = stats.iter().map(|stats| stats.num_docs).sum();
+        let total_tokens: u64 = stats.iter().map(|stats| stats.total_tokens).sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
         Self {
             partitions,
@@ -223,7 +225,7 @@ impl Scorer for IndexBM25Scorer<'_> {
     }
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
-        Some(K1 + 1.0)
+        Some(BM25_DOC_WEIGHT_UPPER_BOUND)
     }
 
     fn doc_weight_cache_key(&self) -> Option<u64> {
@@ -235,4 +237,19 @@ impl Scorer for IndexBM25Scorer<'_> {
 pub fn idf(token_docs: usize, num_docs: usize) -> f32 {
     let num_docs = num_docs as f32;
     ((num_docs - token_docs as f32 + 0.5) / (token_docs as f32 + 0.5) + 1.0).ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bm25_doc_weight_upper_bound_covers_f32_rounding() {
+        let scorer = MemBM25Scorer::new(6_242_289_027, 2, HashMap::new());
+        let doc_weight = scorer.doc_weight(3_926_982_873, 4_078_552_115);
+
+        assert_eq!(doc_weight.to_bits(), 0x400c_ccce);
+        assert!(doc_weight > K1 + 1.0);
+        assert!(scorer.doc_weight_upper_bound().unwrap() >= doc_weight);
+    }
 }

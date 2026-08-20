@@ -543,23 +543,7 @@ async fn do_load_shuffled_vectors(
         base_id: None,
         files: Some(files),
     };
-    let segment = IndexSegment::new(
-        metadata.uuid,
-        metadata
-            .fragment_bitmap
-            .as_ref()
-            .expect("vector metadata should include fragment coverage")
-            .iter(),
-        metadata.fields.iter().copied(),
-        metadata
-            .index_details
-            .as_ref()
-            .expect("vector metadata should include index details")
-            .clone(),
-        metadata.index_version,
-        metadata.dataset_version,
-    );
-    ds.commit_existing_index_segments(index_name, column, vec![segment])
+    ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await
         .infer_error()?;
 
@@ -708,7 +692,7 @@ impl PyIndexDescription {
             .map(|field| {
                 dataset
                     .schema()
-                    .field_path(*field as i32)
+                    .field_path_minimal(*field as i32)
                     .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();
