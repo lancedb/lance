@@ -1920,63 +1920,86 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
-        let manifest_metas: Vec<_> = self
-            .object_store
-            .read_dir_all(&versions_dir, None)
-            .try_collect()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to list manifest files under '{}': {}",
-                        versions_dir, e
-                    ),
-                })
-            })?;
-
-        let is_v2_naming = manifest_metas
-            .first()
-            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
-
-        let mut table_versions: Vec<TableVersion> = manifest_metas
-            .into_iter()
-            .filter_map(|meta| {
-                let filename = meta.location.filename()?;
-                let actual_version = Self::manifest_version_from_filename(filename)?;
-
-                Some(TableVersion {
-                    version: actual_version as i64,
-                    manifest_path: meta.location.to_string(),
-                    manifest_size: Some(meta.size as i64),
-                    e_tag: meta.e_tag,
-                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
-                    metadata: None,
-                })
+        let mut stream = self.object_store.read_dir_all(&versions_dir, None);
+        let list_err = |e: lance_core::Error| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to list manifest files under '{}': {}",
+                    versions_dir, e
+                ),
             })
-            .collect();
-
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
-
-        let needs_sort = if list_is_ordered {
-            if is_v2_naming {
-                !descending
-            } else {
-                descending
-            }
-        } else {
-            true
         };
 
-        if needs_sort {
+        // Read the first entry to detect the naming scheme. V2 filenames are a
+        // fixed 29 chars (`{u64::MAX - version:020}.manifest`); V1 filenames
+        // vary in length.
+        let first = stream.try_next().await.map_err(list_err)?;
+        let is_v2_naming = first
+            .as_ref()
+            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
+
+        // On a lexically-ordered store the list stream already arrives in a
+        // fixed order: V2 filenames invert the version (`u64::MAX - version`),
+        // so ascending keys mean descending versions. When the caller wants
+        // that same order, the stream is already sorted and we can stop after
+        // `limit` entries instead of collecting every manifest. This is the
+        // hot path for `get_latest_version` (descending, limit 1): a table with
+        // many versions would otherwise paginate the whole `_versions/`
+        // directory (one list page per ~1k objects) on every resolution.
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let stream_matches_request = list_is_ordered
+            && if is_v2_naming {
+                descending
+            } else {
+                !descending
+            };
+        let early_stop_at = limit
+            .filter(|_| stream_matches_request)
+            .map(|limit| limit.max(0) as usize);
+
+        let mut table_versions: Vec<TableVersion> = Vec::new();
+        let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| {
+            let Some(filename) = meta.location.filename() else {
+                return;
+            };
+            let Some(actual_version) = Self::manifest_version_from_filename(filename) else {
+                return;
+            };
+            out.push(TableVersion {
+                version: actual_version as i64,
+                manifest_path: meta.location.to_string(),
+                manifest_size: Some(meta.size as i64),
+                e_tag: meta.e_tag,
+                timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+                metadata: None,
+            });
+        };
+
+        if let Some(meta) = first {
+            push_meta(meta, &mut table_versions);
+        }
+        while early_stop_at.is_none_or(|n| table_versions.len() < n) {
+            match stream.try_next().await.map_err(list_err)? {
+                Some(meta) => push_meta(meta, &mut table_versions),
+                None => break,
+            }
+        }
+
+        // The early-stop path already yields entries in the requested order;
+        // only the collected-everything path needs an explicit sort. The first
+        // entry is pushed unconditionally, so re-enforce the limit either way
+        // (covers limit=0).
+        if let Some(n) = early_stop_at {
+            table_versions.truncate(n);
+        } else {
             if descending {
                 table_versions.sort_by_key(|v| std::cmp::Reverse(v.version));
             } else {
                 table_versions.sort_by_key(|v| v.version);
             }
-        }
-
-        if let Some(limit) = limit {
-            table_versions.truncate(limit as usize);
+            if let Some(limit) = limit {
+                table_versions.truncate(limit.max(0) as usize);
+            }
         }
 
         Ok(table_versions)
@@ -6295,6 +6318,84 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    /// `list_versions_under` has two paths: a streaming early-stop path on
+    /// lexically-ordered stores when the stream order matches the requested
+    /// order, and a collect-then-sort path otherwise. Both must return the
+    /// same, correctly-ordered results for every descending/limit combination.
+    #[tokio::test]
+    async fn test_list_versions_under_ordering_and_limit() {
+        use lance_table::io::commit::ManifestNamingScheme;
+
+        async fn seed_and_check(ns: &DirectoryNamespace) {
+            let table_path = ns.base_path.clone().join("lv_test.lance");
+            for v in 1..=7u64 {
+                let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
+                ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+            }
+            fn versions(r: &[TableVersion]) -> Vec<i64> {
+                r.iter().map(|t| t.version).collect()
+            }
+
+            // descending + limit: early-stop path on ordered stores.
+            let got = ns
+                .list_versions_under(&table_path, true, Some(1))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7]);
+            let got = ns
+                .list_versions_under(&table_path, true, Some(3))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5]);
+
+            // ascending + limit: stream order does not match on ordered
+            // stores (V2 inverts), so this exercises collect-then-sort.
+            let got = ns
+                .list_versions_under(&table_path, false, Some(2))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![1, 2]);
+
+            // no limit: full listing, both directions.
+            let got = ns
+                .list_versions_under(&table_path, true, None)
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+            let got = ns
+                .list_versions_under(&table_path, false, None)
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![1, 2, 3, 4, 5, 6, 7]);
+
+            // limit edge cases: zero and beyond the version count.
+            let got = ns
+                .list_versions_under(&table_path, true, Some(0))
+                .await
+                .unwrap();
+            assert!(got.is_empty());
+            let got = ns
+                .list_versions_under(&table_path, true, Some(100))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+        }
+
+        // Ordered store (memory://): descending requests take the early-stop
+        // path without listing the whole directory.
+        let ns_mem = DirectoryNamespaceBuilder::new("memory://lv-test")
+            .build()
+            .await
+            .unwrap();
+        assert!(ns_mem.object_store.list_is_lexically_ordered);
+        seed_and_check(&ns_mem).await;
+
+        // Unordered store (local fs): always collect-then-sort.
+        let (ns_fs, _tmp) = create_test_namespace().await;
+        assert!(!ns_fs.object_store.list_is_lexically_ordered);
+        seed_and_check(&ns_fs).await;
     }
 
     #[derive(Debug)]
