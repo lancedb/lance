@@ -123,12 +123,12 @@ public class DatasetTest {
   @Test
   void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      // Test default version (V2_1)
+      // Test default version (V2_2)
       String defaultPath = tempDir.resolve("default_version").toString();
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_2, dataset.getLanceFileFormatVersion());
         WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
         assertEquals("lance", writerVersion.getLibrary());
         assertFalse(writerVersion.getVersion().isEmpty());
