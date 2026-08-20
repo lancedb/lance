@@ -21,7 +21,7 @@ type DataFileIdentity = (Option<u32>, String);
 struct FieldIdRemap {
     canonical_ids: HashSet<i32>,
     explicit_ids: HashMap<i32, i32>,
-    standalone_ids: HashMap<i32, i32>,
+    raw_source_ids: HashMap<i32, i32>,
 }
 
 /// Transient schema-metadata marker used by bindings for raw Arrow input.
@@ -72,7 +72,7 @@ pub fn canonicalize_stable_field_ids(
         } => {
             let field_id_remap =
                 canonicalize_schema(manifest, schema, true, false, raw_arrow_schema)?;
-            remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new());
+            remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new())?;
         }
         Operation::Project { schema, .. } if raw_arrow_schema => {
             let Some(manifest) = manifest else {
@@ -95,7 +95,7 @@ pub fn canonicalize_stable_field_ids(
             if raw_arrow_schema {
                 let field_id_remap =
                     canonicalize_schema(Some(manifest), schema, false, false, false)?;
-                remap_fragment_field_ids(fragments, &field_id_remap, &retained_files);
+                remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
             }
             canonicalize_merge_replacements(manifest, schema, fragments, &retained_files)?;
         }
@@ -147,7 +147,7 @@ fn canonicalize_merge_replacements(
                 .insert(original.id, canonical.id);
         }
     }
-    remap_fragment_field_ids(fragments, &field_id_remap, retained_files);
+    remap_fragment_field_ids(fragments, &field_id_remap, retained_files)?;
     Ok(())
 }
 
@@ -188,9 +188,16 @@ fn canonicalize_schema(
     schema: &mut Schema,
     replaces_all_identities: bool,
     allow_id_binding: bool,
-    remap_standalone_ids: bool,
+    remap_raw_source_ids: bool,
 ) -> Result<FieldIdRemap> {
     let original = schema.clone();
+    let raw_source = if remap_raw_source_ids {
+        let mut raw_source = original.clone();
+        raw_source.try_set_field_id(None)?;
+        Some(raw_source)
+    } else {
+        None
+    };
 
     let max_existing_id = manifest.map(Manifest::max_field_id);
     if replaces_all_identities || manifest.is_none() {
@@ -205,25 +212,21 @@ fn canonicalize_schema(
     schema.verify_primary_key()?;
 
     let mut field_id_remap = FieldIdRemap::default();
-    for (ordinal, (original, canonical)) in original
-        .fields_pre_order()
-        .zip(schema.fields_pre_order())
-        .enumerate()
-    {
+    for (original, canonical) in original.fields_pre_order().zip(schema.fields_pre_order()) {
         field_id_remap.canonical_ids.insert(canonical.id);
-        // Standalone fragment writers assign zero-based IDs when raw Arrow
-        // fields omit metadata. Overwrite may later commit those files against
-        // an existing stable dataset, so preserve that source mapping too.
-        if remap_standalone_ids {
-            field_id_remap
-                .standalone_ids
-                .insert(ordinal as i32, canonical.id);
-        }
         if original.id >= 0 {
             field_id_remap
                 .explicit_ids
                 .insert(original.id, canonical.id);
         }
+    }
+    if let Some(raw_source) = raw_source {
+        field_id_remap.raw_source_ids.extend(
+            raw_source
+                .fields_pre_order()
+                .zip(schema.fields_pre_order())
+                .map(|(source, canonical)| (source.id, canonical.id)),
+        );
     }
     Ok(field_id_remap)
 }
@@ -286,39 +289,54 @@ fn remap_fragment_field_ids(
     fragments: &mut [Fragment],
     field_id_remap: &FieldIdRemap,
     retained_files: &HashSet<DataFileIdentity>,
-) {
+) -> Result<()> {
     for fragment in fragments {
-        // A dataset-aware staged overwrite already uses canonical IDs. Require
-        // the whole fragment to cover the canonical schema before skipping so
-        // an overlapping source ID in one split file cannot mask a remap.
-        let canonical_fragment = !field_id_remap.standalone_ids.is_empty()
-            && fragment
+        let source_ids = if field_id_remap.raw_source_ids.is_empty() {
+            &field_id_remap.explicit_ids
+        } else {
+            // Raw Arrow overwrite fragments may have been written either by a
+            // standalone writer using the source schema IDs or by a
+            // dataset-aware writer using canonical IDs. Resolve that namespace
+            // once for the whole fragment so split files cannot disagree. If
+            // both interpretations are possible and produce different
+            // identities then there is no safe mapping without provenance.
+            let fragment_field_ids = fragment
                 .referenced_lance_files()
                 .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
                 .flat_map(|file| file.fields.iter().copied())
                 .filter(|field_id| *field_id >= 0)
-                .collect::<HashSet<_>>()
-                == field_id_remap.canonical_ids;
+                .collect::<HashSet<_>>();
+            let canonical_source = fragment_field_ids
+                .iter()
+                .all(|field_id| field_id_remap.canonical_ids.contains(field_id));
+            let raw_source = fragment_field_ids
+                .iter()
+                .all(|field_id| field_id_remap.raw_source_ids.contains_key(field_id));
+            let raw_changes_identity = fragment_field_ids
+                .iter()
+                .any(|field_id| field_id_remap.raw_source_ids.get(field_id) != Some(field_id));
+
+            match (canonical_source, raw_source, raw_changes_identity) {
+                (true, true, true) => {
+                    return Err(Error::invalid_input(format!(
+                        "Fragment {} has ambiguous raw Arrow field IDs; its file mappings can be interpreted as either source or canonical identities",
+                        fragment.id
+                    )));
+                }
+                (true, _, _) => continue,
+                (false, true, _) => &field_id_remap.raw_source_ids,
+                (false, false, _) => {
+                    return Err(Error::invalid_input(format!(
+                        "Fragment {} field IDs do not match either the raw Arrow source schema or the canonical replacement schema",
+                        fragment.id
+                    )));
+                }
+            }
+        };
         for file in fragment.referenced_lance_files_mut() {
             if retained_files.contains(&(file.base_id, file.path.clone())) {
                 continue;
             }
-            if canonical_fragment {
-                continue;
-            }
-            let non_negative_ids = file
-                .fields
-                .iter()
-                .copied()
-                .filter(|field_id| *field_id >= 0);
-            let source_ids = if non_negative_ids
-                .clone()
-                .all(|field_id| field_id_remap.explicit_ids.contains_key(&field_id))
-            {
-                &field_id_remap.explicit_ids
-            } else {
-                &field_id_remap.standalone_ids
-            };
             for field_id in std::sync::Arc::make_mut(&mut file.fields) {
                 if let Some(canonical_id) = source_ids.get(field_id) {
                     *field_id = *canonical_id;
@@ -326,6 +344,7 @@ fn remap_fragment_field_ids(
             }
         }
     }
+    Ok(())
 }
 
 /// Validate the operation is valid for the given manifest.
@@ -1169,6 +1188,77 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[1, 2]);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_uses_one_raw_namespace_for_split_files() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        for field in &mut schema.fields {
+            field.id = -1;
+        }
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut fragment = fragment_with_file_fields(0, "b.lance", vec![0]);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields("c.lance", vec![1], None));
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
+        assert_eq!(fragments[0].files[1].fields.as_ref(), &[2]);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_rejects_ambiguous_raw_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 2;
+        schema.fields[1].id = 1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![2, 1])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }
 
     #[test]
