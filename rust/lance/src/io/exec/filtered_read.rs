@@ -379,6 +379,12 @@ struct EncodedPredicateSelection {
     predicate_scan_counted: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EncodedPredicateAutoDecision {
+    encoding: PrimitivePredicateEncoding,
+    apply: bool,
+}
+
 impl ScopedFragmentRead {
     fn frag_read_config(&self) -> FragReadConfig {
         let mut config = FragReadConfig::default()
@@ -479,6 +485,7 @@ pub struct FilteredReadGlobalMetrics {
     encoded_predicate_predicted_read_rows: Count,
     encoded_predicate_selected_rows: Count,
     encoded_predicate_selected_ranges: Count,
+    encoded_predicate_auto_decision: OnceCell<EncodedPredicateAutoDecision>,
     io_metrics: IoMetrics,
 }
 
@@ -502,6 +509,7 @@ impl FilteredReadGlobalMetrics {
                 .new_count("encoded_predicate_selected_rows", 0),
             encoded_predicate_selected_ranges: metrics
                 .new_count("encoded_predicate_selected_ranges", 0),
+            encoded_predicate_auto_decision: OnceCell::new(),
             io_metrics: IoMetrics::new(metrics, 0),
         }
     }
@@ -1667,7 +1675,6 @@ impl FilteredReadStream {
             Err(Error::NotSupported { .. }) => None,
             Err(error) => return Err(error),
         };
-
         if let Some(PrimitivePredicatePlan { outcome, .. }) = plan {
             match outcome {
                 PrimitivePredicateOutcome::AlwaysFalse => {
@@ -1711,23 +1718,70 @@ impl FilteredReadStream {
         let mut predicate_scan_ranges = 0_usize;
         let selected_ranges = if mode == EncodedPredicateMode::Auto {
             let plan = plan.expect("auto mode requires a metadata plan");
-            if plan.encoding == PrimitivePredicateEncoding::Constant {
+            let decision = global_metrics
+                .encoded_predicate_auto_decision
+                .get_or_try_init(|| async {
+                    if plan.encoding == PrimitivePredicateEncoding::Constant {
+                        return Ok::<_, Error>(EncodedPredicateAutoDecision {
+                            encoding: plan.encoding,
+                            apply: false,
+                        });
+                    }
+                    let sample_ranges = encoded_predicate_sample_ranges(&fragment_read_task.ranges);
+                    let sampled_rows = total_range_rows(&sample_ranges);
+                    global_metrics
+                        .encoded_predicate_sample_rows
+                        .add(sampled_rows as usize);
+                    let Some(sample_selection) = Self::evaluate_encoded_predicate_ranges(
+                        &predicate_reader,
+                        sample_ranges,
+                        fragment_read_task.batch_size,
+                        predicate_schema.clone(),
+                        predicate,
+                    )
+                    .await?
+                    else {
+                        return Ok(EncodedPredicateAutoDecision {
+                            encoding: plan.encoding,
+                            apply: false,
+                        });
+                    };
+                    let sample_selected_rows = total_range_rows(&sample_selection);
+                    global_metrics
+                        .encoded_predicate_sample_selected_rows
+                        .add(sample_selected_rows as usize);
+                    global_metrics
+                        .encoded_predicate_sample_selected_ranges
+                        .add(sample_selection.len());
+                    global_metrics.encoded_predicate_predicted_read_rows.add(
+                        encoded_predicate_predicted_read_rows(
+                            sample_selected_rows,
+                            sample_selection.len(),
+                        ) as usize,
+                    );
+                    Ok(EncodedPredicateAutoDecision {
+                        encoding: plan.encoding,
+                        apply: encoded_predicate_auto_accepts(
+                            plan.encoding,
+                            sampled_rows,
+                            sample_selected_rows,
+                            sample_selection.len(),
+                        ),
+                    })
+                })
+                .await?;
+            if decision.encoding != plan.encoding || !decision.apply {
                 global_metrics.encoded_predicate_rejected.add(1);
                 global_metrics
                     .io_metrics
                     .record(&fragment_read_task.scan_scheduler);
                 return Ok(None);
             }
-            let sample_ranges = encoded_predicate_sample_ranges(&fragment_read_task.ranges);
-            let sampled_rows = total_range_rows(&sample_ranges);
-            global_metrics
-                .encoded_predicate_sample_rows
-                .add(sampled_rows as usize);
-            let Some(sample_selection) = Self::evaluate_encoded_predicate_ranges(
+            let Some(full_selection) = Self::evaluate_encoded_predicate_ranges(
                 &predicate_reader,
-                sample_ranges.clone(),
+                fragment_read_task.ranges.clone(),
                 fragment_read_task.batch_size,
-                predicate_schema.clone(),
+                predicate_schema,
                 predicate,
             )
             .await?
@@ -1738,53 +1792,9 @@ impl FilteredReadStream {
                     .record(&fragment_read_task.scan_scheduler);
                 return Ok(None);
             };
-            let sample_selected_rows = total_range_rows(&sample_selection);
-            global_metrics
-                .encoded_predicate_sample_selected_rows
-                .add(sample_selected_rows as usize);
-            global_metrics
-                .encoded_predicate_sample_selected_ranges
-                .add(sample_selection.len());
-            global_metrics.encoded_predicate_predicted_read_rows.add(
-                encoded_predicate_predicted_read_rows(sample_selected_rows, sample_selection.len())
-                    as usize,
-            );
-            if !encoded_predicate_auto_accepts(
-                plan.encoding,
-                sampled_rows,
-                sample_selected_rows,
-                sample_selection.len(),
-            ) {
-                global_metrics.encoded_predicate_rejected.add(1);
-                global_metrics
-                    .io_metrics
-                    .record(&fragment_read_task.scan_scheduler);
-                return Ok(None);
-            }
-            predicate_scan_rows += sampled_rows;
-            predicate_scan_ranges += sample_ranges.len();
-            if sample_ranges == fragment_read_task.ranges {
-                sample_selection
-            } else {
-                let Some(full_selection) = Self::evaluate_encoded_predicate_ranges(
-                    &predicate_reader,
-                    fragment_read_task.ranges.clone(),
-                    fragment_read_task.batch_size,
-                    predicate_schema,
-                    predicate,
-                )
-                .await?
-                else {
-                    global_metrics.encoded_predicate_rejected.add(1);
-                    global_metrics
-                        .io_metrics
-                        .record(&fragment_read_task.scan_scheduler);
-                    return Ok(None);
-                };
-                predicate_scan_rows += total_range_rows(&fragment_read_task.ranges);
-                predicate_scan_ranges += fragment_read_task.ranges.len();
-                full_selection
-            }
+            predicate_scan_rows += total_range_rows(&fragment_read_task.ranges);
+            predicate_scan_ranges += fragment_read_task.ranges.len();
+            full_selection
         } else {
             let Some(selection) = Self::evaluate_encoded_predicate_ranges(
                 &predicate_reader,
@@ -4329,7 +4339,7 @@ mod tests {
                 reader,
                 tmp_path.as_str(),
                 Some(WriteParams {
-                    max_rows_per_file: num_rows as usize,
+                    max_rows_per_file: 50_000,
                     ..Default::default()
                 }),
             )
@@ -4340,33 +4350,44 @@ mod tests {
         let (output_rows, metrics) =
             execute_encoded_predicate_test_scan(dataset.clone(), "constant = 8").await;
         assert_eq!(output_rows, 0);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 4);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
         assert_eq!(metric_value(&metrics, "encoded_predicate_selected_rows"), 0);
 
         let (output_rows, metrics) =
             execute_encoded_predicate_test_scan(dataset.clone(), "constant = 7").await;
         assert_eq!(output_rows, num_rows as usize);
         assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+            50_000
         );
 
         let (output_rows, metrics) =
             execute_encoded_predicate_test_scan(dataset.clone(), "rle = 1").await;
         assert_eq!(output_rows, 4096);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 4);
         assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
 
         let (output_rows, metrics) =
-            execute_encoded_predicate_test_scan(dataset, "bitpack = 1").await;
+            execute_encoded_predicate_test_scan(dataset.clone(), "bitpack = 1").await;
         assert_eq!(output_rows, 196);
         assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 1);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
         assert_eq!(
             metric_value(&metrics, "encoded_predicate_sample_rows"),
-            ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
+            50_000
+        );
+
+        let (output_rows, metrics) =
+            execute_encoded_predicate_test_scan(dataset, "bitpack = 2048").await;
+        assert_eq!(output_rows, 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 4);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_sample_rows"),
+            50_000
         );
     }
 
