@@ -854,6 +854,39 @@ impl PostingIterator {
         self
     }
 
+    /// Create an independent cursor over the same immutable posting payload.
+    ///
+    /// Staged cross-column execution uses one cursor to enumerate exact
+    /// membership before asynchronous candidate-side document reads, then a
+    /// fresh cursor to compute the canonical score. Arrow buffers and grouped
+    /// term tables remain shared; only mutable decode and position state is
+    /// recreated.
+    pub(super) fn fork_from_start(&self) -> Self {
+        let compressed = match &self.list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
+        };
+        let mut posting = Self {
+            token: self.token.clone(),
+            token_id: self.token_id,
+            position: self.position,
+            query_weight: self.query_weight,
+            list: self.list.clone(),
+            index: 0,
+            block_idx: 0,
+            current_doc: None,
+            approximate_upper_bound: self.approximate_upper_bound,
+            use_scorer_upper_bound: self.use_scorer_upper_bound,
+            grouped_terms: self.grouped_terms.clone(),
+            position_scratch: RefCell::new(Some(Vec::new())),
+            compressed,
+        };
+        posting.refresh_current_doc();
+        posting
+    }
+
     #[inline]
     pub(crate) fn term_index(&self) -> u32 {
         self.position
@@ -932,6 +965,16 @@ impl PostingIterator {
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
         self.current_doc
+    }
+
+    /// The posting's current local document before it is moved into a scorer.
+    ///
+    /// Cross-partition row-address merging uses this only to derive a
+    /// conservative lower bound for lazy source activation. It is not an
+    /// exact match decision: visibility and phrase confirmation still happen
+    /// in [`WandCursor`].
+    pub(super) fn current_doc_id(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
     }
 
     fn refresh_current_doc(&mut self) {
@@ -1596,12 +1639,17 @@ pub struct DocCandidate<C> {
 
 /// Document-side contract consumed by WAND.  Implementations fix candidate
 /// identity and visibility before the CPU executor starts.
-type FlatDocuments<'a> = (usize, Box<dyn Iterator<Item = (u64, u64)> + 'a>);
+pub(super) type FlatDocuments<'a> = (usize, Box<dyn Iterator<Item = (u64, u64)> + 'a>);
 
 pub(super) trait WandDocuments {
     type Candidate: Copy + Debug;
 
     fn len(&self) -> usize;
+    /// Conservative upper bound on documents that can survive visibility.
+    /// Used only to estimate scorer cost; iteration remains authoritative.
+    fn visible_cost_upper_bound(&self) -> usize {
+        self.len()
+    }
     fn scoring_norms(&self) -> Option<&[u8]>;
     fn scoring_num_tokens(&self, doc_id: u32) -> u32;
     fn doc_length(&self, doc: &DocInfo) -> u32;
@@ -1679,6 +1727,10 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn len(&self) -> usize {
         self.lengths.len()
+    }
+
+    fn visible_cost_upper_bound(&self) -> usize {
+        self.visibility.len(self.lengths.len())
     }
 
     fn scoring_norms(&self) -> Option<&[u8]> {
@@ -4584,7 +4636,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                     .fold(0, usize::saturating_add),
             ),
         }
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .min(documents.visible_cost_upper_bound());
         Self {
             wand: Wand::new(operator, postings.into_iter(), documents, scorer),
             phrase_slop: params.phrase_slop,
@@ -4918,6 +4971,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::documents::resident_row_address_projection_for_test;
     use super::super::impact::build_impact_skip_data;
     use super::*;
     use crate::scalar::inverted::scorer::{IndexBM25Scorer, MemBM25Scorer};
@@ -4932,6 +4986,129 @@ mod tests {
             },
         },
     };
+
+    struct CostOnlyDocuments {
+        total_docs: usize,
+        visible_cost_upper_bound: usize,
+    }
+
+    impl WandDocuments for CostOnlyDocuments {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.total_docs
+        }
+
+        fn visible_cost_upper_bound(&self) -> usize {
+            self.visible_cost_upper_bound
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
+            1
+        }
+
+        fn doc_length(&self, _doc: &DocInfo) -> u32 {
+            1
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            Some(doc.doc_id())
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            Some(u64::from(doc_id))
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, _doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
+            1
+        }
+    }
+
+    #[test]
+    fn wand_cursor_cost_uses_materialized_visibility_upper_bound() {
+        let total_docs = 10;
+        let selected = DocVisibility::Selected(roaring::RoaringBitmap::from_iter([1, 7]));
+        let selected_bound = <&DocVisibility as ModernVisibility>::len(&&selected, total_docs);
+
+        let filtered = DocVisibility::Filtered {
+            projection: resident_row_address_projection_for_test((0..total_docs as u64).collect()),
+            mask: Arc::new(RowAddrMask::all_rows()),
+        };
+        let filtered_bound = <&DocVisibility as ModernVisibility>::len(&&filtered, total_docs);
+        let all_bound = AllModernDocuments.len(total_docs);
+
+        assert_eq!(selected_bound, 2);
+        assert_eq!(filtered_bound, total_docs);
+        assert_eq!(all_bound, total_docs);
+
+        let scorer = Arc::new(MemBM25Scorer::new(
+            total_docs as u64,
+            total_docs,
+            std::collections::HashMap::from([("term".to_owned(), 8)]),
+        ));
+        let posting = || {
+            PostingIterator::new(
+                "term".to_owned(),
+                0,
+                0,
+                generate_posting_list((0..8).collect(), 1.0, None, true),
+                total_docs,
+            )
+        };
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let selected_documents = CostOnlyDocuments {
+            total_docs,
+            visible_cost_upper_bound: selected_bound,
+        };
+        let selected_cursor = WandCursor::new(
+            Operator::Or,
+            vec![posting()],
+            &selected_documents,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        assert_eq!(selected_cursor.cost(), 2);
+
+        for visible_cost_upper_bound in [filtered_bound, all_bound] {
+            let documents = CostOnlyDocuments {
+                total_docs,
+                visible_cost_upper_bound,
+            };
+            let cursor = WandCursor::new(
+                Operator::Or,
+                vec![posting()],
+                &documents,
+                scorer.clone(),
+                &params,
+                &metrics,
+            );
+            assert_eq!(cursor.cost(), 8);
+        }
+
+        let mut complete_docs = DocSet::default();
+        for doc_id in 0..total_docs {
+            complete_docs.append(doc_id as u64, 1);
+        }
+        assert_eq!(
+            WandDocuments::visible_cost_upper_bound(&complete_docs),
+            total_docs
+        );
+    }
 
     #[test]
     fn conservative_score_sum_covers_query_order_f32_rounding() {
@@ -5814,6 +5991,30 @@ mod tests {
 
         iter.next(num_docs as u64 + 10);
         assert!(iter.doc().is_none());
+    }
+
+    #[test]
+    fn posting_iterator_fork_restarts_shared_compressed_payload() {
+        let num_docs = (BLOCK_SIZE * 2 + 5) as u32;
+        let posting = generate_posting_list((0..num_docs).collect(), 1.0, None, true);
+        let mut original =
+            PostingIterator::new(String::from("term"), 7, 3, posting, num_docs as usize);
+
+        original.next(BLOCK_SIZE as u64 + 3);
+        assert_eq!(
+            original.doc().map(|doc| doc.doc_id()),
+            Some(BLOCK_SIZE as u64 + 3)
+        );
+
+        let mut replay = original.fork_from_start();
+        assert_eq!(replay.doc().map(|doc| doc.doc_id()), Some(0));
+        replay.next(5);
+        assert_eq!(replay.doc().map(|doc| doc.doc_id()), Some(5));
+        assert_eq!(
+            original.doc().map(|doc| doc.doc_id()),
+            Some(BLOCK_SIZE as u64 + 3),
+            "fork advancement must not mutate the membership cursor"
+        );
     }
 
     #[test]
