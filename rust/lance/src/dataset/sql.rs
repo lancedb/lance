@@ -64,11 +64,9 @@ impl SqlQueryBuilder {
     /// Specify if the query result should include the internal row id.
     /// If true, the query result will include an additional column named "_rowid".
     ///
-    /// The column is appended automatically only for queries whose output rows
-    /// map one-to-one to dataset rows (plain projections/filters). For queries
-    /// that change row cardinality (i.e., DISTINCT, GROUP BY, aggregates, ...),
-    /// this flag makes "_rowid" available to reference explicitly in the SQL
-    /// text but does not append it to the result.
+    /// The column is appended only when output rows map one-to-one to dataset
+    /// rows. For other queries (DISTINCT, GROUP BY, aggregates, ...) it is not
+    /// appended, but can still be referenced explicitly in the SQL text.
     pub fn with_row_id(mut self, row_id: bool) -> Self {
         self.with_row_id = row_id;
         self
@@ -77,11 +75,9 @@ impl SqlQueryBuilder {
     /// Specify if the query result should include the internal row address.
     /// If true, the query result will include an additional column named "_rowaddr".
     ///
-    /// The column is appended automatically only for queries whose output rows
-    /// map one-to-one to dataset rows (plain projections/filters). For queries
-    /// that change row cardinality (i.e., DISTINCT, GROUP BY, aggregates, ...),
-    /// this flag makes "_rowaddr" available to reference explicitly in the SQL
-    /// text but does not append it to the result.
+    /// The column is appended only when output rows map one-to-one to dataset
+    /// rows. For other queries (DISTINCT, GROUP BY, aggregates, ...) it is not
+    /// appended, but can still be referenced explicitly in the SQL text.
     pub fn with_row_addr(mut self, row_addr: bool) -> Self {
         self.with_row_addr = row_addr;
         self
@@ -117,7 +113,7 @@ impl SqlQueryBuilder {
         // (aggregates, DISTINCT, joins, ...) the injection would be ambiguous
         // or would change the query's relational results.
         let plan =
-            if preserves_source_rows(&plan) && project_system_columns(&mut projected, &columns) {
+            if preserves_row_identity(&plan) && project_system_columns(&mut projected, &columns) {
                 match state.statement_to_plan(projected).await {
                     Ok(plan) => plan,
                     // The rewritten statement can still fail to plan in corner
@@ -141,18 +137,25 @@ impl SqlQueryBuilder {
 /// This is a conservative whitelist of row-preserving operators. Anything
 /// else (aggregates, DISTINCT, joins, unions, windows, ...) collapses,
 /// duplicates, or synthesizes rows, so system columns are not injected there.
-fn preserves_source_rows(plan: &LogicalPlan) -> bool {
+fn preserves_row_identity(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::TableScan(_) => true,
         LogicalPlan::Projection(_)
         | LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
-        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|p| preserves_source_rows(p)),
+        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|p| preserves_row_identity(p)),
         _ => false,
     }
 }
 
+/// Appends each enabled system column in `columns` to the statement's SELECT
+/// list unless the query already projects it (directly or via a wildcard).
+/// Returns true if the statement was modified.
+///
+/// Only rewrites top-level `SELECT` statements; the caller must separately
+/// verify that the query preserves row identity (see
+/// [`preserves_row_identity`]) before planning the rewritten statement.
 fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)]) -> bool {
     let DFStatement::Statement(statement) = statement else {
         return false;
@@ -166,21 +169,30 @@ fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)])
 
     let mut changed = false;
     for &(enabled, name) in columns {
-        if enabled
-            && !select
-                .projection
-                .iter()
-                .any(|item| projects_column(item, name))
-        {
-            select
-                .projection
-                .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))));
-            changed = true;
+        if !enabled {
+            continue;
         }
+        let already_projected = select
+            .projection
+            .iter()
+            .any(|item| projects_column(item, name));
+        if already_projected {
+            continue;
+        }
+        select
+            .projection
+            .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))));
+        changed = true;
     }
     changed
 }
 
+/// Returns true if the SELECT item already yields the column `name`, either
+/// as a bare/qualified identifier (e.g. `_rowid`, `t._rowid`) or through a
+/// wildcard (`*`, `t.*`), so injecting it again would duplicate the column.
+///
+/// Expressions that merely reference the column (e.g. `_rowid + 1`, aliases)
+/// intentionally don't count: they produce a different output column.
 fn projects_column(item: &SelectItem, name: &str) -> bool {
     match item {
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
@@ -399,6 +411,46 @@ mod tests {
         );
         assert_eq!(
             batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+    }
+
+    #[rstest]
+    #[case::lowercase("SELECT x, _rowid FROM dataset", vec!["x", "_rowid"])]
+    #[case::unquoted_uppercase("SELECT x, _ROWID FROM dataset", vec!["x", "_rowid"])]
+    #[case::quoted(r#"SELECT x, "_rowid" FROM dataset"#, vec!["x", "_rowid"])]
+    #[case::table_qualified("SELECT x, dataset._rowid FROM dataset", vec!["x", "_rowid"])]
+    #[case::expression_reference("SELECT _rowid + 1 AS y FROM dataset", vec!["y", "_rowid"])]
+    #[case::system_column_only("SELECT _rowid FROM dataset", vec!["_rowid"])]
+    #[tokio::test]
+    async fn test_sql_system_column_spellings(
+        #[case] sql: &str,
+        #[case] expected_columns: Vec<&str>,
+    ) {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_system_column_spellings",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql(sql)
+            .with_row_id(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(batch.schema().field_names(), expected_columns);
+        assert_eq!(
+            batch["_rowid"].as_primitive::<UInt64Type>().values(),
             &[0, 1]
         );
     }
