@@ -361,12 +361,23 @@ async fn test_merge_segments_preserves_format_version(
 }
 
 /// Segments built with different posting-encoding format versions must be
-/// mergeable: after an upgrade a pre-existing V1 index is maintained alongside
-/// newly written V2/V3 delta segments. The merge should succeed (not reject on
-/// "different posting tail codecs"/"different format versions"), re-encode every
-/// segment to the highest version present, and keep all documents searchable.
+/// mergeable: after an upgrade a pre-existing index is maintained alongside
+/// newly written delta segments of another format. The merge must succeed (not
+/// reject on "different posting tail codecs"/"different format versions"),
+/// preserve the reference (first) segment's format per
+/// docs/src/guide/migration.md, and keep all documents searchable. The
+/// non-reference segment is decoded with its own codec and re-encoded to the
+/// reference format.
+///
+/// `reference` selects which segment is `first`, proving the output format
+/// follows the reference rather than the min/max of the inputs.
+#[rstest::rstest]
+#[case::reference_v1(InvertedListFormatVersion::V1)]
+#[case::reference_v3(InvertedListFormatVersion::V3)]
 #[tokio::test]
-async fn test_merge_segments_across_format_versions() -> Result<()> {
+async fn test_merge_segments_across_format_versions(
+    #[case] reference: InvertedListFormatVersion,
+) -> Result<()> {
     let v1_dir = TempObjDir::default();
     let v3_dir = TempObjDir::default();
     let dest_dir = TempObjDir::default();
@@ -402,9 +413,15 @@ async fn test_merge_segments_across_format_versions() -> Result<()> {
     assert_eq!(v1_index.format_version(), InvertedListFormatVersion::V1);
     assert_eq!(v3_index.format_version(), InvertedListFormatVersion::V3);
 
+    // The reference (first) segment fixes the output format.
+    let segments = match reference {
+        InvertedListFormatVersion::V1 => [v1_index, v3_index],
+        _ => [v3_index, v1_index],
+    };
+
     let dest_store = make_store(&dest_dir);
     let created = InvertedIndex::merge_segments(
-        &[v1_index, v3_index],
+        &segments,
         empty_doc_stream(),
         dest_store.as_ref(),
         None,
@@ -412,13 +429,10 @@ async fn test_merge_segments_across_format_versions() -> Result<()> {
     )
     .await?;
 
-    // Merged segment is written at the highest version present (V3).
-    assert_eq!(
-        created.index_version,
-        InvertedListFormatVersion::V3.index_version()
-    );
+    // Output preserves the reference segment's format, not the newest present.
+    assert_eq!(created.index_version, reference.index_version());
     let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-    assert_eq!(merged.format_version(), InvertedListFormatVersion::V3);
+    assert_eq!(merged.format_version(), reference);
 
     // Documents from both source segments survive and remain searchable.
     for (token, expected_row) in [("hello", 100_u64), ("world", 200_u64)] {

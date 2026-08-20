@@ -175,16 +175,15 @@ impl InvertedIndex {
             }
         }
 
-        // Re-encode every segment to the highest format version present. Because
-        // `params` (and thus block_size) is identical across segments, the maximum
-        // is guaranteed to be compatible with that block_size. `token_set_format`
-        // is also identical (checked above), so the segment carrying the highest
-        // format version also carries the resulting merged index version.
-        let target_segment = segments
-            .iter()
-            .max_by_key(|segment| segment.format_version().index_version())
-            .expect("segments is non-empty; checked above");
-        let target_format_version = target_segment.format_version();
+        // Normalize every segment to the reference (`first`) segment's format,
+        // not the newest one present. Maintaining an existing FTS index must
+        // preserve its format (see docs/src/guide/migration.md): a deployment
+        // pinned to an older format for reader compatibility must not be silently
+        // upgraded by a merge. Other segments are decoded with their own codec and
+        // re-encoded to the reference format. `token_set_format` and block_size are
+        // identical across segments (checked above), so the reference format is a
+        // valid target for all of them.
+        let target_format_version = first.format_version();
 
         let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
         builder = builder
@@ -194,16 +193,15 @@ impl InvertedIndex {
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
 
-        // Persist the details for the format we actually wrote, not `first`'s.
-        // Otherwise a V1 `first` would stamp posting_format_version=1 onto files
-        // re-encoded as the (higher) target version, and readers would pick the
-        // wrong decoder.
+        // Stamp details with the reference segment's actual format so the written
+        // metadata matches the encoding above, regardless of whether `params`
+        // carried an explicit format_version.
         let target_params = first.params.clone().format_version(target_format_version);
         let details = pbold::InvertedIndexDetails::try_from(&target_params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: target_segment.index_version(),
+            index_version: first.index_version(),
             files,
         })
     }
