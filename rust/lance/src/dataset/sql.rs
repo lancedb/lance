@@ -191,6 +191,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::Dataset;
+    use crate::dataset::ReadParams;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::write::WriteParams;
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
@@ -201,7 +203,9 @@ mod tests {
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_core::datatypes::BlobHandling;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch};
+    use lance_file::reader::FileReaderOptions;
     use lance_file::version::LanceFileVersion;
 
     #[tokio::test]
@@ -277,6 +281,59 @@ mod tests {
 
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 50);
         assert!(batches.iter().all(|batch| batch.num_rows() <= 7));
+    }
+
+    #[tokio::test]
+    async fn test_sql_batch_size_bytes_overrides_dataset_default() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_read_params(ReadParams {
+                file_reader_options: Some(FileReaderOptions {
+                    batch_size_bytes: Some(8_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let batches = dataset
+            .sql("SELECT x FROM dataset")
+            .batch_size_bytes(64)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1000
+        );
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 16));
     }
 
     #[tokio::test]

@@ -1993,9 +1993,7 @@ impl Scanner {
             .or_else(|| self.dataset.file_reader_options.clone());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
-                if opts.batch_size_bytes.is_none() {
-                    opts.batch_size_bytes = Some(bsb);
-                }
+                opts.batch_size_bytes = Some(bsb);
                 Some(opts)
             }
             (Some(opts), None) => Some(opts),
