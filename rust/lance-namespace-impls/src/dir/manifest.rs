@@ -60,6 +60,9 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
+use lance_table::transaction::{
+    canonicalize_stable_field_ids, validate_stable_field_id_transition,
+};
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -1977,7 +1980,7 @@ impl ManifestNamespace {
                 ..WriteParams::default()
             };
 
-            let transaction = match InsertBuilder::new(dataset.clone())
+            let mut transaction = match InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
                 .execute_uncommitted_stream(output_stream)
                 .await
@@ -1993,10 +1996,7 @@ impl ManifestNamespace {
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
 
-            let Operation::Overwrite {
-                fragments, schema, ..
-            } = &transaction.operation
-            else {
+            let Operation::Overwrite { fragments, .. } = &transaction.operation else {
                 return Err(NamespaceError::Internal {
                     message: "Manifest rewrite transaction is not an overwrite".to_string(),
                 }
@@ -2017,11 +2017,39 @@ impl ManifestNamespace {
                 return Ok(mutation.result);
             }
 
+            if let Err(err) =
+                canonicalize_stable_field_ids(Some(dataset.manifest()), &mut transaction.operation)
+            {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(err);
+            }
+
+            let Operation::Overwrite {
+                fragments, schema, ..
+            } = &transaction.operation
+            else {
+                return Err(NamespaceError::Internal {
+                    message: "Manifest rewrite transaction is not an overwrite".to_string(),
+                }
+                .into());
+            };
+
             let mut manifest = Self::manifest_from_overwrite_transaction(
                 dataset.manifest(),
                 schema.clone(),
                 fragments,
             );
+            if let Err(err) = validate_stable_field_id_transition(
+                dataset.manifest(),
+                &manifest,
+                &transaction.operation,
+            ) {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(err);
+            }
+            manifest.update_max_field_id();
             let target_version = manifest.version;
 
             let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
