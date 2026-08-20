@@ -130,6 +130,8 @@ LAST_BETA_RELEASE = last_beta_release()
 if LAST_BETA_RELEASE is not None:
     VERSIONS.append(LAST_BETA_RELEASE)
 
+STABLE_FIELD_IDS_MIN_READER_VERSION = Version("11.0.0b16")
+
 
 class UpgradeDowngradeTest:
     """Base class for compatibility tests.
@@ -168,6 +170,16 @@ class UpgradeDowngradeTest:
     def compat_env(self, version: str, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in a compat venv."""
         return {}
+
+
+class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
+    """Compatibility contract for datasets with stable field IDs enabled."""
+
+    def skip_downgrade(self, version: str) -> bool:
+        # New datasets require the stable-field-ID reader feature. Versions
+        # released before the feature landed must fail closed instead of
+        # interpreting the dataset with reusable field identities.
+        return Version(version) < STABLE_FIELD_IDS_MIN_READER_VERSION
 
 
 @contextmanager

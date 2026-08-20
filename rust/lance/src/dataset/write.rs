@@ -1328,7 +1328,11 @@ pub(super) fn prepare_write_schema(
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
 ) -> Result<Schema> {
-    let schema = if let Some(dataset) = dataset
+    let schema = if dataset.is_none() {
+        let mut schema = normalized_converted_schema;
+        schema.try_reassign_field_ids(None)?;
+        schema
+    } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
     {
         schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
@@ -2337,7 +2341,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let (fragments, _) = write_fragments_internal(
+        let (fragments, written_schema) = write_fragments_internal(
             ConcreteFileVersion::V1,
             None,
             object_store.clone(),
@@ -2353,7 +2357,16 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
+        // New datasets canonicalize incoming field IDs before writing while
+        // preserving the schema's field order.
+        assert_eq!(
+            written_schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 2]);
 
         let path = base_path
             .clone()
@@ -2364,16 +2377,16 @@ mod tests {
             &path,
             file_reader,
             None,
-            schema.clone(),
+            written_schema.clone(),
             0,
             0,
-            3,
+            2,
             None,
         )
         .await
         .unwrap();
         assert_eq!(reader.num_batches(), 1);
-        let batch = reader.read_batch(0, .., &schema).await.unwrap();
+        let batch = reader.read_batch(0, .., &written_schema).await.unwrap();
         assert_eq!(batch, data);
     }
 

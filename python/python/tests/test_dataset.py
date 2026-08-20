@@ -5333,7 +5333,8 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5427,8 +5428,12 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, monkeypatch
+):
     import json
+
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
 
     base_dir = tmp_path / "test"
     table = pa.table(
@@ -5468,11 +5473,11 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert restored.overlays[0].offsets == [1, 4]
     assert restored.overlays[0].committed_version == overlay_version
 
-    # A commit that round-trips the fragment (here an Overwrite) must keep the
+    # A commit that round-trips the fragment (here a Merge) must keep the
     # overlays, so the overlay still resolves on read instead of being dropped.
     dataset = lance.LanceDataset.commit(
         dataset,
-        lance.LanceOperation.Overwrite(dataset.schema, [restored]),
+        lance.LanceOperation.Merge([restored], dataset.lance_schema, True),
         read_version=dataset.version,
     )
     result = dataset.to_table()

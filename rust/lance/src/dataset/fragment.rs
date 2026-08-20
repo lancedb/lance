@@ -5977,29 +5977,35 @@ mod tests {
         }
 
         let mut fragments: Vec<Fragment> = Vec::new();
+        let rows_per_fragment = dataset_rows / paths.len();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, &dataset, idx, None)
+            let f = FileFragment::create_from_file(path, &dataset, idx, Some(rows_per_fragment))
                 .await
                 .unwrap();
             fragments.push(f)
         }
 
-        let op = Operation::Overwrite {
+        let op = Operation::Merge {
             schema: schema.clone(),
             fragments,
-            config_upsert_values: None,
-            initial_bases: None,
+            preserves_nullability: true,
         };
 
-        let new_dataset =
-            Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                .await
-                .unwrap();
+        let new_dataset = Dataset::commit(
+            test_uri,
+            op,
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(new_dataset.count_rows(None).await.unwrap(), dataset_rows);
 
-        // Fragments will have number of rows recorded in metadata, even though
-        // we passed `None` when constructing the `FileFragment`.
+        // Fragments retain the row count supplied when reconstructing them.
         let fragments = new_dataset.get_fragments();
         assert_eq!(fragments.len(), 5);
         for f in fragments {

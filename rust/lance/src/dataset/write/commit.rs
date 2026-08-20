@@ -30,6 +30,7 @@ use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
+use lance_table::transaction::canonicalize_stable_field_ids;
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
@@ -303,7 +304,7 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, mut transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -386,6 +387,11 @@ impl<'a> CommitBuilder<'a> {
                 "The dataset must already exist unless the operation is Overwrite".into(),
             ));
         }
+
+        canonicalize_stable_field_ids(
+            dest.dataset().map(|dataset| dataset.manifest.as_ref()),
+            &mut transaction.operation,
+        )?;
 
         // Validate the operation before proceeding with the commit
         // This ensures that operations like Merge have proper validation for data integrity

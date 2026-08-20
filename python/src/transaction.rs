@@ -10,9 +10,10 @@ use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
-use lance::datatypes::Schema;
+use lance::datatypes::{Field, Schema};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::transaction::TRANSACTION_SCHEMA_SOURCE_RAW_ARROW;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -996,17 +997,20 @@ fn extract_schema(schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
-    let mut schema = Schema::try_from(arrow_schema).map_err(|e| {
-        PyValueError::new_err(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
-    })?;
-    // A raw Arrow schema is not an allocation authority. Assign a canonical
-    // standalone sequence; dataset commits will either match existing
-    // identities or reject it in favor of a dataset-derived LanceSchema.
-    schema
-        .try_reassign_field_ids(None)
-        .map_err(|e| PyValueError::new_err(format!("Failed to assign field ids: {e}")))?;
-    Ok(schema)
+    let fields = arrow_schema
+        .fields
+        .iter()
+        .map(|field| Field::try_from(field.as_ref()))
+        .collect::<lance_core::Result<_>>()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {e}"
+            ))
+        })?;
+    let mut metadata = arrow_schema.metadata.clone();
+    metadata.insert(
+        TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+        String::new(),
+    );
+    Ok(Schema { fields, metadata })
 }

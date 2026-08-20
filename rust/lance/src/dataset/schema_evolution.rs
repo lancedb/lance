@@ -2148,13 +2148,41 @@ mod test {
         )
         .await?;
         dataset.validate().await?;
+        let checkpoint_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_id",
+            DataType::Int32,
+            false,
+        )]));
+        let checkpoint_schema_ref = checkpoint_schema.clone();
+        let checkpoint_result = add_columns_impl(
+            &dataset.get_fragments(),
+            Some(vec!["id".to_string()]),
+            Box::new(move |batch: &RecordBatch| {
+                let id = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                Ok(RecordBatch::try_new(
+                    checkpoint_schema_ref.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        id.values().iter().map(|i| i * 2),
+                    ))],
+                )?)
+            }),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let cached_fragment = checkpoint_result.fragments[0].clone();
 
-        #[derive(Default)]
         struct RequestCounter {
             pub get_batch_requests: Mutex<Vec<BatchInfo>>,
             pub insert_batch_requests: Mutex<Vec<BatchInfo>>,
             pub get_fragment_requests: Mutex<Vec<u32>>,
             pub insert_fragment_requests: Mutex<Vec<u32>>,
+            pub cached_fragment: Fragment,
         }
 
         impl UDFCheckpointStore for RequestCounter {
@@ -2183,16 +2211,7 @@ mod test {
             fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
                 self.get_fragment_requests.lock().unwrap().push(fragment_id);
                 if fragment_id == 0 {
-                    Ok(Some(Fragment {
-                        files: vec![],
-                        id: 0,
-                        overlays: vec![],
-                        deletion_file: None,
-                        row_id_meta: None,
-                        physical_rows: Some(50),
-                        last_updated_at_version_meta: None,
-                        created_at_version_meta: None,
-                    }))
+                    Ok(Some(self.cached_fragment.clone()))
                 } else {
                     Ok(None)
                 }
@@ -2207,7 +2226,13 @@ mod test {
             }
         }
 
-        let request_counter = Arc::new(RequestCounter::default());
+        let request_counter = Arc::new(RequestCounter {
+            get_batch_requests: Mutex::default(),
+            insert_batch_requests: Mutex::default(),
+            get_fragment_requests: Mutex::default(),
+            insert_fragment_requests: Mutex::default(),
+            cached_fragment,
+        });
 
         let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "double_id",

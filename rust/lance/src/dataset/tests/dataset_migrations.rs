@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -321,6 +322,22 @@ async fn test_fix_v0_10_5_corrupt_schema() {
             .values(),
         &[0, 5, 10, 15]
     );
+}
+
+#[tokio::test]
+async fn test_deep_clone_repairs_legacy_schema_before_activation() {
+    let source_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+    let clone_uri = TempStrDir::default();
+    let mut source = Dataset::open(&source_dir.path_str()).await.unwrap();
+
+    let mut cloned = source
+        .deep_clone(clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap();
+
+    cloned.delete("false").await.unwrap();
+    cloned.validate().await.unwrap();
+    assert!(cloned.manifest.uses_stable_field_ids());
 }
 
 #[tokio::test]
@@ -775,6 +792,42 @@ async fn test_stable_field_id_multi_cast_uses_schema_order() {
     assert_eq!(dataset.schema().field("b").unwrap().id, 3);
     assert_eq!(dataset.manifest.max_allocated_field_id, Some(3));
     dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_new_dataset_ignores_hostile_arrow_field_id() {
+    let source_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, false).with_metadata(HashMap::from([(
+            "lance:field_id".to_string(),
+            i32::MAX.to_string(),
+        )])),
+    ]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        source_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(0));
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "b",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.schema().field("b").unwrap().id, 1);
 }
 
 #[tokio::test]

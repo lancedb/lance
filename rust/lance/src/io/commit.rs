@@ -44,8 +44,8 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
-    validate_detached_stable_field_ids, validate_operation, validate_stable_field_id_manifest,
-    validate_stable_field_id_transition,
+    canonicalize_stable_field_ids, validate_detached_stable_field_ids, validate_operation,
+    validate_stable_field_id_manifest, validate_stable_field_id_transition,
 };
 use rand::{Rng, rng};
 
@@ -360,6 +360,9 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let mut transaction = transaction.clone();
+    canonicalize_stable_field_ids(None, &mut transaction.operation)?;
+    let transaction = &transaction;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -482,6 +485,7 @@ async fn do_commit_new_dataset(
     };
 
     if !manifest.uses_stable_field_ids() {
+        fix_schema(&mut manifest)?;
         manifest.activate_stable_field_ids();
         manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
@@ -1439,6 +1443,7 @@ pub(crate) async fn commit_transaction(
             )));
         }
         validate_stable_field_id_flags(&dataset.manifest)?;
+        canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation)?;
         validate_operation(Some(&dataset.manifest), &transaction.operation)?;
 
         // Recomputed every attempt: the rebase above may have rewritten the

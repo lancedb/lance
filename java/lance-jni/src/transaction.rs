@@ -33,7 +33,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -978,12 +978,46 @@ fn convert_schema_from_operation(
     Ok((schema, field_id_remap))
 }
 
-fn remap_fragment_field_ids(fragments: &mut [Fragment], field_id_remap: &HashMap<i32, i32>) {
+type DataFileIdentity = (Option<u32>, String);
+
+fn retained_file_identities(
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
+) -> Result<HashSet<DataFileIdentity>> {
+    let Some(dataset) = dataset else {
+        return Ok(HashSet::new());
+    };
+    let collect = |dataset: &BlockingDataset| {
+        dataset
+            .inner
+            .manifest()
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.referenced_lance_files())
+            .map(|file| (file.base_id, file.path.clone()))
+            .collect()
+    };
+    if dataset.inner.version().version == read_version {
+        Ok(collect(dataset))
+    } else {
+        let read_dataset = dataset.checkout_version(read_version)?;
+        Ok(collect(&read_dataset))
+    }
+}
+
+fn remap_fragment_field_ids(
+    fragments: &mut [Fragment],
+    field_id_remap: &HashMap<i32, i32>,
+    retained_files: &HashSet<DataFileIdentity>,
+) {
     if field_id_remap.is_empty() {
         return;
     }
     for fragment in fragments {
         for file in fragment.referenced_lance_files_mut() {
+            if retained_files.contains(&(file.base_id, file.path.clone())) {
+                continue;
+            }
             for field_id in Arc::make_mut(&mut file.fields) {
                 if let Some(canonical_id) = field_id_remap.get(field_id) {
                     *field_id = *canonical_id;
@@ -1195,7 +1229,7 @@ fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
     allocator: Option<&JObject<'_>>,
-    dataset: Option<&mut BlockingDataset>,
+    mut dataset: Option<&mut BlockingDataset>,
     read_version: u64,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
@@ -1346,11 +1380,11 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Overwrite operations".to_string(),
                     )
                 })?,
-                dataset,
+                dataset.as_deref_mut(),
                 read_version,
                 true,
             )?;
-            remap_fragment_field_ids(&mut fragments, &field_id_remap);
+            remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -1496,6 +1530,7 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
+            let retained_files = retained_file_identities(dataset.as_deref_mut(), read_version)?;
             let (schema, field_id_remap) = convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1508,7 +1543,7 @@ fn convert_to_rust_operation(
                 read_version,
                 false,
             )?;
-            remap_fragment_field_ids(&mut fragments, &field_id_remap);
+            remap_fragment_field_ids(&mut fragments, &field_id_remap, &retained_files);
             Operation::Merge {
                 fragments,
                 preserves_nullability: env
@@ -1824,6 +1859,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema,
     };
+    use lance_table::format::DataFile;
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
@@ -1890,6 +1926,30 @@ mod tests {
                 .unwrap();
 
         assert_eq!(schema.field("renamed").unwrap().id, 10);
+    }
+
+    #[test]
+    fn merge_remap_skips_retained_files() {
+        let mut retained = Fragment::new(0);
+        retained.files.push(DataFile::new_legacy_from_fields(
+            "retained.lance",
+            vec![0, 1, 2],
+            None,
+        ));
+        let mut rewritten = Fragment::new(1);
+        rewritten.files.push(DataFile::new_legacy_from_fields(
+            "new.lance",
+            vec![1, 2],
+            None,
+        ));
+        let mut fragments = vec![retained, rewritten];
+        let remap = HashMap::from([(1, 2), (2, 3)]);
+        let retained_files = HashSet::from([(None, "retained.lance".to_string())]);
+
+        remap_fragment_field_ids(&mut fragments, &remap, &retained_files);
+
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1, 2]);
+        assert_eq!(fragments[1].files[0].fields.as_ref(), &[2, 3]);
     }
 
     #[test]
