@@ -330,9 +330,10 @@ pub struct CompactionOptions {
     /// it would exceed any budget. In [`SourceBudgetMode::Soft`] mode, the first
     /// task is always admitted. If it exceeds a budget, the plan stops there;
     /// otherwise later tasks use the same cumulative checks as hard mode.
-    /// If the first task has a source file without a recorded size while a
-    /// byte budget is configured, soft mode admits that task and stops because
-    /// no additional task can be admitted safely. Hard mode reports an error.
+    /// If a task has a source file without a recorded size while a byte budget
+    /// is configured, soft mode stops at that task because it cannot be safely
+    /// compared with the budget. The task is admitted only when it is first,
+    /// preserving the soft-mode progress guarantee. Hard mode reports an error.
     /// Defaults to [`SourceBudgetMode::Hard`].
     #[serde(default)]
     pub source_budget_mode: SourceBudgetMode,
@@ -1117,13 +1118,15 @@ fn limit_tasks_to_source_budget(
         total_fragments += task.fragments.len();
         total_rows = total_rows.saturating_add(live_rows);
         if options.max_source_bytes.is_some() {
-            let allow_missing_size =
-                tasks.is_empty() && options.source_budget_mode == SourceBudgetMode::Soft;
+            let allow_missing_size = options.source_budget_mode == SourceBudgetMode::Soft;
             let Some(task_bytes) = task_source_bytes(&task, &schema_field_ids, allow_missing_size)?
             else {
-                // Soft mode admits the first task unconditionally. Without its
-                // source size we cannot safely admit any additional task.
-                tasks.push(task);
+                // Soft mode stops at a task whose source size is unavailable.
+                // Admit it only when it is first so planning still makes
+                // progress; otherwise keep the already-safe selected prefix.
+                if tasks.is_empty() {
+                    tasks.push(task);
+                }
                 break;
             };
             total_bytes = total_bytes.saturating_add(task_bytes);
@@ -8374,6 +8377,47 @@ mod tests {
 
         let soft = CompactionOptions {
             max_source_bytes: Some(1),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+        let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_keeps_prefix_before_unknown_later_task() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let unbounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+        assert!(plan.tasks.len() > 1);
+
+        let mut all_tasks = plan
+            .tasks
+            .into_iter()
+            .map(|task| (task, 0))
+            .collect::<Vec<_>>();
+        assert!(
+            all_tasks[0].0.fragments[0].files[0]
+                .file_size_bytes
+                .get()
+                .is_some()
+        );
+        all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+        let hard = CompactionOptions {
+            max_source_bytes: Some(u64::MAX),
+            ..Default::default()
+        };
+        let err =
+            limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+        assert!(err.to_string().contains("has no size recorded"));
+
+        let soft = CompactionOptions {
+            max_source_bytes: Some(u64::MAX),
             source_budget_mode: SourceBudgetMode::Soft,
             ..Default::default()
         };
