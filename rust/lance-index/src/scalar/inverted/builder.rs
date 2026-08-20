@@ -615,10 +615,19 @@ impl InvertedIndexBuilder {
     pub(crate) async fn write_part_metadata(
         &self,
         dest_store: &dyn IndexStore,
-        partition: u64, // Modify parameter type
+        partition: u64,
+    ) -> Result<IndexFile> {
+        self.write_staged_metadata(dest_store, part_metadata_file_path(partition), &[partition])
+            .await
+    }
+
+    async fn write_staged_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        file_name: String,
+        partitions: &[u64],
     ) -> Result<IndexFile> {
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
-        let partitions = vec![partition];
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
@@ -653,8 +662,6 @@ impl InvertedIndexBuilder {
                     .to_owned(),
             );
         }
-        // Use partition ID to generate a unique temporary filename
-        let file_name = part_metadata_file_path(partition);
         let mut writer = dest_store
             .new_index_file(&file_name, Arc::new(Schema::empty()))
             .await?;
@@ -666,26 +673,39 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partitions: &[u64],
     ) -> Result<Vec<IndexFile>> {
-        let total = if self.fragment_mask.is_none() {
-            Some(1)
-        } else {
-            Some(partitions.len() as u64)
-        };
+        let total = Some(partitions.len().max(1) as u64);
         let mut files = Vec::new();
         self.progress
             .stage_start("write_metadata", total, "files")
             .await?;
-        if self.fragment_mask.is_none() {
-            files.push(self.write_metadata(dest_store, partitions).await?);
-            self.progress.stage_progress("write_metadata", 1).await?;
-        } else {
-            let mut completed = 0;
-            for &partition_id in partitions {
-                files.push(self.write_part_metadata(dest_store, partition_id).await?);
-                completed += 1;
-                self.progress
-                    .stage_progress("write_metadata", completed)
-                    .await?;
+        match self.fragment_mask {
+            None => {
+                files.push(self.write_metadata(dest_store, partitions).await?);
+                self.progress.stage_progress("write_metadata", 1).await?;
+            }
+            Some(fragment_mask) if partitions.is_empty() => {
+                // Root metadata is the finalization marker for the shared index directory. An
+                // empty shard must publish only staged metadata so sibling partitions are still
+                // finalized.
+                files.push(
+                    self.write_staged_metadata(
+                        dest_store,
+                        empty_part_metadata_file_path(fragment_mask),
+                        partitions,
+                    )
+                    .await?,
+                );
+                self.progress.stage_progress("write_metadata", 1).await?;
+            }
+            Some(_) => {
+                let mut completed = 0;
+                for &partition_id in partitions {
+                    files.push(self.write_part_metadata(dest_store, partition_id).await?);
+                    completed += 1;
+                    self.progress
+                        .stage_progress("write_metadata", completed)
+                        .await?;
+                }
             }
         }
         self.progress.stage_complete("write_metadata").await?;
@@ -2081,6 +2101,10 @@ pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
     staged_partition_file_path(partition_id, METADATA_FILE)
 }
 
+fn empty_part_metadata_file_path(fragment_mask: u64) -> String {
+    format!("{STAGED_PARTITION_DIR}/part_empty_{fragment_mask}_{METADATA_FILE}")
+}
+
 const PARTITION_FILE_SUFFIXES: [&str; 3] = [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE];
 const STAGED_PARTITION_DIR: &str = "staging";
 
@@ -3299,6 +3323,80 @@ mod tests {
                 .is_err(),
             "distributed build-only data should not be written to final partition paths"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distributed_empty_build_does_not_finalize_shared_directory() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let empty_fragment_mask = 7_u64 << 32;
+        let batch = make_doc_batch_from_docs(vec![None, None]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params = InvertedIndexParams {
+            lance_tokenizer: Some("text".to_string()),
+            with_position: true,
+            ..Default::default()
+        };
+        let mut builder =
+            InvertedIndexBuilder::new_with_fragment_mask(params.clone(), Some(empty_fragment_mask));
+
+        let files = builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        assert_eq!(files.len(), 1);
+        let empty_metadata_path = empty_part_metadata_file_path(empty_fragment_mask);
+        assert_eq!(files[0].path, empty_metadata_path);
+        assert!(
+            store.open_index_file(METADATA_FILE).await.is_err(),
+            "an empty shard must not finalize the shared directory"
+        );
+        let reader = store.open_index_file(&empty_metadata_path).await?;
+        let metadata = &reader.schema().metadata;
+        let partitions: Vec<u64> = serde_json::from_str(
+            metadata
+                .get("partitions")
+                .expect("partitions missing from metadata"),
+        )?;
+        assert!(partitions.is_empty());
+        let written_params: InvertedIndexParams = serde_json::from_str(
+            metadata
+                .get("params")
+                .expect("params missing from metadata"),
+        )?;
+        assert_eq!(written_params, params);
+
+        let non_empty_fragment_mask = 8_u64 << 32;
+        let batch = make_doc_batch("searchable text", non_empty_fragment_mask);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let mut builder =
+            InvertedIndexBuilder::new_with_fragment_mask(params, Some(non_empty_fragment_mask));
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let staged_metadata =
+            list_metadata_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        assert_eq!(staged_metadata.len(), 2);
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store.clone(),
+            noop_progress(),
+        )
+        .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(index.partition_count(), 1);
 
         Ok(())
     }

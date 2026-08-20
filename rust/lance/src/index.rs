@@ -58,6 +58,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
+use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -89,7 +90,7 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -772,15 +773,6 @@ fn segment_has_zonemap_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
 }
 
-/// True when the index reports matches as physical row addresses rather than row ids
-/// (`ScalarIndex::results_are_row_addresses`).
-///
-/// Such an index cannot follow its data through a rewrite: the addresses it stores
-/// name fragments and offsets, and neither kind supports remap.
-pub(crate) fn index_results_are_row_addrs(index: &IndexMetadata) -> bool {
-    segment_has_zonemap_details(index) || segment_has_bloomfilter_details(index)
-}
-
 fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
@@ -1431,6 +1423,49 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
+impl Dataset {
+    /// Whether an otherwise empty commit would record a new MemWAL catch-up
+    /// position.
+    ///
+    /// Dry-runs the derivation rather than restating its conditions: a second
+    /// copy of "is this index behind" would be one more place to keep in step
+    /// with the real rule. A no-work optimize publishes no new segment, so the
+    /// index list it would commit is the one already loaded, and the version it
+    /// would read is the current one -- which makes the speculative answer the
+    /// same one the commit reaches.
+    fn mem_wal_catch_up_would_advance(&self, indices: &[IndexMetadata]) -> Result<bool> {
+        if self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
+            || self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
+        {
+            return Ok(false);
+        }
+        let catchup_of = |indices: &[IndexMetadata]| -> Result<Option<Vec<_>>> {
+            indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .cloned()
+                .map(|index| {
+                    crate::index::mem_wal::load_mem_wal_index_details(index)
+                        .map(|details| details.index_catchup)
+                })
+                .transpose()
+        };
+
+        let mut speculative = indices.to_vec();
+        Transaction::apply_mem_wal_index_coverage(
+            &mut speculative,
+            &Transaction::logical_index_segments(indices),
+            Some(ReadVersionState {
+                manifest: &self.manifest,
+                indices,
+            }),
+            true,
+            self.manifest.version + 1,
+        )?;
+        Ok(catchup_of(&speculative)? != catchup_of(indices)?)
+    }
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -2067,6 +2102,7 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
+
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
@@ -2124,7 +2160,14 @@ impl DatasetIndexExt for Dataset {
             new_indices.push(new_idx);
         }
 
-        if new_indices.is_empty() {
+        // A no-work optimize still has to commit on a table that requires
+        // catch-up. Coverage is derived at commit time, so an index that
+        // already spans the table records its position only if there is a
+        // commit to record it on -- and that is the ordinary case after a
+        // remap or a compaction that advanced a generation without changing
+        // fragments. Returning early there leaves the position missing forever
+        // and the repair rescheduling itself.
+        if new_indices.is_empty() && !self.mem_wal_catch_up_would_advance(&indices)? {
             return Ok(());
         }
 
@@ -2949,14 +2992,8 @@ impl DatasetIndexInternalExt for Dataset {
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta =
-                        self.load_index(&frag_reuse_uuid).await?.ok_or_else(|| {
-                            Error::index(format!(
-                                "Index with id {} does not exist",
-                                frag_reuse_uuid
-                            ))
-                        })?;
-                    let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                    let index_details =
+                        load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
                             .await?;
@@ -4881,6 +4918,72 @@ mod tests {
 
         assert_eq!(after.misses - before.misses, 1);
         assert_eq!(after.hits - before.hits, 31);
+    }
+
+    #[tokio::test]
+    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
+        let test_dir = TempStrDir::default();
+        let data = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let session = Arc::new(Session::with_index_cache_backend(
+            Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+            128 * 1024 * 1024,
+            Default::default(),
+        ));
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let frag_reuse_index = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dataset.open_frag_reuse_index(&NoOpMetricsCollector),
+        )
+        .await
+        .expect("opening the fragment reuse index deadlocked")
+        .unwrap();
+        assert!(frag_reuse_index.is_some());
     }
 
     #[tokio::test]

@@ -1103,8 +1103,11 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
-        // 2.5 million rows, mostly empty lists. ~100 lists have 10 short strings each.
-        let num_rows = 2_500_000u32;
+        // Three chunks' worth of rep/def levels (1 rep bit + 1 def bit each), so the
+        // planner must split the page. See #6184.
+        let levels_per_chunk =
+            crate::encodings::logical::primitive::miniblock::max_repdef_levels_per_chunk(2);
+        let num_rows = (levels_per_chunk * 3) as u32;
         let num_non_empty = 100u32;
         let strings_per_list = 10;
 

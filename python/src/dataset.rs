@@ -52,8 +52,8 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -98,6 +98,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::fts::FtsTokenizerOptions;
 use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
@@ -2032,6 +2033,19 @@ impl Dataset {
         Ok(pyvers)
     }
 
+    fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        let py = self_.py();
+        self_
+            .list_version_refs()?
+            .iter()
+            .map(|version| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", version.version)?;
+                dict.into_py_any(py)
+            })
+            .collect()
+    }
+
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
         Ok(self.ds.version().version)
@@ -2592,57 +2606,7 @@ impl Dataset {
                         }
                     }
 
-                    let analyzer: Option<String> = kwargs
-                        .get_item("analyzer")?
-                        .map(|value| value.extract())
-                        .transpose()?;
-                    let base_tokenizer: Option<String> = kwargs
-                        .get_item("base_tokenizer")?
-                        .map(|value| value.extract())
-                        .transpose()?;
-
-                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
-                        (Some("text"), Some("code")) => {
-                            return Err(PyValueError::new_err(
-                                "base_tokenizer='code' requires analyzer='code'",
-                            ));
-                        }
-                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
-                            return Err(PyValueError::new_err(format!(
-                                "analyzer='code' requires base_tokenizer='code', got '{}'",
-                                base_tokenizer
-                            )));
-                        }
-                        _ => {}
-                    }
-
-                    let uses_code_analyzer = match analyzer.as_deref() {
-                        Some("code") => true,
-                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
-                        Some(_) => true,
-                    };
-                    if !uses_code_analyzer {
-                        for flag in [
-                            "split_identifiers",
-                            "split_on_numerics",
-                            "preserve_original",
-                            "index_operators",
-                        ] {
-                            if let Some(value) = kwargs.get_item(flag)?
-                                && value.extract::<bool>()?
-                            {
-                                return Err(PyValueError::new_err(
-                                    "code analyzer flags require analyzer='code'",
-                                ));
-                            }
-                        }
-                    }
-
-                    if let Some(analyzer) = analyzer {
-                        params = params
-                            .analyzer(&analyzer)
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
+                    params = FtsTokenizerOptions::from_kwargs(kwargs)?.apply(params)?;
                     if let Some(document_granularity) = kwargs.get_item("document_granularity")? {
                         let document_granularity: String = document_granularity.extract()?;
                         params = params.document_granularity(
@@ -2653,62 +2617,10 @@ impl Dataset {
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
-                    if let Some(base_tokenizer) = base_tokenizer {
-                        params = params.base_tokenizer(base_tokenizer);
-                    }
-                    if let Some(language) = kwargs.get_item("language")? {
-                        let language: PyBackedStr =
-                            language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|err| {
-                            PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {}",
-                                language, err
-                            ))
-                        })?;
-                    }
-                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params = params.max_token_length(max_token_length.extract()?);
-                    }
-                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params = params.lower_case(lower_case.extract()?);
-                    }
-                    if let Some(stem) = kwargs.get_item("stem")? {
-                        params = params.stem(stem.extract()?);
-                    }
-                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params = params.remove_stop_words(remove_stop_words.extract()?);
-                    }
-                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(custom_stop_words.extract()?);
-                    }
-                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params = params.ascii_folding(ascii_folding.extract()?);
-                    }
-                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
-                        params = params.ngram_min_length(min_ngram_length.extract()?);
-                    }
-                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
-                        params = params.ngram_max_length(max_ngram_length.extract()?);
-                    }
-                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
-                        params = params.ngram_prefix_only(prefix_only.extract()?);
-                    }
                     if let Some(block_size) = kwargs.get_item("block_size")? {
                         params = params
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                    }
-                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
-                        params = params.split_identifiers(split_identifiers.extract()?);
-                    }
-                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
-                        params = params.split_on_numerics(split_on_numerics.extract()?);
-                    }
-                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
-                        params = params.preserve_original(preserve_original.extract()?);
-                    }
-                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
-                        params = params.index_operators(index_operators.extract()?);
                     }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
@@ -4555,6 +4467,10 @@ impl Dataset {
         rt().block_on(None, self.ds.versions())?.infer_error()
     }
 
+    fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
+        rt().block_on(None, self.ds.version_refs())?.infer_error()
+    }
+
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
         rt().block_on(None, self.ds.tags().list())?.infer_error()
     }
@@ -4759,6 +4675,9 @@ pub fn get_write_params(
         }
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
+        }
+        if let Some(session) = get_dict_opt::<Session>(options, "session")? {
+            p.session = Some(session.inner.clone());
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;

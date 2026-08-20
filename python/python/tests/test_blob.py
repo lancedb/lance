@@ -2330,6 +2330,45 @@ def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
     assert dataset.take_blobs("info.blob", indices=[2]) == [None]
 
 
+def test_write_list_struct_nested_blob_v2(tmp_path):
+    payload_fields = [
+        lance.blob_field("blob"),
+        pa.field("format", pa.string()),
+    ]
+    payload_values = pa.StructArray.from_arrays(
+        [
+            lance.blob_array([b"first", b"second", None]),
+            pa.array(["bin", "bin", "bin"]),
+        ],
+        fields=payload_fields,
+    )
+    media_fields = [
+        pa.field("type", pa.string()),
+        pa.field("payload", payload_values.type),
+    ]
+    media_values = pa.StructArray.from_arrays(
+        [pa.array(["image", "image", "image"]), payload_values],
+        fields=media_fields,
+    )
+    media = pa.ListArray.from_arrays(pa.array([0, 2, 3]), media_values)
+    table = pa.table({"media": media})
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "list_struct_nested_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    media = (
+        dataset.scanner(columns=["media"], blob_handling="all_binary")
+        .to_table()
+        .column("media")
+        .combine_chunks()
+    )
+    blobs = media.values.field("payload").field("blob")
+    assert blobs.to_pylist() == [b"first", b"second", None]
+
+
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(
     dataset_with_nested_blobs,
 ):

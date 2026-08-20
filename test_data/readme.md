@@ -36,3 +36,6 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   that cross the layout's block boundary and positions used by phrase queries.
   The v1 fixture also retains the retired `skip_merge` parameter written by Lance
   3.0.1.
+* `v8.0.0/decimal_zonemap`: This dataset has a Decimal128 ZoneMap whose non-null
+  values have null min/max statistics because Decimal extrema were not computed
+  by Lance 8.0.0.

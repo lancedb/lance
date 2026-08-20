@@ -129,6 +129,9 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertFalse(writerVersion.getVersion().isEmpty());
       }
 
       // Test LEGACY version
@@ -143,6 +146,67 @@ public class DatasetTest {
               .execute()) {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
+      }
+
+      // This dataset was written before writer_version was added to the manifest.
+      String historicalPath =
+          Path.of("..", "test_data", "v0.7.5", "with_deletions")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
+        assertTrue(historicalDataset.getWriterVersion().isEmpty());
+      }
+
+      // This fixture was written by lance 2.0.0-beta.1. Reading it through Dataset verifies
+      // that the manifest's prerelease qualifier survives the Rust-to-Java JNI mapping.
+      String prereleasePath =
+          Path.of("..", "test_data", "pre_file_sizes", "index_without_file_sizes")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset prereleaseDataset = Dataset.open(prereleasePath, allocator)) {
+        WriterVersion writerVersion =
+            prereleaseDataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertEquals("2.0.0", writerVersion.getVersion());
+        assertEquals("beta.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+        assertTrue(writerVersion.getBuildMetadata().isEmpty());
+      }
+    }
+  }
+
+  @Test
+  void testWriterVersionPreservesOpaqueAndOptionalFields() {
+    WriterVersion writerVersion =
+        new WriterVersion("custom-writer", "release-2026", "preview.1", "build.42");
+
+    assertEquals("custom-writer", writerVersion.getLibrary());
+    assertEquals("release-2026", writerVersion.getVersion());
+    assertEquals("preview.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+    assertEquals("build.42", writerVersion.getBuildMetadata().orElseThrow(AssertionError::new));
+  }
+
+  @Test
+  void testListManifestLocations(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("manifest_locations").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 1).close();
+
+      List<ManifestLocation> manifests = Dataset.listManifestLocations(datasetPath);
+      assertEquals(2, manifests.size());
+      assertEquals(
+          Set.of(1L, 2L),
+          manifests.stream().map(ManifestLocation::getVersion).collect(Collectors.toSet()));
+      for (ManifestLocation manifest : manifests) {
+        assertTrue(manifest.getPath().contains("manifest_locations/_versions/"));
+        assertFalse(manifest.getPath().startsWith("_versions/"));
+        assertTrue(manifest.getPath().endsWith(".manifest"));
+        assertTrue(manifest.getSizeBytes() > 0);
+        assertNotNull(manifest.getNamingScheme());
       }
     }
   }
@@ -241,6 +305,9 @@ public class DatasetTest {
 
             List<Version> versions = dataset.listVersions();
             assertEquals(3, versions.size());
+            assertEquals(3, dataset.getVersionCount());
+            assertEquals(3, dataset2.getVersionCount());
+            assertEquals(3, dataset3.getVersionCount());
             assertEquals(1, versions.get(0).getId());
             assertEquals(2, versions.get(1).getId());
             assertEquals(3, versions.get(2).getId());
@@ -657,6 +724,40 @@ public class DatasetTest {
       nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testAlterColumnsCastType(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Widen "id" from Int32 to Int64. The cast target type is a parameterized ArrowType, which
+      // must survive the trip to the native side; regression test for a dropped cast that left the
+      // stored type unchanged.
+      ColumnAlteration widenId =
+          new ColumnAlteration.Builder("id").castTo(new ArrowType.Int(64, true)).build();
+      dataset.alterColumns(Collections.singletonList(widenId));
+
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id").getType());
+
+      // A cast combined with rename must apply both.
+      ColumnAlteration renameAndWiden =
+          new ColumnAlteration.Builder("id")
+              .rename("id_long")
+              .castTo(new ArrowType.Int(64, true))
+              .build();
+      dataset.alterColumns(Collections.singletonList(renameAndWiden));
+
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
     }
   }
 
