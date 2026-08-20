@@ -102,6 +102,16 @@ pub struct TransactionKey {
     pub version: u64,
 }
 
+/// Encoded transaction cached from an inline manifest section.
+///
+/// Cell Flag transactions can contain compact row selections that are expensive
+/// to materialize. Keeping the protobuf bytes here lets ordinary dataset opens
+/// and historical checkouts defer that work until the transaction is requested.
+#[derive(Debug)]
+pub struct EncodedTransactionKey {
+    pub version: u64,
+}
+
 /// Cache key for a validated immutable Cell Flag root in one snapshot.
 ///
 /// The cache is already namespaced by the destination dataset URI. The source
@@ -214,6 +224,26 @@ impl CacheKey for TransactionKey {
 
     fn schema() -> CacheKeySchema {
         CacheKeySchema::new("lance.dataset.transaction-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+    }
+}
+
+impl CacheKey for EncodedTransactionKey {
+    type ValueType = bytes::Bytes;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("encoded-txn/{}", self.version))
+    }
+
+    fn type_name() -> &'static str {
+        "EncodedTransaction"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.encoded-transaction-key", 1)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {

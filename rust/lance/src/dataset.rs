@@ -15,7 +15,7 @@ use lance_core::deepsize::DeepSizeOf;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::index::DatasetIndexExt;
-use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
+use crate::session::caches::{DSMetadataCache, EncodedTransactionKey, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
@@ -795,16 +795,27 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
             let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            let transaction_proto = lance_table::format::pb::Transaction::decode(message_data)?;
+            if transaction_proto.cell_flag_transaction.is_some() {
+                let metadata_key = EncodedTransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(
+                        &metadata_key,
+                        Arc::new(bytes::Bytes::copy_from_slice(message_data)),
+                    )
+                    .await;
+            } else {
+                let transaction: Transaction = transaction_proto.try_into()?;
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -1269,6 +1280,22 @@ impl Dataset {
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
+        }
+
+        let encoded_transaction_key = EncodedTransactionKey {
+            version: self.manifest.version,
+        };
+        if let Some(encoded) = self
+            .metadata_cache
+            .get_with_key(&encoded_transaction_key)
+            .await
+        {
+            let transaction =
+                Transaction::try_from(pb::Transaction::decode(encoded.as_ref().as_ref())?)?;
+            self.metadata_cache
+                .insert_with_key(&transaction_key, Arc::new(transaction.clone()))
+                .await;
+            return Ok(Some(transaction));
         }
 
         let transaction = self

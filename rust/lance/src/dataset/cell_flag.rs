@@ -3112,10 +3112,12 @@ mod tests {
         MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
     };
     use crate::dataset::{
-        ColumnAlteration, CommitBuilder, DeleteBuilder, InsertBuilder, NewColumnTransform,
-        UpdateBuilder, WriteMode, WriteParams, scanner::AggregateExpr,
+        ColumnAlteration, CommitBuilder, DatasetBuilder, DeleteBuilder, InsertBuilder,
+        NewColumnTransform, UpdateBuilder, WriteMode, WriteParams, scanner::AggregateExpr,
     };
     use crate::index::DatasetIndexExt;
+    use crate::session::Session;
+    use crate::session::caches::{EncodedTransactionKey, TransactionKey};
     use crate::utils::test::copy_test_data_to_tmp;
 
     const FLAG_NAME: &str = "lancedb.computed";
@@ -4202,6 +4204,48 @@ mod tests {
         assert_eq!(
             flagged_ids(&renamed_snapshot, "value", "ready").await?,
             (0..8).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dataset_open_defers_cell_flag_transaction_decoding() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        dataset.register_cell_flag("value", FLAG_NAME, true).await?;
+        let version = dataset.version().version;
+
+        let session = Arc::new(Session::default());
+        let reopened = DatasetBuilder::from_uri(dataset.uri())
+            .with_session(session)
+            .load()
+            .await?;
+        let transaction_key = TransactionKey { version };
+        let encoded_transaction_key = EncodedTransactionKey { version };
+
+        assert!(
+            reopened
+                .metadata_cache
+                .get_with_key(&transaction_key)
+                .await
+                .is_none()
+        );
+        assert!(
+            reopened
+                .metadata_cache
+                .get_with_key(&encoded_transaction_key)
+                .await
+                .is_some()
+        );
+
+        let transaction = reopened.read_transaction().await?.unwrap();
+        assert!(transaction.cell_flag_transaction()?.is_some());
+        assert!(
+            reopened
+                .metadata_cache
+                .get_with_key(&transaction_key)
+                .await
+                .is_some()
         );
         Ok(())
     }
