@@ -108,19 +108,46 @@ pub struct WriteResult {
 #[derive(Debug)]
 struct UploadFailure {
     context: String,
+    /// The kind `into_io_error` restores. Without it every contextualized
+    /// failure would collapse to `ErrorKind::Other`, changing what callers
+    /// matching on the kind observe.
+    kind: io::ErrorKind,
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl UploadFailure {
-    fn new(context: String, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+    /// Wraps an object store error.
+    ///
+    /// The `io::ErrorKind` is taken from `object_store`'s own conversion rather
+    /// than a local copy of its mapping, and the error itself is kept as the
+    /// source, so both callers matching on the kind and `Error::is_not_found`
+    /// (which downcasts along the source chain) keep working.
+    fn new(context: String, source: object_store::Error) -> Self {
+        let mapped = io::Error::from(source);
+        let kind = mapped.kind();
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            match mapped.downcast::<object_store::Error>() {
+                Ok(source) => Box::new(source),
+                Err(mapped) => Box::new(mapped),
+            };
         Self {
             context,
+            kind,
+            source,
+        }
+    }
+
+    /// Wraps a failure that carries no object store error to map a kind from.
+    fn from_task(context: String, source: tokio::task::JoinError) -> Self {
+        Self {
+            context,
+            kind: io::ErrorKind::Other,
             source: Box::new(source),
         }
     }
 
     fn into_io_error(self) -> io::Error {
-        io::Error::other(self)
+        io::Error::new(self.kind, self)
     }
 }
 
@@ -138,10 +165,27 @@ impl std::error::Error for UploadFailure {
 
 type UploadResult<T> = std::result::Result<T, UploadFailure>;
 
+/// Identifies a single part upload, for its failure message.
+struct PartUpload {
+    path: Arc<Path>,
+    part_idx: u16,
+    /// Concurrent part uploads, counting this one, when it was submitted.
+    parts_in_flight: usize,
+    /// The part size in effect, which is the buffer capacity this part was
+    /// filled to. [`ObjectWriter::next_part_buffer`] grows the part size every
+    /// 100 parts so one upload can cover a very large object within the
+    /// 10,000-part limit, so on a long upload this is a multiple of
+    /// `LANCE_INITIAL_UPLOAD_SIZE` rather than equal to it. A body smaller than
+    /// this is the final flush.
+    part_size: usize,
+}
+
 /// Describes the upload knobs in effect, for inclusion in failure messages.
 ///
 /// Both are process-global and read from the environment, so a failure that is
-/// sensitive to either is impossible to interpret without them.
+/// sensitive to either is impossible to interpret without them. Note that
+/// `LANCE_INITIAL_UPLOAD_SIZE` is the starting part size, not the size in
+/// effect: see [`PartUpload::part_size`].
 fn upload_settings() -> String {
     format!(
         "LANCE_INITIAL_UPLOAD_SIZE={} bytes, LANCE_UPLOAD_CONCURRENCY={}",
@@ -266,22 +310,27 @@ impl ObjectWriter {
     fn put_part(
         upload: &mut dyn MultipartUpload,
         buffer: Bytes,
-        path: Arc<Path>,
-        part_idx: u16,
-        parts_in_flight: usize,
+        part: PartUpload,
     ) -> BoxFuture<'static, UploadResult<()>> {
-        let part_size = buffer.len();
-        log::debug!("MultipartUpload submitting part with {} bytes", part_size);
+        let body_size = buffer.len();
+        log::debug!("MultipartUpload submitting part with {} bytes", body_size);
         // Stamped before the future is spawned so the reported duration covers
         // any time the task spent waiting to be polled, not just the request.
         let queued_at = Instant::now();
         let fut = upload.put_part(buffer.into());
         Box::pin(async move {
             fut.await.map_err(|source| {
+                let PartUpload {
+                    path,
+                    part_idx,
+                    parts_in_flight,
+                    part_size,
+                } = part;
                 UploadFailure::new(
                     format!(
                         "multipart upload of part {part_idx} of {path} failed after {:?} \
-                         ({part_size} bytes, parts_in_flight={parts_in_flight} at submission, {})",
+                         ({body_size} bytes, part_size={part_size} bytes, \
+                          parts_in_flight={parts_in_flight} at submission, {})",
                         queued_at.elapsed(),
                         upload_settings()
                     ),
@@ -303,6 +352,9 @@ impl ObjectWriter {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
 
+                        // Read before the buffer is swapped out: capacity is the
+                        // part size this body was filled to.
+                        let part_size = mut_self.buffer.capacity();
                         let data = Self::next_part_buffer(
                             &mut mut_self.buffer,
                             0,
@@ -311,9 +363,12 @@ impl ObjectWriter {
                         futures.spawn(Self::put_part(
                             upload.as_mut(),
                             data,
-                            mut_self.path.clone(),
-                            0,
-                            1,
+                            PartUpload {
+                                path: mut_self.path.clone(),
+                                part_idx: 0,
+                                parts_in_flight: 1,
+                                part_size,
+                            },
                         ));
 
                         mut_self.state = UploadState::InProgress {
@@ -330,7 +385,7 @@ impl ObjectWriter {
                         match res {
                             Ok(Ok(())) => {}
                             Err(err) => {
-                                return Err(UploadFailure::new(
+                                return Err(UploadFailure::from_task(
                                     format!(
                                         "multipart upload task for {} did not complete",
                                         mut_self.path
@@ -431,21 +486,24 @@ impl AsyncWrite for ObjectWriter {
                     futures,
                     ..
                 } if futures.len() < max_upload_parallelism() => {
+                    // Read before the buffer is swapped out: capacity is the
+                    // part size this body was filled to, which grows as the
+                    // upload progresses.
+                    let part_size = mut_self.buffer.capacity();
                     let data = Self::next_part_buffer(
                         &mut mut_self.buffer,
                         *part_idx,
                         mut_self.use_constant_size_upload_parts,
                     );
-                    let parts_in_flight = futures.len() + 1;
+                    let part = PartUpload {
+                        path: mut_self.path.clone(),
+                        part_idx: *part_idx,
+                        parts_in_flight: futures.len() + 1,
+                        part_size,
+                    };
                     futures.spawn(
-                        Self::put_part(
-                            upload.as_mut(),
-                            data,
-                            mut_self.path.clone(),
-                            *part_idx,
-                            parts_in_flight,
-                        )
-                        .instrument(tracing::Span::current()),
+                        Self::put_part(upload.as_mut(), data, part)
+                            .instrument(tracing::Span::current()),
                     );
                     *part_idx += 1;
                 }
@@ -511,21 +569,20 @@ impl AsyncWrite for ObjectWriter {
                     // Flush final batch
                     if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
                         // We can just use `take` since we don't need the buffer anymore.
+                        let part_size = mut_self.buffer.capacity();
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
-                        let parts_in_flight = futures.len() + 1;
-                        let final_part_idx = *part_idx;
+                        let part = PartUpload {
+                            path: mut_self.path.clone(),
+                            part_idx: *part_idx,
+                            parts_in_flight: futures.len() + 1,
+                            part_size,
+                        };
                         // Counted like every other part so the part total
                         // reported when completing the upload is accurate.
                         *part_idx += 1;
                         futures.spawn(
-                            Self::put_part(
-                                upload.as_mut(),
-                                data,
-                                mut_self.path.clone(),
-                                final_part_idx,
-                                parts_in_flight,
-                            )
-                            .instrument(tracing::Span::current()),
+                            Self::put_part(upload.as_mut(), data, part)
+                                .instrument(tracing::Span::current()),
                         );
                         // We need to go back to beginning of loop to poll the
                         // new feature and get the waker registered on the ctx.
@@ -553,12 +610,10 @@ impl Writer for ObjectWriter {
     }
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
-        AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(format!(
-                "failed to shutdown object writer for {}: {}",
-                self.path, e
-            ))
-        })?;
+        // Propagated structurally rather than formatted into a message: every
+        // failure from this writer already names the path, and stringifying it
+        // would flatten the object store error out of the source chain.
+        AsyncWriteExt::shutdown(self).await?;
         if let UploadState::Done(result) = &self.state {
             Ok(result.clone())
         } else {
@@ -973,7 +1028,11 @@ mod tests {
         );
         assert!(
             message.contains(&format!("{} bytes", initial_upload_size())),
-            "should report the part size: {message}"
+            "should report the body size: {message}"
+        );
+        assert!(
+            message.contains(&format!("part_size={} bytes", initial_upload_size())),
+            "should report the part size in effect: {message}"
         );
         assert!(
             message.contains("parts_in_flight="),
@@ -1002,6 +1061,38 @@ mod tests {
         );
     }
 
+    // `part_size` in the failure message is the live buffer capacity, which is
+    // what makes it report the size actually in effect. The part size grows
+    // every 100 parts, so on a long upload that diverges from
+    // LANCE_INITIAL_UPLOAD_SIZE by a multiple; reporting only the configured
+    // value would understate a late part by that factor. Reaching part 100
+    // through the writer would mean allocating hundreds of MiB, so the growth
+    // is asserted on the buffer the message reads from.
+    #[test]
+    fn test_part_buffer_capacity_tracks_grown_part_size() {
+        let mut buffer = Vec::<u8>::with_capacity(initial_upload_size());
+        assert_eq!(buffer.capacity(), initial_upload_size());
+
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 0, false);
+        assert_eq!(
+            buffer.capacity(),
+            initial_upload_size(),
+            "early parts stay at the configured size"
+        );
+
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 100, false);
+        assert_eq!(
+            buffer.capacity(),
+            initial_upload_size().max(2 * INITIAL_UPLOAD_STEP),
+            "the part size has grown past the first step"
+        );
+
+        // A store pinned to constant part sizes never grows, so the reported
+        // size stays equal to the configured one.
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 100, true);
+        assert_eq!(buffer.capacity(), initial_upload_size());
+    }
+
     #[tokio::test]
     async fn test_part_upload_failure_preserves_source_chain() {
         let err = failing_upload(FailAt::PutPart, two_parts()).await;
@@ -1014,6 +1105,57 @@ mod tests {
         assert!(
             source.downcast_ref::<object_store::Error>().is_some(),
             "source should still be the object store error, got: {source}"
+        );
+    }
+
+    /// Adding context must not flatten the `io::ErrorKind` that `object_store`
+    /// maps an error to, since that kind is observable to callers.
+    #[test]
+    fn test_upload_failure_preserves_error_kind() {
+        fn not_found() -> object_store::Error {
+            object_store::Error::NotFound {
+                path: FAILING_UPLOAD_PATH.to_string(),
+                source: "not found".into(),
+            }
+        }
+
+        let unwrapped = io::Error::from(not_found());
+        assert_eq!(unwrapped.kind(), io::ErrorKind::NotFound);
+
+        let wrapped =
+            UploadFailure::new("part upload failed".to_string(), not_found()).into_io_error();
+        assert_eq!(wrapped.kind(), unwrapped.kind());
+    }
+
+    /// `Writer::shutdown` is the public boundary most callers see. The object
+    /// store error has to remain reachable through it, not be flattened into a
+    /// message.
+    #[tokio::test]
+    async fn test_writer_shutdown_preserves_object_store_source() {
+        let mut store = LanceObjectStore::memory();
+        store.inner = Arc::new(FailingUploadStore {
+            fail_at: FailAt::SinglePut,
+        });
+        let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
+            .await
+            .unwrap();
+        writer.write_all(&[0u8; 256]).await.unwrap();
+        let err = Writer::shutdown(&mut writer).await.unwrap_err();
+
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let mut found_object_store = false;
+        while let Some(source) = current {
+            if source.downcast_ref::<object_store::Error>().is_some() {
+                found_object_store = true;
+                break;
+            }
+            current = source.source();
+        }
+        assert!(found_object_store, "source chain was flattened: {err:?}");
+
+        assert!(
+            err.to_string().contains(FAILING_UPLOAD_PATH),
+            "should still name the object: {err}"
         );
     }
 
