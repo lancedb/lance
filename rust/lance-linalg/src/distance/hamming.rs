@@ -396,25 +396,33 @@ pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
         "hamming_batch_u64 needs one result slot per target, \
          got {num_targets} target(s) and {num_slots} slot(s)"
     );
-    hamming_batch_simd(query, targets, results);
+    // SAFETY: the assert above establishes `results.len() == targets.len()`, which
+    // satisfies `hamming_batch_simd`'s `results.len() >= targets.len()` requirement.
+    unsafe { hamming_batch_simd(query, targets, results) };
 }
 
 /// SIMD-accelerated batch hamming distance computation.
 ///
-/// `results.len()` must be at least `targets.len()`: the x86 kernels this
-/// dispatches to store through raw pointers with no bounds check. The only
-/// caller, `hamming_batch_u64`, asserts equality first.
+/// # Safety
+///
+/// `results.len()` must be at least `targets.len()`. The x86 kernels this
+/// dispatches to store through raw pointers with no bounds check, so a shorter
+/// `results` is an out-of-bounds write rather than a panic.
 #[inline]
-fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
+unsafe fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vpopcntdq") && is_x86_feature_detected!("avx512f") {
+            // SAFETY: both required features were just detected, and
+            // `results.len() >= targets.len()` is this function's own requirement.
             unsafe {
                 hamming_batch_avx512(query, targets, results);
             }
             return;
         }
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was just detected, and `results.len() >= targets.len()`
+            // is this function's own requirement.
             unsafe {
                 hamming_batch_avx2(query, targets, results);
             }
