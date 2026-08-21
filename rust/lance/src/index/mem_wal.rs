@@ -399,6 +399,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(roaring::RoaringBitmap::from_iter(fragments.iter().copied())),
             index_details: None,

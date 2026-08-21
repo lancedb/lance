@@ -2042,6 +2042,7 @@ mod tests {
             uuid,
             name: "some_index".to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.version().version,
             fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
             index_details: None,

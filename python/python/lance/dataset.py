@@ -5790,6 +5790,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
