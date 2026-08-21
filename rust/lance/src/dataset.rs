@@ -65,7 +65,7 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -195,6 +195,14 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Object stores for additional base paths, resolved lazily on first use.
+    ///
+    /// The session's `ObjectStoreRegistry` only holds weak references, so
+    /// this cache keeps base stores (and their connection pools) alive for the
+    /// lifetime of the dataset, mirroring the primary `object_store` field.
+    /// Base ids are assigned once at dataset creation and never remapped, so
+    /// sharing this cache across clones of the dataset is safe.
+    pub(crate) base_object_stores: Arc<Mutex<HashMap<u32, Arc<ObjectStore>>>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -853,6 +861,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1962,6 +1971,9 @@ impl Dataset {
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
+        // The clone resolves base stores with different params; don't let it
+        // share (or serve) stores cached under the old binding.
+        cloned.base_object_stores = Arc::new(Mutex::new(HashMap::new()));
         cloned
     }
 
@@ -2010,6 +2022,9 @@ impl Dataset {
                     .collect(),
             )
         });
+        // Base stores cached before the wrappers were appended would bypass
+        // them; make the clone resolve its base stores fresh.
+        cloned.base_object_stores = Arc::new(Mutex::new(HashMap::new()));
         cloned
     }
 
@@ -2419,6 +2434,15 @@ impl Dataset {
     }
 
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+        if let Some(store) = self
+            .base_object_stores
+            .lock()
+            .expect("base_object_stores lock poisoned")
+            .get(&base_id)
+        {
+            return Ok(store.clone());
+        }
+
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
@@ -2431,7 +2455,16 @@ impl Dataset {
         )
         .await?;
 
-        Ok(store)
+        // Concurrent first uses can race to build the store; converge on the
+        // one that landed in the cache so every caller shares one store (and
+        // one connection pool).
+        Ok(self
+            .base_object_stores
+            .lock()
+            .expect("base_object_stores lock poisoned")
+            .entry(base_id)
+            .or_insert(store)
+            .clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.

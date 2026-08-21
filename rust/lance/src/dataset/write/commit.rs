@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lance_file::version::LanceFileVersion;
@@ -461,6 +461,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Arc::new(Mutex::new(HashMap::new())),
                 })
             }
         }

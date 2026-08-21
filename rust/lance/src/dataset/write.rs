@@ -2963,6 +2963,67 @@ mod tests {
         assert_eq!(num_rows, 5);
     }
 
+    // Regression test for https://github.com/lance-format/lance/issues/8692:
+    // the session registry only holds weak references to object stores, so the
+    // dataset itself must keep base stores alive. Otherwise every read from an
+    // additional base rebuilds the store and its connection pool.
+    #[tokio::test]
+    async fn test_base_object_store_kept_alive_by_dataset() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+
+        // A base-scoped option gives the base store a registry cache key
+        // distinct from the primary store's, so nothing but the dataset can
+        // keep the base store alive.
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "base_1.scoped_option".to_string(),
+                    "base1-value".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            primary_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                store_params: Some(store_params),
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("base1".to_string()),
+                    path: base1_dir.as_str().to_string(),
+                    is_dataset_root: true,
+                }]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let store = dataset.object_store(Some(1)).await.unwrap();
+        let weak_store = Arc::downgrade(&store);
+        drop(store);
+
+        // The dataset holds a strong reference, so the store survives the
+        // caller dropping its handle and the next call reuses the instance.
+        let store_again = dataset.object_store(Some(1)).await.unwrap();
+        assert!(
+            weak_store
+                .upgrade()
+                .is_some_and(|original| Arc::ptr_eq(&original, &store_again)),
+            "base object store was rebuilt instead of reused"
+        );
+    }
+
     #[tokio::test]
     async fn test_multi_base_overwrite() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
