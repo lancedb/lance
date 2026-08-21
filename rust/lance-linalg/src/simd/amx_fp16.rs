@@ -58,6 +58,11 @@
     target_os = "linux"
 ))]
 use crate::distance::dot_f16::strided_len;
+#[cfg(all(
+    kernel_support = "amx_fp16",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
 use half::f16;
 
 #[cfg(all(
