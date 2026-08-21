@@ -335,6 +335,20 @@ pub struct WriteParams {
     /// secondary indices need to be updated to point to new row ids.
     pub enable_stable_row_ids: bool,
 
+    /// Whether writers may store new values as data overlay files for this dataset,
+    /// recorded as the `lance.overlays.enabled` dataset config key.
+    ///
+    /// `None` leaves the dataset unconfigured, so it follows the library default.
+    /// This is deliberately an `Option<bool>` rather than a `bool`: the default is
+    /// expected to become "enabled", and a bare `enable_*: bool` could not tell
+    /// "the caller asked for off" from "the caller said nothing".
+    ///
+    /// Only honored for `Create` and `Overwrite`; an append leaves the existing
+    /// setting alone. Use [`Dataset::set_overlays_enabled`] to change it later.
+    ///
+    /// [`Dataset::set_overlays_enabled`]: crate::Dataset::set_overlays_enabled
+    pub enable_overlays: Option<bool>,
+
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
     /// These allow constant-time lookups for the latest manifest on object storage.
     /// This parameter has no effect on existing datasets. To migrate an existing
@@ -429,6 +443,7 @@ impl Default for WriteParams {
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
+            enable_overlays: None,
             enable_v2_manifest_paths: true,
             session: None,
             auto_cleanup: None,

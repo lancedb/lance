@@ -1,18 +1,21 @@
 # Data Overlay Files
 
-!!! warning "Experimental"
-
-    This feature is currently experimental and not yet supported in any library.
-
-<!-- TODO: When overlay file support is implemented, update this note to state
-     the released version that first supports the feature (and drop the
-     "experimental" framing once it is stable). -->
-
 !!! note "Overlay files require feature flag 64 (data overlay files)"
 
     A reader or writer that does not understand overlay files must refuse a
     dataset that uses them. Silently ignoring an overlay would return stale base
     values, which is a correctness bug rather than a degraded experience.
+
+    The flag describes the current manifest, not the dataset's history. The commit
+    that attaches the first overlay sets it, and the commit that removes the last
+    overlay — whether by [compacting](#compaction) the overlays into base data or by
+    deleting the overlaid fragments — clears it, so the dataset is readable by
+    pre-overlay readers again.
+
+    That describes the moment, not a guarantee. Whether a writer *may* create a new
+    overlay is a separate setting, [`lance.overlays.enabled`](#enabling-overlays); a
+    dataset stays open to pre-overlay readers only if its overlays are both removed
+    and disabled.
 
 Overlay files supply new values for a subset of `(row offset, field)` cells
 within a fragment **without rewriting the fragment's base data files**. They make
@@ -24,6 +27,36 @@ This is Lance's third mechanism for changing data in place, alongside
 [deletion files](index.md#deletion-files) (which remove rows) and
 [data evolution](index.md#data-evolution) (which adds or rewrites whole columns).
 An overlay changes individual cells.
+
+## Enabling overlays
+
+A dataset records whether writers may create overlays in the table config key
+`lance.overlays.enabled`, whose value is the string `true` or `false`. This is
+distinct from feature flag 64: the flag reports that overlays **are present**,
+while the config key states that they **are permitted**. Keeping the two apart is
+what lets a dataset be overlay-enabled while holding no overlays, so a writer can
+choose the overlay representation for the next update without the dataset being
+closed to pre-overlay readers in the meantime.
+
+The key is resolved as follows:
+
+1. If it is set to a recognized boolean, that value wins.
+2. Otherwise, if any fragment already carries an overlay, overlays are enabled.
+   This keeps datasets written before the key existed writable.
+3. Otherwise the implementation's default applies. The default is currently
+   *disabled* and is expected to become *enabled* in a future release.
+
+Because absence resolves to a default that is expected to change, a dataset that
+must not accumulate overlays should set the key to `false` explicitly rather than
+relying on it being unset.
+
+Disabling is permitted only when no fragment carries an overlay, since a disabled
+dataset must be resolvable without overlay support. A writer that has overlays to
+clear must [compact](#compaction) them into base data first. Writers must reject
+both a commit that disables overlays while any remain and a commit that adds an
+overlay while they are disabled; both checks have to be re-evaluated when a
+transaction is rebased onto a newer version, or a disable can race an overlay
+write.
 
 ## Concepts
 
@@ -66,8 +99,7 @@ search.
 Because different fields may cover different offset sets, the value columns of a
 single sparse overlay may have **different lengths**. The Lance file format
 permits columns of differing item counts within one file, so a sparse overlay is
-representable as a single file. (See [Writer support](#writer-support) for the
-current implementation status.)
+representable as a single file.
 
 ### Dense vs. sparse overlays
 
@@ -357,26 +389,16 @@ cost. Roughly: few rows changed favors overlays; most rows in a few columns
 favors a column rewrite; most columns changed favors moving rows to a new
 fragment.
 
-### Writer support
-
-<!-- TODO: Fill in as writer implementation progresses, including the status of
-     single-file sparse overlays (independent-length columns). -->
-
-*(To be expanded.)* Dense (rectangular) overlays write with the existing
-equal-length file writer today. Sparse overlays stored as a **single** file
-require the writer to emit columns of independent lengths, which the current v2
-writer does not yet do (it advances all columns from one global row counter).
-Until that support lands, a writer can express a sparse update as multiple dense
-overlays in one transaction.
-
 ### Scheduling compaction
 
-<!-- TODO: Fill in with a concrete cost/benefit policy once compaction is
-     implemented and benchmarked. -->
+<!-- TODO: Fill in with a concrete cost/benefit policy once the overlay→overlay
+     and overlay→base modes are implemented and benchmarked. -->
 
-*(To be expanded.)* The overlay→overlay and overlay→base modes have very
-different costs; a cost/benefit scheduler decides when each is worthwhile, using
-the version gap as a staleness signal.
+*(To be expanded.)* Compaction is currently triggered by a bound on the number of
+overlays a fragment may accumulate, which rewrites the fragment in full. The
+overlay→overlay and overlay→base modes have very different costs; a cost/benefit
+scheduler decides when each is worthwhile, using the version gap as a staleness
+signal.
 
 ## Related specifications
 

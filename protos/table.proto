@@ -117,7 +117,10 @@ message Manifest {
   // * 1 << 5: transaction file writes are disabled
   // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
   //   not understand overlays must refuse the dataset, since ignoring an overlay
-  //   would silently return stale base values.
+  //   would silently return stale base values. Writers set this flag when a commit
+  //   attaches the first overlay and clear it when a commit removes the last one,
+  //   so it reports that overlays are present, not that they are permitted. Whether
+  //   a writer may create one is the separate "lance.overlays.enabled" config key.
   // * 1 << 7: index_catchup is maintained on this table, so an index absent from
   //   it is *not* caught up rather than fully caught up (see MemWalIndexDetails).
   //   Readers that do not understand it must refuse the dataset, since reading
@@ -186,6 +189,13 @@ message Manifest {
   // Keys with the prefix "lance." are reserved for the Lance library. Other
   // libraries may wish to similarly prefix their configuration keys
   // appropriately.
+  //
+  // Reserved keys that affect how a writer may change the table:
+  // * "lance.overlays.enabled": "true" or "false". Whether a writer may store new
+  //   values as data overlay files (see DataOverlayFile). When unset, a dataset
+  //   that already carries overlays is treated as enabled and one that does not
+  //   falls back to the implementation default. It may only be set to "false"
+  //   while no fragment carries an overlay.
   map<string, string> config = 16;
 
   // Metadata associated with the table.

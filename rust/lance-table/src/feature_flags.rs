@@ -25,11 +25,19 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// overlays must refuse the dataset, since ignoring an overlay would silently
 /// return stale base values.
 ///
-/// Data overlay files are not yet a released feature: in release builds this flag
-/// is treated as unknown (so a release reader/writer refuses an overlay dataset)
-/// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
-/// Debug builds always understand it so tests exercise the path.
-pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
+/// The flag tracks the manifest contents rather than the dataset's history: it is
+/// set by the commit that first attaches an overlay and cleared again by the commit
+/// that removes the last one (compaction folding overlays into base data, or the
+/// overlaid fragments being deleted). A dataset that no longer carries overlays is
+/// therefore readable by writers and readers that predate the feature.
+///
+/// So this reports that overlays are *present*. Whether a writer may create one is
+/// the separate [`LANCE_OVERLAYS_ENABLED`] setting, which persists across the flag
+/// being cleared -- a dataset only stays open to pre-overlay readers if its overlays
+/// are both removed and disabled.
+///
+/// [`LANCE_OVERLAYS_ENABLED`]: crate::format::LANCE_OVERLAYS_ENABLED
+pub const FLAG_DATA_OVERLAY_FILES: u64 = 64;
 /// `index_catchup` is maintained on this table, so a missing entry means the
 /// index is *not* caught up rather than fully caught up.
 ///
@@ -45,10 +53,6 @@ pub const FLAG_UNKNOWN: u64 = 256;
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
 const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
-
-/// Environment variable that opts a release build into reading and writing data
-/// overlay files before the feature is generally released.
-pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -126,8 +130,8 @@ pub fn apply_feature_flags(
         .iter()
         .any(|frag| !frag.overlays.is_empty());
     if has_overlays {
-        manifest.reader_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
-        manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
+        manifest.reader_feature_flags |= FLAG_DATA_OVERLAY_FILES;
+        manifest.writer_feature_flags |= FLAG_DATA_OVERLAY_FILES;
     }
 
     if disable_transaction_file {
@@ -168,44 +172,15 @@ pub fn inherit_mem_wal_index_catchup(destination: &mut Manifest, source: &Manife
     }
 }
 
-/// Whether this build understands data overlay files: always in debug builds,
-/// and in release builds only when [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set.
-fn data_overlay_files_enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
-}
-
-/// Clear `flag` from `flags` when its gating feature is not enabled in this
-/// build; leave it set otherwise. One call per unstable flag, so support for
-/// several unstable features chains cleanly.
-fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
-    if !feature_enabled {
-        *flags &= !flag;
-    }
-}
-
-/// The feature-flag bits this build understands, given whether overlay support
-/// is enabled. Split out from [`supported_flags`] so the policy is testable
-/// without toggling the build profile or environment.
-fn supported_flags_when(overlay_enabled: bool) -> u64 {
-    let mut supported = FLAG_UNKNOWN - 1;
-    mark_supported(
-        &mut supported,
-        FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-        overlay_enabled,
-    );
-    supported
-}
-
-fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled())
-}
+/// The feature-flag bits this build understands.
+const SUPPORTED_FLAGS: u64 = FLAG_UNKNOWN - 1;
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
-    reader_flags & !supported_flags() == 0
+    reader_flags & !SUPPORTED_FLAGS == 0
 }
 
 pub fn can_write_dataset(writer_flags: u64) -> bool {
-    writer_flags & !supported_flags() == 0
+    writer_flags & !SUPPORTED_FLAGS == 0
 }
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
@@ -244,13 +219,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        // Overlay support is gated on the build profile / env opt-in, so the
-        // flag is readable exactly when overlays are enabled (see
-        // test_data_overlay_flag_release_gating for the full policy).
-        assert_eq!(
-            can_read_dataset(super::FLAG_UNSTABLE_DATA_OVERLAY_FILES),
-            data_overlay_files_enabled()
-        );
+        assert!(can_read_dataset(super::FLAG_DATA_OVERLAY_FILES));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -259,21 +228,10 @@ mod tests {
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
     }
 
+    /// The overlay flag follows the manifest contents in both directions: set while
+    /// a fragment carries an overlay, cleared once the last overlay is gone.
     #[test]
-    fn test_data_overlay_flag_release_gating() {
-        // Release default (overlays disabled): the overlay flag is treated as
-        // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false);
-        assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
-        assert_eq!(FLAG_DELETION_FILES & !supported, 0);
-        assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
-        // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true);
-        assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
-    }
-
-    #[test]
-    fn test_apply_feature_flags_sets_overlay_flag() {
+    fn test_apply_feature_flags_tracks_overlay_presence() {
         use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
         use crate::format::{DataFile, DataStorageFormat, Fragment};
         use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -296,19 +254,19 @@ mod tests {
         }];
         let mut manifest = Manifest::new(
             schema,
-            Arc::new(vec![fragment]),
+            Arc::new(vec![fragment.clone()]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
         apply_feature_flags(&mut manifest, false, false).unwrap();
-        assert_ne!(
-            manifest.reader_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            0
-        );
-        assert_ne!(
-            manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            0
-        );
+        assert_ne!(manifest.reader_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
+
+        fragment.overlays.clear();
+        manifest.fragments = Arc::new(vec![fragment]);
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
     }
 
     #[test]
@@ -320,13 +278,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        // Overlay support is gated on the build profile / env opt-in, so the
-        // flag is writable exactly when overlays are enabled (see
-        // test_data_overlay_flag_release_gating for the full policy).
-        assert_eq!(
-            can_write_dataset(super::FLAG_UNSTABLE_DATA_OVERLAY_FILES),
-            data_overlay_files_enabled()
-        );
+        assert!(can_write_dataset(super::FLAG_DATA_OVERLAY_FILES));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS

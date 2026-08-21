@@ -6,7 +6,8 @@
 use crate::feature_flags::FLAG_STABLE_ROW_IDS;
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, LANCE_OVERLAYS_ENABLED, Manifest,
+    ManifestBuildConfig,
 };
 use crate::transaction::{Operation, Transaction};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -41,6 +42,17 @@ pub fn sample_manifest() -> Manifest {
         DataStorageFormat::new(ConcreteFileVersion::V2_0),
         HashMap::new(),
     )
+}
+
+/// A [`sample_manifest`] that permits overlay writes. Without the setting a
+/// `DataOverlay` commit is rejected, since a dataset with no overlays yet
+/// resolves to the (currently disabled) library default.
+pub fn overlay_enabled_manifest() -> Manifest {
+    let mut manifest = sample_manifest();
+    manifest
+        .config
+        .insert(LANCE_OVERLAYS_ENABLED.to_string(), "true".to_string());
+    manifest
 }
 
 pub fn sample_index_metadata(name: &str) -> IndexMetadata {
