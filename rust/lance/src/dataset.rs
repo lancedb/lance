@@ -148,9 +148,7 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{
-    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
-};
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
@@ -765,8 +763,6 @@ impl Dataset {
         } else {
             read_struct(object_reader.as_ref(), offset).await
         }?;
-
-        validate_mem_wal_index_catchup_flags(&manifest)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(

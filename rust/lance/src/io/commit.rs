@@ -1332,24 +1332,13 @@ pub(crate) async fn commit_transaction(
     // covering every fragment live here holds every row compaction had copied
     // in by then.
     //
-    // Only tables on the protocol pay for the extra index load; the bit is on
-    // the manifest already in hand.
+    // The Arc is kept rather than cloned out: `load_indices` returns shared
+    // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
-    let read_version_indices = if read_version_dataset.manifest.reader_feature_flags
-        & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
-        != 0
-    {
-        // The Arc is kept rather than cloned out: `load_indices` returns shared
-        // cached data, and this runs on every commit to an activated table.
-        Some(read_version_dataset.load_indices().await?)
-    } else {
-        None
-    };
-    let read_version_state = read_version_indices.as_ref().map(|indices| {
-        crate::dataset::transaction::ReadVersionState {
-            manifest: read_version_dataset.manifest.as_ref(),
-            indices: indices.as_slice(),
-        }
+    let read_version_indices = read_version_dataset.load_indices().await?;
+    let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
+        manifest: read_version_dataset.manifest.as_ref(),
+        indices: read_version_indices.as_slice(),
     });
 
     let mut transaction = transaction.clone();
