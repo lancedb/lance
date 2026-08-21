@@ -122,6 +122,11 @@ pub trait ObjectStoreExt {
 }
 
 #[async_trait]
+pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+}
+
+#[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     fn read_dir_all<'a, 'b>(
         &'a self,
@@ -152,6 +157,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // Provider-owned native directory operations for rooted local stores.
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -549,6 +556,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
+                local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -633,6 +641,14 @@ impl ObjectStore {
         self.scheme == "file" || self.scheme == "file+uring"
     }
 
+    /// Returns true when object paths directly encode absolute local filesystem paths.
+    ///
+    /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
+    /// their inner object-store implementation instead of direct filesystem access.
+    pub fn has_direct_local_paths(&self) -> bool {
+        self.is_local() && self.store_prefix == self.scheme
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -704,7 +720,7 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -766,7 +782,7 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -829,7 +845,7 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 if let Some(parent) = local_path.parent() {
@@ -951,7 +967,7 @@ impl ObjectStore {
         multipart_copy_fallback: bool,
         max_single_copy: u64,
     ) -> Result<()> {
-        if self.is_local() {
+        if self.has_direct_local_paths() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -1018,7 +1034,13 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = local_dir_operations.remove_dir_all(&path).await;
+            metrics.record(&result, 0);
+            return result;
+        }
+        if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -1076,7 +1098,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.is_local() && self.scheme != "file-object-store" {
+        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
             return Ok(());
         }
 
@@ -1308,6 +1330,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
