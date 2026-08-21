@@ -113,6 +113,8 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        // Ensure stable row IDs are monotonically increasing.
+        manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // A version from before catch-up was required carries MemWAL state this
         // protocol never validated -- catch-up values activation deliberately
         // cleared, or compaction progress it deliberately refused to trust.
