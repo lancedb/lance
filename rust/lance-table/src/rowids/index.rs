@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use super::{RowIdSequence, U64Segment};
 use lance_core::deepsize::DeepSizeOf;
@@ -12,8 +11,14 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 
-/// Share of the merged build that probes may spend before building it anyway.
-const PROBE_BUDGET_DIVISOR: u64 = 8;
+/// Fragments one lookup may have to probe before the merged map is worth its
+/// build, whatever that build costs. A compacted table interleaves its
+/// fragments, and one measured at 46.
+const MAX_PROBE_DEPTH: u64 = 64;
+
+/// Row ids the merged build may read before probing is worth its per-lookup
+/// cost instead.
+const MERGE_ROWS_BUDGET: u64 = 1 << 20;
 
 /// An index of row ids
 ///
@@ -24,12 +29,12 @@ const PROBE_BUDGET_DIVISOR: u64 = 8;
 /// map to addresses that have been tombstoned. A separate tombstone index is
 /// used to track tombstoned rows.
 // (Implementation)
-// Two representations answer the same lookups. The merged map keys disjoint
-// ranges of row ids to a pair of segments, the row ids and the addresses, and
-// reads every row id to build. A probe instead reads each segment's bounds and
-// asks the covering segment for the position of the id. `new` builds the merged
-// map when that build is cheap, and a workload that probes past the budget
-// builds it after all.
+// Two representations answer the same lookups, chosen once by `new`. The merged
+// map keys disjoint ranges of row ids to a pair of segments, the row ids and
+// the addresses, and reads every row id to build. A probe instead reads each
+// segment's bounds and asks the covering segment for the position of the id;
+// `new` takes that when few fragments cover one id and the merged build would
+// read a lot of them.
 #[derive(Debug)]
 pub struct RowIdIndex {
     /// Fragments that hold at least one row id, sorted by their lowest row id.
@@ -37,11 +42,7 @@ pub struct RowIdIndex {
     /// Max-`end` heap over `fragments`: `end_tree[1]` is the root and leaf `i`
     /// sits at `end_tree[len() / 2 + i]`.
     end_tree: Vec<u64>,
-    /// Probes to serve before building the merged map. 0 means `new` built it.
-    merge_after: u64,
-    probes: AtomicU64,
-    /// Holds `None` once a merged build failed.
-    merged: OnceLock<Option<MergedIndex>>,
+    merged: Option<MergedIndex>,
 }
 
 type MergedIndex = RangeInclusiveMap<u64, (U64Segment, U64Segment)>;
@@ -61,32 +62,15 @@ impl RowIdIndex {
             .collect();
         fragments.sort_unstable_by_key(|entry| entry.start);
 
-        let index = Self {
-            merge_after: merge_after(&fragments),
+        let mut index = Self {
             end_tree: build_end_tree(&fragments),
             fragments,
-            probes: AtomicU64::new(0),
-            merged: OnceLock::new(),
+            merged: None,
         };
-        if index.merge_after == 0 {
-            // Cheap to build, so build it here and report a corrupt index now.
-            index.merged.set(Some(index.build_merged()?)).ok();
+        if !probing_beats_merging(&index.fragments) {
+            index.merged = Some(index.build_merged()?);
         }
         Ok(index)
-    }
-
-    /// Merged map, once `probes` more lookups pass the budget.
-    fn merged(&self, probes: u64) -> Option<&MergedIndex> {
-        if let Some(merged) = self.merged.get() {
-            return merged.as_ref();
-        }
-        if self.probes.fetch_add(probes, Ordering::Relaxed) + probes < self.merge_after {
-            return None;
-        }
-        // A corrupt index has no merged form; keep probing.
-        self.merged
-            .get_or_init(|| self.build_merged().ok())
-            .as_ref()
     }
 
     fn build_merged(&self) -> Result<MergedIndex> {
@@ -127,7 +111,7 @@ impl RowIdIndex {
     ///
     /// Will return None if the row id does not exist in the index.
     pub fn get(&self, row_id: u64) -> Option<RowAddress> {
-        if let Some(merged) = self.merged(1) {
+        if let Some(merged) = &self.merged {
             return merged_get(merged, row_id);
         }
         self.probe(row_id)
@@ -149,7 +133,7 @@ impl RowIdIndex {
         let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..n).collect();
         sorted.sort_unstable_by_key(|&(id, _)| id);
 
-        let Some(merged) = self.merged(n as u64) else {
+        let Some(merged) = &self.merged else {
             // Sorted ids keep one fragment and its segments warm across the run.
             for (id, orig_idx) in sorted {
                 out[orig_idx] = self.probe(id);
@@ -182,8 +166,12 @@ impl RowIdIndex {
         out
     }
 
-    /// Address of `row_id`, from the fragment that holds it. Descends the
+    /// Address of `row_id`, from the fragment that holds it live. Descends the
     /// max-`end` tree, so a fragment out of reach of the id costs nothing.
+    ///
+    /// Visits every candidate rather than stopping at the first hit, so a row
+    /// id live in two fragments resolves to the same address here and through
+    /// [`Self::get_many`], and trips the assertion in a debug build.
     fn probe(&self, row_id: u64) -> Option<RowAddress> {
         let fragments = self.fragments.len();
         if fragments == 0 {
@@ -201,6 +189,7 @@ impl RowIdIndex {
         let mut stack = [(0usize, 0usize, 0usize); 64];
         stack[0] = (1, 0, leaves);
         let mut depth = 1;
+        let mut found: Option<RowAddress> = None;
         while depth > 0 {
             depth -= 1;
             let (node, lo, hi) = stack[depth];
@@ -209,9 +198,18 @@ impl RowIdIndex {
             }
             if hi - lo == 1 {
                 if lo < fragments
-                    && let Some(found) = self.fragments[lo].resolve(row_id)
+                    && let Some(candidate) = self.fragments[lo].resolve(row_id)
                 {
-                    return Some(found);
+                    debug_assert!(
+                        found.is_none(),
+                        "row id index corrupt: stable row id {row_id} is live in \
+                         multiple fragments"
+                    );
+                    // The lowest fragment id wins, so both lookup APIs agree.
+                    found = Some(match found {
+                        Some(previous) => candidate.min(previous),
+                        None => candidate,
+                    });
                 }
                 continue;
             }
@@ -222,7 +220,7 @@ impl RowIdIndex {
             stack[depth + 1] = (2 * node + 1, mid, hi);
             depth += 2;
         }
-        None
+        found
     }
 }
 
@@ -239,6 +237,38 @@ struct SegmentEntry {
     seq_idx: usize,
     range: RangeInclusive<u64>,
     start_offset: u32,
+    /// Row id to position for an unsorted [`U64Segment::Array`], whose own
+    /// `position` scans. `None` for the encodings that search themselves.
+    positions: Option<Vec<(u64, u32)>>,
+}
+
+impl SegmentEntry {
+    /// Position of `row_id` in this segment, or `None` if it holds no such id.
+    fn position(&self, sequence: &RowIdSequence, row_id: u64) -> Option<usize> {
+        match &self.positions {
+            None => sequence.0[self.seq_idx].position(row_id),
+            Some(positions) => positions
+                .binary_search_by_key(&row_id, |(id, _)| *id)
+                .ok()
+                .map(|found| positions[found].1 as usize),
+        }
+    }
+}
+
+/// Row id to position for a segment, sorted by row id. The first position of a
+/// repeated id wins, which is what `position` returns.
+fn build_positions(segment: &U64Segment) -> Option<Vec<(u64, u32)>> {
+    if !matches!(segment, U64Segment::Array(_)) {
+        return None;
+    }
+    let mut positions: Vec<(u64, u32)> = segment
+        .iter()
+        .enumerate()
+        .map(|(position, row_id)| (row_id, position as u32))
+        .collect();
+    positions.sort_unstable();
+    positions.dedup_by_key(|(row_id, _)| *row_id);
+    Some(positions)
 }
 
 #[derive(Debug)]
@@ -274,6 +304,7 @@ impl FragmentEntry {
                     seq_idx,
                     range,
                     start_offset,
+                    positions: build_positions(segment),
                 });
             }
             start_offset += len as u32;
@@ -298,7 +329,7 @@ impl FragmentEntry {
             if !entry.range.contains(&row_id) {
                 continue;
             }
-            let Some(position) = self.sequence.0[entry.seq_idx].position(row_id) else {
+            let Some(position) = entry.position(&self.sequence, row_id) else {
                 continue;
             };
             let row_offset = entry.start_offset + position as u32;
@@ -311,12 +342,15 @@ impl FragmentEntry {
     }
 }
 
-/// Probes to serve before building the merged map, from the rows that build
-/// reads and the fragments a probe walks. 0 when the build is cheap.
-fn merge_after(fragments: &[FragmentEntry]) -> u64 {
+/// Whether to answer lookups by probing the fragments rather than by merging
+/// every row id.
+///
+/// Probing costs the fragments that cover one id, per lookup; merging costs the
+/// row ids it reads, once. So probe only when both stay on the right side of
+/// [`MAX_PROBE_DEPTH`] and [`MERGE_ROWS_BUDGET`].
+fn probing_beats_merging(fragments: &[FragmentEntry]) -> bool {
     let merge_rows: u64 = fragments.iter().map(|entry| entry.merge_rows).sum();
-    let depth = max_overlap_depth(fragments).max(1);
-    merge_rows / (PROBE_BUDGET_DIVISOR * depth)
+    merge_rows > MERGE_ROWS_BUDGET && max_overlap_depth(fragments) <= MAX_PROBE_DEPTH
 }
 
 /// Most fragments that cover any one row id.
@@ -362,12 +396,17 @@ impl DeepSizeOf for RowIdIndex {
                 entry.sequence.deep_size_of_children(context)
                     + entry.deletion_vector.deep_size_of_children(context)
                     + entry.segments.capacity() * std::mem::size_of::<SegmentEntry>()
+                    + entry
+                        .segments
+                        .iter()
+                        .filter_map(|segment| segment.positions.as_ref())
+                        .map(|positions| positions.capacity() * std::mem::size_of::<(u64, u32)>())
+                        .sum::<usize>()
             })
             .sum();
         let merged_bytes: usize = self
             .merged
-            .get()
-            .and_then(Option::as_ref)
+            .as_ref()
             .map(|merged| {
                 merged
                     .iter()
@@ -421,10 +460,13 @@ fn decompose_sequence(
 }
 
 /// Build an IndexChunk from a list of (row_id, address) pairs.
-fn build_chunk_from_pairs(pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
+fn build_chunk_from_pairs(mut pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
     if pairs.is_empty() {
         return None;
     }
+    // Sorted, so the row id segment encodes as one a lookup can search rather
+    // than an `Array` it has to scan. The address segment follows the pairing.
+    pairs.sort_unstable_by_key(|(row_id, _)| *row_id);
     let (row_ids, addresses): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
     let row_id_segment = U64Segment::from_iter(row_ids);
     let address_segment = U64Segment::from_iter(addresses);
@@ -629,11 +671,10 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 
 #[cfg(test)]
 impl RowIdIndex {
-    /// Index that answers from the probe path, whatever its budget.
+    /// Index that answers from the probe path, whatever the gate decided.
     fn probing(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
         let mut index = Self::new(fragment_indices)?;
-        index.merge_after = u64::MAX;
-        index.merged = OnceLock::new();
+        index.merged = None;
         Ok(index)
     }
 }
@@ -662,23 +703,33 @@ mod tests {
     }
 
     #[test]
-    fn test_new_builds_the_merged_map_when_the_build_is_cheap() {
+    fn test_new_builds_the_merged_map_unless_probing_wins() {
+        // Ranges decompose in constant time, and a small sequence is cheap to
+        // read whatever its encoding.
         let ranges = fragment(1, RowIdSequence(vec![U64Segment::Range(0..1_000_000)]));
-        assert!(RowIdIndex::new(&[ranges]).unwrap().merged.get().is_some());
+        assert!(RowIdIndex::new(&[ranges]).unwrap().merged.is_some());
+        let small = fragment(1, sparse_sequence(16));
+        assert!(RowIdIndex::new(&[small]).unwrap().merged.is_some());
 
-        let index = RowIdIndex::new(&[fragment(1, sparse_sequence(16))]).unwrap();
-        assert_eq!(index.merge_after, 2);
-        assert!(index.merged.get().is_none());
+        // Past the row budget, with one fragment covering any id.
+        let wide = fragment(1, sparse_sequence(2 * MERGE_ROWS_BUDGET));
+        let index = RowIdIndex::new(&[wide]).unwrap();
+        assert!(index.merged.is_none());
+        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(1, 3)));
     }
 
     #[test]
-    fn test_probes_past_the_budget_build_the_merged_map() {
-        let index = RowIdIndex::new(&[fragment(1, sparse_sequence(16))]).unwrap();
-        for _ in 0..=index.merge_after {
-            assert_eq!(index.get(6), Some(RowAddress::new_from_parts(1, 3)));
-        }
-        assert!(index.merged.get().is_some());
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(1, 3)));
+    fn test_deep_overlap_merges_however_many_rows_it_reads() {
+        let deep: Vec<FragmentRowIdIndex> = (0..MAX_PROBE_DEPTH as u32 + 1)
+            .map(|id| {
+                let ids: Vec<u64> = (0..MERGE_ROWS_BUDGET)
+                    .map(|value| value * (MAX_PROBE_DEPTH + 1) + id as u64)
+                    .collect();
+                fragment(id, RowIdSequence(vec![U64Segment::SortedArray(ids.into())]))
+            })
+            .collect();
+
+        assert!(RowIdIndex::new(&deep).unwrap().merged.is_some());
     }
 
     #[test]
@@ -707,7 +758,7 @@ mod tests {
                 Some(RowAddress::new_from_parts(3, offset as u32))
             );
         }
-        assert!(index.merged.get().is_none());
+        assert!(index.merged.is_none());
     }
 
     #[test]
