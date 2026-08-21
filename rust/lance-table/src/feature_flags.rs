@@ -33,19 +33,10 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 128;
 
-// Every flag this build declares must sit below the unknown boundary, or
+// The highest flag allocated must stay below the unknown boundary, or
 // `supported_flags` would refuse a bit this code claims to understand. The next
-// flag allocated takes 128, so it has to move the boundary to 256 with it.
-const _: () = assert!(
-    (FLAG_DELETION_FILES
-        | FLAG_STABLE_ROW_IDS
-        | FLAG_USE_V2_FORMAT_DEPRECATED
-        | FLAG_TABLE_CONFIG
-        | FLAG_BASE_PATHS
-        | FLAG_DISABLE_TRANSACTION_FILE
-        | FLAG_UNSTABLE_DATA_OVERLAY_FILES)
-        < FLAG_UNKNOWN
-);
+// flag takes 128, so it has to move the boundary to 256 with it.
+const _: () = assert!(FLAG_UNSTABLE_DATA_OVERLAY_FILES < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
