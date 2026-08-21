@@ -66,6 +66,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
@@ -74,7 +75,8 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{
-    DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL, SCORE_FIELD, fts_schema,
+    DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
+    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -94,9 +96,10 @@ use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
-    fts_index_fragment_bitmap, load_segment_details, load_segments, resolve_fts_field,
-    resolve_query_document_granularity,
+    fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
+    resolve_fts_field, resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
@@ -106,8 +109,8 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, FtsDocumentExec,
-    MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
+    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -146,28 +149,65 @@ enum FtsOverlayPlan {
     FullScan,
 }
 
-fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
-    match query {
-        FtsQuery::Match(query) => {
-            if let Some(column) = &query.column {
-                columns.insert(column.clone());
+fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
+    fn visit(query: &FtsQuery, columns: &mut Vec<String>, seen: &mut HashSet<String>) {
+        match query {
+            FtsQuery::Match(query) => {
+                if let Some(column) = &query.column
+                    && seen.insert(column.clone())
+                {
+                    columns.push(column.clone());
+                }
+            }
+            FtsQuery::Phrase(query) => {
+                if let Some(column) = &query.column
+                    && seen.insert(column.clone())
+                {
+                    columns.push(column.clone());
+                }
+            }
+            FtsQuery::Boost(query) => {
+                visit(&query.positive, columns, seen);
+                visit(&query.negative, columns, seen);
+            }
+            FtsQuery::MultiMatch(query) => {
+                for match_query in &query.match_queries {
+                    if let Some(column) = &match_query.column
+                        && seen.insert(column.clone())
+                    {
+                        columns.push(column.clone());
+                    }
+                }
+            }
+            FtsQuery::Boolean(query) => {
+                for child in query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                {
+                    visit(child, columns, seen);
+                }
             }
         }
+    }
+
+    let mut columns = Vec::new();
+    let mut seen = HashSet::new();
+    visit(query, &mut columns, &mut seen);
+    columns
+}
+
+fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
+    match query {
         FtsQuery::Phrase(query) => {
             if let Some(column) = &query.column {
                 columns.insert(column.clone());
             }
         }
         FtsQuery::Boost(query) => {
-            collect_all_fts_columns(&query.positive, columns);
-            collect_all_fts_columns(&query.negative, columns);
-        }
-        FtsQuery::MultiMatch(query) => {
-            for match_query in &query.match_queries {
-                if let Some(column) = &match_query.column {
-                    columns.insert(column.clone());
-                }
-            }
+            collect_phrase_columns(&query.positive, columns);
+            collect_phrase_columns(&query.negative, columns);
         }
         FtsQuery::Boolean(query) => {
             for child in query
@@ -176,10 +216,25 @@ fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
                 .chain(&query.must)
                 .chain(&query.must_not)
             {
-                collect_all_fts_columns(child, columns);
+                collect_phrase_columns(child, columns);
             }
         }
+        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => {}
     }
+}
+
+async fn load_physical_fts_details(
+    dataset: &Dataset,
+    column: &str,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexDetails> {
+    let details = fetch_index_details(dataset, column, segment).await?;
+    let details = InvertedIndexDetails::decode(details.value.as_slice()).map_err(|err| {
+        Error::io(format!(
+            "failed to decode InvertedIndexDetails payload: {err}"
+        ))
+    })?;
+    normalize_inverted_details(segment, details)
 }
 
 fn supports_compound_scorer(query: &FtsQuery) -> bool {
@@ -204,25 +259,8 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     if matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) || !supports_shape(query) {
         return false;
     }
-    let mut columns = HashSet::new();
-    collect_all_fts_columns(query, &mut columns);
-    columns.len() == 1
-}
-
-fn contains_phrase_query(query: &FtsQuery) -> bool {
-    match query {
-        FtsQuery::Phrase(_) => true,
-        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => false,
-        FtsQuery::Boost(query) => {
-            contains_phrase_query(&query.positive) || contains_phrase_query(&query.negative)
-        }
-        FtsQuery::Boolean(query) => query
-            .should
-            .iter()
-            .chain(&query.must)
-            .chain(&query.must_not)
-            .any(contains_phrase_query),
-    }
+    let columns = collect_fts_columns_in_order(query);
+    !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -495,7 +533,7 @@ impl FilterPlan {
         if self.refine_query_filter {
             match &self.query_filter {
                 Some(QueryFilter::Fts(fts_query)) => {
-                    let cols = if fts_query.columns().is_empty() {
+                    let cols = if fts_query.query.is_missing_column() {
                         let indexed_columns = fts_indexed_columns(dataset.clone()).await?;
                         let q = fill_fts_query_column(&fts_query.query, &indexed_columns, false)?;
                         q.columns()
@@ -3553,15 +3591,12 @@ impl Scanner {
                 .await
             }
             FtsQuery::Boolean(bool_query) => {
-                for query in bool_query.must.iter() {
-                    if !self
-                        .fragments_covered_by_fts_query_helper(query, accum)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
-                }
-                for query in &bool_query.should {
+                for query in bool_query
+                    .must
+                    .iter()
+                    .chain(&bool_query.should)
+                    .chain(&bool_query.must_not)
+                {
                     if !self
                         .fragments_covered_by_fts_query_helper(query, accum)
                         .await?
@@ -3852,7 +3887,7 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {
         let mut resolved = query.clone();
-        if resolved.columns().is_empty() {
+        if resolved.query.is_missing_column() {
             if Self::query_requests_list_element(&resolved.query) {
                 return Err(Error::invalid_input(
                     "ListElement FTS queries must explicitly specify a field path".to_string(),
@@ -3912,24 +3947,18 @@ impl Scanner {
         prefilter_source: &PreFilterSource,
         document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let mut columns = HashSet::new();
-        collect_all_fts_columns(query, &mut columns);
-        let Some(column) = columns.into_iter().next() else {
+        let columns = collect_fts_columns_in_order(query);
+        if columns.is_empty() {
             return Ok(None);
-        };
+        }
+        let cross_column = columns.len() > 1;
+        if cross_column && params.limit.is_none() {
+            // Candidate-driven cross-column execution requires a bounded top-k
+            // collector. The existing DataFusion plan remains the exact path
+            // for callers that request the full result set.
+            return Ok(None);
+        }
 
-        let index = self
-            .dataset
-            .load_scalar_index(
-                IndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts()
-                    .with_fts_document_granularity(document_granularity),
-            )
-            .await?;
-        let Some(index) = index else {
-            return Ok(None);
-        };
         let target_fragments: &[Fragment] = self
             .fragments
             .as_deref()
@@ -3937,45 +3966,113 @@ impl Scanner {
         if target_fragments.is_empty() {
             return Ok(None);
         }
-        if !self
-            .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?)
-            .is_empty()
-        {
-            // Flat and posting-backed leaves do not share a document domain.
-            // Preserve the exact DataFusion fallback until flat leaves expose
-            // the same candidate protocol.
+        let mut phrase_columns = HashSet::new();
+        collect_phrase_columns(query, &mut phrase_columns);
+
+        let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
+            let phrase_columns = &phrase_columns;
+            async move {
+                let index = self
+                    .dataset
+                    .load_scalar_index(
+                        IndexCriteria::default()
+                            .for_column(&column)
+                            .supports_fts()
+                            .with_fts_document_granularity(document_granularity),
+                    )
+                    .await?;
+                let Some(index) = index else {
+                    return Ok(None);
+                };
+
+                let (unindexed_fragments, overlay_plan) = futures::future::try_join(
+                    self.dataset.unindexed_fragments(&index.name),
+                    self.fts_overlay_plan(&column, document_granularity, target_fragments),
+                )
+                .await?;
+                if !self.retain_target_fragments(unindexed_fragments).is_empty() {
+                    // Flat and posting-backed leaves do not share a document
+                    // domain, so preserve the exact fallback for partial index
+                    // coverage.
+                    return Ok(None);
+                }
+                let segments = match overlay_plan {
+                    FtsOverlayPlan::Unchanged(Some(segments)) => segments,
+                    FtsOverlayPlan::Unchanged(None) => {
+                        load_segments(&self.dataset, &column, document_granularity)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "No Inverted index found for column {column}"
+                                ))
+                            })?
+                    }
+                    FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
+                };
+
+                if cross_column {
+                    let details = futures::future::try_join_all(
+                        segments.iter().map(|segment| {
+                            load_physical_fts_details(&self.dataset, &column, segment)
+                        }),
+                    )
+                    .await?;
+                    if phrase_columns.contains(&column)
+                        && details.iter().any(|details| !details.with_position)
+                    {
+                        return Err(Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position"
+                                .to_string(),
+                        ));
+                    }
+                    let all_modern = details.iter().all(|details| {
+                        matches!(
+                            details.posting_format_version,
+                            Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
+                        )
+                    });
+                    if !all_modern {
+                        return Ok(None);
+                    }
+                } else if phrase_columns.contains(&column) {
+                    let details = load_segment_details(&self.dataset, &column, &segments).await?;
+                    if !details.with_position {
+                        return Err(Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                Ok(Some((column, segments)))
+            }
+        }))
+        .await?;
+        let Some(segment_groups) = segment_groups.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(None);
-        }
-        let segments = match self
-            .fts_overlay_plan(&column, document_granularity, target_fragments)
-            .await?
-        {
-            FtsOverlayPlan::Unchanged(Some(segments)) => segments,
-            FtsOverlayPlan::Unchanged(None) => {
-                load_segments(&self.dataset, &column, document_granularity)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!("No Inverted index found for column {column}"))
-                    })?
-            }
-            FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
         };
-        if contains_phrase_query(query) {
-            let details = load_segment_details(&self.dataset, &column, &segments).await?;
-            if !details.with_position {
-                return Err(Error::invalid_input(
-                    "position is not found but required for phrase queries, try recreating the index with position"
-                        .to_string(),
-                ));
-            }
+
+        if !cross_column {
+            let (_, segments) = segment_groups.into_iter().next().ok_or_else(|| {
+                Error::internal("compound scorer requires one column".to_string())
+            })?;
+            return Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+                segments,
+            ))));
         }
-        Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
+
+        let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             prefilter_source.clone(),
-            segments,
-        ))))
+            segment_groups,
+        )?;
+        Ok(Some(Arc::new(exec)))
     }
 
     async fn plan_fts(
@@ -3995,9 +4092,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Cross-column, flat, and overlay-backed compound queries retain the
-        // exact DataFusion fallback because their leaves do not share one
-        // posting document domain.
+        // Unsupported, unbounded, partial-index, and overlay-backed cross-column
+        // shapes retain the exact DataFusion fallback.
         let plan: Arc<dyn ExecutionPlan> = match query {
             FtsQuery::Match(query) => {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
@@ -4686,7 +4782,7 @@ impl Scanner {
 
                 if requested_index_segments
                     .iter()
-                    .any(|idx| !idx.fields.contains(&column_id))
+                    .any(|idx| idx.fields.first() != Some(&column_id))
                 {
                     return Err(Error::invalid_input(format!(
                         "with_index_segments contained a segment that does not belong to vector column '{}'",
@@ -4738,10 +4834,16 @@ impl Scanner {
                         None
                     }
                 }
-            } else if let Some(index) = indices
-                .iter()
-                .find(|i| i.fields.contains(&column_id) && crate::index::index_type_is_known(i))
-            {
+            }
+            // An index can only answer a query on the column it is keyed on, which is
+            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
+            // merely carries values for, which it cannot search. Not a boundary derived
+            // from `covering_fields` either -- that is computed from a field older
+            // writers drop, so it would widen to the carried columns exactly when the
+            // declaration is lost.
+            else if let Some(index) = indices.iter().find(|i| {
+                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+            }) {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
@@ -5160,7 +5262,8 @@ impl Scanner {
     ///
     /// The check is field-aware (an overlay touching only unindexed fields excludes nothing) and
     /// version-gated (an overlay with `committed_version <= index.dataset_version` is already
-    /// incorporated by the index), via [`overlay_exclusion_offsets`].
+    /// incorporated by the index), via
+    /// [`lance_table::format::overlay::staleness::overlay_exclusion_offsets`].
     async fn overlay_stale_index_rows(
         &self,
         index_expr: &ScalarIndexExpr,
@@ -6727,7 +6830,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{
-        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -6772,6 +6875,73 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_compound_scorer_shape_supports_cross_column_boolean_queries() {
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("alpha".to_string())
+                    .with_column(Some("title".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("beta".to_string())
+                    .with_column(Some("body".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::MustNot,
+                MatchQuery::new("gamma".to_string())
+                    .with_column(Some("summary".to_string()))
+                    .into(),
+            ),
+        ]));
+
+        assert!(supports_compound_scorer(&query));
+        assert_eq!(
+            collect_fts_columns_in_order(&query),
+            ["title", "body", "summary"]
+        );
+    }
+
+    #[test]
+    fn test_compound_scorer_leaves_top_level_cross_column_multi_match_on_existing_path() {
+        let single_column = FtsQuery::MultiMatch(
+            MultiMatchQuery::try_new("alpha".to_string(), vec!["title".to_string()]).unwrap(),
+        );
+        let cross_column = FtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "alpha".to_string(),
+                vec!["title".to_string(), "body".to_string()],
+            )
+            .unwrap(),
+        );
+
+        assert!(supports_compound_scorer(&single_column));
+        assert!(!supports_compound_scorer(&cross_column));
+    }
+
+    #[test]
+    fn test_collect_phrase_columns_traverses_prohibited_subtrees() {
+        let phrase =
+            PhraseQuery::new("exact phrase".to_string()).with_column(Some("body".to_string()));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("alpha".to_string())
+                    .with_column(Some("title".to_string()))
+                    .into(),
+            ),
+            (Occur::MustNot, phrase.into()),
+        ]));
+        let mut columns = HashSet::new();
+
+        collect_phrase_columns(&query, &mut columns);
+
+        assert_eq!(columns, HashSet::from(["body".to_string()]));
     }
 
     #[test]

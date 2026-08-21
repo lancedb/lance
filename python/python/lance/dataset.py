@@ -3319,12 +3319,17 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
                         f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not (
@@ -3355,10 +3360,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
@@ -3513,7 +3514,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
@@ -5668,6 +5670,14 @@ class DatasetDelta:
         """
         return self._delta.get_updated_rows()
 
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
+
 
 class _DatasetDeltaBuilder:
     """Internal builder for :class:`DatasetDelta`.
@@ -5780,6 +5790,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
@@ -7149,6 +7160,7 @@ class DatasetOptimizer:
         max_source_fragments: Optional[int] = None,
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7253,6 +7265,11 @@ class DatasetOptimizer:
             would exceed this limit. Blob v2 payloads live in separate
             blob files and are not counted, so this is not a cap on total
             compaction I/O for datasets with blob columns.
+        excluded_fragment_ids: list[int], optional
+            Fragment IDs to exclude from compaction planning. Excluded
+            fragments remain unchanged and act as boundaries, so fragments
+            on opposite sides are not combined into the same compaction task.
+            Duplicate and unknown IDs are ignored.
 
         Returns
         -------
@@ -7279,6 +7296,7 @@ class DatasetOptimizer:
                 max_source_fragments=max_source_fragments,
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
+                excluded_fragment_ids=excluded_fragment_ids,
             ).items()
             if v is not None
         }
