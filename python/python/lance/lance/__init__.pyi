@@ -206,7 +206,13 @@ class PackedBlobWriter:
     def write_blob(self, data: bytes) -> None: ...
     def write_blobs(
         self,
-        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
     ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
