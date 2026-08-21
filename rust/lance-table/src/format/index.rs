@@ -186,13 +186,20 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap
-            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
-        {
-            // In theory, this should never error. But if we do, just
-            // recover gracefully.
-            log::error!("Failed to serialize fragment bitmap: {}", e);
-            fragment_bitmap.clear();
+        if let Some(bitmap) = &idx.fragment_bitmap {
+            // Fragment ids are allocated monotonically, so index coverage is
+            // highly contiguous. Run containers are part of the standard
+            // roaring serialization format, so converting eligible containers
+            // to runs before writing shrinks the bitmap from O(fragments) to
+            // O(runs) bytes.
+            let mut bitmap = bitmap.clone();
+            bitmap.optimize();
+            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
+                // In theory, this should never error. But if we do, just
+                // recover gracefully.
+                log::error!("Failed to serialize fragment bitmap: {}", e);
+                fragment_bitmap.clear();
+            }
         }
 
         let files = idx
@@ -304,6 +311,37 @@ pub async fn list_index_files_with_sizes(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_fragment_bitmap_serialized_run_optimized() {
+        let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
+        let unoptimized_size = bitmap.serialized_size();
+
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "my_index".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap.clone()),
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(
+            proto.fragment_bitmap.len() < unoptimized_size / 100,
+            "expected run-optimized bitmap ({} bytes) to be <1% of the \
+             unoptimized serialization ({} bytes)",
+            proto.fragment_bitmap.len(),
+            unoptimized_size
+        );
+
+        let recovered = IndexMetadata::try_from(proto).unwrap();
+        assert_eq!(recovered.fragment_bitmap, Some(bitmap));
+    }
 
     /// Demonstrates the pattern a disk-backed cache backend would use:
     /// serialize entries to bytes, store in a key-value map, then

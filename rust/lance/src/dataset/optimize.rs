@@ -2345,7 +2345,11 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None).into_owned();
+            // Compaction reads whole fragments, so the captured addresses are
+            // dense per-fragment ranges; run containers (standard roaring
+            // format) shrink the persisted blob from O(rows) to O(runs) bytes.
+            row_addrs.optimize();
             let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut serialized)?;
             Ok(Some(serialized))
@@ -3817,6 +3821,18 @@ mod tests {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             assert_eq!(row_addrs.len(), 9_000);
+            // The captured addresses are contiguous per-fragment ranges, so the
+            // persisted blob must be run-optimized: O(fragments) bytes, not
+            // O(rows). Without run containers this serializes at ~2 bytes per
+            // address (~18 KB here), so under one byte per address proves the
+            // run form was written.
+            assert!(
+                row_addrs_bytes.len() < row_addrs.len() as usize,
+                "serialized row addrs ({} bytes for {} addresses) should be \
+                 run-optimized before persisting",
+                row_addrs_bytes.len(),
+                row_addrs.len()
+            );
         } else {
             // Simulate a stale worker result that captured row addresses before the
             // dataset no longer needed a remapper. Invalid bytes ensure the commit
