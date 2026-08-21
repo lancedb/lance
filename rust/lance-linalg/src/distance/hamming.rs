@@ -385,10 +385,13 @@ impl Default for PairwiseResult {
 /// Panics if `results` is not the same length as `targets`.
 #[inline]
 pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
-    // The SIMD kernels below write through raw pointers with no bounds check, so
-    // this check has to survive release builds. As a `debug_assert_eq!` it let
-    // both x86 kernels write past the end of `results` in release, while the
-    // scalar fallback panicked on its indexed store.
+    // Rejected in either direction, and before the dispatch. A shorter `results` the
+    // dispatcher's reslice would refuse on its own, and that reslice is what keeps the
+    // kernels' raw stores in bounds; this check just gets there first, with a message
+    // that names both lengths. An over-long one the reslice would instead truncate,
+    // handing the surplus tail back unwritten for the caller to read as distances.
+    // That is wrong output rather than a crash, which is why this is an `assert_eq!`
+    // and not a `debug_assert_eq!`.
     let num_targets = targets.len();
     let num_slots = results.len();
     assert_eq!(
@@ -396,33 +399,37 @@ pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
         "hamming_batch_u64 needs one result slot per target, \
          got {num_targets} target(s) and {num_slots} slot(s)"
     );
-    // SAFETY: the assert above establishes `results.len() == targets.len()`, which
-    // satisfies `hamming_batch_simd`'s `results.len() >= targets.len()` requirement.
-    unsafe { hamming_batch_simd(query, targets, results) };
+    hamming_batch_simd(query, targets, results);
 }
 
 /// SIMD-accelerated batch hamming distance computation.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `results.len()` must be at least `targets.len()`. The x86 kernels this
-/// dispatches to store through raw pointers with no bounds check, so a shorter
-/// `results` is an out-of-bounds write rather than a panic.
+/// Panics if `results` is shorter than `targets`. `results.len()` is required to equal
+/// `targets.len()`: an over-long `results` is truncated here rather than rejected, and
+/// the surplus tail goes back to the caller unwritten. `hamming_batch_u64` asserts the
+/// equality before dispatching.
 #[inline]
-unsafe fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
+fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
+    // Both x86 kernels store through raw pointers over a range bounded by
+    // `targets.len()`, and this reslice makes `results` exactly that long, so it has to
+    // stay above the dispatch.
+    let results = &mut results[..targets.len()];
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vpopcntdq") && is_x86_feature_detected!("avx512f") {
-            // SAFETY: both required features were just detected, and
-            // `results.len() >= targets.len()` is this function's own requirement.
+            // SAFETY: both required features were just detected, and the reslice
+            // above makes `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx512(query, targets, results);
             }
             return;
         }
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 was just detected, and `results.len() >= targets.len()`
-            // is this function's own requirement.
+            // SAFETY: AVX2 was just detected, and the reslice above makes
+            // `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx2(query, targets, results);
             }
@@ -463,10 +470,14 @@ fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
 
 /// AVX-512 VPOPCNTDQ: Process 8 x 64-bit values at once.
 ///
+/// The chunk loop reaches only the first `targets.len() / 8 * 8` slots through a
+/// raw pointer, 8 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
 /// # Safety
+///
 /// The host must support AVX-512F and AVX512VPOPCNTDQ, and `results.len()` must
-/// be at least `targets.len()`: each chunk stores 8 x u32 through a raw pointer
-/// with no bounds check.
+/// be at least `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512vpopcntdq")]
 unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -503,10 +514,14 @@ unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32])
 
 /// AVX2 popcount using lookup table (Harley-Seal / PSHUFB method).
 ///
+/// The chunk loop reaches only the first `targets.len() / 4 * 4` slots through a
+/// raw pointer, 4 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
 /// # Safety
+///
 /// The host must support AVX2, and `results.len()` must be at least
-/// `targets.len()`: each chunk stores 4 x u32 through a raw pointer with no
-/// bounds check.
+/// `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hamming_batch_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -1149,30 +1164,82 @@ mod tests {
     }
 
     #[rstest]
-    // Fewer slots than targets is the case that used to write out of bounds: on
-    // an AVX2 host `hamming_batch_avx2` wrote 28 bytes past a 4-byte `results`.
-    #[case::one_slot_eight_targets(1)]
-    // A short final chunk still overruns, just by less.
-    #[case::seven_slots_eight_targets(7)]
-    // More slots than targets would leave the tail unwritten rather than
-    // overrun, but the contract is one slot per target either way.
-    #[case::nine_slots_eight_targets(9)]
-    // The `8` is the target count every case shares, so this one literal also
-    // pins which length the message reports first. A fourth case with a
-    // different target count has to move it out of the literal.
-    #[should_panic(expected = "needs one result slot per target, got 8 target(s) and ")]
-    fn test_hamming_batch_u64_rejects_mismatched_lengths(#[case] num_slots: usize) {
-        // No CPU feature gate: the assert precedes every kernel, so the panic
-        // happens on each host. An early return here would fail the test.
+    // Fewer slots than targets is the case that used to write out of bounds: on a
+    // host that takes the AVX2 path, `hamming_batch_avx2` wrote 28 bytes past a
+    // one-slot `results`.
+    #[case::eight_targets_one_slot(8, 1)]
+    // On the same path this one overran by 4 bytes instead of 28.
+    #[case::eight_targets_seven_slots(8, 7)]
+    // More slots than targets left the tail unwritten rather than overrunning, but
+    // the contract is one slot per target either way. This and the zero-target case
+    // below are the two that catch a guard weakened to a one-sided
+    // `results.len() >= targets.len()`.
+    #[case::eight_targets_nine_slots(8, 9)]
+    // The target count varies too, so that the two shortcuts most likely to appear
+    // here cannot slip past every case: an `if targets.is_empty() { return; }` above
+    // the check, or a `targets.len() < 8` fast path, would otherwise leave every
+    // eight-target case green. Four is the smallest target count that still reaches
+    // the AVX2 chunk loop.
+    #[case::four_targets_one_slot(4, 1)]
+    #[case::no_targets_one_slot(0, 1)]
+    // Zero slots is the case with no in-bounds slot at all, and the only one here
+    // that a `results.is_empty()` early return above the check would not survive.
+    // Its sentinel assertion is vacuous, so it pins the message and nothing else.
+    #[case::eight_targets_no_slots(8, 0)]
+    fn test_hamming_batch_u64_rejects_mismatched_lengths(
+        #[case] num_targets: usize,
+        #[case] num_slots: usize,
+    ) {
+        // No CPU feature gate: the length check precedes every kernel, so the panic
+        // happens on each host and no case reaches a kernel at all. Every case here is
+        // a mismatch; matching lengths are covered by `test_hamming_batch_u64` above,
+        // which calls `hamming_batch_u64` directly, and by
+        // `test_pairwise_correctness_1000_deterministic` below, which reaches it
+        // through `pairwise_hamming_distance_parallel`'s chunked path and checks the
+        // result against `reference_pairwise`.
+        //
+        // `catch_unwind` rather than `#[should_panic]`, because the property worth
+        // protecting is that the check runs before the dispatch, and
+        // `#[should_panic]` cannot observe order: a check moved below it can still
+        // panic with this same message, after a kernel has already written through
+        // `results`. The sentinel assertion at the end is what rules that out. It is
+        // also why the nine-slot case is here: a kernel's writes all land in bounds
+        // there, so nothing else would notice that it ran.
         //
         // A `debug_assert_eq!` carrying the same message still passes here when
         // debug assertions are on, which is the profile `--profile ci` gives this
         // crate; `cargo test --release -p lance-linalg --lib` (rust.yml) is what
         // catches that revert.
-        let targets = vec![u64::MAX; 8];
-        let mut results = vec![0u32; num_slots];
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        let targets = vec![u64::MAX; num_targets];
+        let mut results = vec![SENTINEL; num_slots];
 
-        hamming_batch_u64(0, &targets, &mut results);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hamming_batch_u64(0, &targets, &mut results);
+        }))
+        .expect_err("a length mismatch must panic");
+
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .expect("panic payload should be a string");
+        // Matching the whole message, not the two numbers separately, is deliberate:
+        // it pins the function name and the order the two lengths are reported in,
+        // which is what a message copied from a sibling guard would get wrong.
+        let expected = format!(
+            "hamming_batch_u64 needs one result slot per target, \
+             got {num_targets} target(s) and {num_slots} slot(s)"
+        );
+        assert!(
+            message.contains(&expected),
+            "expected {expected:?} in panic message, got {message:?}"
+        );
+        assert_eq!(
+            results.iter().position(|&slot| slot != SENTINEL),
+            None,
+            "a kernel reached `results`, so the length check no longer precedes it"
+        );
     }
 
     #[test]
