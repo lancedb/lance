@@ -2969,4 +2969,84 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("must have a valid column index"), "{msg}");
     }
+
+    #[test]
+    fn test_check_column_indices_shared_arc_lists() {
+        // Decoded manifests share `Arc<[i32]>` field lists across data files
+        // (DataFileFieldInterner), and validation dedups repeated lists by
+        // pointer identity. Shared valid lists must pass, and a distinct
+        // (non-shared) invalid list in the same manifest must still be caught.
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1, leaf=0: valid layout; clones share the same Arcs.
+        let shared_file = DataFile::new(
+            "shared.lance",
+            vec![0, 1],
+            vec![-1, 0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let make_fragment = |id: u64, file: DataFile| Fragment {
+            id,
+            files: vec![file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![
+                make_fragment(0, shared_file.clone()),
+                make_fragment(1, shared_file.clone()),
+            ]),
+            DataStorageFormat::new(LanceFileVersion::V2_1.resolve()),
+            HashMap::new(),
+        );
+        assert!(check_column_indices(&manifest).is_ok());
+
+        // Same shared valid lists, plus one heterogeneous file that wrongly
+        // gives the struct a real column index.
+        let bad_file = DataFile::new(
+            "bad.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![
+                make_fragment(0, shared_file.clone()),
+                make_fragment(1, shared_file),
+                make_fragment(2, bad_file),
+            ]),
+            DataStorageFormat::new(LanceFileVersion::V2_1.resolve()),
+            HashMap::new(),
+        );
+        let result = check_column_indices(&manifest);
+        assert!(
+            result.is_err(),
+            "Expected the non-shared invalid list to be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+        assert!(msg.contains("bad.lance"), "{msg}");
+    }
 }
