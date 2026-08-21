@@ -109,9 +109,12 @@ impl RowIdIndex {
 
     /// Get the address for a given row id.
     ///
-    /// Will return None if the row id does not exist in the index. Errors when
-    /// the id is live in more than one fragment, which means the stable row
-    /// ids are corrupt.
+    /// Will return None if the row id does not exist in the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row id is live in more than one fragment,
+    /// which means the stable row ids are corrupt.
     pub fn get(&self, row_id: u64) -> Result<Option<RowAddress>> {
         if let Some(merged) = &self.merged {
             return Ok(merged_get(merged, row_id));
@@ -125,6 +128,11 @@ impl RowIdIndex {
     /// Sorts a working copy of the input internally so the chunk iterator
     /// is advanced at most once per chunk, amortizing the per-id tree walk
     /// from O(N · log F) to O(F + N).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any requested row id is live in more than one
+    /// fragment, which means the stable row ids are corrupt.
     pub fn get_many(&self, row_ids: &[u64]) -> Result<Vec<Option<RowAddress>>> {
         let n = row_ids.len();
         let mut out = vec![None; n];
