@@ -147,7 +147,8 @@ impl UploadFailure {
     }
 
     fn into_io_error(self) -> io::Error {
-        io::Error::new(self.kind, self)
+        let kind = self.kind;
+        io::Error::new(kind, self)
     }
 }
 
