@@ -1335,12 +1335,10 @@ pub(crate) async fn commit_transaction(
     // The Arc is kept rather than cloned out: `load_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
-    let read_version_indices = Some(read_version_dataset.load_indices().await?);
-    let read_version_state = read_version_indices.as_ref().map(|indices| {
-        crate::dataset::transaction::ReadVersionState {
-            manifest: read_version_dataset.manifest.as_ref(),
-            indices: indices.as_slice(),
-        }
+    let read_version_indices = read_version_dataset.load_indices().await?;
+    let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
+        manifest: read_version_dataset.manifest.as_ref(),
+        indices: read_version_indices.as_slice(),
     });
 
     let mut transaction = transaction.clone();
