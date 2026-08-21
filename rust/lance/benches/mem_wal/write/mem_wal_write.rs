@@ -627,6 +627,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
                                     warmer: None,
+                                    observer: None,
                                     store_params: default_config.store_params,
                                     session: default_config.session,
                                     // Measure the built-in per-shard valve, not

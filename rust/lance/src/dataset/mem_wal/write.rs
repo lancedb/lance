@@ -49,6 +49,7 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
+use super::observer::WalObserver;
 use super::scanner::SsTableWarmer;
 use super::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
@@ -224,6 +225,12 @@ pub struct ShardWriterConfig {
     /// WAL pod). Default: `None`.
     pub warmer: Option<Arc<dyn SsTableWarmer>>,
 
+    /// Optional sink for write-path events, currently flush latency. Wired to
+    /// the flush handlers; supplied by the consumer (e.g. the WAL pod), which
+    /// owns the aggregation Lance would otherwise have to pick for it.
+    /// Default: `None`.
+    pub observer: Option<Arc<dyn WalObserver>>,
+
     /// Store params the base dataset was opened with, reused for the flusher's
     /// opens + writes (base + generations). Injected by `mem_wal_writer`; set
     /// these to the params of the dataset at `base_uri`, not to params bound to
@@ -281,6 +288,7 @@ impl Default for ShardWriterConfig {
             enable_memtable: true,
             hnsw_params: HashMap::new(),
             warmer: None,
+            observer: None,
             store_params: None,
             session: None,
             pod_memory_bytes: None,
@@ -2168,6 +2176,7 @@ impl ShardWriter {
             None,
             config.max_wal_flush_interval,
             stats.clone(),
+            config.observer.clone(),
         );
         task_executor.add_handler(
             "wal_flusher".to_string(),
@@ -2185,6 +2194,7 @@ impl ShardWriter {
             epoch,
             index_configs.to_vec(),
             stats.clone(),
+            config.observer.clone(),
             config.frozen_memtable_grace,
         );
         task_executor.add_handler(
@@ -2262,6 +2272,7 @@ impl ShardWriter {
             Some(state.clone()),
             config.max_wal_flush_interval,
             stats,
+            config.observer.clone(),
         );
         task_executor.add_handler(
             "wal_flusher".to_string(),
@@ -3436,6 +3447,7 @@ struct WalFlushHandler {
     /// the append size-triggered (and freeze/close-triggered) only.
     flush_interval: Option<Duration>,
     stats: SharedWriteStats,
+    observer: Option<Arc<dyn WalObserver>>,
 }
 
 impl WalFlushHandler {
@@ -3445,6 +3457,7 @@ impl WalFlushHandler {
         wal_only_state: Option<Arc<WalOnlyState>>,
         flush_interval: Option<Duration>,
         stats: SharedWriteStats,
+        observer: Option<Arc<dyn WalObserver>>,
     ) -> Self {
         Self {
             wal_flusher,
@@ -3452,6 +3465,7 @@ impl WalFlushHandler {
             wal_only_state,
             flush_interval,
             stats,
+            observer,
         }
     }
 }
@@ -3638,9 +3652,14 @@ impl WalFlushHandler {
             .unwrap_or(0);
 
         if batches_flushed > 0 {
-            self.stats
-                .record_wal_flush(start.elapsed(), flush_result.wal_bytes);
+            // One reading for both sinks, so the cumulative total and the
+            // per-flush observation cannot disagree.
+            let elapsed = start.elapsed();
+            self.stats.record_wal_flush(elapsed, flush_result.wal_bytes);
             self.stats.record_wal_io(flush_result.wal_io_duration);
+            if let Some(observer) = &self.observer {
+                observer.on_wal_flush(elapsed, flush_result.wal_bytes);
+            }
         }
 
         Ok(flush_result)
@@ -3670,6 +3689,7 @@ struct MemTableFlushHandler {
     /// at all.
     index_configs: Vec<MemIndexConfig>,
     stats: SharedWriteStats,
+    observer: Option<Arc<dyn WalObserver>>,
     /// How long a frozen memtable lingers in memory after its flush commits
     /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
@@ -3685,6 +3705,7 @@ impl MemTableFlushHandler {
         epoch: u64,
         index_configs: Vec<MemIndexConfig>,
         stats: SharedWriteStats,
+        observer: Option<Arc<dyn WalObserver>>,
         grace: Duration,
     ) -> Self {
         Self {
@@ -3695,6 +3716,7 @@ impl MemTableFlushHandler {
             epoch,
             index_configs,
             stats,
+            observer,
             grace,
         }
     }
@@ -3874,8 +3896,12 @@ impl MemTableFlushHandler {
 
         let result = flush_result?;
 
+        let elapsed = start.elapsed();
         self.stats
-            .record_memtable_flush(start.elapsed(), result.rows_flushed);
+            .record_memtable_flush(elapsed, result.rows_flushed);
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush(elapsed, result.rows_flushed);
+        }
 
         info!(
             "Flushed frozen memtable generation {} ({} rows in {:?})",
@@ -8039,6 +8065,65 @@ mod tests {
             .unwrap()
             .expect("manifest should exist after flush");
         assert_eq!(manifest.sstables.len(), flushed_before + 1);
+
+        writer.close().await.unwrap();
+    }
+
+    /// A durable put returns only once its WAL flush landed, and the seal
+    /// fence resolves only once the sealed memtable reached L0 — so both
+    /// callbacks have fired by the time this asserts, without sleeping.
+    #[tokio::test]
+    async fn test_observer_sees_both_flush_kinds() {
+        #[derive(Debug, Default)]
+        struct CountingObserver {
+            wal_flushes: AtomicU64,
+            wal_bytes: AtomicU64,
+            memtable_flushes: AtomicU64,
+            memtable_rows: AtomicU64,
+        }
+
+        impl WalObserver for CountingObserver {
+            fn on_wal_flush(&self, _duration: Duration, bytes: usize) {
+                self.wal_flushes.fetch_add(1, Ordering::Relaxed);
+                self.wal_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+
+            fn on_memtable_flush(&self, _duration: Duration, rows: usize) {
+                self.memtable_flushes.fetch_add(1, Ordering::Relaxed);
+                self.memtable_rows.fetch_add(rows as u64, Ordering::Relaxed);
+            }
+        }
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let observer = Arc::new(CountingObserver::default());
+        let sink: Arc<dyn WalObserver> = observer.clone();
+        let config = ShardWriterConfig {
+            observer: Some(sink),
+            ..seal_fence_test_config(Uuid::new_v4())
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer
+            .force_seal_active()
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(observer.wal_flushes.load(Ordering::Relaxed) > 0);
+        assert!(observer.wal_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(observer.memtable_flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(observer.memtable_rows.load(Ordering::Relaxed), 10);
 
         writer.close().await.unwrap();
     }

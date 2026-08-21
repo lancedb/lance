@@ -773,15 +773,6 @@ fn segment_has_zonemap_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
 }
 
-/// True when the index reports matches as physical row addresses rather than row ids
-/// (`ScalarIndex::results_are_row_addresses`).
-///
-/// Such an index cannot follow its data through a rewrite: the addresses it stores
-/// name fragments and offsets, and neither kind supports remap.
-pub(crate) fn index_results_are_row_addrs(index: &IndexMetadata) -> bool {
-    segment_has_zonemap_details(index) || segment_has_bloomfilter_details(index)
-}
-
 fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
@@ -3001,14 +2992,8 @@ impl DatasetIndexInternalExt for Dataset {
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta =
-                        self.load_index(&frag_reuse_uuid).await?.ok_or_else(|| {
-                            Error::index(format!(
-                                "Index with id {} does not exist",
-                                frag_reuse_uuid
-                            ))
-                        })?;
-                    let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
+                    let index_details =
+                        load_frag_reuse_index_details(self, &frag_reuse_index_meta).await?;
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
                             .await?;
@@ -4933,6 +4918,72 @@ mod tests {
 
         assert_eq!(after.misses - before.misses, 1);
         assert_eq!(after.hits - before.hits, 31);
+    }
+
+    #[tokio::test]
+    async fn test_open_frag_reuse_index_with_zero_capacity_cache() {
+        let test_dir = TempStrDir::default();
+        let data = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let session = Arc::new(Session::with_index_cache_backend(
+            Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+            128 * 1024 * 1024,
+            Default::default(),
+        ));
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let frag_reuse_index = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dataset.open_frag_reuse_index(&NoOpMetricsCollector),
+        )
+        .await
+        .expect("opening the fragment reuse index deadlocked")
+        .unwrap();
+        assert!(frag_reuse_index.is_some());
     }
 
     #[tokio::test]
