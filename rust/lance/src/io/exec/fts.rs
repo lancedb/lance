@@ -52,6 +52,9 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
     CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
     CROSS_COLUMN_STAGED_SUCCESSES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -63,7 +66,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
+    MemBM25Scorer, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
     compound_search_with_base_scorer, cross_column_compound_search,
     flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
@@ -649,6 +652,52 @@ impl CompoundQueryExec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WandExactnessCertificate {
+    Exhaustive,
+    Strict,
+    Ambiguous,
+}
+
+/// Classify a globally merged k+1 Match WAND result.
+///
+/// Sorting before classification is essential: per-segment WAND output is not
+/// a final cross-segment ordering. A strict score gap after result k proves
+/// that score-only pruning could not have discarded a row-id tie at the final
+/// boundary. Ties wholly inside top-k remain safe because all members of their
+/// score group are present before the strict boundary.
+fn classify_wand_exactness_certificate(
+    documents: &mut [ScoredDoc],
+    limit: usize,
+) -> WandExactnessCertificate {
+    if limit == 0
+        || documents
+            .iter()
+            .any(|document| !document.score.0.is_finite())
+    {
+        return WandExactnessCertificate::Ambiguous;
+    }
+    documents.sort_unstable_by(|left, right| {
+        right
+            .score
+            .0
+            .total_cmp(&left.score.0)
+            .then_with(|| left.row_id.cmp(&right.row_id))
+    });
+    if documents.len() <= limit {
+        WandExactnessCertificate::Exhaustive
+    } else if documents[limit - 1]
+        .score
+        .0
+        .total_cmp(&documents[limit].score.0)
+        == Ordering::Greater
+    {
+        WandExactnessCertificate::Strict
+    } else {
+        WandExactnessCertificate::Ambiguous
+    }
+}
+
 impl DisplayAs for CompoundQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
@@ -805,8 +854,57 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let (row_ids, scores) = match base_scorer {
-                Some(base_scorer) => {
+            let certificate_limit = match (&query, params.limit) {
+                (FtsQuery::Match(match_query), Some(limit))
+                    if limit > 0
+                        && params.wand_factor == 1.0
+                        && match_query.boost.is_finite()
+                        && match_query.boost > 0.0
+                        && base_scorer.is_none()
+                        && indices
+                            .iter()
+                            .all(|index| index.supports_wand_exactness_certificate()) =>
+                {
+                    limit
+                        .checked_add(1)
+                        .map(|wand_limit| (match_query.clone(), limit, wand_limit))
+                }
+                _ => None,
+            };
+            let (row_ids, scores) = if let Some((match_query, limit, wand_limit)) =
+                certificate_limit
+            {
+                let first_index = indices.first().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "FTS index for column {column} has no segments"
+                    ))
+                })?;
+                let mut tokenizer =
+                    tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
+                let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+                let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
+                    .with_phrase_slop(None)
+                    .with_limit(Some(wand_limit));
+                let scorer_start = std::time::Instant::now();
+                let base_scorer = Arc::new(
+                    build_global_bm25_scorer(
+                        &indices,
+                        &tokens,
+                        &wand_params,
+                        Some(metrics.as_ref()),
+                    )
+                    .await?,
+                );
+                metrics.record_scorer_build(scorer_start.elapsed());
+
+                // Zero-weight terms can match documents without contributing a
+                // positive score. A short score-only WAND result therefore does
+                // not prove exhaustion. Preserve exact membership semantics for
+                // those rare corpora without recording a certificate attempt.
+                if base_scorer.token_docs.keys().any(|token| {
+                    let weight = base_scorer.query_weight(token);
+                    !weight.is_finite() || weight <= 0.0
+                }) {
                     compound_search_with_base_scorer(
                         &indices,
                         &query,
@@ -816,9 +914,71 @@ impl ExecutionPlan for CompoundQueryExec {
                         base_scorer,
                     )
                     .await?
+                } else {
+                    metrics.record_wand_exactness_certificate_attempts(1);
+                    prefilter.wait_for_ready().await?;
+                    let mut documents = search_segments(
+                        &indices,
+                        Arc::new(tokens),
+                        Arc::new(wand_params),
+                        match_query.operator,
+                        prefilter.clone(),
+                        metrics.clone(),
+                        base_scorer.clone(),
+                    )
+                    .await?;
+                    documents.iter_mut().for_each(|document| {
+                        document.score.0 *= match_query.boost;
+                    });
+                    metrics.record_wand_exactness_certificate_candidates(documents.len());
+                    match classify_wand_exactness_certificate(&mut documents, limit) {
+                        WandExactnessCertificate::Exhaustive => {
+                            metrics.record_wand_exactness_certificate_exhaustive(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Strict => {
+                            metrics.record_wand_exactness_certificate_strict(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Ambiguous => {
+                            metrics.record_wand_exactness_certificate_fallbacks(1);
+                            compound_search_with_base_scorer(
+                                &indices,
+                                &query,
+                                &params,
+                                prefilter,
+                                metrics.clone(),
+                                base_scorer,
+                            )
+                            .await?
+                        }
+                    }
                 }
-                None => {
-                    compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?
+            } else {
+                match base_scorer {
+                    Some(base_scorer) => {
+                        compound_search_with_base_scorer(
+                            &indices,
+                            &query,
+                            &params,
+                            prefilter,
+                            metrics.clone(),
+                            base_scorer,
+                        )
+                        .await?
+                    }
+                    None => {
+                        compound_search(&indices, &query, &params, prefilter, metrics.clone())
+                            .await?
+                    }
                 }
             };
             metrics.baseline_metrics.record_output(row_ids.len());
@@ -1591,6 +1751,11 @@ pub struct FtsIndexMetrics {
     cross_column_staged_successes: Count,
     cross_column_staged_fallbacks: Count,
     cross_column_staged_candidates: Count,
+    wand_exactness_certificate_attempts: Count,
+    wand_exactness_certificate_strict: Count,
+    wand_exactness_certificate_exhaustive: Count,
+    wand_exactness_certificate_fallbacks: Count,
+    wand_exactness_certificate_candidates: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1636,6 +1801,16 @@ impl FtsIndexMetrics {
                 .new_count(CROSS_COLUMN_STAGED_FALLBACKS_METRIC, partition),
             cross_column_staged_candidates: metrics
                 .new_count(CROSS_COLUMN_STAGED_CANDIDATES_METRIC, partition),
+            wand_exactness_certificate_attempts: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, partition),
+            wand_exactness_certificate_strict: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, partition),
+            wand_exactness_certificate_exhaustive: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, partition),
+            wand_exactness_certificate_fallbacks: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, partition),
+            wand_exactness_certificate_candidates: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1743,6 +1918,28 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_cross_column_staged_candidates(&self, num_candidates: usize) {
         self.cross_column_staged_candidates.add(num_candidates);
+    }
+
+    fn record_wand_exactness_certificate_attempts(&self, num_attempts: usize) {
+        self.wand_exactness_certificate_attempts.add(num_attempts);
+    }
+
+    fn record_wand_exactness_certificate_strict(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_strict.add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_exhaustive(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_exhaustive
+            .add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_fallbacks(&self, num_fallbacks: usize) {
+        self.wand_exactness_certificate_fallbacks.add(num_fallbacks);
+    }
+
+    fn record_wand_exactness_certificate_candidates(&self, num_candidates: usize) {
+        self.wand_exactness_certificate_candidates
+            .add(num_candidates);
     }
 }
 
@@ -4081,6 +4278,7 @@ mod tests {
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+    use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery, collect_query_tokens, has_query_token,
@@ -4106,7 +4304,8 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, build_boolean_query_children, default_text_tokenizer, open_fts_segments,
+        PhraseQueryExec, WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -4162,6 +4361,74 @@ mod tests {
         assert_eq!(metrics.cross_column_staged_successes.value(), 1);
         assert_eq!(metrics.cross_column_staged_fallbacks.value(), 1);
         assert_eq!(metrics.cross_column_staged_candidates.value(), 17);
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_classification() {
+        let documents = |scores: &[f32]| {
+            scores
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(row_id, score)| ScoredDoc::new(row_id as u64, *score))
+                .collect::<Vec<_>>()
+        };
+
+        let mut exhaustive = documents(&[3.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut exhaustive, 3),
+            WandExactnessCertificate::Exhaustive
+        );
+
+        let mut strict = documents(&[4.0, 3.0, 3.0, 1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut strict, 3),
+            WandExactnessCertificate::Strict
+        );
+        assert_eq!(
+            strict
+                .iter()
+                .map(|document| document.row_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "ties wholly inside top-k must use row-id ordering without forcing fallback"
+        );
+
+        let mut ambiguous = documents(&[4.0, 3.0, 2.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut ambiguous, 3),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut non_finite = documents(&[4.0, f32::INFINITY]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut non_finite, 1),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut zero_limit = documents(&[1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut zero_limit, 0),
+            WandExactnessCertificate::Ambiguous
+        );
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_wand_exactness_certificate_attempts(2);
+        metrics.record_wand_exactness_certificate_strict(3);
+        metrics.record_wand_exactness_certificate_exhaustive(5);
+        metrics.record_wand_exactness_certificate_fallbacks(7);
+        metrics.record_wand_exactness_certificate_candidates(11);
+
+        assert_eq!(metrics.wand_exactness_certificate_attempts.value(), 2);
+        assert_eq!(metrics.wand_exactness_certificate_strict.value(), 3);
+        assert_eq!(metrics.wand_exactness_certificate_exhaustive.value(), 5);
+        assert_eq!(metrics.wand_exactness_certificate_fallbacks.value(), 7);
+        assert_eq!(metrics.wand_exactness_certificate_candidates.value(), 11);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {
