@@ -58,7 +58,6 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -1434,9 +1433,7 @@ impl Dataset {
     /// would read is the current one -- which makes the speculative answer the
     /// same one the commit reaches.
     fn mem_wal_catch_up_would_advance(&self, indices: &[IndexMetadata]) -> Result<bool> {
-        if self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
-            || self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
-        {
+        if !indices.iter().any(|index| index.name == MEM_WAL_INDEX_NAME) {
             return Ok(false);
         }
         let catchup_of = |indices: &[IndexMetadata]| -> Result<Option<Vec<_>>> {
@@ -1459,7 +1456,6 @@ impl Dataset {
                 manifest: &self.manifest,
                 indices,
             }),
-            true,
             self.manifest.version + 1,
         )?;
         Ok(catchup_of(&speculative)? != catchup_of(indices)?)

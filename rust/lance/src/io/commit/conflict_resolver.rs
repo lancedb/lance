@@ -3395,7 +3395,6 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
-                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -4796,7 +4795,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4805,7 +4803,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4836,7 +4833,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4845,7 +4841,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4877,7 +4872,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4886,7 +4880,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4918,7 +4911,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4927,7 +4919,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4978,7 +4969,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5004,7 +4994,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5051,7 +5040,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
