@@ -459,6 +459,19 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Return whether an explicit prewarm prepared everything this query needs.
+    ///
+    /// This is an O(1) routing hint for query planning. It never starts I/O or
+    /// waits for a concurrent prewarm. The projection check also clears a stale
+    /// optimistic hint after cache eviction; an unexpected posting eviction is
+    /// still handled exactly by the normal eager loader.
+    pub(in super::super) fn prewarmed_query_state_ready(&self, with_position: bool) -> bool {
+        let Ok(state) = self.prewarm_state.try_lock() else {
+            return false;
+        };
+        state.satisfies(with_position) && self.has_resident_document_projections()
+    }
+
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_result(options).await.map(|_| ())
     }

@@ -24,7 +24,6 @@ impl PostingLoadOptions {
         }
     }
 
-    #[cfg(test)]
     pub(in super::super) const fn cache_aware_exact(force_global_scorer: bool) -> Self {
         Self {
             force_global_scorer,
@@ -56,6 +55,32 @@ fn summarize_position_matches(mut positions: SmallVec<[(u32, bool); 8]>) -> Posi
         exact_scoring_required,
         every_position_matched,
     }
+}
+
+fn token_dictionary_may_match(
+    dictionary: &TokenSet,
+    tokens: &Tokens,
+    operator: Operator,
+    is_phrase_query: bool,
+) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    if operator != Operator::And && !is_phrase_query {
+        return (0..tokens.len()).any(|index| dictionary.get(tokens.get_token(index)).is_some());
+    }
+
+    // Query positions are normally adjacent, but `Tokens::with_positions` is
+    // public and does not require that ordering. Keep the exact behavior
+    // without allocating two hash tables for every leaf in every partition.
+    let mut positions = SmallVec::<[(u32, bool); 8]>::new();
+    for index in 0..tokens.len() {
+        positions.push((
+            tokens.position(index),
+            dictionary.get(tokens.get_token(index)).is_some(),
+        ));
+    }
+    summarize_position_matches(positions).every_position_matched
 }
 
 fn posting_group_demand_counts(
@@ -221,6 +246,23 @@ impl InvertedPartition {
 
     fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
+    }
+
+    /// Return whether this partition's token dictionary can satisfy a query
+    /// leaf without reading any posting data.
+    ///
+    /// Fuzzy expansions and identifier subwords that belong to the same
+    /// original query position are alternatives. AND and phrase leaves need
+    /// at least one dictionary term for every original position; OR leaves
+    /// need any term. A `false` result is therefore an exact empty-source
+    /// proof, while `true` remains conservative until postings are loaded.
+    pub(in super::super) fn may_match_tokens(
+        &self,
+        tokens: &Tokens,
+        operator: Operator,
+        is_phrase_query: bool,
+    ) -> bool {
+        token_dictionary_may_match(&self.tokens, tokens, operator, is_phrase_query)
     }
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
@@ -1013,6 +1055,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::scalar::inverted::document_tokenizer::DocType;
+
+    fn dictionary(terms: &[&str]) -> TokenSet {
+        let mut dictionary = TokenSet::default();
+        for term in terms {
+            dictionary.add((*term).to_owned());
+        }
+        dictionary
+    }
 
     fn position_summary(entries: &[(u32, bool)]) -> PositionMatchSummary {
         summarize_position_matches(entries.iter().copied().collect())
@@ -1055,6 +1106,70 @@ mod tests {
         let summary = summarize_position_matches(positions);
         assert!(summary.exact_scoring_required);
         assert!(summary.every_position_matched);
+    }
+
+    #[test]
+    fn token_dictionary_or_needs_any_expansion() {
+        let tokens = Tokens::with_positions(
+            vec!["missing".to_owned(), "alpha".to_owned()],
+            vec![0, 1],
+            DocType::Text,
+        );
+
+        assert!(token_dictionary_may_match(
+            &dictionary(&["alpha"]),
+            &tokens,
+            Operator::Or,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &dictionary(&["other"]),
+            &tokens,
+            Operator::Or,
+            false,
+        ));
+    }
+
+    #[test]
+    fn token_dictionary_and_and_phrase_need_every_original_position() {
+        let expanded = Tokens::with_positions(
+            vec!["alpha".to_owned(), "alphi".to_owned(), "beta".to_owned()],
+            vec![0, 0, 1],
+            DocType::Text,
+        );
+        let complete = dictionary(&["alphi", "beta"]);
+        let missing_position = dictionary(&["alpha", "alphi"]);
+
+        assert!(token_dictionary_may_match(
+            &complete,
+            &expanded,
+            Operator::And,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &missing_position,
+            &expanded,
+            Operator::And,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &missing_position,
+            &expanded,
+            Operator::Or,
+            true,
+        ));
+
+        let non_adjacent_positions = Tokens::with_positions(
+            vec!["beta".to_owned(), "alpha".to_owned(), "alphi".to_owned()],
+            vec![1, 0, 1],
+            DocType::Text,
+        );
+        assert!(token_dictionary_may_match(
+            &dictionary(&["alpha", "alphi"]),
+            &non_adjacent_positions,
+            Operator::And,
+            false,
+        ));
     }
 
     #[rstest]

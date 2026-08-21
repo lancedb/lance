@@ -20,6 +20,10 @@ pub const COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_essential_evaluations";
 pub const COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_non_essential_evaluations";
+pub const CROSS_COLUMN_STAGED_ATTEMPTS_METRIC: &str = "cross_column_staged_attempts";
+pub const CROSS_COLUMN_STAGED_SUCCESSES_METRIC: &str = "cross_column_staged_successes";
+pub const CROSS_COLUMN_STAGED_FALLBACKS_METRIC: &str = "cross_column_staged_fallbacks";
+pub const CROSS_COLUMN_STAGED_CANDIDATES_METRIC: &str = "cross_column_staged_candidates";
 
 /// A trait used by the index to report metrics
 ///
@@ -124,6 +128,18 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record non-essential-clause evaluations for pure-SHOULD compound FTS.
     fn record_compound_should_non_essential_evaluations(&self, _num_evaluations: usize) {}
+
+    /// Record cross-column queries that attempted candidate-driven staging.
+    fn record_cross_column_staged_attempts(&self, _num_attempts: usize) {}
+
+    /// Record staged executions that produced a complete candidate set.
+    fn record_cross_column_staged_successes(&self, _num_successes: usize) {}
+
+    /// Record staged executions abandoned in favor of exact eager execution.
+    fn record_cross_column_staged_fallbacks(&self, _num_fallbacks: usize) {}
+
+    /// Record unique row-address candidates produced by successful staging.
+    fn record_cross_column_staged_candidates(&self, _num_candidates: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
