@@ -12,7 +12,6 @@
 //! - [`IndexStore`] - In-memory index management
 //! - [`MemTableFlusher`] - Flush MemTable to storage as single Lance file
 
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -242,18 +241,6 @@ pub struct ShardWriterConfig {
     /// Default: `None`.
     pub session: Option<Arc<Session>>,
 
-    /// Shared counter this writer adds its resident memtable bytes to, so an
-    /// embedder running many shards in one process can read a process-wide
-    /// total with a single load instead of scanning every shard.
-    ///
-    /// Lance treats it as opaque: it adds on insert and subtracts on
-    /// flush-commit, and never reads or interprets it. Give every writer in the
-    /// process the same `Arc` to make the sum meaningful. Because the increment
-    /// lands under the write lock before the write is acked, a reader sees a
-    /// safe upper bound rather than a lagging one.
-    /// Default: `None` (no process-wide accounting).
-    pub pod_memory_bytes: Option<Arc<AtomicUsize>>,
-
     /// Admission control for every `put`, **replacing** lance's built-in
     /// per-shard valve ([`LocalBackpressureController`]).
     ///
@@ -291,7 +278,6 @@ impl Default for ShardWriterConfig {
             observer: None,
             store_params: None,
             session: None,
-            pod_memory_bytes: None,
             backpressure: None,
         }
     }
@@ -371,13 +357,6 @@ impl ShardWriterConfig {
     /// Set maximum unflushed bytes for backpressure.
     pub fn with_max_unflushed_memtable_bytes(mut self, size: usize) -> Self {
         self.max_unflushed_memtable_bytes = size;
-        self
-    }
-
-    /// Set the process-wide resident-bytes counter. See
-    /// [`Self::pod_memory_bytes`].
-    pub fn with_pod_memory_bytes(mut self, counter: Arc<AtomicUsize>) -> Self {
-        self.pod_memory_bytes = Some(counter);
         self
     }
 
@@ -1036,54 +1015,34 @@ struct MemoryCounters {
     active: AtomicUsize,
     /// Resident bytes of every sealed memtable still awaiting its flush.
     frozen: AtomicUsize,
-    /// Process-wide `Σ(active + frozen)` over every shard, when the embedder
-    /// injects one. Opaque to lance — it only adds and subtracts. Bumped under
-    /// the write lock before the write is acked, so it is a safe upper bound.
-    pod: Option<Arc<AtomicUsize>>,
 }
 
 impl MemoryCounters {
-    fn new(pod: Option<Arc<AtomicUsize>>) -> Self {
+    fn new() -> Self {
         Self {
             active: AtomicUsize::new(0),
             frozen: AtomicUsize::new(0),
-            pod,
         }
-    }
-
-    /// Mirror a `from -> to` move on one counter into the pod-wide sum.
-    fn shift_pod(&self, from: usize, to: usize) {
-        let Some(pod) = &self.pod else { return };
-        match to.cmp(&from) {
-            CmpOrdering::Greater => pod.fetch_add(to - from, Ordering::Relaxed),
-            CmpOrdering::Less => pod.fetch_sub(from - to, Ordering::Relaxed),
-            CmpOrdering::Equal => return,
-        };
     }
 
     /// Record the active memtable's size. Call under the write lock after any
     /// mutation of it.
     fn set_active(&self, bytes: usize) {
-        let prev = self.active.swap(bytes, Ordering::Relaxed);
-        self.shift_pod(prev, bytes);
+        self.active.store(bytes, Ordering::Relaxed);
     }
 
     /// A memtable of `sealed` bytes was frozen and replaced by a fresh active
-    /// one of `new_active` bytes. Pod-wide this is ~net-zero: the bytes are
-    /// reclassified, not released.
+    /// one of `new_active` bytes: the bytes are reclassified, not released.
     fn seal(&self, sealed: usize, new_active: usize) {
         self.set_active(new_active);
-        let prev = self.frozen.load(Ordering::Relaxed);
-        self.frozen.store(prev + sealed, Ordering::Relaxed);
-        self.shift_pod(prev, prev + sealed);
+        self.frozen.fetch_add(sealed, Ordering::Relaxed);
     }
 
     /// Release a frozen memtable's bytes once its flush has committed.
     fn release_frozen(&self, bytes: usize) {
         let prev = self.frozen.load(Ordering::Relaxed);
-        let next = prev.saturating_sub(bytes);
-        self.frozen.store(next, Ordering::Relaxed);
-        self.shift_pod(prev, next);
+        self.frozen
+            .store(prev.saturating_sub(bytes), Ordering::Relaxed);
     }
 
     fn active(&self) -> usize {
@@ -2147,7 +2106,7 @@ impl ShardWriter {
         // means "no entry covered yet."
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
 
-        let memory = Arc::new(MemoryCounters::new(config.pod_memory_bytes.clone()));
+        let memory = Arc::new(MemoryCounters::new());
         // Replay above may already have filled the memtable.
         memory.set_active(memtable.memory_size());
 
@@ -6032,7 +5991,7 @@ mod tests {
     }
 
     fn empty_shard_memory() -> ShardMemory {
-        shard_memory(Arc::new(MemoryCounters::new(None)))
+        shard_memory(Arc::new(MemoryCounters::new()))
     }
 
     #[tokio::test]
@@ -6217,7 +6176,7 @@ mod tests {
             }))
         });
 
-        let counters = Arc::new(MemoryCounters::new(None));
+        let counters = Arc::new(MemoryCounters::new());
         counters.set_active(700);
         counters.seal(300, 700);
         controller
@@ -6253,7 +6212,7 @@ mod tests {
             }
         }
 
-        let counters = Arc::new(MemoryCounters::new(None));
+        let counters = Arc::new(MemoryCounters::new());
         counters.set_active(0);
         counters.seal(4_096, 0);
 
