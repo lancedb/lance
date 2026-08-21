@@ -16,11 +16,13 @@ use object_store::{
 use object_store_opendal::OpendalStore as InnerOpendalStore;
 use opendal::Operator;
 
-/// Adapts OpenDAL listing paths to Lance's raw object-store path convention.
+/// Adapts OpenDAL listing paths to the spelling used by the request.
 ///
 /// The upstream bridge builds listed locations with [`Path::from`], which
 /// percent-encodes reserved characters. Lance builds dataset base paths with
-/// [`Path::from_url_path`], so listed locations must be decoded to match.
+/// [`Path::from_url_path`], so mismatched listed locations must be decoded.
+/// Locations that already match the requested prefix retain their spelling to
+/// preserve paths containing literal percent escapes.
 #[derive(Debug, Clone)]
 pub(super) struct OpendalStore {
     inner: InnerOpendalStore,
@@ -40,15 +42,22 @@ impl fmt::Display for OpendalStore {
     }
 }
 
-fn normalize_location(location: &Path) -> object_store::Result<Path> {
+fn normalize_location(location: &Path, prefix: Option<&Path>) -> object_store::Result<Path> {
+    if prefix.is_none_or(|prefix| location.prefix_matches(prefix)) {
+        return Ok(location.clone());
+    }
+
     Path::from_url_path(location.as_ref()).map_err(|source| object_store::Error::Generic {
         store: "OpendalStore",
         source: Box::new(source),
     })
 }
 
-fn normalize_object_meta(mut meta: ObjectMeta) -> object_store::Result<ObjectMeta> {
-    meta.location = normalize_location(&meta.location)?;
+fn normalize_object_meta(
+    mut meta: ObjectMeta,
+    prefix: Option<&Path>,
+) -> object_store::Result<ObjectMeta> {
+    meta.location = normalize_location(&meta.location, prefix)?;
     Ok(meta)
 }
 
@@ -95,9 +104,10 @@ impl OSObjectStore for OpendalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner
-            .list(prefix)
-            .map(|result| result.and_then(normalize_object_meta))
+        let listed = self.inner.list(prefix);
+        let prefix = prefix.cloned();
+        listed
+            .map(move |result| result.and_then(|meta| normalize_object_meta(meta, prefix.as_ref())))
             .boxed()
     }
 
@@ -107,9 +117,12 @@ impl OSObjectStore for OpendalStore {
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if self.inner.info().capability().list_with_start_after {
-            self.inner
-                .list_with_offset(prefix, offset)
-                .map(|result| result.and_then(normalize_object_meta))
+            let listed = self.inner.list_with_offset(prefix, offset);
+            let prefix = prefix.cloned();
+            listed
+                .map(move |result| {
+                    result.and_then(|meta| normalize_object_meta(meta, prefix.as_ref()))
+                })
                 .boxed()
         } else {
             // The bridge's fallback compares its encoded output with the raw
@@ -124,10 +137,10 @@ impl OSObjectStore for OpendalStore {
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let mut result = self.inner.list_with_delimiter(prefix).await?;
         for object in &mut result.objects {
-            object.location = normalize_location(&object.location)?;
+            object.location = normalize_location(&object.location, prefix)?;
         }
         for common_prefix in &mut result.common_prefixes {
-            *common_prefix = normalize_location(common_prefix)?;
+            *common_prefix = normalize_location(common_prefix, prefix)?;
         }
         Ok(result)
     }
@@ -157,16 +170,20 @@ mod tests {
     use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
     use opendal::services::Memory;
+    use rstest::rstest;
 
     use super::*;
 
+    #[rstest]
+    #[case::raw_reserved_character("tables/run~1/t.lance")]
+    #[case::literal_percent_escape("tables/run%25231/t.lance")]
     #[tokio::test]
-    async fn test_list_preserves_raw_locations() {
+    async fn test_list_preserves_request_path_spelling(#[case] base_url: &str) {
         let operator = Operator::new(Memory::default()).unwrap();
         let store = OpendalStore::new(operator);
-        let base = Path::from_url_path("tables/run~1/t.lance").unwrap();
-        let direct_location = Path::from_url_path("tables/run~1/t.lance/manifest.lance").unwrap();
-        let nested_location = Path::from_url_path("tables/run~1/t.lance/data/part.lance").unwrap();
+        let base = Path::from_url_path(base_url).unwrap();
+        let direct_location = base.clone().join("manifest.lance");
+        let nested_location = Path::from_url_path(format!("{base_url}/data/part.lance")).unwrap();
         for location in [&direct_location, &nested_location] {
             store
                 .put(location, Bytes::from_static(b"data").into())
@@ -204,9 +221,6 @@ mod tests {
         let delimited = store.list_with_delimiter(Some(&base)).await.unwrap();
         assert_eq!(delimited.objects.len(), 1);
         assert_eq!(delimited.objects[0].location, direct_location);
-        assert_eq!(
-            delimited.common_prefixes,
-            vec![Path::from_url_path("tables/run~1/t.lance/data").unwrap()]
-        );
+        assert_eq!(delimited.common_prefixes, vec![base.clone().join("data")]);
     }
 }
