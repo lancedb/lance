@@ -113,6 +113,17 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
+        manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
+        // Turning stable row ids off would revert `_rowid` to row addresses, whose
+        // namespace overlaps the ids this table has already handed out.
+        if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
+            return Err(Error::invalid_input(format!(
+                "Cannot restore version {version}: stable row ids were enabled \
+                 after it, and turning them back off would let row addresses \
+                 collide with ids this table has already used"
+            )));
+        }
         // A version from before catch-up was required carries MemWAL state this
         // protocol never validated -- catch-up values activation deliberately
         // cleared, or compaction progress it deliberately refused to trust.
