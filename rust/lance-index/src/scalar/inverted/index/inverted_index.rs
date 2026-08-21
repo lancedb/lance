@@ -73,7 +73,11 @@ impl InvertedIndex {
         self.partitions
             .first()
             .map(|partition| partition.inverted_list.posting_tail_codec())
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                // Empty segments have no partition-level codec metadata, so
+                // derive the codec from the segment's declared format.
+                self.format_version().posting_tail_codec()
+            })
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
