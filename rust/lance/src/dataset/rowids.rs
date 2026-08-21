@@ -330,7 +330,7 @@ mod test {
         assert!(dataset.manifest.uses_stable_row_ids());
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        assert!(index.get(0).is_none());
+        assert!(index.get(0).unwrap().is_none());
 
         assert_eq!(dataset.manifest().next_row_id, 0);
     }
@@ -384,7 +384,7 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
 
         let found_addresses = (0..num_rows)
-            .map(|i| index.get(i).unwrap())
+            .map(|i| index.get(i).unwrap().unwrap())
             .collect::<Vec<_>>();
         let expected_addresses = (0..num_rows)
             .map(|i| {
@@ -446,8 +446,8 @@ mod test {
 
         failing_store.clear_fail_when("get_opts", "_deletions");
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        assert!(index.get(2).is_some());
-        assert!(index.get(3).is_none());
+        assert!(index.get(2).unwrap().is_some());
+        assert!(index.get(3).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -530,8 +530,8 @@ mod test {
         assert_eq!(dataset.manifest.fragments[0].id, 1);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        assert!(index.get(0).is_none());
-        assert!(index.get(num_rows).is_some());
+        assert!(index.get(0).unwrap().is_none());
+        assert!(index.get(num_rows).unwrap().is_some());
     }
 
     /// Fragment ids are a high water mark within one dataset, but a dataset
@@ -683,8 +683,8 @@ mod test {
         assert_eq!(dataset.manifest().next_row_id, 60);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        assert!(index.get(0).is_some());
-        assert!(index.get(60).is_none());
+        assert!(index.get(0).unwrap().is_some());
+        assert!(index.get(60).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -830,11 +830,14 @@ mod test {
 
         let dataset = update_result.new_dataset;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        assert!(index.get(0).is_some());
+        assert!(index.get(0).unwrap().is_some());
         // the updated row ids mapping to new address
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
         // there is no new row id
-        assert_eq!(index.get(5), None);
+        assert_eq!(index.get(5).unwrap(), None);
     }
 
     /// 100 sequential rows across 4 fragments with every third row deleted.

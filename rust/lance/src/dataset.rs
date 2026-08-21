@@ -3001,7 +3001,7 @@ impl Dataset {
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(address) = row_id_index.get(*id) {
+                if let Some(address) = row_id_index.get(*id)? {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }

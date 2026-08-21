@@ -469,7 +469,7 @@ impl UpdateJob {
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,

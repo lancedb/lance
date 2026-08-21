@@ -109,10 +109,12 @@ impl RowIdIndex {
 
     /// Get the address for a given row id.
     ///
-    /// Will return None if the row id does not exist in the index.
-    pub fn get(&self, row_id: u64) -> Option<RowAddress> {
+    /// Will return None if the row id does not exist in the index. Errors when
+    /// the id is live in more than one fragment, which means the stable row
+    /// ids are corrupt.
+    pub fn get(&self, row_id: u64) -> Result<Option<RowAddress>> {
         if let Some(merged) = &self.merged {
-            return merged_get(merged, row_id);
+            return Ok(merged_get(merged, row_id));
         }
         self.probe(row_id)
     }
@@ -123,11 +125,11 @@ impl RowIdIndex {
     /// Sorts a working copy of the input internally so the chunk iterator
     /// is advanced at most once per chunk, amortizing the per-id tree walk
     /// from O(N · log F) to O(F + N).
-    pub fn get_many(&self, row_ids: &[u64]) -> Vec<Option<RowAddress>> {
+    pub fn get_many(&self, row_ids: &[u64]) -> Result<Vec<Option<RowAddress>>> {
         let n = row_ids.len();
         let mut out = vec![None; n];
         if n == 0 {
-            return out;
+            return Ok(out);
         }
 
         let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..n).collect();
@@ -136,9 +138,9 @@ impl RowIdIndex {
         let Some(merged) = &self.merged else {
             // Sorted ids keep one fragment and its segments warm across the run.
             for (id, orig_idx) in sorted {
-                out[orig_idx] = self.probe(id);
+                out[orig_idx] = self.probe(id)?;
             }
-            return out;
+            return Ok(out);
         };
 
         let mut chunks = merged.iter().peekable();
@@ -163,26 +165,25 @@ impl RowIdIndex {
                 out[orig_idx] = Some(RowAddress::from(addr));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Address of `row_id`, from the fragment that holds it live. Descends the
     /// max-`end` tree, so a fragment out of reach of the id costs nothing.
     ///
-    /// Visits every candidate rather than stopping at the first hit, so a row
-    /// id live in two fragments resolves to the same address here and through
-    /// [`Self::get_many`], and trips the assertion in a debug build.
-    fn probe(&self, row_id: u64) -> Option<RowAddress> {
+    /// Visits every candidate rather than stopping at the first hit, and
+    /// errors when a second fragment holds the id live.
+    fn probe(&self, row_id: u64) -> Result<Option<RowAddress>> {
         let fragments = self.fragments.len();
         if fragments == 0 {
-            return None;
+            return Ok(None);
         }
         // Only a fragment that starts at or below the id can hold it.
         let upper = self
             .fragments
             .partition_point(|entry| entry.start <= row_id);
         if upper == 0 {
-            return None;
+            return Ok(None);
         }
         let leaves = self.end_tree.len() / 2;
         // Depth is log2(leaves), at most 64, and each level leaves one sibling.
@@ -200,16 +201,13 @@ impl RowIdIndex {
                 if lo < fragments
                     && let Some(candidate) = self.fragments[lo].resolve(row_id)
                 {
-                    debug_assert!(
-                        found.is_none(),
-                        "row id index corrupt: stable row id {row_id} is live in \
-                         multiple fragments"
-                    );
-                    // The lowest fragment id wins, so both lookup APIs agree.
-                    found = Some(match found {
-                        Some(previous) => candidate.min(previous),
-                        None => candidate,
-                    });
+                    if found.is_some() {
+                        return Err(Error::internal(format!(
+                            "row id index corrupt: stable row id {row_id} is \
+                             live in multiple fragments",
+                        )));
+                    }
+                    found = Some(candidate);
                 }
                 continue;
             }
@@ -220,7 +218,7 @@ impl RowIdIndex {
             stack[depth + 1] = (2 * node + 1, mid, hi);
             depth += 2;
         }
-        found
+        Ok(found)
     }
 }
 
@@ -673,9 +671,16 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 impl RowIdIndex {
     /// Index that answers from the probe path, whatever the gate decided.
     fn probing(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let mut index = Self::new(fragment_indices)?;
-        index.merged = None;
-        Ok(index)
+        let mut fragments: Vec<FragmentEntry> = fragment_indices
+            .iter()
+            .filter_map(FragmentEntry::new)
+            .collect();
+        fragments.sort_unstable_by_key(|entry| entry.start);
+        Ok(Self {
+            end_tree: build_end_tree(&fragments),
+            fragments,
+            merged: None,
+        })
     }
 }
 
@@ -715,7 +720,10 @@ mod tests {
         let wide = fragment(1, sparse_sequence(2 * MERGE_ROWS_BUDGET));
         let index = RowIdIndex::new(&[wide]).unwrap();
         assert!(index.merged.is_none());
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(1, 3)));
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(1, 3))
+        );
     }
 
     #[test]
@@ -741,7 +749,34 @@ mod tests {
         assert!(RowIdIndex::new(&sources).is_err());
 
         let index = RowIdIndex::probing(&sources[..1]).unwrap();
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(1, 1)));
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(1, 1))
+        );
+    }
+
+    #[test]
+    fn test_probe_errors_when_two_fragments_hold_an_id_live() {
+        let sources = [
+            fragment(1, RowIdSequence::from(&[0, 2][..])),
+            fragment(2, RowIdSequence::from(&[1, 2][..])),
+        ];
+        let index = RowIdIndex::probing(&sources).unwrap();
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
+
+        let error = index.get(2).unwrap_err();
+        assert!(matches!(&error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("stable row id 2 is live in multiple fragments")
+        );
+
+        let error = index.get_many(&[0, 2]).unwrap_err();
+        assert!(matches!(&error, Error::Internal { .. }));
     }
 
     #[test]
@@ -754,7 +789,7 @@ mod tests {
         .unwrap();
         for (offset, row_id) in row_ids.iter().enumerate() {
             assert_eq!(
-                index.get(*row_id),
+                index.get(*row_id).unwrap(),
                 Some(RowAddress::new_from_parts(3, offset as u32))
             );
         }
@@ -792,14 +827,32 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(15), None);
-        assert_eq!(index.get(16), Some(RowAddress::new_from_parts(10, 14)));
-        assert_eq!(index.get(17), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(25), Some(RowAddress::new_from_parts(10, 16)));
-        assert_eq!(index.get(40), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(60), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(61), None);
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(index.get(15).unwrap(), None);
+        assert_eq!(
+            index.get(16).unwrap(),
+            Some(RowAddress::new_from_parts(10, 14))
+        );
+        assert_eq!(
+            index.get(17).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(25).unwrap(),
+            Some(RowAddress::new_from_parts(10, 16))
+        );
+        assert_eq!(
+            index.get(40).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(
+            index.get(60).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(index.get(61).unwrap(), None);
     }
 
     #[test]
@@ -831,15 +884,42 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(42, 0)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(23, 0)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(42, 1)));
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(23, 1)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(10, 2)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(42, 2)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(23, 2)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(42, 0))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(23, 0))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(42, 1))
+        );
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(23, 1))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(10, 2))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(42, 2))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(23, 2))
+        );
     }
 
     #[test]
@@ -872,19 +952,46 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check that all row ids can be found regardless of their order in the segments
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(30, 1)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(30, 2)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(10, 2)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(30, 0)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(30, 1))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(20, 1))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(30, 2))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(10, 2))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(30, 0))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
 
         // Check that non-existent row ids return None
-        assert_eq!(index.get(0), None);
-        assert_eq!(index.get(10), None);
+        assert_eq!(index.get(0).unwrap(), None);
+        assert_eq!(index.get(10).unwrap(), None);
     }
 
     #[test]
@@ -908,11 +1015,26 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(0, 0)));
-        assert_eq!(index.get(49), Some(RowAddress::new_from_parts(0, 49)));
-        assert_eq!(index.get(50), Some(RowAddress::new_from_parts(1, 0)));
-        assert_eq!(index.get(51), Some(RowAddress::new_from_parts(0, 50)));
-        assert_eq!(index.get(99), Some(RowAddress::new_from_parts(0, 98)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(0, 0))
+        );
+        assert_eq!(
+            index.get(49).unwrap(),
+            Some(RowAddress::new_from_parts(0, 49))
+        );
+        assert_eq!(
+            index.get(50).unwrap(),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
+        assert_eq!(
+            index.get(51).unwrap(),
+            Some(RowAddress::new_from_parts(0, 50))
+        );
+        assert_eq!(
+            index.get(99).unwrap(),
+            Some(RowAddress::new_from_parts(0, 98))
+        );
     }
 
     #[test]
@@ -939,15 +1061,36 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), None);
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(20, 1))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(index.get(4).unwrap(), None);
         // Surviving ids keep their original offsets (the hole is not compacted).
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(20, 3)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 4)));
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(20, 3))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
     }
 
     #[test]
@@ -962,13 +1105,25 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(10, 5)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(10, 5))
+        );
 
-        assert_eq!(index.get(2), None);
-        assert_eq!(index.get(3), None);
+        assert_eq!(index.get(2).unwrap(), None);
+        assert_eq!(index.get(3).unwrap(), None);
     }
 
     #[test]
@@ -988,9 +1143,15 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(4), None);
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(index.get(4).unwrap(), None);
     }
 
     #[test]
@@ -998,8 +1159,8 @@ mod tests {
         let fragment_indices = vec![];
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), None);
-        assert_eq!(index.get(100), None);
+        assert_eq!(index.get(0).unwrap(), None);
+        assert_eq!(index.get(100).unwrap(), None);
     }
 
     #[test]
@@ -1024,12 +1185,30 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(10), Some(RowAddress::new_from_parts(30, 0)));
-        assert_eq!(index.get(14), Some(RowAddress::new_from_parts(30, 4)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(
+            index.get(10).unwrap(),
+            Some(RowAddress::new_from_parts(30, 0))
+        );
+        assert_eq!(
+            index.get(14).unwrap(),
+            Some(RowAddress::new_from_parts(30, 4))
+        );
     }
 
     fn arbitrary_row_ids(
@@ -1121,24 +1300,27 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Verify correctness at boundaries
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(0, 0)));
         assert_eq!(
-            index.get(rows_per_fragment - 1),
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(0, 0))
+        );
+        assert_eq!(
+            index.get(rows_per_fragment - 1).unwrap(),
             Some(RowAddress::new_from_parts(0, rows_per_fragment as u32 - 1))
         );
         assert_eq!(
-            index.get(rows_per_fragment),
+            index.get(rows_per_fragment).unwrap(),
             Some(RowAddress::new_from_parts(1, 0))
         );
         let last_row = num_fragments as u64 * rows_per_fragment - 1;
         assert_eq!(
-            index.get(last_row),
+            index.get(last_row).unwrap(),
             Some(RowAddress::new_from_parts(
                 num_fragments - 1,
                 rows_per_fragment as u32 - 1
             ))
         );
-        assert_eq!(index.get(last_row + 1), None);
+        assert_eq!(index.get(last_row + 1).unwrap(), None);
 
         // With the optimization, building an index for 25M rows across 100 fragments
         // should complete in well under 1 second (typically < 1ms).
@@ -1184,39 +1366,48 @@ mod tests {
 
         // Deleted rows (offset 0, 3, 6, ...) should not be found.
         // Row ID 0 has offset 0 in fragment 0 -> deleted.
-        assert_eq!(index.get(0), None);
+        assert_eq!(index.get(0).unwrap(), None);
         // Row ID 3 has offset 3 in fragment 0 -> deleted.
-        assert_eq!(index.get(3), None);
+        assert_eq!(index.get(3).unwrap(), None);
 
         // Non-deleted rows should resolve correctly.
         // Row ID 1 has offset 1 in fragment 0 -> address (frag=0, row=1).
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(0, 1)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(0, 1))
+        );
         // Row ID 2 has offset 2 in fragment 0 -> address (frag=0, row=2).
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(0, 2)));
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(0, 2))
+        );
         // Row ID 4 has offset 4 in fragment 0 -> address (frag=0, row=4).
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(0, 4)));
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(0, 4))
+        );
 
         // Check second fragment: row IDs start at 1000.
         // Row ID 1000 has offset 0 in fragment 1 -> deleted.
-        assert_eq!(index.get(rows_per_fragment), None);
+        assert_eq!(index.get(rows_per_fragment).unwrap(), None);
         // Row ID 1001 has offset 1 in fragment 1 -> address (frag=1, row=1).
         assert_eq!(
-            index.get(rows_per_fragment + 1),
+            index.get(rows_per_fragment + 1).unwrap(),
             Some(RowAddress::new_from_parts(1, 1))
         );
 
         // Last fragment, last non-deleted row.
         // Row ID 9999 has offset 999 in fragment 9 -> 999 % 3 == 0 -> deleted.
         let last_row = num_fragments as u64 * rows_per_fragment - 1;
-        assert_eq!(index.get(last_row), None);
+        assert_eq!(index.get(last_row).unwrap(), None);
         // Row ID 9998 has offset 998 -> 998 % 3 == 2 -> not deleted.
         assert_eq!(
-            index.get(last_row - 1),
+            index.get(last_row - 1).unwrap(),
             Some(RowAddress::new_from_parts(num_fragments - 1, 998))
         );
 
         // Out of range.
-        assert_eq!(index.get(last_row + 1), None);
+        assert_eq!(index.get(last_row + 1).unwrap(), None);
     }
 
     proptest::proptest! {
@@ -1244,7 +1435,7 @@ mod tests {
                             Some(RowAddress::new_from_parts(*frag_id, local_offset as u32))
                         };
                         prop_assert_eq!(
-                            index.get(row_id),
+                            index.get(row_id).unwrap(),
                             expected,
                             "Row id {} in sequence {:?} not found in index {:?}",
                             row_id,
@@ -1280,7 +1471,7 @@ mod tests {
 
             let index = RowIdIndex::new(&fragment_indices).unwrap();
             prop_assert_eq!(
-                index.get(row_id),
+                index.get(row_id).unwrap(),
                 Some(RowAddress::new_from_parts(target_fragment, 0))
             );
         }

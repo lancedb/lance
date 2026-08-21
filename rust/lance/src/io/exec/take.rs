@@ -193,7 +193,7 @@ impl TakeStream {
                 let mut valid = Vec::with_capacity(row_id_array.len());
 
                 for id in row_id_array.values().iter() {
-                    if let Some(address) = row_id_index.get(*id) {
+                    if let Some(address) = row_id_index.get(*id)? {
                         addresses.push(u64::from(address));
                         valid.push(true);
                     } else {

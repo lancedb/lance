@@ -2404,10 +2404,13 @@ impl MergeInsertJob {
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
             let removed_row_addr_vec =
                 if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    removed_row_ids
-                        .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>()
+                    let mut addresses = Vec::with_capacity(removed_row_ids.len());
+                    for id in &removed_row_ids {
+                        if let Some(address) = row_id_index.get(*id)? {
+                            addresses.push(address.into());
+                        }
+                    }
+                    addresses
                 } else {
                     removed_row_ids
                 };
@@ -2517,10 +2520,12 @@ impl MergeInsertJob {
 
                 let removed_row_addr_vec =
                     if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let addresses: Vec<u64> = removed_row_ids
-                            .iter()
-                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                            .collect::<Vec<_>>();
+                        let mut addresses: Vec<u64> = Vec::with_capacity(removed_row_ids.len());
+                        for id in &removed_row_ids {
+                            if let Some(address) = row_id_index.get(*id)? {
+                                addresses.push(address.into());
+                            }
+                        }
                         addresses
                     } else {
                         removed_row_ids
