@@ -281,7 +281,7 @@ impl ObjectWriter {
                 UploadFailure::new(
                     format!(
                         "multipart upload of part {part_idx} of {path} failed after {:?} \
-                         ({part_size} bytes, {parts_in_flight} parts in flight, {})",
+                         ({part_size} bytes, {parts_in_flight} parts in flight at submission, {})",
                         queued_at.elapsed(),
                         upload_settings()
                     ),
@@ -313,7 +313,7 @@ impl ObjectWriter {
                             data,
                             mut_self.path.clone(),
                             0,
-                            0,
+                            1,
                         ));
 
                         mut_self.state = UploadState::InProgress {
@@ -436,7 +436,7 @@ impl AsyncWrite for ObjectWriter {
                         *part_idx,
                         mut_self.use_constant_size_upload_parts,
                     );
-                    let parts_in_flight = futures.len();
+                    let parts_in_flight = futures.len() + 1;
                     futures.spawn(
                         Self::put_part(
                             upload.as_mut(),
@@ -512,8 +512,11 @@ impl AsyncWrite for ObjectWriter {
                     if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
                         // We can just use `take` since we don't need the buffer anymore.
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
-                        let parts_in_flight = futures.len();
+                        let parts_in_flight = futures.len() + 1;
                         let final_part_idx = *part_idx;
+                        // Counted like every other part so the part total
+                        // reported when completing the upload is accurate.
+                        *part_idx += 1;
                         futures.spawn(
                             Self::put_part(
                                 upload.as_mut(),
@@ -929,6 +932,13 @@ mod tests {
 
     const FAILING_UPLOAD_PATH: &str = "part_7_invert.lance";
 
+    /// Enough bytes for two full multipart parts, so a failing part has a
+    /// sibling in flight. Derived from the configured part size rather than the
+    /// default, since `LANCE_INITIAL_UPLOAD_SIZE` may raise it.
+    fn two_parts() -> usize {
+        initial_upload_size() * 2
+    }
+
     /// Drives a write against a store that rejects `fail_at`, returning the
     /// error. The failure can surface either from a write or from shutdown
     /// depending on when the rejected request is reaped, so both are checked.
@@ -950,8 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_part_upload_failure_reports_upload_context() {
-        // Two parts' worth, so the failing part has a sibling in flight.
-        let err = failing_upload(FailAt::PutPart, INITIAL_UPLOAD_STEP * 2).await;
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
         let message = err.to_string();
 
         assert!(
@@ -963,7 +972,7 @@ mod tests {
             "should name the object: {message}"
         );
         assert!(
-            message.contains(&format!("{INITIAL_UPLOAD_STEP} bytes")),
+            message.contains(&format!("{} bytes", initial_upload_size())),
             "should report the part size: {message}"
         );
         assert!(
@@ -985,7 +994,7 @@ mod tests {
     // a slow request apart from one whose task was never polled.
     #[tokio::test]
     async fn test_part_upload_failure_reports_elapsed_time() {
-        let err = failing_upload(FailAt::PutPart, INITIAL_UPLOAD_STEP * 2).await;
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
         let message = err.to_string();
         assert!(
             message.contains("failed after"),
@@ -995,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_part_upload_failure_preserves_source_chain() {
-        let err = failing_upload(FailAt::PutPart, INITIAL_UPLOAD_STEP * 2).await;
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
 
         let failure = err
             .get_ref()
@@ -1010,7 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_multipart_failure_reports_upload_context() {
-        let err = failing_upload(FailAt::CreateMultipart, INITIAL_UPLOAD_STEP * 2).await;
+        let err = failing_upload(FailAt::CreateMultipart, two_parts()).await;
         let message = err.to_string();
 
         assert!(
@@ -1029,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_multipart_failure_reports_upload_context() {
-        let num_bytes = INITIAL_UPLOAD_STEP * 2;
+        let num_bytes = two_parts();
         let err = failing_upload(FailAt::Complete, num_bytes).await;
         let message = err.to_string();
 
