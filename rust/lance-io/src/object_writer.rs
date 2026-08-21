@@ -281,7 +281,7 @@ impl ObjectWriter {
                 UploadFailure::new(
                     format!(
                         "multipart upload of part {part_idx} of {path} failed after {:?} \
-                         ({part_size} bytes, {parts_in_flight} parts in flight at submission, {})",
+                         ({part_size} bytes, parts_in_flight={parts_in_flight} at submission, {})",
                         queued_at.elapsed(),
                         upload_settings()
                     ),
@@ -976,7 +976,7 @@ mod tests {
             "should report the part size: {message}"
         );
         assert!(
-            message.contains("parts in flight"),
+            message.contains("parts_in_flight="),
             "should report upload concurrency in use: {message}"
         );
         assert!(
