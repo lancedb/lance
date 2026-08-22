@@ -66,10 +66,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -81,10 +81,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | sort | uniq | paste -s -d "," -`
@@ -122,10 +122,10 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           key: llvm-cov-ci
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
         with:
@@ -167,10 +167,6 @@ jobs:
           # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
           rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
           rustup default nightly-2026-07-13
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y libssl-dev
       - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
@@ -284,10 +280,10 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
@@ -315,10 +311,10 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build all
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
@@ -346,15 +342,21 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # macOS runner capacity is the scarcest in CI, so this job is kept as short
+      # as it can be. nextest runs each test in its own process and schedules
+      # across all cores, rather than one test binary at a time. Benchmarks are
+      # only compile-checked here, which build-no-lock already does on Linux;
+      # nothing about bench compilation is macOS-specific.
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
-      - name: Check benchmarks
-        run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
+          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest-4x
     defaults:
@@ -372,12 +374,17 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # Same reasoning as mac-build: nextest schedules across all cores instead
+      # of running one test binary at a time, and build-no-lock already
+      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo test --profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
     # Verifies that lance-linalg's runtime SIMD dispatch still works
@@ -410,13 +417,14 @@ jobs:
         with:
           path: ${{ runner.temp }}/lance-qemu/8.2.10/qemu-x86_64
           key: qemu-user-8.2.10-x86_64-linux-user-${{ runner.os }}-${{ runner.arch }}-v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install QEMU build dependencies
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
+          sudo apt update
           sudo apt install -y \
             ninja-build \
             pkg-config \
@@ -485,10 +493,10 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install ${{ matrix.msrv }}
         run: |
           rustup toolchain install ${{ matrix.msrv }}

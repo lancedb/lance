@@ -88,7 +88,8 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             &offsets,
             &mut decompressed_bytes,
             &mut decompressed_offsets,
-        )?;
+        )
+        .map_err(crate::encodings::physical::fsst::map_fsst_error)?;
 
         // TODO: Change PrimitivePageDecoder to use Vec instead of BytesMut
         // since there is no way to get BytesMut from Vec but these copies should be avoidable

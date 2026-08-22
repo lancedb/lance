@@ -4154,6 +4154,18 @@ impl DatasetDelta {
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
     }
+    /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_deleted_row_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_deleted_row_ids())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
 }
 
 #[pyclass(

@@ -193,6 +193,7 @@ pub fn build_compaction_options(
     max_source_fragments: &JObject,            // Optional<Long>
     max_source_rows: &JObject,                 // Optional<Long>
     max_source_bytes: &JObject,                // Optional<Long>
+    excluded_fragment_ids: &JObject,           // List<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -242,6 +243,19 @@ pub fn build_compaction_options(
     if let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)? {
         compaction_options.max_source_bytes = Some(max_source_bytes_val as u64);
     }
+    compaction_options.excluded_fragment_ids = env
+        .get_longs(excluded_fragment_ids)?
+        .into_iter()
+        .map(|fragment_id| {
+            u32::try_from(fragment_id).map_err(|_| {
+                Error::input_error(format!(
+                    "excluded_fragment_ids must contain values between 0 and {}, got {}",
+                    u32::MAX,
+                    fragment_id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(compaction_options)
 }
