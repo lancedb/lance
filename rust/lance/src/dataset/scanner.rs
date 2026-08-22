@@ -7936,6 +7936,19 @@ mod test {
                 .to_vec()
         };
 
+        // Row counts alone cannot tell a pushed limit from a full scan that happens to
+        // return the right rows, so assert on the plan too. Both index exec nodes render
+        // the pushed limit, and exactly one of them runs depending on storage version.
+        let plan_for = |dataset: Arc<Dataset>, ordered: bool, offset: Option<i64>| async move {
+            let mut scan = dataset.scan();
+            scan.filter("id >= 5")
+                .unwrap()
+                .scan_in_order(ordered)
+                .limit(Some(limit), offset)
+                .unwrap();
+            scan.explain_plan(true).await.unwrap()
+        };
+
         // Ordered scan (the default): limit not pushed, so the first matches are the largest ids
         // (descending storage).
         let ids = scan_ids(Arc::new(dataset.clone()), true, None).await;
@@ -7945,6 +7958,11 @@ mod test {
             "ordered scan must return the storage-order subset, got {:?}",
             &ids[..ids.len().min(5)]
         );
+        let ordered_plan = plan_for(Arc::new(dataset.clone()), true, None).await;
+        assert!(
+            !ordered_plan.contains("limit="),
+            "an ordered scan must not push a limit into the index, plan was:\n{ordered_plan}"
+        );
 
         // Unordered scan: limit pushed into the index, but still exactly `limit` matching rows.
         let ids = scan_ids(Arc::new(dataset.clone()), false, None).await;
@@ -7952,6 +7970,11 @@ mod test {
         assert!(
             ids.iter().all(|&id| id >= 5),
             "every returned row must satisfy the filter"
+        );
+        let unordered_plan = plan_for(Arc::new(dataset.clone()), false, None).await;
+        assert!(
+            unordered_plan.contains("limit=100"),
+            "an unordered scan must push limit=100 into the index, plan was:\n{unordered_plan}"
         );
 
         // With an offset the pushed limit must cover `limit + offset` rows, otherwise the
@@ -7963,15 +7986,25 @@ mod test {
             "offset must not reduce the returned row count"
         );
         assert!(ids.iter().all(|&id| id >= 5));
+        let offset_plan = plan_for(Arc::new(dataset.clone()), false, Some(50)).await;
+        assert!(
+            offset_plan.contains("limit=150"),
+            "an offset of 50 must widen the pushed limit to 150, plan was:\n{offset_plan}"
+        );
 
         // With deletions the limit must not be pushed even when unordered, since deleted rows are
         // pruned after the index search.
         dataset.delete("id >= 5 AND id < 10000").await.unwrap();
-        let ids = scan_ids(Arc::new(dataset), false, None).await;
+        let ids = scan_ids(Arc::new(dataset.clone()), false, None).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= 10000),
             "deleted rows must not be returned"
+        );
+        let deleted_plan = plan_for(Arc::new(dataset), false, None).await;
+        assert!(
+            !deleted_plan.contains("limit="),
+            "deletions must suppress the pushdown, plan was:\n{deleted_plan}"
         );
     }
 

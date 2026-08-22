@@ -156,7 +156,14 @@ impl ScalarIndex for LogicalScalarIndex {
     ) -> Result<SearchResult> {
         // Any limit in `options` is forwarded to every segment unchanged. That is safe
         // because each segment independently returns at least `limit` matches, so their
-        // combination does too; `combine_search_results` keeps the result `AtLeast`.
+        // combination does too, and `combine_search_results` keeps the result `AtLeast`.
+        //
+        // A shared budget, decremented by matches already confirmed so later segments read
+        // less, would cut total reads. It is not used here because it forces the segments
+        // to be searched one after another, and the parallel fan out below is what keeps
+        // latency flat as segment count grows. Trading that for fewer reads is a real
+        // tradeoff rather than a clear win, so it is left to a follow up that can measure
+        // both sides on a many segment index.
         let results = try_join_all(
             self.segments
                 .iter()

@@ -271,7 +271,7 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
 ///
 /// Setup: one fragment of 8192 rows (two `DEFAULT_BTREE_BATCH_SIZE` pages) where `age` == `id`,
 /// so index order matches storage order. Overlays push the first 4000 rows above the
-/// predicate, leaving only 96 live matches in page 0 -- fewer than the limit of 200.
+/// predicate, leaving only 96 live matches in page 0, fewer than the limit of 200.
 #[tokio::test]
 async fn test_overlay_block_does_not_short_limited_index_scan() {
     const PAGE: i32 = 4096;
@@ -305,7 +305,7 @@ async fn test_overlay_block_does_not_short_limited_index_scan() {
     .unwrap();
     build_age_index(&mut dataset).await;
 
-    // Push the first STALE rows -- the lowest index-order matches -- above the predicate so
+    // Push the first STALE rows, the lowest index-order matches, above the predicate so
     // they stop matching. Page 0 keeps only PAGE - STALE = 96 live matches.
     let dataset = commit_overlay(
         dataset,

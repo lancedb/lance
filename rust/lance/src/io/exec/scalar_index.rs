@@ -132,10 +132,20 @@ impl DisplayAs for ScalarIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ScalarIndexQuery: query={}", self.expr)
+                write!(f, "ScalarIndexQuery: query={}", self.expr)?;
+                // Surfacing the pushed limit keeps the early-stop visible in EXPLAIN, which
+                // is otherwise invisible to both users and tests.
+                if let Some(limit) = self.limit {
+                    write!(f, ", limit={}", limit)?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "ScalarIndexQuery\nquery={}", self.expr)
+                write!(f, "ScalarIndexQuery\nquery={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, "\nlimit={}", limit)?;
+                }
+                Ok(())
             }
         }
     }
@@ -733,10 +743,18 @@ impl DisplayAs for MaterializeIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MaterializeIndex: query={}", self.expr)
+                write!(f, "MaterializeIndex: query={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, ", limit={}", limit)?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MaterializeIndex\nquery={}", self.expr)
+                write!(f, "MaterializeIndex\nquery={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, "\nlimit={}", limit)?;
+                }
+                Ok(())
             }
         }
     }

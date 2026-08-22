@@ -2012,7 +2012,7 @@ impl ScalarIndexExpr {
     /// Like [`Self::evaluate`] but pushes a best-effort `limit` into the index search so
     /// it can stop once it has found at least `limit` matches.
     ///
-    /// The limit reaches only a top-level positive lookup; it is dropped at any `Not`,
+    /// The limit reaches only a top-level positive lookup. It is dropped at any `Not`,
     /// `And`, or `Or` node, because a partial match set cannot be complemented,
     /// intersected, or unioned soundly. A limited search reports
     /// [`SearchResult::AtLeast`], so callers must still enforce the exact limit

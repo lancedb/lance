@@ -512,7 +512,7 @@ pub struct SearchOptions {
     ///
     /// An index may stop once it has `n` matches and may still return more, so
     /// this narrows work without narrowing the contract. It applies only to
-    /// positive lookups that preserve matches -- equality, range, `IsIn`.
+    /// positive lookups that preserve matches, such as equality, range, and `IsIn`.
     /// Negating and combining operators ignore it, because a partial match set
     /// cannot be complemented or intersected soundly.
     ///

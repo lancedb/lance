@@ -2248,7 +2248,7 @@ impl ScalarIndex for BTreeIndex {
         // Collect both matching row IDs and null row IDs from all pages.
         //
         // With a limit, read one page at a time and stop as soon as enough TRUE matches
-        // have been seen; fanning out would defeat the point by doing the work anyway.
+        // have been seen. Fanning out would defeat the point by doing the work anyway.
         // Without one, fan out across CPUs as usual.
         let parallelism = if options.limit().is_some() {
             1
@@ -2260,7 +2260,7 @@ impl ScalarIndex for BTreeIndex {
         let mut matches_found: u64 = 0;
         while let Some(page_result) = page_stream.try_next().await? {
             if let Some(limit) = options.limit() {
-                // Count only TRUE matches toward the limit; `len()` already excludes nulls.
+                // Count only TRUE matches toward the limit. `len()` already excludes nulls.
                 matches_found += page_result.len().unwrap_or(0);
                 results.push(page_result);
                 if matches_found >= limit as u64 {
@@ -2287,7 +2287,7 @@ impl ScalarIndex for BTreeIndex {
         // A limited search may stop before reading every matching page, so the returned set
         // is a lower bound rather than the complete match set. Reporting `Exact` would let a
         // downstream consumer treat a partial set as complete, so report `AtLeast` whenever a
-        // limit was in play -- even if this particular scan happened to read every page,
+        // limit was in play, even if this particular scan happened to read every page,
         // since the caller cannot tell the difference and must not rely on it.
         Ok(if options.limit().is_some() {
             SearchResult::AtLeast(selection)
