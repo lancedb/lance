@@ -462,6 +462,14 @@ pub trait DatasetIndexExt {
     /// The handle is first advanced to the latest version, so the handle that
     /// planned the round commits it safely and sees every mutation of the
     /// fan-out window rather than only those its own snapshot happened to know.
+    /// The same exact-source check runs again during commit conflict
+    /// resolution against the manifest each attempt actually publishes onto,
+    /// so a mutation landing while the commit is in flight fails it too.
+    ///
+    /// Worker reports are input from outside the trust boundary. Every output
+    /// id in the round must be globally fresh, and each reported file is
+    /// verified against the object store, by path, size, and the Lance file
+    /// magic, before its metadata replaces readable sources.
     ///
     /// `results` may cover a subset of the plan's tasks. Tasks are disjoint by
     /// construction, so a round survives a failed worker: the merges that

@@ -4821,7 +4821,11 @@ class LanceDataset(pa.dataset.Dataset):
         segments would republish stale entries: the commit raises and the
         caller re-plans. Validation runs against the latest dataset version,
         so the handle that planned the round commits it safely and sees every
-        mutation committed during the fan-out.
+        mutation committed during the fan-out, and the same source check runs
+        again during commit conflict resolution so a mutation landing while
+        the commit is in flight fails it too. Every output id must be fresh
+        and every reported file is verified against the object store before
+        its metadata replaces readable sources.
 
         ``results`` may cover a subset of the plan's tasks. Tasks are disjoint,
         so a round survives a failed worker: what succeeded is published and

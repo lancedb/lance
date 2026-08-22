@@ -1986,6 +1986,42 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
+            // An exact-source commit is a compare-and-swap on its removal set, and
+            // this is the last point that sees the manifest the current attempt will
+            // publish onto. The per-operation checks above cannot express it: a
+            // rebased `Merge` carries no baseline to prove an indexed column was
+            // rewritten in place, so it is classified compatible and would carry
+            // stale coverage through. Re-proving every removed source here, on every
+            // attempt, closes that window. Prune-and-proceed behavior for ordinary
+            // `CreateIndex` commits is unchanged.
+            let exact_source_cas = self
+                .transaction
+                .transaction_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(crate::index::segment_merge::EXACT_SOURCE_CAS_PROPERTY)
+                });
+            if exact_source_cas {
+                let live = dataset.load_indices().await?;
+                for removed in removed_indices.iter() {
+                    let current = live.iter().find(|segment| segment.uuid == removed.uuid);
+                    let unchanged = current.is_some_and(|segment| {
+                        segment.fragment_bitmap == removed.fragment_bitmap
+                            && segment.dataset_version == removed.dataset_version
+                            && segment.base_id == removed.base_id
+                    });
+                    if !unchanged {
+                        return Err(Error::invalid_input(format!(
+                            "commit_index_merge_results: source segment {} of index '{}' \
+                             changed while the commit was in flight; a concurrent commit \
+                             replaced or pruned it, so this merge would republish stale \
+                             entries. Re-plan the merge.",
+                            removed.uuid, removed.name
+                        )));
+                    }
+                }
+            }
+
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()

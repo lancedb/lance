@@ -51,6 +51,17 @@ use crate::{Error, Result};
 /// rather than merging against fields it cannot interpret.
 pub const INDEX_MERGE_CONTRACT_VERSION: u32 = 1;
 
+/// Transaction property marking a `CreateIndex` commit whose `removed_indices`
+/// are an exact compare-and-swap source set.
+///
+/// The commit validates its sources against the manifest it can see, but the
+/// manifest write races every other writer. A transaction carrying this
+/// property is re-validated by the conflict resolver's finish step against the
+/// manifest actually being published onto, and fails asking for a re-plan when
+/// any source moved. Without the property a `CreateIndex` keeps its historical
+/// prune-and-proceed behavior.
+pub(crate) const EXACT_SOURCE_CAS_PROPERTY: &str = "lance.index.merge.exact_source_cas";
+
 /// Identity of the index model every segment in one merge must share.
 ///
 /// Derived from [`IndexMetadata`] alone, so a coordinator builds it from the
@@ -410,8 +421,88 @@ impl IndexMergeResult {
                 self.task_id, self.output.index_type_url, plan.fingerprint.index_type_url
             )));
         }
+        // The merge stamps its output with the oldest source's dataset version, so
+        // staleness validation treats the merged coverage as no fresher than its
+        // oldest input. A report claiming anything else misdescribes the segment.
+        let expected_dataset_version = task
+            .sources
+            .iter()
+            .map(|source| source.dataset_version)
+            .min()
+            .unwrap_or(plan.read_version);
+        if self.output.dataset_version != expected_dataset_version {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} claims dataset version {} for its output \
+                 but its oldest source was built at version {}",
+                self.task_id, self.output.dataset_version, expected_dataset_version
+            )));
+        }
+        if self.output.index_version != plan.fingerprint.index_version {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} produced index format version {} but the \
+                 plan pinned version {}",
+                self.task_id, self.output.index_version, plan.fingerprint.index_version
+            )));
+        }
+        if self.output.files.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} reports no files for output {}; a merged \
+                 segment without files is not readable",
+                self.task_id, self.output.uuid
+            )));
+        }
+        // A fresh merge output can never reuse a planned id. Publishing a segment
+        // under a source's id makes the manifest drop that source everywhere it
+        // appears, even in a task this round never touched.
+        if plan.source_frontier.contains(&self.output.uuid)
+            || plan
+                .tasks
+                .iter()
+                .flat_map(|task| task.sources.iter())
+                .any(|source| source.uuid == self.output.uuid)
+        {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} names output {} which is already a \
+                 source segment of the plan; merge outputs must use fresh ids",
+                self.task_id, self.output.uuid
+            )));
+        }
         Ok(())
     }
+}
+
+/// Reject output ids that could alias another segment.
+///
+/// Manifest construction removes every existing entry whose id appears in the
+/// new segments, independently of the removal list, and cleanup deletes the
+/// directories of losing attempts by id. An output id equal to a live segment,
+/// a planned source, or another attempt's output therefore either drops
+/// coverage silently or deletes files the commit just published. Every id in
+/// the round, winner or loser, must be globally fresh.
+pub(crate) fn check_output_identity(
+    winners: &[IndexMergeResult],
+    orphaned: &[IndexMergeResult],
+    live_segment_ids: &HashSet<Uuid>,
+) -> Result<()> {
+    let mut seen: HashSet<Uuid> = HashSet::with_capacity(winners.len() + orphaned.len());
+    for result in winners.iter().chain(orphaned) {
+        if !seen.insert(result.output.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index merge results name output {} more than once across attempts; \
+                 conflicting reports cannot be reconciled, resubmit the genuine ones",
+                result.output.uuid
+            )));
+        }
+        if live_segment_ids.contains(&result.output.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} names output {} which is already a \
+                 committed segment; merge outputs must use fresh ids, so this round was \
+                 either already committed or the report is forged. Re-plan the merge.",
+                result.task_id, result.output.uuid
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Sorted fragment ids of a coverage bitmap, empty when coverage is unknown.
@@ -560,6 +651,37 @@ mod tests {
         let err = check_disjoint_outputs(&[first, second]).unwrap_err();
         assert!(
             err.to_string().contains("overlap on fragment 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Output ids must be globally fresh: reusing another attempt's id would
+    /// make cleanup delete a published segment, and reusing a live segment's id
+    /// would make the manifest drop that segment.
+    #[test]
+    fn test_check_output_identity() {
+        let live = [uuid(50)].into_iter().collect::<HashSet<_>>();
+        check_output_identity(
+            &[result(0, uuid(1), uuid(10))],
+            &[result(1, uuid(2), uuid(20))],
+            &live,
+        )
+        .unwrap();
+
+        let err = check_output_identity(
+            &[result(0, uuid(1), uuid(10))],
+            &[result(0, uuid(2), uuid(10))],
+            &live,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("more than once across attempts"),
+            "unexpected error: {err}"
+        );
+
+        let err = check_output_identity(&[result(0, uuid(1), uuid(50))], &[], &live).unwrap_err();
+        assert!(
+            err.to_string().contains("already a committed segment"),
             "unexpected error: {err}"
         );
     }
