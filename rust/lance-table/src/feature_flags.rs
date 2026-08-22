@@ -30,8 +30,36 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
+/// Some index declares covering columns: `IndexMetadata.covering_fields` names
+/// columns the index carries values for but is not keyed on.
+///
+/// Covering makes `fields` mean "keyed columns followed by carried columns"
+/// rather than "the columns this index is searched on". A reader without this
+/// bit still selects a vector index by testing membership of `fields`, so it
+/// would answer a query on a merely-carried column with an index keyed on a
+/// different column and return wrong neighbours with no error. A writer without
+/// it would maintain the index as though every entry of `fields` were keyed.
+/// Both must refuse the table.
+///
+/// This takes the bit reclaimed from the retired MemWAL index-catchup flag
+/// (<https://github.com/lance-format/lance/pull/8680>), which is the boundary the
+/// current released build treats as unknown -- so that build refuses a covering
+/// dataset without needing a change of its own. Builds from the window where the
+/// bit was allocated to index catch-up (v11.0.0-beta.4 through beta.17) still
+/// count it as supported and will open a covering dataset rather than refuse it;
+/// that exposure comes with the reclamation and is inherited by whichever flag
+/// takes the bit.
+pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 128;
+pub const FLAG_UNKNOWN: u64 = 256;
+
+// The highest flag allocated must stay below the unknown boundary, or
+// `supported_flags` would refuse a bit this code claims to understand. The next
+// flag takes 256, so it has to move the boundary to 512 with it.
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
+// The fence needs a bit the current released build already refuses, which means
+// at or above the boundary that build shipped with (128).
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -43,6 +71,14 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
+    // Carried across the reset: a `Manifest` only points at its index section,
+    // so whether any index declares covering columns is not visible here. `build_manifest` decides it from the index list it is
+    // committing and sets the bit after calling this; without the carry the
+    // second call, from `write_manifest_file`, would clear that decision
+    // immediately before the write.
+    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_COVERED_INDEX_METADATA;
+
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -100,6 +136,10 @@ pub fn apply_feature_flags(
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
+
+    manifest.reader_feature_flags |= covered_index_metadata;
+    manifest.writer_feature_flags |= covered_index_metadata;
+
     Ok(())
 }
 
@@ -149,6 +189,26 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The covering fence only works if the bit is one the current released
+    /// build already rejects. That build's unknown boundary is 128, so the bit
+    /// has to be 128 and this build has to have moved its own boundary past it
+    /// -- otherwise either that build accepts a covering dataset, or we refuse
+    /// our own.
+    #[test]
+    fn test_covered_index_metadata_fences_older_builds_only() {
+        assert_eq!(
+            FLAG_COVERED_INDEX_METADATA, 128,
+            "the fence must sit on the boundary the released build shipped with"
+        );
+        assert!(
+            can_read_dataset(FLAG_COVERED_INDEX_METADATA),
+            "this build implements covering, so it must accept its own datasets"
+        );
+        assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
+        // A build whose boundary is still 128 refuses the bit, which is the fence;
+        // the module-level `const _` assertion keeps it at or above that boundary.
+    }
+
     use super::*;
     use crate::format::BasePath;
 

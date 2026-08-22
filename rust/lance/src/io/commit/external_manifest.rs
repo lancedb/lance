@@ -14,10 +14,11 @@ mod test {
     use futures::stream::BoxStream;
     use futures::{StreamExt, TryStreamExt, future::join_all};
     use lance_core::{Error, Result};
+    use lance_io::object_store::ObjectStore;
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
     };
-    use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
+    use lance_table::io::commit::{CommitHandler, ManifestLocation, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::memory::InMemory;
     use object_store::{
@@ -125,6 +126,79 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct StaticExternalManifestStore {
+        location: ManifestLocation,
+        verify_store: Option<Arc<dyn OSObjectStore>>,
+    }
+
+    #[async_trait]
+    impl ExternalManifestStore for StaticExternalManifestStore {
+        async fn get(&self, _uri: &str, version: u64) -> Result<String> {
+            if version == self.location.version {
+                Ok(self.location.path.to_string())
+            } else {
+                Err(Error::not_found(format!("version {}", version)))
+            }
+        }
+
+        async fn get_manifest_location(
+            &self,
+            _base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            if version == self.location.version {
+                Ok(self.location.clone())
+            } else {
+                Err(Error::not_found(format!("version {}", version)))
+            }
+        }
+
+        async fn get_latest_version(&self, _uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(Some((
+                self.location.version,
+                self.location.path.to_string(),
+            )))
+        }
+
+        async fn get_latest_manifest_location(
+            &self,
+            _base_uri: &str,
+        ) -> Result<Option<ManifestLocation>> {
+            Ok(Some(self.location.clone()))
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            _uri: &str,
+            _version: u64,
+            _path: &str,
+            _size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            _uri: &str,
+            _version: u64,
+            path: &str,
+            size: u64,
+            e_tag: Option<String>,
+        ) -> Result<()> {
+            if let Some(store) = &self.verify_store {
+                let final_meta = store.head(&Path::from(path)).await?;
+                assert_eq!(size, final_meta.size);
+                assert_eq!(
+                    e_tag, None,
+                    "the generic workflow must not persist a physical generation"
+                );
+            }
+            Ok(())
+        }
+    }
+
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
             commit_handler: Some(handler),
@@ -137,6 +211,252 @@ mod test {
             commit_handler: Some(handler),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn finalized_external_manifest_location_is_head_checked() {
+        let sleepy_store = SleepyExternalManifestStore::new();
+        let inner_store = sleepy_store.store.clone();
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(sleepy_store),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 7;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let body = b"manifest body";
+
+        object_store
+            .inner
+            .put(&final_path, PutPayload::from_static(body))
+            .await
+            .expect("seed finalized manifest");
+        inner_store
+            .lock()
+            .await
+            .insert((base_path.to_string(), version), final_path.to_string());
+
+        let location = handler
+            .resolve_latest_location(&base_path, &object_store)
+            .await
+            .expect("resolve latest finalized manifest");
+
+        assert_eq!(location.path, final_path);
+        assert_eq!(location.size, Some(body.len() as u64));
+        assert_eq!(location.naming_scheme, ManifestNamingScheme::V2);
+    }
+
+    #[tokio::test]
+    async fn finalized_external_manifest_location_falls_back_to_v1() {
+        let sleepy_store = SleepyExternalManifestStore::new();
+        let inner_store = sleepy_store.store.clone();
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(sleepy_store),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 7;
+        let missing_v2_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let v1_path = ManifestNamingScheme::V1.manifest_path(&base_path, version);
+
+        object_store
+            .inner
+            .put(&v1_path, PutPayload::from_static(b"v1 manifest body"))
+            .await
+            .expect("seed V1 manifest");
+        inner_store.lock().await.insert(
+            (base_path.to_string(), version),
+            missing_v2_path.to_string(),
+        );
+
+        let latest_location = handler
+            .resolve_latest_location(&base_path, &object_store)
+            .await
+            .expect("resolve latest should fall back to V1");
+        assert_eq!(latest_location.path, v1_path);
+        assert_eq!(latest_location.naming_scheme, ManifestNamingScheme::V1);
+
+        let version_location = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("resolve version should fall back to V1");
+        assert_eq!(version_location.path, v1_path);
+        assert_eq!(version_location.naming_scheme, ManifestNamingScheme::V1);
+    }
+
+    #[tokio::test]
+    async fn finalized_external_manifest_location_rejects_size_mismatch() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 7;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let body = b"manifest body";
+
+        object_store
+            .inner
+            .put(&final_path, PutPayload::from_static(body))
+            .await
+            .expect("seed finalized manifest");
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(StaticExternalManifestStore {
+                location: ManifestLocation {
+                    version,
+                    path: final_path,
+                    size: Some(body.len() as u64 + 1),
+                    naming_scheme: ManifestNamingScheme::V2,
+                    e_tag: None,
+                },
+                verify_store: None,
+            }),
+        };
+
+        let err = handler
+            .resolve_latest_location(&base_path, &object_store)
+            .await
+            .expect_err("stale external manifest size should be rejected");
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("Manifest size mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn finalized_external_manifest_location_without_stored_etag_uses_current_etag() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 7;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let body = b"manifest body";
+
+        object_store
+            .inner
+            .put(&final_path, PutPayload::from_static(body))
+            .await
+            .expect("seed finalized manifest");
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(StaticExternalManifestStore {
+                location: ManifestLocation {
+                    version,
+                    path: final_path,
+                    size: Some(body.len() as u64),
+                    naming_scheme: ManifestNamingScheme::V2,
+                    e_tag: None,
+                },
+                verify_store: None,
+            }),
+        };
+
+        let resolved = handler
+            .resolve_latest_location(&base_path, &object_store)
+            .await
+            .expect("the canonical manifest should resolve from object storage");
+        let current_meta = object_store
+            .inner
+            .head(&resolved.path)
+            .await
+            .expect("read current object-store metadata");
+        assert_eq!(resolved.e_tag, current_meta.e_tag);
+    }
+
+    #[tokio::test]
+    async fn external_manifest_store_put_returns_destination_etag() {
+        let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let base_path = Path::from("repro");
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        object_store
+            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .await
+            .expect("seed staging manifest");
+        let staging_meta = object_store
+            .head(&staging_path)
+            .await
+            .expect("read staging metadata");
+
+        let external_store = StaticExternalManifestStore {
+            location: ManifestLocation {
+                version: 1,
+                path: staging_path.clone(),
+                size: Some(staging_meta.size),
+                naming_scheme: ManifestNamingScheme::V2,
+                e_tag: staging_meta.e_tag.clone(),
+            },
+            verify_store: Some(object_store.clone()),
+        };
+        let location = external_store
+            .put(
+                &base_path,
+                1,
+                &staging_path,
+                staging_meta.size,
+                staging_meta.e_tag.clone(),
+                object_store.as_ref(),
+                ManifestNamingScheme::V2,
+            )
+            .await
+            .expect("finalize manifest");
+        let final_meta = object_store
+            .head(&location.path)
+            .await
+            .expect("read finalized metadata");
+
+        assert_ne!(
+            staging_meta.e_tag, final_meta.e_tag,
+            "test store must assign a new ETag to the copied object"
+        );
+        assert_eq!(location.size, Some(final_meta.size));
+        assert_eq!(
+            location.e_tag, final_meta.e_tag,
+            "the caller must receive the finalized physical generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_manifest_handler_finalize_returns_destination_etag() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 1;
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        object_store
+            .inner
+            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .await
+            .expect("seed staging manifest");
+        let staging_meta = object_store
+            .inner
+            .head(&staging_path)
+            .await
+            .expect("read staging metadata");
+
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(StaticExternalManifestStore {
+                location: ManifestLocation {
+                    version,
+                    path: staging_path,
+                    size: Some(staging_meta.size),
+                    naming_scheme: ManifestNamingScheme::V2,
+                    e_tag: staging_meta.e_tag.clone(),
+                },
+                verify_store: Some(object_store.inner.clone()),
+            }),
+        };
+
+        let location = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("finalize manifest");
+        let final_meta = object_store
+            .inner
+            .head(&location.path)
+            .await
+            .expect("read finalized metadata");
+
+        assert_ne!(
+            staging_meta.e_tag, final_meta.e_tag,
+            "test store must assign a new ETag to the copied object"
+        );
+        assert_eq!(location.size, Some(final_meta.size));
+        assert_eq!(
+            location.e_tag, final_meta.e_tag,
+            "the caller must receive the finalized physical generation"
+        );
     }
 
     #[tokio::test]
@@ -592,10 +912,8 @@ mod test {
     /// our `CopyCapStore` wrapper rejects with the same `EntityTooLarge`
     /// error S3 returns in production.
     ///
-    /// Today this test is RED: the copy step fails on >5 GB.
-    /// After `copy_size_aware` lands, it should turn GREEN by falling back
-    /// to a multipart-equivalent path (option 1: read+rewrite via
-    /// `ObjectWriter`).
+    /// The regression verifies that `copy_size_aware` falls back to the
+    /// multipart-equivalent read+rewrite path instead of calling CopyObject.
     #[tokio::test]
     async fn manifest_commit_succeeds_when_staging_exceeds_5gb_copy_cap() {
         let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
@@ -618,6 +936,12 @@ mod test {
         // path the failing CTAS hits via ExternalManifestCommitHandler).
         let external = SleepyExternalManifestStore::new();
         let head_meta = capped.head(&staging_path).await.unwrap();
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
+        // The fixture stores only a tiny body, so its source-size override must
+        // also apply to the destination metadata. This keeps the fake object
+        // store internally consistent with the real 14 GB object it models
+        // when finalization verifies that the copy preserved size.
+        capped.override_size(&final_path, head_meta.size).await;
 
         let location = external
             .put(

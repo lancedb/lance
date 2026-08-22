@@ -68,7 +68,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
@@ -88,6 +88,15 @@ const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
 const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
 /// LabelList index on the base_objects column for view dependencies
 const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
+/// Value field of the base_objects index, whose nested `List` type would
+/// otherwise allocate an inner field per use.
+static BASE_OBJECTS_VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| {
+    Field::new(
+        VALUE_COLUMN_NAME,
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        true,
+    )
+});
 // Each retry reloads and rewrites the full manifest. Match the regular Lance
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
@@ -1184,11 +1193,7 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ));
+        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
@@ -1274,6 +1279,7 @@ impl ManifestNamespace {
         Ok(IndexMetadata {
             uuid: trained_index.uuid,
             fields: vec![lance_schema.field_id(trained_index.column_name)?],
+            covering_fields: vec![],
             name: trained_index.index_name.to_string(),
             dataset_version,
             fragment_bitmap: Some(fragment_bitmap.clone()),
@@ -1376,11 +1382,7 @@ impl ManifestNamespace {
                 index_name: BASE_OBJECTS_INDEX_NAME,
                 column_name: "base_objects",
                 params: ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList),
-                field: Field::new(
-                    VALUE_COLUMN_NAME,
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                    true,
-                ),
+                field: BASE_OBJECTS_VALUE_FIELD.clone(),
                 stream: Self::base_objects_index_stream(base_objects_values, base_objects_row_ids),
             },
             &fragment_bitmap,
@@ -3490,30 +3492,26 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
+        // Atomically create the .lance-reserved file to mark the table as declared.
+        // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
+        // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
-
-        self.object_store
-            .create(&reserved_file_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
+        super::put_marker_file_atomic(
+            &self.object_store,
+            &reserved_file_path,
+            &format!("table {}", table_name),
+        )
+        .await
+        .map_err(|e| match e {
+            super::MarkerFileError::AlreadyExists { .. } => {
+                lance_core::Error::from(NamespaceError::TableAlreadyExists {
+                    message: table_name.to_string(),
                 })
-            })?
-            .shutdown()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to finalize .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
-                })
-            })?;
+            }
+            super::MarkerFileError::Other { message } => {
+                lance_core::Error::from(NamespaceError::Internal { message })
+            }
+        })?;
 
         let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
 

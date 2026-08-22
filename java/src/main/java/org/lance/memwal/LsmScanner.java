@@ -31,8 +31,8 @@ import java.util.Optional;
  * LSM-aware scanner covering all MemWAL data levels.
  *
  * <p>Results are deduplicated by primary key, always returning the newest version of each row
- * across the base table, flushed MemTables, and (when created from a {@link ShardWriter}) the
- * active MemTable.
+ * across the base table, SSTables, and (when created from a {@link ShardWriter}) the active
+ * MemTable.
  *
  * <p>The builder methods ({@link #project}, {@link #filter}, {@link #limit}, {@link
  * #withRowAddress}, {@link #withMemtableGen}) mutate this scanner and return it for chaining.
@@ -55,7 +55,7 @@ public class LsmScanner implements Closeable {
    * read-your-writes consistency.
    *
    * @param dataset the base dataset to scan
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @return an LSM scanner
    */
   public static LsmScanner fromSnapshots(Dataset dataset, List<ShardSnapshot> shardSnapshots) {

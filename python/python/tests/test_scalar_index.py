@@ -7,9 +7,12 @@ import random
 import re
 import shutil
 import string
+import subprocess
+import sys
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -21,6 +24,8 @@ from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    DocumentGranularity,
+    FullTextOperator,
     MatchQuery,
     MultiMatchQuery,
     Occur,
@@ -624,13 +629,13 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     plan = make_vec_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_vec_search(ds).to_table().num_rows == 6
 
     plan = make_fts_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_fts_search(ds).to_table().num_rows == 6
 
     # Add new data (including 6 more results)
@@ -692,24 +697,87 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
-def test_fixed_size_binary(tmp_path):
-    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+@pytest.mark.parametrize(
+    "index_type, data_type, values, filter_expr",
+    [
+        pytest.param(
+            "BTREE",
+            pa.uuid(),
+            [b"0123012301230123", b"2345234523452345"],
+            (
+                "value = arrow_cast(0x32333435323334353233343532333435, "
+                "'FixedSizeBinary(16)')"
+            ),
+            id="btree-fixed-size-binary",
+        ),
+        *[
+            pytest.param(
+                index_type,
+                data_type,
+                values,
+                filter_expr,
+                id=f"{index_type.lower()}-{type_name}",
+            )
+            for type_name, data_type, values, filter_expr in [
+                (
+                    "large-string",
+                    pa.large_string(),
+                    ["alpha", "beta", "gamma"],
+                    "value = 'beta'",
+                ),
+                (
+                    "binary",
+                    pa.binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'Binary')",
+                ),
+                (
+                    "large-binary",
+                    pa.large_binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'LargeBinary')",
+                ),
+                (
+                    "decimal128",
+                    pa.decimal128(10, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal128(10, 2)')",
+                ),
+                (
+                    "decimal256",
+                    pa.decimal256(76, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal256(76, 2)')",
+                ),
+                (
+                    "duration",
+                    pa.duration("ms"),
+                    [1, 2, 3],
+                    "value = arrow_cast(2, 'Duration(Millisecond)')",
+                ),
+            ]
+            for index_type in ["BTREE", "BITMAP", "ZONEMAP"]
+        ],
+    ],
+)
+def test_scalar_index_types(tmp_path, index_type, data_type, values, filter_expr):
+    values = pa.array(values, type=data_type)
+    ds = lance.write_dataset(pa.table({"value": values}), tmp_path)
 
-    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+    ds.create_scalar_index("value", index_type)
 
-    ds.create_scalar_index("uuid", "BTREE")
+    scanner = ds.scanner(filter=filter_expr)
+    assert "ScalarIndexQuery" in scanner.explain_plan()
+    assert scanner.to_table()["value"].to_pylist() == values.slice(1, 1).to_pylist()
 
-    query = (
-        "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
+    fragment_id = ds.get_fragments()[0].fragment_id
+    segment = ds.create_index_uncommitted(
+        column="value",
+        index_type=index_type,
+        name=f"{index_type.lower()}_segment_idx",
+        fragment_ids=[fragment_id],
     )
-    assert (
-        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
-        in ds.scanner(filter=query).explain_plan()
-    )
-
-    table = ds.scanner(filter=query).to_table()
-    assert table.num_rows == 1
-    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
+    assert segment.fragment_ids == {fragment_id}
 
 
 def test_index_take_batch_size(tmp_path):
@@ -804,6 +872,341 @@ def test_full_text_search(dataset, with_position, base_tokenizer):
         dataset.to_table(
             with_row_id=True, full_text_query=query, include_deleted_rows=True
         )
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path, block_size):
+    table = pa.table({"code": ["GetUserName", "GetUserEmail", "user"]})
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        block_size=block_size,
+    )
+    assert ds.describe_indices()[0].segments[0].index_version == 3
+
+    results = ds.to_table(
+        columns=["code"],
+        full_text_query=MatchQuery("user", "code"),
+    )
+    assert results["code"].to_pylist() == ["user"]
+
+    stats = ds.stats.index_stats("code_idx")["indices"][0]
+    params = stats["params"]
+    assert "analyzer" not in params
+    assert params["base_tokenizer"] == "code"
+    assert params["split_identifiers"] is False
+
+
+def test_code_analyzer_full_text_search_with_identifier_splitting(tmp_path):
+    table = pa.table(
+        {
+            "code": [
+                "getUserName",
+                "set_user_name",
+                "user-name",
+                "username",
+                "other",
+            ]
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        split_identifiers=True,
+    )
+
+    results = ds.to_table(
+        columns=["code"],
+        full_text_query=MatchQuery("user", "code"),
+    )
+    assert set(results["code"].to_pylist()) == {
+        "getUserName",
+        "set_user_name",
+        "user-name",
+    }
+
+    stats = ds.stats.index_stats("code_idx")["indices"][0]
+    params = stats["params"]
+    assert "analyzer" not in params
+    assert params["base_tokenizer"] == "code"
+    assert params["split_identifiers"] is True
+    assert params["split_on_numerics"] is True
+    assert params["preserve_original"] is True
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is False
+
+
+def test_code_analyzer_operator_search_matches_rust_turbofish(tmp_path):
+    table = pa.table(
+        {
+            "path": ["turbofish.rs", "comparison.rs"],
+            "code": ["value.parse::<usize>()", "value.parse<usize>()"],
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        index_operators=True,
+    )
+
+    results = ds.to_table(
+        columns=["path"],
+        full_text_query=MatchQuery("::", "code", operator=FullTextOperator.OR),
+    )
+    assert results["path"].to_pylist() == ["turbofish.rs"]
+
+
+def test_code_analyzer_exact_identifier_survives_grouped_top_k(tmp_path):
+    table = pa.table(
+        {
+            "path": ["split_0.rs", "split_1.rs", "split_2.rs", "exact.rs"],
+            "code": ["get user name", "get user name", "get user name", "getUserName"],
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        split_identifiers=True,
+    )
+
+    results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery(
+            "getUserName", "code", operator=FullTextOperator.AND
+        ),
+        limit=1,
+    ).to_table()
+    assert results["path"].to_pylist() == ["exact.rs"]
+
+
+def test_code_analyzer_flags_require_code_analyzer(tmp_path):
+    table = pa.table({"text": ["getUserName"]})
+    ds = lance.write_dataset(table, tmp_path)
+
+    with pytest.raises(ValueError, match="code analyzer flags require analyzer='code'"):
+        ds.create_scalar_index(
+            "text",
+            index_type="INVERTED",
+            split_identifiers=True,
+        )
+
+
+def test_code_analyzer_requires_fts_v3(tmp_path):
+    table = pa.table({"code": ["getUserName"]})
+    ds = lance.write_dataset(table, tmp_path)
+
+    with pytest.raises(ValueError, match="requires FTS format_version=3"):
+        ds.create_scalar_index(
+            "code",
+            index_type="INVERTED",
+            analyzer="code",
+            format_version=2,
+        )
+
+
+def test_code_analyzer_complex_code_constructs(tmp_path):
+    table = pa.table(
+        {
+            "path": [
+                "edge/trait.rs",
+                "edge/impl.rs",
+                "edge/fn_pointer.rs",
+                "edge/unit_result.rs",
+                "edge/hrtb.rs",
+                "edge/associated.rs",
+                "edge/operators.rs",
+            ],
+            "code": [
+                """
+pub trait EdgeAsyncRepository<'a, T: Send + Sync>
+where
+    T: TryFrom<&'a str, Error = EdgeParseError>,
+{
+    type Output<'b>: Iterator<Item = Result<T, EdgeRepoError>>
+    where
+        Self: 'b;
+
+    async fn fetch_by_key<const N: usize>(
+        &'a self,
+        key: [u8; N],
+    ) -> Result<Self::Output<'a>, EdgeRepoError>;
+}
+""",
+                """
+impl<'a, T, S> EdgeAsyncRepository<'a, T> for EdgeStore<S>
+where
+    T: TryFrom<&'a str, Error = EdgeParseError> + Clone + Send + Sync,
+    S: EdgeBackend<T> + ?Sized,
+{
+    type Output<'b> = std::vec::IntoIter<Result<T, EdgeRepoError>> where Self: 'b;
+
+    async fn fetch_by_key<const N: usize>(
+        &'a self,
+        key: [u8; N],
+    ) -> Result<Self::Output<'a>, EdgeRepoError> {
+        self.backend.fetch::<T, N>(key).await
+    }
+}
+""",
+                """
+pub fn build_edge_handler<T, F>(
+    factory: F,
+) -> impl Fn() -> Result<EdgeHandler<T>, EdgeError>
+where
+    F: FnOnce() -> Result<T, EdgeError> + Send + 'static,
+    T: Default + Send + Sync + 'static,
+{
+    move || factory().map(EdgeHandler::new)
+}
+""",
+                """
+pub fn edge_unit_result_callback() -> Result<()> {
+    Ok(())
+}
+""",
+                """
+pub fn edge_higher_ranked<'a, T>(
+    visitor: impl for<'b> Fn(&'b T) -> Result<&'b str, EdgeVisitError>,
+    value: &'a T,
+) -> Result<&'a str, EdgeVisitError> {
+    visitor(value)
+}
+""",
+                """
+pub fn edge_collect_stream<I, E>(items: I) -> Result<Vec<E::Item>, E::Error>
+where
+    I: IntoIterator<Item = E>,
+    E: EdgeExtract,
+{
+    items.into_iter().map(E::extract).collect()
+}
+""",
+                """
+pub fn edge_operator_arrow() -> Result<EdgeArrow, EdgeError> {
+    let variant = EdgeModule::EdgeVariant;
+    if variant != EdgeModule::Default && EdgeMask::enabled() {
+        return Ok(EdgeArrow::new(variant));
+    }
+    Err(EdgeError::empty())
+}
+""",
+            ],
+        }
+    )
+    table = table.append_column("code_ops", table["code"])
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+    ds.create_scalar_index(
+        "code_ops",
+        index_type="INVERTED",
+        analyzer="code",
+        index_operators=True,
+    )
+
+    ds.insert(
+        pa.table(
+            {
+                "path": ["edge/flat_unindexed.rs"],
+                "code": [
+                    """
+pub async fn edge_flat_generic_return<T, E>() -> Result<T, EdgeFlatError>
+where
+    T: TryFrom<String, Error = E> + Send,
+    E: Into<EdgeFlatError>,
+{
+    T::try_from(String::new()).map_err(Into::into)
+}
+"""
+                ],
+                "code_ops": [
+                    """
+pub async fn edge_flat_operator() -> Result<EdgeFlat, EdgeFlatError> {
+    EdgeFlat::try_new() -> Result<EdgeFlat, EdgeFlatError>
+}
+"""
+                ],
+            }
+        )
+    )
+    ds = lance.dataset(tmp_path)
+
+    def assert_search(column, query, expected_path, operator=FullTextOperator.AND):
+        result = ds.scanner(
+            columns=["path", "_score"],
+            full_text_query=MatchQuery(query, column, operator=operator),
+            limit=50,
+        ).to_table()
+        assert expected_path in result["path"].to_pylist()
+
+    assert_search(
+        "code",
+        "EdgeAsyncRepository fetch_by_key TryFrom EdgeRepoError",
+        "edge/trait.rs",
+    )
+    assert_search(
+        "code",
+        "EdgeStore fetch_by_key const usize where Result",
+        "edge/impl.rs",
+    )
+    assert_search(
+        "code",
+        "build_edge_handler FnOnce Result EdgeHandler",
+        "edge/fn_pointer.rs",
+    )
+    assert_search(
+        "code",
+        "edge_unit_result_callback fn () -> Result",
+        "edge/unit_result.rs",
+    )
+    assert_search(
+        "code",
+        "edge_higher_ranked for Fn EdgeVisitError Result",
+        "edge/hrtb.rs",
+    )
+    assert_search(
+        "code",
+        "edge_collect_stream IntoIterator Item Error Result",
+        "edge/associated.rs",
+    )
+    assert_search(
+        "code",
+        "edge_flat_generic_return TryFrom EdgeFlatError Result",
+        "edge/flat_unindexed.rs",
+    )
+    assert_search(
+        "code_ops",
+        "edge_operator_arrow -> Result",
+        "edge/operators.rs",
+    )
+    assert_search(
+        "code_ops",
+        "EdgeModule :: EdgeVariant !=",
+        "edge/operators.rs",
+    )
+    assert_search(
+        "code_ops",
+        "edge_flat_operator -> Result EdgeFlatError",
+        "edge/flat_unindexed.rs",
+    )
+
+    default_operator_results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery("->", "code", operator=FullTextOperator.OR),
+    ).to_table()
+    operator_results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery("->", "code_ops", operator=FullTextOperator.OR),
+    ).to_table()
+    assert default_operator_results.num_rows == 0
+    assert operator_results.num_rows > 0
 
 
 def test_unindexed_full_text_search_on_empty_index(tmp_path):
@@ -1349,6 +1752,136 @@ def test_fts_on_list(tmp_path):
     ds.insert(data)
     results = ds.to_table(full_text_query="lance")
     assert results.num_rows == 6
+
+
+@pytest.mark.parametrize(
+    "list_type",
+    [
+        pa.list_(pa.string()),
+        pa.list_(pa.large_string()),
+        pa.large_list(pa.string()),
+        pa.large_list(pa.large_string()),
+    ],
+)
+def test_fts_on_list_elements(tmp_path, list_type):
+    data = pa.table(
+        {
+            "id": pa.array([0, 1, 2]),
+            "tags": pa.array(
+                [
+                    ["alpha beta", "gamma alpha", None, "", "delta"],
+                    ["beta", "gamma"],
+                    None,
+                ],
+                type=list_type,
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    def hits(table):
+        return sorted(zip(table["id"].to_pylist(), table["_doc_index"].to_pylist()))
+
+    list_element = DocumentGranularity.LIST_ELEMENT
+    query = MatchQuery("alpha", "tags", document_granularity=list_element)
+    flat = ds.to_table(full_text_query=query)
+    assert hits(flat) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(flat.schema.field("_doc_index").type)
+    assert flat.schema.field("_doc_index").type.value_type == pa.uint32()
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
+
+    ds.create_scalar_index(
+        "tags",
+        "INVERTED",
+        with_position=True,
+        document_granularity=list_element,
+    )
+    ds.create_scalar_index(
+        "tags",
+        IndexConfig(index_type="inverted", parameters={"with_position": True}),
+        document_granularity=list_element,
+    )
+    inferred = ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
+    assert hits(inferred) == [(0, [0]), (0, [1])]
+    with pytest.raises(ValueError, match=r"requested Row.*ListElement"):
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "alpha", "tags", document_granularity=DocumentGranularity.ROW
+            )
+        )
+
+    ds.create_scalar_index("tags", "INVERTED", with_position=True)
+    index_names = {index.name for index in ds.describe_indices()}
+    assert {"tags_idx", "tags_list_element_idx"}.issubset(index_names)
+    row_auto = ds.to_table(full_text_query="alpha")
+    assert row_auto["id"].to_pylist() == [0]
+    assert "_doc_index" not in row_auto.column_names
+    with pytest.raises(ValueError, match=r"ambiguous.*document_granularity"):
+        ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
+    indexed = ds.to_table(full_text_query=query)
+    assert hits(indexed) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(indexed.schema.field("_doc_index").type)
+    assert indexed.schema.field("_doc_index").type.value_type == pa.uint32()
+    filtered = ds.to_table(full_text_query=query, filter="id = 0", prefilter=True)
+    assert hits(filtered) == [(0, [0]), (0, [1])]
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
+
+    phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma", "tags", document_granularity=list_element
+        )
+    )
+    assert phrase.num_rows == 0
+    assert hits(
+        ds.to_table(
+            full_text_query=PhraseQuery(
+                "alpha beta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [0])]
+    row_phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma",
+            "tags",
+            document_granularity=DocumentGranularity.ROW,
+        )
+    )
+    assert sorted(row_phrase["id"].to_pylist()) == [0, 1]
+    assert "_doc_index" not in row_phrase.column_names
+
+    ds.insert(
+        pa.table(
+            {
+                "id": pa.array([3]),
+                "tags": pa.array([["alpha", "alpha again"]], type=list_type),
+            }
+        )
+    )
+    assert hits(ds.to_table(full_text_query=query)) == [
+        (0, [0]),
+        (0, [1]),
+        (3, [0]),
+        (3, [1]),
+    ]
+
+    with pytest.raises(RuntimeError, match=r"tags\[\*\]"):
+        ds.create_scalar_index(
+            "tags[*]",
+            "INVERTED",
+            document_granularity=list_element,
+        )
 
 
 def test_fts_fuzzy_query(tmp_path):
@@ -2391,6 +2924,54 @@ def test_zonemap_index_remapping(tmp_path: Path):
     assert result.num_rows == 501  # 1000..1500 inclusive
 
 
+def test_zonemap_fsl_column(tmp_path: Path):
+    """Zone map can be created on a FixedSizeList column and accelerates IS NULL."""
+    dim = 8
+    n = 1000
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 10th row is null
+    vec_list = [None if i % 10 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    result = scanner.to_table()
+    assert result.num_rows == 100  # every 10th row is null
+
+
+def test_vector_and_zonemap_on_fsl_column(tmp_path: Path):
+    """Vector index and zone map can coexist on the same FSL column."""
+    dim = 16
+    n = 2000
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 20th row is null
+    vec_list = [None if i % 20 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    ds.create_index("vec", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    # Vector search still works
+    query = vectors[5]
+    result = ds.scanner(nearest={"column": "vec", "q": query, "k": 10}).to_table()
+    assert result.num_rows == 10
+
+    # IS NULL is zone-map-accelerated
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    null_result = scanner.to_table()
+    assert null_result.num_rows == 100  # every 20th row is null
+
+
 def test_bloomfilter_index(tmp_path: Path):
     """Test create bloomfilter index"""
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
@@ -2471,6 +3052,36 @@ def test_json_index():
     assert ds.to_table(filter=filter) == ds.to_table(
         filter=filter, use_scalar_index=False
     )
+
+
+def test_json_index_non_exact_floats():
+    # A JSON-path btree index is trained on the value extracted from the JSON
+    # column, not on the raw column itself, so the index build must sort by
+    # the extracted value rather than assuming the raw column's order matches
+    # it. Without that, range/equality queries silently miss rows whenever
+    # the extracted floats are not exactly representable in float64 (#7485).
+    vals = ['{"latitude": 10.5}', '{"latitude": 40.1}', '{"latitude": -3.2}']
+    tbl = pa.table({"data": pa.array(vals, pa.json_())})
+    ds = lance.write_dataset(tbl, "memory://test")
+    ds.create_scalar_index(
+        "data",
+        IndexConfig(
+            index_type="json",
+            parameters={"target_index_type": "btree", "path": "latitude"},
+        ),
+    )
+
+    for filter in [
+        "json_get_float(data, 'latitude') > 0",
+        "json_get_float(data, 'latitude') >= 10.5",
+        "json_get_float(data, 'latitude') = 40.1",
+        "json_get_float(data, 'latitude') = 10.5",
+        "json_get_float(data, 'latitude') < 100",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+        assert ds.to_table(filter=filter) == ds.to_table(
+            filter=filter, use_scalar_index=False
+        ), filter
 
 
 def test_null_handling():
@@ -2978,6 +3589,166 @@ def test_btree_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded == 0
 
 
+def test_btree_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold scan reports index cache misses; warm scan reports hits.
+
+    ScanStatistics.index_cache_{hits,misses} are populated at page-level cache
+    boundaries. On a freshly-loaded dataset the BTree page fetch must be a
+    miss; a second scan against the same in-memory Dataset re-uses the cached
+    page and therefore reports a hit with zero misses.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"val": list(range(1000))})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("val", index_type="BTREE")
+
+    # Reopen so the session cache starts cold. A single-key point lookup on
+    # a small dataset resolves to exactly one BTree page, so cold/warm counts
+    # are deterministic 1/0 and 0/1.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 1
+    assert scan_stats.index_cache_hits == 0
+
+    # Same Dataset, warm cache — no new page loads, only hits.
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats.index_cache_hits == 1
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_bitmap_index_cache_hit_miss_stats(tmp_path: Path):
+    """Bitmap Range/IN queries report cold misses and warm hits; a value
+    that is not in the index never reaches the loader and must not count.
+
+    Guards against the ``BitmapIndex::search`` regressions where the
+    ``Range`` / ``IsIn`` branches used to drop the ``MetricsCollector`` (so
+    every lookup was silently ``0/0``), and where an equality on a value
+    absent from ``index_map`` recorded a spurious miss before short-circuiting
+    to the empty result.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"color": ["red", "green", "blue", "yellow"] * 25})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("color", index_type="BITMAP")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 2
+    assert scan_stats.index_cache_hits == 0
+
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 2
+    assert scan_stats.index_cache_misses == 0
+
+    # A value that is not in the index short-circuits before the loader and
+    # must not touch either counter.
+    ds.scanner(
+        filter="color = 'purple'", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_phrase_query_cache_hit_miss_stats(tmp_path: Path):
+    """Phrase-query fallback populates ``PositionKey``; that boundary must
+    show up in per-query cache statistics.
+
+    Guards against ``read_positions`` silently using the non-metric
+    ``get_or_insert_with_key`` API — before this fix, a warm phrase query
+    would report zero hits for the phrase-position cache slot even though
+    the loader was skipped.
+
+    The cold path can already record a few hits (``bm25_stats_for_terms``
+    populates ``PostingMetadataKey``, which is then re-read on the
+    posting-list path as a cross-boundary hit), so the cold assertion is
+    ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table(
+        {"text": ["quick brown fox jumps over lazy dog" for _ in range(50)]}
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_fts_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold FTS scan reports misses; warm FTS scan reports hits.
+
+    Guards the wrapper-forwarding fix in ``FtsIndexMetrics``: previously the
+    two new cache-hit/miss trait methods had default no-op implementations
+    that swallowed FTS-side events, so cache activity was reported as ``0/0``
+    even for hot inverted-index scans.
+
+    The cold path can still record a few hits when the same cache key is
+    read across boundaries in one query (e.g. ``bm25_stats_for_terms``
+    populates ``PostingMetadataKey`` before ``posting_list`` re-reads it),
+    so the cold assertion is ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"fts": ["word" for _ in range(100)]})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    # Same Dataset, warm cache — posting-list / metadata reads must now hit.
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
+
+
 def test_fts_backward_v0_27_0(tmp_path: Path):
     path = (
         Path(__file__).parent.parent.parent.parent
@@ -3002,6 +3773,14 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         "frodo was a puppy with a tail",
         "frodo was a happy puppy",
     }
+
+    # Requiring both disjoint terms advances "happy" past its final document while
+    # "tail" remains live. Legacy WAND must terminate without reading the exhausted
+    # posting.
+    results = ds.to_table(
+        full_text_query=MatchQuery("happy tail", "text", operator=FullTextOperator.AND)
+    )
+    assert results.num_rows == 0
 
     data = pa.table(
         {
@@ -4301,6 +5080,126 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     )
 
 
+def test_ngram_segment_merge_and_commit_from_python(tmp_path):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "text": [
+                    "alpha needle",
+                    None,
+                    "beta needle",
+                    "gamma stack",
+                    "delta needle",
+                    "",
+                ]
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    index_name = "text_ngram_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type="NGRAM",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+    source_version = staged_segments[0].dataset_version
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "ngram_postings.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.dataset_version == source_version
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "ngram_postings.lance" for file in merged_segment.files)
+
+    ds.insert(pa.table({"text": ["new stack"]}))
+    assert ds.version > source_version
+    ds = ds.commit_existing_index_segments(index_name, "text", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "NGram"
+    assert len(descriptions[index_name].segments) == 1
+    assert (
+        descriptions[index_name].segments[0].dataset_version_at_last_update
+        == source_version
+    )
+    assert ds.count_rows("contains(text, 'needle')") == 3
+    assert ds.count_rows("text IS NULL") == 1
+
+
+@pytest.mark.parametrize(
+    "label_type",
+    [pa.list_(pa.string()), pa.large_list(pa.string())],
+    ids=["list", "large_list"],
+)
+def test_label_list_segment_index(tmp_path, label_type):
+    rows_per_fragment = 8
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(rows_per_fragment * 4), type=pa.int32()),
+                "labels": pa.array(
+                    [
+                        ["distributed"] if row_id % 2 == 0 else ["other"]
+                        for row_id in range(rows_per_fragment * 4)
+                    ],
+                    type=label_type,
+                ),
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=rows_per_fragment,
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 4
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="labels",
+            index_type="LABEL_LIST",
+            fragment_ids=[fragment_ids[0]],
+        )
+
+    index_name = "labels_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="labels",
+            index_type="LABEL_LIST",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    merged_segment = ds.merge_existing_index_segments(segments)
+    ds = ds.commit_existing_index_segments(index_name, "labels", [merged_segment])
+
+    filter_expr = "array_has_any(labels, ['distributed'])"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.equals(without_index)
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100
@@ -4368,6 +5267,54 @@ def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
 
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
+def test_bloomfilter_segment_merge_and_commit_from_python(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = "id_bloomfilter_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="BLOOMFILTER",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "bloomfilter.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bloomfilter.lance" for file in merged_segment.files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "BloomFilter"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id = 117"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+    assert with_index.to_pydict() == without_index.to_pydict()
     assert (
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
@@ -5074,7 +6021,7 @@ def test_json_inverted_match_query(tmp_path):
 
 @pytest.mark.parametrize(
     ("format_version", "expected_format_version"),
-    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+    [(1, 1), (2, 2), (3, 3), ("v1", 1), ("v2", 2), ("v3", 3)],
 )
 def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
@@ -5124,7 +6071,6 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
     assert details["lower_case"]
     assert details["stem"]
     assert details["remove_stop_words"]
-    assert details["custom_stop_words"] is None
     assert details["ascii_folding"]
     assert details["min_ngram_length"] == 3
     assert details["max_ngram_length"] == 3
@@ -5205,15 +6151,92 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert index.num_rows_indexed == 50
 
 
-def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
-    data = pa.table({"text": ["document about lance database"]})
-    ds = lance.write_dataset(data, tmp_path)
+def _run_fts_format_creation_probe(
+    tmp_path, env_value, creation_options=None, expected_format_version=None
+):
+    script = """
+import json
+import sys
 
-    ds.create_scalar_index("text", index_type="INVERTED")
+import lance
+import pyarrow as pa
 
-    indices = ds.describe_indices()
-    assert indices[0].segments[0].index_version == 2
+dataset = lance.write_dataset(
+    pa.table({"text": ["document about lance database"]}), sys.argv[1]
+)
+dataset.create_scalar_index(
+    "text", index_type="INVERTED", **json.loads(sys.argv[2])
+)
+expected_format_version = json.loads(sys.argv[3])
+if expected_format_version is not None:
+    actual_format_version = dataset.describe_indices()[0].segments[0].index_version
+    assert actual_format_version == expected_format_version
+"""
+    env = os.environ.copy()
+    if env_value is None:
+        env.pop("LANCE_FTS_FORMAT_VERSION", None)
+    else:
+        env["LANCE_FTS_FORMAT_VERSION"] = env_value
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            json.dumps(creation_options or {}),
+            json.dumps(expected_format_version),
+        ],
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_value", "creation_options", "expected_format_version"),
+    [
+        ("1", {}, 1),
+        ("2", {}, 2),
+        ("3", {}, 3),
+        ("3", {"block_size": 256}, 3),
+    ],
+)
+def test_create_inverted_index_uses_env_format_version(
+    tmp_path, env_value, creation_options, expected_format_version
+):
+    result = _run_fts_format_creation_probe(
+        tmp_path,
+        env_value,
+        creation_options,
+        expected_format_version,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_inverted_index_explicit_format_version_overrides_env(tmp_path):
+    result = _run_fts_format_creation_probe(
+        tmp_path,
+        "invalid",
+        {"format_version": 1},
+        1,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_text_inverted_index_defaults_to_v2_without_env(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=2)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_inverted_index_rejects_invalid_env_format_version(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, "invalid")
+
+    assert result.returncode != 0
+    assert "LANCE_FTS_FORMAT_VERSION" in result.stderr
+    assert "invalid" in result.stderr
 
 
 def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
@@ -5221,10 +6244,10 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     ds = lance.write_dataset(data, tmp_path)
 
     with pytest.raises(ValueError, match="unsupported FTS format version"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v5")
 
-    with pytest.raises(ValueError, match="format_version=3"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
 
 
 def test_vector_filter_fts_search(tmp_path):

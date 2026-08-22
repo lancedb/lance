@@ -4,6 +4,11 @@
 //! L2 (Euclidean) distance.
 //!
 
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_sub_ps};
 use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
@@ -17,7 +22,6 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::assume_eq;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 // Named tiers are only matched on x86_64, or by the fp16 kernels on the other
@@ -26,11 +30,18 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
+use crate::distance::{assert_batch_layout, assert_equal_lengths};
+
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-use crate::distance::BatchIter;
+use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+use crate::simd::x86::hsum256_ps;
 
 /// Calculate the L2 distance between two vectors.
 ///
@@ -54,6 +65,7 @@ pub trait L2: Num {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = f32> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
     }
 }
@@ -67,49 +79,18 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// available at runtime.
 ///
 /// On x86_64 with AVX-512 this uses 16-wide f32 lanes; otherwise it falls back
-/// to [`l2`], which auto-vectorizes to the compiled target (AVX2 on the default
-/// `haswell` build). Lance ships an AVX2-baseline binary, so the generic
-/// [`l2`] never emits AVX-512 even on capable CPUs — this dispatcher recovers
-/// that throughput for callers in the hot path (e.g. the in-memory HNSW index).
+/// to [`l2`], whose x86_64 implementation selects the best runtime-supported
+/// kernel. This entry point gives hot-path callers such as the in-memory HNSW
+/// index an explicit f32 API.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-            // SAFETY: guarded by the runtime AVX-512 detection above.
-            return unsafe { l2_f32_avx512(x, y) };
-        }
-    }
-    l2(x, y)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    debug_assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let a = _mm512_loadu_ps(x.as_ptr().add(i));
-        let b = _mm512_loadu_ps(y.as_ptr().add(i));
-        let diff = _mm512_sub_ps(a, b);
-        acc = _mm512_fmadd_ps(diff, diff, acc);
-        i += 16;
-    }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    while i < n {
-        let diff = x[i] - y[i];
-        sum += diff * diff;
-        i += 1;
-    }
-    sum
+    f32::l2(x, y)
 }
 
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    assert_equal_lengths(key.len(), target.len());
     key.iter()
         .zip(target.iter())
         .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
@@ -130,6 +111,7 @@ pub fn l2_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
+    assert_equal_lengths(from.len(), to.len());
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -161,6 +143,7 @@ pub fn l2_scalar<
 impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         super::l2_u8::l2_u8(x, y) as f32
     }
 }
@@ -188,6 +171,7 @@ mod bf16_kernel {
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -244,6 +228,7 @@ mod kernel {
 impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -258,7 +243,7 @@ impl L2 for f16 {
                 kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 => unsafe {
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
@@ -280,6 +265,7 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 or AVX-512 inner kernel on capable hosts, or a portable
@@ -292,8 +278,8 @@ impl L2 for f32 {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
-        // See `Dot::dot_batch` for f32.
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx2",
@@ -327,7 +313,11 @@ impl L2 for f32 {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `L2::l2` validation for every vector.
+            y.chunks_exact(dimension)
+                .map(move |v| l2_f32_dispatched(x, v))
         }
     }
 }
@@ -343,18 +333,117 @@ fn l2_batch_f32_runtime_dispatch<'a>(
     y: &'a [f32],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    // SAFETY: each kernel is entered only under its matching runtime detection.
-    match *SIMD_SUPPORT {
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => {
-            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx512(x, y, dimension) }.into_iter())
+    let (kernel, kind): (BatchKernel, BatchKind) = match *SIMD_SUPPORT {
+        // AVX-512 has no useful work for an eight-element vector. Retain the
+        // AVX/FMA kernel used by the former Haswell baseline for PQ dimensions.
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if dimension > 16 => {
+            (x86::l2_batch_f32_avx512, BatchKind::Avx512)
         }
-        SimdSupport::Avx2 | SimdSupport::AvxFma => {
-            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx_fma(x, y, dimension) }.into_iter())
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if std::is_x86_feature_detected!("fma") => {
+            (x86::l2_batch_f32_avx_fma, BatchKind::AvxFma)
         }
-        SimdSupport::Avx => {
-            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx(x, y, dimension) }.into_iter())
+        SimdSupport::Avx2 | SimdSupport::AvxFma => (x86::l2_batch_f32_avx_fma, BatchKind::AvxFma),
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx => {
+            (x86::l2_batch_f32_avx, BatchKind::Avx)
         }
-        _ => BatchIter::Lazy(y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v))),
+        _ => (l2_batch_f32_scalar, BatchKind::Scalar),
+    };
+
+    // SAFETY: the runtime tier and the explicit FMA check above establish the
+    // selected kernel's target-feature contract.
+    unsafe { BatchIter::<L2Batch>::new(x, y, dimension, kernel, kind) }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+struct L2Batch;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+impl BatchOperation for L2Batch {
+    #[inline]
+    fn fold_scalar<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, f32) -> B,
+    {
+        batch
+            .chunks_exact(dimension)
+            .fold(init, |acc, vector| f(acc, l2_f32_scalar(key, vector)))
+    }
+
+    #[target_feature(enable = "avx")]
+    unsafe fn fold_avx<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, f32) -> B,
+    {
+        if dimension == 8 {
+            let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+            return batch.chunks_exact(8).fold(init, |acc, vector| {
+                let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
+                let difference = _mm256_sub_ps(key_values, vector_values);
+                let squared = _mm256_mul_ps(difference, difference);
+                f(acc, unsafe { hsum256_ps(squared) })
+            });
+        }
+        batch.chunks_exact(dimension).fold(init, |acc, vector| {
+            f(acc, unsafe { x86::l2_f32_avx(key, vector) })
+        })
+    }
+
+    #[target_feature(enable = "avx,fma")]
+    unsafe fn fold_avx_fma<B, F>(
+        key: &[f32],
+        batch: &[f32],
+        dimension: usize,
+        init: B,
+        mut f: F,
+    ) -> B
+    where
+        F: FnMut(B, f32) -> B,
+    {
+        if dimension == 8 {
+            let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+            return batch.chunks_exact(8).fold(init, |acc, vector| {
+                let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
+                let difference = _mm256_sub_ps(key_values, vector_values);
+                let squared = _mm256_mul_ps(difference, difference);
+                f(acc, unsafe { hsum256_ps(squared) })
+            });
+        }
+        batch.chunks_exact(dimension).fold(init, |acc, vector| {
+            f(acc, unsafe { x86::l2_f32_avx_fma(key, vector) })
+        })
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn fold_avx512<B, F>(
+        key: &[f32],
+        batch: &[f32],
+        dimension: usize,
+        init: B,
+        mut f: F,
+    ) -> B
+    where
+        F: FnMut(B, f32) -> B,
+    {
+        batch.chunks_exact(dimension).fold(init, |acc, vector| {
+            f(acc, unsafe { x86::l2_f32_avx512(key, vector) })
+        })
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+unsafe fn l2_batch_f32_scalar(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
+    debug_assert_eq!(output.len(), batch.len() / dimension);
+    for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+        *distance = l2_f32_scalar(x, y);
     }
 }
 
@@ -391,6 +480,7 @@ fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         l2_f64_simd(x, y)
     }
 }
@@ -453,11 +543,12 @@ mod x86 {
         x: &[f32],
         batch: &[f32],
         dimension: usize,
-    ) -> Vec<f32> {
-        batch
-            .chunks_exact(dimension)
-            .map(|y| unsafe { l2_f32_avx512(x, y) })
-            .collect()
+        output: &mut [f32],
+    ) {
+        debug_assert_eq!(output.len(), batch.len() / dimension);
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f32_avx512(x, y) };
+        }
     }
 
     /// As [`l2_batch_f32_avx512`], for the AVX+FMA and AVX2 tiers.
@@ -470,11 +561,12 @@ mod x86 {
         x: &[f32],
         batch: &[f32],
         dimension: usize,
-    ) -> Vec<f32> {
-        batch
-            .chunks_exact(dimension)
-            .map(|y| unsafe { l2_f32_avx_fma(x, y) })
-            .collect()
+        output: &mut [f32],
+    ) {
+        debug_assert_eq!(output.len(), batch.len() / dimension);
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f32_avx_fma(x, y) };
+        }
     }
 
     /// As [`l2_batch_f32_avx512`], for the AVX-without-FMA tier.
@@ -483,11 +575,16 @@ mod x86 {
     /// The host must support AVX.
     #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
     #[target_feature(enable = "avx")]
-    pub(super) unsafe fn l2_batch_f32_avx(x: &[f32], batch: &[f32], dimension: usize) -> Vec<f32> {
-        batch
-            .chunks_exact(dimension)
-            .map(|y| unsafe { l2_f32_avx(x, y) })
-            .collect()
+    pub(super) unsafe fn l2_batch_f32_avx(
+        x: &[f32],
+        batch: &[f32],
+        dimension: usize,
+        output: &mut [f32],
+    ) {
+        debug_assert_eq!(output.len(), batch.len() / dimension);
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f32_avx(x, y) };
+        }
     }
 
     /// AVX-512 path for f64: 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
@@ -585,6 +682,7 @@ mod x86 {
     }
 
     /// AVX-512 path for f32: 16-wide `__m512` with `vsubps` + `vfmadd231ps` per iteration.
+    #[inline]
     #[target_feature(enable = "avx512f")]
     pub unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
         let dim = x.len();
@@ -611,6 +709,7 @@ mod x86 {
     }
 
     /// AVX + FMA path for f32. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
+    #[inline]
     #[target_feature(enable = "avx,fma")]
     pub unsafe fn l2_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
         let dim = x.len();
@@ -637,6 +736,7 @@ mod x86 {
     }
 
     /// AVX-only path for f32 (no FMA): squared diff via `_mm256_mul_ps` + `_mm256_add_ps` for Sandy/Ivy Bridge.
+    #[inline]
     #[target_feature(enable = "avx")]
     pub unsafe fn l2_f32_avx(x: &[f32], y: &[f32]) -> f32 {
         let dim = x.len();
@@ -829,9 +929,6 @@ pub fn l2_distance_batch<'a, T: L2>(
     to: &'a [T],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    assume_eq!(from.len(), dimension);
-    assume_eq!(to.len() % dimension, 0);
-
     T::l2_batch(from, to, dimension)
 }
 
@@ -905,6 +1002,22 @@ mod tests {
     use approx::assert_relative_eq;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_l2_rejects_mismatched_lengths() {
+        let short = [1.0_f32];
+        let long = [1.0_f32, 2.0];
+
+        assert!(std::panic::catch_unwind(|| l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_f32(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| f32::l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&short, &long, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch::<f32>(&[], &[], 0)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_uint_scalar(&[1, 2], &[1])).is_err());
+        assert!(std::panic::catch_unwind(|| l2_scalar::<u8, f32, 16>(&[1, 2], &[1])).is_err());
+    }
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
@@ -1354,7 +1467,7 @@ mod tests {
         target_arch = "x86_64",
         not(all(target_feature = "avx2", target_feature = "fma"))
     ))]
-    fn check_l2_batch_kernel(kernel: unsafe fn(&[f32], &[f32], usize) -> Vec<f32>) {
+    fn check_l2_batch_kernel(kernel: BatchKernel) {
         for dimension in [8_usize, 16, 40] {
             let num_vectors = 3;
             let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
@@ -1362,7 +1475,8 @@ mod tests {
                 .map(|i| ((i % 7) as f32) + 1.0)
                 .collect();
 
-            let got = unsafe { kernel(&x, &batch, dimension) };
+            let mut got = vec![0.0; num_vectors];
+            unsafe { kernel(&x, &batch, dimension, &mut got) };
             assert_eq!(got.len(), num_vectors);
             for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
                 let want = l2_scalar::<f32, f32, 16>(&x, chunk);

@@ -171,11 +171,9 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         }
 
         // Create OpenDAL Operator with GooseFS service
-        let operator = Operator::from_iter::<GooseFs>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(format!("Failed to create GooseFS operator: {:?}", e))
-            })?
-            .finish();
+        let operator = Operator::from_iter::<GooseFs>(config_map).map_err(|e| {
+            Error::invalid_input(format!("Failed to create GooseFS operator: {:?}", e))
+        })?;
 
         // Wrap as object_store::ObjectStore via OpendalStore bridge
         let opendal_store = Arc::new(OpendalStore::new(operator));
@@ -183,6 +181,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),
             inner: opendal_store,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

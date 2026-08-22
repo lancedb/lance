@@ -52,8 +52,8 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -61,7 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
+    vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -78,7 +79,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::inverted::InvertedListFormatVersion,
+    scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -97,6 +98,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::fts::FtsTokenizerOptions;
 use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
@@ -125,13 +127,44 @@ const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
-fn read_blobs_to_python(
-    py: Python<'_>,
-    blobs: Vec<lance::dataset::ReadBlob>,
-) -> Vec<(u64, Py<PyBytes>)> {
+type PyBlobBytes = Option<Py<PyBytes>>;
+type PyReadBlob = (u64, PyBlobBytes);
+type PyReadBlobRange = (usize, u64, PyBlobBytes);
+
+fn read_blobs_to_python(py: Python<'_>, blobs: Vec<lance::dataset::ReadBlob>) -> Vec<PyReadBlob> {
     blobs
         .into_iter()
-        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .map(|blob| {
+            (
+                blob.row_address,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
+        .collect()
+}
+
+fn read_blob_ranges_to_python(
+    py: Python<'_>,
+    ranges: Vec<lance::dataset::ReadBlobRange>,
+) -> Vec<PyReadBlobRange> {
+    ranges
+        .into_iter()
+        .map(|range| {
+            (
+                range.request_index,
+                range.row_address,
+                range.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
+        .collect()
+}
+
+fn blob_range_requests_from_tuples(
+    requests: Vec<(u64, u64, u64)>,
+) -> Vec<lance::dataset::BlobRangeRequest> {
+    requests
+        .into_iter()
+        .map(|(row, offset, length)| lance::dataset::BlobRangeRequest::new(row, offset, length))
         .collect()
 }
 
@@ -140,6 +173,20 @@ fn configure_read_blobs_builder(
     io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+fn configure_read_blob_ranges_builder(
+    mut builder: lance::dataset::ReadBlobRangesBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobRangesBuilder {
     if let Some(bytes) = io_buffer_size {
         builder = builder.with_io_buffer_size_bytes(bytes);
     }
@@ -164,7 +211,6 @@ fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
 #[allow(clippy::too_many_arguments)]
 fn writer_config_from_kwargs(
     durable_write: Option<bool>,
-    sync_indexed_write: Option<bool>,
     max_wal_buffer_size: Option<usize>,
     max_wal_flush_interval_ms: Option<u64>,
     max_memtable_size: Option<usize>,
@@ -172,8 +218,6 @@ fn writer_config_from_kwargs(
     max_memtable_batches: Option<usize>,
     max_unflushed_memtable_bytes: Option<usize>,
     manifest_scan_batch_size: Option<usize>,
-    async_index_buffer_rows: Option<usize>,
-    async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
     hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -184,10 +228,6 @@ fn writer_config_from_kwargs(
     let mut any = false;
     if let Some(v) = durable_write {
         config = config.with_durable_write(v);
-        any = true;
-    }
-    if let Some(v) = sync_indexed_write {
-        config = config.with_sync_indexed_write(v);
         any = true;
     }
     if let Some(v) = max_wal_buffer_size {
@@ -216,14 +256,6 @@ fn writer_config_from_kwargs(
     }
     if let Some(v) = manifest_scan_batch_size {
         config = config.with_manifest_scan_batch_size(v);
-        any = true;
-    }
-    if let Some(v) = async_index_buffer_rows {
-        config = config.with_async_index_buffer_rows(v);
-        any = true;
-    }
-    if let Some(v) = async_index_interval_ms {
-        config = config.with_async_index_interval(Duration::from_millis(v));
         any = true;
     }
     if let Some(v) = backpressure_log_interval_ms {
@@ -467,6 +499,60 @@ impl MergeInsertBuilder {
         Ok((PyLance(transaction), stats))
     }
 
+    /// Execute the merge insert from fully-materialized data.
+    ///
+    /// The data is read into memory and wrapped in an in-memory table, so retries
+    /// never spill to disk and the source's statistics drive the join. Callers
+    /// should only route in-memory inputs (e.g. a `pa.Table`) here.
+    pub fn execute_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.bind(py);
+        dataset.borrow_mut().ds = new_dataset;
+
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_batches<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+
     #[pyo3(signature=(schema = None, verbose = false))]
     pub fn explain_plan(
         &mut self,
@@ -498,46 +584,27 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    /// Mark MemWAL generations as merged into the base table.
+    /// Mark MemWAL SSTables as compacted into the base table.
     ///
-    /// Call this when executing a merge_insert that incorporates MemWAL
-    /// flushed generation data. This updates the MemWAL generation tracking
-    /// to prevent duplicate merges.
-    pub fn mark_generations_as_merged<'a>(
+    /// Call this when executing a merge_insert that compacts MemWAL SSTables.
+    /// This updates MemWAL compaction progress to prevent duplicate compactions.
+    pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
-        generations: Vec<Bound<'a, crate::mem_wal::PyMergedGeneration>>,
+        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        use lance_index::mem_wal::MergedGeneration;
+        use lance_index::mem_wal::CompactedSsTable;
 
-        let gens: Vec<MergedGeneration> = generations
+        let compacted_sstables: Vec<CompactedSsTable> = sstables
             .iter()
-            .map(|g| g.borrow().to_lance())
+            .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_generations_as_merged(gens);
+        slf.builder.mark_sstables_as_compacted(compacted_sstables);
         Ok(slf)
     }
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        index_details,
-        metadata.index_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -1047,7 +1114,13 @@ impl Dataset {
 
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
-        Ok(self.ds.manifest().data_storage_format.version.clone())
+        Ok(self
+            .ds
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+            .to_string())
     }
 
     #[getter(has_stable_row_ids)]
@@ -1222,6 +1295,13 @@ impl Dataset {
 
                 let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
                 let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+                let document_granularity = match full_text_query.get_item("document_granularity")? {
+                    Some(value) if !value.is_none() => Some(
+                        DocumentGranularity::try_from(value.extract::<String>()?.as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    ),
+                    _ => None,
+                };
 
                 if is_phrase {
                     // Remove the surrounding quotes for phrase queries
@@ -1229,8 +1309,20 @@ impl Dataset {
                 }
 
                 let query: FtsQuery = match (is_phrase, is_multi_match) {
-                    (false, _) => MatchQuery::new(query).into(),
-                    (true, false) => PhraseQuery::new(query).into(),
+                    (false, _) => {
+                        let mut query = MatchQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
+                    (true, false) => {
+                        let mut query = PhraseQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
                     (true, true) => {
                         return Err(PyValueError::new_err(
                             "Phrase queries cannot be used with multiple columns.",
@@ -1551,18 +1643,21 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_ids: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_addresses(
         self_: PyRef<'_, Self>,
         row_addresses: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
@@ -1571,21 +1666,27 @@ impl Dataset {
                     .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     #[pyo3(signature=(
@@ -1600,7 +1701,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1628,7 +1729,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1656,7 +1757,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1670,6 +1771,40 @@ impl Dataset {
             .block_on(Some(self_.py()), builder.execute())?
             .infer_error()?;
         Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        requests,
+        blob_column,
+        selector,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_ranges(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(u64, u64, u64)>,
+        blob_column: &str,
+        selector: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<PyReadBlobRange>> {
+        let requests = blob_range_requests_from_tuples(requests);
+        let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
+        let builder = match selector {
+            "ids" => builder.with_row_ids(requests),
+            "addresses" => builder.with_row_addresses(requests),
+            "indices" => builder.with_row_indices(requests),
+            selector => {
+                return Err(PyValueError::new_err(format!(
+                    "selector must be one of 'ids', 'addresses', or 'indices', got {selector:?}"
+                )));
+            }
+        };
+        let builder = configure_read_blob_ranges_builder(builder, io_buffer_size, preserve_order);
+        let ranges = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_ranges_to_python(self_.py(), ranges))
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
@@ -1907,6 +2042,19 @@ impl Dataset {
             })
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        let py = self_.py();
+        self_
+            .list_version_refs()?
+            .iter()
+            .map(|version| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", version.version)?;
+                dict.into_py_any(py)
+            })
+            .collect()
     }
 
     /// Fetches the currently checked out version of the dataset.
@@ -2432,48 +2580,53 @@ impl Dataset {
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
+                    let allowed_kwargs = [
+                        "analyzer",
+                        "document_granularity",
+                        "with_position",
+                        "base_tokenizer",
+                        "language",
+                        "max_token_length",
+                        "lower_case",
+                        "stem",
+                        "remove_stop_words",
+                        "custom_stop_words",
+                        "ascii_folding",
+                        "min_ngram_length",
+                        "max_ngram_length",
+                        "prefix_only",
+                        "block_size",
+                        "split_identifiers",
+                        "split_on_numerics",
+                        "preserve_original",
+                        "index_operators",
+                        "memory_limit",
+                        "num_workers",
+                        "format_version",
+                        "fragment_ids",
+                        "index_uuid",
+                        "progress_callback",
+                    ];
+                    for (key, _) in kwargs.iter() {
+                        let key: String = key.extract()?;
+                        if !allowed_kwargs.contains(&key.as_str()) {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown FTS index parameter '{}'",
+                                key
+                            )));
+                        }
+                    }
+
+                    params = FtsTokenizerOptions::from_kwargs(kwargs)?.apply(params)?;
+                    if let Some(document_granularity) = kwargs.get_item("document_granularity")? {
+                        let document_granularity: String = document_granularity.extract()?;
+                        params = params.document_granularity(
+                            DocumentGranularity::try_from(document_granularity.as_str())
+                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                        );
+                    }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
-                    }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params = params.base_tokenizer(base_tokenizer.extract()?);
-                    }
-                    if let Some(language) = kwargs.get_item("language")? {
-                        let language: PyBackedStr =
-                            language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|e| {
-                            PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
-                            ))
-                        })?;
-                    }
-                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params = params.max_token_length(max_token_length.extract()?);
-                    }
-                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params = params.lower_case(lower_case.extract()?);
-                    }
-                    if let Some(stem) = kwargs.get_item("stem")? {
-                        params = params.stem(stem.extract()?);
-                    }
-                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params = params.remove_stop_words(remove_stop_words.extract()?);
-                    }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(stop_words_file.extract()?);
-                    }
-                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params = params.ascii_folding(ascii_folding.extract()?);
-                    }
-                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
-                        params = params.ngram_min_length(min_ngram_length.extract()?);
-                    }
-                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
-                        params = params.ngram_max_length(max_ngram_length.extract()?);
-                    }
-                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
-                        params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
                     if let Some(block_size) = kwargs.get_item("block_size")? {
                         params = params
@@ -3425,7 +3578,6 @@ impl Dataset {
         identity_column=None,
         unsharded=false,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3433,8 +3585,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3448,7 +3598,6 @@ impl Dataset {
         identity_column: Option<String>,
         unsharded: bool,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3456,8 +3605,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3485,7 +3632,6 @@ impl Dataset {
 
         let writer_config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3493,8 +3639,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3576,7 +3720,6 @@ impl Dataset {
         shard_id,
         *,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3584,8 +3727,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3595,7 +3736,6 @@ impl Dataset {
         py: Python<'_>,
         shard_id: String,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3603,8 +3743,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3616,7 +3754,6 @@ impl Dataset {
 
         let config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3624,8 +3761,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3965,6 +4100,23 @@ impl SqlQueryBuilder {
         }
     }
 
+    #[pyo3(signature = (blob_handling))]
+    fn blob_handling(&self, blob_handling: &str) -> PyResult<Self> {
+        let blob_handling = match blob_handling {
+            "all_binary" => BlobHandling::AllBinary,
+            "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+            "all_descriptions" => BlobHandling::AllDescriptions,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                )));
+            }
+        };
+        Ok(Self {
+            builder: self.builder.clone().blob_handling(blob_handling),
+        })
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {
@@ -4009,6 +4161,18 @@ impl DatasetDelta {
         use arrow_array::RecordBatchReader;
         let stream = rt()
             .block_on(None, self.inner.get_updated_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
+    /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_deleted_row_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_deleted_row_ids())?
             .infer_error()?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
@@ -4326,6 +4490,10 @@ impl Dataset {
         rt().block_on(None, self.ds.versions())?.infer_error()
     }
 
+    fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
+        rt().block_on(None, self.ds.version_refs())?.infer_error()
+    }
+
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
         rt().block_on(None, self.ds.tags().list())?.infer_error()
     }
@@ -4530,6 +4698,9 @@ pub fn get_write_params(
         }
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
+        }
+        if let Some(session) = get_dict_opt::<Session>(options, "session")? {
+            p.session = Some(session.inner.clone());
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
@@ -5092,7 +5263,8 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0, document_granularity=None))]
+    #[allow(clippy::too_many_arguments)]
     fn match_query(
         query: String,
         column: String,
@@ -5101,30 +5273,48 @@ impl PyFullTextQuery {
         max_expansions: usize,
         operator: &str,
         prefix_length: u32,
+        document_granularity: Option<&str>,
     ) -> PyResult<Self> {
+        let mut query = MatchQuery::new(query)
+            .with_column(Some(column))
+            .with_boost(boost)
+            .with_fuzziness(fuzziness)
+            .with_max_expansions(max_expansions)
+            .with_operator(
+                Operator::try_from(operator)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+            )
+            .with_prefix_length(prefix_length);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: MatchQuery::new(query)
-                .with_column(Some(column))
-                .with_boost(boost)
-                .with_fuzziness(fuzziness)
-                .with_max_expansions(max_expansions)
-                .with_operator(
-                    Operator::try_from(operator)
-                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
-                )
-                .with_prefix_length(prefix_length)
-                .into(),
+            inner: query.into(),
         })
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column, slop))]
-    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop, document_granularity=None))]
+    fn phrase_query(
+        query: String,
+        column: String,
+        slop: u32,
+        document_granularity: Option<&str>,
+    ) -> PyResult<Self> {
+        let mut query = PhraseQuery::new(query)
+            .with_column(Some(column))
+            .with_slop(slop);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: PhraseQuery::new(query)
-                .with_column(Some(column))
-                .with_slop(slop)
-                .into(),
+            inner: query.into(),
         })
     }
 

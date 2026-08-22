@@ -49,6 +49,12 @@ use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 
+// Deciding which rows an overlay makes stale needs only fragment and index metadata,
+// so it lives at the table layer; this module resolves the reads that consume it.
+pub use lance_table::format::overlay::staleness::{
+    collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
+};
+
 /// The plan for merging one field's overlays into one batch: which source (base or
 /// a particular overlay) supplies each output row, and which overlay values must be
 /// fetched to do it.
@@ -977,7 +983,8 @@ mod tests {
             DataType::Struct(outer_fields),
             true,
         )]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
         let middle = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("a", DataType::Int32, true)),

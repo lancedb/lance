@@ -101,8 +101,7 @@ impl TosStoreProvider {
 
     fn build_tos_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         let operator = Operator::from_iter::<Tos>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?;
 
         Ok(OpendalStore::new(operator))
     }
@@ -143,6 +142,7 @@ impl ObjectStoreProvider for TosStoreProvider {
         Ok(ObjectStore {
             scheme: "tos".to_string(),
             inner,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
