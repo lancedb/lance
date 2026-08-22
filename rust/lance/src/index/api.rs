@@ -459,6 +459,9 @@ pub trait DatasetIndexExt {
     /// is exactly the signal that these merged segments would republish stale
     /// entries. The commit fails with an actionable error and the caller
     /// re-plans instead of the commit re-deriving replacements from coverage.
+    /// The handle is first advanced to the latest version, so the handle that
+    /// planned the round commits it safely and sees every mutation of the
+    /// fan-out window rather than only those its own snapshot happened to know.
     ///
     /// `results` may cover a subset of the plan's tasks. Tasks are disjoint by
     /// construction, so a round survives a failed worker: the merges that

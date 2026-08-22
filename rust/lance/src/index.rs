@@ -2225,6 +2225,12 @@ impl DatasetIndexExt for Dataset {
         let (results, orphaned) = segment_merge::reconcile_attempts(results);
         segment_merge::check_disjoint_outputs(&results)?;
 
+        // Refresh to the live manifest before validating. The natural flow plans and
+        // commits through the same handle, which would otherwise still sit at the
+        // plan's read version, and a compare-and-swap against that snapshot would
+        // compare the plan with itself and miss every mutation of the fan-out window.
+        self.checkout_latest().await?;
+
         // Compare-and-swap the exact source set. Re-deriving replacements from the
         // coordinator's current coverage is what let a merge planned at version V
         // re-add a fragment that an indexed-field Update invalidated at V+1: the merged
@@ -2292,8 +2298,11 @@ impl DatasetIndexExt for Dataset {
 
         // The merged contents were read at the plan's version, so that is the version
         // this transaction read. Declaring it truthfully lets the conflict resolver
-        // replay everything committed since and prune or reject accordingly, which
-        // closes the window between the check above and the manifest write.
+        // replay everything committed since. In the window between the refresh above
+        // and the manifest write, a concurrent Update prunes coverage during that
+        // replay and a same-name CreateIndex conflicts. An in-place Merge is replayed
+        // without pruning, a pre-existing resolver gap shared by every index commit,
+        // which the refresh narrows from the whole fan-out to this window.
         let transaction = Transaction::new(
             plan.read_version,
             Operation::CreateIndex {
@@ -9450,6 +9459,12 @@ mod tests {
     /// the index. Coverage is then complete again, the flat fallback that would
     /// have answered for that fragment is suppressed, and the query reads
     /// pre-mutation vectors: false negatives and wrong ANN ranking, silently.
+    ///
+    /// Every case runs twice. With `stale_handle` the mutation lands through a
+    /// separate handle while the committing handle still sits at the plan's
+    /// read version, which is the natural coordinator flow. The commit must
+    /// refresh to the live manifest before validating, or the compare-and-swap
+    /// compares the plan with itself and the stale merge is published.
     #[rstest]
     #[case::update_drops_source(
         ConcurrentMutation::IndexedFieldUpdate,
@@ -9471,6 +9486,7 @@ mod tests {
         #[case] mutation: ConcurrentMutation,
         #[case] first_source_coverage: Vec<u32>,
         #[case] expected_message: &str,
+        #[values(false, true)] stale_handle: bool,
     ) {
         let test_dir = tempfile::tempdir().unwrap();
         let mut dataset = write_merge_test_dataset(test_dir.path().to_str().unwrap(), 3).await;
@@ -9513,7 +9529,12 @@ mod tests {
         assert_eq!(plan.tasks.len(), 1);
         let result = stub_merge_result(&plan, 0, Uuid::new_v4(), Uuid::new_v4());
 
-        apply_concurrent_mutation(&mut dataset, mutation, field_id).await;
+        if stale_handle {
+            let mut writer = dataset.clone();
+            apply_concurrent_mutation(&mut writer, mutation, field_id).await;
+        } else {
+            apply_concurrent_mutation(&mut dataset, mutation, field_id).await;
+        }
 
         let err = dataset
             .commit_index_merge_results(&plan, vec![result])

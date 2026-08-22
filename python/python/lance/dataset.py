@@ -4819,7 +4819,9 @@ class LanceDataset(pa.dataset.Dataset):
         concurrent update of an indexed column prunes coverage out of the
         segments it invalidates, so a coverage change means these merged
         segments would republish stale entries: the commit raises and the
-        caller re-plans.
+        caller re-plans. Validation runs against the latest dataset version,
+        so the handle that planned the round commits it safely and sees every
+        mutation committed during the fan-out.
 
         ``results`` may cover a subset of the plan's tasks. Tasks are disjoint,
         so a round survives a failed worker: what succeeded is published and
