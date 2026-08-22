@@ -3350,22 +3350,37 @@ def test_plan_index_segment_merge_ivf_rq(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="segments_per_task"):
         ds.plan_index_segment_merge("vector_idx", 1)
 
-    tasks = ds.plan_index_segment_merge("vector_idx", 2)
-    assert [len(task) for task in tasks] == [2, 2]
+    plan = ds.plan_index_segment_merge("vector_idx", 2)
+    assert [len(task["sources"]) for task in plan.tasks] == [2, 2]
+    assert plan.index_name == "vector_idx"
+    assert plan.read_version == ds.version
+    assert len(plan.source_frontier) == 4
 
     newest = ds.plan_index_segment_merge("vector_idx", 2, max_segments_to_merge=2)
-    assert [len(task) for task in newest] == [2]
+    assert [len(task["sources"]) for task in newest.tasks] == [2]
 
-    tasks = pickle.loads(pickle.dumps(tasks))
+    # The plan crosses the driver to executor boundary, so it must survive
+    # pickling, and a worker must accept the rebuilt copy.
+    plan = pickle.loads(pickle.dumps(plan))
 
-    merged = [ds.merge_existing_index_segments(task) for task in tasks]
-    ds = ds.commit_existing_index_segments("vector_idx", "vector", merged)
+    results = [
+        pickle.loads(pickle.dumps(ds.execute_index_merge_task(plan, task_id)))
+        for task_id in plan.task_ids
+    ]
+    assert sorted(result.task_id for result in results) == [0, 1]
+    assert len({result.output_id for result in results}) == 2
+    ds = ds.commit_index_merge_results(plan, results)
+
+    # Committing the same round again must fail: its sources are gone, and the
+    # caller has to re-plan rather than re-deriving what to replace.
+    with pytest.raises(ValueError, match="Re-plan the merge"):
+        ds.commit_index_merge_results(plan, results)
 
     second_round = ds.plan_index_segment_merge("vector_idx", 2)
-    assert [len(task) for task in second_round] == [2]
-    final = ds.merge_existing_index_segments(second_round[0])
-    ds = ds.commit_existing_index_segments("vector_idx", "vector", [final])
-    assert ds.plan_index_segment_merge("vector_idx", 2) == []
+    assert [len(task["sources"]) for task in second_round.tasks] == [2]
+    final = ds.execute_index_merge_task(second_round, 0)
+    ds = ds.commit_index_merge_results(second_round, [final])
+    assert ds.plan_index_segment_merge("vector_idx", 2).tasks == []
 
     q = np.random.rand(dim).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})

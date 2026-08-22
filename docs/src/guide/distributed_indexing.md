@@ -112,6 +112,47 @@ commit multiple compatible segments directly when their build path supports
 fragment-scoped segments, but cannot be merged into a larger physical segment
 until they add a merge implementation.
 
+### Coordinated Merge Rounds
+
+Grouping segments by hand works when the caller owns the whole round. For a
+scheduler-driven round, `plan_index_segment_merge(...)` returns a serializable
+`IndexMergePlan` that a driver ships to its executors:
+
+1. the coordinator calls `plan_index_segment_merge(index_name,
+   segments_per_task, max_segments_to_merge)`, which groups the qualifying
+   segments into tasks with disjoint fragment coverage
+2. each worker calls `execute_index_merge_task(plan, task_id)` and returns an
+   `IndexMergeResult`
+3. the coordinator calls `commit_index_merge_results(plan, results)`
+
+The plan pins the dataset version it was built at, the exact source segment
+ids, the base-aware location of each one, the coverage each one claimed, and a
+fingerprint of the index model. That provenance is what makes the round safe
+across the minutes it takes:
+
+- a worker reopens the dataset at the pinned version and revalidates the task
+  against that snapshot before writing anything, so it never merges one version
+  of a segment while validating another
+- the commit compare-and-swaps the exact source set. A concurrent update of an
+  indexed column prunes coverage out of the segments it invalidates, so a
+  changed source is precisely the signal that the merged segment would
+  republish stale entries. The commit fails and the caller re-plans instead of
+  the commit re-deriving what to replace from current coverage
+- a segment a shallow clone imported keeps its `base_id` and resolves under the
+  base dataset, so a clone's mixed segment set is executable
+
+Results may cover a subset of the plan's tasks. Tasks are disjoint, so a round
+survives a failed worker: what succeeded is published and the rest can be
+retried against a fresh plan. Several attempts of the same task are reconciled
+to the lowest attempt id, which makes the outcome a function of the reports
+alone, and those losing attempts' directories are removed after the commit.
+Output that no result reported, such as a worker that wrote a segment and then
+died, is left to the age-based `cleanup_old_versions(...)` rules that already
+reclaim uncommitted index directories.
+
+One bounded fan-out round commits several terminal segments. Reducing the index
+to a single root takes another round against a fresh plan.
+
 ### Vector Model Scope
 
 Distributed vector builds support two model scopes.

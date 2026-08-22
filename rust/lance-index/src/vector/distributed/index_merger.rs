@@ -801,14 +801,14 @@ async fn read_shard_window_partitions(
 /// Supports IVF_FLAT, IVF_PQ, IVF_RQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
 /// IVF_HNSW_SQ storage types. Every source segment must share one quantizer
 /// model and distance type, because the merged artifact carries a single
-/// metadata scope; a mismatched PQ codebook, RaBitQ rotation, or scalar
+/// metadata scope. A mismatched PQ codebook, RaBitQ rotation, or scalar
 /// quantizer is rejected rather than silently decoded against the first
 /// segment's model.
 ///
 /// In practice this makes IVF_SQ unmergeable: each SQ segment trains its bounds
 /// from its own fragment sample, and `SQBuildParams` has no way to pin a shared
 /// model the way `RQBuildParams::rotation` does. SQ segments can still be
-/// committed and queried side by side; only physical merge is unavailable.
+/// committed and queried side by side. Only physical merge is unavailable.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],

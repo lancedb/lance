@@ -771,6 +771,125 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return self
 
 
+class _IndexMergeArtifact:
+    """One artifact of a distributed index merge.
+
+    Distributed merge artifacts travel from a driver to its executors and back,
+    so the Rust core hands them over as JSON. Wrapping that string keeps the
+    driver from having to know the field names while leaving every validation
+    rule in the core, where the worker and the commit share it. Instances
+    pickle, so a Spark or Ray task can close over one directly.
+    """
+
+    def __init__(self, payload: str):
+        self._payload = payload
+        self._fields: Dict[str, Any] = json.loads(payload)
+
+    @classmethod
+    def from_json(cls, payload: str):
+        """Rebuild an artifact from the string :meth:`to_json` produced."""
+        return cls(payload)
+
+    def to_json(self) -> str:
+        """The wire form, ready to ship to an executor."""
+        return self._payload
+
+    @property
+    def contract_version(self) -> int:
+        """Version of the plan/task/result contract this artifact speaks."""
+        return self._fields["contract_version"]
+
+    @property
+    def plan_id(self) -> str:
+        """Identity of the planning round this artifact belongs to."""
+        return self._fields["plan_id"]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, type(self)) and self._fields == other._fields
+
+    def __hash__(self):
+        raise TypeError(f"{type(self).__name__} is not hashable")
+
+
+class IndexMergePlan(_IndexMergeArtifact):
+    """A coordinator's plan for merging one logical index's segments.
+
+    Produced by :meth:`LanceDataset.plan_index_segment_merge`. Pins the dataset
+    version it was built at, the exact source segments and where they live, and
+    a fingerprint of the index model, so a worker can prove its snapshot still
+    describes what was planned and the commit can compare-and-swap that exact
+    source set.
+    """
+
+    @property
+    def index_name(self) -> str:
+        """Logical index being merged."""
+        return self._fields["index_name"]
+
+    @property
+    def read_version(self) -> int:
+        """Dataset version the plan was built against. Workers reopen here."""
+        return self._fields["read_version"]
+
+    @property
+    def tasks(self) -> List[Dict[str, Any]]:
+        """The independent units of work, covering disjoint fragment sets."""
+        return self._fields["tasks"]
+
+    @property
+    def task_ids(self) -> List[int]:
+        """Ids to pass to :meth:`LanceDataset.execute_index_merge_task`."""
+        return [task["task_id"] for task in self._fields["tasks"]]
+
+    @property
+    def source_frontier(self) -> List[str]:
+        """Every segment the index had when the plan was built, planned or not."""
+        return self._fields["source_frontier"]
+
+    def __len__(self) -> int:
+        return len(self._fields["tasks"])
+
+    def __repr__(self) -> str:
+        return (
+            f"IndexMergePlan(index_name={self.index_name!r}, "
+            f"read_version={self.read_version}, tasks={len(self)})"
+        )
+
+
+class IndexMergeResult(_IndexMergeArtifact):
+    """One worker attempt's report.
+
+    Produced by :meth:`LanceDataset.execute_index_merge_task` and handed back to
+    :meth:`LanceDataset.commit_index_merge_results`.
+    """
+
+    @property
+    def task_id(self) -> int:
+        """Which task of the plan this report answers."""
+        return self._fields["task_id"]
+
+    @property
+    def attempt_id(self) -> str:
+        """Identity of this attempt. Retries of one task differ here."""
+        return self._fields["attempt_id"]
+
+    @property
+    def source_ids(self) -> List[str]:
+        """The segments this attempt merged."""
+        return [source["uuid"] for source in self._fields["sources"]]
+
+    @property
+    def output_id(self) -> str:
+        """The merged segment this attempt wrote."""
+        return self._fields["output"]["uuid"]
+
+    def __repr__(self) -> str:
+        return (
+            f"IndexMergeResult(task_id={self.task_id}, "
+            f"attempt_id={self.attempt_id!r}, output_id={self.output_id!r})"
+        )
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
@@ -4587,25 +4706,34 @@ class LanceDataset(pa.dataset.Dataset):
         index_name: str,
         segments_per_task: int,
         max_segments_to_merge: Optional[int] = None,
-    ) -> List[List[Index]]:
+    ) -> IndexMergePlan:
         """
         Plan a distributed merge of an index's segments.
 
         Partitions the segments of ``index_name`` into groups of
-        ``segments_per_task`` (at least 2). Each group is one independent unit
-        of work. The returned :class:`Index` objects are picklable, so a
-        coordinator (for example a Spark driver) can ship each group to a
-        worker, the worker merges it with
-        :meth:`merge_existing_index_segments`, and the coordinator publishes
-        every merged segment at once with
-        :meth:`commit_existing_index_segments`. Groups cover disjoint fragment
-        sets, so workers never contend. Segments with no effective fragment
-        coverage (deferred builds, or coverage naming only fragments that no
-        longer exist) are skipped. A legacy segment without fragment coverage
-        is rejected with an error, and that rejection is evaluated over the
-        whole segment set before ``max_segments_to_merge`` selects a suffix, so
-        an index whose base segment is legacy cannot be planned until it is
-        rebuilt.
+        ``segments_per_task`` (at least 2). Each group becomes one task: a
+        worker runs it with :meth:`execute_index_merge_task` and the
+        coordinator publishes every result at once with
+        :meth:`commit_index_merge_results`. Groups cover disjoint fragment
+        sets, so workers never contend.
+
+        The returned plan pins the dataset version it was built at, the exact
+        source segment ids, where each one lives (base-aware, so a segment a
+        shallow clone imported still resolves), the coverage each one claimed,
+        and a fingerprint of the index model. Workers reopen at the pinned
+        version and revalidate before writing, and the commit
+        compare-and-swaps that exact source set, so a round planned at one
+        version cannot silently republish entries a later write invalidated.
+
+        Segments with no effective fragment coverage (deferred builds, or
+        coverage naming only fragments that no longer exist) are skipped. A
+        legacy segment without fragment coverage is rejected with an error,
+        and that rejection is evaluated over the whole segment set before
+        ``max_segments_to_merge`` selects a suffix, so an index whose base
+        segment is legacy cannot be planned until it is rebuilt.
+
+        One bounded fan-out round commits several terminal segments. Reducing
+        the index to a single root takes another round against a fresh plan.
 
         Parameters
         ----------
@@ -4627,23 +4755,94 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        List[List[Index]]
-            One inner list per merge task. Empty when fewer than two segments
+        IndexMergePlan
+            A plan whose ``tasks`` is empty when fewer than two segments
             qualify.
 
         Examples
         --------
-        >>> tasks = dataset.plan_index_segment_merge("vec_idx", 32)  # doctest: +SKIP
-        >>> merged = [
-        ...     dataset.merge_existing_index_segments(task) for task in tasks
+        >>> plan = dataset.plan_index_segment_merge("vec_idx", 32)  # doctest: +SKIP
+        >>> results = [
+        ...     dataset.execute_index_merge_task(plan, task_id)
+        ...     for task_id in plan.task_ids
         ... ]  # doctest: +SKIP
-        >>> dataset.commit_existing_index_segments(
-        ...     "vec_idx", "vector", merged
-        ... )  # doctest: +SKIP
+        >>> dataset.commit_index_merge_results(plan, results)  # doctest: +SKIP
         """
-        return self._ds.plan_index_segment_merge(
-            index_name, segments_per_task, max_segments_to_merge
+        return IndexMergePlan(
+            self._ds.plan_index_segment_merge(
+                index_name, segments_per_task, max_segments_to_merge
+            )
         )
+
+    def execute_index_merge_task(
+        self, plan: IndexMergePlan, task_id: int
+    ) -> IndexMergeResult:
+        """
+        Run one task of a merge plan.
+
+        Reopens the dataset at the version the plan pinned when this handle is
+        at a different one, validates the task against that snapshot, and only
+        then writes the merged segment. A source that moved, changed coverage,
+        or disappeared raises instead of producing a segment the commit would
+        reject.
+
+        Safe to retry: each attempt writes its own output and reports its own
+        attempt id, and the commit reconciles duplicates deterministically.
+
+        Parameters
+        ----------
+        plan: IndexMergePlan
+            The plan this task belongs to, as returned by
+            :meth:`plan_index_segment_merge`.
+        task_id: int
+            Which task of ``plan`` to run.
+
+        Returns
+        -------
+        IndexMergeResult
+            The worker's report, to be handed back to
+            :meth:`commit_index_merge_results`.
+        """
+        return IndexMergeResult(
+            self._ds.execute_index_merge_task(plan.to_json(), task_id)
+        )
+
+    def commit_index_merge_results(
+        self, plan: IndexMergePlan, results: List[IndexMergeResult]
+    ) -> LanceDataset:
+        """
+        Publish the merged segments of one fan-out round.
+
+        Compare-and-swaps the exact source segments named by ``results``.
+        Every source must still be present, under the same base, at the same
+        dataset version, with the coverage it had when the plan was built. A
+        concurrent update of an indexed column prunes coverage out of the
+        segments it invalidates, so a coverage change means these merged
+        segments would republish stale entries: the commit raises and the
+        caller re-plans.
+
+        ``results`` may cover a subset of the plan's tasks. Tasks are disjoint,
+        so a round survives a failed worker: what succeeded is published and
+        the rest can be retried against a fresh plan. Several attempts of the
+        same task are reconciled to one winner by lowest attempt id, so the
+        outcome depends on the reports rather than on their arrival order.
+
+        Cleanup covers exactly the losing attempts among ``results``. Output
+        that no result reported, such as a worker that wrote a segment and then
+        died, is unreachable from any manifest and is reclaimed by
+        ``cleanup_old_versions`` like any other uncommitted index directory.
+
+        Parameters
+        ----------
+        plan: IndexMergePlan
+            The plan the results were produced against.
+        results: List[IndexMergeResult]
+            Worker reports from :meth:`execute_index_merge_task`.
+        """
+        self._ds.commit_index_merge_results(
+            plan.to_json(), [result.to_json() for result in results]
+        )
+        return self
 
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """

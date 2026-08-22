@@ -2369,14 +2369,21 @@ async fn write_ivf_hnsw_file(
 }
 
 /// Merge one caller-defined group of source segments into a single segment.
+///
+/// `source_dirs` gives the directory of each entry of `segments`, in the same
+/// order. It is passed rather than derived from `indices_dir` because a segment
+/// imported by a shallow clone lives under the base dataset's index directory,
+/// not this one's. `indices_dir` is where the merged output is written.
 pub(crate) async fn merge_segments(
     object_store: &ObjectStore,
     indices_dir: &Path,
+    source_dirs: &[Path],
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_with_progress(
         object_store,
         indices_dir,
+        source_dirs,
         segments,
         lance_index::progress::noop_progress(),
     )
@@ -2388,11 +2395,19 @@ pub(crate) async fn merge_segments(
 pub(crate) async fn merge_segments_with_progress(
     object_store: &ObjectStore,
     indices_dir: &Path,
+    source_dirs: &[Path],
     segments: Vec<TableIndexMetadata>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+    if source_dirs.len() != segments.len() {
+        return Err(Error::index(format!(
+            "merge_segments was given {} source directories for {} segments",
+            source_dirs.len(),
+            segments.len()
+        )));
     }
     if segments.len() == 1 {
         return Ok(segments.into_iter().next().unwrap());
@@ -2415,7 +2430,7 @@ pub(crate) async fn merge_segments_with_progress(
     let final_dir = indices_dir.clone().join(segment_uuid.to_string());
     let files = merge_segments_to_dir(
         object_store,
-        indices_dir,
+        source_dirs,
         &final_dir,
         &segments,
         None,
@@ -2438,12 +2453,12 @@ pub(crate) async fn merge_segments_with_progress(
 
 /// Merge the selected input segments into `final_dir`.
 ///
-/// The caller defines the source segment group explicitly. This helper reads
-/// those input segments directly from `indices/<segment_uuid>/` and writes the
-/// merged auxiliary/index files into `final_dir`.
+/// The caller defines the source segment group explicitly and supplies each
+/// segment's directory in `source_dirs`, parallel to `segments`. The merged
+/// auxiliary/index files are written into `final_dir`.
 async fn merge_segments_to_dir(
     object_store: &ObjectStore,
-    indices_dir: &Path,
+    source_dirs: &[Path],
     final_dir: &Path,
     segments: &[TableIndexMetadata],
     _requested_index_type: Option<IndexType>,
@@ -2455,24 +2470,15 @@ async fn merge_segments_to_dir(
         segments.len() > 1,
         "merge helper should only be used for multi-source groups"
     );
+    debug_assert_eq!(source_dirs.len(), segments.len());
 
-    let aux_paths = segments
+    let aux_paths = source_dirs
         .iter()
-        .map(|segment| {
-            indices_dir
-                .clone()
-                .join(segment.uuid.to_string())
-                .join(INDEX_AUXILIARY_FILE_NAME)
-        })
+        .map(|dir| dir.clone().join(INDEX_AUXILIARY_FILE_NAME))
         .collect::<Vec<_>>();
-    let source_index_paths = segments
+    let source_index_paths = source_dirs
         .iter()
-        .map(|segment| {
-            indices_dir
-                .clone()
-                .join(segment.uuid.to_string())
-                .join(INDEX_FILE_NAME)
-        })
+        .map(|dir| dir.clone().join(INDEX_FILE_NAME))
         .collect::<Vec<_>>();
 
     let auxiliary_file =

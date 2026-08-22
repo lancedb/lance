@@ -3106,6 +3106,15 @@ mod tests {
         ivf_params
     }
 
+    /// Ship a merge artifact the way a Spark or Ray driver does.
+    ///
+    /// The plan/task/result types only earn their keep if they survive the hop
+    /// to an executor, so the distributed tests move every artifact through
+    /// serialization rather than passing the in-memory value along.
+    fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+        serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+    }
+
     async fn build_segments_for_fragment_groups(
         dataset: &mut Dataset,
         fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
@@ -3349,7 +3358,7 @@ mod tests {
 
     // IVF_SQ belongs here even though it cannot be segment-merged: this test commits
     // per-fragment segments and queries across them without merging, and a multi-segment
-    // SQ index is fully supported -- each segment keeps its own bounds and the query fans
+    // SQ index is fully supported. Each segment keeps its own bounds and the query fans
     // out per segment.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat)]
@@ -3534,7 +3543,7 @@ mod tests {
     }
 
     /// Read the `packed` flag from an IVF_RQ segment's auxiliary storage file.
-    /// Distributed shards store row-major codes (`packed = false`); any merged
+    /// Distributed shards store row-major codes (`packed = false`). Any merged
     /// segment stores packed codes (`packed = true`).
     async fn read_rq_segment_packed(dataset: &Dataset, uuid: &Uuid) -> bool {
         let aux_path = dataset
@@ -3568,7 +3577,7 @@ mod tests {
     }
 
     /// Read the `transposed` flag from a PQ segment's auxiliary storage file.
-    /// Distributed shards store row-major codes (`transposed = false`); any
+    /// Distributed shards store row-major codes (`transposed = false`). Any
     /// merged segment stores column-major codes (`transposed = true`).
     async fn read_pq_segment_transposed(dataset: &Dataset, uuid: &Uuid) -> bool {
         let aux_path = dataset
@@ -3983,7 +3992,7 @@ mod tests {
     // so merging independently-trained shards decodes all but the first against the
     // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
     // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed; see test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
     #[case::ivf_pq(IndexType::IvfPq, 0.2)]
@@ -4185,7 +4194,7 @@ mod tests {
     // so merging independently-trained shards decodes all but the first against the
     // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
     // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed; see test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
     #[case::ivf_pq(IndexType::IvfPq, 0.15)]
@@ -4223,19 +4232,30 @@ mod tests {
             .await
             .unwrap();
 
-        // Round 1: plan on the coordinator, merge each task as a worker would.
-        let tasks = dataset
-            .plan_index_segment_merge(INDEX_NAME, 2, None)
-            .await
-            .unwrap();
-        assert_eq!(tasks.len(), 2);
-        let mut merged = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            assert_eq!(task.len(), 2);
-            merged.push(dataset.merge_existing_index_segments(task).await.unwrap());
+        // Round 1: plan on the coordinator, run each task as a worker would. The
+        // artifacts cross a driver-to-executor boundary as JSON in production, so
+        // every hop here goes through serde to prove they survive it.
+        let plan = round_trip(
+            &dataset
+                .plan_index_segment_merge(INDEX_NAME, 2, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.read_version, dataset.manifest.version);
+        assert_eq!(plan.source_frontier.len(), 4);
+        let mut results = Vec::with_capacity(plan.tasks.len());
+        for task in &plan.tasks {
+            assert_eq!(task.sources.len(), 2);
+            results.push(round_trip(
+                &dataset
+                    .execute_index_merge_task(&plan, task.task_id)
+                    .await
+                    .unwrap(),
+            ));
         }
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", merged)
+            .commit_index_merge_results(&plan, results)
             .await
             .unwrap();
         assert_eq!(
@@ -4247,18 +4267,19 @@ mod tests {
             2
         );
 
-        // Round 2: the plan now covers the packed outputs of round 1.
-        let tasks = dataset
-            .plan_index_segment_merge(INDEX_NAME, 2, None)
-            .await
-            .unwrap();
-        assert_eq!(tasks.len(), 1);
-        let final_segment = dataset
-            .merge_existing_index_segments(tasks.into_iter().next().unwrap())
-            .await
-            .unwrap();
+        // Round 2: the plan now covers the packed outputs of round 1. A bounded
+        // fan-out round leaves several terminal segments, so reducing the index to
+        // one root takes another round against a fresh plan.
+        let plan = round_trip(
+            &dataset
+                .plan_index_segment_merge(INDEX_NAME, 2, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(plan.tasks.len(), 1);
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", vec![final_segment])
+            .commit_index_merge_results(&plan, vec![result])
             .await
             .unwrap();
         assert_eq!(
@@ -4273,12 +4294,107 @@ mod tests {
         assert_merged_index_recall(&dataset, "vector", min_recall).await;
     }
 
+    /// Workers reopen the dataset at the version their plan pinned.
+    ///
+    /// A distributed round takes minutes and the table keeps moving underneath
+    /// it. A worker handed a plan validates and merges against the pinned
+    /// snapshot rather than whatever version its own handle happens to sit at,
+    /// so an append that lands mid-round neither invalidates the round nor leaks
+    /// its rows into a segment that never read them. The append's fragment stays
+    /// unindexed and is answered by the flat fallback until the next build.
+    #[tokio::test]
+    async fn test_execute_index_merge_task_uses_pinned_snapshot() {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let mut dataset =
+            write_dataset_from_batches(test_dir.as_str(), schema.clone(), batches).await;
+
+        let params = shared_model_params(&dataset, IndexType::IvfFlat).await;
+        let fragment_groups = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let planned_fragments = fragment_groups.len();
+        let shards =
+            build_segments_for_fragment_groups(&mut dataset, fragment_groups, &params, INDEX_NAME)
+                .await;
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", shards)
+            .await
+            .unwrap();
+
+        let plan = round_trip(
+            &dataset
+                .plan_index_segment_merge(INDEX_NAME, 2, None)
+                .await
+                .unwrap(),
+        );
+        let pinned_version = plan.read_version;
+
+        // The table moves on while the workers are still running.
+        let (_, more_batches) = make_two_fragment_batches();
+        let appended = RecordBatchIterator::new(more_batches.into_iter().map(Ok), schema);
+        dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 500,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.version > pinned_version);
+        assert!(dataset.get_fragments().len() > planned_fragments);
+
+        let mut results = Vec::with_capacity(plan.tasks.len());
+        for task in &plan.tasks {
+            let result = round_trip(
+                &dataset
+                    .execute_index_merge_task(&plan, task.task_id)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                result.read_version, pinned_version,
+                "the worker must merge at the pinned version, not its own"
+            );
+            assert_eq!(
+                result.output.fragment_ids,
+                task.coverage(),
+                "the merged segment must claim exactly what its sources claimed, so the \
+                 fragment appended mid-round stays unindexed"
+            );
+            results.push(result);
+        }
+
+        dataset
+            .commit_index_merge_results(&plan, results)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            plan.tasks.len(),
+            "each task publishes one terminal segment"
+        );
+
+        assert_merged_index_recall(&dataset, "vector", 0.95).await;
+    }
+
     // IVF_SQ is deliberately absent: every SQ shard trains its own bounds from its own
     // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
     // so merging independently-trained shards decodes all but the first against the
     // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
     // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed; see test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat)]
     #[case::ivf_pq(IndexType::IvfPq)]
@@ -4544,10 +4660,15 @@ mod tests {
         assert!(result.num_rows() > 0);
     }
 
+    // IVF_HNSW_SQ is deliberately absent: every SQ shard trains its own bounds from its own
+    // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
+    // so merging independently-trained shards decodes all but the first against the
+    // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
+    // model, so this cannot be made correct from the build side yet. The merge now fails
+    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::flat("IVF_HNSW_FLAT")]
     #[case::pq("IVF_HNSW_PQ")]
-    #[case::sq("IVF_HNSW_SQ")]
     #[tokio::test]
     async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
         let test_dir = TempStrDir::default();
@@ -4719,9 +4840,14 @@ mod tests {
         }
 
         let progress = Arc::new(RecordingProgress::default());
+        let source_dirs = segments
+            .iter()
+            .map(|segment| dataset.indices_dir().join(segment.uuid.to_string()))
+            .collect::<Vec<_>>();
         let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
             dataset.object_store.as_ref(),
             &dataset.indices_dir(),
+            &source_dirs,
             segments,
             progress.clone(),
         )

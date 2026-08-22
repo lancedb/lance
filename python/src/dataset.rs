@@ -61,8 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
-    vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexMergePlan, IndexMergeResult, IndexSegment,
+    IntoIndexSegment, vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -594,6 +594,12 @@ impl MergeInsertBuilder {
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
     metadata.into_index_segment().infer_error()
+}
+
+/// Decode a merge plan handed back from the Python side.
+fn parse_index_merge_plan(plan: &str) -> PyResult<IndexMergePlan> {
+    serde_json::from_str(plan)
+        .map_err(|err| PyValueError::new_err(format!("failed to parse index merge plan: {err}")))
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -2735,14 +2741,20 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
+    /// Plan a distributed merge and return the plan as JSON.
+    ///
+    /// The plan crosses a driver-to-executor boundary, so it is handed over as
+    /// JSON rather than as Python objects: a string pickles and ships without
+    /// the executor needing the same Lance object graph, and every validation
+    /// rule stays in the Rust core where the worker and the commit share it.
     #[pyo3(signature = (index_name, segments_per_task, max_segments_to_merge = None))]
     fn plan_index_segment_merge(
         &self,
         index_name: &str,
         segments_per_task: usize,
         max_segments_to_merge: Option<usize>,
-    ) -> PyResult<Vec<Vec<PyLance<IndexMetadata>>>> {
-        let tasks = rt()
+    ) -> PyResult<String> {
+        let plan = rt()
             .block_on(
                 None,
                 self.ds.plan_index_segment_merge(
@@ -2752,10 +2764,38 @@ impl Dataset {
                 ),
             )?
             .infer_error()?;
-        Ok(tasks
-            .into_iter()
-            .map(|task| task.into_iter().map(PyLance).collect())
-            .collect())
+        serde_json::to_string(&plan).map_err(|err| {
+            PyValueError::new_err(format!("failed to serialize index merge plan: {err}"))
+        })
+    }
+
+    /// Run one task of a merge plan and return the result as JSON.
+    fn execute_index_merge_task(&self, plan: &str, task_id: u32) -> PyResult<String> {
+        let plan = parse_index_merge_plan(plan)?;
+        let result = rt()
+            .block_on(None, self.ds.execute_index_merge_task(&plan, task_id))?
+            .infer_error()?;
+        serde_json::to_string(&result).map_err(|err| {
+            PyValueError::new_err(format!("failed to serialize index merge result: {err}"))
+        })
+    }
+
+    /// Publish the merged segments reported by one fan-out round.
+    fn commit_index_merge_results(&mut self, plan: &str, results: Vec<String>) -> PyResult<()> {
+        let plan = parse_index_merge_plan(plan)?;
+        let results = results
+            .iter()
+            .map(|result| {
+                serde_json::from_str::<IndexMergeResult>(result).map_err(|err| {
+                    PyValueError::new_err(format!("failed to parse index merge result: {err}"))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.commit_index_merge_results(&plan, results))?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn merge_existing_index_segments(

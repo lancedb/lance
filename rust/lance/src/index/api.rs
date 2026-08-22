@@ -12,6 +12,7 @@ use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::index::segment_merge::{IndexMergePlan, IndexMergeResult};
 use crate::{Error, Result};
 
 /// A single physical segment of a logical index.
@@ -347,32 +348,42 @@ pub trait DatasetIndexExt {
     /// Plan a distributed merge of an index's segments.
     ///
     /// Partitions the segments of the index named `index_name` into groups of
-    /// `segments_per_task` (at least 2). Each group is one independent unit of
-    /// work: a worker merges it with [Self::merge_existing_index_segments] and
-    /// the resulting segments are committed together on the coordinator with
-    /// [Self::commit_existing_index_segments]. Groups cover disjoint fragment
-    /// sets, so workers never contend and the commit replaces exactly the
-    /// planned segments.
+    /// `segments_per_task` (at least 2). Each group becomes one
+    /// [`IndexMergeTask`](crate::index::segment_merge::IndexMergeTask): a worker runs it with
+    /// [`Self::execute_index_merge_task`] and the coordinator publishes every
+    /// resulting segment with [`Self::commit_index_merge_results`]. Groups
+    /// cover disjoint fragment sets, so workers never contend.
+    ///
+    /// The returned [`IndexMergePlan`] pins the dataset version it was built
+    /// at, the exact source segment UUIDs, the base-aware location of each one,
+    /// the coverage each one claimed, and a fingerprint of the index model.
+    /// That provenance is what makes the round safe to publish later: workers
+    /// reopen at the pinned version and revalidate before writing, and the
+    /// commit compare-and-swaps the exact source set instead of re-deriving
+    /// what to replace from whatever the coordinator's coverage says by then.
     ///
     /// `max_segments_to_merge` bounds how many segments are planned, taking
     /// the newest ones first, mirroring
     /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge).
     /// `None` plans every segment, which consolidates the full index and
     /// rewrites the oldest (typically largest) segment as well. Segments with
-    /// no effective fragment coverage -- deferred builds, or coverage naming
-    /// only fragments that no longer exist -- are skipped before the bound is
+    /// no effective fragment coverage, meaning deferred builds or coverage naming
+    /// only fragments that no longer exist, are skipped before the bound is
     /// applied, so the bound counts qualifying segments only. A legacy segment
     /// without a fragment bitmap is rejected with an error, because merging
     /// requires fragment coverage. That rejection is evaluated over the whole
     /// segment set before the bound selects a suffix, so an index whose base
-    /// segment is legacy cannot be planned at all until it is rebuilt; the
+    /// segment is legacy cannot be planned at all until it is rebuilt. The
     /// commit path scans every same-name segment and would reject such a plan
     /// anyway. A trailing leftover group of one segment borrows a segment back
     /// from the previous task when `segments_per_task >= 3`, so both stay
-    /// mergeable and within the bound; with `segments_per_task == 2` there is
+    /// mergeable and within the bound. With `segments_per_task == 2` there is
     /// nothing to borrow and the leftover folds into a task of three. Every
-    /// task therefore merges at least two segments. Returns an empty plan when
-    /// fewer than two segments qualify.
+    /// task therefore merges at least two segments. Returns a plan with no
+    /// tasks when fewer than two segments qualify.
+    ///
+    /// One bounded fan-out round commits several terminal segments. Reducing
+    /// the index to a single root takes another round against a fresh plan.
     ///
     /// # Examples
     ///
@@ -381,18 +392,17 @@ pub trait DatasetIndexExt {
     /// # use lance::index::DatasetIndexExt;
     /// # async fn example(dataset: &mut Dataset) -> Result<()> {
     /// // Coordinator: fold the newest 1000 delta segments, 32 per worker.
-    /// let tasks = dataset
+    /// let plan = dataset
     ///     .plan_index_segment_merge("vec_idx", 32, Some(1000))
     ///     .await?;
-    /// // Workers: one merge per task (fanned out by the scheduler).
-    /// let mut merged = Vec::with_capacity(tasks.len());
-    /// for task in tasks {
-    ///     merged.push(dataset.merge_existing_index_segments(task).await?);
+    /// // Workers: one merge per task (fanned out by the scheduler, each on its
+    /// // own dataset handle reopened at the plan's read version).
+    /// let mut results = Vec::with_capacity(plan.tasks.len());
+    /// for task in &plan.tasks {
+    ///     results.push(dataset.execute_index_merge_task(&plan, task.task_id).await?);
     /// }
     /// // Coordinator: one atomic commit for all merged segments.
-    /// dataset
-    ///     .commit_existing_index_segments("vec_idx", "vector", merged)
-    ///     .await?;
+    /// dataset.commit_index_merge_results(&plan, results).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -404,10 +414,71 @@ pub trait DatasetIndexExt {
         _index_name: &str,
         _segments_per_task: usize,
         _max_segments_to_merge: Option<usize>,
-    ) -> Result<Vec<Vec<IndexMetadata>>> {
+    ) -> Result<IndexMergePlan> {
         Err(Error::not_supported(
             "index segment merge planning is not supported by this dataset implementation"
                 .to_owned(),
+        ))
+    }
+
+    /// Run one task of an [`IndexMergePlan`] and report what it produced.
+    ///
+    /// Reopens the dataset at the plan's pinned read version when this handle
+    /// is at a different one, then validates the task against that snapshot
+    /// before writing anything: contract version, index family and on-disk
+    /// version, field declaration, per-source dataset version, base-aware
+    /// location, and the coverage each source claimed when it was planned. A
+    /// source that has moved, changed coverage, or disappeared fails here
+    /// rather than producing a segment the commit would have to reject.
+    ///
+    /// Deeper model checks, covering metric type, IVF centroids, quantizer codebooks
+    /// and rotation matrices, are made by the merge itself, which already
+    /// parses every shard's metadata and cross-checks it at no extra I/O.
+    ///
+    /// Safe to retry: each attempt writes its own output segment and reports a
+    /// distinct [`IndexMergeResult::attempt_id`], and the commit reconciles
+    /// duplicate attempts deterministically.
+    async fn execute_index_merge_task(
+        &self,
+        _plan: &IndexMergePlan,
+        _task_id: u32,
+    ) -> Result<IndexMergeResult> {
+        Err(Error::not_supported(
+            "index segment merge execution is not supported by this dataset implementation"
+                .to_owned(),
+        ))
+    }
+
+    /// Publish the merged segments of one fan-out round.
+    ///
+    /// Compare-and-swaps the exact set of source segment UUIDs named by
+    /// `results`. Every source must still be present, under the same base, at
+    /// the same dataset version, with the same coverage it had when the plan
+    /// was built. A concurrent indexed-field `Update` or in-place `Merge`
+    /// prunes coverage out of the segments it invalidates, so a coverage change
+    /// is exactly the signal that these merged segments would republish stale
+    /// entries. The commit fails with an actionable error and the caller
+    /// re-plans instead of the commit re-deriving replacements from coverage.
+    ///
+    /// `results` may cover a subset of the plan's tasks. Tasks are disjoint by
+    /// construction, so a round survives a failed worker: the merges that
+    /// succeeded are published and the rest can be retried against a fresh
+    /// plan. Several attempts of the same task are reconciled to one winner by
+    /// lowest attempt id, which makes the outcome a function of the reports
+    /// alone rather than of their arrival order.
+    ///
+    /// Cleanup covers exactly the losing attempts among `results`. Output that
+    /// no result reported, such as a worker that wrote a segment and then died or an
+    /// attempt whose report this commit rejected, is unreachable from any
+    /// manifest and is reclaimed by `cleanup_old_versions` under the same
+    /// age-based rules as any other uncommitted index directory.
+    async fn commit_index_merge_results(
+        &mut self,
+        _plan: &IndexMergePlan,
+        _results: Vec<IndexMergeResult>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "index segment merge commit is not supported by this dataset implementation".to_owned(),
         ))
     }
 
