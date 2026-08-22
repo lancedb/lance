@@ -3,8 +3,6 @@
 
 //! Serializable contracts for distributed index segment merges.
 //!
-//! A distributed merge has three actors and three artifacts:
-//!
 //! ```text
 //! coordinator                worker(s)                    coordinator
 //! plan_index_segment_merge   execute_index_merge_task     commit_index_merge_results
@@ -12,26 +10,18 @@
 //!   IndexMergePlan  --------->  IndexMergeTask  ---------> IndexMergeResult
 //! ```
 //!
-//! The plan is built from one manifest read and pins everything the workers and
-//! the commit need to prove that what they are about to write still describes
-//! the data it was planned against: the read version, the exact source segment
-//! UUIDs, where those segments live (base-aware, so an imported segment of a
-//! shallow clone resolves), the coverage each one claimed, and a fingerprint of
-//! the index model. Workers reopen the dataset at the pinned version and
-//! revalidate before writing a byte. The commit compare-and-swaps the exact
-//! source UUID set instead of re-deriving what to remove from the
-//! coordinator's current coverage, which is what makes a merge planned at
-//! version V safe to publish at version V+n.
+//! The plan pins what the round needs to prove it still describes the data
+//! it was planned against: read version, exact source UUIDs, each source's
+//! base-aware location and claimed coverage, and the model fingerprint.
+//! Workers reopen at the pinned version and revalidate. The commit
+//! compare-and-swaps the exact source set, so a plan is safe to publish late.
 //!
-//! Every type carries [`INDEX_MERGE_CONTRACT_VERSION`] so a driver and its
-//! executors can detect a version skew instead of misreading each other's
-//! fields.
+//! Every type carries [`INDEX_MERGE_CONTRACT_VERSION`] so version skew
+//! between a driver and its executors fails loudly.
 //!
-//! Fragment coverage travels as a sorted `Vec<u32>` rather than a serialized
-//! [`RoaringBitmap`]. These artifacts cross a language boundary (a Spark or Ray
-//! driver ships them to executors as JSON), and a legible list of fragment ids
-//! is worth more there than the compression, which only matters for in-memory
-//! working sets.
+//! Coverage travels as a sorted `Vec<u32>` rather than a serialized
+//! [`RoaringBitmap`]: these artifacts cross language boundaries as JSON,
+//! where a legible fragment id list is worth more than compression.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -45,31 +35,25 @@ use crate::{Error, Result};
 
 /// Version of the plan/task/result contract.
 ///
-/// Bump this whenever a field changes meaning or a new field becomes required.
-/// Both the worker and the commit reject an artifact whose version they do not
-/// recognize, so a driver running an older Lance than its executors fails loudly
-/// rather than merging against fields it cannot interpret.
+/// Bump when a field changes meaning or a new field becomes required. Worker
+/// and commit reject unrecognized versions, so a driver running an older
+/// Lance than its executors fails loudly.
 pub const INDEX_MERGE_CONTRACT_VERSION: u32 = 1;
 
 /// Transaction property marking a `CreateIndex` commit whose `removed_indices`
 /// are an exact compare-and-swap source set.
 ///
-/// The commit validates its sources against the manifest it can see, but the
-/// manifest write races every other writer. A transaction carrying this
-/// property is re-validated by the conflict resolver's finish step against the
-/// manifest actually being published onto, and fails asking for a re-plan when
-/// any source moved. Without the property a `CreateIndex` keeps its historical
-/// prune-and-proceed behavior.
+/// The conflict resolver's finish step re-validates such removals against the
+/// manifest each commit attempt publishes onto, failing with a re-plan request
+/// when any source moved. Without the property a `CreateIndex` keeps its
+/// historical prune-and-proceed behavior.
 pub(crate) const EXACT_SOURCE_CAS_PROPERTY: &str = "lance.index.merge.exact_source_cas";
 
 /// Identity of the index model every segment in one merge must share.
 ///
-/// Derived from [`IndexMetadata`] alone, so a coordinator builds it from the
-/// single manifest read it already performs. Opening each segment to compare
-/// IVF centroids and quantizer parameters would turn planning into N async
-/// segment opens. That deeper check belongs at the worker, where the merge
-/// already parses every shard's quantizer metadata and cross-checks codebooks
-/// and rotation matrices at no extra I/O.
+/// Derived from [`IndexMetadata`] alone so planning stays one manifest read.
+/// Deeper checks (IVF centroids, quantizer codebooks) belong at the worker,
+/// where the merge already parses every shard's metadata at no extra I/O.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMergeFingerprint {
     /// `index_details.type_url`, which names the index family.
@@ -170,10 +154,9 @@ impl From<&IndexMergeFile> for IndexFile {
 /// One source segment of a merge, with everything needed to find it again.
 ///
 /// [`Self::store_prefix`] and [`Self::path`] together are the base-aware
-/// location. A shallow clone keeps `base_id` on its imported segments and
-/// resolves them under the base dataset's index directory, not the clone's, so
-/// a task that recorded only a UUID would be non-executable for exactly the
-/// segments a clone did not rewrite.
+/// location. A shallow clone resolves imported segments under the base
+/// dataset's index directory, not the clone's, so a UUID alone would not
+/// locate exactly the segments a clone did not rewrite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMergeSource {
     /// Physical segment id.
@@ -473,12 +456,10 @@ impl IndexMergeResult {
 
 /// Reject output ids that could alias another segment.
 ///
-/// Manifest construction removes every existing entry whose id appears in the
-/// new segments, independently of the removal list, and cleanup deletes the
-/// directories of losing attempts by id. An output id equal to a live segment,
-/// a planned source, or another attempt's output therefore either drops
-/// coverage silently or deletes files the commit just published. Every id in
-/// the round, winner or loser, must be globally fresh.
+/// Manifest construction drops any existing entry whose id a new segment
+/// reuses, and cleanup deletes losing attempts by id, so an aliased id either
+/// silently removes coverage or deletes just-published files. Every id in the
+/// round, winner or loser, must be globally fresh.
 pub(crate) fn check_output_identity(
     winners: &[IndexMergeResult],
     orphaned: &[IndexMergeResult],
@@ -514,13 +495,11 @@ pub(crate) fn fragment_ids(bitmap: Option<&RoaringBitmap>) -> Vec<u32> {
 
 /// Keep one result per task, deterministically.
 ///
-/// Two attempts of the same task merged the same sources at the same pinned
-/// version, so their outputs are interchangeable and there is nothing to
-/// choose on merit. Ordering by attempt id makes the choice reproducible from
-/// the results alone: every coordinator that sees the same reports commits the
-/// same segment, which is what lets a retried round be replayed. Returns the
-/// winners in task order alongside the outputs that lost, whose files are
-/// orphaned and can be deleted.
+/// Attempts of one task merged the same sources at the same pinned version,
+/// so their outputs are interchangeable. Choosing the lowest attempt id makes
+/// the winner a pure function of the reports, so every coordinator replaying
+/// the same round commits the same segment. Returns winners in task order
+/// plus the losing outputs, whose orphaned files can be deleted.
 pub(crate) fn reconcile_attempts(
     results: Vec<IndexMergeResult>,
 ) -> (Vec<IndexMergeResult>, Vec<IndexMergeResult>) {

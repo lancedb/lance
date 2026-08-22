@@ -1987,13 +1987,10 @@ impl<'a> TransactionRebase<'a> {
         } = &mut self.transaction.operation
         {
             // An exact-source commit is a compare-and-swap on its removal set, and
-            // this is the last point that sees the manifest the current attempt will
-            // publish onto. The per-operation checks above cannot express it: a
-            // rebased `Merge` carries no baseline to prove an indexed column was
-            // rewritten in place, so it is classified compatible and would carry
-            // stale coverage through. Re-proving every removed source here, on every
-            // attempt, closes that window. Prune-and-proceed behavior for ordinary
-            // `CreateIndex` commits is unchanged.
+            // this is the last point that sees the manifest the current attempt
+            // publishes onto. Per-operation checks cannot express it (a rebased
+            // `Merge` shows no evidence an indexed column was rewritten in place),
+            // so re-prove every removed source here, on every attempt.
             let exact_source_cas = self
                 .transaction
                 .transaction_properties

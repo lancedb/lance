@@ -2743,10 +2743,9 @@ impl Dataset {
 
     /// Plan a distributed merge and return the plan as JSON.
     ///
-    /// The plan crosses a driver-to-executor boundary, so it is handed over as
-    /// JSON rather than as Python objects: a string pickles and ships without
-    /// the executor needing the same Lance object graph, and every validation
-    /// rule stays in the Rust core where the worker and the commit share it.
+    /// JSON rather than Python objects because the plan crosses a
+    /// driver-to-executor boundary: a string pickles and ships without a
+    /// shared object graph, and all validation stays in the Rust core.
     #[pyo3(signature = (index_name, segments_per_task, max_segments_to_merge = None))]
     fn plan_index_segment_merge(
         &self,

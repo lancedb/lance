@@ -347,43 +347,33 @@ pub trait DatasetIndexExt {
 
     /// Plan a distributed merge of an index's segments.
     ///
-    /// Partitions the segments of the index named `index_name` into groups of
-    /// `segments_per_task` (at least 2). Each group becomes one
-    /// [`IndexMergeTask`](crate::index::segment_merge::IndexMergeTask): a worker runs it with
-    /// [`Self::execute_index_merge_task`] and the coordinator publishes every
-    /// resulting segment with [`Self::commit_index_merge_results`]. Groups
-    /// cover disjoint fragment sets, so workers never contend.
+    /// Groups the segments of `index_name` into tasks of `segments_per_task`
+    /// (at least 2). Workers run tasks with [`Self::execute_index_merge_task`]
+    /// and the coordinator publishes the results with
+    /// [`Self::commit_index_merge_results`]. Tasks cover disjoint fragments,
+    /// so workers never contend.
     ///
-    /// The returned [`IndexMergePlan`] pins the dataset version it was built
-    /// at, the exact source segment UUIDs, the base-aware location of each one,
-    /// the coverage each one claimed, and a fingerprint of the index model.
-    /// That provenance is what makes the round safe to publish later: workers
-    /// reopen at the pinned version and revalidate before writing, and the
-    /// commit compare-and-swaps the exact source set instead of re-deriving
-    /// what to replace from whatever the coordinator's coverage says by then.
+    /// The returned [`IndexMergePlan`] pins the read version, the exact source
+    /// segment UUIDs, each source's base-aware location and claimed coverage,
+    /// and a fingerprint of the index model. Workers revalidate against that
+    /// snapshot, and the commit compare-and-swaps the exact source set, which
+    /// is what makes a plan built at version V safe to publish at V+n.
     ///
-    /// `max_segments_to_merge` bounds how many segments are planned, taking
-    /// the newest ones first, mirroring
-    /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge).
-    /// `None` plans every segment, which consolidates the full index and
-    /// rewrites the oldest (typically largest) segment as well. Segments with
-    /// no effective fragment coverage, meaning deferred builds or coverage naming
-    /// only fragments that no longer exist, are skipped before the bound is
-    /// applied, so the bound counts qualifying segments only. A legacy segment
-    /// without a fragment bitmap is rejected with an error, because merging
-    /// requires fragment coverage. That rejection is evaluated over the whole
-    /// segment set before the bound selects a suffix, so an index whose base
-    /// segment is legacy cannot be planned at all until it is rebuilt. The
-    /// commit path scans every same-name segment and would reject such a plan
-    /// anyway. A trailing leftover group of one segment borrows a segment back
-    /// from the previous task when `segments_per_task >= 3`, so both stay
-    /// mergeable and within the bound. With `segments_per_task == 2` there is
-    /// nothing to borrow and the leftover folds into a task of three. Every
-    /// task therefore merges at least two segments. Returns a plan with no
-    /// tasks when fewer than two segments qualify.
+    /// `max_segments_to_merge` bounds the plan to the newest qualifying
+    /// segments, mirroring
+    /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge),
+    /// and `None` plans every segment. Segments with no effective coverage
+    /// are skipped before the bound applies.
     ///
-    /// One bounded fan-out round commits several terminal segments. Reducing
-    /// the index to a single root takes another round against a fresh plan.
+    /// Any legacy segment without a fragment bitmap anywhere in the index
+    /// fails planning, because merging requires fragment coverage. Rebuild
+    /// the index first.
+    ///
+    /// Every task merges at least two segments: a trailing leftover of one
+    /// borrows a segment from the previous task, or folds into a task of three
+    /// when `segments_per_task == 2` leaves nothing to borrow. Fewer than two
+    /// qualifying segments yield a plan with no tasks. Reducing the index to a
+    /// single segment can take several rounds, each against a fresh plan.
     ///
     /// # Examples
     ///
@@ -395,8 +385,7 @@ pub trait DatasetIndexExt {
     /// let plan = dataset
     ///     .plan_index_segment_merge("vec_idx", 32, Some(1000))
     ///     .await?;
-    /// // Workers: one merge per task (fanned out by the scheduler, each on its
-    /// // own dataset handle reopened at the plan's read version).
+    /// // Workers: one merge per task, normally fanned out by a scheduler.
     /// let mut results = Vec::with_capacity(plan.tasks.len());
     /// for task in &plan.tasks {
     ///     results.push(dataset.execute_index_merge_task(&plan, task.task_id).await?);
@@ -407,8 +396,8 @@ pub trait DatasetIndexExt {
     /// # }
     /// ```
     ///
-    /// Defaulted rather than required: `DatasetIndexExt` is public and unsealed, so a
-    /// required method would source-break downstream implementations.
+    /// Defaulted rather than required because `DatasetIndexExt` is public and
+    /// unsealed, so a required method would source-break implementations.
     async fn plan_index_segment_merge(
         &self,
         _index_name: &str,
@@ -424,16 +413,13 @@ pub trait DatasetIndexExt {
     /// Run one task of an [`IndexMergePlan`] and report what it produced.
     ///
     /// Reopens the dataset at the plan's pinned read version when this handle
-    /// is at a different one, then validates the task against that snapshot
-    /// before writing anything: contract version, index family and on-disk
-    /// version, field declaration, per-source dataset version, base-aware
-    /// location, and the coverage each source claimed when it was planned. A
-    /// source that has moved, changed coverage, or disappeared fails here
-    /// rather than producing a segment the commit would have to reject.
+    /// is elsewhere, then validates the task against that snapshot before
+    /// writing: contract version, index model fingerprint, and each source's
+    /// dataset version, base-aware location, and planned coverage. A changed
+    /// source fails here rather than producing a doomed segment.
     ///
-    /// Deeper model checks, covering metric type, IVF centroids, quantizer codebooks
-    /// and rotation matrices, are made by the merge itself, which already
-    /// parses every shard's metadata and cross-checks it at no extra I/O.
+    /// Deeper model checks (metric type, IVF centroids, quantizer codebooks)
+    /// happen inside the merge, which already parses every shard's metadata.
     ///
     /// Safe to retry: each attempt writes its own output segment and reports a
     /// distinct [`IndexMergeResult::attempt_id`], and the commit reconciles
@@ -451,38 +437,26 @@ pub trait DatasetIndexExt {
 
     /// Publish the merged segments of one fan-out round.
     ///
-    /// Compare-and-swaps the exact set of source segment UUIDs named by
-    /// `results`. Every source must still be present, under the same base, at
-    /// the same dataset version, with the same coverage it had when the plan
-    /// was built. A concurrent indexed-field `Update` or in-place `Merge`
-    /// prunes coverage out of the segments it invalidates, so a coverage change
-    /// is exactly the signal that these merged segments would republish stale
-    /// entries. The commit fails with an actionable error and the caller
-    /// re-plans instead of the commit re-deriving replacements from coverage.
-    /// The handle is first advanced to the latest version, so the handle that
-    /// planned the round commits it safely and sees every mutation of the
-    /// fan-out window rather than only those its own snapshot happened to know.
-    /// The same exact-source check runs again during commit conflict
-    /// resolution against the manifest each attempt actually publishes onto,
-    /// so a mutation landing while the commit is in flight fails it too.
+    /// Advances this handle to the latest version, then compare-and-swaps the
+    /// exact source segments named by `results`: each must still exist with
+    /// the base, dataset version, and coverage it was planned with. Coverage
+    /// pruned by a concurrent indexed-field `Update` or in-place `Merge` means
+    /// the output would republish stale entries, so the commit asks to re-plan.
     ///
-    /// Worker reports are input from outside the trust boundary. Every output
-    /// id in the round must be globally fresh, and each reported file is
-    /// verified against the object store, by path, size, and the Lance file
-    /// magic, before its metadata replaces readable sources.
+    /// The transaction carries the `lance.index.merge.exact_source_cas`
+    /// property, so conflict resolution re-proves the removed sources against
+    /// the manifest each commit attempt publishes onto. A mutation landing
+    /// while the commit is in flight fails it too.
     ///
-    /// `results` may cover a subset of the plan's tasks. Tasks are disjoint by
-    /// construction, so a round survives a failed worker: the merges that
-    /// succeeded are published and the rest can be retried against a fresh
-    /// plan. Several attempts of the same task are reconciled to one winner by
-    /// lowest attempt id, which makes the outcome a function of the reports
-    /// alone rather than of their arrival order.
+    /// Worker reports come from outside the trust boundary: every output id
+    /// must be globally fresh, and each reported file is verified against the
+    /// object store by path, size, and Lance file magic before publishing.
     ///
-    /// Cleanup covers exactly the losing attempts among `results`. Output that
-    /// no result reported, such as a worker that wrote a segment and then died or an
-    /// attempt whose report this commit rejected, is unreachable from any
-    /// manifest and is reclaimed by `cleanup_old_versions` under the same
-    /// age-based rules as any other uncommitted index directory.
+    /// `results` may cover a subset of the plan's tasks, so a round survives a
+    /// failed worker. Duplicate attempts of a task reconcile to one winner by
+    /// lowest attempt id, making the outcome a function of the reports alone.
+    /// Losing attempts among `results` are cleaned up after the commit, and
+    /// unreported output is reclaimed later by `cleanup_old_versions`.
     async fn commit_index_merge_results(
         &mut self,
         _plan: &IndexMergePlan,

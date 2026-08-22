@@ -109,11 +109,9 @@ pub use lance_index::IndexDescription;
 
 /// Directory holding one segment's files, resolved through its base path.
 ///
-/// A shallow clone keeps `base_id` on the segments it imported rather than
-/// rewrote, and those live under the base dataset's index directory. Resolving
-/// every segment under the current dataset's directory would make an imported
-/// segment unreadable, which is what made some otherwise valid merge plans
-/// non-executable for clones.
+/// Segments a shallow clone imported carry `base_id` and live under the base
+/// dataset's index directory, so resolving them under the current dataset
+/// would make them unreadable.
 async fn segment_files_dir(dataset: &Dataset, segment: &IndexMetadata) -> Result<(String, Path)> {
     let store = dataset.object_store_for_index(segment).await?;
     let dir = dataset
@@ -199,10 +197,9 @@ async fn resolve_merge_sources(
 
 /// Base-aware source directories for a vector segment merge.
 ///
-/// The merge reads every shard through one object store, so sources spread
-/// across stores are rejected up front with a message naming both, rather than
-/// failing later as a missing file. Sources under a *different base in the same
-/// store*, which is the shallow-clone case, resolve normally.
+/// The merge reads every shard through one object store, so cross-store
+/// sources are rejected up front rather than failing later as a missing file.
+/// A different base in the same store, the shallow-clone case, resolves fine.
 async fn resolve_vector_source_dirs(
     dataset: &Dataset,
     segments: &[IndexMetadata],
@@ -225,12 +222,9 @@ async fn resolve_vector_source_dirs(
 
 /// Verify a winning attempt's reported files against the object store.
 ///
-/// The report is worker input from outside the trust boundary, and its file
-/// list becomes durable manifest metadata. The store listing of the output
-/// directory is the canonical truth: the reported paths and sizes must match
-/// it exactly, and every file must end with the Lance file magic, so a
-/// fabricated, truncated, or partially uploaded output is rejected before its
-/// metadata replaces readable sources.
+/// The report is untrusted worker input whose file list becomes durable
+/// manifest metadata, so the store listing is the truth: exact path and size
+/// match, plus the trailing Lance file magic on every file.
 async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResult) -> Result<()> {
     let dir = dataset.indices_dir().join(result.output.uuid.to_string());
     let mut listed = match list_index_files_with_sizes(&dataset.object_store, &dir).await {
@@ -290,9 +284,8 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
 
 /// Best-effort removal of the output directories of losing merge attempts.
 ///
-/// Failure here leaks storage but never correctness: nothing in any manifest
-/// references these files. Warn and continue rather than fail a commit that has
-/// already succeeded.
+/// No manifest references these files, so failure only leaks storage. Warn
+/// rather than fail a commit that already succeeded.
 async fn delete_orphaned_merge_outputs(dataset: &Dataset, orphaned: &[IndexMergeResult]) {
     for result in orphaned {
         let dir = dataset.indices_dir().join(result.output.uuid.to_string());
@@ -2089,10 +2082,9 @@ impl DatasetIndexExt for Dataset {
             return Err(Error::index_not_found(format!("name={}", index_name)));
         }
 
-        // Reject unknown coverage across the *whole* segment set before selecting a
-        // suffix. `commit_index_merge_results` cannot compare-and-swap a segment whose
-        // coverage it cannot read, so bounding first could hand back a plan whose
-        // workers all succeed and whose commit is guaranteed to fail.
+        // Reject missing coverage across the whole segment set before bounding to a
+        // suffix: `commit_index_merge_results` cannot compare-and-swap a segment whose
+        // coverage it cannot read, so its failure would be guaranteed.
         if let Some(legacy) = all_segments
             .iter()
             .find(|segment| segment.fragment_bitmap.is_none())
@@ -2109,10 +2101,9 @@ impl DatasetIndexExt for Dataset {
             .map(|segment| segment.uuid)
             .collect::<Vec<_>>();
 
-        // Coverage must be judged against fragments that still exist. A segment whose
-        // fragments were all compacted away is dormant: it holds rows no live fragment
-        // claims, and merging it would resurrect stale vectors rather than drop them.
-        // The raw bitmap cannot see this, because it still names the removed fragments.
+        // Judge coverage against fragments that still exist. A segment whose fragments
+        // were all compacted away is dormant and merging it would resurrect stale
+        // vectors, but its raw bitmap still names the removed fragments.
         let mut segments: Vec<IndexMetadata> = all_segments
             .into_iter()
             .filter(|segment| {
@@ -2139,9 +2130,8 @@ impl DatasetIndexExt for Dataset {
                 plan_id,
                 index_name: index_name.to_owned(),
                 read_version: self.manifest.version,
-                // Nothing qualifies, so there is no model to pin. Report what the
-                // single leftover segment declares when it has details at all,
-                // purely so the plan is legible.
+                // Nothing qualifies, so there is no model to pin. Report the
+                // leftover segment's fingerprint, if any, purely for legibility.
                 fingerprint: segments
                     .first()
                     .and_then(|segment| IndexMergeFingerprint::try_from_metadata(segment).ok())
@@ -2152,10 +2142,9 @@ impl DatasetIndexExt for Dataset {
             });
         }
 
-        // Match `merge_existing_index_segments` exactly: it compares the keyed field and
-        // requires identical carried columns, not equality of the whole `fields` vector.
-        // The fingerprint keeps both, plus the detail type and on-disk version, so a
-        // worker can prove its snapshot still describes the model that was planned.
+        // Match `merge_existing_index_segments` exactly: it compares the keyed field
+        // and requires identical carried columns, not whole-`fields` equality. The
+        // fingerprint lets a worker prove its snapshot still matches the planned model.
         let fingerprint = IndexMergeFingerprint::try_from_metadata(&segments[0])?;
         for segment in &segments[1..] {
             fingerprint.check(segment, "plan_index_segment_merge")?;
@@ -2165,11 +2154,10 @@ impl DatasetIndexExt for Dataset {
             .chunks(segments_per_task)
             .map(|chunk| chunk.to_vec())
             .collect();
-        // A trailing group of one cannot be merged on its own. Folding it into the
-        // previous task would make `segments_per_task` a soft bound and can erase all
-        // parallelism. With k=32 and N=33 the whole plan collapses to one 33-input
-        // task. Borrowing one segment back keeps both tasks mergeable and within the
-        // configured bound. Only k=2 leaves no room to borrow and needs a task of three.
+        // A trailing group of one cannot merge alone. Folding it into the previous
+        // task can erase all parallelism (k=32, N=33 collapses to one 33-input task),
+        // so borrow one segment back instead, keeping both tasks within the bound.
+        // Only k=2 leaves no room to borrow and needs a task of three.
         if chunks.len() > 1
             && let Some(mut leftover) = chunks.pop_if(|task| task.len() == 1)
         {
@@ -2227,10 +2215,9 @@ impl DatasetIndexExt for Dataset {
         let task = plan.task(task_id)?;
         IndexMergePlan::check_contract_version(task.contract_version, "index merge task")?;
 
-        // A worker is handed a plan, not a snapshot. Reopening at the pinned version is
-        // what makes the validation below mean anything: validating against whatever
-        // version this handle happens to sit at would accept a source whose coverage was
-        // pruned after planning, and then merge the pre-pruning contents anyway.
+        // A worker is handed a plan, not a snapshot. Validating at whatever version
+        // this handle sits at could accept a source whose coverage was pruned after
+        // planning and then merge the pre-pruning contents anyway.
         let pinned;
         let snapshot = if self.manifest.version == plan.read_version {
             self
@@ -2292,16 +2279,14 @@ impl DatasetIndexExt for Dataset {
         let (results, orphaned) = segment_merge::reconcile_attempts(results);
         segment_merge::check_disjoint_outputs(&results)?;
 
-        // Refresh to the live manifest before validating. The natural flow plans and
-        // commits through the same handle, which would otherwise still sit at the
-        // plan's read version, and a compare-and-swap against that snapshot would
-        // compare the plan with itself and miss every mutation of the fan-out window.
+        // Refresh before validating. The natural flow plans and commits through one
+        // handle still sitting at the plan's read version, and a compare-and-swap
+        // against that snapshot would compare the plan with itself.
         self.checkout_latest().await?;
 
-        // Every output id in the round must be globally fresh, losers included.
-        // Manifest construction drops any existing segment whose id a new segment
-        // reuses, and cleanup deletes losing attempts by id, so a colliding id
-        // either silently removes coverage or deletes just-published files.
+        // Every output id, losers included, must be globally fresh. Manifest
+        // construction drops any existing segment with a reused id and cleanup
+        // deletes losers by id, so a collision removes coverage or deletes files.
         let live_segment_ids = self
             .load_indices()
             .await?
@@ -2310,11 +2295,10 @@ impl DatasetIndexExt for Dataset {
             .collect::<HashSet<_>>();
         segment_merge::check_output_identity(&results, &orphaned, &live_segment_ids)?;
 
-        // Compare-and-swap the exact source set. Re-deriving replacements from the
-        // coordinator's current coverage is what let a merge planned at version V
-        // re-add a fragment that an indexed-field Update invalidated at V+1: the merged
-        // segment carries the pre-update entries, and republishing them suppresses the
-        // flat fallback that would otherwise have answered for that fragment.
+        // Compare-and-swap the exact source set. Re-deriving replacements from
+        // current coverage would let a merge planned at V republish entries an
+        // indexed-field Update invalidated at V+1, suppressing the flat fallback
+        // that should answer for that fragment.
         let current = self.load_indices_by_name(&plan.index_name).await?;
         let current_by_uuid = current
             .iter()
@@ -2379,17 +2363,11 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        // The checks above ran against the refreshed manifest, so that is the
-        // version this transaction read. Declaring the plan's version instead
-        // would replay the whole fan-out window through the conflict resolver,
-        // whose same-index-name rule then permanently rejects the round whenever
-        // a routine delta commit, or an earlier partial commit of this very plan,
-        // landed mid-flight. The merged content needs no replay for safety: the
-        // compare-and-swap proves the sources are unchanged, and a merged segment
-        // is exactly as current as the committed sources it replaces. Mutations
-        // landing after the refresh are handled by the exact-source property,
-        // which makes the conflict resolver's finish step re-validate the removal
-        // set against the manifest each commit attempt actually publishes onto.
+        // Declare the refreshed version the checks above validated against. The
+        // plan's version would replay the fan-out window through the conflict
+        // resolver, whose same-index-name rule rejects the round after any delta
+        // commit. Safety needs no replay: the compare-and-swap covers the window and
+        // the exact-source property re-validates the removal set on every rebase.
         let transaction = TransactionBuilder::new(
             self.manifest.version,
             Operation::CreateIndex {
@@ -2405,9 +2383,8 @@ impl DatasetIndexExt for Dataset {
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Only after the winners are durable: a losing attempt's files are unreachable
-        // from any manifest, but deleting them before the commit would race a retry that
-        // still names them.
+        // Delete losers only after the winners are durable: deleting before the
+        // commit would race a retry that still names these files.
         delete_orphaned_merge_outputs(self, &orphaned).await;
         Ok(())
     }
@@ -9165,12 +9142,9 @@ mod tests {
         );
     }
 
-    /// A trailing group of one segment cannot be merged alone. Folding it into the
-    /// previous task makes `segments_per_task` a soft bound and, at the sizes this API
-    /// exists for, destroys the parallelism it was asked to create: with k=32 and N=33
-    /// the entire plan collapses into a single 33-input task. For k>=3 the planner
-    /// borrows one segment back instead, keeping both tasks mergeable and within the
-    /// configured bound. Only k=2 has nothing to borrow and must emit a task of three.
+    /// A leftover singleton must not collapse the plan's parallelism. For k>=3 the
+    /// planner borrows one segment back from the previous task, keeping both tasks
+    /// within the bound. Only k=2 has nothing to borrow and must emit a task of three.
     #[tokio::test]
     async fn test_plan_index_segment_merge_preserves_parallelism_on_leftover() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -9284,11 +9258,10 @@ mod tests {
         }
     }
 
-    /// Deferred build placeholders (empty fragment bitmap) are skipped by the
-    /// planner. The companion rejection of legacy segments without any
-    /// fragment bitmap cannot be constructed here: `migrate_indices` in the
-    /// commit path backfills missing bitmaps, so a `None` bitmap only occurs
-    /// in manifests written by very old Lance versions.
+    /// The planner skips segments with no effective coverage. The companion
+    /// rejection of a `None` bitmap cannot be built here: `migrate_indices`
+    /// backfills missing bitmaps on commit, so `None` only occurs in manifests
+    /// written by very old Lance versions.
     #[tokio::test]
     async fn test_plan_index_segment_merge_coverage_edge_cases() {
         use crate::dataset::transaction::{Operation, Transaction};
@@ -9345,10 +9318,9 @@ mod tests {
             b"deferred",
         )
         .await;
-        // Dormant: a NON-empty bitmap that names only a fragment the dataset no
-        // longer has. The raw bitmap cannot distinguish this from live coverage, so a
-        // planner filtering on it would hand this segment to a worker and resurrect
-        // stale vectors. Only `effective_fragment_bitmap` sees that it covers nothing.
+        // Dormant: a non-empty bitmap naming only a fragment the dataset no longer
+        // has. Filtering on the raw bitmap would plan this segment and resurrect
+        // stale vectors, only `effective_fragment_bitmap` sees it covers nothing.
         let dormant = write_vector_segment_metadata(
             &dataset,
             "vector_idx",
@@ -9451,9 +9423,8 @@ mod tests {
 
     /// Bytes of a fabricated merge output file.
     ///
-    /// The commit verifies each reported file against the store, including the
-    /// trailing Lance file magic, so a stub that should reach the commit must
-    /// write these bytes rather than arbitrary ones.
+    /// The commit checks the trailing Lance file magic, so a stub that should
+    /// pass verification must end with it.
     fn stub_output_content() -> Vec<u8> {
         [b"merged".as_slice(), lance_file::format::MAGIC.as_slice()].concat()
     }
@@ -9476,11 +9447,9 @@ mod tests {
 
     /// A worker report for `task_id` that never ran a merge.
     ///
-    /// The commit path validates and rewrites metadata without decoding index
-    /// contents, so a fabricated report exercises it exactly as a real one
-    /// would while keeping these tests independent of any index format. A test
-    /// expecting the commit to succeed must also call [`write_stub_output_file`]
-    /// so the store holds what the report claims.
+    /// The commit path never decodes index contents, so a fabricated report
+    /// exercises it exactly as a real one would. A test expecting the commit to
+    /// succeed must also call [`write_stub_output_file`].
     fn stub_merge_result(
         plan: &IndexMergePlan,
         task_id: u32,
@@ -9516,9 +9485,8 @@ mod tests {
         }
     }
 
-    /// How a concurrent writer invalidates the entries a planned merge is about
-    /// to republish. Both shapes prune index coverage, and both leave the
-    /// merged segment carrying the pre-mutation entries for that fragment.
+    /// How a concurrent writer invalidates entries a planned merge would
+    /// republish. Both shapes prune index coverage for the mutated fragment.
     #[derive(Debug, Clone, Copy)]
     enum ConcurrentMutation {
         /// `Operation::Update` naming the indexed field in `fields_modified`.
@@ -9573,21 +9541,11 @@ mod tests {
             .unwrap();
     }
 
-    /// A merge planned at version V must not be publishable once a concurrent
-    /// writer has invalidated one of its sources.
-    ///
-    /// This is the failure the compare-and-swap exists for. `CreateIndex` does
-    /// not prune coverage, so a merged segment built from version-V contents and
-    /// committed at V+1 re-adds the fragment the mutation had just removed from
-    /// the index. Coverage is then complete again, the flat fallback that would
-    /// have answered for that fragment is suppressed, and the query reads
-    /// pre-mutation vectors: false negatives and wrong ANN ranking, silently.
-    ///
-    /// Every case runs twice. With `stale_handle` the mutation lands through a
-    /// separate handle while the committing handle still sits at the plan's
-    /// read version, which is the natural coordinator flow. The commit must
-    /// refresh to the live manifest before validating, or the compare-and-swap
-    /// compares the plan with itself and the stale merge is published.
+    /// A merge planned at version V must not be publishable after a concurrent
+    /// writer invalidates a source: `CreateIndex` does not prune coverage, so the
+    /// stale segment would suppress the flat fallback and silently serve
+    /// pre-mutation vectors. The `stale_handle` variant only fails because the
+    /// commit refreshes to the live manifest before its compare-and-swap.
     #[rstest]
     #[case::update_drops_source(
         ConcurrentMutation::IndexedFieldUpdate,
@@ -9689,10 +9647,9 @@ mod tests {
 
     /// The same round replayed twice, plus one worker that never reported.
     ///
-    /// Duplicate attempts are reconciled to the lowest attempt id so that any
-    /// coordinator replaying the same reports publishes the same segment, the
-    /// losing attempt's files are deleted, and the tasks that did report commit
-    /// without waiting for the one that did not.
+    /// Duplicate attempts reconcile to the lowest attempt id, so any replay
+    /// publishes the same segment, losing files are deleted, and reported tasks
+    /// commit without waiting for the missing one.
     #[tokio::test]
     async fn test_commit_index_merge_results_reconciles_attempts_and_commits_partial_round() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -9776,12 +9733,10 @@ mod tests {
             "the published segment's files must survive the cleanup"
         );
 
-        // The worker that died reports late, against the same plan. Its sources
-        // are untouched, so the round's remainder commits in a second batch.
-        // This is only possible because the commit's transaction declares the
-        // refreshed version it validated against: declaring the plan's version
-        // would replay the first batch's CreateIndex and hard-conflict on the
-        // shared index name.
+        // The dead worker reports late against the same plan and commits as a
+        // second batch. This works only because the transaction declares the
+        // refreshed version: the plan's version would replay the first batch's
+        // CreateIndex and hard-conflict on the shared index name.
         let late_output = Uuid::new_v4();
         write_stub_output_file(&dataset, late_output).await;
         let late = stub_merge_result(&plan, 1, late_output, Uuid::new_v4());
@@ -9839,15 +9794,10 @@ mod tests {
         (dataset, segments)
     }
 
-    /// A same-name index commit that touches none of the planned sources must
-    /// not fail the round.
-    ///
-    /// Delta segments keep landing on an actively written table while workers
-    /// merge, through the same `CreateIndex` operation this commit uses. The
-    /// compare-and-swap already proves such a commit compatible, so dragging it
-    /// back through the conflict resolver's same-index-name rule, which is what
-    /// declaring the plan's read version does, would deterministically brick
-    /// every round that overlapped one and discard all the worker compute.
+    /// A same-name index commit touching none of the planned sources must not
+    /// fail the round. Delta segments land continuously while workers merge, and
+    /// the compare-and-swap proves them compatible. Declaring the plan's read
+    /// version would hit the resolver's same-index-name rule and brick the round.
     #[tokio::test]
     async fn test_commit_index_merge_results_survives_unrelated_same_name_commit() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -9923,11 +9873,8 @@ mod tests {
 
     /// An output id that reuses a planned or committed segment id is rejected.
     ///
-    /// Manifest construction removes every existing entry whose id appears in
-    /// the new segments, independently of the removal list. Publishing task 0's
-    /// output under a source id of untouched task 1 would silently drop that
-    /// task's fragment from index coverage, and reusing another index's id
-    /// would drop that index's segment.
+    /// Manifest construction drops any existing entry whose id a new segment
+    /// reuses, so an aliased id would silently remove another segment's coverage.
     #[tokio::test]
     async fn test_commit_index_merge_results_rejects_aliased_output_id() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -10008,10 +9955,8 @@ mod tests {
 
     /// Two attempts of one task naming the same output id cannot be reconciled.
     ///
-    /// Reconciliation would pick one as the winner and orphan the other, and
-    /// cleanup deletes orphans by id, so accepting the pair would publish a
-    /// segment and then delete its files. The commit must reject the round and
-    /// leave the reported directory untouched.
+    /// Cleanup deletes orphaned attempts by id, so accepting the pair would
+    /// publish a segment and then delete its files.
     #[tokio::test]
     async fn test_commit_index_merge_results_rejects_conflicting_attempt_outputs() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -10065,10 +10010,8 @@ mod tests {
 
     /// A report whose files the store cannot vouch for is rejected.
     ///
-    /// The reported file list becomes durable manifest metadata, so the store
-    /// listing is the canonical truth: a missing file, a size that disagrees
-    /// with the report, or content without the Lance file magic all mean the
-    /// output is not the readable segment the report claims.
+    /// A missing file, a disagreeing size, or a missing Lance file magic all
+    /// mean the output is not the readable segment the report claims.
     #[rstest]
     #[case::missing_file(None, "the report does not describe")]
     #[case::size_mismatch(Some(b"merged".to_vec()), "the report does not describe")]
@@ -10124,15 +10067,10 @@ mod tests {
     }
 
     /// A mutation landing after the commit's validation but before the manifest
-    /// write must still fail the publication.
-    ///
-    /// `commit_index_merge_results` validates against the freshest manifest it
-    /// can see, but the manifest write races every other writer. The conflict
-    /// resolver classifies a rebased in-place `Merge` as compatible with
-    /// `CreateIndex`, so without the exact-source re-check in the resolver's
-    /// finish step the stale merged coverage would be published. The window is
-    /// simulated by building the commit's transaction, letting the mutation
-    /// land through a second handle, and only then committing the transaction.
+    /// write must still fail. The resolver treats a rebased in-place `Merge` as
+    /// compatible with `CreateIndex`, so only the exact-source re-check in its
+    /// finish step catches this window, simulated by mutating between building
+    /// the transaction and committing it.
     #[rstest]
     #[case::indexed_field_update(ConcurrentMutation::IndexedFieldUpdate)]
     #[case::in_place_merge(ConcurrentMutation::InPlaceMerge)]
@@ -10215,10 +10153,9 @@ mod tests {
         );
     }
 
-    /// A shallow clone keeps `base_id` on the segments it imported rather than
-    /// rewrote, and those files live under the *base* dataset's index directory.
-    /// A plan that recorded only UUIDs, or a merge that resolved every UUID under
-    /// the current dataset, would be non-executable for exactly those segments.
+    /// Imported shallow-clone segments live under the base dataset's index
+    /// directory, so a plan or merge resolving every UUID under the current
+    /// dataset would be non-executable for exactly those segments.
     #[tokio::test]
     async fn test_index_merge_sources_are_base_aware() {
         let test_dir = tempfile::tempdir().unwrap();
