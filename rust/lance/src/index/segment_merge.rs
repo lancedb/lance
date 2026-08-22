@@ -496,27 +496,40 @@ pub(crate) fn fragment_ids(bitmap: Option<&RoaringBitmap>) -> Vec<u32> {
 /// Keep one result per task, deterministically.
 ///
 /// Attempts of one task merged the same sources at the same pinned version,
-/// so their outputs are interchangeable. Choosing the lowest attempt id makes
-/// the winner a pure function of the reports, so every coordinator replaying
-/// the same round commits the same segment. Returns winners in task order
-/// plus the losing outputs, whose orphaned files can be deleted.
+/// so their outputs are interchangeable and the lowest attempt id wins, making
+/// the winner a pure function of the reports. Identical re-deliveries of one
+/// attempt are dropped, but one attempt id carrying two different payloads is
+/// an error: neither report can be trusted. Returns winners in task order.
 pub(crate) fn reconcile_attempts(
     results: Vec<IndexMergeResult>,
-) -> (Vec<IndexMergeResult>, Vec<IndexMergeResult>) {
-    let mut winners: Vec<IndexMergeResult> = Vec::with_capacity(results.len());
-    let mut orphaned = Vec::new();
+) -> Result<(Vec<IndexMergeResult>, Vec<IndexMergeResult>)> {
+    let mut distinct: Vec<IndexMergeResult> = Vec::with_capacity(results.len());
     for result in results {
+        match distinct
+            .iter()
+            .find(|prior| prior.task_id == result.task_id && prior.attempt_id == result.attempt_id)
+        {
+            Some(prior) if *prior == result => continue,
+            Some(_) => {
+                return Err(Error::invalid_input(format!(
+                    "index merge results carry two different payloads for attempt {} of \
+                     task {}; conflicting reports cannot be reconciled, resubmit the \
+                     genuine one",
+                    result.attempt_id, result.task_id
+                )));
+            }
+            None => distinct.push(result),
+        }
+    }
+    let mut winners: Vec<IndexMergeResult> = Vec::with_capacity(distinct.len());
+    let mut orphaned = Vec::new();
+    for result in distinct {
         match winners
             .iter_mut()
             .find(|winner| winner.task_id == result.task_id)
         {
             None => winners.push(result),
             Some(winner) => {
-                // The same attempt reported twice is a duplicate delivery, not a
-                // second attempt: it names files that are still in use.
-                if winner.attempt_id == result.attempt_id {
-                    continue;
-                }
                 if result.attempt_id < winner.attempt_id {
                     orphaned.push(std::mem::replace(winner, result));
                 } else {
@@ -526,7 +539,7 @@ pub(crate) fn reconcile_attempts(
         }
     }
     winners.sort_by_key(|result| result.task_id);
-    (winners, orphaned)
+    Ok((winners, orphaned))
 }
 
 /// Reject a set of results that cannot be committed as one round.
@@ -604,7 +617,8 @@ mod tests {
                 .into_iter()
                 .map(|(task, attempt, output)| result(task, uuid(attempt), uuid(output)))
                 .collect(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             winners
                 .iter()
@@ -631,6 +645,32 @@ mod tests {
         assert!(
             err.to_string().contains("overlap on fragment 2"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// One attempt id carrying two different payloads is unresolvable, even
+    /// when its earlier report was already displaced by a lower attempt.
+    #[test]
+    fn test_reconcile_attempts_rejects_conflicting_payloads() {
+        let err = reconcile_attempts(vec![
+            result(0, uuid(1), uuid(10)),
+            result(0, uuid(1), uuid(11)),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("two different payloads"),
+            "unexpected error: {err}"
+        );
+
+        let err = reconcile_attempts(vec![
+            result(0, uuid(2), uuid(20)),
+            result(0, uuid(1), uuid(10)),
+            result(0, uuid(2), uuid(21)),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("two different payloads"),
+            "a displaced attempt must still veto a differing re-report: {err}"
         );
     }
 

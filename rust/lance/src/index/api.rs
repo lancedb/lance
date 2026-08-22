@@ -449,14 +449,14 @@ pub trait DatasetIndexExt {
     /// while the commit is in flight fails it too.
     ///
     /// Worker reports come from outside the trust boundary: every output id
-    /// must be globally fresh, and each reported file is verified against the
-    /// object store by path, size, and Lance file magic before publishing.
+    /// must be globally fresh, re-proven again at publication, and each
+    /// reported file must match the store listing and decode as a Lance file.
     ///
     /// `results` may cover a subset of the plan's tasks, so a round survives a
     /// failed worker. Duplicate attempts of a task reconcile to one winner by
-    /// lowest attempt id, making the outcome a function of the reports alone.
-    /// Losing attempts among `results` are cleaned up after the commit, and
-    /// unreported output is reclaimed later by `cleanup_old_versions`.
+    /// lowest attempt id, and one attempt id carrying different payloads is an
+    /// error. The commit deletes nothing: losing and unreported outputs are
+    /// unreachable from any manifest and reclaimed by `cleanup_old_versions`.
     async fn commit_index_merge_results(
         &mut self,
         _plan: &IndexMergePlan,

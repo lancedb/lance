@@ -4809,17 +4809,18 @@ class LanceDataset(pa.dataset.Dataset):
         Validation runs against the latest dataset version and runs again
         during commit conflict resolution, so a mutation landing during the
         fan-out or while the commit is in flight fails it. Every output id
-        must be fresh, and every reported file is verified against the object
-        store before its metadata replaces readable sources.
+        must be fresh, and every reported file must match the store listing
+        and decode as a Lance file before replacing readable sources.
 
         ``results`` may cover a subset of the plan's tasks, so a round
-        survives a failed worker: what succeeded is published and the rest is
-        retried against a fresh plan. Duplicate attempts of one task are
-        reconciled to the lowest attempt id, independent of arrival order.
+        survives a failed worker: what succeeded is published and the rest
+        can land in a later call against the same plan. Duplicate attempts of
+        one task reconcile to the lowest attempt id, and one attempt id
+        carrying different payloads is an error.
 
-        Cleanup covers exactly the losing attempts among ``results``. Output
-        no result reported is unreachable from any manifest and is reclaimed
-        by ``cleanup_old_versions`` like any uncommitted index directory.
+        The commit deletes nothing. Losing and unreported outputs are
+        unreachable from any manifest and are reclaimed by
+        ``cleanup_old_versions`` like any uncommitted index directory.
 
         Parameters
         ----------

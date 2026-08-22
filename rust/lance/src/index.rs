@@ -223,8 +223,8 @@ async fn resolve_vector_source_dirs(
 /// Verify a winning attempt's reported files against the object store.
 ///
 /// The report is untrusted worker input whose file list becomes durable
-/// manifest metadata, so the store listing is the truth: exact path and size
-/// match, plus the trailing Lance file magic on every file.
+/// manifest metadata, so the store is the truth: the listing must match the
+/// report exactly and every file must decode as a Lance file.
 async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResult) -> Result<()> {
     let dir = dataset.indices_dir().join(result.output.uuid.to_string());
     let mut listed = match list_index_files_with_sizes(&dataset.object_store, &dir).await {
@@ -257,48 +257,32 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
                 .collect::<Vec<_>>(),
         )));
     }
+    let scan_scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
     for file in &listed {
-        let magic_len = lance_file::format::MAGIC.len() as u64;
         let path = dir.clone().join(file.path.as_str());
-        if file.size_bytes < magic_len {
+        // A fabricated report can list real sizes for garbage bytes, so decode
+        // the file metadata rather than probing the trailing magic.
+        let decoded = match scan_scheduler
+            .open_file_with_priority(&path, 0, &CachedFileSize::new(file.size_bytes))
+            .await
+        {
+            Ok(file_scheduler) => {
+                lance_file::reader::FileReader::read_all_metadata(&file_scheduler).await
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = decoded {
             return Err(Error::invalid_input(format!(
-                "index merge output file {} of task {} is {} bytes, too small to be a \
-                 Lance index file",
-                path, result.task_id, file.size_bytes
-            )));
-        }
-        let reader = dataset.object_store.open(&path).await?;
-        let tail = reader
-            .get_range((file.size_bytes - magic_len) as usize..file.size_bytes as usize)
-            .await?;
-        if tail.as_ref() != lance_file::format::MAGIC {
-            return Err(Error::invalid_input(format!(
-                "index merge output file {} of task {} does not end with the Lance file \
-                 magic; the output is not a readable index file, so re-run the task",
-                path, result.task_id
+                "index merge output file {} of task {} is not a readable Lance index \
+                 file ({}); re-run the task",
+                path, result.task_id, err
             )));
         }
     }
     Ok(())
-}
-
-/// Best-effort removal of the output directories of losing merge attempts.
-///
-/// No manifest references these files, so failure only leaks storage. Warn
-/// rather than fail a commit that already succeeded.
-async fn delete_orphaned_merge_outputs(dataset: &Dataset, orphaned: &[IndexMergeResult]) {
-    for result in orphaned {
-        let dir = dataset.indices_dir().join(result.output.uuid.to_string());
-        match dataset.object_store.remove_dir_all(dir.clone()).await {
-            Ok(()) | Err(Error::NotFound { .. }) => {}
-            Err(err) => log::warn!(
-                "failed to remove orphaned index merge output {} of attempt {}: {}",
-                dir,
-                result.attempt_id,
-                err
-            ),
-        }
-    }
 }
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -2276,7 +2260,7 @@ impl DatasetIndexExt for Dataset {
             result.check_against(plan)?;
         }
 
-        let (results, orphaned) = segment_merge::reconcile_attempts(results);
+        let (results, orphaned) = segment_merge::reconcile_attempts(results)?;
         segment_merge::check_disjoint_outputs(&results)?;
 
         // Refresh before validating. The natural flow plans and commits through one
@@ -2285,8 +2269,8 @@ impl DatasetIndexExt for Dataset {
         self.checkout_latest().await?;
 
         // Every output id, losers included, must be globally fresh. Manifest
-        // construction drops any existing segment with a reused id and cleanup
-        // deletes losers by id, so a collision removes coverage or deletes files.
+        // construction drops any existing segment with a reused id, so a
+        // collision silently removes coverage from whichever index held it.
         let live_segment_ids = self
             .load_indices()
             .await?
@@ -2383,9 +2367,10 @@ impl DatasetIndexExt for Dataset {
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Delete losers only after the winners are durable: deleting before the
-        // commit would race a retry that still names these files.
-        delete_orphaned_merge_outputs(self, &orphaned).await;
+        // Losing attempts' files stay in place. Their ids are worker input, so
+        // deleting by id could destroy a directory this commit never owned.
+        // Unreachable from any manifest, they are reclaimed by
+        // `cleanup_old_versions` like any other uncommitted index directory.
         Ok(())
     }
 
@@ -9421,39 +9406,45 @@ mod tests {
         .unwrap()
     }
 
-    /// Bytes of a fabricated merge output file.
-    ///
-    /// The commit checks the trailing Lance file magic, so a stub that should
-    /// pass verification must end with it.
-    fn stub_output_content() -> Vec<u8> {
-        [b"merged".as_slice(), lance_file::format::MAGIC.as_slice()].concat()
-    }
+    /// Write a genuine minimal Lance file as a stubbed merge output and return
+    /// its size, since the commit decodes every reported file.
+    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> u64 {
+        use lance_file::version::ConcreteFileVersion;
+        use lance_file::writer::FileWriterOptions;
 
-    /// Write the output file a stubbed report claims, so the commit's store
-    /// verification sees exactly what the report describes.
-    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) {
-        dataset
-            .object_store
-            .put(
-                &dataset
-                    .indices_dir()
-                    .join(output_uuid.to_string())
-                    .join(INDEX_FILE_NAME),
-                &stub_output_content(),
-            )
-            .await
-            .unwrap();
+        let path = dataset
+            .indices_dir()
+            .join(output_uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let arrow_schema = Schema::new(vec![Field::new("stub", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let lance_schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
+        let writer = dataset.object_store.create(&path).await.unwrap();
+        let mut file_writer = lance_file::versions::create_writer(
+            ConcreteFileVersion::V2_1,
+            writer,
+            lance_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        file_writer.write_batch(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+        dataset.object_store.size(&path).await.unwrap()
     }
 
     /// A worker report for `task_id` that never ran a merge.
     ///
-    /// The commit path never decodes index contents, so a fabricated report
-    /// exercises it exactly as a real one would. A test expecting the commit to
-    /// succeed must also call [`write_stub_output_file`].
+    /// A test expecting the commit to succeed must pass the size returned by
+    /// [`write_stub_output_file`], any size works for tests that reject earlier.
     fn stub_merge_result(
         plan: &IndexMergePlan,
         task_id: u32,
         output_uuid: Uuid,
+        output_file_size: u64,
         attempt_id: Uuid,
     ) -> IndexMergeResult {
         let task = plan.task(task_id).unwrap();
@@ -9479,7 +9470,7 @@ mod tests {
                 fragment_ids: task.coverage(),
                 files: vec![IndexMergeFile {
                     path: INDEX_FILE_NAME.to_string(),
-                    size_bytes: stub_output_content().len() as u64,
+                    size_bytes: output_file_size,
                 }],
             },
         }
@@ -9608,7 +9599,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
-        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), Uuid::new_v4());
+        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), 0, Uuid::new_v4());
 
         if stale_handle {
             let mut writer = dataset.clone();
@@ -9648,8 +9639,8 @@ mod tests {
     /// The same round replayed twice, plus one worker that never reported.
     ///
     /// Duplicate attempts reconcile to the lowest attempt id, so any replay
-    /// publishes the same segment, losing files are deleted, and reported tasks
-    /// commit without waiting for the missing one.
+    /// publishes the same segment, losing files stay for manifest-aware
+    /// cleanup, and reported tasks commit without waiting for the missing one.
     #[tokio::test]
     async fn test_commit_index_merge_results_reconciles_attempts_and_commits_partial_round() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -9667,12 +9658,13 @@ mod tests {
         let losing_attempt = Uuid::from_bytes([2; 16]);
         let winning_output = Uuid::new_v4();
         let losing_output = Uuid::new_v4();
+        let mut output_size = 0;
         for uuid in [winning_output, losing_output] {
-            write_stub_output_file(&dataset, uuid).await;
+            output_size = write_stub_output_file(&dataset, uuid).await;
         }
         let results = vec![
-            stub_merge_result(&plan, 0, losing_output, losing_attempt),
-            stub_merge_result(&plan, 0, winning_output, winning_attempt),
+            stub_merge_result(&plan, 0, losing_output, output_size, losing_attempt),
+            stub_merge_result(&plan, 0, winning_output, output_size, winning_attempt),
         ];
 
         dataset
@@ -9706,8 +9698,11 @@ mod tests {
             );
         }
 
+        // Loser ids are worker input with no ownership proof, so the commit
+        // must not delete by id. The unreferenced directory is left for
+        // `cleanup_old_versions` to reclaim.
         assert!(
-            !dataset
+            dataset
                 .object_store
                 .exists(
                     &dataset
@@ -9717,7 +9712,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            "the losing attempt's files are unreachable and must be cleaned up"
+            "the commit must not delete the losing attempt's files"
         );
         assert!(
             dataset
@@ -9730,7 +9725,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            "the published segment's files must survive the cleanup"
+            "the published segment's files must survive"
         );
 
         // The dead worker reports late against the same plan and commits as a
@@ -9738,8 +9733,8 @@ mod tests {
         // refreshed version: the plan's version would replay the first batch's
         // CreateIndex and hard-conflict on the shared index name.
         let late_output = Uuid::new_v4();
-        write_stub_output_file(&dataset, late_output).await;
-        let late = stub_merge_result(&plan, 1, late_output, Uuid::new_v4());
+        let late_size = write_stub_output_file(&dataset, late_output).await;
+        let late = stub_merge_result(&plan, 1, late_output, late_size, Uuid::new_v4());
         dataset
             .commit_index_merge_results(&plan, vec![late])
             .await
@@ -9843,8 +9838,8 @@ mod tests {
             .unwrap();
 
         let output = Uuid::new_v4();
-        write_stub_output_file(&dataset, output).await;
-        let result = stub_merge_result(&plan, 0, output, Uuid::new_v4());
+        let output_size = write_stub_output_file(&dataset, output).await;
+        let result = stub_merge_result(&plan, 0, output, output_size, Uuid::new_v4());
         dataset
             .commit_index_merge_results(&plan, vec![result])
             .await
@@ -9889,7 +9884,7 @@ mod tests {
         assert_eq!(plan.tasks.len(), 2);
 
         let untouched = plan.task(1).unwrap().sources[0].uuid;
-        let aliased = stub_merge_result(&plan, 0, untouched, Uuid::new_v4());
+        let aliased = stub_merge_result(&plan, 0, untouched, 0, Uuid::new_v4());
         let err = dataset
             .commit_index_merge_results(&plan, vec![aliased])
             .await
@@ -9924,7 +9919,7 @@ mod tests {
             .plan_index_segment_merge("vector_idx", 2, None)
             .await
             .unwrap();
-        let foreign = stub_merge_result(&plan, 0, other.uuid, Uuid::new_v4());
+        let foreign = stub_merge_result(&plan, 0, other.uuid, 0, Uuid::new_v4());
         let err = dataset
             .commit_index_merge_results(&plan, vec![foreign])
             .await
@@ -9968,10 +9963,22 @@ mod tests {
             .await
             .unwrap();
         let shared_output = Uuid::new_v4();
-        write_stub_output_file(&dataset, shared_output).await;
+        let shared_size = write_stub_output_file(&dataset, shared_output).await;
         let results = vec![
-            stub_merge_result(&plan, 0, shared_output, Uuid::from_bytes([2; 16])),
-            stub_merge_result(&plan, 0, shared_output, Uuid::from_bytes([1; 16])),
+            stub_merge_result(
+                &plan,
+                0,
+                shared_output,
+                shared_size,
+                Uuid::from_bytes([2; 16]),
+            ),
+            stub_merge_result(
+                &plan,
+                0,
+                shared_output,
+                shared_size,
+                Uuid::from_bytes([1; 16]),
+            ),
         ];
 
         let err = dataset
@@ -10010,15 +10017,18 @@ mod tests {
 
     /// A report whose files the store cannot vouch for is rejected.
     ///
-    /// A missing file, a disagreeing size, or a missing Lance file magic all
-    /// mean the output is not the readable segment the report claims.
+    /// A missing file, a disagreeing size, or bytes that do not decode as a
+    /// Lance file all mean the output is not the segment the report claims.
+    /// The undecodable case uses the exact 10 byte magic-suffixed fabrication
+    /// a tail probe would have accepted.
     #[rstest]
-    #[case::missing_file(None, "the report does not describe")]
-    #[case::size_mismatch(Some(b"merged".to_vec()), "the report does not describe")]
-    #[case::bad_magic(Some(b"mergedXXXX".to_vec()), "Lance file magic")]
+    #[case::missing_file(None, 100, "the report does not describe")]
+    #[case::size_mismatch(Some(b"mergedLANC".to_vec()), 99, "the report does not describe")]
+    #[case::undecodable_content(Some(b"mergedLANC".to_vec()), 10, "not a readable Lance index")]
     #[tokio::test]
     async fn test_commit_index_merge_results_rejects_unverifiable_output(
         #[case] content: Option<Vec<u8>>,
+        #[case] reported_size: u64,
         #[case] expected_message: &str,
     ) {
         let test_dir = tempfile::tempdir().unwrap();
@@ -10044,7 +10054,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let result = stub_merge_result(&plan, 0, output, Uuid::new_v4());
+        let result = stub_merge_result(&plan, 0, output, reported_size, Uuid::new_v4());
 
         let err = dataset
             .commit_index_merge_results(&plan, vec![result])
@@ -10090,7 +10100,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
-        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), Uuid::new_v4());
+        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), 0, Uuid::new_v4());
 
         // The tail of `commit_index_merge_results` after its validation: the
         // sources it saw, the output it built, and the exact-source property.
@@ -10150,6 +10160,95 @@ mod tests {
                 .iter()
                 .all(|segment| segment.uuid != result.output.uuid),
             "the rejected merge must not have published a segment"
+        );
+    }
+
+    /// An output id landing inside the commit window must also be re-proven
+    /// fresh at publication. Two exact-source commits for different index
+    /// names sharing one new id would otherwise both land, and the later
+    /// manifest silently drops the earlier index's segment.
+    #[tokio::test]
+    async fn test_exact_source_commit_rejects_output_id_taken_in_window() {
+        use crate::dataset::transaction::{Operation, TransactionBuilder};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, _segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let other = write_vector_segment_metadata(
+            &dataset,
+            "other_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"other",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "other_idx",
+                "vector",
+                vec![segment_from_metadata(&other)],
+            )
+            .await
+            .unwrap();
+
+        // First round publishes `shared` under vector_idx.
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let shared = Uuid::new_v4();
+        let shared_size = write_stub_output_file(&dataset, shared).await;
+        let result = stub_merge_result(&plan, 0, shared, shared_size, Uuid::new_v4());
+        dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        // A second exact-source commit for other_idx reuses `shared` as its
+        // output id. Its pre-commit identity check never saw the first commit,
+        // so only the finish-step re-proof can reject it.
+        let removed = dataset
+            .load_indices_by_name("other_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|segment| segment.uuid == other.uuid)
+            .collect::<Vec<_>>();
+        let mut forged = removed[0].clone();
+        forged.uuid = shared;
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version - 1,
+            Operation::CreateIndex {
+                new_indices: vec![forged],
+                removed_indices: removed,
+            },
+        )
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            segment_merge::EXACT_SOURCE_CAS_PROPERTY.to_owned(),
+            "true".to_owned(),
+        )]))))
+        .build();
+        let err = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a taken output id must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("is already a committed segment"),
+            "unexpected error: {err}"
+        );
+
+        dataset.checkout_latest().await.unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            after.iter().any(|segment| segment.uuid == shared),
+            "the first index's published segment must survive"
         );
     }
 

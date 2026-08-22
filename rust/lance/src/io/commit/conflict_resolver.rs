@@ -2017,6 +2017,25 @@ impl<'a> TransactionRebase<'a> {
                         )));
                     }
                 }
+                // Manifest construction drops any existing entry, in any index,
+                // whose id a new segment reuses, so output freshness must also be
+                // re-proven against the manifest this attempt publishes onto.
+                let removed_ids = removed_indices
+                    .iter()
+                    .map(|segment| segment.uuid)
+                    .collect::<std::collections::HashSet<_>>();
+                for new_index in new_indices.iter() {
+                    if !removed_ids.contains(&new_index.uuid)
+                        && live.iter().any(|segment| segment.uuid == new_index.uuid)
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "commit_index_merge_results: output segment {} of index '{}' \
+                             is already a committed segment; publishing it would silently \
+                             drop that segment. Re-plan the merge.",
+                            new_index.uuid, new_index.name
+                        )));
+                    }
+                }
             }
 
             // Handle FRAG_REUSE_INDEX rebasing
