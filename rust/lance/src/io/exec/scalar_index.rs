@@ -781,6 +781,33 @@ impl Iterator for FragIdIter<'_> {
     }
 }
 
+/// Pick the row-address mask `MaterializeIndexExec` should materialize.
+///
+/// The `upper` mask is the candidate set: for `Exact` it is the answer, and for `AtMost`
+/// or refined results it is a superset that `LanceFilterExec` prunes downstream, because
+/// the full filter reruns on the materialized batches.
+///
+/// `AtLeast` carries an unbounded `upper`, so it cannot serve as a candidate set.
+/// Materializing its `lower` mask instead is sound ONLY when this node asked for a partial
+/// answer, which is exactly the pushed-limit case: the B-tree stops early, every row in
+/// `lower` is a confirmed match, and a downstream `GlobalLimitExec` still enforces the
+/// exact limit.
+///
+/// A lower bound can also arrive for reasons unrelated to any limit. `bloomfilter.rs` and
+/// the multi-segment combination in `scalar_logical.rs` both produce `AtLeast` on their
+/// own, and there the unconfirmed rows between `lower` and `upper` still need the full
+/// recheck. Treating `lower` as the answer would silently drop them, so with no pushed
+/// limit this keeps the preexisting behavior rather than guessing.
+fn candidate_mask_for(result: IndexExprResult, limit: Option<usize>) -> Result<RowAddrMask> {
+    if result.is_at_least() && !result.is_exact() {
+        if limit.is_none() {
+            todo!("Support AtLeast in MaterializeIndexExec")
+        }
+        return Ok(result.lower);
+    }
+    Ok(result.upper)
+}
+
 impl MaterializeIndexExec {
     pub fn new(
         dataset: Arc<Dataset>,
@@ -849,19 +876,8 @@ impl MaterializeIndexExec {
         // non-matching candidates in `upper` are dropped before they
         // reach the user).
         //
-        // `AtLeast` carries an unbounded `upper`, so we cannot use it as the
-        // candidate set. Instead we materialize its `lower` mask. Every row
-        // in `lower` is a guaranteed match, so it is a sound (possibly
-        // partial) answer. This is exactly what the limit pushdown produces.
-        // The B-tree stops early and returns a confirmed lower bound, and a
-        // downstream `GlobalLimitExec` still enforces the exact limit.
-        let candidate_mask = |result: IndexExprResult| -> Result<RowAddrMask> {
-            if result.is_at_least() && !result.is_exact() {
-                Ok(result.lower)
-            } else {
-                Ok(result.upper)
-            }
-        };
+        let candidate_mask =
+            |result: IndexExprResult| -> Result<RowAddrMask> { candidate_mask_for(result, limit) };
         let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
             candidate_mask(expr_result)? & (*prefilter).clone()
@@ -1039,6 +1055,47 @@ impl ExecutionPlan for MaterializeIndexExec {
 #[cfg(test)]
 mod tests {
     use std::{ops::Bound, sync::Arc};
+
+    use super::{IndexExprResult, RowAddrMask, candidate_mask_for};
+
+    fn mask_of(addrs: [u64; 2]) -> RowAddrMask {
+        RowAddrMask::AllowList(RowAddrTreeMap::from_iter(addrs))
+    }
+
+    /// A pushed limit is the only thing that makes a lower bound a sufficient answer, so
+    /// `AtLeast` may collapse to its `lower` mask only when this node asked for one.
+    #[test]
+    fn test_candidate_mask_uses_lower_only_for_a_pushed_limit() {
+        let result = IndexExprResult::at_least(mask_of([1, 2]));
+        let expected = result.lower.clone();
+        let picked = candidate_mask_for(result, Some(10)).unwrap();
+        assert_eq!(
+            picked, expected,
+            "a limited AtLeast must materialize its confirmed lower bound"
+        );
+    }
+
+    /// Anything that is not a bare lower bound keeps using `upper` as the candidate set,
+    /// which `LanceFilterExec` prunes downstream.
+    #[test]
+    fn test_candidate_mask_uses_upper_for_exact_results() {
+        let result = IndexExprResult::exact(mask_of([3, 4]));
+        let expected = result.upper.clone();
+        assert_eq!(candidate_mask_for(result, None).unwrap(), expected);
+        let result = IndexExprResult::exact(mask_of([3, 4]));
+        let expected = result.upper.clone();
+        assert_eq!(candidate_mask_for(result, Some(10)).unwrap(), expected);
+    }
+
+    /// Regression: `AtLeast` also arrives from sources that have nothing to do with a
+    /// limit, such as `bloomfilter.rs` and the multi-segment combination in
+    /// `scalar_logical.rs`. Collapsing those to `lower` would silently drop the
+    /// unconfirmed rows that still require a recheck, so this path must not do it.
+    #[test]
+    #[should_panic(expected = "Support AtLeast in MaterializeIndexExec")]
+    fn test_candidate_mask_refuses_lower_without_a_pushed_limit() {
+        let _ = candidate_mask_for(IndexExprResult::at_least(mask_of([1, 2])), None);
+    }
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
