@@ -1962,6 +1962,108 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+def test_no_stale_duplicate_after_partial_column_update(tmp_path):
+    # Regression test: updating an indexed vector column in place (via the
+    # low-level fragment.update_columns API + LanceOperation.Update) and then
+    # delta-optimizing the index must not leave a stale copy of the row in the
+    # original index segment.
+    #
+    # Mechanism: update_columns rewrites only the column data file, keeping the
+    # fragment id and row address. Committing the Update prunes the fragment
+    # from the old index segment's fragment_bitmap, but that segment's index
+    # file still physically holds the row's OLD vector. optimize_indices then
+    # builds a new delta segment with the NEW vector. Before the fix a KNN query
+    # searched both segments and returned the updated row TWICE - once with the
+    # stale vector (old segment) and once with the new value (delta segment).
+    np.random.seed(42)
+    ndim = 16
+
+    # Fragment 0: a "far" cluster bounded to [-1, 1]. No bulk vector is close to
+    # the query (all-10.8), so the bulk cannot crowd the stale copy out of top-k.
+    n_bulk = 1000
+    bulk = np.random.uniform(-1, 1, (n_bulk, ndim)).astype(np.float32)
+    table0 = pa.table(
+        {
+            "id": pa.array(range(n_bulk), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(bulk.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table0, tmp_path, mode="create")
+
+    # Fragment 1: a single row whose ORIGINAL vector (all 2.0) is closer to the
+    # query than any bulk vector, so its stale copy ranks well inside top-k.
+    orig = np.full((1, ndim), 2.0, dtype=np.float32)
+    table1 = pa.table(
+        {
+            "id": pa.array([10_000], type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(orig.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table1, tmp_path, mode="append")
+    assert len(ds.get_fragments()) == 2
+
+    # One index segment covering BOTH fragments {0, 1}.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="l2",
+        num_partitions=1,
+        num_sub_vectors=ndim,
+    )
+
+    # Overwrite fragment 1's vector in place and commit Update(fields_modified).
+    new_vec = [10.8] * ndim
+    frag = ds.get_fragment(1)
+    rowids = frag.to_table(columns=["id"], with_row_id=True)["_rowid"].to_pylist()
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(rowids, type=pa.uint64()),
+            "vector": pa.array(
+                [new_vec] * len(rowids), type=pa.list_(pa.float32(), ndim)
+            ),
+        }
+    )
+    updated_fragment, fields_modified = frag.update_columns(update_data)
+    op = lance.LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    ds = lance.LanceDataset.commit(ds.uri, op, read_version=ds.version)
+
+    # Delta-optimize: appends a new segment for the updated fragment; the old
+    # segment is left intact, still physically holding the stale vector.
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds = lance.dataset(ds.uri)
+    assert ds.stats.index_stats("vector_idx")["num_indices"] == 2
+
+    # KNN near the NEW value via the default vector search (searches all
+    # segments). The updated row must appear EXACTLY ONCE.
+    #
+    # This pins the filtering only. With a single partition the late search
+    # returns before the shared budget is consulted, so the accounting half of
+    # the fix is pinned by the Rust unit test
+    # `test_unowned_row_does_not_fill_the_shared_budget` instead.
+    q = np.array(new_vec, dtype=np.float32)
+    res = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10},
+        with_row_id=True,
+    ).to_pandas()
+    dupes = res[res["id"] == 10_000]
+    assert len(dupes) == 1, (
+        f"updated row id=10000 returned {len(dupes)} times "
+        f"(stale index segment not masked); rowids={res['_rowid'].tolist()}"
+    )
+    # A mask that over-restricts would drop the old segment wholesale and still
+    # satisfy the assertion above, so pin the full result set too.
+    assert len(res) == 10, f"expected a full top-10, got {len(res)} rows"
+    assert res["id"].is_unique, f"duplicate ids in result: {res['id'].tolist()}"
+
+
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
@@ -2052,6 +2154,34 @@ def test_read_partition(indexed_dataset):
     with pytest.raises(ValueError, match="not vector index"):
         indexed_dataset.create_scalar_index("id", index_type="BTREE")
         VectorIndexReader(indexed_dataset, "id_idx")
+
+
+def test_read_partition_nested_vector_quoted_field(tmp_path):
+    num_rows = 1024
+    dimensions = 8
+    rng = np.random.default_rng(42)
+    values = rng.integers(0, 256, size=num_rows * dimensions, dtype=np.uint8)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(values), dimensions)
+    nested = pa.StructArray.from_arrays([vectors], names=["embedding.v1"])
+    dataset = lance.write_dataset(pa.table({"data": nested}), tmp_path)
+    # Match nested uint8 pHash indexes without introducing PQ training setup.
+    dataset = dataset.create_index(
+        "data.`embedding.v1`",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        metric="hamming",
+        num_partitions=4,
+    )
+
+    reader = VectorIndexReader(dataset, "vector_idx")
+    for with_vector in (False, True):
+        partitions = [
+            reader.read_partition(partition_id, with_vector=with_vector)
+            for partition_id in range(reader.num_partitions())
+        ]
+
+        assert all("_rowid" in partition.column_names for partition in partitions)
+        assert sum(partition.num_rows for partition in partitions) == num_rows
 
 
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
@@ -2272,6 +2402,14 @@ def test_nested_field_vector_index(tmp_path):
     indices = dataset.describe_indices()
     assert len(indices) == 1
     assert indices[0].field_names == ["data.embedding"]
+
+    reader = VectorIndexReader(dataset, indices[0].name)
+    for with_vector in (False, True):
+        partition_rows = sum(
+            reader.read_partition(partition_id, with_vector=with_vector).num_rows
+            for partition_id in range(reader.num_partitions())
+        )
+        assert partition_rows == num_rows
 
     # Test querying with the index
     query_vec = vectors[0]

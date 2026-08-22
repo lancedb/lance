@@ -80,8 +80,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
         }
 
         let operator = Operator::from_iter::<Cos>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?;
 
         let opendal_store = Arc::new(OpendalStore::new(operator));
 
@@ -93,6 +92,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
         Ok(ObjectStore {
             scheme: "cos".to_string(),
             inner: opendal_store,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

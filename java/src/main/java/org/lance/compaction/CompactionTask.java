@@ -18,6 +18,7 @@ import org.lance.Dataset;
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.util.List;
 import java.util.Optional;
 
 /** The compaction task which can be sent across network and executed individually. */
@@ -56,7 +57,10 @@ public class CompactionTask implements Serializable {
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceRows(),
+        compactionOptions.getMaxSourceBytes(),
+        compactionOptions.getExcludedFragmentIds());
   }
 
   private native RewriteResult nativeExecute(
@@ -73,7 +77,10 @@ public class CompactionTask implements Serializable {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

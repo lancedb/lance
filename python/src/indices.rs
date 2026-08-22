@@ -533,6 +533,7 @@ async fn do_load_shuffled_vectors(
         uuid: index_id,
         name: index_name.to_string(),
         fields: vec![ds.schema().field(column).unwrap().id],
+        covering_fields: vec![],
         dataset_version: ds.manifest.version,
         fragment_bitmap: Some(ds.fragments().iter().map(|f| f.id as u32).collect()),
         index_details: Some(Arc::new(
@@ -543,21 +544,7 @@ async fn do_load_shuffled_vectors(
         base_id: None,
         files: Some(files),
     };
-    let segment = IndexSegment::new(
-        metadata.uuid,
-        metadata
-            .fragment_bitmap
-            .as_ref()
-            .expect("vector metadata should include fragment coverage")
-            .iter(),
-        metadata
-            .index_details
-            .as_ref()
-            .expect("vector metadata should include index details")
-            .clone(),
-        metadata.index_version,
-    );
-    ds.commit_existing_index_segments(index_name, column, vec![segment])
+    ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await
         .infer_error()?;
 
@@ -638,6 +625,9 @@ pub struct PyIndexSegmentDescription {
     /// The id of the dataset base path that stores this segment
     /// (None when the segment is stored in the dataset's default base path)
     pub base_id: Option<i64>,
+    /// The ids of the fields whose values this segment carries but is not keyed on.
+    /// Always the trailing entries of the segment's fields.
+    pub covering_fields: Vec<i32>,
 }
 
 impl PyIndexSegmentDescription {
@@ -657,19 +647,21 @@ impl PyIndexSegmentDescription {
             created_at: segment.created_at,
             size_bytes,
             base_id: segment.base_id.map(|id| id as i64),
+            covering_fields: segment.covering_fields.clone(),
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
             self.fragment_ids,
             self.index_version,
             self.created_at,
             self.size_bytes,
-            self.base_id
+            self.base_id,
+            self.covering_fields
         )
     }
 }
@@ -706,7 +698,7 @@ impl PyIndexDescription {
             .map(|field| {
                 dataset
                     .schema()
-                    .field_path(*field as i32)
+                    .field_path_minimal(*field as i32)
                     .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();

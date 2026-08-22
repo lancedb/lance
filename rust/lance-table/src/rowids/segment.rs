@@ -282,23 +282,19 @@ impl U64Segment {
     }
 
     /// Get the min and max value of the segment, excluding tombstones.
+    ///
+    /// Returns `None` for an empty segment, which has no extrema. Decoding accepts an
+    /// empty encoding of every variant, so no arm here may assume it holds a value.
     pub fn range(&self) -> Option<RangeInclusive<u64>> {
         match self {
-            Self::Range(range) if range.is_empty() => None,
             Self::Range(range)
             | Self::RangeWithBitmap { range, .. }
-            | Self::RangeWithHoles { range, .. } => Some(range.start..=(range.end - 1)),
-            Self::SortedArray(array) => {
-                // We can assume that the array is sorted.
-                let min_value = array.first().unwrap();
-                let max_value = array.last().unwrap();
-                Some(min_value..=max_value)
+            | Self::RangeWithHoles { range, .. } => {
+                (!range.is_empty()).then(|| range.start..=(range.end - 1))
             }
-            Self::Array(array) => {
-                let min_value = array.min().unwrap();
-                let max_value = array.max().unwrap();
-                Some(min_value..=max_value)
-            }
+            // We can assume that the array is sorted.
+            Self::SortedArray(array) => Some(array.first()?..=array.last()?),
+            Self::Array(array) => Some(array.min()?..=array.max()?),
         }
     }
 
@@ -379,27 +375,18 @@ impl U64Segment {
                 }
                 Some(range.start + i as u64 + lo as u64)
             }
-            Self::RangeWithBitmap { range, bitmap } => {
-                // Find the i-th set bit (a "select1") via byte-wise popcount.
-                // Bytes past `bitmap.len()` are zero-padded by construction
-                // (Bitmap::new_full), so popcount counts only valid positions.
-                let mut remaining = i;
-                for (byte_idx, &byte) in bitmap.data.iter().enumerate() {
-                    let ones = byte.count_ones() as usize;
-                    if remaining < ones {
-                        let mut b = byte;
-                        for _ in 0..remaining {
-                            b &= b - 1; // clear lowest set bit
-                        }
-                        let bit = b.trailing_zeros() as usize;
-                        return Some(range.start + (byte_idx * 8 + bit) as u64);
-                    }
-                    remaining -= ones;
-                }
-                None
-            }
+            Self::RangeWithBitmap { .. } => self.cursor().get(i),
             Self::SortedArray(array) => array.get(i),
             Self::Array(array) => array.get(i),
+        }
+    }
+
+    /// Reads values at non-decreasing indices in one pass.
+    pub fn cursor(&self) -> SegmentCursor<'_> {
+        SegmentCursor {
+            segment: self,
+            byte_idx: 0,
+            ones_before: 0,
         }
     }
 
@@ -660,6 +647,46 @@ impl U64Segment {
     }
 }
 
+/// Segment reader that keeps its scan position across calls.
+pub struct SegmentCursor<'a> {
+    segment: &'a U64Segment,
+    /// Byte the next select1 scan resumes at.
+    byte_idx: usize,
+    /// Set bits in `bitmap.data[..byte_idx]`.
+    ones_before: usize,
+}
+
+impl SegmentCursor<'_> {
+    /// The value at index `i`. A decreasing index rewinds the scan.
+    pub fn get(&mut self, i: usize) -> Option<u64> {
+        let U64Segment::RangeWithBitmap { range, bitmap } = self.segment else {
+            return self.segment.get(i);
+        };
+        if i < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+        // Deserialization rejects a bitmap whose padding bits are set, so
+        // popcount counts only valid positions.
+        let mut remaining = i - self.ones_before;
+        while let Some(&byte) = bitmap.data.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            if remaining < ones {
+                let mut b = byte;
+                for _ in 0..remaining {
+                    b &= b - 1; // clear lowest set bit
+                }
+                let bit = b.trailing_zeros() as usize;
+                return Some(range.start + (self.byte_idx * 8 + bit) as u64);
+            }
+            remaining -= ones;
+            self.ones_before += ones;
+            self.byte_idx += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -763,6 +790,30 @@ mod test {
             &[7000, 1, 24000],
             &U64Segment::Array(vec![7000, 1, 24000].into()),
         );
+    }
+
+    /// Decoding accepts an empty encoding of every variant, so `range()` must report the
+    /// absence of extrema for all of them rather than unwrapping a value or computing
+    /// `end - 1` on a zero-length range.
+    #[test]
+    fn test_empty_segments_have_no_range() {
+        let empty: Vec<u64> = Vec::new();
+        let segments = [
+            U64Segment::Range(5..5),
+            U64Segment::RangeWithHoles {
+                range: 0..0,
+                holes: empty.clone().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 0..0,
+                bitmap: Bitmap::new_empty(0),
+            },
+            U64Segment::SortedArray(empty.clone().into()),
+            U64Segment::Array(empty.into()),
+        ];
+        for segment in segments {
+            assert_eq!(segment.range(), None, "{segment:?} should have no range");
+        }
     }
 
     #[test]

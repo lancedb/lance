@@ -143,6 +143,15 @@ into one artifact with one model metadata scope. Use shared compatible model
 artifacts for segments you plan to merge physically, or keep independently
 trained segments as separate physical segments.
 
+!!! note
+
+    IVF_SQ segments cannot be merged physically. Each segment trains its scalar
+    quantizer bounds from its own fragment sample, and there is no build-side way
+    to pin a shared model, so a merge would decode every segment after the first
+    against the wrong range. The merge fails closed instead. Commit IVF_SQ
+    segments side by side and let the query fan out across them, or rebuild the
+    index as a single segment.
+
 ## Internal Finalize Model
 
 Internally, Lance models distributed segment build as:
