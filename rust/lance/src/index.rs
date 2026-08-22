@@ -2379,16 +2379,19 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        // The merged contents were read at the plan's version, so that is the version
-        // this transaction read. The exact-source property makes the conflict
-        // resolver's finish step re-validate the removal set against the manifest
-        // each commit attempt actually publishes onto, and every concurrent commit
-        // forces such an attempt. A mutation landing between the checks above and
-        // the manifest write therefore fails the commit asking for a re-plan
-        // instead of being rebased over, which is what makes the compare-and-swap
-        // authoritative at publication time.
+        // The checks above ran against the refreshed manifest, so that is the
+        // version this transaction read. Declaring the plan's version instead
+        // would replay the whole fan-out window through the conflict resolver,
+        // whose same-index-name rule then permanently rejects the round whenever
+        // a routine delta commit, or an earlier partial commit of this very plan,
+        // landed mid-flight. The merged content needs no replay for safety: the
+        // compare-and-swap proves the sources are unchanged, and a merged segment
+        // is exactly as current as the committed sources it replaces. Mutations
+        // landing after the refresh are handled by the exact-source property,
+        // which makes the conflict resolver's finish step re-validate the removal
+        // set against the manifest each commit attempt actually publishes onto.
         let transaction = TransactionBuilder::new(
-            plan.read_version,
+            self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices: replaced,
@@ -9772,6 +9775,32 @@ mod tests {
                 .unwrap(),
             "the published segment's files must survive the cleanup"
         );
+
+        // The worker that died reports late, against the same plan. Its sources
+        // are untouched, so the round's remainder commits in a second batch.
+        // This is only possible because the commit's transaction declares the
+        // refreshed version it validated against: declaring the plan's version
+        // would replay the first batch's CreateIndex and hard-conflict on the
+        // shared index name.
+        let late_output = Uuid::new_v4();
+        write_stub_output_file(&dataset, late_output).await;
+        let late = stub_merge_result(&plan, 1, late_output, Uuid::new_v4());
+        dataset
+            .commit_index_merge_results(&plan, vec![late])
+            .await
+            .unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            after_uuids,
+            [winning_output, late_output]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "both batches of one round must end up published"
+        );
     }
 
     /// One committed single-fragment segment per fragment, the shape the
@@ -9808,6 +9837,88 @@ mod tests {
             .await
             .unwrap();
         (dataset, segments)
+    }
+
+    /// A same-name index commit that touches none of the planned sources must
+    /// not fail the round.
+    ///
+    /// Delta segments keep landing on an actively written table while workers
+    /// merge, through the same `CreateIndex` operation this commit uses. The
+    /// compare-and-swap already proves such a commit compatible, so dragging it
+    /// back through the conflict resolver's same-index-name rule, which is what
+    /// declaring the plan's read version does, would deterministically brick
+    /// every round that overlapped one and discard all the worker compute.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_survives_unrelated_same_name_commit() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 4).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        // Plan only the newest two segments, leaving the oldest two available
+        // for a concurrent writer.
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let planned = plan
+            .task(0)
+            .unwrap()
+            .sources
+            .iter()
+            .map(|source| source.uuid)
+            .collect::<HashSet<_>>();
+        assert!(!planned.contains(&segments[0].uuid));
+        assert!(!planned.contains(&segments[1].uuid));
+
+        // While workers run, another writer folds the two unplanned segments
+        // into one, a same-name CreateIndex that touches no planned source.
+        let combined = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32, 1_u32],
+            b"combined",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&combined)],
+            )
+            .await
+            .unwrap();
+
+        let output = Uuid::new_v4();
+        write_stub_output_file(&dataset, output).await;
+        let result = stub_merge_result(&plan, 0, output, Uuid::new_v4());
+        dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            after_uuids,
+            [combined.uuid, output].into_iter().collect::<HashSet<_>>(),
+            "the concurrent delta and the merged round must both survive"
+        );
+        let coverage = after
+            .iter()
+            .filter_map(|segment| segment.fragment_bitmap.as_ref())
+            .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+        assert_eq!(
+            coverage.iter().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "index coverage must stay complete"
+        );
     }
 
     /// An output id that reuses a planned or committed segment id is rejected.
