@@ -7575,6 +7575,95 @@ mod test {
         );
     }
 
+    /// A cross-column boolean query plans into CrossColumnCompoundFtsScorer,
+    /// which is a different exec from the same-column CompoundFtsScorer and
+    /// builds its own prefilter, so it needs the mask threaded separately.
+    #[tokio::test]
+    async fn row_addr_mask_cross_column_fts_respects_mask() {
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("title", DataType::Utf8, true),
+            ArrowField::new("body", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..64).map(|v| format!("alpha title {v}")),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..64).map(|v| format!("alpha body {v}")),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let path = TempStrDir::default();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &path, None).await.unwrap();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false);
+        for column in ["title", "body"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &params, true)
+                .await
+                .unwrap();
+        }
+
+        // Two leaves on different columns is what selects the cross-column
+        // scorer; a bounded limit is required by that exec.
+        let cross_column = || {
+            FullTextSearchQuery::new_query(FtsQuery::Boolean(BooleanQuery::new([
+                (
+                    Occur::Should,
+                    MatchQuery::new("title".to_string())
+                        .with_column(Some("title".to_string()))
+                        .into(),
+                ),
+                (
+                    Occur::Should,
+                    MatchQuery::new("body".to_string())
+                        .with_column(Some("body".to_string()))
+                        .into(),
+                ),
+            ])))
+            .limit(Some(10))
+        };
+
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("CrossColumnCompoundFtsScorer"),
+            "expected the cross-column compound scorer path, got:\n{plan}"
+        );
+        let base = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(!base.is_empty(), "cross-column query matched nothing");
+
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::allow_nothing());
+        assert_eq!(
+            scan.try_into_batch().await.unwrap().num_rows(),
+            0,
+            "the cross-column scorer must not return rows the mask excludes"
+        );
+
+        let keep = base[0];
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([keep])));
+        assert_eq!(
+            batch_row_ids(&scan.try_into_batch().await.unwrap()),
+            vec![keep]
+        );
+    }
+
     #[tokio::test]
     async fn row_addr_mask_fts_search_only_allowed() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
