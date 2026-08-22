@@ -2173,17 +2173,19 @@ impl DatasetIndexExt for Dataset {
         if chunks.len() > 1
             && let Some(mut leftover) = chunks.pop_if(|task| task.len() == 1)
         {
-            let previous_task = chunks
-                .last_mut()
-                .expect("chunks.len() > 1 checked above, so a previous task exists");
             if segments_per_task >= 3 {
-                let borrowed = previous_task
-                    .pop()
-                    .expect("a chunk produced by chunks() is never empty");
-                leftover.insert(0, borrowed);
+                // A chunk produced by chunks() is never empty, so the previous
+                // task always has a segment to give back.
+                if let Some(borrowed) = chunks.last_mut().and_then(Vec::pop) {
+                    leftover.insert(0, borrowed);
+                }
                 chunks.push(leftover);
-            } else {
+            } else if let Some(previous_task) = chunks.last_mut() {
                 previous_task.extend(leftover);
+            } else {
+                // Unreachable: chunks.len() > 1 held before the pop above. Keep
+                // the leftover rather than dropping planned segments.
+                chunks.push(leftover);
             }
         }
 
@@ -9885,7 +9887,10 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             after_uuids,
-            segments.iter().map(|segment| segment.uuid).collect(),
+            segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
             "a rejected alias must leave every segment exactly as committed"
         );
     }
