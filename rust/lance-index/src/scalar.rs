@@ -27,7 +27,7 @@ pub use crate::metrics::MetricsCollector;
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
 };
 
 pub mod bitmap;
@@ -43,6 +43,7 @@ pub mod ngram;
 pub mod registry;
 #[cfg(feature = "geo")]
 pub mod rtree;
+pub mod seed;
 pub mod zoned;
 pub mod zonemap;
 

@@ -136,6 +136,8 @@
   color: var(--beam-600);
   margin-bottom: 24px;
 }
+/* Wrap only between segments (at the · separators), never inside one. */
+.ld-kicker span, .ld-kicker a { white-space: nowrap; }
 .ld-kicker a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
 .ld-kicker a:hover { color: var(--beam-700); }
 .ld-hero h1 {
@@ -301,6 +303,29 @@
   height: calc(100vh - 60px);
   overflow-y: auto;
 }
+/* Mobile-only disclosure for the sidenav; hidden on desktop where the
+   sidenav is a sticky column. */
+.ld-sidenav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  background: none;
+  border: 1px solid var(--line-2);
+  padding: 9px 12px;
+  margin: 16px 0 0;
+  cursor: pointer;
+}
+.ld-sidenav-toggle:hover { color: var(--fg-1); border-color: var(--beam-400); }
+.ld-sidenav-toggle svg { transition: transform var(--dur-fast) var(--ease-out); }
+.ld-sidenav-toggle.open svg { transform: rotate(180deg); }
 .ld-sidenav__group { margin-bottom: 6px; }
 .ld-sidenav__label {
   font-family: var(--font-mono);
@@ -400,6 +425,8 @@
 /* ---------- article prose (python-markdown output) ---------- */
 .ld-article-col { max-width: 760px; min-width: 0; padding: 40px 0 96px; }
 .ld-article { font-family: var(--font-body); color: var(--text-secondary); }
+/* Keep anchor targets clear of the sticky header. */
+.ld-article :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: 76px; }
 .ld-article h1 { font-family: var(--font-display); font-size: 42px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.05; color: var(--fg-1); margin: 0 0 20px; text-wrap: balance; }
 .ld-article h2 { font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: var(--fg-1); margin: 48px 0 14px; padding-top: 28px; border-top: 1px solid var(--line-2); }
 .ld-article h3 { font-family: var(--font-display); font-size: 19px; font-weight: 600; letter-spacing: -0.01em; color: var(--fg-1); margin: 32px 0 10px; }
@@ -715,20 +742,51 @@
   .ld-toc { display: none; }
 }
 @media (max-width: 960px) {
+  /* Header folds into two rows: brand + icon actions, then a scrollable
+     section-tab row. Text-heavy controls collapse to icons. */
+  .ld-header { flex-wrap: wrap; height: auto; gap: 0 10px; padding: 10px 16px 0; }
+  .ld-header__actions { margin-left: auto; }
+  .ld-header__actions .ld-btn--primary,
+  .ld-header__actions .ld-btn__label,
+  .ld-header__actions .ld-btn__count { display: none; }
+  .ld-topnav { order: 1; flex-basis: 100%; margin: 4px 0 0; padding-bottom: 10px; }
+  .ld-toptab { padding: 7px 10px; }
+  .ld-toptab:first-child { margin-left: -10px; }
+  .ld-toptab.active::after { left: 10px; right: 10px; }
+
+  .ld-article :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: 104px; }
+  .ld-article h1 { font-size: 32px; }
+
   .ld-hero h1 { font-size: clamp(38px, 9vw, 56px); }
   .ld-stats { grid-template-columns: 1fr; }
   .ld-stat { padding: 20px 0; }
   .ld-stat + .ld-stat { border-left: 0; border-top: 1px solid var(--line-2); }
   .ld-feature { grid-template-columns: 1fr; gap: 16px; }
   .ld-feature__num { padding-top: 0; }
+
+  /* Docs: sidenav collapses behind a disclosure button; article leads. */
   .ld-docs { display: block; padding: 0 20px; }
+  .ld-sidenav-toggle { display: flex; }
   .ld-sidenav {
+    display: none;
     position: static;
     height: auto;
     border-right: 0;
     border-bottom: 1px solid var(--line-2);
-    padding: 20px 0;
+    padding: 0 0 20px;
   }
+  .ld-sidenav.open { display: block; }
+  .ld-sidenav__group:first-child .ld-sidenav__label { margin-top: 16px; }
+  .ld-article-col { padding-top: 24px; }
+
   .ld-hero, .ld-band, .ld-what, .ld-features { padding-left: 20px; padding-right: 20px; }
   .ld-hero { padding-top: 56px; padding-bottom: 48px; }
+  .ld-notfound { padding: 72px 20px 96px; }
+  .ld-footer { padding: 32px 20px; }
+  .ld-footer__cols { gap: 28px 40px; }
+}
+@media (max-width: 700px) {
+  /* Search becomes an edge-to-edge sheet under the top of the screen. */
+  .ld-search__panel { margin: 0; max-width: none; border-left: 0; border-right: 0; border-top: 0; }
+  .ld-search__results { max-height: calc(100dvh - 110px); }
 }

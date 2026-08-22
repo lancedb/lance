@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
     compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
@@ -63,8 +63,8 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{
-        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
-        WeakLanceCache,
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+        KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::{
@@ -76,7 +76,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_select::{NullableRowAddrSet, RowSetOps};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1365,6 +1365,14 @@ impl CacheKey for BTreePageKey {
         "BTreePage"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-page-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.page_number);
+    }
+
     fn codec() -> Option<CacheCodec> {
         // Pages are cached as `FlatIndex` values (see `ValueType` above).
         Some(CacheCodec::from_impl::<FlatIndex>())
@@ -1489,6 +1497,14 @@ impl CacheKey for BTreeIndexStateKey {
 
     fn type_name() -> &'static str {
         "BTreeIndexState"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -1635,11 +1651,17 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<FlatIndex>> {
-        self.index_cache
-            .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+        let result = self
+            .index_cache
+            .get_or_insert_with_key_hit(BTreePageKey { page_number }, move || async move {
                 self.read_page(page_number, index_reader, metrics).await
             })
-            .await
+            .await;
+        match &result {
+            Ok((_, true)) => metrics.record_index_cache_hit(),
+            _ => metrics.record_index_cache_miss(),
+        }
+        result.map(|(page, _)| page)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1684,6 +1706,7 @@ impl BTreeIndex {
         matches: Matches,
         index_reader: LazyIndexReader,
         prebuilt: Option<&Arc<dyn PhysicalExpr>>,
+        track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         let subindex = self
@@ -1694,13 +1717,14 @@ impl BTreeIndex {
             // For a large IsIn the predicate is compiled once (see `search`) and
             // reused here, instead of rebuilding the whole IN-list per page.
             Matches::Some(_) => match prebuilt {
-                Some(expr) => subindex.search_prebuilt(expr, metrics),
-                None => subindex.search(query, metrics),
+                Some(expr) => subindex.search_prebuilt(expr, track_nulls, metrics),
+                None => subindex.search(query, track_nulls, metrics),
             },
             Matches::All(_) => Ok(match query {
                 // This means we hit an all-null page so just grab all row ids as true
                 SargableQuery::IsNull() => subindex.all_ignore_nulls(),
-                _ => subindex.all(),
+                _ if track_nulls => subindex.all(),
+                _ => subindex.all_non_null(),
             }),
         }
     }
@@ -2098,19 +2122,24 @@ impl Index for BTreeIndex {
     }
 }
 
-impl BTreeIndex {
-    /// Shared implementation for [`ScalarIndex::search`] and
-    /// [`ScalarIndex::search_limited`].
-    ///
-    /// When `limit` is `Some(n)` the pages are searched in order and the search stops once
-    /// it has at least `n` matching row ids. The result may hold more than `n` rows but
-    /// never fewer unless the query matches fewer.
-    async fn do_search(
+#[async_trait]
+impl ScalarIndex for BTreeIndex {
+    async fn search(
         &self,
-        query: &SargableQuery,
+        query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
-        limit: Option<usize>,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
@@ -2176,12 +2205,7 @@ impl BTreeIndex {
         // page with zero nulls is a true Matches::All, while one with nulls needs
         // Matches::Some only to track the null rows; surfacing `null_count` here
         // could refine that classification (see #6802).
-        //
-        // A `limit` implies a single positive lookup, so skip null tracking to stop early.
-        // Correctness then relies on the caller discarding nulls. Every `search_limited`
-        // path goes through `evaluate_limited` and `drop_nulls`, so the untracked null rows
-        // are dropped anyway. A future caller that keeps nulls must not pass a limit here.
-        if limit.is_none() && !matches!(query, SargableQuery::IsNull()) {
+        if options.track_nulls() && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
                 .page_lookup
@@ -2213,6 +2237,7 @@ impl BTreeIndex {
                     page_index,
                     lazy_index_reader.clone(),
                     prebuilt.as_ref(),
+                    options.track_nulls(),
                     metrics,
                 )
                 .boxed()
@@ -2220,19 +2245,22 @@ impl BTreeIndex {
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
 
-        // With a `limit`, read one page at a time and stop once we have enough. Otherwise fan out across CPUs.
-        let parallelism = if limit.is_some() {
+        // Collect both matching row IDs and null row IDs from all pages.
+        //
+        // With a limit, read one page at a time and stop as soon as enough TRUE matches
+        // have been seen; fanning out would defeat the point by doing the work anyway.
+        // Without one, fan out across CPUs as usual.
+        let parallelism = if options.limit().is_some() {
             1
         } else {
             get_num_compute_intensive_cpus()
         };
         let mut page_stream = stream::iter(page_tasks).buffered(parallelism);
-
         let mut results: Vec<NullableRowAddrSet> = Vec::new();
         let mut matches_found: u64 = 0;
         while let Some(page_result) = page_stream.try_next().await? {
-            if let Some(limit) = limit {
-                // Count only TRUE matches toward the limit. `len()` already excludes nulls.
+            if let Some(limit) = options.limit() {
+                // Count only TRUE matches toward the limit; `len()` already excludes nulls.
                 matches_found += page_result.len().unwrap_or(0);
                 results.push(page_result);
                 if matches_found >= limit as u64 {
@@ -2243,41 +2271,29 @@ impl BTreeIndex {
             }
         }
 
-        // Merge matching row IDs
-        let selection = NullableRowAddrSet::union_all(&results);
+        let selection = if options.track_nulls() {
+            NullableRowAddrSet::union_all(&results)
+        } else {
+            let selected_rows = results
+                .iter()
+                .map(NullableRowAddrSet::selected_rows)
+                .collect::<Vec<_>>();
+            NullableRowAddrSet::new(
+                RowAddrTreeMap::union_all(&selected_rows),
+                Default::default(),
+            )
+        };
 
-        // A limited search may stop before reading every matching page, so the returned set is
-        // not the complete answer. Every row in it still satisfies the query, so the result is a
-        // valid lower bound, which is exactly `AtLeast`. Reporting `Exact` would let callers treat
-        // a partial match set as complete, so report `AtLeast` for any limited search even when it
-        // happened to read all pages.
-        Ok(if limit.is_some() {
+        // A limited search may stop before reading every matching page, so the returned set
+        // is a lower bound rather than the complete match set. Reporting `Exact` would let a
+        // downstream consumer treat a partial set as complete, so report `AtLeast` whenever a
+        // limit was in play -- even if this particular scan happened to read every page,
+        // since the caller cannot tell the difference and must not rely on it.
+        Ok(if options.limit().is_some() {
             SearchResult::AtLeast(selection)
         } else {
             SearchResult::Exact(selection)
         })
-    }
-}
-
-#[async_trait]
-impl ScalarIndex for BTreeIndex {
-    async fn search(
-        &self,
-        query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        self.do_search(query, metrics, None).await
-    }
-
-    async fn search_limited(
-        &self,
-        query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
-        limit: Option<usize>,
-    ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        self.do_search(query, metrics, limit).await
     }
 
     fn can_remap(&self) -> bool {
@@ -2401,6 +2417,10 @@ impl ScalarIndex for BTreeIndex {
             range_id: None,
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
+    }
+
+    fn training_data_type(&self) -> Option<DataType> {
+        Some(self.data_type.clone())
     }
 }
 
@@ -3440,7 +3460,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchOptions,
+            SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -3758,6 +3779,53 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_page_cache_hit_miss_counts() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // First search: cold cache — the page fetch must miss.
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
+        let cold = LocalMetricsCollector::default();
+        index.search(&query, &cold).await.unwrap();
+        assert_eq!(cold.index_cache_hits(), 0);
+        assert_eq!(cold.index_cache_misses(), 1);
+        assert_eq!(cold.parts_loaded.load(Ordering::Relaxed), 1);
+
+        // Second search: same key, page must now be served from cache.
+        let warm = LocalMetricsCollector::default();
+        index.search(&query, &warm).await.unwrap();
+        assert_eq!(warm.index_cache_hits(), 1);
+        assert_eq!(warm.index_cache_misses(), 0);
+        assert_eq!(warm.parts_loaded.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -5452,13 +5520,10 @@ mod tests {
         }
     }
 
-    /// Regression test: BTree search must track null row IDs for non-IsNull
-    /// queries, even when no pages match the queried value.
-    ///
-    /// Without this, `NOT(x = val)` when `val` is absent from the data would
-    /// produce an empty null set, causing NULL rows to incorrectly pass.
+    /// Regression test: BTree search skips null pages only when the caller
+    /// explicitly opts out of NULL tracking.
     #[tokio::test]
-    async fn test_search_tracks_nulls_for_absent_value() {
+    async fn test_search_null_tracking_options_for_absent_value() {
         use arrow_array::{Int32Array, UInt64Array};
 
         let tmpdir = TempObjDir::default();
@@ -5509,16 +5574,26 @@ mod tests {
             index.page_lookup.all_null_pages.len(),
         );
 
-        let metrics = NoOpMetricsCollector;
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
 
-        // Search for Equals(0) — value 0 doesn't exist in any page
+        // A top-level positive filter can discard NULL results. No BTree page
+        // should be read when the searched value is absent.
+        let metrics = LocalMetricsCollector::default();
         let result = index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
                 &metrics,
             )
             .await
             .unwrap();
+        assert_eq!(result, SearchResult::exact(RowAddrTreeMap::default()));
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 0);
+
+        // The existing search API keeps its NULL-preserving behavior for
+        // callers that need three-valued logic.
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         match result {
             SearchResult::Exact(set) => {
@@ -5540,7 +5615,7 @@ mod tests {
                     std::ops::Bound::Unbounded,
                     std::ops::Bound::Excluded(ScalarValue::Int32(Some(50))),
                 ),
-                &metrics,
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -5557,8 +5632,9 @@ mod tests {
         }
     }
 
-    /// `search_limited` returns at least `limit` matches but stops reading pages early,
-    /// so for a multi-page range it returns fewer rows than an unlimited search.
+    /// A limited search returns at least `limit` matches but stops reading pages early, so
+    /// for a multi-page range it reads fewer pages than an unlimited search and must report
+    /// `AtLeast` rather than `Exact`.
     #[tokio::test]
     async fn test_search_limited_short_circuits() {
         use arrow_array::{Int32Array, UInt64Array};
@@ -5570,7 +5646,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Five btree pages of `DEFAULT_BTREE_BATCH_SIZE` rows, with no nulls so every row matches.
+        // Five btree pages of `DEFAULT_BTREE_BATCH_SIZE` rows, no nulls, so every row matches.
         let num_rows = 5 * DEFAULT_BTREE_BATCH_SIZE;
         let values: Int32Array = (0..num_rows).map(|i| Some(i as i32)).collect();
         let row_ids = UInt64Array::from_iter_values(0..num_rows);
@@ -5579,9 +5655,8 @@ mod tests {
             ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
         ])
         .unwrap();
-        let schema = data.schema();
-        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            data.schema(),
             stream::iter(vec![Ok(data)]),
         ));
         train_btree_index(
@@ -5601,15 +5676,25 @@ mod tests {
         let everything =
             SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
 
-        // Baseline: an unlimited search returns every row.
+        // Baseline: an unlimited search returns every row and is exact.
         let full = index.search(&everything, &metrics).await.unwrap();
+        assert!(
+            matches!(full, SearchResult::Exact(_)),
+            "an unlimited search must stay Exact, got {full:?}"
+        );
         let full_len = full.row_addrs().len().unwrap();
         assert_eq!(full_len, num_rows);
 
-        // A limit reaching into the second page: satisfied but stops before reading all five.
+        // A limit reaching into the second page: satisfied, but stops before all five.
         let limit = (DEFAULT_BTREE_BATCH_SIZE + 100) as usize;
         let limited = index
-            .search_limited(&everything, &metrics, Some(limit))
+            .search_with_options(
+                &everything,
+                SearchOptions::default()
+                    .with_track_nulls(false)
+                    .with_limit(Some(limit)),
+                &metrics,
+            )
             .await
             .unwrap();
         // A short-circuited search is not the complete match set, so it must be reported as
@@ -5627,6 +5712,57 @@ mod tests {
             limited_len < full_len,
             "expected the search to short-circuit, but it returned all {full_len} rows"
         );
+    }
+
+    /// Regression test: disabling NULL tracking also omits NULL rows from a
+    /// candidate page that contains both matching and NULL values.
+    #[tokio::test]
+    async fn test_search_without_null_tracking_on_mixed_page() {
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let data = record_batch!(
+            ("value", Int32, [None, Some(5), Some(7)]),
+            ("_rowid", UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        let schema = data.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async { Ok(data) }),
+        ));
+        train_btree_index(stream, test_store.as_ref(), 3, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.page_lookup.null_pages, vec![0]);
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(5)));
+        let result = index
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let SearchResult::Exact(row_ids) = result else {
+            panic!("BTree search should be exact");
+        };
+        assert_eq!(row_ids.true_rows(), RowAddrTreeMap::from_iter([1]));
+        assert!(row_ids.null_rows().is_empty());
+
+        let tracked = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(tracked) = tracked else {
+            panic!("BTree search should be exact");
+        };
+        assert_eq!(tracked.true_rows(), RowAddrTreeMap::from_iter([1]));
+        assert_eq!(tracked.null_rows(), &RowAddrTreeMap::from_iter([0]));
     }
 
     fn sample_lookup_batch() -> RecordBatch {

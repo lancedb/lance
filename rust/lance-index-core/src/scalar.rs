@@ -4,7 +4,7 @@
 //! Abstract scalar index traits and types for Lance index plugins
 
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -500,6 +500,62 @@ impl UpdateCriteria {
     }
 }
 
+/// Execution-time options for scalar index searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Preserve rows where the query evaluates to NULL.
+    ///
+    /// Callers may disable this only when NULL rows cannot affect the final
+    /// result, such as a top-level filter whose NULL results will be discarded.
+    track_nulls: bool,
+    /// Best-effort cap on how many matching rows the search needs to find.
+    ///
+    /// An index may stop once it has `n` matches and may still return more, so
+    /// this narrows work without narrowing the contract. It applies only to
+    /// positive lookups that preserve matches -- equality, range, `IsIn`.
+    /// Negating and combining operators ignore it, because a partial match set
+    /// cannot be complemented or intersected soundly.
+    ///
+    /// A limited search reports [`SearchResult::AtLeast`], never
+    /// [`SearchResult::Exact`], so a short-circuited scan can never be mistaken
+    /// for the complete match set.
+    limit: Option<usize>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            track_nulls: true,
+            limit: None,
+        }
+    }
+}
+
+impl SearchOptions {
+    /// Configure whether searches preserve rows where the query evaluates to
+    /// NULL. When disabled, implementations return only TRUE rows.
+    pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
+        self.track_nulls = track_nulls;
+        self
+    }
+
+    /// Whether searches preserve rows where the query evaluates to NULL.
+    pub fn track_nulls(&self) -> bool {
+        self.track_nulls
+    }
+
+    /// Set a best-effort cap on the number of matching rows the search must find.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The best-effort cap on matching rows, if any.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -512,17 +568,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
-    /// Like [`Self::search`] but with a best-effort `limit` hint. When `limit` is `Some(n)`, an
-    /// index may stop after finding `n` matching rows and may still return more. The hint applies
-    /// only to positive lookups that preserve matches, such as equality, range, and `IsIn`.
-    /// Negating or combining operators ignore it. The caller must discard null rows, since an
-    /// index may skip null tracking when a limit is set. The default ignores the hint and calls
+    /// Search the scalar index with execution-time options.
+    ///
+    /// Index implementations that do not need the options can rely on this
+    /// default implementation. The default preserves the behavior of
     /// [`Self::search`].
-    async fn search_limited(
+    async fn search_with_options(
         &self,
         query: &dyn AnyQuery,
+        _options: SearchOptions,
         metrics: &dyn MetricsCollector,
-        _limit: Option<usize>,
     ) -> Result<SearchResult> {
         self.search(query, metrics).await
     }
@@ -569,6 +624,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Returns the value type expected by [`Self::update`], when the index has
+    /// a durable type contract for its training data.
+    ///
+    /// Wrapper indices use this to transform new data to the same type as the
+    /// loaded index instead of inferring a potentially different type from an
+    /// update batch. Index types without such a contract may return `None`.
+    fn training_data_type(&self) -> Option<DataType> {
+        None
+    }
 
     /// Global `[min, max]` of the indexed column from index metadata, without a
     /// scan, or `None` if this index type cannot supply a sound bound. When

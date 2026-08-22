@@ -160,11 +160,9 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         builder = builder.download_mode(download_mode);
     }
 
-    let operator = Operator::new(builder)
-        .map_err(|e| {
-            Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
-        })?
-        .finish();
+    let operator = Operator::new(builder).map_err(|e| {
+        Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
+    })?;
 
     Ok(OpendalStore::new(operator))
 }
@@ -209,6 +207,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         Ok(ObjectStore {
             scheme: "hf".to_string(),
             inner,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

@@ -39,6 +39,17 @@
       .catch(function () { /* rate-limited or offline: button still works without the count */ });
   })();
 
+  /* ---------- mobile sidenav toggle ---------- */
+  var sidenavToggle = document.querySelector(".ld-sidenav-toggle");
+  var sidenav = document.querySelector(".ld-sidenav");
+  if (sidenavToggle && sidenav) {
+    sidenavToggle.addEventListener("click", function () {
+      var open = sidenav.classList.toggle("open");
+      sidenavToggle.classList.toggle("open", open);
+      sidenavToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  }
+
   /* ---------- article enhancements ---------- */
   var article = document.querySelector(".ld-article");
 

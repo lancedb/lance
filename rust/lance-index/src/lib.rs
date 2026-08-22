@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![cfg_attr(coverage, feature(coverage_attribute))]
 
 //! Lance secondary index library
 //!
@@ -78,9 +79,7 @@ pub struct IndexMetadata {
     pub distance_type: String,
 }
 
-pub fn is_system_index(index_meta: &lance_table::format::IndexMetadata) -> bool {
-    index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
-}
+pub use lance_table::system_index::is_system_index;
 
 pub fn infer_system_index_type(
     index_meta: &lance_table::format::IndexMetadata,

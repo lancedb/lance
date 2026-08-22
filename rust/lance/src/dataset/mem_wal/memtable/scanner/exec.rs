@@ -36,7 +36,7 @@ pub use vector::VectorIndexExec;
 pub(super) fn newest_pk_positions(
     batch_store: &BatchStore,
     pk_columns: &[String],
-    max_visible_batch_position: usize,
+    visible_count: usize,
     max_visible_row: u64,
 ) -> DataFusionResult<HashSet<u64>> {
     let mut newest: HashMap<Vec<ScalarValue>, u64> = HashMap::new();
@@ -46,7 +46,7 @@ pub(super) fn newest_pk_positions(
         if n == 0 {
             continue;
         }
-        if batch_position > max_visible_batch_position {
+        if batch_position >= visible_count {
             current_row += n as u64;
             continue;
         }

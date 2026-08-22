@@ -49,14 +49,15 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "boto3",
-    "datasets",
-    "duckdb",
+    "datasets==4.4.0",
+    "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes",
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
+    "pytest-xdist",
     "tqdm",
     "datafusion>=54,<55",
 ]
@@ -72,14 +73,15 @@ geo = [
 [dependency-groups]
 tests = [
     "boto3==1.40.43",
-    "datasets==4.1.1",
-    "duckdb==1.4.0",
+    "datasets==4.4.0",
+    "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes==0.5.3",
     "pillow==11.3.0",
     "pandas==2.3.3",
     "polars[pyarrow,pandas]==1.34.0",
     "psutil==7.1.0",
     "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
     "tqdm==4.67.1",
     "datafusion==54.0.0",
     "opentelemetry-sdk==1.30.0",
@@ -103,7 +105,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 "*.pyi" = ["E301", "E302"]
 
 [tool.pyright]
-pythonVersion = "3.13"
+pythonVersion = "3.14"
 # TODO: expand this list as we fix more files.
 include = [
     "python/lance/util.py",
@@ -131,7 +133,6 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
-    "recurring: marks tests as recurring tests",
 ]
 filterwarnings = [
     'error::FutureWarning',

@@ -26,7 +26,11 @@
   {%- for item in nav %}{% if item.active %}{% set active_section.item = item %}{% endif %}{% endfor %}
 
   <main class="ld-docs">
-    <aside class="ld-sidenav" aria-label="Section pages">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      {{ active_section.item.title if active_section.item else "Menu" }}
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
       {%- if active_section.item and active_section.item.is_section %}
         {{ sidenav_section(active_section.item, active_section.item.title) }}
       {%- elif active_section.item %}

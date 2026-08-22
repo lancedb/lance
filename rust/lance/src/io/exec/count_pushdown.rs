@@ -13,16 +13,17 @@
 //! enough to be reused.
 //!
 //! Two rewritten shapes are emitted depending on whether the scalar index
-//! backing the filter covers every dataset fragment.
+//! backing the filter covers every fragment targeted by the scan.
 //!
-//! **Full coverage** (index ⊇ dataset, or no filter at all):
+//! **Full coverage** (index ⊇ targeted fragments, or no filter at all):
 //!
 //! ```text
 //! AggregateExec(Final, aggs=[count(...)], group_by=[])
 //!   └── CountFromMaskExec { prefilter_input = index_input }
 //! ```
 //!
-//! **Partial coverage** (index ⊊ dataset — typically appended fragments):
+//! **Partial coverage** (index misses some targeted fragments — typically
+//! appended fragments):
 //!
 //! ```text
 //! AggregateExec(Final, aggs=[count(...)], group_by=[])
@@ -147,6 +148,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let options = filtered_read.options();
+    // We don't currently support count pushdown when the row selector
+    // is a row stream.
+    if filtered_read.row_stream_input().is_some() {
+        return Ok(None);
+    }
     // A refine filter is a residual the index couldn't fully evaluate — it
     // needs column data to apply, which we can't.
     if options.refine_filter.is_some() {
@@ -173,21 +179,38 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         );
         return Ok(None);
     }
-    // Same story for an explicit fragment subset: legitimate, but unexpected
-    // alongside an aggregate, and we lose the pushdown opportunity.
-    if options.fragments.is_some() {
-        warn!(
-            "count_pushdown: skipped because the FilteredReadExec was scoped \
-             to an explicit fragment subset; the count will be computed via a \
-             full scan. Intersecting that subset into the coverage logic would \
-             let this query be answered from index metadata."
-        );
-        return Ok(None);
-    }
-
     let dataset = filtered_read.dataset().clone();
     let dataset_fragments: RoaringBitmap =
         dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let fragment_scope = if let Some(fragments) = options.fragments.as_ref() {
+        let fragment_scope = fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        // A bitmap cannot preserve duplicate fragments, and CountFromMaskExec
+        // resolves fragment IDs against the current manifest instead of using
+        // the descriptors supplied to FilteredReadExec.
+        let has_duplicate_fragments = fragment_scope.len() != fragments.len() as u64;
+        let descriptors_are_current = fragments.iter().all(|fragment| {
+            let Ok(fragment_id) = u32::try_from(fragment.id) else {
+                return false;
+            };
+            if !dataset.fragment_bitmap.contains(fragment_id) {
+                return false;
+            }
+            let fragment_index = dataset.fragment_bitmap.rank(fragment_id) as usize - 1;
+            dataset.fragments().get(fragment_index) == Some(fragment)
+        });
+        if has_duplicate_fragments || !descriptors_are_current {
+            return Ok(None);
+        }
+        Some(fragment_scope)
+    } else {
+        None
+    };
+    let target_fragments = fragment_scope
+        .clone()
+        .unwrap_or_else(|| dataset_fragments.clone());
     let prefilter_input = filtered_read.index_input().cloned();
 
     // If there is a prefilter, inspect its ScalarIndexExpr leaves:
@@ -223,11 +246,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     // Decide on the plan shape. Three cases:
     //
     // 1. No prefilter (no filter at all): single pushdown branch over every
-    //    dataset fragment. Always safe.
-    // 2. Prefilter + index covers every dataset fragment: single pushdown
+    //    targeted fragment. Always safe.
+    // 2. Prefilter + index covers every targeted fragment: single pushdown
     //    branch, prefilter feeds in directly.
-    // 3. Prefilter + index covers a strict subset: split into pushdown over
-    //    indexed fragments + parallel scan over unindexed fragments.
+    // 3. Prefilter + index covers a strict subset of the target: split into
+    //    pushdown over indexed fragments + parallel scan over unindexed fragments.
     let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
@@ -235,32 +258,36 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
-                None,
+                fragment_scope,
             )?;
             let schema = exec.schema();
             (Arc::new(exec), schema)
         }
-        Some(coverage) if (&dataset_fragments - &coverage).is_empty() => {
-            // Prefilter exists and the index covers every dataset fragment —
+        Some(coverage) if (&target_fragments - &coverage).is_empty() => {
+            // Prefilter exists and the index covers every targeted fragment —
             // safe to push the whole count down.
             let exec = CountFromMaskExec::try_new_restricted(
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
-                None,
+                fragment_scope,
             )?;
             let schema = exec.schema();
             (Arc::new(exec), schema)
         }
         Some(coverage) => {
-            // Split plan: CountFromMaskExec for the indexed fragments, a
-            // normal scan + AggregateExec(Partial) for the rest.
-            let uncovered = &dataset_fragments - &coverage;
+            // Split plan: CountFromMaskExec for the targeted indexed fragments,
+            // a normal scan + AggregateExec(Partial) for the targeted remainder.
+            let covered = &target_fragments & &coverage;
+            if covered.is_empty() {
+                return Ok(None);
+            }
+            let uncovered = &target_fragments - &coverage;
             let pushdown_exec = CountFromMaskExec::try_new_restricted(
                 dataset,
                 aggr_exprs.clone(),
                 prefilter_input,
-                Some(&dataset_fragments & &coverage),
+                Some(covered),
             )?;
             let partial_state_schema = pushdown_exec.schema();
             let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
@@ -583,6 +610,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_fires_when_filter_is_scoped_to_fragment() {
+        let fixture = make_fixture().await;
+        let mut scanner = fixture.dataset.get_fragments()[1].scan();
+        scanner.empty_project().unwrap().with_row_id();
+        scanner.filter("ordered < 25").unwrap();
+
+        let (plan, count) = run_count(&mut scanner).await;
+
+        assert_eq!(count, 10);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "expected CountFromMaskExec for a fragment-scoped count: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_contains_union(&plan),
+            "no union expected when the index covers the requested fragment, got: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn count_matches_scan_for_stale_fragment_descriptor() {
+        let fixture = make_fixture().await;
+        let mut dataset = fixture.dataset.as_ref().clone();
+        let stale_fragment = dataset.fragments()[0].clone();
+        dataset.delete("ordered = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![stale_fragment.clone()]);
+        scan.filter("ordered < 10").unwrap();
+        let scanned_rows = scan.try_into_batch().await.unwrap().num_rows() as i64;
+
+        let mut count_scan = dataset.scan();
+        count_scan.with_fragments(vec![stale_fragment]);
+        count_scan.filter("ordered < 10").unwrap();
+        let (plan, count) = run_count(&mut count_scan).await;
+
+        assert_eq!(count, scanned_rows);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "a stale fragment descriptor must retain the original scan plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
     async fn rule_emits_split_plan_for_partial_index_coverage() {
         // Build index over 4 fragments, then append a 5th — the index now
         // covers a strict subset of the dataset. The rule must split into a
@@ -641,6 +716,43 @@ mod tests {
         assert!(
             plan_contains_union(&plan),
             "expected UnionExec for partial-coverage split, got: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+
+        let fragments = dataset.fragments();
+        let mut indexed_fragment_scanner = dataset.scan();
+        indexed_fragment_scanner
+            .with_fragments(vec![fragments[1].clone()])
+            .filter("ordered < 100")
+            .unwrap();
+        let (plan, count) = run_count(&mut indexed_fragment_scanner).await;
+        assert_eq!(count, 10);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "expected pushdown when the index covers the requested fragment: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_contains_union(&plan),
+            "unindexed fragments outside the requested scope must not add a scan branch: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+
+        let mut mixed_fragment_scanner = dataset.scan();
+        mixed_fragment_scanner
+            .with_fragments(vec![fragments[1].clone(), fragments[4].clone()])
+            .filter("ordered < 100")
+            .unwrap();
+        let (plan, count) = run_count(&mut mixed_fragment_scanner).await;
+        assert_eq!(count, 20);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "expected pushdown for the indexed requested fragment: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_contains_union(&plan),
+            "expected a scan branch for the unindexed requested fragment: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
@@ -723,6 +835,19 @@ mod tests {
         assert!(
             plan_contains_pushdown(&plan),
             "rule should fire under stable row IDs with a filter, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+
+        let mut fragment_scanner = dataset.scan();
+        fragment_scanner
+            .with_fragments(vec![dataset.fragments()[1].clone()])
+            .filter("ordered >= 0")
+            .unwrap();
+        let (plan, count) = run_count(&mut fragment_scanner).await;
+        assert_eq!(count, 9);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "rule should push down a fragment-scoped count under stable row IDs: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
