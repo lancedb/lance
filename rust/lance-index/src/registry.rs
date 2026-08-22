@@ -19,6 +19,10 @@ use crate::{
     },
 };
 
+/// Scalar detail package emitted by Lance 0.36 before the messages moved back
+/// to `lance.table` for forward compatibility.
+const V036_SCALAR_DETAILS_PACKAGE: &str = "lance.index.pb";
+
 /// Derive the scalar index plugin name from a details type URL.
 ///
 /// Takes the last `.`-separated segment, lowercases it, and strips any trailing
@@ -85,6 +89,11 @@ impl IndexPluginRegistry {
             .insert(plugin_name, Box::new(PluginType::default()));
     }
 
+    fn add_details_type_alias<DetailsType: prost::Name>(&mut self, package: &str) {
+        self.details_type_names
+            .insert(format!("{}.{}", package, DetailsType::NAME).to_ascii_lowercase());
+    }
+
     /// Create a registry with the default plugins
     pub fn with_default_plugins() -> Arc<Self> {
         let mut registry = Self {
@@ -102,6 +111,17 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
+
+        // Lance 0.36 released these scalar detail messages in the index package.
+        // Register only those historical identities, not arbitrary packages
+        // carrying the same terminal message names.
+        registry.add_details_type_alias::<pbold::BTreeIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+        registry.add_details_type_alias::<pbold::BitmapIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+        registry
+            .add_details_type_alias::<pbold::LabelListIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+        registry.add_details_type_alias::<pbold::NGramIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+        registry.add_details_type_alias::<pbold::ZoneMapIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+        registry.add_details_type_alias::<pbold::InvertedIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
 
         let registry = Arc::new(registry);
         for plugin in registry.plugins.values() {
@@ -205,6 +225,12 @@ mod tests {
         for type_url in [
             "/lance.table.BTreeIndexDetails",
             "type.googleapis.com/LANCE.TABLE.BTREEINDEXDETAILS",
+            "/lance.index.pb.BTreeIndexDetails",
+            "/lance.index.pb.BitmapIndexDetails",
+            "/lance.index.pb.LabelListIndexDetails",
+            "/lance.index.pb.NGramIndexDetails",
+            "/lance.index.pb.ZoneMapIndexDetails",
+            "/lance.index.pb.InvertedIndexDetails",
         ] {
             assert!(registry.supports_details(&prost_types::Any {
                 type_url: type_url.to_string(),

@@ -4639,6 +4639,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v036_scalar_details_are_still_known() {
+        let test_dir = copy_test_data_to_tmp("0.36.0/btree_in_index_pkg.lance").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let details = indices[0].index_details.clone().unwrap();
+
+        assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
+        assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
+        assert!(index_type_is_known(&indices[0]));
+    }
+
+    #[tokio::test]
     async fn test_unknown_index_type_does_not_block_queries_or_optimization() {
         let reader = gen_batch()
             .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
