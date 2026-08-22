@@ -321,7 +321,7 @@ async fn test_overlay_block_does_not_short_limited_index_scan() {
 
     let filter = format!("age < {THRESHOLD}");
 
-    // Ground truth: every non-overlayed row still matches.
+    // Ground truth: every non-overlaid row still matches.
     let mut unlimited = dataset.scan();
     unlimited
         .filter(&filter)
@@ -333,7 +333,7 @@ async fn test_overlay_block_does_not_short_limited_index_scan() {
     assert_eq!(
         total,
         (NUM_ROWS - STALE) as usize,
-        "overlayed rows must drop out of the unlimited result"
+        "overlaid rows must drop out of the unlimited result"
     );
     assert!(
         (PAGE - STALE) < LIMIT as i32,
