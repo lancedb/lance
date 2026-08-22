@@ -72,6 +72,27 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
+/// Whether an operation changes schema-level or per-field metadata. A merge
+/// carries the complete schema from its read version, so rebasing either
+/// operation over the other can discard one side's metadata changes.
+fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
+    let Operation::UpdateConfig {
+        schema_metadata_updates,
+        field_metadata_updates,
+        ..
+    } = operation
+    else {
+        return false;
+    };
+
+    schema_metadata_updates
+        .as_ref()
+        .is_some_and(|update| update.replace || !update.update_entries.is_empty())
+        || field_metadata_updates
+            .values()
+            .any(|update| update.replace || !update.update_entries.is_empty())
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -276,6 +297,14 @@ impl<'a> TransactionRebase<'a> {
         let theirs = &other_transaction.operation;
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        // Merge carries a complete schema from its read version. In either
+        // commit order, rebasing it with a metadata update can keep one side's
+        // schema while discarding metadata from the other side.
+        if (matches!(ours, Operation::Merge { .. }) && updates_schema_or_field_metadata(theirs))
+            || (updates_schema_or_field_metadata(ours) && matches!(theirs, Operation::Merge { .. }))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -2260,7 +2289,7 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
+    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -2340,6 +2369,149 @@ mod tests {
             schema_metadata_updates,
             field_metadata_updates,
         }
+    }
+
+    #[rstest::rstest]
+    #[case::config(false)]
+    #[case::table_metadata(true)]
+    #[tokio::test]
+    async fn test_merge_preserves_unrelated_update_config_compatibility(
+        #[case] update_table_metadata: bool,
+        #[values(true, false)] merge_commits_first: bool,
+    ) {
+        let dataset = Arc::new(test_dataset(5, 1).await);
+        let read_version = dataset.manifest.version;
+
+        let mut merged_schema = dataset.schema().clone();
+        merged_schema
+            .metadata
+            .insert("merge.schema".to_string(), "preserved".to_string());
+        let field_id = merged_schema.fields[0].id;
+        merged_schema.fields[0]
+            .metadata
+            .insert("merge.field".to_string(), "preserved".to_string());
+        let merge = Transaction::new_from_version(
+            read_version,
+            Operation::Merge {
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+        );
+
+        let replacement = UpdateMap {
+            update_entries: vec![("key", Some("value")).into()],
+            replace: true,
+        };
+        let update_config = Transaction::new_from_version(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: (!update_table_metadata).then_some(replacement.clone()),
+                table_metadata_updates: update_table_metadata.then_some(replacement),
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+        );
+
+        let (first, stale) = if merge_commits_first {
+            (merge, update_config)
+        } else {
+            (update_config, merge)
+        };
+        CommitBuilder::new(dataset.clone())
+            .execute(first)
+            .await
+            .unwrap();
+        let latest_dataset = CommitBuilder::new(dataset).execute(stale).await.unwrap();
+
+        assert_eq!(
+            latest_dataset
+                .schema()
+                .metadata
+                .get("merge.schema")
+                .map(String::as_str),
+            Some("preserved")
+        );
+        assert_eq!(
+            latest_dataset
+                .schema()
+                .field_by_id(field_id)
+                .unwrap()
+                .metadata
+                .get("merge.field")
+                .map(String::as_str),
+            Some("preserved")
+        );
+        let updated_map = if update_table_metadata {
+            &latest_dataset.manifest.table_metadata
+        } else {
+            &latest_dataset.manifest.config
+        };
+        assert_eq!(updated_map.get("key").map(String::as_str), Some("value"));
+    }
+
+    #[rstest::rstest]
+    #[case::schema_metadata(true)]
+    #[case::field_metadata(false)]
+    #[tokio::test]
+    async fn test_concurrent_merge_and_metadata_update_conflict(
+        #[case] replace_schema_metadata: bool,
+        #[values(true, false)] replace: bool,
+        #[values(true, false)] merge_commits_first: bool,
+    ) {
+        let dataset = Arc::new(test_dataset(5, 1).await);
+        let read_version = dataset.manifest.version;
+
+        let mut merged_schema = dataset.schema().clone();
+        merged_schema
+            .metadata
+            .insert("merge.schema".to_string(), "coordinated".to_string());
+        let field_id = merged_schema.fields[0].id;
+        merged_schema.fields[0]
+            .metadata
+            .insert("merge.field".to_string(), "coordinated".to_string());
+        let merge = Transaction::new_from_version(
+            read_version,
+            Operation::Merge {
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+        );
+
+        let metadata_update = UpdateMap {
+            update_entries: vec![("replacement", Some("coordinated")).into()],
+            replace,
+        };
+        let update_config = Transaction::new_from_version(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: replace_schema_metadata.then_some(metadata_update.clone()),
+                field_metadata_updates: if replace_schema_metadata {
+                    HashMap::new()
+                } else {
+                    HashMap::from_iter([(field_id, metadata_update)])
+                },
+            },
+        );
+
+        let (first, stale) = if merge_commits_first {
+            (merge, update_config)
+        } else {
+            (update_config, merge)
+        };
+        CommitBuilder::new(dataset.clone())
+            .execute(first)
+            .await
+            .unwrap();
+        let error = CommitBuilder::new(dataset)
+            .execute(stale)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
     }
 
     #[tokio::test]
@@ -2978,7 +3150,7 @@ mod tests {
                     schema: lance_core::datatypes::Schema::default(),
                     preserves_nullability: true,
                 },
-                // Merge conflicts with everything except CreateIndex and ReserveFragments.
+                // Merge also conflicts with schema and field metadata updates.
                 [
                     Retryable,     // append
                     Compatible,    // create index
@@ -2988,7 +3160,7 @@ mod tests {
                     Retryable,     // rewrite
                     Compatible,    // reserve
                     Retryable,     // update
-                    Compatible,    // update config
+                    Retryable,     // update config
                 ],
             ),
             (
@@ -3136,7 +3308,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3163,7 +3335,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3189,7 +3361,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
