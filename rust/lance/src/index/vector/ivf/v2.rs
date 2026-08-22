@@ -3108,9 +3108,8 @@ mod tests {
 
     /// Ship a merge artifact the way a Spark or Ray driver does.
     ///
-    /// The plan/task/result types only earn their keep if they survive the hop
-    /// to an executor, so the distributed tests move every artifact through
-    /// serialization rather than passing the in-memory value along.
+    /// The distributed tests move every artifact through serialization to
+    /// prove the plan/task/result types survive the hop to an executor.
     fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
     }
@@ -3356,10 +3355,9 @@ mod tests {
         );
     }
 
-    // IVF_SQ belongs here even though it cannot be segment-merged: this test commits
-    // per-fragment segments and queries across them without merging, and a multi-segment
-    // SQ index is fully supported. Each segment keeps its own bounds and the query fans
-    // out per segment.
+    // IVF_SQ belongs here even though it cannot be segment-merged: this test
+    // commits per-fragment segments without merging, each segment keeps its
+    // own bounds, and the query fans out per segment.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat)]
     #[case::ivf_pq(IndexType::IvfPq)]
@@ -3543,8 +3541,7 @@ mod tests {
     }
 
     /// Read the `packed` flag from an IVF_RQ segment's auxiliary storage file.
-    /// Distributed shards store row-major codes (`packed = false`). Any merged
-    /// segment stores packed codes (`packed = true`).
+    /// Distributed shards store row-major codes, merged segments packed codes.
     async fn read_rq_segment_packed(dataset: &Dataset, uuid: &Uuid) -> bool {
         let aux_path = dataset
             .indices_dir()
@@ -3577,8 +3574,7 @@ mod tests {
     }
 
     /// Read the `transposed` flag from a PQ segment's auxiliary storage file.
-    /// Distributed shards store row-major codes (`transposed = false`). Any
-    /// merged segment stores column-major codes (`transposed = true`).
+    /// Distributed shards store row-major codes, merged segments column-major.
     async fn read_pq_segment_transposed(dataset: &Dataset, uuid: &Uuid) -> bool {
         let aux_path = dataset
             .indices_dir()
@@ -3648,12 +3644,11 @@ mod tests {
         }
     }
 
-    /// Assert mean recall@K of the committed index against brute-force ground
-    /// truth, averaged over a deterministic query set drawn from the data.
+    /// Mean recall@K of the committed index against brute-force ground truth,
+    /// averaged over a deterministic query set drawn from the data.
     async fn merged_index_recall(dataset: &Dataset, column: &str) -> f32 {
-        // Mirrors the single-node recall measurement (`test_recall`): k=100,
-        // all partitions probed. Quantized codes on random data are coarse, so
-        // recall is measured at k=100 rather than a tiny k.
+        // Mirrors the single-node measurement in `test_recall`: all partitions
+        // probed, k large because quantized codes on random data are coarse.
         const K: usize = 100;
         const NUM_QUERIES: usize = 10;
         let query_batch = dataset
@@ -3701,11 +3696,9 @@ mod tests {
     }
 
     fn ivf_rq_params(ivf_params: IvfBuildParams, num_bits: u8) -> VectorIndexParams {
-        // Pin one shared RaBitQ rotation across every segment so their binary
-        // codes are comparable when merged. This is the distributed-build
-        // contract (mirrors `build_rq_model` + `rabitq_model`): without it each
-        // segment trains an independent random rotation and the merged codes are
-        // meaningless.
+        // Pin one shared RaBitQ rotation so every segment's binary codes are
+        // comparable when merged. Without it each segment trains an independent
+        // random rotation and the merged codes are meaningless.
         let quantizer = RabitQuantizer::new_with_rotation::<Float32Type>(
             num_bits,
             TWO_FRAG_DIM as i32,
@@ -3716,11 +3709,9 @@ mod tests {
         VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params)
     }
 
-    /// Merging IVF_RQ segments must support already-packed inputs so the merge
-    /// can be composed (a hierarchical/tree merge feeds the packed output of one
-    /// merge level into the next). Before the per-shard unpack fix, the merger
-    /// re-packed already-packed codes via `pack_codes`, silently corrupting the
-    /// index and collapsing recall.
+    /// A tree merge feeds the packed output of one merge level into the next,
+    /// so the merger must unpack packed IVF_RQ inputs rather than re-pack
+    /// them, which silently corrupts the codes and collapses recall.
     #[rstest]
     #[case::single_bit(1)]
     #[case::multi_bit(4)]
@@ -3773,8 +3764,7 @@ mod tests {
             "merged IVF_RQ segments are expected to be packed (the level-2 input)",
         );
 
-        // Level 2: merge the two packed segments. This is the case that
-        // double-packed (and corrupted) the codes before the fix.
+        // Level 2: both inputs are packed, exercising the unpack path.
         let final_segment = dataset
             .merge_existing_index_segments(vec![merged_a, merged_b])
             .await
@@ -3787,9 +3777,9 @@ mod tests {
         assert_merged_index_recall(&dataset, "vector", 0.4).await;
     }
 
-    /// A merge whose inputs mix an already-packed segment with a row-major shard
-    /// must honor each input's layout independently. The `multi_bit` case also
-    /// exercises the mixed-layout + ex-code interaction.
+    /// A merge mixing an already-packed segment with row-major shards must
+    /// honor each input's layout independently. The `multi_bit` case also
+    /// covers the mixed-layout and ex-code interaction.
     #[rstest]
     #[case::single_bit(1)]
     #[case::multi_bit(4)]
@@ -3970,29 +3960,19 @@ mod tests {
         assert_merged_index_recall(&dataset, "vector", 0.4).await;
     }
 
-    /// Merging segments must support already-merged inputs for every IVF
-    /// storage layout so the merge can be composed into a tree. PQ backed
-    /// merged segments (IVF_PQ and IVF_HNSW_PQ) store column-major codes and
-    /// must be transposed back on re-read (the analog of the packed RQ case).
-    /// SQ and FLAT layouts need no transform and are covered for regression.
-    /// IVF_RQ has its own compose tests above. The final heterogeneous merge
-    /// mixes one merged input with row-major shards in a single call, which
-    /// exercises the per-shard layout flags.
+    /// Merged inputs must be re-mergeable for every IVF storage layout so the
+    /// merge composes into a tree. PQ-backed merged segments store column-major
+    /// codes that must be transposed back on re-read, the analog of the packed
+    /// RQ case. The final heterogeneous merge mixes one merged input with
+    /// row-major shards, exercising the per-shard layout flags.
     ///
-    /// PQ recall on this uniform random data is inherently low (~0.24, the
-    /// same as a single-node build) and the PQ codebook is trained with an
-    /// unseeded RNG. The 0.15 threshold sits in the middle of the band
-    /// between a correct merge (~0.24) and the double-transpose corruption
-    /// signature (~0.07) to keep the assertion stable across runs. This is a
-    /// deliberate exception to the repository's usual 0.5 recall floor,
-    /// which is unreachable for PQ on this fixture regardless of merge
-    /// correctness.
-    // IVF_SQ is deliberately absent: every SQ shard trains its own bounds from its own
-    // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
-    // so merging independently-trained shards decodes all but the first against the
-    // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
-    // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    /// PQ recall on this uniform random data tops out near 0.24 even
+    /// single-node, so the usual 0.5 floor is unreachable here. The 0.15
+    /// threshold sits between a correct merge (~0.24) and the double-transpose
+    /// corruption signature (~0.07), stable with an unseeded codebook RNG.
+    // IVF_SQ is absent: each SQ shard trains its own bounds and no shared SQ
+    // model can be pinned, so the merge fails closed on a bounds mismatch. See
+    // test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
     #[case::ivf_pq(IndexType::IvfPq, 0.2)]
@@ -4053,8 +4033,8 @@ mod tests {
             );
         }
 
-        // Level 2: merge the two merged segments. For PQ this is the case that
-        // double-transposed (and corrupted) the codes before the fix.
+        // Level 2: both inputs are merged segments. For PQ this exercises the
+        // untranspose path.
         let final_segment = dataset
             .merge_existing_index_segments(vec![merged_a.clone(), merged_b])
             .await
@@ -4080,17 +4060,11 @@ mod tests {
         assert_merged_index_recall(&dataset, "vector", min_recall).await;
     }
 
-    /// Xuanwo's review point on #7730: the SQ merge arm checked only `dim` and then
-    /// wrote the FIRST shard's `ScalarQuantizationMetadata` over the concatenated codes
-    /// of every shard. When workers train SQ under their own fragment filter, shards
-    /// drawn from separated value ranges learn different bounds, so later shards were
-    /// dequantized against the wrong range: the merge committed successfully and recall
-    /// silently collapsed.
-    ///
-    /// `test_merge_existing_ivf_segments_compose`'s SQ case cannot catch this because
-    /// every fragment there draws from the same `0.0..1.0` distribution, so all shards
-    /// happen to agree. This one separates the ranges so the bounds genuinely differ,
-    /// and pins that the merge now fails closed rather than corrupting the index.
+    /// SQ shards trained under per-fragment filters can learn different bounds
+    /// while the merged file carries a single ScalarQuantizationMetadata, so
+    /// the merge must fail closed on a bounds mismatch instead of decoding
+    /// later shards against the first shard's bounds. The fragments draw from
+    /// disjoint value ranges so the bounds genuinely differ.
     #[tokio::test]
     async fn test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds() {
         const INDEX_NAME: &str = "vector_idx";
@@ -4182,19 +4156,13 @@ mod tests {
     }
 
     /// Distributed optimize round trip: the coordinator plans disjoint merge
-    /// tasks, workers merge each task independently, and the coordinator
-    /// commits every merged segment at once. The second round consumes the
-    /// merged outputs of the first, which requires composable merges for
-    /// every IVF storage layout.
-    ///
-    /// The PQ threshold is 0.15 for the same reason as in
-    /// `test_merge_existing_ivf_segments_compose`.
-    // IVF_SQ is deliberately absent: every SQ shard trains its own bounds from its own
-    // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
-    // so merging independently-trained shards decodes all but the first against the
-    // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
-    // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    /// tasks, workers run each one independently, and the coordinator commits
+    /// every merged segment at once. The second round consumes the merged
+    /// outputs of the first, requiring composable merges. The PQ threshold is
+    /// 0.15 for the reason in `test_merge_existing_ivf_segments_compose`.
+    // IVF_SQ is absent: each SQ shard trains its own bounds and no shared SQ
+    // model can be pinned, so the merge fails closed on a bounds mismatch. See
+    // test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
     #[case::ivf_pq(IndexType::IvfPq, 0.15)]
@@ -4296,12 +4264,10 @@ mod tests {
 
     /// Workers reopen the dataset at the version their plan pinned.
     ///
-    /// A distributed round takes minutes and the table keeps moving underneath
-    /// it. A worker handed a plan validates and merges against the pinned
-    /// snapshot rather than whatever version its own handle happens to sit at,
-    /// so an append that lands mid-round neither invalidates the round nor leaks
-    /// its rows into a segment that never read them. The append's fragment stays
-    /// unindexed and is answered by the flat fallback until the next build.
+    /// Merging against the pinned snapshot means an append landing mid-round
+    /// neither invalidates the round nor leaks rows into a segment that never
+    /// read them. The appended fragment stays unindexed and is answered by
+    /// the flat fallback until the next build.
     #[tokio::test]
     async fn test_execute_index_merge_task_uses_pinned_snapshot() {
         const INDEX_NAME: &str = "vector_idx";
@@ -4389,12 +4355,9 @@ mod tests {
         assert_merged_index_recall(&dataset, "vector", 0.95).await;
     }
 
-    // IVF_SQ is deliberately absent: every SQ shard trains its own bounds from its own
-    // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
-    // so merging independently-trained shards decodes all but the first against the
-    // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
-    // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    // IVF_SQ is absent: each SQ shard trains its own bounds and no shared SQ
+    // model can be pinned, so the merge fails closed on a bounds mismatch. See
+    // test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat)]
     #[case::ivf_pq(IndexType::IvfPq)]
@@ -4660,12 +4623,9 @@ mod tests {
         assert!(result.num_rows() > 0);
     }
 
-    // IVF_HNSW_SQ is deliberately absent: every SQ shard trains its own bounds from its own
-    // fragment sample, and the merged file carries a single ScalarQuantizationMetadata,
-    // so merging independently-trained shards decodes all but the first against the
-    // wrong range. Unlike RQBuildParams::rotation there is no way to pin a shared SQ
-    // model, so this cannot be made correct from the build side yet. The merge now fails
-    // closed. See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
+    // IVF_HNSW_SQ is absent: each SQ shard trains its own bounds and no shared
+    // SQ model can be pinned, so the merge fails closed on a bounds mismatch.
+    // See test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::flat("IVF_HNSW_FLAT")]
     #[case::pq("IVF_HNSW_PQ")]

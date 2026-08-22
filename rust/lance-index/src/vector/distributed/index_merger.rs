@@ -524,15 +524,13 @@ struct ShardInfo {
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
-    /// IVF_RQ only: this shard stores its RaBitQ binary codes in the packed
-    /// SIMD-block layout, so they must be unpacked back to row-major before the
-    /// merge re-packs the concatenated partition. Row-major shards leave this
-    /// false and are untouched.
+    /// IVF_RQ only: this shard's RaBitQ codes are in the packed SIMD-block
+    /// layout and must be unpacked to row-major before the merge re-packs the
+    /// concatenated partition. Row-major shards leave this false.
     unpack_rq_codes: bool,
-    /// PQ-backed only: this shard stores its PQ codes column-major (the output
-    /// of a prior merge), so they must be transposed back to row-major before
-    /// the merge re-transposes the concatenated partition. Row-major shards
-    /// leave this false and are untouched.
+    /// PQ-backed only: this shard's PQ codes are column-major (a prior merge's
+    /// output) and must be transposed to row-major before the merge
+    /// re-transposes the concatenated partition. Row-major shards leave this false.
     untranspose_pq_codes: bool,
 }
 
@@ -772,9 +770,9 @@ async fn read_shard_window_partitions(
         )));
     }
 
-    // A merged shard stores its codes in the query-optimized layout. Restore
-    // row-major per shard here, before the merge stage concatenates partitions
-    // across shards and applies the layout once (see the `layout` module docs).
+    // Restore row-major per shard, before the merge stage concatenates
+    // partitions across shards and applies the query-optimized layout once
+    // (see the `layout` module docs).
     if shard_job.unpack_rq_codes {
         super::layout::restore_partition_layout(
             &mut per_partition_batches,
@@ -799,16 +797,14 @@ async fn read_shard_window_partitions(
 /// `auxiliary.idx` into `target_dir`.
 ///
 /// Supports IVF_FLAT, IVF_PQ, IVF_RQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
-/// IVF_HNSW_SQ storage types. Every source segment must share one quantizer
-/// model and distance type, because the merged artifact carries a single
-/// metadata scope. A mismatched PQ codebook, RaBitQ rotation, or scalar
-/// quantizer is rejected rather than silently decoded against the first
-/// segment's model.
+/// IVF_HNSW_SQ storage types. The merged artifact carries a single metadata
+/// scope, so every source segment must share one quantizer model and distance
+/// type. A mismatched PQ codebook, RaBitQ rotation, or scalar quantizer is
+/// rejected rather than silently decoded against the first segment's model.
 ///
-/// In practice this makes IVF_SQ unmergeable: each SQ segment trains its bounds
-/// from its own fragment sample, and `SQBuildParams` has no way to pin a shared
-/// model the way `RQBuildParams::rotation` does. SQ segments can still be
-/// committed and queried side by side. Only physical merge is unavailable.
+/// In practice IVF_SQ is unmergeable: each SQ segment trains bounds from its
+/// own fragment sample and `SQBuildParams` cannot pin a shared model. SQ
+/// segments can still be committed and queried side by side.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
@@ -993,12 +989,9 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
-        // IVF_RQ: whether THIS shard's binary codes are packed. Captured per
-        // shard (not from the shared first-shard metadata) so a mix of packed
-        // and row-major shards merges correctly.
+        // Captured per shard, not from the shared first-shard metadata, so a
+        // mix of query-optimized and row-major shards merges correctly.
         let mut shard_unpack_rq_codes = false;
-        // PQ-backed: whether THIS shard's PQ codes are transposed, captured per
-        // shard for the same reason.
         let mut shard_untranspose_pq_codes = false;
 
         match idx_type {
@@ -1050,11 +1043,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
 
-                // Every shard's u8 codes are concatenated and then decoded with ONE
-                // metadata blob. A shard trained on a different value range would be
-                // dequantized against the first shard's bounds, silently corrupting
-                // distances and recall with no error at commit time. Fail closed on any
-                // difference instead of letting the first shard's model win.
+                // Every shard's codes are decoded with one metadata blob. A shard
+                // trained on a different value range would be dequantized against the
+                // first shard's bounds, silently corrupting distances. Fail closed.
                 match sq_meta.as_ref() {
                     None => sq_meta = Some(sq_meta_parsed.clone()),
                     Some(expected) if *expected != sq_meta_parsed => {
@@ -1478,11 +1469,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 {
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
-                // Every shard's u8 codes are concatenated and then decoded with ONE
-                // metadata blob. A shard trained on a different value range would be
-                // dequantized against the first shard's bounds, silently corrupting
-                // distances and recall with no error at commit time. Fail closed on any
-                // difference instead of letting the first shard's model win.
+                // Every shard's codes are decoded with one metadata blob. A shard
+                // trained on a different value range would be dequantized against the
+                // first shard's bounds, silently corrupting distances. Fail closed.
                 match sq_meta.as_ref() {
                     None => sq_meta = Some(sq_meta_parsed.clone()),
                     Some(expected) if *expected != sq_meta_parsed => {

@@ -3315,9 +3315,10 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
 
 def test_plan_index_segment_merge_ivf_rq(tmp_path: Path) -> None:
     """The coordinator plans disjoint merge tasks, workers merge each task, and
-    the coordinator commits every merged segment at once. Tasks are pickled to
-    mimic the Spark driver to executor boundary, and the second round consumes
-    the packed outputs of the first, which requires composable IVF_RQ merges."""
+    the coordinator commits every merged segment at once. The plan and results
+    are pickled to mimic the Spark driver to executor boundary, and the second
+    round consumes the packed outputs of the first, requiring composable IVF_RQ
+    merges."""
     from lance.lance import indices
 
     dim = 32

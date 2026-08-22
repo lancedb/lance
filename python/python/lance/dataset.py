@@ -774,10 +774,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 class _IndexMergeArtifact:
     """One artifact of a distributed index merge.
 
-    Distributed merge artifacts travel from a driver to its executors and back,
-    so the Rust core hands them over as JSON. Wrapping that string keeps the
-    driver from having to know the field names while leaving every validation
-    rule in the core, where the worker and the commit share it. Instances
+    Artifacts travel between a driver and its executors as JSON produced by
+    the Rust core, which owns every field name and validation rule. Instances
     pickle, so a Spark or Ray task can close over one directly.
     """
 
@@ -814,11 +812,10 @@ class _IndexMergeArtifact:
 class IndexMergePlan(_IndexMergeArtifact):
     """A coordinator's plan for merging one logical index's segments.
 
-    Produced by :meth:`LanceDataset.plan_index_segment_merge`. Pins the dataset
-    version it was built at, the exact source segments and where they live, and
-    a fingerprint of the index model, so a worker can prove its snapshot still
-    describes what was planned and the commit can compare-and-swap that exact
-    source set.
+    Produced by :meth:`LanceDataset.plan_index_segment_merge`. Pins the
+    dataset version, the exact source segments and their locations, and a
+    fingerprint of the index model, so workers can validate their snapshot
+    and the commit can compare-and-swap that exact source set.
     """
 
     @property
@@ -4711,26 +4708,21 @@ class LanceDataset(pa.dataset.Dataset):
         Plan a distributed merge of an index's segments.
 
         Partitions the segments of ``index_name`` into groups of
-        ``segments_per_task`` (at least 2). Each group becomes one task: a
-        worker runs it with :meth:`execute_index_merge_task` and the
-        coordinator publishes every result at once with
-        :meth:`commit_index_merge_results`. Groups cover disjoint fragment
-        sets, so workers never contend.
+        ``segments_per_task``. Each group becomes one task: a worker runs it
+        with :meth:`execute_index_merge_task` and the coordinator publishes
+        every result at once with :meth:`commit_index_merge_results`. Groups
+        cover disjoint fragment sets, so workers never contend.
 
-        The returned plan pins the dataset version it was built at, the exact
-        source segment ids, where each one lives (base-aware, so a segment a
-        shallow clone imported still resolves), the coverage each one claimed,
-        and a fingerprint of the index model. Workers reopen at the pinned
-        version and revalidate before writing, and the commit
-        compare-and-swaps that exact source set, so a round planned at one
-        version cannot silently republish entries a later write invalidated.
+        The plan pins the dataset version, the source segment ids, each
+        segment's location (base-aware, so a segment imported by a shallow
+        clone still resolves), its claimed coverage, and a fingerprint of the
+        index model. Workers revalidate at the pinned version before writing
+        and the commit compare-and-swaps that exact source set.
 
-        Segments with no effective fragment coverage (deferred builds, or
-        coverage naming only fragments that no longer exist) are skipped. A
-        legacy segment without fragment coverage is rejected with an error,
-        and that rejection is evaluated over the whole segment set before
-        ``max_segments_to_merge`` selects a suffix, so an index whose base
-        segment is legacy cannot be planned until it is rebuilt.
+        Segments with no effective fragment coverage are skipped. A legacy
+        segment without fragment coverage is rejected, and that check runs
+        over the whole segment set before ``max_segments_to_merge`` selects a
+        suffix, so a legacy base segment blocks planning until it is rebuilt.
 
         One bounded fan-out round commits several terminal segments. Reducing
         the index to a single root takes another round against a fresh plan.
@@ -4740,18 +4732,14 @@ class LanceDataset(pa.dataset.Dataset):
         index_name: str
             Name of the index whose segments should be merged.
         segments_per_task: int
-            Number of segments each worker merges. Must be at least 2. A
-            trailing leftover group of one segment borrows a segment back from
-            the previous group when this is 3 or more, keeping both groups
-            mergeable and within the bound; when it is 2 there is nothing to
-            borrow and the leftover folds into a group of three.
+            Number of segments each worker merges, at least 2. A trailing
+            leftover group of one segment borrows a segment back from the
+            previous group when this is 3 or more. When it is 2 there is
+            nothing to borrow and the leftover folds into a group of three.
         max_segments_to_merge: int, optional
-            Plan at most this many segments, taking the newest ones first,
-            mirroring ``num_indices_to_merge`` in optimize. Segments with
-            empty fragment coverage are skipped before the bound is applied,
-            so it counts qualifying segments only. The default plans every
-            segment, which consolidates the full index and rewrites the
-            oldest (typically largest) segment as well.
+            Plan at most this many qualifying segments, newest first,
+            mirroring ``num_indices_to_merge`` in optimize. The default plans
+            every segment, consolidating the full index.
 
         Returns
         -------
@@ -4780,11 +4768,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Run one task of a merge plan.
 
-        Reopens the dataset at the version the plan pinned when this handle is
-        at a different one, validates the task against that snapshot, and only
-        then writes the merged segment. A source that moved, changed coverage,
-        or disappeared raises instead of producing a segment the commit would
-        reject.
+        Reopens the dataset at the version the plan pinned, validates the
+        task against that snapshot, and only then writes the merged segment.
+        A source that moved, changed coverage, or disappeared raises instead
+        of producing a segment the commit would reject.
 
         Safe to retry: each attempt writes its own output and reports its own
         attempt id, and the commit reconciles duplicates deterministically.
@@ -4814,29 +4801,25 @@ class LanceDataset(pa.dataset.Dataset):
         Publish the merged segments of one fan-out round.
 
         Compare-and-swaps the exact source segments named by ``results``.
-        Every source must still be present, under the same base, at the same
-        dataset version, with the coverage it had when the plan was built. A
-        concurrent update of an indexed column prunes coverage out of the
-        segments it invalidates, so a coverage change means these merged
+        Every source must still be present, under the same base, with the
+        coverage it had when the plan was built, otherwise the merged
         segments would republish stale entries: the commit raises and the
-        caller re-plans. Validation runs against the latest dataset version,
-        so the handle that planned the round commits it safely and sees every
-        mutation committed during the fan-out, and the same source check runs
-        again during commit conflict resolution so a mutation landing while
-        the commit is in flight fails it too. Every output id must be fresh
-        and every reported file is verified against the object store before
-        its metadata replaces readable sources.
+        caller re-plans.
 
-        ``results`` may cover a subset of the plan's tasks. Tasks are disjoint,
-        so a round survives a failed worker: what succeeded is published and
-        the rest can be retried against a fresh plan. Several attempts of the
-        same task are reconciled to one winner by lowest attempt id, so the
-        outcome depends on the reports rather than on their arrival order.
+        Validation runs against the latest dataset version and runs again
+        during commit conflict resolution, so a mutation landing during the
+        fan-out or while the commit is in flight fails it. Every output id
+        must be fresh, and every reported file is verified against the object
+        store before its metadata replaces readable sources.
+
+        ``results`` may cover a subset of the plan's tasks, so a round
+        survives a failed worker: what succeeded is published and the rest is
+        retried against a fresh plan. Duplicate attempts of one task are
+        reconciled to the lowest attempt id, independent of arrival order.
 
         Cleanup covers exactly the losing attempts among ``results``. Output
-        that no result reported, such as a worker that wrote a segment and then
-        died, is unreachable from any manifest and is reclaimed by
-        ``cleanup_old_versions`` like any other uncommitted index directory.
+        no result reported is unreachable from any manifest and is reclaimed
+        by ``cleanup_old_versions`` like any uncommitted index directory.
 
         Parameters
         ----------

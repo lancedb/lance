@@ -3,13 +3,11 @@
 
 //! Restore row-major quantized code layouts when re-reading merged segments.
 //!
-//! A merged vector segment stores its codes in the query-optimized layout:
-//! packed SIMD blocks for RaBitQ (`packed = true`) and column-major for PQ
-//! (`transposed = true`). Re-merging such a segment must invert that layout
-//! back to row-major first, per partition and per shard, because the merge
-//! concatenates partitions across shards before applying the layout once.
-//! Codes in the optimized layout cannot be concatenated, and applying the
-//! layout to already-optimized codes corrupts them silently.
+//! Merged segments store codes in the query-optimized layout: packed SIMD
+//! blocks for RaBitQ (`packed`), column-major for PQ (`transposed`). The merge
+//! concatenates partitions across shards and applies the layout once, so
+//! optimized inputs must be restored to row-major first. Applying the layout
+//! to already-optimized codes corrupts them silently.
 
 use std::sync::Arc;
 
@@ -26,9 +24,8 @@ use crate::vector::pq::storage::transpose;
 
 /// Reassemble each partition's batches and restore its code layout.
 ///
-/// Each partition is laid out as an independent unit, so its rows must be
-/// reassembled into one batch (a partition can span multiple stream batches)
-/// before `restore` can invert the layout.
+/// The layout is per partition, so a partition spanning multiple stream
+/// batches must become one batch before `restore` can invert it.
 pub(super) fn restore_partition_layout(
     per_partition_batches: &mut [Vec<RecordBatch>],
     restore: impl Fn(RecordBatch) -> Result<RecordBatch>,
