@@ -799,7 +799,7 @@ pub(crate) fn index_type_is_known(index: &IndexMetadata) -> bool {
     index
         .index_details
         .as_ref()
-        .is_none_or(|details| IndexDetails(details.clone()).index_version().is_ok())
+        .is_none_or(|details| IndexDetails(details.clone()).has_reader())
 }
 
 /// Detect FTS / inverted segments from manifest details.
@@ -4681,7 +4681,7 @@ mod tests {
         )
         .await;
         foreign_segment.index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/example.MyIndexDetails".to_string(),
+            type_url: "type.googleapis.com/example.MyVectorIndexDetails".to_string(),
             value: Vec::new(),
         }));
         foreign_segment.index_version = 1;
