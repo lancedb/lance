@@ -7335,6 +7335,28 @@ class DatasetOptimizer:
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
+    def cleanup_frag_reuse_index(self) -> None:
+        """Prune obsolete generations from the ``__lance_frag_reuse`` system index.
+
+        The fragment-reuse index is created by :meth:`compact_files` when
+        ``defer_index_remap=True``. It retains one generation per deferred
+        compaction so indices can be remapped lazily. Once every index has caught
+        up to a generation (for example after rebuilding it or calling
+        :meth:`optimize_indices`), that generation is obsolete and can be pruned.
+
+        This is safe to call at any time: a generation that an index has not yet
+        caught up to is always retained.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"id": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://frag_reuse_example")
+        >>> dataset.optimize.cleanup_frag_reuse_index()
+        """
+        self._dataset._ds.cleanup_frag_reuse_index()
+
     def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
         """Enable autocleaning for an existing dataset.
 

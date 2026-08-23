@@ -57,29 +57,15 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         return Ok(());
     };
 
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
-        .await
-        .unwrap();
+    // Surface corrupt/stale metadata as a normal error instead of panicking on unwrap.
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
 
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
 
-    let mut retained_versions = Vec::new();
+    let mut retained_versions = Vec::with_capacity(frag_reuse_details.versions.len());
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
-            .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-            .collect::<Vec<_>>();
-
-        if check_results
-            .iter()
-            .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-        {
-            // If the check fails, the reuse version is likely corrupted, do not retain it.
-            continue;
-        }
-
-        if !check_results.into_iter().all(|r| r.unwrap()) {
+        if !is_reuse_version_caught_up(version, &indices, &chain_frag_bitmap)? {
             fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
@@ -128,6 +114,33 @@ fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
         bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
     }
     bitmap
+}
+
+/// Decide whether a reuse version can be safely cleaned up given the current indices.
+///
+/// A reuse version is only droppable once every index has caught up to it. This
+/// mirrors the load/remap path. `recalculate_fragment_bitmap` treats a rewrite group
+/// that straddles indexed and non-indexed fragments as a recoverable state that aborts
+/// the remap and preserves the reuse generation, rather than as corruption to discard.
+/// We treat the same `InvalidInput` straddling state as "not caught up" so the reuse
+/// generation is kept. Dropping it would leave the affected indexes unable to remap
+/// their stale fragments. Any other error is surfaced to the caller.
+fn is_reuse_version_caught_up(
+    frag_reuse_version: &FragReuseVersion,
+    indices: &[IndexMetadata],
+    chain_frag_bitmap: &RoaringBitmap,
+) -> lance_core::Result<bool> {
+    for idx in indices.iter() {
+        match is_index_remap_caught_up(frag_reuse_version, idx, chain_frag_bitmap) {
+            Ok(true) => {}
+            // The index is behind or straddles indexed and non-indexed data, so the
+            // reuse version is still needed and must be kept, as the load path does.
+            Ok(false) | Err(Error::InvalidInput { .. }) => return Ok(false),
+            // Any other error is unexpected, so surface it instead of panicking.
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }
 
 fn is_index_remap_caught_up(
@@ -362,6 +375,22 @@ mod tests {
             .unwrap()
         );
 
+        // Cleanup must not prune a reuse version while an index has not caught up to it.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            frag_reuse_details.versions.len(),
+            1,
+            "reuse version must be retained while an index is not caught up"
+        );
+
         // Remap and check index is caught up
         remapping::remap_column_index(&mut dataset, &["i"], index_name.clone())
             .await
@@ -397,6 +426,136 @@ mod tests {
             cleanup_frag_reuse_index(&mut dataset_clone).await,
             Err(Error::RetryableCommitConflict { .. })
         ));
+    }
+
+    /// Corrupt or stale fragment-reuse metadata must surface as a normal error,
+    /// not a panic. Regression for the `load_frag_reuse_index_details().unwrap()`
+    /// that used to crash the (Python) caller on unloadable metadata.
+    #[tokio::test]
+    async fn test_cleanup_frag_reuse_index_corrupt_metadata_errors() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+
+        // Replace the reuse index with one whose details cannot be loaded.
+        let corrupt_meta = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            index_details: None,
+            ..frag_reuse_index_meta.clone()
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![corrupt_meta],
+                removed_indices: vec![frag_reuse_index_meta],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let err = cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .expect_err("corrupt frag-reuse metadata must surface as an error, not a panic");
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "expected an Error::Index for corrupt frag-reuse metadata, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("fragment reuse index"),
+            "error message should identify the fragment reuse index, got: {err}"
+        );
+    }
+
+    /// A rewrite group that straddles indexed and non-indexed fragments must not be
+    /// treated as corrupt-and-droppable by cleanup. The load/remap path
+    /// (`recalculate_fragment_bitmap`) aborts on this state and preserves the reuse
+    /// generation, so cleanup must report the version as "not caught up" and retain
+    /// it. A buggy "drop on straddle" implementation would report it as caught up and
+    /// silently prune the still-needed generation.
+    #[test]
+    fn test_straddling_group_is_not_caught_up() {
+        // Reuse version at dataset version 5 rewrites old fragments [1, 2] -> [10].
+        let version = reuse_version(5, &[1, 2], &[10]);
+
+        // Index is at a newer dataset version so the version short-circuit does not
+        // fire, but its bitmap only covers fragment 1 of the group. It straddles
+        // indexed (1) and non-indexed (2) data, which makes
+        // `is_index_remap_caught_up` return `Err(InvalidInput)`.
+        let index = index_covering(7, &[1]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        assert!(
+            matches!(
+                is_index_remap_caught_up(&version, &index, &chain),
+                Err(Error::InvalidInput { .. })
+            ),
+            "a straddling group must produce InvalidInput at the per-index check"
+        );
+
+        // The retention decision must treat that straddle as "not caught up" so the
+        // reuse generation is retained, mirroring the load path.
+        assert!(
+            !is_reuse_version_caught_up(&version, std::slice::from_ref(&index), &chain).unwrap(),
+            "cleanup must retain (not drop) a reuse version whose group straddles \
+             indexed and non-indexed fragments"
+        );
+    }
+
+    /// Sanity check the opposite direction: an index is "caught up" once it has
+    /// already remapped the group's old fragments away, i.e. its bitmap no longer
+    /// contains any of them (and it is at/after the reuse version). Such a reuse
+    /// version is droppable.
+    #[test]
+    fn test_remapped_group_is_caught_up() {
+        let version = reuse_version(5, &[1, 2], &[10]);
+        // Bitmap points at the new fragment only. The old fragments [1, 2] have
+        // already been remapped away, so this index is caught up.
+        let index = index_covering(7, &[10]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        assert!(
+            is_reuse_version_caught_up(&version, std::slice::from_ref(&index), &chain).unwrap()
+        );
+
+        // An index still covering all old fragments has not remapped yet, so the
+        // version is still needed and not caught up.
+        let stale_index = index_covering(7, &[1, 2]);
+        assert!(
+            !is_reuse_version_caught_up(&version, std::slice::from_ref(&stale_index), &chain)
+                .unwrap()
+        );
     }
 
     /// With more than one index on the table, remapping every index must catch

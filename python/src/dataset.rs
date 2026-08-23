@@ -3148,6 +3148,17 @@ impl Dataset {
         Ok(())
     }
 
+    fn cleanup_frag_reuse_index(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(
+            None,
+            lance::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut new_self),
+        )?
+        .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn drop_columns(&mut self, columns: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let columns: Vec<_> = columns.iter().map(|s| s.as_str()).collect();
