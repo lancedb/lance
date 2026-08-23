@@ -88,7 +88,28 @@ mod schema_evolution;
 pub mod sql;
 pub mod statistics;
 mod take;
-pub mod transaction;
+/// Transaction definitions for updating datasets
+///
+/// Prior to creating a new manifest, a transaction must be created representing
+/// the changes being made to the dataset. By representing them as incremental
+/// changes, we can detect whether concurrent operations are compatible with
+/// one another. We can also rebuild manifests when retrying committing a
+/// manifest.
+///
+/// The definitions live in [`lance_table::transaction`]: building a manifest from
+/// a transaction reads and writes only table metadata, so it belongs at the table
+/// layer. This module re-exports them at the path callers have always used.
+///
+/// For more details please refer to the
+/// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
+pub mod transaction {
+    pub use lance_table::transaction::{
+        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
+        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
+        validate_operation,
+    };
+}
 pub mod udtf;
 pub mod updater;
 mod utils;
@@ -127,9 +148,7 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{
-    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
-};
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
@@ -138,8 +157,8 @@ pub use schema_evolution::{
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
-    WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,
+    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
@@ -744,8 +763,6 @@ impl Dataset {
         } else {
             read_struct(object_reader.as_ref(), offset).await
         }?;
-
-        validate_mem_wal_index_catchup_flags(&manifest)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -2734,13 +2751,8 @@ impl Dataset {
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
-        let dataset = Arc::new(self.clone());
-        let fragment = self
-            .manifest
-            .fragments
-            .iter()
-            .find(|f| f.id == fragment_id as u64)?;
-        Some(FileFragment::new(dataset, fragment.clone()))
+        let metadata = self.find_fragment(fragment_id as u64)?.clone();
+        Some(FileFragment::new(Arc::new(self.clone()), metadata))
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
@@ -2849,6 +2861,27 @@ impl Dataset {
                 Some(FileFragment::new(dataset.clone(), fragment.clone()))
             })
             .collect()
+    }
+
+    /// Look up the fragment with `id` in the manifest.
+    ///
+    /// `Manifest::fragments` is kept sorted by id, so this binary searches
+    /// rather than scanning. Two kinds of manifest predate that invariant and
+    /// are still readable: those written before fragments were forced into id
+    /// order (Lance 0.10 and earlier), and those with duplicate fragment ids
+    /// (Lance 0.16 and earlier). Neither is rejected on read, so the search
+    /// result is checked and a scan takes over when it does not match --
+    /// returning some other fragment's data would be silent corruption.
+    fn find_fragment(&self, id: u64) -> Option<&Fragment> {
+        if !u32::try_from(id).is_ok_and(|id| self.fragment_bitmap.contains(id)) {
+            return None;
+        }
+        let fragments = self.manifest.fragments.as_slice();
+        let index = fragments.partition_point(|fragment| fragment.id < id);
+        match fragments.get(index) {
+            Some(fragment) if fragment.id == id => Some(fragment),
+            _ => fragments.iter().find(|fragment| fragment.id == id),
+        }
     }
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
@@ -3136,11 +3169,11 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them.
-    /// Assigns a contiguous `RowIdSequence` to every fragment starting from row
-    /// ID 0 and returns the resulting `next_row_id` high-water mark.
-    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment]) -> Result<u64> {
-        let mut next_row_id = 0u64;
+    /// Assign stable row ID sequences to fragments that do not yet have them,
+    /// contiguously from `start`, and return the resulting `next_row_id`
+    /// high-water mark.
+    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
+        let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
             let physical_rows = fragment.physical_rows.ok_or_else(|| {
                 Error::internal(format!(
@@ -3182,7 +3215,11 @@ impl Dataset {
         }
 
         let mut fragments = self.manifest.fragments.as_ref().clone();
-        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        // Restore carries the high-water mark forward across a version that
+        // predates activation, so a re-migration must allocate above it rather
+        // than reissue ids the earlier versions still hold.
+        let next_row_id =
+            Self::assign_stable_row_ids_for_migration(&mut fragments, self.manifest.next_row_id)?;
         let schema = self.manifest.schema.clone();
         let read_version = self.manifest.version;
 
@@ -4052,6 +4089,7 @@ impl ManifestWriteConfig {
             use_legacy_format: self.use_legacy_format,
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
+            migration_next_row_id: self.migration_next_row_id,
         }
     }
 }
