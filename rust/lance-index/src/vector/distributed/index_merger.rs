@@ -249,25 +249,27 @@ async fn open_aux_reader(
     .await
 }
 
-/// Durable row provenance of a segment: its stored row count and the
-/// fragments its stored row addresses name.
+/// Durable row identity of a segment: its stored row count and the distinct
+/// row ids it holds.
 #[derive(Debug, Clone)]
-pub struct SegmentRowProvenance {
+pub struct SegmentRowIdentity {
     /// Rows the storage actually holds.
     pub num_rows: u64,
-    /// Fragments named by the stored row addresses.
-    pub fragments: roaring::RoaringBitmap,
+    /// Distinct row ids stored by the segment.
+    pub row_ids: roaring::RoaringTreemap,
 }
 
-/// Read a segment's durable row provenance from its auxiliary file.
+/// Read a segment's durable row identity from its auxiliary file.
 ///
-/// A report's coverage claim is untrusted, but every stored row address names
-/// its fragment, so the bytes themselves prove which fragments the segment
-/// holds and how many rows it carries.
-pub async fn read_segment_row_provenance(
+/// A report's task binding is untrusted, but the stored row ids prove which
+/// rows the segment holds. The ids are treated as opaque u64 identities and
+/// never decoded into fragments: physical row addresses, stable row ids, and
+/// addresses written before a deferred fragment reuse remap all validate the
+/// same way, by set equality against the rows of the claimed sources.
+pub async fn read_segment_row_ids(
     object_store: &lance_io::object_store::ObjectStore,
     segment_dir: &object_store::path::Path,
-) -> Result<SegmentRowProvenance> {
+) -> Result<SegmentRowIdentity> {
     use lance_core::ROW_ID;
 
     let reader = open_aux_reader(object_store, segment_dir).await?;
@@ -296,7 +298,7 @@ pub async fn read_segment_row_provenance(
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
         .await?;
-    let mut fragments = roaring::RoaringBitmap::new();
+    let mut row_ids_set = roaring::RoaringTreemap::new();
     let mut num_rows = 0u64;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -311,25 +313,13 @@ pub async fn read_segment_row_provenance(
             })?;
         num_rows += row_ids.len() as u64;
         for row_id in row_ids.values() {
-            fragments.insert((*row_id >> 32) as u32);
+            row_ids_set.insert(*row_id);
         }
     }
-    Ok(SegmentRowProvenance {
+    Ok(SegmentRowIdentity {
         num_rows,
-        fragments,
+        row_ids: row_ids_set,
     })
-}
-
-/// A segment's durable row count, from its IVF partition lengths.
-pub async fn read_segment_row_count(
-    object_store: &lance_io::object_store::ObjectStore,
-    segment_dir: &object_store::path::Path,
-) -> Result<u64> {
-    let reader = open_aux_reader(object_store, segment_dir).await?;
-    let pb_ivf = try_read_ivf_proto(&reader)
-        .await?
-        .ok_or_else(|| Error::index(format!("segment {segment_dir} has no IVF metadata")))?;
-    Ok(pb_ivf.lengths.iter().map(|length| *length as u64).sum())
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
