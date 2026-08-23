@@ -274,12 +274,53 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
             }
             Err(err) => Err(err),
         };
-        if let Err(err) = decoded {
-            return Err(Error::invalid_input(format!(
-                "index merge output file {} of task {} is not a readable Lance index \
-                 file ({}); re-run the task",
-                path, result.task_id, err
-            )));
+        let metadata = match decoded {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                return Err(Error::invalid_input(format!(
+                    "index merge output file {} of task {} is not a readable Lance index \
+                     file ({}); re-run the task",
+                    path, result.task_id, err
+                )));
+            }
+        };
+        // The production open reads the vector index header from the index
+        // file's schema metadata, so a decodable but generic Lance file must
+        // be rejected here rather than at query time.
+        if file.path == INDEX_FILE_NAME
+            && result
+                .fingerprint
+                .index_type_url
+                .ends_with("VectorIndexDetails")
+        {
+            let header = metadata
+                .file_schema
+                .metadata
+                .get(INDEX_METADATA_SCHEMA_KEY)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "index merge output file {} of task {} carries no vector index \
+                         header; the output is not a vector index segment, re-run the task",
+                        path, result.task_id
+                    ))
+                })?;
+            let header: lance_index::IndexMetadata =
+                serde_json::from_str(header).map_err(|err| {
+                    Error::invalid_input(format!(
+                        "index merge output file {} of task {} has an unreadable vector \
+                         index header ({}); re-run the task",
+                        path, result.task_id, err
+                    ))
+                })?;
+            lance_linalg::distance::DistanceType::try_from(header.distance_type.as_str()).map_err(
+                |err| {
+                    Error::invalid_input(format!(
+                        "index merge output file {} of task {} declares an invalid \
+                         distance type ({}); re-run the task",
+                        path, result.task_id, err
+                    ))
+                },
+            )?;
         }
     }
     Ok(())
@@ -2347,13 +2388,13 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        // Declare the refreshed version the checks above validated against. The
-        // plan's version would replay the fan-out window through the conflict
-        // resolver, whose same-index-name rule rejects the round after any delta
-        // commit. Safety needs no replay: the compare-and-swap covers the window and
-        // the exact-source property re-validates the removal set on every rebase.
+        // The plan's version is the content snapshot the merged data was read
+        // at, and MemWAL catch-up derives from the declared read version, so
+        // the refreshed coordinator version must not stand in for it. Same-name
+        // commits in the replayed window are not conflicts for this commit: the
+        // exact-source property waives that rule and re-proves safety instead.
         let transaction = TransactionBuilder::new(
-            self.manifest.version,
+            plan.read_version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices: replaced,
@@ -9407,8 +9448,13 @@ mod tests {
     }
 
     /// Write a genuine minimal Lance file as a stubbed merge output and return
-    /// its size, since the commit decodes every reported file.
-    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> u64 {
+    /// its size. `vector_header` controls whether the file carries the vector
+    /// index header the commit and the production open both require.
+    async fn write_stub_output_file_impl(
+        dataset: &Dataset,
+        output_uuid: Uuid,
+        vector_header: bool,
+    ) -> u64 {
         use lance_file::version::ConcreteFileVersion;
         use lance_file::writer::FileWriterOptions;
 
@@ -9432,8 +9478,23 @@ mod tests {
         )
         .unwrap();
         file_writer.write_batch(&batch).await.unwrap();
+        if vector_header {
+            file_writer.add_schema_metadata(
+                INDEX_METADATA_SCHEMA_KEY,
+                serde_json::to_string(&lance_index::IndexMetadata {
+                    index_type: "IVF_FLAT".to_owned(),
+                    distance_type: "l2".to_owned(),
+                })
+                .unwrap(),
+            );
+        }
         file_writer.finish().await.unwrap();
         dataset.object_store.size(&path).await.unwrap()
+    }
+
+    /// A stubbed merge output that passes the commit's file verification.
+    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> u64 {
+        write_stub_output_file_impl(dataset, output_uuid, true).await
     }
 
     /// A worker report for `task_id` that never ran a merge.
@@ -9729,9 +9790,9 @@ mod tests {
         );
 
         // The dead worker reports late against the same plan and commits as a
-        // second batch. This works only because the transaction declares the
-        // refreshed version: the plan's version would replay the first batch's
-        // CreateIndex and hard-conflict on the shared index name.
+        // second batch. The replay of the first batch's CreateIndex is not a
+        // conflict because the exact-source property waives the same-name rule
+        // and the finish step re-proves the batch's sources instead.
         let late_output = Uuid::new_v4();
         let late_size = write_stub_output_file(&dataset, late_output).await;
         let late = stub_merge_result(&plan, 1, late_output, late_size, Uuid::new_v4());
@@ -9791,8 +9852,10 @@ mod tests {
 
     /// A same-name index commit touching none of the planned sources must not
     /// fail the round. Delta segments land continuously while workers merge, and
-    /// the compare-and-swap proves them compatible. Declaring the plan's read
-    /// version would hit the resolver's same-index-name rule and brick the round.
+    /// the compare-and-swap proves them compatible: the exact-source property
+    /// waives the resolver's same-index-name rule that would brick the round.
+    /// The transaction must still declare the plan's version, the content
+    /// snapshot MemWAL catch-up derives from.
     #[tokio::test]
     async fn test_commit_index_merge_results_survives_unrelated_same_name_commit() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -9863,6 +9926,52 @@ mod tests {
             coverage.iter().collect::<Vec<_>>(),
             vec![0, 1, 2, 3],
             "index coverage must stay complete"
+        );
+
+        let committed = dataset.read_transaction().await.unwrap().unwrap();
+        assert_eq!(
+            committed.read_version, plan.read_version,
+            "the commit must declare the plan's content snapshot, which MemWAL \
+             catch-up derives generations from"
+        );
+    }
+
+    /// A decodable but generic Lance file must not replace readable sources.
+    ///
+    /// The production open reads the vector index header from the index file's
+    /// schema metadata, so a headerless table published as a vector segment
+    /// fails only at query time unless the commit rejects it first.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_generic_lance_file() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let output = Uuid::new_v4();
+        let size = write_stub_output_file_impl(&dataset, output, false).await;
+        let result = stub_merge_result(&plan, 0, output, size, Uuid::new_v4());
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a headerless output must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("carries no vector index header"),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected round must not publish a segment"
         );
     }
 

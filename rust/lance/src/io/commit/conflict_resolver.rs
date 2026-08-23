@@ -674,9 +674,21 @@ impl<'a> TransactionRebase<'a> {
                                 .any(|created_index| created_index.name == new_index.name)
                         });
 
+                    // An exact-source commit re-proves its removal set, output
+                    // freshness, and coverage disjointness in the finish step,
+                    // so a same-name commit in its window is not a conflict.
+                    let exact_source_cas = self
+                        .transaction
+                        .transaction_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key(
+                                crate::index::segment_merge::EXACT_SOURCE_CAS_PROPERTY,
+                            )
+                        });
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
-                        || has_regular_name_conflict
+                        || (has_regular_name_conflict && !exact_source_cas)
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -2034,6 +2046,30 @@ impl<'a> TransactionRebase<'a> {
                              drop that segment. Re-plan the merge.",
                             new_index.uuid, new_index.name
                         )));
+                    }
+                }
+                // The name-conflict rule is waived for this commit, so coverage
+                // overlap with same-name segments that landed in the window
+                // must be re-proven here as well.
+                for new_index in new_indices.iter() {
+                    let Some(new_bitmap) = new_index.fragment_bitmap.as_ref() else {
+                        continue;
+                    };
+                    for segment in live.iter() {
+                        if segment.name == new_index.name
+                            && !removed_ids.contains(&segment.uuid)
+                            && segment
+                                .fragment_bitmap
+                                .as_ref()
+                                .is_some_and(|bitmap| !bitmap.is_disjoint(new_bitmap))
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "commit_index_merge_results: output segment {} of index \
+                                 '{}' overlaps segment {} committed while the merge was \
+                                 in flight. Re-plan the merge.",
+                                new_index.uuid, new_index.name, segment.uuid
+                            )));
+                        }
                     }
                 }
             }

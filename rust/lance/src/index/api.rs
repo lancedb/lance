@@ -449,8 +449,9 @@ pub trait DatasetIndexExt {
     /// while the commit is in flight fails it too.
     ///
     /// Worker reports come from outside the trust boundary: every output id
-    /// must be globally fresh, re-proven again at publication, and each
-    /// reported file must match the store listing and decode as a Lance file.
+    /// must be globally fresh, re-proven again at publication, each reported
+    /// file must match the store listing and decode as a Lance file, and the
+    /// index file must carry the vector index header the query path opens.
     ///
     /// `results` may cover a subset of the plan's tasks, so a round survives a
     /// failed worker. Duplicate attempts of a task reconcile to one winner by
