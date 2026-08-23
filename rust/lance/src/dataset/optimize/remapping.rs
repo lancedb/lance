@@ -346,14 +346,21 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     };
 
     let new_index_meta = match remap_result {
-        // The composed remap emptied the index (every row deleted). Matching the
-        // prior per-version behavior, leave the existing index untouched and
-        // commit nothing -- there is no remap to apply.
+        // Nothing to commit: either the composed remap emptied the index (every
+        // row deleted), matching the prior per-version behavior, or
+        // `index::remap_index` withdrew a covered index it cannot carry payload
+        // through. Either way the existing entry is left untouched.
+        //
+        // The withdrawal case is unreachable here today: the only caller is
+        // `remap_column_index`, which refuses a covered index first. Compaction
+        // reaches that withdrawal through `DatasetIndexRemapper`, which handles
+        // `RemapResult::Drop` in `dataset/index.rs` rather than through here.
         RemapResult::Drop => return Ok(()),
         RemapResult::Keep(new_id) => IndexMetadata {
             uuid: new_id,
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
+            covering_fields: curr_index_meta.covering_fields.clone(),
             dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
             index_details: curr_index_meta.index_details.clone(),
@@ -366,6 +373,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             uuid: remapped_index.new_id,
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
+            covering_fields: curr_index_meta.covering_fields.clone(),
             dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
             index_details: Some(Arc::new(remapped_index.index_details)),
@@ -381,7 +389,6 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Operation::CreateIndex {
             new_indices: vec![new_index_meta],
             removed_indices: vec![curr_index_meta],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );
@@ -421,10 +428,26 @@ pub async fn remap_column_index(
             )));
         }
         Some(index) => {
-            if index.fields != [field.id] {
+            // The real question is "does this index belong to this column",
+            // i.e. its one keyed field is `field.id`. Carried fields are
+            // irrelevant here, same as in `index::remap_index`.
+            if index.keyed_field() != Some(field.id) {
                 Err(Error::index(format!(
-                    "Index name {} already exists with different fields",
-                    index_name
+                    "Index name {} already exists with fields {:?} (carried fields {:?}); \
+                     expected a single keyed field {}",
+                    index_name, index.fields, index.covering_fields, field.id
+                )))
+            } else if !index.covering_fields.is_empty() {
+                // Same rule as `optimize_indices`, and for the same reason: no
+                // index type carries the declared payload through a remap, so the
+                // result would still claim values its storage does not hold. The
+                // caller named this index, so refuse out loud -- compaction
+                // withdraws instead only because it must not block a table-level
+                // operation over one index it cannot remap.
+                Err(Error::index(format!(
+                    "Remapping index '{}' is not supported: it declares covering \
+                     fields {:?}, which no index builder writes or preserves yet",
+                    index_name, index.covering_fields,
                 )))
             } else {
                 Ok(index)
@@ -594,5 +617,103 @@ mod tests {
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
             .collect::<Vec<u64>>();
         assert_eq!(result, expected);
+    }
+
+    /// A *physical* remap through the real production entry point,
+    /// `remap_column_index`, must refuse a covered index rather than quietly do
+    /// nothing. No index type carries the declared payload through a remap, and
+    /// the caller named this index, so a silent no-op would hand back an index
+    /// that covers nothing with no indication why.
+    ///
+    /// Asserting on committed metadata here would prove nothing: the flow is
+    /// `remap_column_index` -> the private `remap_index` -> `index::remap_index`,
+    /// which withdraws a covered index before the fully-deleted `Keep` check, and
+    /// the `Drop` arm returns without committing. The `Keep`/`Remapped` arms are
+    /// therefore unreachable for a covered index, so a "declaration preserved"
+    /// assertion would pass even if those arms stopped preserving it. Assert the
+    /// refusal instead.
+    #[tokio::test]
+    async fn test_remap_column_index_refuses_a_covered_index() {
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{
+            CompactionOptions, commit_compaction, plan_compaction, rewrite_files,
+        };
+        use crate::utils::test::covering;
+        use lance_core::utils::tempfile::TempStrDir;
+        use std::borrow::Cow;
+
+        let test_uri = TempStrDir::default();
+        // Two fragments, so compaction has something to merge.
+        let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+        covering::append_vector_payload_rows(&mut dataset, covering::ROWS_PER_FRAGMENT).await;
+        covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+        let (_, id_field_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+
+        // Delete some (not all) rows so the remap has real work to do and does
+        // not take the all-fragments-deleted `RemapResult::Keep` shortcut.
+        dataset.delete("payload < 100").await.unwrap();
+
+        let options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(
+            !plan.tasks().is_empty(),
+            "compaction plan must have work to do, or this test proves nothing"
+        );
+        for task in plan.tasks().iter() {
+            let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+                .await
+                .unwrap();
+            commit_compaction(
+                &mut dataset,
+                Vec::from([rewrite_result]),
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .cloned()
+            .expect("precondition: the covered index exists");
+
+        // `remap_column_index` is user-directed -- the caller named this index --
+        // so it must refuse rather than no-op. Refusing is also what makes this
+        // test meaningful: the `Keep`/`Remapped` arms below are unreachable for a
+        // covered index, so asserting on the committed metadata instead would
+        // pass whether or not those arms preserved `covering_fields`.
+        let error = remap_column_index(&mut dataset, &["vec"], Some(index_name.clone()))
+            .await
+            .expect_err("remapping a covered index must be refused");
+        assert!(
+            error.to_string().contains("declares covering fields"),
+            "unexpected message: {error}"
+        );
+
+        // Refused, not half-applied.
+        let after = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .cloned()
+            .expect("a refused remap must leave the index in place");
+        assert_eq!(
+            after.uuid, before.uuid,
+            "a refused remap replaced the index"
+        );
+        assert_eq!(after.covering_fields, vec![id_field_id]);
+        assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
     }
 }

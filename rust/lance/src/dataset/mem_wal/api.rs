@@ -240,7 +240,6 @@ impl<'a> InitializeMemWalBuilder<'a> {
             Operation::CreateIndex {
                 new_indices: vec![index_meta],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -486,20 +485,6 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
-    /// Require a recorded index catch-up before an SSTable stops being served.
-    ///
-    /// Until this is called, a missing index-coverage entry reads as "fully
-    /// caught up". Afterwards it reads as "not caught up", so an SSTable is served
-    /// until some commit shows the indexes contain its rows.
-    ///
-    /// One-way: there is no matching deactivate, because a table that has
-    /// already retired SSTables against a recorded catch-up cannot go back to
-    /// treating missing coverage as caught up. Calling it on an already-active
-    /// table succeeds and changes nothing.
-    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     /// List current MemWAL shard IDs from object storage directory listing.
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         Ok(Vec::new())
@@ -578,30 +563,6 @@ impl DatasetMemWalExt for Dataset {
         };
 
         load_mem_wal_index_details(index_meta).map(Some)
-    }
-
-    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
-        if self.load_index_by_name(MEM_WAL_INDEX_NAME).await?.is_none() {
-            return Err(Error::invalid_input(
-                "Cannot require MemWAL index catch-up: MemWAL is not initialized on \
-                 this dataset.",
-            ));
-        }
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::UpdateMemWalState {
-                compacted_sstables: Vec::new(),
-                require_index_catchup: true,
-            },
-            None,
-        );
-        // Assigned back: leaving the receiver on the pre-activation manifest
-        // would report success while `self` still reads as legacy.
-        *self = CommitBuilder::new(Arc::new(self.clone()))
-            .execute(transaction)
-            .await?;
-        Ok(())
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {

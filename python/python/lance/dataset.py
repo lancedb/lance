@@ -69,6 +69,7 @@ from .lance import (
     _MergeInsertBuilder,
     _parse_field_path,
     _Scanner,
+    _serialize_row_addrs,
     _write_dataset,
     indices,
 )
@@ -1169,6 +1170,8 @@ class LanceDataset(pa.dataset.Dataset):
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -1368,6 +1371,14 @@ class LanceDataset(pa.dataset.Dataset):
 
             This parameter allows you to opt-in to the new behavior early, to avoid
             being subject to breaking changes in the future.
+        row_addr_allowlist: bytes, default None
+            Restrict the scan to these row addresses. A serialized roaring treemap
+            over ``_rowid`` (``RowAddrTreeMap::serialize_into`` output). Applied
+            before KNN / BM25 ranking, so top-k is computed over the surviving rows
+            rather than filtered afterwards.
+        row_addr_blocklist: bytes, default None
+            Exclude these row addresses, same encoding as ``row_addr_allowlist``.
+            Combined with it when both are given.
 
 
         .. note::
@@ -1410,6 +1421,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         setopt(builder.filter, filter)
         setopt(builder.prefilter, prefilter)
+        if row_addr_allowlist is not None or row_addr_blocklist is not None:
+            builder.row_addr_prefilter(row_addr_allowlist, row_addr_blocklist)
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
@@ -2986,6 +2999,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -3154,7 +3176,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3213,7 +3235,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -3310,12 +3332,17 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
                         f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not (
@@ -3346,10 +3373,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
@@ -3504,7 +3527,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
@@ -5659,6 +5683,14 @@ class DatasetDelta:
         """
         return self._delta.get_updated_rows()
 
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
+
 
 class _DatasetDeltaBuilder:
     """Internal builder for :class:`DatasetDelta`.
@@ -5724,6 +5756,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -5767,6 +5803,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
@@ -6397,6 +6434,18 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
+    """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
+
+    Those parameters take a serialized roaring treemap over ``_rowid``; this is
+    the way to produce one from Python.
+
+    >>> blob = serialize_row_addrs([0, 2, 4])                    # doctest: +SKIP
+    >>> ds.scanner(row_addr_allowlist=blob).to_table()           # doctest: +SKIP
+    """
+    return _serialize_row_addrs(list(addrs))
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -6405,6 +6454,8 @@ class ScannerBuilder:
         self._search_filter = None
         self._substrait_filter = None
         self._prefilter = False
+        self._row_addr_allowlist: Optional[bytes] = None
+        self._row_addr_blocklist: Optional[bytes] = None
         self._late_materialization = None
         self._blob_handling = None
         self._offset = None
@@ -6618,6 +6669,25 @@ class ScannerBuilder:
             if search_filter is not None:
                 self.filter(search_filter)
 
+        return self
+
+    def row_addr_prefilter(
+        self,
+        allowlist: Optional[bytes] = None,
+        blocklist: Optional[bytes] = None,
+    ) -> ScannerBuilder:
+        """Restrict the scan to an externally supplied set of row addresses.
+
+        allowlist / blocklist are serialized roaring treemaps over ``_rowid``
+        (``RowAddrTreeMap::serialize_into`` output); passing neither clears the
+        mask. Applied before KNN / BM25 ranking, so top-k is computed over the
+        surviving rows rather than filtered afterwards.
+
+        Bytes rather than an object so the mask can be produced by a different
+        extension module -- nothing Rust-typed crosses the boundary.
+        """
+        self._row_addr_allowlist = allowlist
+        self._row_addr_blocklist = blocklist
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -6912,6 +6982,8 @@ class ScannerBuilder:
             self._orderings,
             self._disable_scoring_autoprojection,
             self._substrait_aggregate,
+            self._row_addr_allowlist,
+            self._row_addr_blocklist,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
@@ -7134,6 +7206,9 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7165,7 +7240,9 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7224,6 +7301,23 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
+        excluded_fragment_ids: list[int], optional
+            Fragment IDs to exclude from compaction planning. Excluded
+            fragments remain unchanged and act as boundaries, so fragments
+            on opposite sides are not combined into the same compaction task.
+            Duplicate and unknown IDs are ignored.
 
         Returns
         -------
@@ -7248,6 +7342,9 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
+                excluded_fragment_ids=excluded_fragment_ids,
             ).items()
             if v is not None
         }

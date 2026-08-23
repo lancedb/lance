@@ -27,6 +27,7 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+pub mod covering;
 mod failing_store;
 pub mod serializing_cache;
 mod throttle_store;
@@ -640,17 +641,8 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema
-                .fields_pre_order()
-                .filter_map(|f| {
-                    if data_storage_version < LanceFileVersion::V2_1 || f.children.is_empty() {
-                        Some(f.id)
-                    } else {
-                        // In 2.1+, struct / list fields don't have their own column
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut field_ids, _) =
+                lance_file::versions::data_file_columns(data_storage_version.resolve(), &schema);
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);

@@ -312,6 +312,32 @@ struct CleanupInspection {
     tagged_old_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
+    /// The latest timestamp of all manifests that will be removed.
+    latest_deleted_manifest_time: Option<DateTime<Utc>>,
+}
+
+impl CleanupInspection {
+    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    ///
+    /// Listing only files with `last_modified <= earliest_retained` is valid
+    /// when the working set is a time suffix: every retained version is newer
+    /// than every deleted one. A tagged old version (or any other sparse
+    /// retain) pulls that cutoff backwards, so files from newer deleted
+    /// versions are never listed. Their manifests are still removed, which
+    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
+    ///
+    /// When a deleted manifest is newer than the earliest retained one, drop
+    /// the cutoff and scan the whole subtree — the same approach already used
+    /// for `_indices/`.
+    fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
+        match (
+            self.earliest_retained_manifest_time,
+            self.latest_deleted_manifest_time,
+        ) {
+            (Some(retained), Some(deleted)) if deleted > retained => None,
+            (retained, _) => retained,
+        }
+    }
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -561,18 +587,19 @@ impl<'a> CleanupTask<'a> {
         }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        let commit_ts = manifest.timestamp();
         if !in_working_set {
             inspection
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
+            match inspection.latest_deleted_manifest_time {
+                Some(ts) if commit_ts <= ts => {}
+                _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
+            }
         } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            match inspection.earliest_retained_manifest_time {
+                Some(ts) if commit_ts >= ts => {}
+                _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
             }
         }
         Ok(())
@@ -688,7 +715,10 @@ impl<'a> CleanupTask<'a> {
         };
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
-        let unmodified_since = inspection.earliest_retained_manifest_time;
+        // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
+        // would hide files that belong to newer deleted versions. See
+        // [`CleanupInspection::listing_unmodified_since`].
+        let unmodified_since = inspection.listing_unmodified_since();
         let streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
@@ -1348,7 +1378,16 @@ impl CleanupPolicyBuilder {
     }
 
     /// Cleanup all versions except the last `n` versions of the dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `n` is zero.
     pub async fn retain_n_versions(mut self, dataset: &Dataset, n: usize) -> Result<Self> {
+        if n == 0 {
+            return Err(Error::invalid_input(format!(
+                "retain_versions must be greater than 0, got {n}"
+            )));
+        }
         let versions = dataset.versions().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
@@ -2033,6 +2072,7 @@ mod tests {
             uuid,
             name: "some_index".to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.version().version,
             fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
             index_details: None,
@@ -2418,6 +2458,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.old_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_data_files_newer_than_tagged_version() {
+        // A tag on an old version must not prevent cleanup from deleting data
+        // files that belong only to newer, untagged versions. The listing
+        // cutoff used to be the earliest retained manifest time; with a tag
+        // that pulled the cutoff backwards and skipped those newer files.
+        // After their manifests were removed they became permanent orphans
+        // (https://github.com/lance-format/lance/issues/8705).
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(2).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let dataset = *(fixture.open().await.unwrap());
+        dataset.tags().create("keep-v1", 1).await.unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_data_files, 3);
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_data_files, 2);
+        assert_eq!(after_count.num_tx_files, 2);
     }
 
     // Helper function to check that the number of files is correct.
@@ -2943,7 +3026,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![referenced_index],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3051,7 +3133,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_a.clone(), index_b.clone()],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3070,7 +3151,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_c.clone()],
                 removed_indices: vec![index_a.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3149,7 +3229,6 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![old_index.clone()],
                         removed_indices: vec![],
-                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -3168,7 +3247,6 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![current_index],
                         removed_indices: vec![old_index],
-                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -3402,6 +3480,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_rejects_retain_zero_versions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let error = CleanupPolicyBuilder::default()
+            .retain_n_versions(&fixture.open().await.unwrap(), 0)
+            .await
+            .err()
+            .expect("retaining zero versions should return an error");
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("retain_versions must be greater than 0, got 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_and_retain_3_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -3433,6 +3531,19 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|version| version.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[tokio::test]

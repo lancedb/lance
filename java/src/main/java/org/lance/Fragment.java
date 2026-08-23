@@ -261,7 +261,7 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId) {
-    return create(datasetUri, allocator, root, params, namespaceClient, tableId, null);
+    return create(datasetUri, allocator, root, params, namespaceClient, tableId, null, null);
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -272,11 +272,13 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      LanceSchema schema) {
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
     Preconditions.checkNotNull(params);
+    long sessionHandle = getSessionHandle(session);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
@@ -301,7 +303,8 @@ public class Fragment {
               tableId,
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
-              lanceSchema.memoryAddress());
+              lanceSchema.memoryAddress(),
+              sessionHandle);
         }
       }
       return createWithFfiArray(
@@ -322,7 +325,8 @@ public class Fragment {
           tableId,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold(),
-          0L);
+          0L,
+          sessionHandle);
     }
   }
 
@@ -333,7 +337,7 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId) {
-    return create(datasetUri, null, stream, params, namespaceClient, tableId, null);
+    return create(datasetUri, null, stream, params, namespaceClient, tableId, null, null);
   }
 
   /** Create a fragment from the given arrow stream. */
@@ -344,10 +348,12 @@ public class Fragment {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      LanceSchema schema) {
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
+    long sessionHandle = getSessionHandle(session);
     if (schema != null) {
       Preconditions.checkNotNull(allocator, "allocator is required with schema");
       try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
@@ -369,7 +375,8 @@ public class Fragment {
             tableId,
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
-            lanceSchema.memoryAddress());
+            lanceSchema.memoryAddress(),
+            sessionHandle);
       }
     }
     return createWithFfiStream(
@@ -389,7 +396,16 @@ public class Fragment {
         tableId,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold(),
-        0L);
+        0L,
+        sessionHandle);
+  }
+
+  /**
+   * Resolves the native handle of an optional session. A closed session has a zero handle and is
+   * treated as absent, matching how Dataset handles closed sessions.
+   */
+  private static long getSessionHandle(Session session) {
+    return session == null ? 0L : session.getNativeHandle();
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -411,7 +427,8 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      long schemaMemoryAddress);
+      long schemaMemoryAddress,
+      long sessionHandle);
 
   /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
@@ -431,5 +448,6 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      long schemaMemoryAddress);
+      long schemaMemoryAddress,
+      long sessionHandle);
 }

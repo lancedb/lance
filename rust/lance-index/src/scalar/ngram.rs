@@ -640,6 +640,9 @@ impl ScalarIndex for NGramIndex {
 #[derive(Debug, Clone)]
 pub struct NGramIndexBuilderOptions {
     tokens_per_spill: usize,
+    /// How many partitions the token space is sharded across. Spilling is tracked
+    /// per worker, so tests pin this to keep the spill/merge schedule deterministic.
+    num_workers: usize,
 }
 
 // A higher value will use more RAM.  A lower value will have to do more spilling
@@ -673,6 +676,7 @@ impl Default for NGramIndexBuilderOptions {
     fn default() -> Self {
         Self {
             tokens_per_spill: *DEFAULT_TOKENS_PER_SPILL,
+            num_workers: *DEFAULT_NUM_PARTITIONS,
         }
     }
 }
@@ -978,6 +982,9 @@ pub struct NGramIndexBuilder {
     tokens_seen: usize,
     worker_number: usize,
     has_flushed: bool,
+    /// Flushes that merged into an existing spill file rather than writing the first
+    /// one, aggregated across workers by `train`.
+    merging_flushes: usize,
 
     state: NGramIndexBuildState,
 }
@@ -1000,6 +1007,7 @@ impl NGramIndexBuilder {
             tokens_seen: 0,
             worker_number,
             has_flushed: false,
+            merging_flushes: 0,
         }
     }
 
@@ -1022,6 +1030,7 @@ impl NGramIndexBuilder {
             tokens_seen: 0,
             worker_number: 0,
             has_flushed: false,
+            merging_flushes: 0,
         })
     }
 
@@ -1089,6 +1098,7 @@ impl NGramIndexBuilder {
         // The primary builder should never flush
         debug_assert_ne!(self.worker_number, 0);
         if self.has_flushed {
+            self.merging_flushes += 1;
             info!("Merging flush for worker {}", self.worker_number);
             // If we have flushed before then we need to merge with the spill file
             let mut writer = self
@@ -1163,7 +1173,7 @@ impl NGramIndexBuilder {
         let schema = data.schema();
         Self::validate_schema(schema.as_ref())?;
 
-        let num_workers = *DEFAULT_NUM_PARTITIONS;
+        let num_workers = self.options.num_workers;
         let mut senders = Vec::with_capacity(num_workers);
         let mut builders = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
@@ -1214,6 +1224,7 @@ impl NGramIndexBuilder {
             if builder.flush(state).await? {
                 to_spill.push(builder.worker_number);
             }
+            self.merging_flushes += builder.merging_flushes;
         }
 
         Ok(to_spill)
@@ -1894,8 +1905,9 @@ mod tests {
     async fn do_train(
         mut builder: NGramIndexBuilder,
         data: SendableRecordBatchStream,
-    ) -> (NGramIndex, Arc<TempDir>) {
+    ) -> (NGramIndex, usize, Arc<TempDir>) {
         let spill_files = builder.train(data).await.unwrap();
+        let merging_flushes = builder.merging_flushes;
 
         let tmpdir = Arc::new(TempDir::default());
         let test_store = LanceIndexStore::new(
@@ -1913,6 +1925,7 @@ mod tests {
             NGramIndex::from_store(Arc::new(test_store), None, &LanceCache::no_cache())
                 .await
                 .unwrap(),
+            merging_flushes,
             tmpdir,
         )
     }
@@ -1965,7 +1978,7 @@ mod tests {
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
         assert_eq!(index.tokens.len(), 21);
 
         // Basic search
@@ -2088,7 +2101,7 @@ mod tests {
         ));
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
 
         async fn search(index: &NGramIndex, pattern: &str) -> SearchResult {
             index
@@ -2137,7 +2150,7 @@ mod tests {
         // Rows: cat(0), dog(1), NULL(2), NULL(3), cat dog(4).
         let data = simple_data_with_nulls();
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
 
         // The NULL rows (2, 3) must never appear in the candidate set.
         let res = index
@@ -2187,7 +2200,7 @@ mod tests {
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
         assert_eq!(index.tokens.len(), 3);
 
         let res = index
@@ -2217,7 +2230,7 @@ mod tests {
     async fn test_train_empty() {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
-        let (index, _tmpdir) = do_train(builder, empty_data()).await;
+        let (index, _merges, _tmpdir) = do_train(builder, empty_data()).await;
         assert_eq!(index.tokens.len(), 0);
     }
 
@@ -2226,7 +2239,7 @@ mod tests {
         let data = simple_data_with_nulls();
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, empty_data()).await;
+        let (index, _merges, _tmpdir) = do_train(builder, empty_data()).await;
 
         let new_tmpdir = Arc::new(TempDir::default());
         let test_store = Arc::new(LanceIndexStore::new(
@@ -2260,7 +2273,7 @@ mod tests {
     async fn test_ngram_index_remap() {
         let data = simple_data_with_nulls();
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
 
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4]);
@@ -2317,7 +2330,7 @@ mod tests {
     async fn test_ngram_index_remap_compact(#[case] remap: RowAddrRemap) {
         let data = simple_data_with_nulls();
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
 
         let row_ids = row_ids_in_index(&index).await;
         assert_eq!(row_ids, vec![0, 1, 2, 3, 4]);
@@ -2347,7 +2360,7 @@ mod tests {
     async fn test_ngram_index_merge() {
         let data = simple_data_with_nulls();
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
 
         let data = StringArray::from_iter(&[Some("giraffe"), Some("cat"), None]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
@@ -2492,21 +2505,30 @@ mod tests {
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),
             )
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
-            .into_reader_stream(RowCount::from(128), BatchCount::from(32));
+            .into_reader_stream(RowCount::from(128), BatchCount::from(4));
 
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             data.map_err(|arrow_err| DataFusionError::ArrowError(Box::new(arrow_err), None)),
         ));
 
+        // Spilling is tracked per worker, so pin the worker count and keep the spill
+        // threshold well below the tokens each worker sees. That way every worker spills
+        // repeatedly and the merge-into-existing-spill path runs, independent of how many
+        // partitions the default would pick.
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
             tokens_per_spill: 100,
+            num_workers: 8,
         })
         .unwrap();
 
-        let (index, _tmpdir) = do_train(builder, data).await;
+        let (index, merging_flushes, _tmpdir) = do_train(builder, data).await;
 
-        assert_eq!(index.tokens.len(), 29012);
+        assert_eq!(index.tokens.len(), 5716);
+        assert!(
+            merging_flushes > 0,
+            "expected repeat spills to merge into existing spill files, got none"
+        );
     }
 
     #[test]

@@ -324,24 +324,6 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_fragment_schema(
-    version: ConcreteFileVersion,
-    schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
-    match version {
-        ConcreteFileVersion::V1 => {
-            super::transaction::schema_fragments_legacy_valid(schema, fragments)
-        }
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            super::transaction::schema_fragments_modern_valid(schema, fragments)
-        }
-    }
-}
-
 pub async fn write_fragment(
     version: ConcreteFileVersion,
     builder: &FragmentCreateBuilder<'_>,
@@ -411,6 +393,7 @@ pub async fn open_update_writer(
     version: ConcreteFileVersion,
     dataset: &Dataset,
     schema: &Schema,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<Box<dyn GenericWriter>> {
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -424,7 +407,11 @@ pub async fn open_update_writer(
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(dataset.session.store_registry(), external_base_resolver),
+        WriterOptions::update(
+            dataset.session.store_registry(),
+            external_base_resolver,
+            allow_external_blob_outside_bases,
+        ),
     )
     .await
 }
