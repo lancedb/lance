@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::{DerefMut, Range},
     panic::AssertUnwindSafe,
@@ -14,7 +14,7 @@ use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, builder::LargeBinaryBuilder,
 };
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -186,6 +186,158 @@ impl ExternalBaseResolver {
 
         Ok(best_match.map(|(_, matched)| matched))
     }
+}
+
+fn arrow_field_contains_blob_v2(field: &ArrowField) -> bool {
+    if field.is_blob_v2() {
+        return true;
+    }
+    match field.data_type() {
+        ArrowDataType::Struct(children) => children
+            .iter()
+            .any(|child| arrow_field_contains_blob_v2(child)),
+        ArrowDataType::List(child) | ArrowDataType::LargeList(child) => {
+            arrow_field_contains_blob_v2(child)
+        }
+        _ => false,
+    }
+}
+
+fn collect_external_blob_uris(
+    field: &ArrowField,
+    array: &ArrayRef,
+    selected_rows: &[bool],
+    field_path: &str,
+    external_uris: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if !arrow_field_contains_blob_v2(field) {
+        return Ok(());
+    }
+    if array.len() != selected_rows.len() {
+        return Err(Error::internal(format!(
+            "Blob field '{}' row count {} did not match selection length {}",
+            field_path,
+            array.len(),
+            selected_rows.len()
+        )));
+    }
+
+    if field.is_blob_v2() {
+        let struct_array = array.as_struct();
+        if BlobV2Layout::classify(struct_array.fields()) != Some(BlobV2Layout::Logical) {
+            return Err(blob_v2_shape_error(field, &[BlobV2Layout::Logical]));
+        }
+        let uri_column = struct_array
+            .column_by_name("uri")
+            .ok_or_else(|| Error::invalid_input("Blob struct missing `uri` field"))?
+            .as_string::<i32>();
+        for (row_idx, is_selected) in selected_rows.iter().copied().enumerate() {
+            if is_selected && struct_array.is_valid(row_idx) && uri_column.is_valid(row_idx) {
+                external_uris.push((
+                    field_path.to_string(),
+                    uri_column.value(row_idx).to_string(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    match field.data_type() {
+        ArrowDataType::Struct(children) => {
+            let struct_array = array.as_struct();
+            let child_selection = selected_rows
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(row_idx, is_selected)| is_selected && struct_array.is_valid(row_idx))
+                .collect::<Vec<_>>();
+            for (child_field, child_array) in children.iter().zip(struct_array.columns()) {
+                let child_path = format!("{}.{}", field_path, child_field.name());
+                collect_external_blob_uris(
+                    child_field,
+                    child_array,
+                    &child_selection,
+                    &child_path,
+                    external_uris,
+                )?;
+            }
+        }
+        ArrowDataType::List(child) => {
+            let list_array = array.as_list::<i32>();
+            let mut child_selection = vec![false; list_array.values().len()];
+            for (row_idx, is_selected) in selected_rows.iter().copied().enumerate() {
+                if is_selected && list_array.is_valid(row_idx) {
+                    let start = list_array.value_offsets()[row_idx].as_usize();
+                    let end = list_array.value_offsets()[row_idx + 1].as_usize();
+                    child_selection[start..end].fill(true);
+                }
+            }
+            let child_path = format!("{}.{}", field_path, child.name());
+            collect_external_blob_uris(
+                child,
+                list_array.values(),
+                &child_selection,
+                &child_path,
+                external_uris,
+            )?;
+        }
+        ArrowDataType::LargeList(child) => {
+            let list_array = array.as_list::<i64>();
+            let mut child_selection = vec![false; list_array.values().len()];
+            for (row_idx, is_selected) in selected_rows.iter().copied().enumerate() {
+                if is_selected && list_array.is_valid(row_idx) {
+                    let start = list_array.value_offsets()[row_idx].as_usize();
+                    let end = list_array.value_offsets()[row_idx + 1].as_usize();
+                    child_selection[start..end].fill(true);
+                }
+            }
+            let child_path = format!("{}.{}", field_path, child.name());
+            collect_external_blob_uris(
+                child,
+                list_array.values(),
+                &child_selection,
+                &child_path,
+                external_uris,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate external blob references supplied by selected input rows.
+///
+/// Existing rows can contain trusted absolute references that were accepted by an earlier write.
+/// Update paths use this check before allowing those fallback values through the writer, so newly
+/// matched values must still resolve beneath a registered external base.
+pub(super) async fn validate_external_blob_references(
+    resolver: &ExternalBaseResolver,
+    batch: &RecordBatch,
+    selected_rows: &[bool],
+) -> Result<()> {
+    let mut external_uris = Vec::new();
+    for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+        collect_external_blob_uris(
+            field,
+            array,
+            selected_rows,
+            field.name(),
+            &mut external_uris,
+        )?;
+    }
+
+    let mut validated_uris = HashSet::new();
+    for (field_path, uri) in external_uris {
+        if validated_uris.insert(uri.clone())
+            && resolver.resolve_external_uri(&uri).await?.is_none()
+        {
+            return Err(Error::invalid_input(format!(
+                "External blob URI '{}' in field '{}' is outside registered external bases (dataset root is not allowed)",
+                uri, field_path
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct RollingPackedBlobWriter {
@@ -3022,6 +3174,16 @@ async fn collect_blob_files_v2(
     descriptions: &StructArray,
     row_addrs: &arrow::array::PrimitiveArray<UInt64Type>,
 ) -> Result<Vec<Option<BlobFile>>> {
+    collect_blob_v2_descriptor_files(dataset, blob_field_id, descriptions, row_addrs.values()).await
+}
+
+/// Resolve blob v2 descriptors to lazy handles without materializing their payloads.
+pub(super) async fn collect_blob_v2_descriptor_files(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    descriptions: &StructArray,
+    row_addrs: &[u64],
+) -> Result<Vec<Option<BlobFile>>> {
     if descriptions.len() != row_addrs.len() {
         return Err(Error::internal(format!(
             "Blob descriptor count {} did not match row address count {}",
@@ -3032,7 +3194,7 @@ async fn collect_blob_files_v2(
     let columns = BlobV2DescriptorColumns::new(descriptions);
     let mut files = Vec::with_capacity(row_addrs.len());
     let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
-    for (selection_index, row_addr) in row_addrs.values().iter().enumerate() {
+    for (selection_index, row_addr) in row_addrs.iter().enumerate() {
         files.push(
             read_context
                 .collect_file(&columns, selection_index, *row_addr)
@@ -4471,6 +4633,24 @@ mod tests {
             assert_eq!(blob1.position(), blob2.position());
             assert_eq!(blob1.size(), blob2.size());
             assert_eq!(blob1.data_path(), blob2.data_path());
+        }
+
+        // Unsorted indices spanning fragments use the take remapping path, which
+        // carries _rowaddr internally and must still preserve the requested order.
+        let indices = [33_u64, 17, 5, 28, 12, 39];
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+        for (blob, index) in blobs.iter().zip(indices) {
+            let actual = blob.as_ref().unwrap().read().await.unwrap();
+            let index = index as usize;
+            let expected = fixture.data[index / 10]
+                .column(1)
+                .as_binary::<i64>()
+                .value(index % 10);
+            assert_eq!(actual.as_ref(), expected);
         }
     }
 

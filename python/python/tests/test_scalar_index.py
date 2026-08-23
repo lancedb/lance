@@ -12,6 +12,7 @@ import sys
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -696,24 +697,87 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
-def test_fixed_size_binary(tmp_path):
-    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+@pytest.mark.parametrize(
+    "index_type, data_type, values, filter_expr",
+    [
+        pytest.param(
+            "BTREE",
+            pa.uuid(),
+            [b"0123012301230123", b"2345234523452345"],
+            (
+                "value = arrow_cast(0x32333435323334353233343532333435, "
+                "'FixedSizeBinary(16)')"
+            ),
+            id="btree-fixed-size-binary",
+        ),
+        *[
+            pytest.param(
+                index_type,
+                data_type,
+                values,
+                filter_expr,
+                id=f"{index_type.lower()}-{type_name}",
+            )
+            for type_name, data_type, values, filter_expr in [
+                (
+                    "large-string",
+                    pa.large_string(),
+                    ["alpha", "beta", "gamma"],
+                    "value = 'beta'",
+                ),
+                (
+                    "binary",
+                    pa.binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'Binary')",
+                ),
+                (
+                    "large-binary",
+                    pa.large_binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'LargeBinary')",
+                ),
+                (
+                    "decimal128",
+                    pa.decimal128(10, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal128(10, 2)')",
+                ),
+                (
+                    "decimal256",
+                    pa.decimal256(76, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal256(76, 2)')",
+                ),
+                (
+                    "duration",
+                    pa.duration("ms"),
+                    [1, 2, 3],
+                    "value = arrow_cast(2, 'Duration(Millisecond)')",
+                ),
+            ]
+            for index_type in ["BTREE", "BITMAP", "ZONEMAP"]
+        ],
+    ],
+)
+def test_scalar_index_types(tmp_path, index_type, data_type, values, filter_expr):
+    values = pa.array(values, type=data_type)
+    ds = lance.write_dataset(pa.table({"value": values}), tmp_path)
 
-    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+    ds.create_scalar_index("value", index_type)
 
-    ds.create_scalar_index("uuid", "BTREE")
+    scanner = ds.scanner(filter=filter_expr)
+    assert "ScalarIndexQuery" in scanner.explain_plan()
+    assert scanner.to_table()["value"].to_pylist() == values.slice(1, 1).to_pylist()
 
-    query = (
-        "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
+    fragment_id = ds.get_fragments()[0].fragment_id
+    segment = ds.create_index_uncommitted(
+        column="value",
+        index_type=index_type,
+        name=f"{index_type.lower()}_segment_idx",
+        fragment_ids=[fragment_id],
     )
-    assert (
-        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
-        in ds.scanner(filter=query).explain_plan()
-    )
-
-    table = ds.scanner(filter=query).to_table()
-    assert table.num_rows == 1
-    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
+    assert segment.fragment_ids == {fragment_id}
 
 
 def test_index_take_batch_size(tmp_path):
@@ -3709,6 +3773,14 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         "frodo was a puppy with a tail",
         "frodo was a happy puppy",
     }
+
+    # Requiring both disjoint terms advances "happy" past its final document while
+    # "tail" remains live. Legacy WAND must terminate without reading the exhausted
+    # posting.
+    results = ds.to_table(
+        full_text_query=MatchQuery("happy tail", "text", operator=FullTextOperator.AND)
+    )
+    assert results.num_rows == 0
 
     data = pa.table(
         {

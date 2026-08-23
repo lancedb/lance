@@ -33,6 +33,7 @@ use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
 
+use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
 
@@ -53,6 +54,7 @@ pub(crate) fn build_prefilter(
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
     overlay_block: Option<RowAddrMask>,
+    external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -64,6 +66,16 @@ pub(crate) fn build_prefilter(
             Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
         PreFilterSource::None => None,
+    };
+    // Combine the external row-address mask (logical AND) with whatever the
+    // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
+    // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
+    // applies separately to drop index entries staled by a data overlay.
+    let prefilter_loader = match external_mask {
+        Some(mask) => {
+            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+        }
+        None => prefilter_loader,
     };
     let mut prefilter = DatasetPreFilter::new(ds, index_meta, prefilter_loader);
     if let Some(overlay_block) = overlay_block {

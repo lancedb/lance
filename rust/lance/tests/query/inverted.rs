@@ -27,7 +27,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{DocumentGranularity, Language};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata};
 
 use super::{strip_score_column, test_fts, test_scan, test_take};
 use crate::utils::DatasetTestCases;
@@ -106,6 +106,23 @@ async fn run_fts(ds: &Dataset, query: FullTextSearchQuery, filter: Option<&str>)
         )]))
         .unwrap();
     scanner.try_into_batch().await.unwrap()
+}
+
+async fn boolean_fts_ids_on_fragment(
+    dataset: &Dataset,
+    fragment: Fragment,
+    query: BooleanQuery,
+) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(vec![fragment]);
+    scanner.project(&["id"]).unwrap();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Boolean(query)))
+        .unwrap();
+    scanner.try_into_batch().await.unwrap()["id"]
+        .as_primitive::<arrow_array::types::Int32Type>()
+        .values()
+        .to_vec()
 }
 
 // Run an FTS query and assert results match a deterministic expected batch.
@@ -227,6 +244,86 @@ fn expected_bm25_score(
     let avg_doc_length = total_tokens as f32 / num_docs;
     let doc_norm = 1.2 * (1.0 - 0.75 + 0.75 * doc_tokens as f32 / avg_doc_length);
     idf * 2.2 / (1.0 + doc_norm)
+}
+
+#[tokio::test]
+async fn test_boolean_must_not_uses_all_index_fragment_coverage() {
+    let initial = arrow_array::record_batch!(
+        ("id", Int32, [0]),
+        ("positive_text", Utf8, ["placeholder"]),
+        ("negative_text", Utf8, ["placeholder"])
+    )
+    .unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+        test_dir.path().to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .create_index(
+            &["positive_text"],
+            IndexType::Inverted,
+            None,
+            &base_inverted_params(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let appended = arrow_array::record_batch!(
+        ("id", Int32, [1, 2]),
+        ("positive_text", Utf8, ["include", "include"]),
+        ("negative_text", Utf8, ["exclude", "keep"])
+    )
+    .unwrap();
+    let appended_reader = RecordBatchIterator::new([Ok(appended.clone())], appended.schema());
+    dataset.append(appended_reader, None).await.unwrap();
+    let appended_fragment = dataset.fragments().last().unwrap().clone();
+
+    dataset
+        .create_index(
+            &["negative_text"],
+            IndexType::Inverted,
+            None,
+            &base_inverted_params(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = BooleanQuery::new([
+        (
+            Occur::Must,
+            FtsQuery::Match(row_match_node("positive_text", "include")),
+        ),
+        (
+            Occur::MustNot,
+            FtsQuery::Match(row_match_node("negative_text", "exclude")),
+        ),
+    ]);
+    assert_eq!(
+        boolean_fts_ids_on_fragment(&dataset, appended_fragment.clone(), query).await,
+        vec![2]
+    );
+
+    let partially_qualified_query = BooleanQuery::new([
+        (
+            Occur::Must,
+            FtsQuery::Match(MatchQuery::new("include".to_string())),
+        ),
+        (
+            Occur::MustNot,
+            FtsQuery::Match(row_match_node("negative_text", "exclude")),
+        ),
+    ]);
+    assert_eq!(
+        boolean_fts_ids_on_fragment(&dataset, appended_fragment, partially_qualified_query).await,
+        vec![2]
+    );
 }
 
 #[tokio::test]

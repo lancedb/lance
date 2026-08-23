@@ -206,6 +206,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            local_dir_operations: None,
             scheme: String::from(base_path.scheme()),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -492,10 +493,12 @@ impl CredentialProvider for AwsCredentialAdapter {
                 token: creds.session_token().map(|s| s.to_string()),
             }))
         } else {
-            let refreshed_creds =
-                Arc::new(self.inner.provide_credentials().await.map_err(|e| {
-                    Error::internal(format!("Failed to get AWS credentials: {:?}", e))
-                })?);
+            let refreshed_creds = Arc::new(
+                self.inner
+                    .provide_credentials()
+                    .await
+                    .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
+            );
 
             self.cache
                 .write()
@@ -580,6 +583,7 @@ pub type DynamicStorageOptionsCredentialProvider =
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
     use crate::object_store::StorageOptionsProvider;
+    use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -603,6 +607,46 @@ mod tests {
                 token: None,
             }))
         }
+    }
+
+    #[derive(Debug)]
+    struct FailingAwsCredentialsProvider;
+
+    impl ProvideCredentials for FailingAwsCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            aws_credential_types::provider::future::ProvideCredentials::new(async {
+                Err(CredentialsError::provider_error(Box::new(
+                    std::io::Error::other("Glue credential endpoint unavailable"),
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aws_credential_failure_is_io_error() {
+        let provider = AwsCredentialAdapter::new(
+            Arc::new(FailingAwsCredentialsProvider),
+            Duration::from_secs(60),
+        );
+
+        let error = provider.get_credential().await.unwrap_err();
+        let object_store::Error::Generic { source, .. } = &error else {
+            panic!("expected a generic object store error, got {error}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<Error>(),
+            Some(Error::IO { .. })
+        ));
+
+        let message = error.to_string();
+        assert!(message.contains("Failed to get AWS credentials"));
+        assert!(message.contains("Glue credential endpoint unavailable"));
+        assert!(!message.contains("Encountered internal error"));
     }
 
     #[tokio::test]

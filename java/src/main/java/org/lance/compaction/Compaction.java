@@ -44,7 +44,10 @@ public class Compaction {
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceRows(),
+        compactionOptions.getMaxSourceBytes(),
+        compactionOptions.getExcludedFragmentIds());
   }
 
   public static CompactionMetrics commitCompaction(
@@ -65,7 +68,10 @@ public class Compaction {
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceRows(),
+        compactionOptions.getMaxSourceBytes(),
+        compactionOptions.getExcludedFragmentIds());
   }
 
   public static native CompactionMetrics nativeCommitCompaction(
@@ -81,7 +87,10 @@ public class Compaction {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -95,5 +104,8 @@ public class Compaction {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 }

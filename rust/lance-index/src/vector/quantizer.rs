@@ -102,7 +102,29 @@ impl std::fmt::Display for QuantizationType {
 }
 
 pub trait QuantizerBuildParams: Send + Sync {
+    /// Returns the number of rows to sample when training the quantizer.
     fn sample_size(&self) -> usize;
+
+    /// Returns the number of rows to sample, rejecting parameters whose sample size
+    /// cannot be represented by [`usize`].
+    ///
+    /// Implementations with fallible sample-size calculations should override this
+    /// method. The default preserves the behavior of existing implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::vector::pq::PQBuildParams;
+    /// use lance_index::vector::quantizer::QuantizerBuildParams;
+    ///
+    /// let params = PQBuildParams::new(16, 8);
+    /// assert_eq!(params.try_sample_size()?, 65_536);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn try_sample_size(&self) -> Result<usize> {
+        Ok(self.sample_size())
+    }
+
     fn use_residual(_: DistanceType) -> bool {
         false
     }

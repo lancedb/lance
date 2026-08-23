@@ -460,20 +460,12 @@ impl MemIndexConfig {
     }
 }
 
-/// Whether the MemWAL can maintain an index of this protobuf type.
-///
-/// Opening a shard writer rejects anything outside this set, which makes the
-/// table unwritable — so filter on this before committing a maintained set,
-/// not at claim time.
-pub fn is_maintainable_index_type(type_url: &str) -> bool {
-    MemIndexKind::from_type_url(type_url).is_some()
-}
-
-/// Shared by the detection and writer paths so both report the same thing.
-pub(crate) fn unsupported_index_type(type_url: &str) -> Error {
+/// Names the index, not just its type: a caller validating a maintained set
+/// needs to know which one to drop.
+pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error {
     Error::invalid_input(format!(
-        "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
-        type_url
+        "index '{}' has type {}, which the MemWAL cannot maintain. Supported: BTree, Inverted, Vector",
+        index_name, type_url
     ))
 }
 
@@ -1334,7 +1326,6 @@ mod tests {
         #[case] expected: Option<MemIndexKind>,
     ) {
         assert_eq!(MemIndexKind::from_type_url(type_url), expected);
-        assert_eq!(is_maintainable_index_type(type_url), expected.is_some());
     }
 
     /// `ALL` is hand-maintained, so a kind left out of it stops resolving.
@@ -1417,6 +1408,7 @@ mod tests {
         IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![2],
+            covering_fields: vec![],
             name: "desc_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,

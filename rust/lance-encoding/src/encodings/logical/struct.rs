@@ -31,7 +31,7 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::validate_fixed_size_list_dimensions};
 use log::trace;
 
 #[derive(Debug)]
@@ -276,6 +276,12 @@ impl StructuralStructDecoder {
             DataType::FixedSizeList(child_field, _)
                 if matches!(child_field.data_type(), DataType::Struct(_)) =>
             {
+                // The scheduler factories run the same guard, but the decoder tree can be
+                // built independently (e.g. `create_decode_stream`) so a zero dimension from
+                // a malformed schema must be rejected here as well.  Draining and unraveling
+                // validity both scale by the dimension and a zero would make that math
+                // degenerate.
+                validate_fixed_size_list_dimensions(field.name(), field.data_type())?;
                 // FixedSizeList containing Struct needs structural decoding
                 let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
                 Ok(Box::new(StructuralFixedSizeListDecoder::new(
@@ -632,7 +638,33 @@ mod tests {
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
+    use super::StructuralStructDecoder;
     use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+
+    #[test]
+    fn test_zero_dimension_fsl_decoder_errors() {
+        // Simulates a stored schema declaring a zero-dimension FixedSizeList (writers reject
+        // it but old files may contain one).  Building the decoder must fail cleanly instead
+        // of letting the zero dimension reach the rep/def decimation.
+        let item_fields = Fields::from(vec![Field::new("x", DataType::Int32, true)]);
+        let fields = Fields::from(vec![Field::new(
+            "vecs",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Struct(item_fields), true)),
+                0,
+            ),
+            true,
+        )]);
+
+        let err = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap_err();
+        assert!(matches!(err, lance_core::Error::Schema { .. }));
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
