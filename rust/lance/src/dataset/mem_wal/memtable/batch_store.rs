@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Lock-free append-only batch storage for MemTable.
+//! Append-only batch storage with lock-free readers for MemTable.
 //!
-//! This module provides a high-performance, lock-free storage structure for
-//! RecordBatches in the MemTable. It is designed for a single-writer,
-//! multiple-reader scenario where:
+//! This module provides high-performance storage for RecordBatches in the
+//! MemTable. Reads remain lock-free, while appends are serialized so the
+//! single-writer invariant is also upheld for safe callers.
 //!
-//! - A single writer task (WriteBatchHandler) appends batches
+//! - A writer task (WriteBatchHandler) appends batches
 //! - Multiple reader tasks concurrently read batches
-//! - No locks are needed for either reads or writes
+//! - Accidental concurrent appends are serialized
 //!
 //! # Safety Model
 //!
 //! The lock-free design relies on these invariants:
 //!
-//! 1. **Single Writer**: Only one thread calls `append()` at a time.
-//!    Enforced by the WriteBatchHandler architecture.
+//! 1. **Serialized Writers**: Only one thread mutates slots at a time.
+//!    Enforced by an internal writer guard in addition to the
+//!    WriteBatchHandler architecture.
 //!
 //! 2. **Append-Only**: Once written, slots are never modified or removed
 //!    until the entire store is dropped.
@@ -41,7 +42,7 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
@@ -156,10 +157,9 @@ impl std::fmt::Display for StoreFull {
 
 impl std::error::Error for StoreFull {}
 
-/// Lock-free append-only storage for memtable batches.
+/// Append-only storage with lock-free readers for memtable batches.
 ///
-/// This structure provides O(1) lock-free appends and reads for a
-/// single-writer, multiple-reader scenario.
+/// This structure provides O(1) serialized appends and lock-free reads.
 ///
 /// # Example
 ///
@@ -186,6 +186,9 @@ pub struct BatchStore {
     /// Invariant: all slots [0, committed_len) contain valid data.
     committed_len: AtomicUsize,
 
+    /// Serializes slot initialization for safe callers.
+    writer_active: AtomicBool,
+
     /// Total capacity (fixed at creation).
     capacity: usize,
 
@@ -206,12 +209,22 @@ pub struct BatchStore {
 }
 
 // SAFETY: Safe to share across threads because:
-// - Single writer guarantee (architectural invariant)
+// - writer_active serializes all slot initialization
 // - Readers only access committed slots (index < committed_len)
 // - Atomic operations provide proper synchronization
 // - Slots are never modified after being written
 unsafe impl Sync for BatchStore {}
 unsafe impl Send for BatchStore {}
+
+struct BatchStoreWriterGuard<'a> {
+    writer_active: &'a AtomicBool,
+}
+
+impl Drop for BatchStoreWriterGuard<'_> {
+    fn drop(&mut self) {
+        self.writer_active.store(false, Ordering::Release);
+    }
+}
 
 impl BatchStore {
     /// Create a new store with the given capacity.
@@ -243,6 +256,7 @@ impl BatchStore {
         Self {
             slots: slots.into_boxed_slice(),
             committed_len: AtomicUsize::new(0),
+            writer_active: AtomicBool::new(false),
             capacity,
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
@@ -282,22 +296,19 @@ impl BatchStore {
     }
 
     // =========================================================================
-    // Writer API (Single Writer Only)
+    // Writer API
     // =========================================================================
 
     /// Append a batch to the store.
-    ///
-    /// # Safety Requirements
-    ///
-    /// This method MUST only be called from the single writer task.
-    /// Concurrent calls from multiple threads cause undefined behavior.
     ///
     /// # Returns
     ///
     /// - `Ok((batch_position, row_offset, estimated_size))` - The index, row offset, and size of the appended batch
     /// - `Err(StoreFull)` - The store is at capacity, needs flush
     pub fn append(&self, batch: RecordBatch) -> Result<(usize, u64, usize), StoreFull> {
-        // Load current length (Relaxed is fine - we're the only writer)
+        let _writer_guard = self.acquire_writer();
+
+        // The writer guard makes Relaxed sufficient for writer-owned state.
         let idx = self.committed_len.load(Ordering::Relaxed);
 
         if idx >= self.capacity {
@@ -313,7 +324,7 @@ impl BatchStore {
 
         // SAFETY:
         // 1. idx < capacity, so slot exists
-        // 2. Single writer guarantee - no concurrent writes to this slot
+        // 2. The writer guard prevents concurrent writes to this slot
         // 3. Slot at idx is uninitialized (never written before, append-only)
         unsafe {
             let slot_ptr = self.slots[idx].get();
@@ -338,11 +349,6 @@ impl BatchStore {
     /// All batches are written before publishing, so readers see either
     /// none of the batches or all of them (atomic visibility).
     ///
-    /// # Safety Requirements
-    ///
-    /// This method MUST only be called from the single writer task.
-    /// Concurrent calls from multiple threads cause undefined behavior.
-    ///
     /// # Returns
     ///
     /// - `Ok(Vec<(batch_position, row_offset, estimated_size)>)` - Info for each appended batch
@@ -355,7 +361,9 @@ impl BatchStore {
             return Ok(vec![]);
         }
 
-        // Load current length (Relaxed is fine - we're the only writer)
+        let _writer_guard = self.acquire_writer();
+
+        // The writer guard makes Relaxed sufficient for writer-owned state.
         let start_idx = self.committed_len.load(Ordering::Relaxed);
         let count = batches.len();
 
@@ -378,7 +386,7 @@ impl BatchStore {
 
             // SAFETY:
             // 1. idx < capacity (checked above)
-            // 2. Single writer guarantee - no concurrent writes to this slot
+            // 2. The writer guard prevents concurrent writes to this slot
             // 3. Slot at idx is uninitialized (never written before, append-only)
             unsafe {
                 let slot_ptr = self.slots[idx].get();
@@ -404,6 +412,19 @@ impl BatchStore {
             .store(start_idx + count, Ordering::Release);
 
         Ok(results)
+    }
+
+    fn acquire_writer(&self) -> BatchStoreWriterGuard<'_> {
+        while self
+            .writer_active
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        BatchStoreWriterGuard {
+            writer_active: &self.writer_active,
+        }
     }
 
     // =========================================================================
@@ -788,7 +809,7 @@ mod tests {
     use super::*;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -1289,6 +1310,42 @@ mod tests {
 
         for r in readers {
             r.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_concurrent_writers_are_serialized() {
+        const NUM_WRITERS: usize = 8;
+        const BATCHES_PER_WRITER: usize = 50;
+        let expected_batches = NUM_WRITERS * BATCHES_PER_WRITER;
+        let store = Arc::new(BatchStore::with_capacity(expected_batches));
+        let start = Arc::new(Barrier::new(NUM_WRITERS));
+
+        let writers: Vec<_> = (0..NUM_WRITERS)
+            .map(|_| {
+                let writer_store = store.clone();
+                let writer_start = start.clone();
+                std::thread::spawn(move || {
+                    writer_start.wait();
+                    for _ in 0..BATCHES_PER_WRITER {
+                        writer_store.append(create_test_batch(1)).unwrap();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        assert_eq!(store.len(), expected_batches);
+        assert_eq!(store.total_rows(), expected_batches);
+        let mut expected_row_offset = 0;
+        for (batch_position, batch) in store.iter().enumerate() {
+            assert_eq!(batch.batch_position, batch_position);
+            assert_eq!(batch.row_offset, expected_row_offset);
+            expected_row_offset += batch.num_rows as u64;
         }
     }
 

@@ -165,6 +165,16 @@ impl ZoneMapIndex {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
     }
 
+    fn zone_has_missing_extrema(zone: &ZoneMapStatistics) -> bool {
+        zone.min.is_null() || zone.max.is_null()
+    }
+
+    /// Counts prove whether missing extrema mean "no comparable values" or
+    /// "bounds unknown". Only the latter must conservatively retain the zone.
+    fn zone_has_comparable_values(zone: &ZoneMapStatistics) -> bool {
+        zone.bound.length as u128 > u128::from(zone.null_count) + u128::from(zone.nan_count)
+    }
+
     /// Global `[min, max]` folded across one or more ZoneMap segments (the
     /// disjoint per-column segments of a multi-segment index), without a scan.
     ///
@@ -190,6 +200,11 @@ impl ZoneMapIndex {
                 return None;
             }
             for zone in seg.zones.iter() {
+                // Legacy Decimal zones can contain comparable values even though their
+                // extrema were never written, so skipping them would produce a subset.
+                if Self::zone_has_missing_extrema(zone) && Self::zone_has_comparable_values(zone) {
+                    return None;
+                }
                 if Self::scalar_is_nan(&zone.max) {
                     return None;
                 }
@@ -272,8 +287,8 @@ impl ZoneMapIndex {
                     return Ok(zone.nan_count > 0);
                 }
 
-                if !Self::zone_has_finite_min(zone) {
-                    return Ok(false);
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
                 }
 
                 Ok(target >= &zone.min && target <= &zone.max)
@@ -281,8 +296,8 @@ impl ZoneMapIndex {
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
-                if !Self::zone_has_finite_min(zone) {
-                    return Ok(false);
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
                 }
 
                 let zone_min = &zone.min;
@@ -398,6 +413,8 @@ impl ZoneMapIndex {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
@@ -407,6 +424,8 @@ impl ZoneMapIndex {
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
@@ -416,6 +435,8 @@ impl ZoneMapIndex {
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
@@ -423,9 +444,13 @@ impl ZoneMapIndex {
                                 }
                             }
                             _ => {
-                                Self::zone_has_finite_extrema(zone)
-                                    && value >= &zone.min
-                                    && value <= &zone.max
+                                if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
+                                } else {
+                                    Self::zone_has_finite_extrema(zone)
+                                        && value >= &zone.min
+                                        && value <= &zone.max
+                                }
                             }
                         }
                     }
@@ -1760,7 +1785,7 @@ mod tests {
 
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
-    use arrow::datatypes::{ArrowPrimitiveType, Float32Type, Int64Type};
+    use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Int64Type};
     use arrow_array::{Array, PrimitiveArray, RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
@@ -1880,6 +1905,15 @@ mod tests {
     async fn test_value_range_all_null_is_none() {
         let index = train_and_load::<Int64Type>(vec![vec![None, None, None]]).await;
         assert_eq!(index.value_range(), None);
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
     #[tokio::test]
@@ -1921,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_value_range_over_skips_all_null_segment() {
+    async fn test_value_range_over_missing_extrema() {
         // An all-null segment yields no finite zone; folding it with a finite
         // segment returns the finite segment's range (null contributes nothing).
         let a = train_and_load::<Int64Type>(vec![vec![None, None]]).await;
@@ -1929,6 +1963,20 @@ mod tests {
         assert_eq!(
             ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
             Some((ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(7))))
+        );
+
+        // Lance v8 persisted typed-null Decimal extrema even when a zone contained
+        // values. Such unknown bounds cannot be skipped like an all-null segment.
+        let mut legacy = train_and_load::<Decimal128Type>(vec![vec![Some(100), Some(200)]]).await;
+        for zone in &mut Arc::get_mut(&mut legacy).unwrap().zones {
+            zone.min = ScalarValue::Decimal128(None, 38, 10);
+            zone.max = ScalarValue::Decimal128(None, 38, 10);
+        }
+        let current =
+            train_and_load::<Decimal128Type>(vec![vec![Some(10_000), Some(20_000)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([legacy.as_ref(), current.as_ref()]),
+            None
         );
     }
 

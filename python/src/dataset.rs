@@ -52,8 +52,8 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -2031,6 +2031,19 @@ impl Dataset {
             })
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        let py = self_.py();
+        self_
+            .list_version_refs()?
+            .iter()
+            .map(|version| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", version.version)?;
+                dict.into_py_any(py)
+            })
+            .collect()
     }
 
     /// Fetches the currently checked out version of the dataset.
@@ -4141,6 +4154,18 @@ impl DatasetDelta {
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
     }
+    /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_deleted_row_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_deleted_row_ids())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
 }
 
 #[pyclass(
@@ -4452,6 +4477,10 @@ impl Dataset {
 
     fn list_versions(&self) -> PyResult<Vec<Version>> {
         rt().block_on(None, self.ds.versions())?.infer_error()
+    }
+
+    fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
+        rt().block_on(None, self.ds.version_refs())?.infer_error()
     }
 
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
