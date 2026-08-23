@@ -2097,18 +2097,29 @@ impl MergeInsertJob {
         // side's value for that column. For matched rows this carries the
         // existing target value (preserving non-source columns on update);
         // for unmatched source rows (inserts) the outer join leaves the
-        // target side NULL, so inserts get NULL for missing columns. The
-        // unqualified name matches the dataset field and becomes a normal
-        // data column from the write exec's perspective.
         //
-        // We iterate the dataset schema in order so that the resulting
-        // physical plan is deterministic and easy to inspect in tests.
-        for field in dataset_schema.fields() {
-            if !source_field_names.contains(field.name()) {
-                df = df.with_column(
-                    field.name(),
-                    logical_expr::col(format!("target.\"{}\"", field.name())),
-                )?;
+        // Skip this loop for partial-schema updates: when the source has
+        // fewer columns than the target, the references to every target
+        // column prevent DataFusion's optimizer from pushing projections
+        // down to the scan.  By skipping, the optimizer sees only _rowid,
+        // _rowaddr, and on-columns are needed and prunes the rest.  The
+        // write exec fills missing columns from the dataset instead.
+        let is_partial_schema =
+            source_field_names.len() < dataset_schema.fields.len() && !self.params.on.is_empty();
+        if !is_partial_schema {
+            // target side NULL, so inserts get NULL for missing columns. The
+            // unqualified name matches the dataset field and becomes a normal
+            // data column from the write exec's perspective.
+            //
+            // We iterate the dataset schema in order so that the resulting
+            // physical plan is deterministic and easy to inspect in tests.
+            for field in dataset_schema.fields() {
+                if !source_field_names.contains(field.name()) {
+                    df = df.with_column(
+                        field.name(),
+                        logical_expr::col(format!("target.\"{}\"", field.name())),
+                    )?;
+                }
             }
         }
 
