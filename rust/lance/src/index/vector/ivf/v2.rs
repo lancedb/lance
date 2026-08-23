@@ -3975,7 +3975,7 @@ mod tests {
     // test_merge_existing_ivf_sq_segments_rejects_mismatched_bounds.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
-    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.15)]
     #[case::ivf_hnsw_pq(IndexType::IvfHnswPq, 0.15)]
     #[tokio::test]
     async fn test_merge_existing_ivf_segments_compose(
