@@ -1338,7 +1338,7 @@ impl MergeInsertJob {
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
-        let mut index_mapper = mapped_rows
+        let index_mapper = mapped_rows
             .scan(&session_ctx.state(), None, &[], None)
             .await?;
 
