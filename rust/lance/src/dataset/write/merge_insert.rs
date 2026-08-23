@@ -40,6 +40,7 @@ pub mod inserted_rows;
 
 use assign_action::{
     combined_schema_fields_from_qualified, merge_insert_action, parse_when_matched_condition,
+    qualify_combined_schema_fields,
 };
 use inserted_rows::KeyExistenceFilter;
 
@@ -246,6 +247,26 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
         vec![Arc::new(source), Arc::new(target)],
     )
     .unwrap()
+}
+
+// Whether a relation-qualified "when matched" condition reads a target column the source
+// does not carry.
+//
+// Unqualified columns count as target-side: they do not resolve against the indexed path's
+// combined schema either, so routing them to the standard plan is the useful behavior.
+fn reads_absent_target_column(condition: &Expr, source_schema: &Schema) -> bool {
+    condition.column_refs().iter().any(|column| {
+        let is_target_side = column
+            .relation
+            .as_ref()
+            .map(|relation| relation.table() == "target")
+            .unwrap_or(true);
+        is_target_side
+            && !source_schema
+                .fields()
+                .iter()
+                .any(|field| field.name() == &column.name)
+    })
 }
 
 // Applies `source_dedupe_behavior` to matched rows, returning the rows that own their
@@ -2427,18 +2448,13 @@ impl MergeInsertJob {
                 };
                 let parsed =
                     parse_when_matched_condition(condition, Some(&target_arrow_schema), variant)?;
-                parsed.column_refs().iter().any(|column| {
-                    let is_target_side = column
-                        .relation
-                        .as_ref()
-                        .map(|relation| relation.table() == "target")
-                        .unwrap_or(true);
-                    is_target_side
-                        && !source_schema
-                            .fields()
-                            .iter()
-                            .any(|field| field.name() == &column.name)
-                })
+                reads_absent_target_column(&parsed, source_schema)
+            }
+            // A pre-built expression may address its sides either way, so normalize to
+            // relation-qualified columns before the dependency analysis.
+            WhenMatched::UpdateIfExpr(condition) | WhenMatched::DeleteIfExpr(condition) => {
+                let normalized = qualify_combined_schema_fields(condition.clone())?;
+                reads_absent_target_column(&normalized, source_schema)
             }
             _ => false,
         };
@@ -11849,6 +11865,80 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         }
         assert_eq!(stats.num_updated_rows, 0);
         assert_eq!(stats.num_inserted_rows, 0);
+    }
+
+    /// Route selection must analyse pre-built conditions too, not just SQL strings. A
+    /// `DeleteIfExpr` reading a target column the partial source omits cannot be compiled
+    /// against the indexed path's combined schema, so it has to reach the standard plan.
+    /// Both column representations are covered, since either may be handed to the builder.
+    #[rstest::rstest]
+    #[case::qualified_standard(true, false)]
+    #[case::qualified_indexed(true, true)]
+    #[case::struct_field_standard(false, false)]
+    #[case::struct_field_indexed(false, true)]
+    #[tokio::test]
+    async fn test_delete_if_expr_partial_source_target_predicate(
+        #[case] relation_qualified: bool,
+        #[case] indexed: bool,
+    ) {
+        use datafusion_functions::core::expr_ext::FieldAccessor;
+
+        let initial =
+            record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30])).unwrap();
+        let schema = initial.schema();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if indexed {
+            ds.create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The source carries only the join key, so `value` is available on the target side
+        // of the join alone.
+        let source = record_batch!(("id", Int32, [1, 2, 3])).unwrap();
+        let condition = if relation_qualified {
+            logical_expr::col("target.value").gt(logical_expr::lit(20))
+        } else {
+            logical_expr::col("target")
+                .field("value")
+                .gt(logical_expr::lit(20))
+        };
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::delete_if_expr(condition))
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 1);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 3".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "only the row whose target value exceeds 20 is deleted"
+        );
     }
 
     /// Test WhenMatched::DeleteIf error cases. Parsing is deferred until the execution
