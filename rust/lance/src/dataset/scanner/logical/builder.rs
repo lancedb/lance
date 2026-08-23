@@ -169,6 +169,7 @@ pub(super) fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         fast_search: scanner.fast_search,
         index_segments: scanner.index_segments.clone().map(Arc::new),
         include_deleted_rows: scanner.include_deleted_rows,
+        rows: None,
         filter_plan: None,
         legacy_scanner: super::source::v1::is_legacy(&scanner.dataset)
             .then(|| Arc::new(scanner.clone())),

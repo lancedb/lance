@@ -429,3 +429,60 @@ async fn test_a_projection_that_reads_nothing_is_rejected() {
     );
     assert!(error.to_string().contains("at least one column"), "{error}");
 }
+
+/// A `_rowid` predicate names its rows, so the scan reads only those.
+#[tokio::test]
+async fn test_a_row_id_take() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowid IN (5, 10, 20)")?.with_row_id();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    // Without stable row ids a row id is its address, so these name rows 5, 10 and 20 of the first
+    // fragment — whose `i` values are the same numbers.
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![5, 10, 20])
+        .await
+        .unwrap();
+
+    let plan = logical_plan_for(&dataset, config).await.unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        !display.contains("full_filter=_rowid"),
+        "the take should have replaced the predicate: {display}"
+    );
+}
+
+/// The rest of a conjunction survives the rewrite as an ordinary filter.
+#[tokio::test]
+async fn test_a_row_id_take_with_a_remainder() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowid IN (5, 10, 20) AND i > 7")?
+            .with_row_id();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![10, 20])
+        .await
+        .unwrap();
+}
+
+/// A `_rowaddr` predicate is a take too, once stage 2 has translated the addresses.
+#[tokio::test]
+async fn test_a_row_address_take() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowaddr IN (5, 10, 20)")?.with_row_address();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![5, 10, 20])
+        .await
+        .unwrap();
+}
