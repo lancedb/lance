@@ -23,8 +23,8 @@ use crate::{
         FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
     },
     utils::{
-        build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_long_obj,
-        to_java_optional,
+        build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_list,
+        to_java_long_obj, to_java_optional,
     },
 };
 
@@ -48,6 +48,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -66,7 +67,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             binary_copy_read_batch_bytes,
             max_source_fragments,
             max_source_rows,
-            max_source_bytes
+            max_source_bytes,
+            excluded_fragment_ids
         ),
         JObject::null()
     )
@@ -89,6 +91,7 @@ fn inner_plan_compaction<'local>(
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -110,6 +113,7 @@ fn inner_plan_compaction<'local>(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         &config,
     )?;
 
@@ -140,6 +144,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -160,6 +165,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
             max_source_fragments,
             max_source_rows,
             max_source_bytes,
+            excluded_fragment_ids,
         ),
         JObject::null()
     )
@@ -183,6 +189,7 @@ fn inner_commit_compaction<'local>(
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -204,6 +211,7 @@ fn inner_commit_compaction<'local>(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -243,6 +251,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -263,7 +272,8 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             binary_copy_read_batch_bytes,
             max_source_fragments,
             max_source_rows,
-            max_source_bytes
+            max_source_bytes,
+            excluded_fragment_ids
         ),
         JObject::null()
     )
@@ -288,6 +298,7 @@ fn inner_execute_task<'local>(
     max_source_fragments: JObject,            // Optional<Long>
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
+    excluded_fragment_ids: JObject,           // List<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -310,6 +321,7 @@ fn inner_execute_task<'local>(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         &config,
     )?;
     let compaction_task = CompactionTask {
@@ -337,7 +349,7 @@ const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -413,6 +425,12 @@ impl IntoJava for &CompactionOptions {
         let max_source_rows_opt = to_java_optional(env, max_source_rows)?;
         let max_source_bytes = to_java_long_obj(env, self.max_source_bytes.map(|v| v as i64))?;
         let max_source_bytes_opt = to_java_optional(env, max_source_bytes)?;
+        let excluded_fragment_ids = self
+            .excluded_fragment_ids
+            .iter()
+            .map(|fragment_id| to_java_long_obj(env, Some(*fragment_id as i64)))
+            .collect::<Result<Vec<_>>>()?;
+        let excluded_fragment_ids = to_java_list(env, &excluded_fragment_ids)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -431,6 +449,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&max_source_fragments_opt),
                 JValueGen::Object(&max_source_rows_opt),
                 JValueGen::Object(&max_source_bytes_opt),
+                JValueGen::Object(&excluded_fragment_ids),
             ],
         )?)
     }

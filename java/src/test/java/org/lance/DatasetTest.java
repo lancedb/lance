@@ -129,6 +129,9 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertFalse(writerVersion.getVersion().isEmpty());
       }
 
       // Test LEGACY version
@@ -144,7 +147,44 @@ public class DatasetTest {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
       }
+
+      // This dataset was written before writer_version was added to the manifest.
+      String historicalPath =
+          Path.of("..", "test_data", "v0.7.5", "with_deletions")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
+        assertTrue(historicalDataset.getWriterVersion().isEmpty());
+      }
+
+      // This fixture was written by lance 2.0.0-beta.1. Reading it through Dataset verifies
+      // that the manifest's prerelease qualifier survives the Rust-to-Java JNI mapping.
+      String prereleasePath =
+          Path.of("..", "test_data", "pre_file_sizes", "index_without_file_sizes")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset prereleaseDataset = Dataset.open(prereleasePath, allocator)) {
+        WriterVersion writerVersion =
+            prereleaseDataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertEquals("2.0.0", writerVersion.getVersion());
+        assertEquals("beta.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+        assertTrue(writerVersion.getBuildMetadata().isEmpty());
+      }
     }
+  }
+
+  @Test
+  void testWriterVersionPreservesOpaqueAndOptionalFields() {
+    WriterVersion writerVersion =
+        new WriterVersion("custom-writer", "release-2026", "preview.1", "build.42");
+
+    assertEquals("custom-writer", writerVersion.getLibrary());
+    assertEquals("release-2026", writerVersion.getVersion());
+    assertEquals("preview.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+    assertEquals("build.42", writerVersion.getBuildMetadata().orElseThrow(AssertionError::new));
   }
 
   @Test
@@ -2214,6 +2254,10 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
         assertTrue(
             desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
             "segment size should be positive");

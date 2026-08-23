@@ -42,6 +42,11 @@ impl std::fmt::Debug for i32x8 {
 
 impl From<&[i32]> for i32x8 {
     fn from(value: &[i32]) -> Self {
+        assert!(
+            value.len() >= 8,
+            "i32x8 requires at least 8 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -318,4 +323,11 @@ impl Mul for i32x8 {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slice_conversion_rejects_short_input() {
+        assert!(std::panic::catch_unwind(|| i32x8::from(&[0; 7][..])).is_err());
+    }
+}

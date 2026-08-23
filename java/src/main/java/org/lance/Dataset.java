@@ -1105,13 +1105,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutVersion(version);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutVersion(version));
     }
   }
 
@@ -1128,17 +1122,22 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutTag(tag);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutTag(tag));
     }
   }
 
   private native Dataset nativeCheckoutTag(String tag);
+
+  private Dataset initializeCheckoutDataset(Dataset checkedOutDataset) {
+    if (selfManagedAllocator) {
+      checkedOutDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      checkedOutDataset.allocator = allocator;
+    }
+    checkedOutDataset.session = Session.fromHandle(checkedOutDataset.nativeGetSessionHandle());
+    checkedOutDataset.ownsSession = true;
+    return checkedOutDataset;
+  }
 
   /**
    * Restore the currently checked out version of the dataset as the latest version. This operation
@@ -1626,6 +1625,22 @@ public class Dataset implements Closeable {
   private native boolean nativeHasStableRowIds();
 
   /**
+   * Get the library version that wrote the current manifest.
+   *
+   * <p>Older manifests may not contain writer version metadata.
+   *
+   * @return the current manifest writer version, or empty if unavailable
+   */
+  public Optional<WriterVersion> getWriterVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeGetWriterVersion());
+    }
+  }
+
+  private native WriterVersion nativeGetWriterVersion();
+
+  /**
    * Get the Lance file format version of this dataset.
    *
    * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".
@@ -1899,13 +1914,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckout(ref);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckout(ref));
     }
   }
 
