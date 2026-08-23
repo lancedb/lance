@@ -441,49 +441,54 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
-struct MembershipRowIndex {
-    /// Prefix offsets into `rows`; cluster `i` owns `offsets[i]..offsets[i + 1]`.
+const MIN_OWNER_INDEX_ROWS: usize = 4096;
+
+struct MembershipOwnerIndex {
+    /// Prefix offsets into `rows`; owner `i` owns `offsets[i]..offsets[i + 1]`.
     offsets: Vec<usize>,
-    /// Input row numbers grouped by cluster and stable within each cluster.
+    /// Input row numbers grouped by centroid owner and stable within each owner.
     rows: Vec<usize>,
 }
 
-/// Group input rows by their assigned cluster in linear time.
+/// Group input rows by the worker that owns their centroid range.
 ///
-/// This counting-sort layout lets centroid owners read each assigned vector
-/// without rescanning every membership. Keeping rows stable within a cluster
-/// also preserves the prior floating-point accumulation order.
-fn build_membership_row_index(
+/// Rows remain in ascending input order within each owner. This avoids the
+/// cluster-major gathers of a per-centroid index while still removing the
+/// repeated full membership scan performed by every centroid owner.
+fn build_membership_owner_index(
     membership: &[Option<u32>],
     num_vectors: usize,
     k: usize,
-) -> MembershipRowIndex {
+    centroids_per_owner: usize,
+) -> MembershipOwnerIndex {
     let membership = &membership[..membership.len().min(num_vectors)];
-    let mut offsets = vec![0; k + 1];
+    let owner_count = k.div_ceil(centroids_per_owner);
+    let mut offsets = vec![0; owner_count + 1];
     membership.iter().flatten().for_each(|&cluster_id| {
         let cluster_id = cluster_id as usize;
         if cluster_id < k {
-            offsets[cluster_id + 1] += 1;
+            offsets[cluster_id / centroids_per_owner + 1] += 1;
         }
     });
-    for cluster_id in 0..k {
-        offsets[cluster_id + 1] += offsets[cluster_id];
+    for owner in 0..owner_count {
+        offsets[owner + 1] += offsets[owner];
     }
 
-    let mut next_offsets = offsets[..k].to_vec();
-    let mut rows = vec![0; offsets[k]];
+    let mut next_offsets = offsets[..owner_count].to_vec();
+    let mut rows = vec![0; offsets[owner_count]];
     membership
         .iter()
         .enumerate()
         .filter_map(|(row, cluster_id)| cluster_id.map(|cluster_id| (row, cluster_id as usize)))
         .for_each(|(row, cluster_id)| {
             if cluster_id < k {
-                rows[next_offsets[cluster_id]] = row;
-                next_offsets[cluster_id] += 1;
+                let owner = cluster_id / centroids_per_owner;
+                rows[next_offsets[owner]] = row;
+                next_offsets[owner] += 1;
             }
         });
 
-    MembershipRowIndex { offsets, rows }
+    MembershipOwnerIndex { offsets, rows }
 }
 
 fn recompute_float_centroids<T>(
@@ -520,26 +525,56 @@ where
         return centroids;
     }
 
-    let row_index = build_membership_row_index(membership, num_vectors, k);
-    let centroids_per_chunk = k / available_parallelism;
+    let centroids_per_owner = k / available_parallelism;
+
+    // For very small training sets, constructing an index costs more than the
+    // short membership rescans it replaces. Keep the existing owner-rescan
+    // path there and reserve indexing for workloads large enough to amortize
+    // its two linear setup passes.
+    if num_vectors < MIN_OWNER_INDEX_ROWS {
+        centroids
+            .par_chunks_mut(dimension * centroids_per_owner)
+            .enumerate()
+            .with_max_len(1)
+            .for_each(|(owner, centroids)| {
+                let first_cluster = owner * centroids_per_owner;
+                let end_cluster = first_cluster + centroids.len() / dimension;
+                data.chunks(dimension)
+                    .zip(membership)
+                    .filter_map(|(vector, cluster_id)| {
+                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                    })
+                    .for_each(|(vector, cluster_id)| {
+                        if first_cluster <= cluster_id && cluster_id < end_cluster {
+                            let local_cluster = cluster_id - first_cluster;
+                            let centroid = &mut centroids
+                                [local_cluster * dimension..(local_cluster + 1) * dimension];
+                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        }
+                    });
+            });
+        return centroids;
+    }
+
+    let owner_index = build_membership_owner_index(membership, num_vectors, k, centroids_per_owner);
     centroids
-        .par_chunks_mut(dimension * centroids_per_chunk)
+        .par_chunks_mut(dimension * centroids_per_owner)
         .enumerate()
         .with_max_len(1)
-        .for_each(|(chunk_idx, centroids)| {
-            let first_cluster = chunk_idx * centroids_per_chunk;
-            centroids
-                .chunks_mut(dimension)
-                .enumerate()
-                .for_each(|(local_cluster, centroid)| {
-                    let cluster_id = first_cluster + local_cluster;
-                    row_index.rows
-                        [row_index.offsets[cluster_id]..row_index.offsets[cluster_id + 1]]
-                        .iter()
-                        .for_each(|&row| {
-                            let vector = &data[row * dimension..(row + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        });
+        .for_each(|(owner, centroids)| {
+            let first_cluster = owner * centroids_per_owner;
+            owner_index.rows[owner_index.offsets[owner]..owner_index.offsets[owner + 1]]
+                .iter()
+                .for_each(|&row| {
+                    if let Some(cluster_id) = membership[row].map(|cluster_id| cluster_id as usize)
+                        && cluster_id < k
+                    {
+                        let local_cluster = cluster_id - first_cluster;
+                        let centroid = &mut centroids
+                            [local_cluster * dimension..(local_cluster + 1) * dimension];
+                        let vector = &data[row * dimension..(row + 1) * dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    }
                 });
         });
     centroids
@@ -2025,19 +2060,23 @@ mod tests {
     }
 
     #[test]
-    fn test_membership_row_index_is_stable() {
-        let row_index =
-            build_membership_row_index(&[Some(2), Some(0), None, Some(2), Some(1), Some(0)], 5, 3);
+    fn test_membership_owner_index_is_stable() {
+        let owner_index = build_membership_owner_index(
+            &[Some(5), Some(0), None, Some(4), Some(2), Some(1)],
+            6,
+            6,
+            2,
+        );
 
-        assert_eq!(row_index.offsets, [0, 1, 2, 4]);
-        assert_eq!(row_index.rows, [1, 4, 0, 3]);
+        assert_eq!(owner_index.offsets, [0, 2, 3, 5]);
+        assert_eq!(owner_index.rows, [1, 5, 4, 0, 3]);
     }
 
     #[test]
-    fn test_indexed_recompute_matches_serial_accumulation() {
+    fn test_owner_indexed_recompute_matches_serial_accumulation() {
         let dimension = 2;
-        let k = 17;
-        let num_vectors = 65;
+        let k = 64;
+        let num_vectors = MIN_OWNER_INDEX_ROWS;
         let data = (0..num_vectors * dimension)
             .map(|value| value as f32)
             .collect::<Vec<_>>();
@@ -2049,6 +2088,24 @@ mod tests {
         let indexed = recompute_float_centroids(&data, dimension, k, &membership, 4);
 
         assert_eq!(indexed, serial);
+    }
+
+    #[test]
+    fn test_small_parallel_recompute_matches_serial_accumulation() {
+        let dimension = 2;
+        let k = 64;
+        let num_vectors = MIN_OWNER_INDEX_ROWS - 1;
+        let data = (0..num_vectors * dimension)
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let membership = (0..num_vectors)
+            .map(|row| (row != 17).then_some((row % k) as u32))
+            .collect::<Vec<_>>();
+
+        let serial = recompute_float_centroids(&data, dimension, k, &membership, 1);
+        let rescanned = recompute_float_centroids(&data, dimension, k, &membership, 4);
+
+        assert_eq!(rescanned, serial);
     }
 
     #[tokio::test]
