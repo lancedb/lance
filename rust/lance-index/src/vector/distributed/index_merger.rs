@@ -226,125 +226,6 @@ async fn open_sibling_index_reader(
     ))
 }
 
-/// Map an index file header's declared type name to the merge's family enum.
-fn ivf_index_type_from_name(name: &str) -> Result<SupportedIvfIndexType> {
-    SupportedIvfIndexType::from_index_type_str(name).ok_or_else(|| {
-        Error::index(format!(
-            "Unsupported index type in shard index.idx: {}",
-            name
-        ))
-    })
-}
-
-/// The durable model a segment directory declares.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SegmentModel {
-    /// Index family, from the index file header or the storage schema.
-    pub index_type: SupportedIvfIndexType,
-    /// Distance type recorded in the auxiliary file.
-    pub distance_type: DistanceType,
-    /// Number of IVF partitions.
-    pub num_partitions: usize,
-}
-
-/// Read one segment directory's model from its durable files.
-///
-/// A structural entry check, not a full open: the auxiliary file must decode
-/// with a distance type, at least one IVF partition, and the quantizer
-/// metadata its family requires, and an index file header must agree with the
-/// auxiliary distance type. Deep model validation (codebooks, rotations,
-/// bounds) stays with the merge that reads the segment as a source.
-pub async fn read_segment_model(
-    object_store: &lance_io::object_store::ObjectStore,
-    segment_dir: &object_store::path::Path,
-) -> Result<SegmentModel> {
-    let sched = ScanScheduler::new(
-        Arc::new(object_store.clone()),
-        SchedulerConfig::max_bandwidth(object_store),
-    );
-    let aux_path = segment_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-    let fh = sched
-        .open_file(&aux_path, &CachedFileSize::unknown())
-        .await?;
-    let reader = V2Reader::try_open(
-        fh,
-        None,
-        Arc::default(),
-        &lance_core::cache::LanceCache::no_cache(),
-        V2ReaderOptions::default(),
-    )
-    .await?;
-    let meta = reader.metadata();
-    let distance_type = meta
-        .file_schema
-        .metadata
-        .get(DISTANCE_TYPE_KEY)
-        .ok_or_else(|| {
-            Error::index(format!(
-                "Missing {} in segment {}",
-                DISTANCE_TYPE_KEY, segment_dir
-            ))
-        })?;
-    let distance_type = DistanceType::try_from(distance_type.as_str())?;
-
-    let idx_path = segment_dir.clone().join(crate::INDEX_FILE_NAME);
-    let mut index_type = None;
-    if let Some(idx_reader) = open_sibling_index_reader(object_store, &sched, &idx_path).await?
-        && let Some(idx_meta_json) = idx_reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(INDEX_METADATA_SCHEMA_KEY)
-    {
-        let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-        let header_distance = DistanceType::try_from(idx_meta.distance_type.as_str())?;
-        if header_distance != distance_type {
-            return Err(Error::index(format!(
-                "segment header declares distance type {header_distance} but its \
-                 auxiliary file records {distance_type}"
-            )));
-        }
-        index_type = Some(ivf_index_type_from_name(&idx_meta.index_type)?);
-    }
-    let index_type = match index_type {
-        Some(index_type) => index_type,
-        None => {
-            let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
-            detect_supported_index_type(&reader, &schema_arrow)?
-        }
-    };
-
-    let pb_ivf = try_read_ivf_proto(&reader)
-        .await?
-        .ok_or_else(|| Error::index(format!("Missing IVF metadata in segment {}", segment_dir)))?;
-    if pb_ivf.lengths.is_empty() {
-        return Err(Error::index(format!(
-            "segment {} declares no IVF partitions",
-            segment_dir
-        )));
-    }
-    let required_key = match index_type {
-        SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => Some(PQ_METADATA_KEY),
-        SupportedIvfIndexType::IvfSq | SupportedIvfIndexType::IvfHnswSq => Some(SQ_METADATA_KEY),
-        SupportedIvfIndexType::IvfRq => Some(RABIT_METADATA_KEY),
-        SupportedIvfIndexType::IvfFlat | SupportedIvfIndexType::IvfHnswFlat => None,
-    };
-    if let Some(key) = required_key
-        && !meta.file_schema.metadata.contains_key(key)
-    {
-        return Err(Error::index(format!(
-            "segment declares index type {} but its auxiliary file carries no {} metadata",
-            index_type.as_str(),
-            key
-        )));
-    }
-    Ok(SegmentModel {
-        index_type,
-        distance_type,
-        num_partitions: pb_ivf.lengths.len(),
-    })
-}
-
 /// Initialize schema-level metadata on a writer for a given storage.
 ///
 /// It writes the distance type and the storage metadata (as a vector payload),
@@ -1029,7 +910,16 @@ pub async fn merge_partial_vector_auxiliary_files(
                     .get(INDEX_METADATA_SCHEMA_KEY)
             {
                 let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-                detected_index_type = Some(ivf_index_type_from_name(&idx_meta.index_type)?);
+                detected_index_type = Some(
+                    SupportedIvfIndexType::from_index_type_str(&idx_meta.index_type).ok_or_else(
+                        || {
+                            Error::index(format!(
+                                "Unsupported index type in shard index.idx: {}",
+                                idx_meta.index_type
+                            ))
+                        },
+                    )?,
+                );
             }
             // Fallback: infer from auxiliary schema
             if detected_index_type.is_none() {

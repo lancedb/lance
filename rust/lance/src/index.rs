@@ -225,7 +225,11 @@ async fn resolve_vector_source_dirs(
 /// The report is untrusted worker input whose file list becomes durable
 /// manifest metadata, so the store is the truth: the listing must match the
 /// report exactly and every file must decode as a Lance file.
-async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResult) -> Result<()> {
+async fn validate_merge_output_files(
+    dataset: &Dataset,
+    index_name: &str,
+    result: &IndexMergeResult,
+) -> Result<()> {
     let dir = dataset.indices_dir().join(result.output.uuid.to_string());
     let mut listed = match list_index_files_with_sizes(&dataset.object_store, &dir).await {
         Ok(files) => files,
@@ -287,69 +291,370 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
             }
             Err(err) => Err(err),
         };
-        let metadata = match decoded {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                return Err(Error::invalid_input(format!(
-                    "index merge output file {} of task {} is not a readable Lance index \
-                     file ({}); re-run the task",
-                    path, result.task_id, err
-                )));
-            }
-        };
-        // The production open reads the vector index header from the index
-        // file's schema metadata, so a decodable but generic Lance file must
-        // be rejected here rather than at query time.
-        if file.path == INDEX_FILE_NAME && vector_plan {
-            let header = metadata
-                .file_schema
-                .metadata
-                .get(INDEX_METADATA_SCHEMA_KEY)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "index merge output file {} of task {} carries no vector index \
-                         header; the output is not a vector index segment, re-run the task",
-                        path, result.task_id
-                    ))
-                })?;
-            let header: lance_index::IndexMetadata =
-                serde_json::from_str(header).map_err(|err| {
-                    Error::invalid_input(format!(
-                        "index merge output file {} of task {} has an unreadable vector \
-                         index header ({}); re-run the task",
-                        path, result.task_id, err
-                    ))
-                })?;
-            lance_linalg::distance::DistanceType::try_from(header.distance_type.as_str()).map_err(
-                |err| {
-                    Error::invalid_input(format!(
-                        "index merge output file {} of task {} declares an invalid \
-                         distance type ({}); re-run the task",
-                        path, result.task_id, err
-                    ))
-                },
-            )?;
+        if let Err(err) = decoded {
+            return Err(Error::invalid_input(format!(
+                "index merge output file {} of task {} is not a readable Lance index \
+                 file ({}); re-run the task",
+                path, result.task_id, err
+            )));
         }
     }
-    // A header is a forgeable string, so the segment must also pass the
-    // structural entry check a merge input would: auxiliary file, distance
-    // type, at least one partition, and the family's quantizer metadata. Deep
-    // model validation stays with the worker that read the sources.
+    // Metadata strings are forgeable, so the segment must open through the
+    // production vector index reader before it may replace readable sources.
+    // The open runs on a handle with fresh session caches: a uuid opened
+    // earlier in this session must not validate against remembered state
+    // instead of the bytes on the store.
     if vector_plan {
-        lance_index::vector::distributed::index_merger::read_segment_model(
-            &dataset.object_store,
-            &dir,
+        let session = Arc::new(crate::session::Session::default());
+        let mut validation_dataset = dataset.clone();
+        validation_dataset.index_cache = Arc::new(session.index_cache.for_dataset(dataset.uri()));
+        validation_dataset.metadata_cache =
+            Arc::new(session.metadata_cache.for_dataset(dataset.uri()));
+        validation_dataset.session = session;
+        let keyed_field = result.fingerprint.keyed_field().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "index merge result for task {} has no keyed field in its fingerprint",
+                result.task_id
+            ))
+        })?;
+        let column = dataset.schema().field_path(keyed_field)?;
+        let output_meta = result.output_metadata(index_name);
+        open_vector_index_from_meta(
+            &validation_dataset,
+            &column,
+            &output_meta,
+            &NoOpMetricsCollector,
         )
         .await
         .map_err(|err| {
             Error::invalid_input(format!(
-                "index merge output {} of task {} does not validate as its declared \
-                 vector index ({}); re-run the task",
+                "index merge output {} of task {} does not open as its declared \
+                     vector index ({}); re-run the task",
                 result.output.uuid, result.task_id, err
             ))
         })?;
     }
     Ok(())
+}
+
+/// Open a vector index segment from its metadata rather than a manifest lookup.
+///
+/// The commit path validates worker-built segments before they exist in any
+/// manifest, so the production open must be reachable without `load_index`.
+async fn open_vector_index_from_meta(
+    dataset: &Dataset,
+    column: &str,
+    index_meta: &IndexMetadata,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn VectorIndex>> {
+    {
+        let self_ = dataset;
+        let uuid = &index_meta.uuid;
+        let frag_reuse_uuid = self_.frag_reuse_index_uuid().await;
+        let object_store = self_.object_store_for_index(index_meta).await?;
+
+        // Check sized cache first (v2+ indices with serializable state).
+        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(entry) = self_.index_cache.get_with_key(&state_key).await {
+            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
+            let partition_cache = self_.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+            let frag_reuse_index = self_.open_frag_reuse_index(metrics).await?;
+            return entry
+                .0
+                .reconstruct(
+                    object_store,
+                    self_.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
+                .await;
+        }
+
+        // Fallback: in-memory cache for legacy indices.
+        let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(cached) = self_.index_cache.get_with_key(&cache_key).await {
+            return Ok(cached.0.clone());
+        }
+
+        let frag_reuse_index = self_.open_frag_reuse_index(metrics).await?;
+        let index_dir = self_.indice_files_dir(index_meta)?;
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let file_sizes = index_meta.file_size_map();
+        let reader: Arc<dyn Reader> = vector::open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?
+        .into();
+
+        let tailing_bytes = read_last_block(reader.as_ref()).await?;
+        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+
+        // Namespace the index cache by the UUID of the index. v2+ partition
+        // entries are store-free and remain reusable across object-store
+        // generations alongside their serializable state.
+        let index_cache = self_.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+
+        // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
+        fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+            ivf: IVFIndex<S, Q>,
+        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
+            let entry = ivf.to_state_entry();
+            (Arc::new(ivf), Some(entry))
+        }
+
+        // the index file is in lance format since version (0,2)
+        // TODO: we need to change the legacy IVF_PQ to be in lance format
+        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
+            major_version,
+            minor_version,
+        ) {
+            (0, 1) | (0, 0) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                let proto = open_index_proto(reader.as_ref()).await?;
+                match &proto.implementation {
+                    Some(Implementation::VectorIndex(vector_index)) => {
+                        let dataset = Arc::new(self_.clone());
+                        let idx = vector::open_vector_index(
+                            dataset,
+                            uuid,
+                            vector_index,
+                            reader,
+                            frag_reuse_index,
+                        )
+                        .await?;
+                        Ok((idx, None::<IvfStateEntryBox>))
+                    }
+                    None => Err(Error::internal(
+                        "Index proto was missing implementation field",
+                    )),
+                }
+            }
+
+            (0, 2) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                let reader = V1FileReader::try_new_self_described_from_reader(
+                    reader.clone(),
+                    Some(&self_.metadata_cache.file_metadata_cache(&index_file)),
+                )
+                .await?;
+                let idx = vector::open_vector_index_v2(
+                    Arc::new(self_.clone()),
+                    column,
+                    uuid,
+                    reader,
+                    frag_reuse_index,
+                )
+                .await?;
+                Ok((idx, None::<IvfStateEntryBox>))
+            }
+
+            (0, 3) | (2, _) => {
+                let scheduler = ScanScheduler::new(
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
+                );
+                let cached_size = file_sizes
+                    .get(INDEX_FILE_NAME)
+                    .map(|&size| CachedFileSize::new(size))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&index_file, &cached_size).await?;
+                let reader = lance_file::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self_.metadata_cache.file_metadata_cache(&index_file),
+                    FileReaderOptions::default(),
+                )
+                .await?;
+                let index_metadata = reader
+                    .schema()
+                    .metadata
+                    .get(INDEX_METADATA_SCHEMA_KEY)
+                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
+                let index_metadata: lance_index::IndexMetadata =
+                    serde_json::from_str(index_metadata)?;
+
+                // Resolve the column name and field
+                let (field_path, field) = resolve_index_column(self_.schema(), index_meta, column)?;
+
+                let (_, element_type) = get_vector_type(self_.schema(), &field_path)?;
+
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+
+                match index_metadata.index_type.as_str() {
+                    "IVF_FLAT" => match element_type {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        _ => Err(Error::index(format!(
+                            "the field type {} is not supported for FLAT index",
+                            field.data_type()
+                        ))),
+                    },
+
+                    "IVF_PQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_SQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_RQ" => {
+                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_HNSW_FLAT" => match element_type {
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        _ => {
+                            let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                    },
+
+                    "IVF_HNSW_SQ" => {
+                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_HNSW_PQ" => {
+                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    _ => Err(Error::index(format!(
+                        "Unsupported index type: {}",
+                        index_metadata.index_type
+                    ))),
+                }
+            }
+
+            _ => Err(Error::index(
+                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
+            )),
+        };
+        let (index, ivf_entry) = result?;
+        metrics.record_index_load();
+        // Attribute the one-time index-open I/O (file footers, IVF centroids,
+        // quantization metadata) to this query's metrics.  This runs only on a
+        // real open; cache hits return earlier, so a warm query reports zero
+        // index-open I/O.
+        if let Some(io_stats) = metrics.io_stats()
+            && let Some(open_stats) = index.open_io_stats()
+        {
+            io_stats.add_scan_stats(&open_stats);
+        }
+        if let Some(ivf_entry) = ivf_entry {
+            self_
+                .index_cache
+                .insert_with_key(&state_key, Arc::new(ivf_entry))
+                .await;
+        } else {
+            self_
+                .index_cache
+                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
+                .await;
+        }
+        Ok(index)
+    }
 }
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -2377,7 +2682,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         for result in &results {
-            validate_merge_output_files(self, result).await?;
+            validate_merge_output_files(self, &plan.index_name, result).await?;
         }
 
         let new_indices = results
@@ -3380,312 +3685,11 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let object_store = self.object_store_for_index(&index_meta).await?;
-
-        // Check sized cache first (v2+ indices with serializable state).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
-            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-            return entry
-                .0
-                .reconstruct(
-                    object_store,
-                    self.metadata_cache.as_ref(),
-                    partition_cache,
-                    frag_reuse_index,
-                )
-                .await;
-        }
-
-        // Fallback: in-memory cache for legacy indices.
-        let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            return Ok(cached.0.clone());
-        }
-
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir
-            .clone()
-            .join(uuid.to_string())
-            .join(INDEX_FILE_NAME);
-        let file_sizes = index_meta.file_size_map();
-        let reader: Arc<dyn Reader> = vector::open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?
-        .into();
-
-        let tailing_bytes = read_last_block(reader.as_ref()).await?;
-        let (major_version, minor_version) = read_version(&tailing_bytes)?;
-
-        // Namespace the index cache by the UUID of the index. v2+ partition
-        // entries are store-free and remain reusable across object-store
-        // generations alongside their serializable state.
-        let index_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-
-        // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
-        fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
-            ivf: IVFIndex<S, Q>,
-        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
-            let entry = ivf.to_state_entry();
-            (Arc::new(ivf), Some(entry))
-        }
-
-        // the index file is in lance format since version (0,2)
-        // TODO: we need to change the legacy IVF_PQ to be in lance format
-        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
-            major_version,
-            minor_version,
-        ) {
-            (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
-                let proto = open_index_proto(reader.as_ref()).await?;
-                match &proto.implementation {
-                    Some(Implementation::VectorIndex(vector_index)) => {
-                        let dataset = Arc::new(self.clone());
-                        let idx = vector::open_vector_index(
-                            dataset,
-                            uuid,
-                            vector_index,
-                            reader,
-                            frag_reuse_index,
-                        )
-                        .await?;
-                        Ok((idx, None::<IvfStateEntryBox>))
-                    }
-                    None => Err(Error::internal(
-                        "Index proto was missing implementation field",
-                    )),
-                }
-            }
-
-            (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
-                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
-                )
-                .await?;
-                let idx = vector::open_vector_index_v2(
-                    Arc::new(self.clone()),
-                    column,
-                    uuid,
-                    reader,
-                    frag_reuse_index,
-                )
-                .await?;
-                Ok((idx, None::<IvfStateEntryBox>))
-            }
-
-            (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
-                    object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&object_store),
-                );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &self.metadata_cache.file_metadata_cache(&index_file),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let index_metadata = reader
-                    .schema()
-                    .metadata
-                    .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
-                let index_metadata: lance_index::IndexMetadata =
-                    serde_json::from_str(index_metadata)?;
-
-                // Resolve the column name and field
-                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
-
-                let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
-
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
-
-                match index_metadata.index_type.as_str() {
-                    "IVF_FLAT" => match element_type {
-                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        DataType::UInt8 => {
-                            let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        _ => Err(Error::index(format!(
-                            "the field type {} is not supported for FLAT index",
-                            field.data_type()
-                        ))),
-                    },
-
-                    "IVF_PQ" => {
-                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_SQ" => {
-                        let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_RQ" => {
-                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_HNSW_FLAT" => match element_type {
-                        DataType::UInt8 => {
-                            let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        _ => {
-                            let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                    },
-
-                    "IVF_HNSW_SQ" => {
-                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_HNSW_PQ" => {
-                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    _ => Err(Error::index(format!(
-                        "Unsupported index type: {}",
-                        index_metadata.index_type
-                    ))),
-                }
-            }
-
-            _ => Err(Error::index(
-                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
-            )),
-        };
-        let (index, ivf_entry) = result?;
-        metrics.record_index_load();
-        // Attribute the one-time index-open I/O (file footers, IVF centroids,
-        // quantization metadata) to this query's metrics.  This runs only on a
-        // real open; cache hits return earlier, so a warm query reports zero
-        // index-open I/O.
-        if let Some(io_stats) = metrics.io_stats()
-            && let Some(open_stats) = index.open_io_stats()
-        {
-            io_stats.add_scan_stats(&open_stats);
-        }
-        if let Some(ivf_entry) = ivf_entry {
-            self.index_cache
-                .insert_with_key(&state_key, Arc::new(ivf_entry))
-                .await;
-        } else {
-            self.index_cache
-                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
-                .await;
-        }
-        Ok(index)
+        open_vector_index_from_meta(self, column, &index_meta, metrics).await
     }
 
     async fn open_logical_vector_index(
@@ -9488,9 +9492,9 @@ mod tests {
 
     /// Write a fabricated merge output and return its reported file list.
     ///
-    /// The commit verifies reports against the store listing, decodes each
-    /// file, and parses the segment the way the merge reads a shard, so a
-    /// stub that should commit must write [`StubShape::Complete`].
+    /// Every shape is rejected by the commit: it opens each winner through the
+    /// production vector index reader, which no metadata fabrication survives.
+    /// Tests whose commit must succeed use [`DatasetIndexExt::execute_index_merge_task`].
     async fn write_stub_output_shape(
         dataset: &Dataset,
         output_uuid: Uuid,
@@ -9574,7 +9578,7 @@ mod tests {
         files
     }
 
-    /// A fabricated output that passes every commit-side verification.
+    /// The richest fabrication shape, for tests rejected before file checks.
     async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> Vec<IndexMergeFile> {
         write_stub_output_shape(dataset, output_uuid, StubShape::Complete).await
     }
@@ -9587,11 +9591,8 @@ mod tests {
         }]
     }
 
-    /// A worker report for `task_id` that never ran a merge.
-    ///
-    /// A test expecting the commit to succeed must pass the file list from
-    /// [`write_stub_output_file`], [`unwritten_stub_files`] works for tests
-    /// that reject earlier.
+    /// A worker report for `task_id` that never ran a merge, for tests the
+    /// commit rejects before or during file verification.
     fn stub_merge_result(
         plan: &IndexMergePlan,
         task_id: u32,
@@ -9808,25 +9809,18 @@ mod tests {
             .unwrap();
         assert_eq!(plan.tasks.len(), 2);
 
-        // Two attempts of task 0, reported out of order. Task 1's worker died.
-        let winning_attempt = Uuid::from_bytes([1; 16]);
-        let losing_attempt = Uuid::from_bytes([2; 16]);
-        let winning_output = Uuid::new_v4();
-        let losing_output = Uuid::new_v4();
-        let mut output_files = Vec::new();
-        for uuid in [winning_output, losing_output] {
-            output_files = write_stub_output_file(&dataset, uuid).await;
-        }
-        let results = vec![
-            stub_merge_result(
-                &plan,
-                0,
-                losing_output,
-                output_files.clone(),
-                losing_attempt,
-            ),
-            stub_merge_result(&plan, 0, winning_output, output_files, winning_attempt),
-        ];
+        // Two real attempts of task 0, reported out of order. Task 1's worker
+        // died. The lowest attempt id wins, so compute which attempt that is.
+        let first = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let second = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let (winner, loser) = if first.attempt_id < second.attempt_id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let winning_output = winner.output.uuid;
+        let losing_output = loser.output.uuid;
+        let results = vec![loser, winner];
 
         dataset
             .commit_index_merge_results(&plan, results)
@@ -9893,9 +9887,8 @@ mod tests {
         // second batch. The replay of the first batch's CreateIndex is not a
         // conflict because the exact-source property waives the same-name rule
         // and the finish step re-proves the batch's sources instead.
-        let late_output = Uuid::new_v4();
-        let late_files = write_stub_output_file(&dataset, late_output).await;
-        let late = stub_merge_result(&plan, 1, late_output, late_files, Uuid::new_v4());
+        let late = dataset.execute_index_merge_task(&plan, 1).await.unwrap();
+        let late_output = late.output.uuid;
         dataset
             .commit_index_merge_results(&plan, vec![late])
             .await
@@ -9920,21 +9913,28 @@ mod tests {
         uri: &str,
         fragments: u32,
     ) -> (Dataset, Vec<IndexMetadata>) {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::ivf::IvfBuildParams;
+
         let mut dataset = write_merge_test_dataset(uri, fragments as u64).await;
-        let field_id = dataset.schema().field("vector").unwrap().id;
+        // One shared zero centroid keeps independently built shards merge
+        // compatible without kmeans nondeterminism.
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf_params,
+        );
         let mut segments = Vec::new();
         for fragment_id in 0..fragments {
-            segments.push(
-                write_vector_segment_metadata(
-                    &dataset,
-                    "vector_idx",
-                    field_id,
-                    Uuid::new_v4(),
-                    [fragment_id],
-                    format!("seg{fragment_id}").as_bytes(),
-                )
-                .await,
-            );
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
+            builder = builder
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment_id]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
         }
         dataset
             .commit_existing_index_segments(
@@ -10000,9 +10000,8 @@ mod tests {
             .await
             .unwrap();
 
-        let output = Uuid::new_v4();
-        let output_files = write_stub_output_file(&dataset, output).await;
-        let result = stub_merge_result(&plan, 0, output, output_files, Uuid::new_v4());
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let output = result.output.uuid;
         dataset
             .commit_index_merge_results(&plan, vec![result])
             .await
@@ -10043,10 +10042,17 @@ mod tests {
     /// the segment the way the merge reads a shard. Both fabrications are
     /// rejected before publication.
     #[rstest]
-    #[case::headerless(StubShape::HeaderlessIndex, "carries no vector index header")]
+    #[case::headerless(
+        StubShape::HeaderlessIndex,
+        "does not open as its declared vector index"
+    )]
     #[case::forged_header_without_index_content(
         StubShape::ForgedHeaderOnly,
-        "does not validate as its declared vector index"
+        "does not open as its declared vector index"
+    )]
+    #[case::forged_header_and_auxiliary(
+        StubShape::Complete,
+        "does not open as its declared vector index"
     )]
     #[case::auxiliary_only(StubShape::AuxOnly, "reports no index")]
     #[tokio::test]
@@ -10395,6 +10401,52 @@ mod tests {
         );
     }
 
+    /// Validation must prove the bytes on the store, not session caches.
+    ///
+    /// A uuid opened earlier in the session leaves index state and file
+    /// metadata in caches, so a worker resubmitting that uuid with swapped
+    /// files could otherwise validate against remembered state.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_revalidates_swapped_output_bytes() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, _segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+
+        // Warm the session caches with a successful open of the real output.
+        let output_meta = result.output_metadata("vector_idx");
+        open_vector_index_from_meta(&dataset, "vector", &output_meta, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Swap the output files for decodable but headerless fabrications and
+        // resubmit the same uuid with the swapped sizes reported.
+        let swapped_files =
+            write_stub_output_shape(&dataset, result.output.uuid, StubShape::HeaderlessIndex).await;
+        let mut resubmitted = result;
+        resubmitted.attempt_id = Uuid::new_v4();
+        resubmitted.output.files = swapped_files;
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![resubmitted])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "swapped output bytes must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("does not open as its declared vector index"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// An output id landing inside the commit window must also be re-proven
     /// fresh at publication. Two exact-source commits for different index
     /// names sharing one new id would otherwise both land, and the later
@@ -10431,9 +10483,8 @@ mod tests {
             .plan_index_segment_merge("vector_idx", 3, None)
             .await
             .unwrap();
-        let shared = Uuid::new_v4();
-        let shared_files = write_stub_output_file(&dataset, shared).await;
-        let result = stub_merge_result(&plan, 0, shared, shared_files, Uuid::new_v4());
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let shared = result.output.uuid;
         dataset
             .commit_index_merge_results(&plan, vec![result])
             .await
