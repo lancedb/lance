@@ -551,6 +551,7 @@ pub fn new_mem_wal_index_meta(
         uuid: Uuid::new_v4(),
         name: MEM_WAL_INDEX_NAME.to_string(),
         fields: vec![],
+        covering_fields: vec![],
         dataset_version,
         fragment_bitmap: None,
         index_details: Some(Arc::new(prost_types::Any::from_msg(

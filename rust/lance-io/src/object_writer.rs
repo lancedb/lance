@@ -79,6 +79,11 @@ fn initial_upload_size() -> usize {
 /// PUT request. If the object is larger, the writer will create a multipart
 /// upload and upload parts in parallel.
 ///
+/// Parts stay in flight across writes and flushes, so a writer can hold up to
+/// `LANCE_UPLOAD_CONCURRENCY` part bodies in memory at once. With a large
+/// `LANCE_INITIAL_UPLOAD_SIZE` that product is what bounds the writer's
+/// footprint, not the part size alone.
+///
 /// This implements the `AsyncWrite` trait.
 pub struct ObjectWriter {
     state: UploadState,
@@ -531,13 +536,16 @@ impl AsyncWrite for ObjectWriter {
             UploadState::CreatingUpload(_)
             | UploadState::Completing(_)
             | UploadState::PuttingSingle(_) => Poll::Pending,
-            UploadState::InProgress { futures, .. } => {
-                if futures.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
+            // In-flight parts are spawned tasks, so the runtime drives them
+            // whether or not this writer is polled again; `poll_tasks` above
+            // only reaps them. Waiting for them here would serialize every part
+            // upload behind the caller's next batch, because callers flush once
+            // per batch. `poll_shutdown` still drains them before completing the
+            // upload, which is the only point at which the object becomes
+            // readable. Note this never flushed the tail buffer either, so it
+            // was not a "all data has reached the destination" barrier to begin
+            // with.
+            UploadState::InProgress { .. } => Poll::Ready(Ok(())),
         }
     }
 
@@ -852,17 +860,44 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
     };
+    use std::sync::Mutex;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Semaphore;
 
     use super::*;
 
     /// Which stage of an upload the mock store rejects.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FailAt {
+        Nothing,
         CreateMultipart,
         PutPart,
         Complete,
         SinglePut,
+    }
+
+    /// What the mock store saw, so a test can assert on uploads that are still
+    /// in flight as well as on the object they eventually assemble.
+    #[derive(Debug)]
+    struct UploadObservations {
+        /// One permit per part upload that has begun. A test waits on this
+        /// rather than sampling a counter: `write_all` and a non-waiting
+        /// `flush` can both complete without ever returning `Pending`, so on a
+        /// current-thread runtime the spawned upload tasks may not have run yet.
+        started: Semaphore,
+        /// `(part index, body)` in completion order. The index is recorded
+        /// because it, not completion order, determines the assembled object.
+        parts: Mutex<Vec<(usize, Vec<u8>)>>,
+    }
+
+    impl Default for UploadObservations {
+        fn default() -> Self {
+            Self {
+                started: Semaphore::new(0),
+                parts: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     fn rejected(stage: &'static str) -> object_store::Error {
@@ -875,13 +910,38 @@ mod tests {
     #[derive(Debug)]
     struct FailingUpload {
         fail_at: FailAt,
+        /// When set, a part upload does not resolve until the gate is given a
+        /// permit, so a test can hold requests in flight.
+        gate: Option<Arc<Semaphore>>,
+        observations: Arc<UploadObservations>,
+        next_part: usize,
     }
 
     #[async_trait]
     impl MultipartUpload for FailingUpload {
-        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
             let fails = self.fail_at == FailAt::PutPart;
-            Box::pin(async move { if fails { Err(rejected("part")) } else { Ok(()) } })
+            let part_idx = self.next_part;
+            self.next_part += 1;
+            let gate = self.gate.clone();
+            let observations = self.observations.clone();
+            Box::pin(async move {
+                observations.started.add_permits(1);
+                if let Some(gate) = gate {
+                    // `forget` keeps the permit from being returned on drop, so
+                    // adding N permits releases exactly N parts.
+                    gate.acquire_owned().await.unwrap().forget();
+                }
+                if fails {
+                    return Err(rejected("part"));
+                }
+                let body = data
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect();
+                observations.parts.lock().unwrap().push((part_idx, body));
+                Ok(())
+            })
         }
 
         async fn complete(&mut self) -> OSResult<PutResult> {
@@ -901,10 +961,34 @@ mod tests {
     }
 
     /// Rejects exactly one stage of an upload so each failure site can be
-    /// exercised on its own.
+    /// exercised on its own, and optionally holds part uploads open.
     #[derive(Debug)]
     struct FailingUploadStore {
         fail_at: FailAt,
+        gate: Option<Arc<Semaphore>>,
+        observations: Arc<UploadObservations>,
+    }
+
+    impl FailingUploadStore {
+        fn new(fail_at: FailAt) -> Self {
+            Self {
+                fail_at,
+                gate: None,
+                observations: Arc::new(UploadObservations::default()),
+            }
+        }
+
+        /// Builds a store whose part uploads stay in flight until the returned
+        /// gate is given permits.
+        fn gated(fail_at: FailAt) -> (Self, Arc<Semaphore>) {
+            let gate = Arc::new(Semaphore::new(0));
+            let store = Self {
+                fail_at,
+                gate: Some(gate.clone()),
+                observations: Arc::new(UploadObservations::default()),
+            };
+            (store, gate)
+        }
     }
 
     impl std::fmt::Display for FailingUploadStore {
@@ -941,6 +1025,9 @@ mod tests {
             } else {
                 Ok(Box::new(FailingUpload {
                     fail_at: self.fail_at,
+                    gate: self.gate.clone(),
+                    observations: self.observations.clone(),
+                    next_part: 0,
                 }))
             }
         }
@@ -1000,7 +1087,7 @@ mod tests {
     /// depending on when the rejected request is reaped, so both are checked.
     async fn failing_upload(fail_at: FailAt, num_bytes: usize) -> io::Error {
         let mut store = LanceObjectStore::memory();
-        store.inner = Arc::new(FailingUploadStore { fail_at });
+        store.inner = Arc::new(FailingUploadStore::new(fail_at));
 
         let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
             .await
@@ -1134,9 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn test_writer_shutdown_preserves_object_store_source() {
         let mut store = LanceObjectStore::memory();
-        store.inner = Arc::new(FailingUploadStore {
-            fail_at: FailAt::SinglePut,
-        });
+        store.inner = Arc::new(FailingUploadStore::new(FailAt::SinglePut));
         let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
             .await
             .unwrap();
@@ -1220,6 +1305,97 @@ mod tests {
         assert!(
             message.contains("single put rejected by test"),
             "should keep the underlying object store error: {message}"
+        );
+    }
+
+    /// Released permits, comfortably above the part count of any test here so
+    /// no test depends on the exact number of parts a payload produces.
+    const GATE_RELEASE: usize = 64;
+
+    /// How long a flush is allowed to take before it counts as waiting. A flush
+    /// that does not wait resolves immediately; this bound only has to be short
+    /// of the test harness timeout.
+    const FLUSH_BOUND: Duration = Duration::from_secs(10);
+
+    /// Blocks until a part upload has begun, so the assertions that follow are
+    /// made against a request that is genuinely in flight.
+    async fn await_part_in_flight(observations: &UploadObservations) {
+        tokio::time::timeout(FLUSH_BOUND, observations.started.acquire())
+            .await
+            .expect("a part upload should have started")
+            .unwrap()
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn test_flush_does_not_wait_for_in_flight_parts() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+
+        let mut writer = ObjectWriter::new(&lance_store, &Path::from("gated.lance"))
+            .await
+            .unwrap();
+        // Distinct bytes so a part landing out of order is detectable.
+        let payload = (0..two_parts()).map(|i| i as u8).collect::<Vec<_>>();
+        writer.write_all(payload.as_slice()).await.unwrap();
+        await_part_in_flight(&observations).await;
+
+        tokio::time::timeout(FLUSH_BOUND, AsyncWriteExt::flush(&mut writer))
+            .await
+            .expect("flush must not wait for in-flight part uploads")
+            .unwrap();
+
+        assert!(
+            observations.parts.lock().unwrap().is_empty(),
+            "no gated part may have completed before the gate opened"
+        );
+
+        gate.add_permits(GATE_RELEASE);
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, payload.len());
+
+        let mut parts = observations.parts.lock().unwrap().clone();
+        parts.sort_by_key(|(part_idx, _)| *part_idx);
+        let assembled = parts
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assembled, payload,
+            "parts must reassemble into the original bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_failure_after_flush_surfaces_at_shutdown() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::PutPart);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+
+        let mut writer = ObjectWriter::new(&lance_store, &Path::from(FAILING_UPLOAD_PATH))
+            .await
+            .unwrap();
+        writer
+            .write_all(vec![0u8; two_parts()].as_slice())
+            .await
+            .unwrap();
+        await_part_in_flight(&observations).await;
+        // The parts are still gated, so nothing has failed yet and flush passes.
+        AsyncWriteExt::flush(&mut writer).await.unwrap();
+
+        // Now let them fail. Shutdown is the first place that can report it, so
+        // no longer waiting in flush must not lose the error.
+        gate.add_permits(GATE_RELEASE);
+        let err = AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect_err("a failed part upload must still surface");
+        let message = err.to_string();
+        assert!(
+            message.contains(FAILING_UPLOAD_PATH),
+            "should name the object being written: {message}"
         );
     }
 

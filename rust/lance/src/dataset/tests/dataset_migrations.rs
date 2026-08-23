@@ -9,7 +9,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
-use lance_index::{IndexType, scalar::ScalarIndexParams};
+use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::read_row_ids;
@@ -447,6 +447,27 @@ async fn test_index_without_file_sizes() {
     assert!(
         index.files.is_none() || index.files.as_ref().unwrap().is_empty(),
         "Index should not have file size info (created with old version)"
+    );
+    // A manifest predating `covering_fields` decodes it as empty, so the keyed
+    // prefix is the whole of `fields` -- exactly what selection assumed before
+    // covering existed.
+    assert!(
+        index.covering_fields.is_empty(),
+        "Index from old version should declare no covered columns"
+    );
+
+    // Selection derives the keyed count as `fields.len() - covering_fields.len()`.
+    // On this old metadata it must still resolve to the one indexed column;
+    // otherwise the filter below would quietly fall back to a full scan and
+    // still return the right row.
+    let selected = dataset
+        .load_scalar_index(IndexCriteria::default().for_column("values"))
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.map(|idx| idx.name),
+        Some("values_idx".to_string()),
+        "an old single-field index must still be selected for its column"
     );
 
     // Verify the index still works - scan with a filter that uses the index

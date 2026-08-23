@@ -56,12 +56,11 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use tokio::sync::Notify;
 use uuid::Uuid;
-
-use lance_select::RowAddrMask;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -70,6 +69,7 @@ use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
 use lance_arrow::*;
 
+use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
     FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
     SelectionVectorToPrefilter,
@@ -1104,12 +1104,15 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
 /// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
+/// `external_mask`, when `Some`, additionally restricts the scan to a caller-supplied
+/// allow/block set (see [`ANNIvfSubIndexExec::with_external_mask`]).
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
     overlay_block: Option<RowAddrMask>,
+    external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1126,6 +1129,9 @@ pub fn new_knn_exec(
     )?;
     if let Some(overlay_block) = overlay_block {
         sub_index = sub_index.with_overlay_block(overlay_block);
+    }
+    if external_mask.is_some() {
+        sub_index = sub_index.with_external_mask(external_mask);
     }
 
     Ok(Arc::new(sub_index))
@@ -1390,6 +1396,10 @@ pub struct ANNIvfSubIndexExec {
     /// index results at execution time via [`DatasetPreFilter::with_overlay_block`].
     overlay_block: Option<RowAddrMask>,
 
+    /// Optional external row-address allow/block mask, combined with the
+    /// prefilter using logical AND.
+    external_mask: Option<Arc<RowAddrMask>>,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1423,6 +1433,7 @@ impl ANNIvfSubIndexExec {
             query,
             prefilter_source,
             overlay_block: None,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1431,6 +1442,14 @@ impl ANNIvfSubIndexExec {
     /// Block stale row addresses (see the `overlay_block` field) from index results.
     pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// Restrict the ANN search to a caller-supplied row-address allow/block set.
+    /// Intersected with the prefilter, so top-k is computed over surviving rows
+    /// rather than filtered afterwards. No-op when `mask` is `None`.
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -1988,6 +2007,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 query: self.query.clone(),
                 prefilter_source,
                 overlay_block: self.overlay_block.clone(),
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -2082,6 +2102,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => None,
         };
 
+        // AND the external row-address mask into whatever the filter produced.
+        let prefilter_loader = match self.external_mask.clone() {
+            Some(mask) => {
+                Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+            }
+            None => prefilter_loader,
+        };
         let pre_filter = {
             let mut pf = DatasetPreFilter::new(ds.clone(), &indices, prefilter_loader);
             if let Some(block) = self.overlay_block.clone() {
@@ -2957,6 +2984,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![],
+            covering_fields: vec![],
             name: "test".to_string(),
             dataset_version: 1,
             fragment_bitmap: Some(indexed_fragments),

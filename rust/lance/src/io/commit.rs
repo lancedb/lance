@@ -932,7 +932,15 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
         {
-            debug_assert_eq!(index.fields.len(), 1);
+            // A covered index still has exactly one keyed field; the trailing
+            // `covering_fields` are carried, not keyed, so counting them
+            // against `fields.len()` would fail this on a legal covered index.
+            debug_assert!(
+                index.keyed_field().is_some(),
+                "migrate_indices expects a single keyed field, got fields {:?} carrying {:?}",
+                index.fields,
+                index.covering_fields,
+            );
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
@@ -2957,5 +2965,62 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("must have a valid column index"), "{msg}");
+    }
+
+    /// Reproduces the debug-only panic `migrate_indices`'s fragment-bitmap
+    /// recalculation guard used to contain: a legal covered index
+    /// (`fields=[a,b]`, `covering_fields=[b]`) has `fields.len() == 2`, which
+    /// the old `debug_assert_eq!(index.fields.len(), 1)` rejected outright even
+    /// though the following line only ever reads `fields[0]`.
+    /// `must_recalculate_fragment_bitmap` takes this branch whenever
+    /// `fragment_bitmap` is `None`, so committing with it unset drives the
+    /// assert during the index's own commit.
+    #[tokio::test]
+    async fn test_covered_index_commit_recalculates_fragment_bitmap_without_panicking() {
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let b_id = dataset.schema().field("b").unwrap().id;
+        let current = dataset.load_indices().await.unwrap();
+        let mut covered = current[0].clone();
+        covered.fields.push(b_id);
+        covered.covering_fields = vec![b_id];
+        // Force the fragment-bitmap recalculation branch this guard sits in.
+        covered.fragment_bitmap = None;
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let recomputed = dataset.load_indices().await.unwrap();
+        assert_eq!(recomputed.len(), 1);
+        assert!(
+            recomputed[0].fragment_bitmap.is_some(),
+            "migrate_indices should have recalculated the fragment bitmap for the covered index"
+        );
     }
 }

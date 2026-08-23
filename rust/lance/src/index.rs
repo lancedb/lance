@@ -158,21 +158,31 @@ fn fragment_field_paths<'a>(
         .collect()
 }
 
+/// Resolve the field ids a segment's staleness check must consider: the subtree of
+/// every field the segment declares, keyed and carried alike (see
+/// [`IndexSegment::fields`] and [`IndexSegment::covering_fields`]). A covered
+/// segment's carried columns can go stale independently of its keyed column, so
+/// checking only the keyed subtree would leave a fragment covered after a carried
+/// column was rewritten, and the segment would answer with the obsolete value.
+fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
+    let mut indexed_field_ids = HashSet::new();
+    for field_id in segment.fields() {
+        let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "CreateIndex: field id {field_id} does not exist in the current schema"
+            ))
+        })?;
+        collect_subtree_field_ids(field, &mut indexed_field_ids);
+    }
+    Ok(indexed_field_ids)
+}
+
 async fn prune_stale_segment_coverage(
     dataset: &Dataset,
-    field_id: i32,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
     prune_newer_overlays: bool,
 ) -> Result<()> {
-    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: field id {field_id} does not exist in the current schema"
-        ))
-    })?;
-    let mut indexed_field_ids = HashSet::new();
-    collect_subtree_field_ids(field, &mut indexed_field_ids);
-
     let current_fragments = dataset
         .fragments()
         .iter()
@@ -200,6 +210,7 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
+            let indexed_field_ids = segment_indexed_field_ids(dataset, segment)?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()
@@ -247,6 +258,16 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
+    // One logical index needs one declaration. The per-segment rules below only
+    // pin the *keyed* field and its count, so segments that disagree on the
+    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
+    // individually. Committing that pair produces an index whose own description
+    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
+    // identical across segments, so `describe_indices` would error on metadata
+    // this function just wrote. Same rule, and same reason, as
+    // `merge_existing_index_segments`.
+    let expected_fields = segments[0].fields().to_vec();
+    let expected_covering_fields = segments[0].covering_fields().to_vec();
     for segment in &segments {
         if segment.dataset_version() > dataset.manifest.version {
             return Err(Error::invalid_input(format!(
@@ -256,12 +277,46 @@ pub(crate) async fn build_index_metadata_from_segments(
                 dataset.manifest.version
             )));
         }
-        if segment.fields() != [field_id] {
+        if segment.keyed_field() != Some(field_id) {
             return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
+                "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
+                 expected keyed field [{}]",
                 segment.uuid(),
                 segment.fields(),
+                segment.covering_fields(),
                 field_id
+            )));
+        }
+        // Cardinality alone does not prove `covering_fields` is really the
+        // trailing slice of `fields`; delegate that to the same rule a
+        // committed `IndexMetadata` is held to, rather than re-deriving it.
+        IndexMetadata {
+            uuid: segment.uuid(),
+            fields: segment.fields().to_vec(),
+            covering_fields: segment.covering_fields().to_vec(),
+            name: index_name.to_string(),
+            dataset_version: segment.dataset_version(),
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: segment.index_version(),
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+        .validate_covering_fields()?;
+        if segment.fields() != expected_fields.as_slice()
+            || segment.covering_fields() != expected_covering_fields.as_slice()
+        {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} declares fields {:?} (carried {:?}) but index \
+                 '{}' declares fields {:?} (carried {:?}); every segment of one index \
+                 must declare the same columns",
+                segment.uuid(),
+                segment.fields(),
+                segment.covering_fields(),
+                index_name,
+                expected_fields,
+                expected_covering_fields,
             )));
         }
         if !seen_segment_ids.insert(segment.uuid()) {
@@ -280,17 +335,25 @@ pub(crate) async fn build_index_metadata_from_segments(
         covered_fragments |= segment.fragment_bitmap().clone();
     }
 
-    prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
+    prune_stale_segment_coverage(dataset, &mut segments, false, false).await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
-        let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
-            segment.into_parts();
+        let (
+            uuid,
+            fragment_bitmap,
+            fields,
+            covering_fields,
+            index_details,
+            index_version,
+            dataset_version,
+        ) = segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
         if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
                 fields: fields.clone(),
+                covering_fields: covering_fields.clone(),
                 dataset_version,
                 fragment_bitmap: Some(fragment_bitmap.clone()),
                 index_details: Some(index_details.clone()),
@@ -311,6 +374,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             uuid,
             name: index_name.to_string(),
             fields,
+            covering_fields,
             dataset_version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(index_details),
@@ -1031,10 +1095,40 @@ pub(crate) async fn remap_index(
         .find(|i| i.uuid == *index_id)
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
 
+    // Corrupt metadata fails closed before anything else: a declaration that is
+    // not a valid suffix of `fields` cannot be reasoned about at all, and the
+    // withdrawal below would otherwise swallow it as an ordinary covered index.
+    matched.validate_covering_fields()?;
+
+    // A covered index cannot survive a remap yet. Nothing writes the carried
+    // values in the first place, and each index type's `remap` rewrites only the
+    // schema that type knows about, so the remapped segment would still declare
+    // payload its storage no longer holds. Withdraw it instead, exactly as an
+    // index whose type reports `can_remap() == false` is withdrawn below: an
+    // absent index costs a fallback scan, whereas a surviving false declaration
+    // is answered from data that is not there. Erroring here would instead block
+    // compaction of the whole table.
+    if !matched.covering_fields.is_empty() {
+        log::warn!(
+            "Index '{}' declares covering fields {:?}, which no index builder \
+             writes or preserves yet. Index will be dropped during compaction \
+             and must be rebuilt.",
+            matched.name,
+            matched.covering_fields,
+        );
+        return Ok(RemapResult::Drop);
+    }
+
+    // With covering withdrawn above, `fields` is entirely keyed, so more than one
+    // entry means a genuinely composite index.
     if matched.fields.len() > 1 {
-        return Err(Error::index(
-            "Remapping indices with multiple fields is not supported".to_string(),
-        ));
+        return Err(Error::index(format!(
+            "Remapping index '{}' is not supported: it has {} keyed fields {:?}; \
+             only one keyed field is supported",
+            matched.name,
+            matched.fields.len(),
+            matched.fields,
+        )));
     }
 
     if let Some(deleted_bitmap) = row_id_map.fully_deleted_fragments()
@@ -1258,7 +1352,17 @@ impl IndexDescriptionImpl {
                 "Index fields should be identical across all segments".to_string(),
             ));
         }
-        let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
+        // Only the keyed prefix. `fields` also lists the columns the index merely
+        // carries values for, which it cannot be searched on, and this list is what
+        // every binding advertises as the index's columns -- Python's
+        // `_default_vector_index_for_column` matches on membership of it, so
+        // including a carried column here would hand back the keyed column's IVF
+        // model for a query about the carried one.
+        let field_ids_vec: Vec<u32> = example_metadata
+            .keyed_fields()
+            .iter()
+            .map(|id| *id as u32)
+            .collect();
 
         // Index details may be absent on indices created before details were
         // persisted in the manifest. We describe such indices on a best-effort
@@ -1657,8 +1761,13 @@ impl DatasetIndexExt for Dataset {
                     log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
                     return false;
                 }
+                // Only the keyed prefix. `index_matches_criteria` compares this
+                // slice against the single column named by `for_column`, so
+                // passing the carried columns too would push its length past one
+                // and silently drop every covered index from a filtered
+                // describe.
                 let fields = idx
-                    .fields
+                    .keyed_fields()
                     .iter()
                     .filter_map(|id| self.schema().field_by_id(*id))
                     .collect::<Vec<_>>();
@@ -1780,13 +1889,27 @@ impl DatasetIndexExt for Dataset {
                 source_segments[0].uuid
             ))
         })?;
-        if source_segments
-            .iter()
-            .any(|segment| segment.fields != [field_id])
-        {
-            return Err(Error::invalid_input(
-                "merge_existing_index_segments requires segments with identical fields".to_string(),
-            ));
+        let expected_covering_fields = source_segments[0].covering_fields.clone();
+        for segment in &source_segments {
+            // Same rule as `build_index_metadata_from_segments`: only the
+            // keyed-field count matters here, not the exact `fields` vector,
+            // so a covered segment is not rejected outright.
+            if segment.keyed_field() != Some(field_id) {
+                return Err(Error::invalid_input(format!(
+                    "merge_existing_index_segments: segment {} was built for fields {:?} \
+                     (carried {:?}), expected keyed field [{}]",
+                    segment.uuid, segment.fields, segment.covering_fields, field_id
+                )));
+            }
+            segment.validate_covering_fields()?;
+            // Merging requires one coherent output declaration, so every
+            // input must carry the same columns (not merely the same count).
+            if segment.covering_fields != expected_covering_fields {
+                return Err(Error::invalid_input(
+                    "merge_existing_index_segments requires segments with identical fields"
+                        .to_string(),
+                ));
+            }
         }
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
@@ -1821,7 +1944,7 @@ impl DatasetIndexExt for Dataset {
                 .cloned()
                 .map(IntoIndexSegment::into_index_segment)
                 .collect::<Result<Vec<_>>>()?;
-            prune_stale_segment_coverage(self, field_id, &mut source_coverage, true, true).await?;
+            prune_stale_segment_coverage(self, &mut source_coverage, true, true).await?;
             for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
@@ -1866,7 +1989,6 @@ impl DatasetIndexExt for Dataset {
         if !all_ngram && !all_fmindex {
             merged_segment.dataset_version = merged_dataset_version;
         }
-        merged_segment.fields = vec![field_id];
         Ok(merged_segment)
     }
 
@@ -1925,22 +2047,29 @@ impl DatasetIndexExt for Dataset {
             .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
-            if segment.fields != [field.id] {
+            // Mirrors `build_index_metadata_from_segments`'s guard, which
+            // already validated these exact segments. Kept in the same shape
+            // so this second look does not silently re-reject what that guard
+            // just accepted.
+            if segment.keyed_field() != Some(field.id) {
                 return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
-                    segment.uuid, segment.fields, field.id
+                    "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
+                     expected keyed field [{}]",
+                    segment.uuid, segment.fields, segment.covering_fields, field.id
                 )));
             }
+            segment.validate_covering_fields()?;
             if let Some(fragment_bitmap) = &segment.fragment_bitmap {
                 incoming_fragments |= fragment_bitmap.clone();
             }
         }
 
         let existing_named_indices = self.load_indices_by_name(index_name).await?;
-        if existing_named_indices
-            .iter()
-            .any(|idx| idx.fields != [field.id])
-        {
+        if existing_named_indices.iter().any(|idx| {
+            // Same name-collision rule as `CreateIndexBuilder`'s default-name
+            // loop in create.rs.
+            idx.keyed_field() != Some(field.id)
+        }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
                 please specify a different name"
@@ -2121,6 +2250,42 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
+            // Optimizing a covered index would republish its declaration on a
+            // segment rebuilt without the carried values: `scan_vector_fragments`
+            // projects the keyed field and `_rowid` only, and the scalar merges
+            // reconstruct value plus row id.
+            //
+            // What decides is the caller's intent, not whether this group is
+            // stale. An unfiltered `optimize_indices()` is a table-wide
+            // maintenance request, and erroring aborts the loop before the
+            // replacements accumulated for the other groups are committed -- so
+            // one index this build cannot rebuild would leave every other index
+            // on the table stale. Skip it with a warning instead.
+            //
+            // A caller that listed this index in `index_names` asked for it
+            // specifically, so refuse out loud. The loop is already filtered by
+            // that list, so reaching here with it set means this group was named.
+            if let Some(covered) = deltas
+                .iter()
+                .find(|index| !index.covering_fields.is_empty())
+            {
+                if options.index_names.is_none() {
+                    log::warn!(
+                        "Skipping index '{}': it declares covering fields {:?}, \
+                         which no index builder writes or preserves yet.",
+                        covered.name,
+                        covered.covering_fields,
+                    );
+                    continue;
+                }
+                return Err(Error::index(format!(
+                    "Optimizing index '{}' is not supported: it declares \
+                     covering fields {:?}, which no index builder writes or \
+                     preserves yet",
+                    covered.name, covered.covering_fields,
+                )));
+            }
+
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -2144,6 +2309,7 @@ impl DatasetIndexExt for Dataset {
                 uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
+                covering_fields: last_idx.covering_fields.clone(),
                 dataset_version: res.new_dataset_version,
                 fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: Some(Arc::new(res.new_index_details)),
@@ -2956,7 +3122,7 @@ impl DatasetIndexInternalExt for Dataset {
         let field_id = self.schema().field_id(column)?;
         if let Some(invalid_metadata) = metadatas
             .iter()
-            .find(|metadata| !metadata.fields.contains(&field_id))
+            .find(|metadata| metadata.fields.first() != Some(&field_id))
         {
             return Err(Error::invalid_input(format!(
                 "Logical vector index '{}' contains segment {} that does not belong to column '{}'",
@@ -3075,7 +3241,10 @@ impl DatasetIndexInternalExt for Dataset {
                 !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
             });
 
-            idx.fields.len() == 1 && (has_non_empty_bitmap || is_fts_index)
+            // Same name-collision rationale as `CreateIndexBuilder`'s
+            // default-name loop in create.rs: only the keyed prefix decides
+            // which column this index answers for.
+            idx.keyed_field().is_some() && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| {
@@ -3220,8 +3389,13 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        let mut field_paths = Vec::with_capacity(source_index.fields.len());
-        for field_id in source_index.fields.iter() {
+        // Only the keyed prefix matters here. The rebuild below writes fresh,
+        // non-covered metadata and never reads the carried columns, so requiring
+        // them to exist and type-match would reject a target that can hold this
+        // index perfectly well.
+        let keyed_fields = source_index.keyed_fields();
+        let mut field_paths = Vec::with_capacity(keyed_fields.len());
+        for field_id in keyed_fields.iter() {
             let source_field = source_dataset
                 .schema()
                 .field_by_id(*field_id)
@@ -3422,6 +3596,7 @@ mod tests {
             uuid,
             name: index_name.to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -3616,6 +3791,352 @@ mod tests {
             .await
             .unwrap();
         segment_ids
+    }
+
+    /// Premise guard, not a regression test: confirms that the broken shape
+    /// (`fields` truncated to the keyed field while `covering_fields` is
+    /// inherited unchanged) is actually rejected by `validate_covering_fields`,
+    /// and that the fixed shape (both fields carried through) is accepted.
+    /// Both shapes are hand-built here, so this exercises no `merge_segments`
+    /// code and would keep passing even if every impl regressed to the broken
+    /// shape. The real regression coverage is
+    /// `test_merge_existing_index_segments_preserves_covering_bitmap`,
+    /// `_btree`, `_vector`, and `_rtree` below, which merge real segments
+    /// through the actual `merge_segments` implementations.
+    #[test]
+    fn test_merged_covered_metadata_is_committable() {
+        let source = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered".to_string(),
+            fields: vec![7, 11],
+            covering_fields: vec![11],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        // The shape every merge_segments impl builds: keyed field only, carried
+        // inherited from the source.
+        let field_id = *source.fields.first().unwrap();
+        let merged = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            ..source.clone()
+        };
+        assert!(
+            merged.validate_covering_fields().is_err(),
+            "this is the broken shape; if it validates, the premise has changed"
+        );
+
+        // What the fix must produce instead.
+        let fixed = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            ..source
+        };
+        fixed
+            .validate_covering_fields()
+            .expect("merged covered metadata must be committable");
+        assert_eq!(fixed.fields, vec![7, 11]);
+        assert_eq!(fixed.covering_fields, vec![11]);
+    }
+
+    /// Two-fragment, two-int-column dataset for the scalar-segment covering
+    /// tests below. Column "id" is keyed, "carried" plays the covered column.
+    async fn write_two_int_column_dataset(uri: &str, rows_per_fragment: i32) -> Dataset {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("carried", array::step::<Int32Type>())
+            .into_reader_rows(
+                RowCount::from(rows_per_fragment as u64),
+                BatchCount::from(2),
+            );
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Nothing writes a covering declaration yet, so the declaration below is
+    /// hand-constructed on top of real single-field segments: merge plumbing
+    /// never reads covered-column storage, so a declaration naming a real,
+    /// uninvolved column is a faithful stand-in for a genuinely covered segment.
+    fn make_covered(
+        segment: IndexMetadata,
+        keyed_field_id: i32,
+        carried_field_id: i32,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            fields: vec![keyed_field_id, carried_field_id],
+            covering_fields: vec![carried_field_id],
+            ..segment
+        }
+    }
+
+    /// Build one covered segment per named fragment, merge them, and assert the
+    /// merged declaration survived and is committable.
+    ///
+    /// The per-index-type cases below differ only in how their dataset and
+    /// params are built, so the merge and the assertions live here.
+    async fn assert_merge_preserves_covering(
+        dataset: &mut Dataset,
+        column: &str,
+        index_type: IndexType,
+        params: &dyn IndexParams,
+        fragment_ids: Vec<u32>,
+        keyed_field_id: i32,
+        carried_field_id: i32,
+    ) {
+        let index_name = format!("covered_{column}");
+        let mut covered_segments = Vec::new();
+        for fragment_id in fragment_ids {
+            let segment = dataset
+                .create_index_builder(&[column], index_type, params)
+                .name(index_name.clone())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            covered_segments.push(make_covered(segment, keyed_field_id, carried_field_id));
+        }
+
+        let merged = dataset
+            .merge_existing_index_segments(covered_segments)
+            .await
+            .unwrap();
+
+        merged
+            .validate_covering_fields()
+            .expect("merged covering declaration must be committable");
+        assert_eq!(merged.fields, vec![keyed_field_id, carried_field_id]);
+        assert_eq!(
+            merged.covering_fields,
+            vec![carried_field_id],
+            "merge_segments must neither drop the covering declaration nor \
+             produce an uncommittable one"
+        );
+    }
+
+    fn all_fragment_ids(dataset: &Dataset) -> Vec<u32> {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect()
+    }
+
+    /// Two shapes of the same bug, one per `merge_segments` family:
+    ///
+    ///   - **struct update** (bitmap, inverted, zonemap, label_list,
+    ///     bloomfilter, fmindex): `fields` was truncated to `vec![field_id]`
+    ///     while `..segments[0].clone()` re-supplied `covering_fields`,
+    ///     producing an *uncommittable* merged segment.
+    ///   - **explicit** (btree, ngram): `fields: vec![field_id],
+    ///     covering_fields: vec![]` was built outright, *silently dropping* the
+    ///     declaration instead.
+    #[rstest]
+    #[case::struct_update(BuiltinIndexType::Bitmap, IndexType::Bitmap)]
+    #[case::explicit(BuiltinIndexType::BTree, IndexType::BTree)]
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_preserves_covering_scalar(
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+    ) {
+        let test_dir = TempStrDir::default();
+        let mut dataset = write_two_int_column_dataset(&test_dir, 20).await;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let carried_field_id = dataset.schema().field("carried").unwrap().id;
+        let fragment_ids = all_fragment_ids(&dataset);
+
+        let params = ScalarIndexParams::for_builtin(builtin);
+        assert_merge_preserves_covering(
+            &mut dataset,
+            "id",
+            index_type,
+            &params,
+            fragment_ids,
+            id_field_id,
+            carried_field_id,
+        )
+        .await;
+    }
+
+    /// Segments that disagree on which columns they carry cannot be folded
+    /// into one coherent output declaration: there is no single
+    /// `covering_fields` that would describe the merged segment truthfully.
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_rejects_mismatched_covering_fields() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = write_two_int_column_dataset(&test_dir, 20).await;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let carried_field_id = dataset.schema().field("carried").unwrap().id;
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let mut mismatched_segments = Vec::new();
+        for (i, fragment) in dataset.get_fragments().into_iter().enumerate() {
+            let segment = dataset
+                .create_index_builder(&["id"], IndexType::Bitmap, &params)
+                .name("mismatched_bitmap".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            // First segment declares `carried` covered; the second declares
+            // nothing covered -- a genuine disagreement, not just a
+            // reordering.
+            if i == 0 {
+                mismatched_segments.push(make_covered(segment, id_field_id, carried_field_id));
+            } else {
+                mismatched_segments.push(segment);
+            }
+        }
+
+        let err = dataset
+            .merge_existing_index_segments(mismatched_segments)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires segments with identical fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Vector shape: `crate::index::vector::ivf::merge_segments` already
+    /// preserves both `fields` and `covering_fields` via struct update, but
+    /// `merge_existing_index_segments`'s own tail used to unconditionally
+    /// overwrite `fields` to `vec![field_id]` afterwards, reproducing the
+    /// struct-update bug for every index type it dispatches to.
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_preserves_covering_vector() {
+        const DIMENSION: i32 = 4;
+        let test_dir = TempStrDir::default();
+        let mut dataset = write_fragmented_vector_dataset(&test_dir, DIMENSION).await;
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+
+        let batch = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch
+            .column_by_name("vector")
+            .expect("vector column should exist")
+            .as_fixed_size_list();
+        let values = vectors.values().as_primitive::<Float32Type>();
+        let centroids = train_kmeans::<Float32Type>(
+            values,
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            DIMENSION as usize,
+            2,
+            2,
+        )
+        .unwrap()
+        .centroids
+        .as_primitive::<Float32Type>()
+        .clone();
+        let centroids =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids, DIMENSION).unwrap());
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(2, centroids).unwrap(),
+        );
+
+        let fragment_ids = all_fragment_ids(&dataset).into_iter().take(2).collect();
+
+        assert_merge_preserves_covering(
+            &mut dataset,
+            "vector",
+            IndexType::Vector,
+            &params,
+            fragment_ids,
+            vector_field_id,
+            id_field_id,
+        )
+        .await;
+    }
+
+    /// Struct-update shape, sweep-found in `rtree.rs`: same bug as the
+    /// bitmap/inverted/zonemap/label_list/bloomfilter/fmindex family, not
+    /// called out in the original brief but reachable from the same
+    /// `all_rtree` dispatch branch this function tests.
+    #[cfg(feature = "geo")]
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_preserves_covering_rtree() {
+        use geo_types::line_string;
+        use geoarrow_array::GeoArrowArray;
+        use geoarrow_array::builder::LineStringBuilder;
+        use geoarrow_schema::{Dimension, LineStringType};
+
+        const ROWS_PER_FRAGMENT: i32 = 20;
+        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            line_string_type.clone().to_field("geometry", true),
+        ]));
+
+        let batches = (0..2)
+            .map(|fragment: i32| {
+                let mut builder = LineStringBuilder::new(line_string_type.clone());
+                for row in 0..ROWS_PER_FRAGMENT {
+                    let x = (fragment * ROWS_PER_FRAGMENT + row) as f64;
+                    builder
+                        .push_line_string(Some(&line_string![
+                            (x: x, y: x),
+                            (x: x + 1.0, y: x + 1.0)
+                        ]))
+                        .unwrap();
+                }
+                let ids = Int32Array::from_iter_values(
+                    fragment * ROWS_PER_FRAGMENT..(fragment + 1) * ROWS_PER_FRAGMENT,
+                );
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ids), builder.finish().to_array_ref()],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, arrow_schema::ArrowError>>()
+            .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let geometry_field_id = dataset.schema().field("geometry").unwrap().id;
+        let fragment_ids = all_fragment_ids(&dataset);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+        assert_merge_preserves_covering(
+            &mut dataset,
+            "geometry",
+            IndexType::RTree,
+            &params,
+            fragment_ids,
+            geometry_field_id,
+            id_field_id,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5009,6 +5530,169 @@ mod tests {
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
     }
 
+    /// The `fields.len() > 1` rejection in `remap_index`, which had no dedicated
+    /// coverage. A covered index never reaches it: the withdrawal above returns
+    /// `RemapResult::Drop` first, which is what
+    /// `test_compaction_withdraws_a_covered_index_without_failing` in
+    /// `dataset/tests/dataset_index.rs` exercises, and
+    /// `test_remap_column_index_refuses_a_covered_index` in
+    /// `dataset/optimize/remapping.rs` never reaches `remap_index` at all since
+    /// `remap_column_index` refuses first. So only a genuinely composite index --
+    /// two keyed fields, no covering declaration -- arrives here, and it must
+    /// still be rejected.
+    #[tokio::test]
+    async fn test_remap_index_rejects_composite_index() {
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let a_id = dataset.schema().field("a").unwrap().id;
+        let b_id = dataset.schema().field("b").unwrap().id;
+        let current = dataset.load_indices().await.unwrap();
+        let mut composite = current[0].clone();
+        // No covering declaration at all -- genuinely composite, not covered.
+        composite.fields = vec![a_id, b_id];
+        composite.covering_fields = vec![];
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![composite],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let error = remap_index(&dataset, &index_uuid, &RowAddrRemap::empty())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only one keyed field is supported"),
+            "{error}"
+        );
+    }
+
+    /// Decoding a manifest validates the declaration, so `matched` cannot be
+    /// malformed by that route -- but it is not the only route: metadata
+    /// constructed in-process (segment conversion, a distributed build's output)
+    /// reaches this guard without ever passing through
+    /// `TryFrom<pb::IndexMetadata>`. This guard is therefore load-bearing on its
+    /// own, and must produce a named error rather than either a panic (plain
+    /// subtraction on `usize` underflows) or a silent
+    /// saturation that lets corrupt metadata through as an ordinary covered index
+    /// and gets it quietly withdrawn. The test reaches it by seeding the index
+    /// cache, the same way the migration-path test in `dataset/index.rs` does.
+    #[tokio::test]
+    async fn test_remap_index_rejects_malformed_covering_fields() {
+        let data = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+
+        // Malform the cached metadata directly: more carried fields than fields
+        // at all. No commit and no manifest decode can produce this -- both run
+        // `validate_covering_fields` -- which is exactly why the guard has to
+        // stand on its own for metadata that reached it by neither route.
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut indices {
+            if idx.uuid == index_uuid {
+                idx.covering_fields = idx
+                    .fields
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(999))
+                    .collect();
+            }
+        }
+        assert!(
+            indices
+                .iter()
+                .any(|idx| idx.uuid == index_uuid && idx.covering_fields.len() > idx.fields.len()),
+            "test setup should have produced a malformed entry"
+        );
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&metadata_key, Arc::new(indices))
+            .await;
+
+        // The validation runs first in `remap_index`, ahead of the withdrawal and
+        // of every row-map-dependent branch, so an empty remap reaches it.
+        let error = remap_index(&dataset, &index_uuid, &RowAddrRemap::empty())
+            .await
+            .expect_err("malformed covering metadata must not be silently accepted");
+        assert!(
+            error.to_string().contains("are not among its fields"),
+            "expected the validator's message, got: {error}"
+        );
+    }
+
+    /// A covered scalar index still answers for its keyed column: only the
+    /// keyed prefix of `fields` must be a single field for `scalar_index_info`
+    /// to make it eligible for filter pushdown, not the full vector including
+    /// carried columns. Before this fix, a covered index was silently excluded
+    /// -- no error, no failing query, just a plan that quietly stopped using it.
+    #[tokio::test]
+    async fn test_scalar_index_info_includes_covered_index() {
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        crate::utils::test::covering::declare_covering(&mut dataset, "a", "b").await;
+
+        let index_info = dataset.scalar_index_info().await.unwrap();
+        assert!(
+            index_info.get_index("a").is_some(),
+            "a covered index must still be eligible for filter pushdown on its keyed column"
+        );
+    }
+
     #[tokio::test]
     async fn test_optimize_ivf_pq_up_to_date() {
         // https://github.com/lance-format/lance/issues/4016
@@ -5460,6 +6144,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "mystery_idx".to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(std::iter::once(0_u32).collect()),
             index_details: None,
@@ -5497,6 +6182,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "mystery_idx".to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(std::iter::once(0_u32).collect()),
             index_details: Some(Arc::new(prost_types::Any {
@@ -6708,6 +7394,60 @@ mod tests {
         );
     }
 
+    /// `initialize_index` must depend only on the keyed prefix of the source
+    /// index. The rebuild it drives writes fresh, non-covered metadata and never
+    /// reads the carried columns, so requiring them to exist and type-match in
+    /// the target rejects a target that can hold the index perfectly well.
+    #[tokio::test]
+    async fn test_initialize_index_ignores_carried_columns() {
+        use crate::dataset::Dataset;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let source_data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("carried", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut source = Dataset::write(source_data, "memory://source", None)
+            .await
+            .unwrap();
+        source
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // No creation API writes a covering declaration yet, so commit one.
+        crate::utils::test::covering::declare_covering(&mut source, "a", "carried").await;
+        let index_name = source.load_indices().await.unwrap()[0].name.clone();
+
+        // The target holds the keyed column only -- exactly what the rebuild
+        // reads.
+        let target_data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut target = Dataset::write(target_data, "memory://target", None)
+            .await
+            .unwrap();
+
+        target.initialize_index(&source, &index_name).await.unwrap();
+
+        let initialized = target.load_indices().await.unwrap();
+        assert_eq!(initialized.len(), 1);
+        assert_eq!(
+            initialized[0].fields,
+            vec![target.schema().field("a").unwrap().id]
+        );
+        assert!(
+            initialized[0].covering_fields.is_empty(),
+            "the rebuild carries nothing, so it must not claim to"
+        );
+    }
+
     #[tokio::test]
     async fn test_initialize_single_index() {
         use crate::dataset::Dataset;
@@ -7756,6 +8496,349 @@ mod tests {
         assert!(err.to_string().contains("at least one index segment"));
     }
 
+    /// A segment may carry extra columns; `build_index_metadata_from_segments`
+    /// must still commit it, keyed on the field the index is being built for.
+    /// Calls the guarded function directly (not through
+    /// `commit_existing_index_segments`) so this test's outcome depends only
+    /// on this guard, not on the independent duplicate a few lines into
+    /// `commit_existing_index_segments`.
+    #[tokio::test]
+    async fn test_build_index_metadata_from_segments_accepts_carried_fields() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        // Carry `id` alongside the keyed `vector` field.
+        metadata.fields = vec![vector_field_id, id_field_id];
+        metadata.covering_fields = vec![id_field_id];
+
+        let new_indices = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![segment_from_metadata(&metadata)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_indices.len(), 1);
+        assert_eq!(new_indices[0].fields, vec![vector_field_id, id_field_id]);
+        assert_eq!(new_indices[0].covering_fields, vec![id_field_id]);
+    }
+
+    /// A segment's carried columns can go stale independently of its keyed column,
+    /// so the staleness check has to walk every entry of `fields`, not just the
+    /// keyed subtree. Here the carried column did not exist when the segment was
+    /// built, so the segment cannot be carrying its values and its coverage of that
+    /// fragment must be pruned. Walking only the keyed subtree sees no change and
+    /// leaves the fragment covered, which is the bug.
+    #[tokio::test]
+    async fn test_prune_stale_coverage_notices_a_changed_carried_column() {
+        use crate::dataset::NewColumnTransform;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        // Built against the schema as it stands now, before `payload` exists.
+        let metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+
+        // `payload` lands in a new data file on the same fragment, so the fragment's
+        // file layout changes for `payload` while `vector`'s file is untouched.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("payload".into(), "id * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let payload_field_id = dataset.schema().field("payload").unwrap().id;
+
+        let mut covered = metadata.clone();
+        covered.fields = vec![vector_field_id, payload_field_id];
+        covered.covering_fields = vec![payload_field_id];
+
+        let new_indices = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![segment_from_metadata(&covered)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_indices.len(), 1);
+        assert!(
+            new_indices[0].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "coverage of a fragment whose carried column changed must be pruned, got {:?}",
+            new_indices[0].fragment_bitmap
+        );
+
+        // Control: with nothing carried, the same segment over the same fragment
+        // keeps its coverage -- so the assertion above is about the carried column,
+        // not about `add_columns` invalidating everything.
+        let plain_indices = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![segment_from_metadata(&metadata)],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !plain_indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "a non-covering segment must keep its coverage across the same add_columns"
+        );
+    }
+
+    /// The per-segment rules only pin the keyed field and its count, so two
+    /// segments can disagree about the carried columns and each still pass. That
+    /// pair must be refused at commit, because `IndexDescriptionImpl::try_new`
+    /// requires `fields` to be identical across segments -- committing it would
+    /// leave `describe_indices` erroring on metadata this call just wrote.
+    #[tokio::test]
+    async fn test_build_index_metadata_from_segments_rejects_mixed_covering_declarations() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+
+        let mut covered = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"covered",
+        )
+        .await;
+        covered.fields = vec![vector_field_id, id_field_id];
+        covered.covering_fields = vec![id_field_id];
+
+        // Plain: one keyed field, nothing carried. Passes every per-segment rule
+        // on its own -- `keyed == 1` and `fields[0]` is the keyed field -- and so
+        // does `covered`; only comparing them catches the disagreement.
+        let plain = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"plain",
+        )
+        .await;
+        assert_eq!(plain.fields, vec![vector_field_id]);
+        assert!(plain.covering_fields.is_empty());
+
+        let err = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![
+                segment_from_metadata(&covered),
+                segment_from_metadata(&plain),
+            ],
+        )
+        .await
+        .expect_err("segments disagreeing about carried columns must not commit");
+        assert!(
+            err.to_string().contains("must declare the same columns"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// `fields` lists the carried columns too, but a logical description must
+    /// advertise only what the index can be searched on. Every binding reads this
+    /// list as "the index's columns" -- Python's `_default_vector_index_for_column`
+    /// matches on membership -- so a carried column here hands back the keyed
+    /// column's model for a query about the carried one.
+    #[tokio::test]
+    async fn test_index_description_reports_only_keyed_fields() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.fields = vec![vector_field_id, id_field_id];
+        metadata.covering_fields = vec![id_field_id];
+
+        let description = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            description.field_ids(),
+            &[vector_field_id as u32],
+            "a covered index must advertise only its keyed column"
+        );
+    }
+
+    /// A segment keyed on the wrong field must still be rejected. Calls
+    /// `build_index_metadata_from_segments` directly so the assertion is
+    /// evidence for *this* guard specifically -- going through
+    /// `commit_existing_index_segments` would let the untouched-looking
+    /// duplicate check there mask this guard's removal.
+    #[tokio::test]
+    async fn test_build_index_metadata_from_segments_rejects_wrong_field_provenance() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.fields = vec![id_field_id];
+
+        let error = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![segment_from_metadata(&metadata)],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("expected keyed field"));
+    }
+
+    /// Matching cardinality is not enough: `covering_fields` must actually be
+    /// the trailing slice of `fields`. `fields = [vector, id]`,
+    /// `covering_fields = [999]` has exactly one keyed field but carries a
+    /// column that is not even present in `fields`, let alone its suffix.
+    #[tokio::test]
+    async fn test_build_index_metadata_from_segments_rejects_non_suffix_covering_fields() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.fields = vec![vector_field_id, id_field_id];
+        metadata.covering_fields = vec![999];
+
+        let error = build_index_metadata_from_segments(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            vec![segment_from_metadata(&metadata)],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("are not among its fields"));
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_segments_rejects_wrong_field_provenance() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -7792,7 +8875,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("was built for fields"));
+        // This end-to-end path is guarded twice (`build_index_metadata_from_segments`
+        // and a duplicate check in `commit_existing_index_segments` itself), so
+        // this assertion alone does not prove which one fired -- see
+        // `test_build_index_metadata_from_segments_rejects_wrong_field_provenance`
+        // for that. It still proves the public `commit_existing_index_segments`
+        // entry point rejects this input end-to-end.
+        assert!(error.to_string().contains("expected keyed field"));
     }
 
     #[tokio::test]
@@ -7912,6 +9001,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "vector_idx".to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(std::iter::once(1_u32).collect()),
             index_details: Some(Arc::new(
@@ -8123,6 +9213,114 @@ mod tests {
         }));
     }
 
+    /// A covered index still names the same column by its keyed prefix. The
+    /// name-collision guard in `commit_existing_index_segments` must recognize
+    /// that, not reject on the full `fields` vector including the carried
+    /// column -- which would misfire "already exists with different fields"
+    /// before ever reaching the deeper type-compatibility check this test
+    /// otherwise shares with
+    /// `test_commit_existing_index_segments_rejects_partial_index_type_change`.
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_recognizes_covered_index_by_name() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col("extra", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.path().to_str().unwrap(),
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let index_name = "shared_name";
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut original_segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            original_segments.push(
+                dataset
+                    .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(index_name, "id", original_segments)
+            .await
+            .unwrap();
+
+        // Hand-declare the committed index as covering an extra carried column
+        // -- there is no producer in this phase, so this is done directly.
+        let id_field = dataset.schema().field("id").unwrap().id;
+        let extra_field = dataset.schema().field("extra").unwrap().id;
+        let current = dataset.load_indices_by_name(index_name).await.unwrap();
+        let covered_segments = current
+            .iter()
+            .cloned()
+            .map(|mut idx| {
+                idx.fields = vec![id_field, extra_field];
+                idx.covering_fields = vec![extra_field];
+                idx
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: covered_segments,
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let replacement = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let error = dataset
+            .commit_existing_index_segments(index_name, "id", vec![replacement])
+            .await
+            .unwrap_err();
+
+        // Must reach the deeper type-compatibility error, not misfire the
+        // shallow "already exists with different fields" guard this test
+        // targets.
+        assert!(
+            error
+                .to_string()
+                .contains("cannot change index 'shared_name'"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("missing current fragments"),
+            "{error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("already exists with different fields"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_partial_type_change_with_legacy_missing_details_is_rejected() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -8220,6 +9418,7 @@ mod tests {
             }),
             0,
             dataset.manifest.version,
+            vec![],
         );
         let error = dataset
             .commit_existing_index_segments(index_name, "id", vec![sentinel_segment])

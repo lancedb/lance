@@ -2254,6 +2254,10 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
         assertTrue(
             desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
             "segment size should be positive");
