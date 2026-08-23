@@ -5,7 +5,7 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::Lazy
 
 use arrow::{
     array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
         IntervalMonthDayNano, UInt32Type,
@@ -826,9 +826,11 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let num_bytes = length.0 * Self::byte_width()?;
-        let mut bytes = vec![0; num_bytes as usize];
-        rng.fill_bytes(&mut bytes);
-        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        // A Vec<u8> is only guaranteed byte alignment, use MutableBuffer to get
+        // an allocation aligned for T::Native
+        let mut bytes = MutableBuffer::from_len_zeroed(num_bytes as usize);
+        rng.fill_bytes(bytes.as_slice_mut());
+        let bytes = ScalarBuffer::new(bytes.into(), 0, length.0 as usize);
         Ok(Arc::new(
             PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
         ))
@@ -3650,6 +3652,24 @@ mod tests {
             let l2_dist = ((value_x - centroid_x).powi(2) + (value_y - centroid_y).powi(2)).sqrt();
             assert!(l2_dist < 0.001001);
             assert!(l2_dist > 0.000999);
+        }
+    }
+
+    #[test]
+    fn test_rand_bytes_zero_rows() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        // These types are generated from raw bytes and used to panic on empty
+        // arrays because a Vec<u8> is not sufficiently aligned for them
+        for data_type in [
+            DataType::Float16,
+            DataType::Decimal128(38, 10),
+            DataType::Decimal256(76, 10),
+        ] {
+            let mut genn = array::rand_type(&data_type);
+            let arr = genn.generate(RowCount::from(0), &mut rng).unwrap();
+            assert_eq!(arr.len(), 0);
+            let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
+            assert_eq!(arr.len(), 3);
         }
     }
 
