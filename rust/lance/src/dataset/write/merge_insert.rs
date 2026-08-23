@@ -38,7 +38,9 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
 pub mod inserted_rows;
 
-use assign_action::{merge_insert_action, parse_when_matched_condition};
+use assign_action::{
+    combined_schema_fields_from_qualified, merge_insert_action, parse_when_matched_condition,
+};
 use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
@@ -482,8 +484,8 @@ pub enum WhenMatched {
     ///
     /// The expression can reference columns with `source.` and `target.` prefixes. Matched
     /// rows where the condition is false are left untouched. Construct this with
-    /// [`WhenMatched::delete_if_expr`], which documents a caveat on how the expression's
-    /// columns must be represented. Prefer [`WhenMatched::DeleteIf`] to pass a SQL string.
+    /// [`WhenMatched::delete_if_expr`], or prefer [`WhenMatched::DeleteIf`] to pass a SQL
+    /// string.
     DeleteIfExpr(Expr),
 }
 
@@ -493,6 +495,13 @@ impl WhenMatched {
         Ok(Self::UpdateIf(expr.to_string()))
     }
 
+    /// Create an instance of [`WhenMatched::UpdateIfExpr`] from a pre-built expression
+    ///
+    /// The expression's `source` and `target` columns may be written either as
+    /// relation-qualified columns (`col("source.value")`) or as combined-schema
+    /// struct-field access (`col("source").field("value")`); both are normalized to
+    /// whichever form the selected execution path needs. See
+    /// [`WhenMatched::delete_if_expr`] for the conditional delete analogue.
     pub fn update_if_expr(expr: Expr) -> Self {
         Self::UpdateIfExpr(expr)
     }
@@ -513,12 +522,14 @@ impl WhenMatched {
 
     /// Create an instance of [`WhenMatched::DeleteIfExpr`] from a pre-built expression
     ///
-    /// Unlike [`WhenMatched::delete_if`], which stores a SQL string and defers parsing until
-    /// the execution path is known, this stores the `Expr` as given, so its column
-    /// representation must already match the path that consumes it. The standard plan
-    /// expects relation-qualified columns such as `col("source.value")`, while the
-    /// indexed (Merger) path expects combined-schema struct-field access such as
-    /// `col("source").field("value")`.
+    /// Unlike [`WhenMatched::delete_if`], which stores a SQL string and defers parsing
+    /// until the execution path is known, this stores the `Expr` as given. Its `source`
+    /// and `target` columns may be written either as relation-qualified columns
+    /// (`col("source.value")`), which is what the standard plan evaluates, or as
+    /// combined-schema struct-field access (`col("source").field("value")`), which is what
+    /// the indexed (Merger) path evaluates. Whichever form is given is normalized to the
+    /// one the selected path needs, so the same expression works with and without a scalar
+    /// index on the join key.
     ///
     /// Pass the result to [`MergeInsertBuilder::when_matched`]. See
     /// [`WhenMatched::update_if_expr`] for the conditional update analogue.
@@ -3076,9 +3087,12 @@ impl Merger {
                 let planner = Planner::new(combined_schema.clone());
                 let expr = match &params.when_matched {
                     WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
-                    WhenMatched::UpdateIfExpr(expr) => expr.clone(),
                     WhenMatched::DeleteIf(expr_str) => planner.parse_filter(expr_str)?,
-                    WhenMatched::DeleteIfExpr(expr) => expr.clone(),
+                    // A pre-built expression may use either representation; normalize the
+                    // relation-qualified form so it resolves against the combined schema.
+                    WhenMatched::UpdateIfExpr(expr) | WhenMatched::DeleteIfExpr(expr) => {
+                        combined_schema_fields_from_qualified(expr.clone())?
+                    }
                     _ => unreachable!(),
                 };
                 let expr = planner.optimize_expr(expr)?;
@@ -11601,10 +11615,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     /// Test WhenMatched::delete_if_expr on the slow (Merger) path, forced by a scalar
     /// index on the join key. The Merger compiles the pre-built expr against the combined
-    /// schema where `source`/`target` are struct fields rather than relations, so the expr
-    /// must use struct-field access (`col("source").field(...)`) instead of the
-    /// relation-qualified columns the fast path uses. A relation-qualified expr fails to
-    /// resolve here with a `FieldNotFound` error.
+    /// schema where `source`/`target` are struct fields rather than relations, so this
+    /// covers the struct-field form natively. See
+    /// `test_delete_if_expr_representation_is_path_independent` for the guarantee that the
+    /// relation-qualified form resolves here too.
     #[tokio::test]
     async fn test_indexed_merge_insert_when_matched_delete_if_expr_slow_path() {
         use datafusion_functions::core::expr_ext::FieldAccessor;
@@ -11662,6 +11676,99 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(stats.num_updated_rows, 0);
         assert_eq!(stats.num_inserted_rows, 0);
         assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 4".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "id=4 must be deleted"
+        );
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 2 AND value = 20".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "id=2 must survive with its original value"
+        );
+    }
+
+    /// A pre-built `DeleteIfExpr` plans the same way whichever representation it uses.
+    /// Relation-qualified columns (`col("source.value")`) and combined-schema struct-field
+    /// access (`col("source").field("value")`) are both normalized to the form the selected
+    /// execution path needs, so adding or removing a scalar index on the join key never
+    /// changes which expression the caller has to build.
+    #[rstest::rstest]
+    #[case::qualified_standard(true, false)]
+    #[case::qualified_indexed(true, true)]
+    #[case::struct_field_standard(false, false)]
+    #[case::struct_field_indexed(false, true)]
+    #[tokio::test]
+    async fn test_delete_if_expr_representation_is_path_independent(
+        #[case] relation_qualified: bool,
+        #[case] indexed: bool,
+    ) {
+        use datafusion_functions::core::expr_ext::FieldAccessor;
+
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if indexed {
+            ds.create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Only id=4 has a source value greater than its target value.
+        let source = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [0, 0, 0, 100])
+        )
+        .unwrap();
+        let condition = if relation_qualified {
+            logical_expr::col("source.value").gt(logical_expr::col("target.value"))
+        } else {
+            logical_expr::col("source")
+                .field("value")
+                .gt(logical_expr::col("target").field("value"))
+        };
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::delete_if_expr(condition))
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.num_deleted_rows, 1,
+            "only id=4 satisfies the condition"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
         assert_eq!(
             updated_ds
                 .count_rows(Some("id = 4".to_string()))
