@@ -198,12 +198,6 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
-        /// Requests the one-way migration to required index catch-up.
-        ///
-        /// One-way because returning to legacy semantics — where a missing
-        /// coverage entry reads as "fully caught up" — is unsafe once any
-        /// SSTable has been retired against a recorded catch-up position.
-        require_index_catchup: bool,
     },
 
     /// Clone a dataset.

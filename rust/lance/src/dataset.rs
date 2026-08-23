@@ -148,9 +148,7 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{
-    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
-};
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
@@ -765,8 +763,6 @@ impl Dataset {
         } else {
             read_struct(object_reader.as_ref(), offset).await
         }?;
-
-        validate_mem_wal_index_catchup_flags(&manifest)?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -3173,11 +3169,11 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them.
-    /// Assigns a contiguous `RowIdSequence` to every fragment starting from row
-    /// ID 0 and returns the resulting `next_row_id` high-water mark.
-    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment]) -> Result<u64> {
-        let mut next_row_id = 0u64;
+    /// Assign stable row ID sequences to fragments that do not yet have them,
+    /// contiguously from `start`, and return the resulting `next_row_id`
+    /// high-water mark.
+    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
+        let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
             let physical_rows = fragment.physical_rows.ok_or_else(|| {
                 Error::internal(format!(
@@ -3219,7 +3215,11 @@ impl Dataset {
         }
 
         let mut fragments = self.manifest.fragments.as_ref().clone();
-        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        // Restore carries the high-water mark forward across a version that
+        // predates activation, so a re-migration must allocate above it rather
+        // than reissue ids the earlier versions still hold.
+        let next_row_id =
+            Self::assign_stable_row_ids_for_migration(&mut fragments, self.manifest.next_row_id)?;
         let schema = self.manifest.schema.clone();
         let read_version = self.manifest.version;
 

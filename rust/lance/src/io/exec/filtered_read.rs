@@ -3278,7 +3278,12 @@ impl ExecutionPlan for FilteredReadExec {
         let mut updated_options = self.options.clone();
 
         if self.options.full_filter.is_none() && self.options.refine_filter.is_none() {
-            if self.options.scan_range_before_filter.is_some() {
+            // A before-filter range trims raw scan positions, which is only valid for
+            // an unindexed full scan. With an index_input (e.g. an external row mask or
+            // a scalar-index result) the rows are selected by that input, so a pre-range
+            // would apply before selection and keep the wrong rows; leave the limit to a
+            // node above the read instead.
+            if self.options.scan_range_before_filter.is_some() || self.index_input().is_some() {
                 return None;
             }
             updated_options.scan_range_before_filter = Some(0..(limit as u64));
@@ -4696,6 +4701,35 @@ mod tests {
             let plan = fixture.make_plan(base_options.clone()).await;
             let result = plan.with_fetch(None);
             assert!(result.is_none());
+        }
+
+        // Case 7: index_input present with no filter (the external-row-mask
+        // plain-scan shape) - with_fetch must reject before-filter pushdown, since
+        // the index_input selects the rows and a raw before-filter range would trim
+        // scan positions before that selection.
+        {
+            // Build a real scalar-index input, then attach it to options that carry
+            // no filter of their own.
+            let index_filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+            let index_input = fixture
+                .index_input(&base_options.clone().with_filter_plan(index_filter_plan))
+                .await;
+            assert!(index_input.is_some(), "expected a scalar-index input");
+
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                base_options.clone(),
+                index_input,
+            )
+            .unwrap();
+            assert!(plan.index_input().is_some());
+            assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
+
+            let result = plan.with_fetch(Some(100));
+            assert!(
+                result.is_none(),
+                "with_fetch must reject before-filter pushdown when index_input is present"
+            );
         }
     }
 
