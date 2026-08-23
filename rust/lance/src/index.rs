@@ -229,6 +229,7 @@ async fn validate_merge_output_files(
     dataset: &Dataset,
     index_name: &str,
     result: &IndexMergeResult,
+    source_segments: &[IndexMetadata],
 ) -> Result<()> {
     let dir = dataset.indices_dir().join(result.output.uuid.to_string());
     let mut listed = match list_index_files_with_sizes(&dataset.object_store, &dir).await {
@@ -329,10 +330,69 @@ async fn validate_merge_output_files(
         .map_err(|err| {
             Error::invalid_input(format!(
                 "index merge output {} of task {} does not open as its declared \
-                     vector index ({}); re-run the task",
+                 vector index ({}); re-run the task",
                 result.output.uuid, result.task_id, err
             ))
         })?;
+
+        // Openability is not provenance: the report's task binding is untrusted.
+        // The stored row addresses prove which fragments the output holds, and
+        // the replaced sources' durable lengths prove how many rows it must.
+        let provenance =
+            lance_index::vector::distributed::index_merger::read_segment_row_provenance(
+                &dataset.object_store,
+                &dir,
+            )
+            .await
+            .map_err(|err| {
+                Error::invalid_input(format!(
+                    "index merge output {} of task {} has unreadable row provenance ({}); \
+                     re-run the task",
+                    result.output.uuid, result.task_id, err
+                ))
+            })?;
+        let source_dirs = resolve_vector_source_dirs(dataset, source_segments).await?;
+        let mut expected_rows = 0u64;
+        for (segment, source_dir) in source_segments.iter().zip(&source_dirs) {
+            expected_rows +=
+                lance_index::vector::distributed::index_merger::read_segment_row_count(
+                    &dataset.object_store,
+                    source_dir,
+                )
+                .await
+                .map_err(|err| {
+                    Error::invalid_input(format!(
+                        "source segment {} of task {} has unreadable row counts ({}); \
+                         re-plan the merge",
+                        segment.uuid, result.task_id, err
+                    ))
+                })?;
+        }
+        if provenance.num_rows != expected_rows {
+            return Err(Error::invalid_input(format!(
+                "index merge output {} of task {} does not hold the rows of its claimed \
+                 sources ({} stored, {} expected); the output does not come from this \
+                 task. Re-plan the merge.",
+                result.output.uuid, result.task_id, provenance.num_rows, expected_rows
+            )));
+        }
+        let claimed = result
+            .output
+            .fragment_ids
+            .iter()
+            .copied()
+            .collect::<RoaringBitmap>();
+        if !provenance.fragments.is_subset(&claimed) {
+            let foreign = &provenance.fragments - &claimed;
+            return Err(Error::invalid_input(format!(
+                "index merge output {} of task {} stores rows from fragments {:?} outside \
+                 its claimed coverage; the output does not come from this task. Re-plan \
+                 the merge.",
+                result.output.uuid,
+                result.task_id,
+                foreign.iter().collect::<Vec<_>>()
+            )));
+        }
     }
     Ok(())
 }
@@ -2682,7 +2742,23 @@ impl DatasetIndexExt for Dataset {
         }
 
         for result in &results {
-            validate_merge_output_files(self, &plan.index_name, result).await?;
+            let sources = result
+                .sources
+                .iter()
+                .map(|source| {
+                    current_by_uuid
+                        .get(&source.uuid)
+                        .map(|segment| (*segment).clone())
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "commit_index_merge_results: source segment {} vanished \
+                                 during validation; re-plan the merge",
+                                source.uuid
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_merge_output_files(self, &plan.index_name, result, &sources).await?;
         }
 
         let new_indices = results
@@ -10444,6 +10520,60 @@ mod tests {
             err.to_string()
                 .contains("does not open as its declared vector index"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A genuine output re-labeled to another task must not publish.
+    ///
+    /// The report's task binding is untrusted, so the commit binds the durable
+    /// row addresses and row counts to the claimed task. With equal task sizes
+    /// the foreign fragments are caught, with unequal sizes the row count is.
+    #[rstest]
+    #[case::foreign_fragments(4, "outside its claimed coverage")]
+    #[case::wrong_row_count(5, "does not hold the rows of its claimed sources")]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_cross_task_output_substitution(
+        #[case] fragments: u32,
+        #[case] expected_message: &str,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), fragments).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        let last_task = plan.tasks.last().unwrap().task_id;
+        let genuine = dataset
+            .execute_index_merge_task(&plan, last_task)
+            .await
+            .unwrap();
+
+        let task0 = plan.task(0).unwrap();
+        let mut forged = genuine;
+        forged.task_id = 0;
+        forged.sources = task0.sources.clone();
+        forged.output.fragment_ids = task0.coverage();
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![forged])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a re-labeled output must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected substitution must not publish or remove segments"
         );
     }
 

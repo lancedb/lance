@@ -226,6 +226,112 @@ async fn open_sibling_index_reader(
     ))
 }
 
+/// Open a segment directory's auxiliary file for metadata or column reads.
+async fn open_aux_reader(
+    object_store: &lance_io::object_store::ObjectStore,
+    segment_dir: &object_store::path::Path,
+) -> Result<V2Reader> {
+    let sched = ScanScheduler::new(
+        Arc::new(object_store.clone()),
+        SchedulerConfig::max_bandwidth(object_store),
+    );
+    let aux_path = segment_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+    let fh = sched
+        .open_file(&aux_path, &CachedFileSize::unknown())
+        .await?;
+    V2Reader::try_open(
+        fh,
+        None,
+        Arc::default(),
+        &lance_core::cache::LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await
+}
+
+/// Durable row provenance of a segment: its stored row count and the
+/// fragments its stored row addresses name.
+#[derive(Debug, Clone)]
+pub struct SegmentRowProvenance {
+    /// Rows the storage actually holds.
+    pub num_rows: u64,
+    /// Fragments named by the stored row addresses.
+    pub fragments: roaring::RoaringBitmap,
+}
+
+/// Read a segment's durable row provenance from its auxiliary file.
+///
+/// A report's coverage claim is untrusted, but every stored row address names
+/// its fragment, so the bytes themselves prove which fragments the segment
+/// holds and how many rows it carries.
+pub async fn read_segment_row_provenance(
+    object_store: &lance_io::object_store::ObjectStore,
+    segment_dir: &object_store::path::Path,
+) -> Result<SegmentRowProvenance> {
+    use lance_core::ROW_ID;
+
+    let reader = open_aux_reader(object_store, segment_dir).await?;
+    let file_schema = reader.schema().clone();
+    let column = file_schema
+        .fields
+        .iter()
+        .position(|field| field.name == ROW_ID)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "segment {segment_dir} stores no {ROW_ID} column, so its row provenance \
+                 cannot be proven"
+            ))
+        })?;
+    let projected = file_schema.project(&[ROW_ID])?;
+    let projection = lance_file::reader::ReaderProjection {
+        schema: Arc::new(projected),
+        column_indices: vec![column as u32],
+    };
+    let mut stream = reader
+        .read_stream_projected(
+            lance_io::ReadBatchParams::RangeFull,
+            u32::MAX,
+            4,
+            projection,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
+    let mut fragments = roaring::RoaringBitmap::new();
+    let mut num_rows = 0u64;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let row_ids = batch
+            .column(0)
+            .as_primitive_opt::<arrow_array::types::UInt64Type>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "segment {segment_dir} stores a non u64 {ROW_ID} column ({})",
+                    batch.column(0).data_type()
+                ))
+            })?;
+        num_rows += row_ids.len() as u64;
+        for row_id in row_ids.values() {
+            fragments.insert((*row_id >> 32) as u32);
+        }
+    }
+    Ok(SegmentRowProvenance {
+        num_rows,
+        fragments,
+    })
+}
+
+/// A segment's durable row count, from its IVF partition lengths.
+pub async fn read_segment_row_count(
+    object_store: &lance_io::object_store::ObjectStore,
+    segment_dir: &object_store::path::Path,
+) -> Result<u64> {
+    let reader = open_aux_reader(object_store, segment_dir).await?;
+    let pb_ivf = try_read_ivf_proto(&reader)
+        .await?
+        .ok_or_else(|| Error::index(format!("segment {segment_dir} has no IVF metadata")))?;
+    Ok(pb_ivf.lengths.iter().map(|length| *length as u64).sum())
+}
+
 /// Initialize schema-level metadata on a writer for a given storage.
 ///
 /// It writes the distance type and the storage metadata (as a vector payload),

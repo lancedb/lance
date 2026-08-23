@@ -450,8 +450,10 @@ pub trait DatasetIndexExt {
     ///
     /// Worker reports come from outside the trust boundary: every output id
     /// must be globally fresh, re-proven again at publication, each reported
-    /// file must match the store listing and decode as a Lance file, and the
-    /// segment must open through the production vector index reader.
+    /// file must match the store listing and decode as a Lance file, the
+    /// segment must open through the production vector index reader, and its
+    /// durable row addresses and counts must match the claimed task, so a
+    /// genuine output cannot be re-labeled to another task.
     ///
     /// `results` may cover a subset of the plan's tasks, so a round survives a
     /// failed worker. Duplicate attempts of a task reconcile to one winner by

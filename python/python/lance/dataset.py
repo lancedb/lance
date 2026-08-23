@@ -4809,9 +4809,10 @@ class LanceDataset(pa.dataset.Dataset):
         Validation runs against the latest dataset version and runs again
         during commit conflict resolution, so a mutation landing during the
         fan-out or while the commit is in flight fails it. Every output id
-        must be fresh, every reported file must match the store listing, and
-        the segment must open through the production vector index reader
-        before replacing readable sources.
+        must be fresh, every reported file must match the store listing, the
+        segment must open through the production vector index reader, and its
+        stored row addresses and counts must match the claimed task before it
+        replaces readable sources.
 
         ``results`` may cover a subset of the plan's tasks, so a round
         survives a failed worker: what succeeded is published and the rest
