@@ -65,6 +65,17 @@ pub async fn load_frag_reuse_index_details(
                     external_file.size
                 ))
             })?;
+            // An external details file is only written when the encoded payload exceeds
+            // the inline threshold, so a zero size is always corruption. Rejecting it
+            // matters because it would otherwise slip past the range check below and
+            // decode as an empty (but structurally valid) index with zero reuse versions,
+            // which is indistinguishable from a legitimately fully-cleaned-up index.
+            if size == 0 {
+                return Err(Error::index(
+                    "Fragment reuse external file size is 0, which cannot be a valid details file"
+                        .to_string(),
+                ));
+            }
             let end = offset.checked_add(size).ok_or_else(|| {
                 Error::index(format!(
                     "Fragment reuse external file range overflows: offset {offset} + size {size}"
@@ -74,11 +85,10 @@ pub async fn load_frag_reuse_index_details(
             // the file content will be cached in the index cache later
             // so we do not put it to the file cache
             let reader = dataset.object_store.open(&file_path).await?;
-            let file_size = reader.size().await.map_err(|e| {
-                Error::index(format!(
-                    "Failed to read size of fragment reuse external file {file_path}: {e}"
-                ))
-            })?;
+            // Propagate the object-store error unchanged: a transient read failure must
+            // stay an IO error (and reach Python as IOError) rather than be relabelled
+            // as index corruption.
+            let file_size = reader.size().await?;
             if end > file_size {
                 return Err(Error::index(format!(
                     "Fragment reuse external file range {offset}..{end} is out of bounds for file {file_path} of size {file_size}"
@@ -103,7 +113,16 @@ pub(crate) async fn open_frag_reuse_index(
         let mut row_id_map = HashMap::<u64, Option<u64>>::new();
         for group in version.groups.iter() {
             let cursor = Cursor::new(&group.changed_row_addrs);
-            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
+            // The row-address digest is opaque bytes inside an otherwise valid protobuf,
+            // so a corrupt payload must surface here as an error rather than a panic that
+            // aborts the caller (including the Python cleanup binding).
+            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).map_err(|e| {
+                Error::index(format!(
+                    "Failed to decode changed row addresses in fragment reuse index {uuid} \
+                         at dataset version {}: {e}",
+                    version.dataset_version
+                ))
+            })?;
             let group_row_id_map = transpose_row_ids_from_digest(
                 changed_row_addrs,
                 &group.old_frags,
@@ -239,6 +258,43 @@ mod tests {
         }
     }
 
+    /// `num_deleted_rows` is read verbatim from persisted metadata, and
+    /// `transpose_row_ids_from_digest` used it directly as a `HashMap::with_capacity`
+    /// hint. A corrupt value therefore aborted the caller with a capacity-overflow panic
+    /// (or thrashed on merely large values) on the same path the Python cleanup binding
+    /// reaches, defeating the "corrupt metadata becomes an exception" contract.
+    #[tokio::test]
+    async fn test_open_frag_reuse_index_tolerates_corrupt_num_deleted_rows() {
+        let mut changed_row_addrs = Vec::new();
+        RoaringTreemap::new()
+            .serialize_into(&mut changed_row_addrs)
+            .unwrap();
+
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![lance_table::system_index::frag_reuse::FragDigest {
+                        id: 0,
+                        physical_rows: 4,
+                        num_deleted_rows: usize::MAX,
+                    }],
+                    new_frags: vec![],
+                }],
+            }],
+        };
+
+        let index = open_frag_reuse_index(Uuid::new_v4(), &details)
+            .await
+            .expect("a corrupt deleted-row count must not abort the caller");
+        assert_eq!(
+            index.row_id_maps.len(),
+            1,
+            "the version should still produce one (empty) row id map"
+        );
+    }
+
     /// Malformed external metadata must surface as a normal Error instead of
     /// panicking or building an invalid object-store range. Each case crafts a
     /// different bad offset/size against a valid PAYLOAD_LEN-byte details file
@@ -247,6 +303,9 @@ mod tests {
     #[case::out_of_bounds(0, PAYLOAD_LEN as u64 + 1, "out of bounds")]
     #[case::offset_past_eof(PAYLOAD_LEN as u64 + 100, 1, "out of bounds")]
     #[case::overflow(u64::MAX, u64::MAX, "overflow")]
+    // A zero size would decode as a structurally valid but empty index, which is
+    // indistinguishable from a fully-cleaned-up one, so it must be rejected outright.
+    #[case::zero_size(0, 0, "size is 0")]
     #[tokio::test]
     async fn test_load_external_details_malformed_offset_size_errors(
         #[case] offset: u64,

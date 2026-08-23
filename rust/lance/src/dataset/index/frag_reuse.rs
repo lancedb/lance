@@ -500,6 +500,98 @@ mod tests {
         );
     }
 
+    /// A valid protobuf can still carry a corrupt inner row-address digest. Decoding it
+    /// happens when the index is opened, which cleanup reaches through `apply_commit` ->
+    /// `commit_transaction` -> `load_indices`. That decode must produce an error rather
+    /// than a panic that aborts the caller, including the Python cleanup binding.
+    #[tokio::test]
+    async fn test_cleanup_frag_reuse_index_corrupt_changed_row_addrs_errors() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let index_name = "scalar".to_string();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some(index_name.clone()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let frag_reuse_index_meta = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .expect("Fragment reuse index must be available")
+            .clone();
+        let scalar_index_meta = indices
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .expect("Scalar index must be available")
+            .clone();
+
+        // Keep the protobuf structurally valid but make the opaque row-address digest
+        // undecodable, then drop the user index so the reuse version becomes droppable.
+        // Without the latter, cleanup returns early and never opens the index.
+        let mut details = (*load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap())
+        .clone();
+        details.versions[0].groups[0].changed_row_addrs = vec![0xff];
+        let fragment_bitmaps = reuse_chain_frag_bitmap(&details.versions);
+        let corrupt_meta = build_frag_reuse_index_metadata(
+            &dataset,
+            Some(&frag_reuse_index_meta),
+            details,
+            fragment_bitmaps,
+        )
+        .await
+        .unwrap();
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![corrupt_meta],
+                removed_indices: vec![frag_reuse_index_meta, scalar_index_meta],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let err = cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .expect_err("a corrupt row-address digest must surface as an error, not a panic");
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "expected an Error::Index for a corrupt row-address digest, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("changed row addresses"),
+            "error message should identify the undecodable digest, got: {err}"
+        );
+    }
+
     /// A rewrite group that straddles indexed and non-indexed fragments must not be
     /// treated as corrupt-and-droppable by cleanup. The load/remap path
     /// (`recalculate_fragment_bitmap`) aborts on this state and preserves the reuse

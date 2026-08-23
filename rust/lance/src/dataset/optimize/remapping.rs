@@ -183,11 +183,19 @@ pub fn transpose_row_ids_from_digest(
     });
     // The hashmap will have an entry for each row addr to map plus all rows that
     // were deleted.
-    let expected_size = row_addrs.len() as usize
-        + old_fragments
-            .iter()
-            .map(|frag| frag.num_deleted_rows)
-            .sum::<usize>();
+    //
+    // `num_deleted_rows` is read verbatim from persisted fragment-reuse metadata and is
+    // never validated, so a corrupt value must not become an allocation: `u64::MAX`
+    // deleted rows would otherwise panic with a capacity overflow, and a merely large
+    // value would thrash. The hint is only an optimization, so clamp it. Realistic
+    // compaction inputs stay well under the ceiling and keep the single allocation;
+    // a corrupt one costs a few rehashes instead of aborting the caller.
+    const MAX_CAPACITY_HINT: usize = 1 << 20;
+    let expected_size = (row_addrs.len() as usize)
+        .saturating_add(old_fragments.iter().fold(0usize, |acc, frag| {
+            acc.saturating_add(frag.num_deleted_rows)
+        }))
+        .min(MAX_CAPACITY_HINT);
     // We expect row addrs to be unique, so we should already not get many collisions.
     // The default hasher is designed to be resistance to DoS attacks, which is
     // more than we need for this use case.
@@ -211,13 +219,11 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
     }?;
 
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
-        .await
-        .unwrap();
+    // Corrupt fragment-reuse metadata must surface as an error here too, otherwise the
+    // remap path still aborts the process on exactly the payloads cleanup now rejects.
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
     let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref()).await?;
 
     if frag_reuse_index.row_id_maps.is_empty() {
         return Ok(());
