@@ -2760,6 +2760,88 @@ def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: s
     assert result["nested"].to_pylist() == expected_nested
 
 
+def test_merge_insert_subcols_in_place(tmp_path: Path):
+    """`write_mode("rewrite_columns")` patches the source columns into the
+    fragments that already hold the matched rows.
+
+    Compare with `test_merge_insert_subcols`, which runs the same merge in the
+    default `"auto"` mode and gets whole rows rewritten into a new fragment
+    instead.
+    """
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data, tmp_path / "dataset", max_rows_per_file=5
+    )
+    fragments_before = [f.fragment_id for f in dataset.get_fragments()]
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_matched_update_all()
+        .write_mode("rewrite_columns")
+        .execute(new_values)
+    )
+
+    # No fragment is added, removed, or renumbered, and column `c` (absent from
+    # the source) is neither read nor written.
+    assert [f.fragment_id for f in dataset.get_fragments()] == fragments_before
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+    # Patching columns cannot add rows, so asking for it explicitly on a merge
+    # that also inserts is rejected rather than quietly rewriting whole rows.
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    with pytest.raises(OSError, match="adds rows, which patching cannot do"):
+        (
+            dataset.merge_insert("a")
+            .when_not_matched_insert_all()
+            .when_matched_update_all()
+            .write_mode("rewrite_columns")
+            .execute(new_values)
+        )
+
+    # The same merge under the default mode picks the row-rewrite sink.
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+
 def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
     """End-to-end test: merge_insert with JSON columns where ALL rows are updated.
 

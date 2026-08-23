@@ -33,6 +33,7 @@ use lance_core::{
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -67,7 +68,6 @@ use lance_index::scalar::inverted::{
     flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -541,6 +541,10 @@ pub struct CompoundQueryExec {
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Caller-supplied row-address mask, intersected into the prefilter so the
+    /// compound scorer ranks only surviving rows (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -593,6 +597,7 @@ impl CompoundQueryExec {
             prefilter_source,
             base_scorer: None,
             segment_selection,
+            external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -601,6 +606,12 @@ impl CompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
     }
 
     /// Override locally computed BM25 statistics with a corpus-wide scorer.
@@ -712,6 +723,7 @@ impl ExecutionPlan for CompoundQueryExec {
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -730,6 +742,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -767,6 +780,7 @@ impl ExecutionPlan for CompoundQueryExec {
                 dataset,
                 &segments,
                 None,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -854,6 +868,9 @@ pub struct CrossColumnCompoundQueryExec {
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
     columns: Arc<[CompoundColumnSelection]>,
+    /// Combined into the prefilter so only masked rows are scored (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -930,6 +947,7 @@ impl CrossColumnCompoundQueryExec {
             params,
             prefilter_source,
             columns: Arc::from(columns),
+            external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -938,6 +956,12 @@ impl CrossColumnCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -1032,6 +1056,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             params: self.params.clone(),
             prefilter_source,
             columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -1053,6 +1078,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
+        let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1083,6 +1109,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 dataset.clone(),
                 &selected_segments,
                 None,
+                external_mask,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -1736,6 +1763,9 @@ pub struct MatchQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`Self::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -1821,6 +1851,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1883,6 +1914,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1923,6 +1955,7 @@ impl MatchQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -1955,6 +1988,15 @@ impl MatchQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// Restrict BM25 scoring to rows selected by an external row-address mask.
+    /// The mask is combined (logical AND) with the prefilter built by
+    /// `build_prefilter`, so top-k is computed over masked rows only. No-op when
+    /// `mask` is `None`.
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -2037,6 +2079,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -2069,6 +2112,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -2093,6 +2137,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -2124,6 +2169,7 @@ impl ExecutionPlan for MatchQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -3053,6 +3099,9 @@ pub struct PhraseQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -3129,6 +3178,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3182,6 +3232,7 @@ impl PhraseQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -3227,6 +3278,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3246,6 +3298,12 @@ impl PhraseQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -3321,6 +3379,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 overlay_block: self.overlay_block.clone(),
                 document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -3351,6 +3410,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -3375,6 +3435,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -3406,6 +3467,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
