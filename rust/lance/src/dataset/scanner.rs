@@ -2837,6 +2837,19 @@ impl Scanner {
         if logical::is_enabled() {
             return logical::create_plan(self).await;
         }
+        self.create_plan_imperative().await
+    }
+
+    /// Plan this scan through the logical planner, whatever `LANCE_LOGICAL_SCAN_PLANNER` says.
+    ///
+    /// Exists for the planning benchmark, which needs both paths in one process so criterion can
+    /// put them side by side. Goes away with the imperative path.
+    #[doc(hidden)]
+    pub async fn create_plan_logical(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        logical::create_plan(self).await
+    }
+
+    async fn create_plan_imperative(&self) -> Result<Arc<dyn ExecutionPlan>> {
         self.validate_options()?;
 
         let full_text_query = match &self.full_text_query {
