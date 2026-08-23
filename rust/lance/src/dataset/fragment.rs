@@ -1169,8 +1169,7 @@ impl FileFragment {
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
         let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
-            // TODO: make object stores for non-default bases reuse the same scan scheduler
-            //  currently we always create a new one
+            // TODO: reuse the same scan scheduler for non-default bases
             let object_store = self.dataset.object_store(Some(base_id)).await?;
             let config = SchedulerConfig::max_bandwidth(&object_store);
             (
@@ -2190,7 +2189,7 @@ impl FileFragment {
         }
     }
 
-    /// Write new data for a column of this fragment as a standalone data file,
+    /// Write new data for columns of this fragment as a standalone data file,
     /// without committing it, and return the
     /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup)
     /// describing it.
@@ -2216,7 +2215,7 @@ impl FileFragment {
     /// Callers should take care to set the read version correctly. If this is
     /// not done then multiple replacements to the same field will not be
     /// detected as a conflict.
-    pub async fn write_column(
+    pub async fn write_columns(
         &self,
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
@@ -2310,7 +2309,7 @@ impl FileFragment {
             // unreadable. Rechunking is the legacy update path's job, not this
             // one's.
             return Err(Error::not_supported(format!(
-                "write_column is not supported for fragment {} in the legacy file format",
+                "write_columns is not supported for fragment {} in the legacy file format",
                 self.id()
             )));
         }
