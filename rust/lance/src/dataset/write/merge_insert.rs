@@ -11787,6 +11787,70 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    /// A matched delete combined with `WhenNotMatchedBySource::Delete` is not a
+    /// delete-only plan: unmatched target rows are removed through the full write path,
+    /// which needs every dataset column. The logical plan must therefore keep the source
+    /// payload columns it prunes for a genuine delete-only merge, otherwise the writer
+    /// fails with a "missing from merge insert input schema" internal error.
+    #[rstest::rstest]
+    #[case::delete_if(true)]
+    #[case::delete(false)]
+    #[tokio::test]
+    async fn test_matched_delete_with_delete_not_matched_by_source(#[case] conditional: bool) {
+        let initial =
+            record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30])).unwrap();
+        let schema = initial.schema();
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // id=1 satisfies the condition, id=2 does not, id=3 is unmatched by the source.
+        let source = record_batch!(("id", Int32, [1, 2]), ("value", Int32, [100, 5])).unwrap();
+        let when_matched = if conditional {
+            WhenMatched::delete_if(&ds, "source.value > target.value").unwrap()
+        } else {
+            WhenMatched::Delete
+        };
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        if conditional {
+            // id=1 by the condition, id=3 as unmatched by source.
+            assert_eq!(stats.num_deleted_rows, 2);
+            assert_eq!(updated_ds.count_rows(None).await.unwrap(), 1);
+            assert_eq!(
+                updated_ds
+                    .count_rows(Some("id = 2 AND value = 20".to_string()))
+                    .await
+                    .unwrap(),
+                1,
+                "id=2 failed the condition and must survive unmodified"
+            );
+        } else {
+            // Both matched rows plus the row unmatched by the source.
+            assert_eq!(stats.num_deleted_rows, 3);
+            assert_eq!(updated_ds.count_rows(None).await.unwrap(), 0);
+        }
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
+    }
+
     /// Test WhenMatched::DeleteIf error cases. Parsing is deferred until the execution
     /// path is known, so `delete_if` succeeds even for an unparsable condition and the
     /// parse error only surfaces when the fast path plan is built. A non-boolean condition
