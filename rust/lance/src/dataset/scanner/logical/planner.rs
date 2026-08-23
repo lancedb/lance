@@ -38,6 +38,9 @@ impl ExtensionPlanner for LanceExtensionPlanner {
         _session_state: &SessionState,
     ) -> datafusion::common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // FTS owns its own nodes, rules, and lowering; ask that module first.
+        if let Some(plan) = super::fts::plan_extension(node, physical_inputs) {
+            return Ok(Some(plan?));
+        }
 
         let input = physical_inputs.first().cloned().ok_or_else(|| {
             datafusion::common::DataFusionError::Internal(
