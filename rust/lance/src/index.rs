@@ -261,6 +261,19 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),
     );
+    let vector_plan = result
+        .fingerprint
+        .index_type_url
+        .ends_with("VectorIndexDetails");
+    // The production open starts at the index file, so a segment without one
+    // is never readable and its family fallback cannot fail closed.
+    if vector_plan && !listed.iter().any(|file| file.path == INDEX_FILE_NAME) {
+        return Err(Error::invalid_input(format!(
+            "index merge result for task {} reports no {} for output {}; the segment \
+             would never be readable, re-run the task",
+            result.task_id, INDEX_FILE_NAME, result.output.uuid
+        )));
+    }
     for file in &listed {
         let path = dir.clone().join(file.path.as_str());
         // A fabricated report can list real sizes for garbage bytes, so decode
@@ -287,12 +300,7 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
         // The production open reads the vector index header from the index
         // file's schema metadata, so a decodable but generic Lance file must
         // be rejected here rather than at query time.
-        if file.path == INDEX_FILE_NAME
-            && result
-                .fingerprint
-                .index_type_url
-                .ends_with("VectorIndexDetails")
-        {
+        if file.path == INDEX_FILE_NAME && vector_plan {
             let header = metadata
                 .file_schema
                 .metadata
@@ -322,6 +330,24 @@ async fn validate_merge_output_files(dataset: &Dataset, result: &IndexMergeResul
                 },
             )?;
         }
+    }
+    // A header is a forgeable string, so the segment must also pass the
+    // structural entry check a merge input would: auxiliary file, distance
+    // type, at least one partition, and the family's quantizer metadata. Deep
+    // model validation stays with the worker that read the sources.
+    if vector_plan {
+        lance_index::vector::distributed::index_merger::read_segment_model(
+            &dataset.object_store,
+            &dir,
+        )
+        .await
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "index merge output {} of task {} does not validate as its declared \
+                 vector index ({}); re-run the task",
+                result.output.uuid, result.task_id, err
+            ))
+        })?;
     }
     Ok(())
 }
@@ -9447,21 +9473,36 @@ mod tests {
         .unwrap()
     }
 
-    /// Write a genuine minimal Lance file as a stubbed merge output and return
-    /// its size. `vector_header` controls whether the file carries the vector
-    /// index header the commit and the production open both require.
-    async fn write_stub_output_file_impl(
+    /// Which parts of a fabricated merge output exist on the store.
+    #[derive(Clone, Copy)]
+    enum StubShape {
+        /// Index file with the vector header plus a parseable auxiliary file.
+        Complete,
+        /// Index file without the vector header, auxiliary file present.
+        HeaderlessIndex,
+        /// Index file with a forged header and no auxiliary file.
+        ForgedHeaderOnly,
+        /// Auxiliary file only, no index file at all.
+        AuxOnly,
+    }
+
+    /// Write a fabricated merge output and return its reported file list.
+    ///
+    /// The commit verifies reports against the store listing, decodes each
+    /// file, and parses the segment the way the merge reads a shard, so a
+    /// stub that should commit must write [`StubShape::Complete`].
+    async fn write_stub_output_shape(
         dataset: &Dataset,
         output_uuid: Uuid,
-        vector_header: bool,
-    ) -> u64 {
+        shape: StubShape,
+    ) -> Vec<IndexMergeFile> {
         use lance_file::version::ConcreteFileVersion;
         use lance_file::writer::FileWriterOptions;
+        use lance_index::vector::DISTANCE_TYPE_KEY;
+        use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+        use prost::Message;
 
-        let path = dataset
-            .indices_dir()
-            .join(output_uuid.to_string())
-            .join(INDEX_FILE_NAME);
+        let dir = dataset.indices_dir().join(output_uuid.to_string());
         let arrow_schema = Schema::new(vec![Field::new("stub", DataType::Int32, false)]);
         let batch = RecordBatch::try_new(
             Arc::new(arrow_schema.clone()),
@@ -9469,43 +9510,93 @@ mod tests {
         )
         .unwrap();
         let lance_schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
-        let writer = dataset.object_store.create(&path).await.unwrap();
-        let mut file_writer = lance_file::versions::create_writer(
-            ConcreteFileVersion::V2_1,
-            writer,
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-        file_writer.write_batch(&batch).await.unwrap();
-        if vector_header {
-            file_writer.add_schema_metadata(
-                INDEX_METADATA_SCHEMA_KEY,
-                serde_json::to_string(&lance_index::IndexMetadata {
-                    index_type: "IVF_FLAT".to_owned(),
-                    distance_type: "l2".to_owned(),
-                })
-                .unwrap(),
-            );
+
+        let mut files = Vec::new();
+        if !matches!(shape, StubShape::AuxOnly) {
+            let index_path = dir.clone().join(INDEX_FILE_NAME);
+            let writer = dataset.object_store.create(&index_path).await.unwrap();
+            let mut file_writer = lance_file::versions::create_writer(
+                ConcreteFileVersion::V2_1,
+                writer,
+                lance_schema.clone(),
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            file_writer.write_batch(&batch).await.unwrap();
+            if !matches!(shape, StubShape::HeaderlessIndex) {
+                file_writer.add_schema_metadata(
+                    INDEX_METADATA_SCHEMA_KEY,
+                    serde_json::to_string(&lance_index::IndexMetadata {
+                        index_type: "IVF_FLAT".to_owned(),
+                        distance_type: "l2".to_owned(),
+                    })
+                    .unwrap(),
+                );
+            }
+            file_writer.finish().await.unwrap();
+            files.push(IndexMergeFile {
+                path: INDEX_FILE_NAME.to_string(),
+                size_bytes: dataset.object_store.size(&index_path).await.unwrap(),
+            });
         }
-        file_writer.finish().await.unwrap();
-        dataset.object_store.size(&path).await.unwrap()
+
+        if !matches!(shape, StubShape::ForgedHeaderOnly) {
+            let aux_path = dir.join(lance_index::INDEX_AUXILIARY_FILE_NAME);
+            let writer = dataset.object_store.create(&aux_path).await.unwrap();
+            let mut aux_writer = lance_file::versions::create_writer(
+                ConcreteFileVersion::V2_1,
+                writer,
+                lance_schema,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            aux_writer.write_batch(&batch).await.unwrap();
+            aux_writer.add_schema_metadata(DISTANCE_TYPE_KEY, "l2");
+            let ivf_pos = aux_writer
+                .add_global_buffer(
+                    lance_index::pb::Ivf {
+                        lengths: vec![1],
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                    .into(),
+                )
+                .await
+                .unwrap();
+            aux_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_pos.to_string());
+            aux_writer.finish().await.unwrap();
+            files.push(IndexMergeFile {
+                path: lance_index::INDEX_AUXILIARY_FILE_NAME.to_string(),
+                size_bytes: dataset.object_store.size(&aux_path).await.unwrap(),
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
     }
 
-    /// A stubbed merge output that passes the commit's file verification.
-    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> u64 {
-        write_stub_output_file_impl(dataset, output_uuid, true).await
+    /// A fabricated output that passes every commit-side verification.
+    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> Vec<IndexMergeFile> {
+        write_stub_output_shape(dataset, output_uuid, StubShape::Complete).await
+    }
+
+    /// Report shape for stubs the commit rejects before file verification.
+    fn unwritten_stub_files() -> Vec<IndexMergeFile> {
+        vec![IndexMergeFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: 0,
+        }]
     }
 
     /// A worker report for `task_id` that never ran a merge.
     ///
-    /// A test expecting the commit to succeed must pass the size returned by
-    /// [`write_stub_output_file`], any size works for tests that reject earlier.
+    /// A test expecting the commit to succeed must pass the file list from
+    /// [`write_stub_output_file`], [`unwritten_stub_files`] works for tests
+    /// that reject earlier.
     fn stub_merge_result(
         plan: &IndexMergePlan,
         task_id: u32,
         output_uuid: Uuid,
-        output_file_size: u64,
+        output_files: Vec<IndexMergeFile>,
         attempt_id: Uuid,
     ) -> IndexMergeResult {
         let task = plan.task(task_id).unwrap();
@@ -9529,10 +9620,7 @@ mod tests {
                 index_type_url: plan.fingerprint.index_type_url.clone(),
                 index_details: vector_index_details_default().value,
                 fragment_ids: task.coverage(),
-                files: vec![IndexMergeFile {
-                    path: INDEX_FILE_NAME.to_string(),
-                    size_bytes: output_file_size,
-                }],
+                files: output_files,
             },
         }
     }
@@ -9660,7 +9748,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
-        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), 0, Uuid::new_v4());
+        let result = stub_merge_result(
+            &plan,
+            0,
+            Uuid::new_v4(),
+            unwritten_stub_files(),
+            Uuid::new_v4(),
+        );
 
         if stale_handle {
             let mut writer = dataset.clone();
@@ -9719,13 +9813,19 @@ mod tests {
         let losing_attempt = Uuid::from_bytes([2; 16]);
         let winning_output = Uuid::new_v4();
         let losing_output = Uuid::new_v4();
-        let mut output_size = 0;
+        let mut output_files = Vec::new();
         for uuid in [winning_output, losing_output] {
-            output_size = write_stub_output_file(&dataset, uuid).await;
+            output_files = write_stub_output_file(&dataset, uuid).await;
         }
         let results = vec![
-            stub_merge_result(&plan, 0, losing_output, output_size, losing_attempt),
-            stub_merge_result(&plan, 0, winning_output, output_size, winning_attempt),
+            stub_merge_result(
+                &plan,
+                0,
+                losing_output,
+                output_files.clone(),
+                losing_attempt,
+            ),
+            stub_merge_result(&plan, 0, winning_output, output_files, winning_attempt),
         ];
 
         dataset
@@ -9794,8 +9894,8 @@ mod tests {
         // conflict because the exact-source property waives the same-name rule
         // and the finish step re-proves the batch's sources instead.
         let late_output = Uuid::new_v4();
-        let late_size = write_stub_output_file(&dataset, late_output).await;
-        let late = stub_merge_result(&plan, 1, late_output, late_size, Uuid::new_v4());
+        let late_files = write_stub_output_file(&dataset, late_output).await;
+        let late = stub_merge_result(&plan, 1, late_output, late_files, Uuid::new_v4());
         dataset
             .commit_index_merge_results(&plan, vec![late])
             .await
@@ -9901,8 +10001,8 @@ mod tests {
             .unwrap();
 
         let output = Uuid::new_v4();
-        let output_size = write_stub_output_file(&dataset, output).await;
-        let result = stub_merge_result(&plan, 0, output, output_size, Uuid::new_v4());
+        let output_files = write_stub_output_file(&dataset, output).await;
+        let result = stub_merge_result(&plan, 0, output, output_files, Uuid::new_v4());
         dataset
             .commit_index_merge_results(&plan, vec![result])
             .await
@@ -9936,13 +10036,24 @@ mod tests {
         );
     }
 
-    /// A decodable but generic Lance file must not replace readable sources.
+    /// A decodable but generic Lance table must not replace readable sources.
     ///
-    /// The production open reads the vector index header from the index file's
-    /// schema metadata, so a headerless table published as a vector segment
-    /// fails only at query time unless the commit rejects it first.
+    /// A missing vector index header fails the production open at query time,
+    /// and a header alone is a forgeable string, so the commit must also parse
+    /// the segment the way the merge reads a shard. Both fabrications are
+    /// rejected before publication.
+    #[rstest]
+    #[case::headerless(StubShape::HeaderlessIndex, "carries no vector index header")]
+    #[case::forged_header_without_index_content(
+        StubShape::ForgedHeaderOnly,
+        "does not validate as its declared vector index"
+    )]
+    #[case::auxiliary_only(StubShape::AuxOnly, "reports no index")]
     #[tokio::test]
-    async fn test_commit_index_merge_results_rejects_generic_lance_file() {
+    async fn test_commit_index_merge_results_rejects_generic_lance_file(
+        #[case] shape: StubShape,
+        #[case] expected_message: &str,
+    ) {
         let test_dir = tempfile::tempdir().unwrap();
         let (mut dataset, segments) =
             write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
@@ -9952,8 +10063,8 @@ mod tests {
             .await
             .unwrap();
         let output = Uuid::new_v4();
-        let size = write_stub_output_file_impl(&dataset, output, false).await;
-        let result = stub_merge_result(&plan, 0, output, size, Uuid::new_v4());
+        let files = write_stub_output_shape(&dataset, output, shape).await;
+        let result = stub_merge_result(&plan, 0, output, files, Uuid::new_v4());
 
         let err = dataset
             .commit_index_merge_results(&plan, vec![result])
@@ -9961,10 +10072,10 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidInput { .. }),
-            "a headerless output must be invalid input, got {err:?}"
+            "a fabricated output must be invalid input, got {err:?}"
         );
         assert!(
-            err.to_string().contains("carries no vector index header"),
+            err.to_string().contains(expected_message),
             "unexpected error: {err}"
         );
         let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
@@ -9993,7 +10104,8 @@ mod tests {
         assert_eq!(plan.tasks.len(), 2);
 
         let untouched = plan.task(1).unwrap().sources[0].uuid;
-        let aliased = stub_merge_result(&plan, 0, untouched, 0, Uuid::new_v4());
+        let aliased =
+            stub_merge_result(&plan, 0, untouched, unwritten_stub_files(), Uuid::new_v4());
         let err = dataset
             .commit_index_merge_results(&plan, vec![aliased])
             .await
@@ -10028,7 +10140,8 @@ mod tests {
             .plan_index_segment_merge("vector_idx", 2, None)
             .await
             .unwrap();
-        let foreign = stub_merge_result(&plan, 0, other.uuid, 0, Uuid::new_v4());
+        let foreign =
+            stub_merge_result(&plan, 0, other.uuid, unwritten_stub_files(), Uuid::new_v4());
         let err = dataset
             .commit_index_merge_results(&plan, vec![foreign])
             .await
@@ -10072,20 +10185,20 @@ mod tests {
             .await
             .unwrap();
         let shared_output = Uuid::new_v4();
-        let shared_size = write_stub_output_file(&dataset, shared_output).await;
+        let shared_files = write_stub_output_file(&dataset, shared_output).await;
         let results = vec![
             stub_merge_result(
                 &plan,
                 0,
                 shared_output,
-                shared_size,
+                shared_files.clone(),
                 Uuid::from_bytes([2; 16]),
             ),
             stub_merge_result(
                 &plan,
                 0,
                 shared_output,
-                shared_size,
+                shared_files,
                 Uuid::from_bytes([1; 16]),
             ),
         ];
@@ -10163,7 +10276,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let result = stub_merge_result(&plan, 0, output, reported_size, Uuid::new_v4());
+        let reported = vec![IndexMergeFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: reported_size,
+        }];
+        let result = stub_merge_result(&plan, 0, output, reported, Uuid::new_v4());
 
         let err = dataset
             .commit_index_merge_results(&plan, vec![result])
@@ -10209,7 +10326,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
-        let result = stub_merge_result(&plan, 0, Uuid::new_v4(), 0, Uuid::new_v4());
+        let result = stub_merge_result(
+            &plan,
+            0,
+            Uuid::new_v4(),
+            unwritten_stub_files(),
+            Uuid::new_v4(),
+        );
 
         // The tail of `commit_index_merge_results` after its validation: the
         // sources it saw, the output it built, and the exact-source property.
@@ -10309,8 +10432,8 @@ mod tests {
             .await
             .unwrap();
         let shared = Uuid::new_v4();
-        let shared_size = write_stub_output_file(&dataset, shared).await;
-        let result = stub_merge_result(&plan, 0, shared, shared_size, Uuid::new_v4());
+        let shared_files = write_stub_output_file(&dataset, shared).await;
+        let result = stub_merge_result(&plan, 0, shared, shared_files, Uuid::new_v4());
         dataset
             .commit_index_merge_results(&plan, vec![result])
             .await
