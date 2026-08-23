@@ -380,6 +380,11 @@ def test_upsert_unindexed_baseline(benchmark, narrow: Target, num_rows: int) -> 
 ROW_FRACTIONS = [0.001, 0.01, 0.1, 1.0]
 FRACTION_IDS = ["0.1pct", "1pct", "10pct", "100pct"]
 
+# The projection sweeps only need the two ends of that range: one fraction where
+# the updater interleaves and one where it rewrites whole column files.
+PROJECTION_FRACTIONS = [0.01, 1.0]
+PROJECTION_FRACTION_IDS = ["1pct", "100pct"]
+
 # Isolates the two pressures a partial-column update can exert: field count
 # (scalar columns, cheap per field) and byte volume (the vector column).
 PROJECTIONS = {
@@ -394,6 +399,24 @@ def _wide_rounds(fraction: float) -> int:
     # A full-fragment update rewrites every column file it touches, which for
     # the vector column is ~1 GB per round.
     return 1 if fraction == 1.0 else 3
+
+
+def wide_plan_cases(fractions: Sequence[float], ids: Sequence[str]):
+    """``(fraction, plan)`` cases, minus the ones v1 cannot execute.
+
+    At ``fraction == 1.0`` the source covers every row of the target, and the
+    legacy path builds its hash join on the source side: it asks for the whole
+    source at once -- ~1 GB once the 256-dim vector column is projected --
+    against a 150 MiB pool, and fails with "Resources exhausted". That is the
+    same limitation that keeps ``test_upsert_source_equals_target`` v2-only, so
+    the full-fragment shapes report a v2 number only. The 10pct fraction still
+    gives a v1-vs-v2 write-amplification comparison at fragment scale.
+    """
+    return [
+        pytest.param(fraction, plan, id=f"{fraction_id}-{plan}")
+        for fraction, fraction_id in zip(fractions, ids)
+        for plan in (["v2_hash"] if fraction == 1.0 else PLANS)
+    ]
 
 
 def update_subset(
@@ -412,8 +435,7 @@ def update_subset(
     return job
 
 
-@pytest.mark.parametrize("plan", PLANS)
-@pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
+@pytest.mark.parametrize("fraction,plan", wide_plan_cases(ROW_FRACTIONS, FRACTION_IDS))
 def test_update_subset_row_fraction(
     benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
@@ -433,8 +455,9 @@ def test_update_subset_row_fraction(
     )
 
 
-@pytest.mark.parametrize("plan", PLANS)
-@pytest.mark.parametrize("fraction", [0.01, 1.0], ids=["1pct", "100pct"])
+@pytest.mark.parametrize(
+    "fraction,plan", wide_plan_cases(PROJECTION_FRACTIONS, PROJECTION_FRACTION_IDS)
+)
 @pytest.mark.parametrize("projection", list(PROJECTIONS), ids=list(PROJECTIONS))
 def test_update_subset_projection(
     benchmark, wide: Target, projection: str, fraction: float, plan: str
@@ -451,8 +474,9 @@ def test_update_subset_projection(
     )
 
 
-@pytest.mark.parametrize("plan", PLANS)
-@pytest.mark.parametrize("fraction", [0.01, 1.0], ids=["1pct", "100pct"])
+@pytest.mark.parametrize(
+    "fraction,plan", wide_plan_cases(PROJECTION_FRACTIONS, PROJECTION_FRACTION_IDS)
+)
 def test_upsert_wide_full_schema(
     benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
@@ -727,8 +751,7 @@ def test_io_mem_upsert_ratio(
 
 
 @pytest.mark.io_memory_benchmark()
-@pytest.mark.parametrize("plan", PLANS)
-@pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
+@pytest.mark.parametrize("fraction,plan", wide_plan_cases(ROW_FRACTIONS, FRACTION_IDS))
 def test_io_mem_update_subset_row_fraction(
     io_mem_benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
