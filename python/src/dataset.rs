@@ -51,9 +51,9 @@ use lance::dataset::{
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
-    MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
-    WriteMode, WriteParams,
+    MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, ReadParams,
+    UncommittedMergeInsert, UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -425,6 +425,22 @@ impl MergeInsertBuilder {
 
     pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
         slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
+    pub fn write_mode<'a>(mut slf: PyRefMut<'a, Self>, mode: &str) -> PyResult<PyRefMut<'a, Self>> {
+        let mode = match mode {
+            "auto" => MergeInsertWriteMode::Auto,
+            "rewrite_rows" => MergeInsertWriteMode::RewriteRows,
+            "rewrite_columns" => MergeInsertWriteMode::RewriteColumns,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid write_mode: {other}. Expected one of \
+                     'auto', 'rewrite_rows', 'rewrite_columns'"
+                )));
+            }
+        };
+        slf.builder.write_mode(mode);
         Ok(slf)
     }
 

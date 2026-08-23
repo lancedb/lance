@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
@@ -564,6 +565,7 @@ impl FilterPlan {
         &self,
         input: Arc<dyn ExecutionPlan>,
         scanner: &Scanner,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plan = input;
 
@@ -580,9 +582,12 @@ impl FilterPlan {
         }
 
         if let Some(refine_expr) = &self.expr_filter_plan.refine_expr {
-            // We create a new planner specific to the node's schema, since
-            // physical expressions reference column by index rather than by name.
-            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            plan = Arc::new(match session {
+                Some(session) => {
+                    LanceFilterExec::try_new_with_session(refine_expr.clone(), plan, session)?
+                }
+                None => LanceFilterExec::try_new(refine_expr.clone(), plan)?,
+            });
         }
 
         Ok(plan)
@@ -2882,8 +2887,22 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    pub fn create_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(None))
+    }
+
+    pub(crate) fn create_plan_with_session<'a>(
+        &'a self,
+        session: &'a dyn Session,
+    ) -> BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(Some(session)))
+    }
+
     #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan_impl(
+        &self,
+        session: Option<&dyn Session>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
@@ -2946,7 +2965,7 @@ impl Scanner {
                     self.take_source(take_op).await?
                 } else {
                     let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                        .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
                         .await?;
                     if planned_read.limit_pushed_down {
                         use_limit_node = false;
@@ -2991,7 +3010,7 @@ impl Scanner {
         plan = self.take(plan, pre_filter_projection)?;
 
         // Filter
-        plan = filter_plan.refine_filter(plan, self).await?;
+        plan = filter_plan.refine_filter(plan, self, session).await?;
 
         // Aggregate (if set, applies aggregate and returns early)
         if let Some(agg) = &self.aggregate {
@@ -3244,6 +3263,7 @@ impl Scanner {
         make_deletions_null: bool,
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Kept for the overlay stale-Take path below, which re-evaluates blocked stale rows.
         let user_projection = projection.clone();
@@ -3289,6 +3309,10 @@ impl Scanner {
 
         if self.fast_search && filter_plan.has_index_query() {
             read_options = read_options.with_only_indexed_fragments();
+        }
+
+        if let Some(session) = session {
+            read_options = read_options.with_physical_filters(session)?;
         }
 
         // Mask data overlay files: a row with an overlay committed after an index it relies on
@@ -3343,7 +3367,12 @@ impl Scanner {
             .await?;
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
-        let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
+        let filtered = Arc::new(match session {
+            Some(session) => {
+                LanceFilterExec::try_new_with_session(optimized_filter, stale_node, session)?
+            }
+            None => LanceFilterExec::try_new(optimized_filter, stale_node)?,
+        });
         let stale_path: Arc<dyn ExecutionPlan> =
             Arc::new(project(filtered, plan.schema().as_ref())?);
 
@@ -3357,6 +3386,7 @@ impl Scanner {
     // Helper function for filtered read
     //
     // Delegates to legacy or new filtered read based on dataset storage version
+    #[allow(clippy::too_many_arguments)]
     fn filtered_read<'a>(
         &'a self,
         filter_plan: &'a ExprFilterPlan,
@@ -3365,6 +3395,7 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
+        session: Option<&'a dyn Session>,
     ) -> BoxFuture<'a, Result<PlannedFilteredScan>> {
         // The plain-scan mask path lives in new_filtered_read; legacy_filtered_read
         // has no equivalent, so a masked plain scan there would silently drop the
@@ -3397,6 +3428,7 @@ impl Scanner {
             fragments,
             scan_range,
             is_prefilter,
+            session,
         )
         .boxed()
     }
@@ -3469,6 +3501,7 @@ impl Scanner {
     async fn filtered_read_source(
         &self,
         filter_plan: &mut ExprFilterPlan,
+        session: Option<&dyn Session>,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
@@ -3530,6 +3563,7 @@ impl Scanner {
             self.fragments.clone().map(Arc::new),
             scan_range,
             /*is_prefilter= */ false,
+            session,
         )
         .await
     }
@@ -4825,6 +4859,7 @@ impl Scanner {
                     Some(Arc::new(fragments)),
                     None,
                     /*is_prefilter=*/ true,
+                    None,
                 )
                 .await?;
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -5133,6 +5168,7 @@ impl Scanner {
                     self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
+                    None,
                 )
                 .await?;
 
@@ -6442,6 +6478,7 @@ impl Scanner {
                 Some(fragments),
                 None,
                 /*is_prefilter= */ true,
+                None,
             )
             .await?;
         Ok(PreFilterSource::FilteredRowIds(plan))
