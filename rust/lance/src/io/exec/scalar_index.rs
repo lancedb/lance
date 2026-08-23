@@ -893,7 +893,6 @@ impl MaterializeIndexExec {
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
         // reach the user).
-        //
         let candidate_mask =
             |result: IndexExprResult| -> Result<RowAddrMask> { candidate_mask_for(result, limit) };
         let mut mask = if let Some(prefilter) = prefilter {

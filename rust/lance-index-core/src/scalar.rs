@@ -516,9 +516,12 @@ pub struct SearchOptions {
     /// Negating and combining operators ignore it, because a partial match set
     /// cannot be complemented or intersected soundly.
     ///
-    /// A limited search reports [`SearchResult::AtLeast`], never
+    /// A search that acts on the limit reports [`SearchResult::AtLeast`], never
     /// [`SearchResult::Exact`], so a short-circuited scan can never be mistaken
-    /// for the complete match set.
+    /// for the complete match set. An index may also decline the hint and search
+    /// in full, in which case it still reports [`SearchResult::Exact`]. Notably
+    /// [`track_nulls`](Self::track_nulls) forces this, because a partial scan
+    /// cannot report a complete null set.
     limit: Option<usize>,
 }
 
