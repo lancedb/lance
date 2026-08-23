@@ -10,7 +10,7 @@ use arrow_array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
-use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
+use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 
 use crate::Result;
@@ -244,6 +244,8 @@ pub(super) fn assert_columns_match(actual: &RecordBatch, fixture: &Fixture, row_
     }
 }
 
+pub(super) const DIM: u32 = 32;
+
 /// Tag a reader's schema with dataset-level metadata.
 ///
 /// The imperative suite's own fixtures do this deliberately — `scanner.rs:6489` says "so it tests
@@ -297,4 +299,161 @@ pub(super) async fn test_dataset_versioned(version: LanceFileVersion) -> Dataset
     )
     .await
     .unwrap()
+}
+
+/// Written through a real (in-memory) object store rather than `into_ram_dataset`, so index
+/// creation and `io_stats_incremental` both work.
+pub(super) async fn vector_dataset() -> Dataset {
+    use crate::dataset::WriteParams;
+    use arrow::datatypes::{Float32Type, Int32Type};
+
+    // 1024 rows so PQ has enough to train on, split into two fragments so plans exercise the
+    // multi-fragment path.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col("s", array::rand_utf8(ByteCount::from(8), false))
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(DIM)))
+        .into_reader_rows(RowCount::from(256), BatchCount::from(4));
+    Dataset::write(
+        tagged(data),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 512,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// A query inside the fixture's value range.
+///
+/// `rand_vec` draws each coordinate from [0, 1), so a query built from raw indices would sit far
+/// outside the cloud, at nearly the same distance from every row. "The five nearest" is then a
+/// coin flip no approximate index can be expected to win, and the recall assertions below would
+/// measure the query rather than the plan.
+pub(super) fn query_vector() -> arrow_array::Float32Array {
+    arrow_array::Float32Array::from((0..DIM).map(|v| v as f32 / DIM as f32).collect::<Vec<_>>())
+}
+
+/// A vector dataset with an IVF_PQ index covering every fragment.
+pub(super) async fn indexed_vector_dataset() -> Dataset {
+    indexed_vector_dataset_with_metric(lance_linalg::distance::DistanceType::L2).await
+}
+
+/// As [`indexed_vector_dataset`], but with the index built for a chosen metric.
+pub(super) async fn indexed_vector_dataset_with_metric(
+    metric: lance_linalg::distance::DistanceType,
+) -> Dataset {
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+
+    let mut dataset = vector_dataset().await;
+    // Two partitions, so the plan exercises the multi-partition path, and no quantizer. The
+    // fixture's coordinates are uniform random, so in 32 dimensions its rows sit at nearly equal
+    // distances from any query: a quantizer's error then exceeds the gaps it has to preserve, and
+    // which rows come back varies with how k-means happened to land. That noise measures the
+    // quantizer, not the plan, which is what these assertions are about.
+    let params = VectorIndexParams::ivf_flat(2, metric);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+}
+
+// ---------------------------------------------------------------------------------------------
+// Search oracles
+// ---------------------------------------------------------------------------------------------
+
+/// The `i` values of the `k` vectors closest to `query`, computed by brute force over the whole
+/// dataset. Ties broken by `i`, so the answer is a sequence rather than a set.
+pub(super) async fn exact_neighbors(
+    dataset: &Dataset,
+    query: &arrow_array::Float32Array,
+    metric: lance_linalg::distance::DistanceType,
+    k: usize,
+) -> Result<Vec<i32>> {
+    use arrow_array::cast::AsArray;
+
+    let fixture = Fixture::read(dataset).await?;
+    let vectors = fixture.rows["vec"].as_fixed_size_list();
+    let distances = metric.arrow_batch_func()(query, vectors)?;
+
+    let mut ranked = fixture
+        .ids()
+        .iter()
+        .copied()
+        .zip(distances.values().iter().copied())
+        .filter(|(_, distance)| !distance.is_nan())
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(k);
+    Ok(ranked.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Assert a vector search found at least `min_recall` of the true nearest neighbours, and returned
+/// them in nondecreasing distance order.
+///
+/// Recall rather than equality because an IVF_PQ index is approximate by construction: it quantizes
+/// the vectors and probes a subset of partitions, so an exact match would be a coincidence of the
+/// fixture's size rather than a contract. Pass `1.0` where the search is brute force and the exact
+/// answer *is* the contract.
+pub(super) async fn assert_search_recall(
+    dataset: &Dataset,
+    config: impl ScanConfig,
+    query: &arrow_array::Float32Array,
+    metric: lance_linalg::distance::DistanceType,
+    k: usize,
+    min_recall: f64,
+) -> Result<()> {
+    let fixture = Fixture::read(dataset).await?;
+    let expected = exact_neighbors(dataset, query, metric, k).await?;
+
+    let actual = scan_rows(dataset, probe_every_partition(config)).await?;
+    let row_ids = row_ids_of(&actual);
+    assert_eq!(row_ids.len(), k, "search returned the wrong number of rows");
+    assert_distances_ascending(&actual);
+    assert_columns_match(&actual, &fixture, &row_ids);
+
+    let found = fixture.ids_of(&row_ids);
+    let hits = found.iter().filter(|id| expected.contains(id)).count();
+    let recall = hits as f64 / expected.len() as f64;
+    assert!(
+        recall >= min_recall,
+        "recall {recall} below {min_recall}: expected {expected:?}, got {found:?}"
+    );
+    Ok(())
+}
+
+/// Probe both of the fixture index's partitions.
+///
+/// The default probes one of the two, so recall then depends mostly on which partition k-means put
+/// the neighbours in — it varies run to run and says nothing about the plan. Probing both leaves
+/// quantization error, which is the approximation these assertions are about. Plan-shape tests do
+/// not go through here, so they still pin the default `minimum_nprobes=1`.
+pub(super) fn probe_every_partition(config: impl ScanConfig) -> impl ScanConfig {
+    move |scan: &mut Scanner| {
+        config(scan)?;
+        Ok(scan.minimum_nprobes(2))
+    }
+}
+
+/// Assert `_distance` never decreases down the result, which is the ordering a search promises.
+pub(super) fn assert_distances_ascending(batch: &RecordBatch) {
+    use arrow::datatypes::Float32Type;
+    use arrow_array::cast::AsArray;
+
+    let distances = batch[lance_index::vector::DIST_COL]
+        .as_primitive::<Float32Type>()
+        .values();
+    assert!(
+        distances.windows(2).all(|pair| pair[0] <= pair[1]),
+        "distances are not ascending: {distances:?}"
+    );
 }

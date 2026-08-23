@@ -29,6 +29,9 @@
 //!    ├─ validate_options + ensure_supported
 //!    │     exhaustive destructure of Scanner: an option is read, rejected, or explained
 //!    │
+//!    ├─ 0. PreparedQueries::resolve ....................................  prepare   [async]
+//!    │     resolve the FTS column and document granularity, which stage 1's schemas need
+//!    │
 //!    ├─ 1. builder::build .............................................   builder   [sync]
 //!    │     Scanner state -> the naive LogicalPlan, index-unaware
 //!    │
@@ -66,29 +69,51 @@
 //!    every equivalence test meaningless.
 //! 3. **Analyzer rules need no idempotence guard; optimizer rules do.** The optimizer runs to a
 //!    fixed point, so a structural rewrite there has to recognize its own output.
+//! 4. **Nothing may move a predicate or a limit across a search node.** Under approximation that
+//!    changes the answer. Enforced by the rule list being pinned, and pinned by tests.
+//! 5. **Output order is a plan-level contract**, stated by the builder rather than inherited from
+//!    whichever physical operator happened to sort.
 //!
 //! # Layout
 //!
-//! The framework is split by stage.
+//! The framework is split by stage; each index type keeps its own contribution together.
 //!
 //! ```text
 //! builder      stage 1: Scanner -> LogicalPlan
+//! prepare      stage 0: the async work that must precede the builder
 //! context      stage 2: the one prefetch every later stage reads from
 //! source       the scan leaf, as a TableProvider
-//! scan_index   recording on each scan how it finds its rows
+//! rules        rule plumbing shared by every index type
+//! coverage     splitting a search across indexed and unindexed fragments
+//! scan_index   recording on each scan how it finds its rows (index query, or a take)
 //! planner      stage 4: dispatch to each node's lowering
+//! take/        late materialization
+//! vector/      node, rerank, rules, planner
 //! ```
 //!
-//! Rule *ordering* stays here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a
-//! whole-plan property that no single index type can decide.
+//! The design doc proposes that an index type could one day ship its own planning support, so
+//! `vector/` reaches the framework through a fixed set of entry points rather than reaching into
+//! it. Rule *ordering* stays here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a
+//! whole-plan property that no single index can decide.
 
 pub(super) mod builder;
 pub(super) mod context;
+pub(super) mod coverage;
 pub(super) mod planner;
+pub(super) mod prepare;
+pub(super) mod rules;
 pub(super) mod scan_index;
 pub(super) mod source;
+pub(super) mod take;
 #[cfg(test)]
 mod tests;
+pub(super) mod vector;
+
+pub use coverage::*;
+pub use rules::*;
+pub use scan_index::*;
+pub use take::*;
+pub use vector::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -131,7 +156,8 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
     scanner.validate_options()?;
     ensure_supported(scanner)?;
 
-    let logical_plan = builder::build(scanner)?;
+    let prepared = prepare::PreparedQueries::resolve(scanner).await?;
+    let logical_plan = builder::build(scanner, &prepared)?;
 
     if scanner.fragments.as_ref().is_some_and(Vec::is_empty) {
         // An explicit empty fragment list means the scan reads nothing, whatever the query on top
@@ -148,7 +174,8 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
 /// Stages 2 through 4: prefetch, optimize, lower.
 ///
 /// Separate from [`create_plan`] because nothing here reads the `Scanner` — the plan is the only
-/// input. Any plan whose leaf is a [`LanceScanSource`](source::LanceScanSource) can go through it.
+/// input. Any plan whose leaf is a [`LanceScanSource`](source::LanceScanSource) can go through it,
+/// which is how [`dataframe`] plans a query DataFusion built.
 pub async fn lower(
     logical_plan: LogicalPlan,
     state: Arc<SessionState>,
@@ -233,14 +260,24 @@ fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
         return state.clone();
     }
 
+    let mut config = session
+        .copied_config()
+        .with_target_partitions(target_partitions);
+    // DataFusion compares an aggregate's physical input schema against its logical one, schema
+    // metadata included. A search emits `[_rowid, _distance]`, and whether the dataset's schema
+    // metadata rides along depends on which physical shape the search lowered to: the brute-force
+    // chain inherits it from the read below, the index chain builds its own schema without it. One
+    // logical node declares the schema for both, so the comparison cannot be satisfied — and what it
+    // would reject is metadata no aggregate reads.
+    config
+        .options_mut()
+        .execution
+        .skip_physical_aggregate_schema_check = true;
+
     let state = Arc::new(
         SessionStateBuilder::new()
             .with_default_features()
-            .with_config(
-                session
-                    .copied_config()
-                    .with_target_partitions(target_partitions),
-            )
+            .with_config(config)
             .with_runtime_env(session.runtime_env())
             .with_physical_optimizer_rules(physical_optimizer_rules())
             .build(),
@@ -267,8 +304,17 @@ fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
 /// to pin it would be worse than inheriting it. The cost is that a DataFusion upgrade can change
 /// this stage's behavior without the change being visible here.
 fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-    let _ = context;
-    Analyzer::new().rules
+    let mut rules = Analyzer::new().rules;
+    rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
+        Arc::new(ResolveVectorAccessPath::new(context.clone())),
+        // Before the split and the refine, so both see plain single-query searches.
+        Arc::new(ExpandBatchSearch),
+        Arc::new(SplitOnIndexCoverage::searches(context.clone())),
+        // After the split, so the refine lands on the *indexed branch* of a partially-covered
+        // search rather than above the union — the nesting the imperative path produces.
+        Arc::new(ExpandVectorRefine::new(context.clone())),
+    ]);
+    rules
 }
 
 /// The curated logical rule set: a pinned subset of DataFusion's rules plus the Lance-owned ones
@@ -284,12 +330,20 @@ fn optimizer_rules(
     vec![
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
+        // The rest of this list is mandatory work that could not run in the analyzer, because each
+        // rule reads something `PushDownFilter` is what settles.
+        //
+        // Which predicates reached the leaf decides the scalar index query, and the index query
+        // decides the scan's coverage — so the split runs here for scans and in the analyzer for
+        // searches. Before `PushDownLimit`, so a limit is pushed into a union of branches rather
+        // than duplicated onto each of them.
+        Arc::new(ResolveTake::new(context.clone())),
+        Arc::new(ResolveScalarIndexQuery::new(context.clone())),
+        Arc::new(SplitOnIndexCoverage::scans(context.clone())),
         Arc::new(PushDownLimit::new()),
-        // Both run after `PushDownFilter`, so the predicate they read has reached the scan. A row
-        // restriction and a scalar index query compete for the same slot on the read, and the
-        // restriction wins.
-        Arc::new(scan_index::ResolveTake::new(context.clone())),
-        Arc::new(scan_index::ResolveScalarIndexQuery::new(context.clone())),
+        // Whether a predicate sits below the search is what makes it a prefilter, and pushdown is
+        // what moves it there.
+        Arc::new(ResolvePrefilterSource::new(context.clone())),
         Arc::new(OptimizeProjections::new()),
     ]
 }
@@ -304,17 +358,18 @@ fn optimizer_rules(
 /// * `JoinSelection` — `DefaultPhysicalPlanner` emits a `HashJoinExec` with `PartitionMode::Auto`,
 ///   which panics at `execute()` unless something resolves it. It runs first so the Lance rules see
 ///   a fully-resolved plan, the same way they do today.
-/// * `EnforceSorting` — a logical `Sort` is the only way to say "this order is the result's
-///   order", so the builder states it whether or not the plan below already produces it. Whether
-///   it does is a physical fact, so only a physical rule can drop the redundant sort. It runs
-///   last, after `EnforceDistribution` has settled partitioning, which is what decides whether an
-///   ordering survives a merge.
+/// * `EnforceSorting` — the builder restates a search's ordering above the take, because a logical
+///   `Sort` is the only way to say "this order is the result's order". Whether the take preserved
+///   it is a physical fact, so only a physical rule can drop the restatement. It runs last, after
+///   `EnforceDistribution` has settled partitioning, which is what decides whether an ordering
+///   survives a merge.
 fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
         vec![Arc::new(JoinSelection::new())];
     rules.extend(get_physical_optimizer().rules);
     rules.push(Arc::new(EnforceSorting::new()));
-    // Again, because dropping a sort can leave the projections it separated adjacent.
+    // Again, because dropping the restatement leaves the projections it separated adjacent: the
+    // search's own output-order fixup and the one the user's projection asked for.
     rules.push(Arc::new(SimplifyProjection));
     rules
 }
@@ -333,18 +388,24 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         // Read by the scan leaf, which decides there which columns it reads alongside the filter
         // and which it takes afterwards.
         materialization_style: _,
-        // Read by the scan leaf.
-        include_deleted_rows: _,
+        // Carried on the search node as its query count, and expanded by `ExpandBatchSearch`.
+        is_batch_nearest: _,
+        include_deleted_rows,
 
         // Applied by the builder as a stock `Aggregate` node, which also replaces the output
         // projection. `validate_options` has already rejected limit/offset/ordering alongside it.
         aggregate: _,
+
+        // Read by `ScanPlanningContext::collect`, which narrows the searched index to the
+        // segments it names.
+        index_segments: _,
 
         // Applied to the finished plan by `create_plan`, above every rule: it only reshapes
         // batches, so nothing in planning depends on it.
         strict_batch_size: _,
 
         // Read by the builder, the source, the context, or the session config.
+        prefilter: _,
         filter: _,
         batch_size: _,
         batch_readahead: _,
@@ -353,6 +414,8 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         limit: _,
         offset: _,
         ordering: _,
+        nearest,
+        full_text_query,
         use_scalar_index: _,
         fragments: _,
         fast_search: _,
@@ -360,6 +423,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         target_parallelism: _,
         legacy_with_row_id: _,
         legacy_with_row_addr: _,
+        autoproject_scoring_columns: _,
 
         // Read by the scan leaf, which types blob columns by it and reads them accordingly.
         blob_handling: _,
@@ -376,23 +440,16 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ordered: _,
 
         // Not plan-affecting here. The callback is applied by `execute_plan` on the finished plan,
-        // and `explicit_projection` only gates a deprecation warning.
+        // `explicit_projection` only gates a deprecation warning, and `nearest_query_count` reaches
+        // the plan through the search node's query count.
         scan_stats_callback: _,
         explicit_projection: _,
-
-        // Search options. Every one of them is inert once the search itself is rejected below.
-        nearest,
-        full_text_query,
-        prefilter: _,
-        is_batch_nearest: _,
         nearest_query_count: _,
-        index_segments: _,
-        autoproject_scoring_columns: _,
     } = scanner;
 
-    if nearest.is_some() || full_text_query.is_some() {
+    if full_text_query.is_some() {
         return Err(Error::not_supported_source(
-            "The logical scan planner cannot plan a search yet".into(),
+            "The logical scan planner cannot plan a full-text search yet".into(),
         ));
     }
     if reads_row_offset(scanner)? {
@@ -402,11 +459,22 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
             "The logical scan planner cannot produce _rowoffset yet".into(),
         ));
     }
-    if projection_plan.has_output_cols() && projection_plan.physical_projection.is_empty() {
+    if *include_deleted_rows && nearest.is_some() {
+        // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
+        // same reason: a search returns row ids, and a deleted row does not have one.
+        return Err(Error::invalid_input_source(
+            "Cannot include deleted rows in a search".into(),
+        ));
+    }
+    if nearest.is_none()
+        && projection_plan.has_output_cols()
+        && projection_plan.physical_projection.is_empty()
+    {
         // `SELECT 1 AS foo` — output columns that read nothing. Not a gap: the imperative path
         // rejects this too (`scanner.rs:2846`), and for the same reason, so this states the same
         // refusal rather than deferring it. Without the guard, the leaf's "reading nothing is not a
-        // thing the reader can do" branch would quietly return row addresses instead.
+        // thing the reader can do" branch would quietly return row addresses instead. A search is
+        // exempt because it generates columns of its own, so `_distance` alone is a real query.
         //
         // Resolving the output against an empty schema first is what distinguishes the two ways to
         // land here: `SELECT 1` is unsupported, while `SELECT does_not_exist` is a missing column.

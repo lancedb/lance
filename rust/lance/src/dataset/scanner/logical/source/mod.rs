@@ -45,9 +45,16 @@ use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{FilterPlan as ExprFilterPlan, Planner};
 use crate::{Error, Result};
 
-/// How a scan is narrowed to the rows one part of the plan is responsible for.
+/// How a branch's scan is narrowed to the rows that branch is responsible for.
+///
+/// The two variants are the same statement at two granularities, which is the point: index
+/// coverage has holes at fragment level (the index never saw those rows) and at row level (the
+/// index saw the row before a data overlay changed it), and both holes are filled by a
+/// brute-force branch reading exactly the rows in the hole.
 #[derive(Debug, Clone)]
 pub enum ScanRestriction {
+    /// Read only these fragments.
+    Fragments(Arc<Vec<Fragment>>),
     /// Read only these rows, identified by row id.
     Rows(Arc<RowAddrTreeMap>),
 }
@@ -88,7 +95,9 @@ pub struct ScanSourceOptions {
     /// Read only these rows, from [`ScanRestriction::Rows`].
     ///
     /// The row set arrives through the same leaf slot a scalar-index result would, so a scan
-    /// restricted this way cannot also consult a scalar index.
+    /// restricted this way cannot also consult a scalar index — which is exactly right for the
+    /// case that produces one: these rows were singled out *because* their index entries are no
+    /// longer trustworthy.
     pub rows: Option<Arc<RowAddrTreeMap>>,
     /// How this scan's predicate splits into a scalar index query and a refine filter.
     ///
@@ -96,6 +105,10 @@ pub struct ScanSourceOptions {
     /// what makes the index decision part of the plan rather than a private detail of
     /// [`TableProvider::scan`] — see [`ResolveScalarIndexQuery`](ResolveScalarIndexQuery).
     pub filter_plan: Option<ExprFilterPlan>,
+    /// Rows the scalar index result must not emit, because a data overlay invalidated its entries
+    /// for them. The same rows are re-read on a sibling branch, restricted by
+    /// [`ScanRestriction::Rows`].
+    pub overlay_block: Option<Arc<RowAddrTreeMap>>,
     /// The scanner this plan came from, captured only for legacy (v1) datasets.
     ///
     /// The legacy scan builder reads its options straight off `&Scanner` and is frozen, so the v1
@@ -127,6 +140,7 @@ impl std::fmt::Debug for ScanSourceOptions {
             .field("include_deleted_rows", &self.include_deleted_rows)
             .field("rows", &self.rows)
             .field("filter_plan", &self.filter_plan)
+            .field("overlay_block", &self.overlay_block)
             .field("legacy", &self.legacy_scanner.is_some())
             .finish()
     }
@@ -192,21 +206,30 @@ impl LanceScanSource {
 
     /// The scan-wide settings this leaf was built with.
     ///
-    /// Read from here rather than from the `Scanner`, which is what lets stages 2 through 4 run
-    /// against any plan whose leaf is a Lance scan.
+    /// Stage 2 reads them from here rather than from the `Scanner`, which is what lets stages 2
+    /// through 4 run against any plan whose leaf is a Lance scan.
     pub fn options(&self) -> &ScanSourceOptions {
         &self.options
     }
 
-    /// The same source, reading only the rows `restriction` names.
+    /// The same source narrowed to part of the dataset.
     ///
-    /// The schema is unchanged, so a `TableScan`'s `projected_schema` stays valid across the swap.
+    /// Used by [`SplitOnIndexCoverage`](SplitOnIndexCoverage) to give the indexed
+    /// and brute-force branches disjoint row sets. The schema is unchanged, so a `TableScan`'s
+    /// `projected_schema` stays valid across the swap.
     pub fn restricted_to(&self, restriction: &ScanRestriction) -> Self {
         let options = match restriction {
+            ScanRestriction::Fragments(fragments) => ScanSourceOptions {
+                fragments: Some(fragments.clone()),
+                ..self.options.clone()
+            },
+            // The resolved filter plan goes with it: it was resolved *using* the index whose
+            // entries for these rows are the reason this branch exists.
             ScanRestriction::Rows(rows) => ScanSourceOptions {
                 rows: Some(rows.clone()),
                 use_scalar_index: false,
                 filter_plan: None,
+                overlay_block: None,
                 ..self.options.clone()
             },
         };
@@ -225,6 +248,19 @@ impl LanceScanSource {
     pub fn with_filter_plan(&self, filter_plan: ExprFilterPlan) -> Self {
         self.with_options(ScanSourceOptions {
             filter_plan: Some(filter_plan),
+            ..self.options.clone()
+        })
+    }
+
+    /// The rows withheld from this source's index result, if a split has already happened here.
+    pub fn overlay_block(&self) -> Option<&Arc<RowAddrTreeMap>> {
+        self.options.overlay_block.as_ref()
+    }
+
+    /// The same source, with `rows` withheld from whatever its index query returns.
+    pub fn blocking(&self, rows: Arc<RowAddrTreeMap>) -> Self {
+        self.with_options(ScanSourceOptions {
+            overlay_block: Some(rows),
             ..self.options.clone()
         })
     }
@@ -448,7 +484,6 @@ impl LanceScanSource {
     /// mask. That does not by itself make the scan re-executable — `FilteredReadExec` drains one
     /// shared task stream per instance, so every Lance scan plan is single-execution — but it keeps
     /// the reason for that in one place instead of two.
-    /// A row restriction, shaped as the scalar-index result the leaf reads its rows from.
     fn rows_as_index_input(&self, rows: &RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
         let result = IndexExprResult::exact(RowAddrMask::from_allowed(rows.clone()));
         let batch = result.serialize(
@@ -539,6 +574,15 @@ impl LanceScanSource {
                     "a legacy (v1) scan reached the leaf without the scanner it needs".to_string(),
                 ));
             };
+            // Both of these come from a data overlay, and no writer can put one on a v1 dataset:
+            // `lance_file::versions::create_writer` refuses `V1`. Reaching here means a split rule
+            // produced a branch for a dataset that cannot have the coverage gap it is filling.
+            if self.options.rows.is_some() || self.options.overlay_block.is_some() {
+                return Err(Error::internal(
+                    "a legacy (v1) scan was restricted by a data overlay, which v1 cannot have"
+                        .to_string(),
+                ));
+            }
             let plan = v1::scan(
                 scanner,
                 &filter_plan,
@@ -585,6 +629,11 @@ impl LanceScanSource {
         }
         if let Some(scan_range) = scan_range {
             read_options = read_options.with_scan_range_before_filter(scan_range)?;
+        }
+
+        if let Some(rows) = &self.options.overlay_block {
+            read_options =
+                read_options.with_overlay_block(RowAddrMask::from_block(rows.as_ref().clone()));
         }
 
         // A row restriction and a scalar-index query compete for the same slot, and

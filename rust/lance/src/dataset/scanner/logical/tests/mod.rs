@@ -7,4 +7,6 @@
 //! the logical path and compare the rows. See [`harness`] for that oracle.
 
 mod harness;
+mod planner;
 mod scan;
+mod vector;
