@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
 
@@ -319,22 +320,36 @@ impl InvertedIndexBuilder {
                 if partition_builder.is_empty() {
                     continue;
                 }
-                match &mut merged {
-                    Some(merged) => {
-                        let would_exceed_memory = merged
+                match merged.take() {
+                    Some(mut accumulated) => {
+                        let would_exceed_memory = accumulated
                             .memory_size()
                             .saturating_add(partition_builder.memory_size())
                             >= memory_limit_bytes;
-                        let would_exceed_doc_ids = merged
+                        let would_exceed_doc_ids = accumulated
                             .docs
                             .len()
                             .saturating_add(partition_builder.docs.len())
                             > u32::MAX as usize;
                         if would_exceed_memory || would_exceed_doc_ids {
-                            let builder = std::mem::replace(merged, partition_builder);
-                            files.extend(self.write_new_partition(dest_store, builder).await?);
+                            merged = Some(partition_builder);
+                            files.extend(self.write_new_partition(dest_store, accumulated).await?);
                         } else {
-                            merged.merge_from(partition_builder)?;
+                            // `merge_from` remaps token ids into a unified
+                            // dictionary and concatenates posting lists across
+                            // builders holding up to LANCE_FTS_PARTITION_SIZE of
+                            // state, so it runs for seconds at a time. Inline it
+                            // would occupy a runtime worker for that whole span,
+                            // starving the tasks driving in-flight uploads; the
+                            // upload's whole-request timeout keeps running while
+                            // its task waits to be polled. The builder is moved
+                            // in and handed back so ownership survives the hop.
+                            accumulated = spawn_cpu(move || {
+                                accumulated.merge_from(partition_builder)?;
+                                Result::Ok(accumulated)
+                            })
+                            .await?;
+                            merged = Some(accumulated);
                         }
                     }
                     None => merged = Some(partition_builder),
@@ -1161,8 +1176,10 @@ impl InnerBuilder {
                 batch_rows,
             );
             let mut posting_lists = posting_lists.into_iter();
+            let mut encode_elapsed = Duration::ZERO;
             loop {
                 let docs_for_batches = docs_for_batches.clone();
+                let encode_started = Instant::now();
                 // Build the next batch on the CPU pool. The builder and the
                 // remaining posting lists are moved in and handed back so state
                 // persists across batches.
@@ -1187,6 +1204,7 @@ impl InnerBuilder {
                     Result::Ok((batch_builder, posting_lists, batch))
                 })
                 .await?;
+                encode_elapsed += encode_started.elapsed();
                 batch_builder = next_builder;
                 posting_lists = next_posting_lists;
 
@@ -1201,11 +1219,15 @@ impl InnerBuilder {
                 }
             }
 
-            Result::Ok(())
+            Result::Ok(encode_elapsed)
         });
 
+        let mut write_elapsed = Duration::ZERO;
         while let Ok(batch) = rx.recv().await {
-            if let Err(err) = writer.write_record_batch(batch).await {
+            let write_started = Instant::now();
+            let result = writer.write_record_batch(batch).await;
+            write_elapsed += write_started.elapsed();
+            if let Err(err) = result {
                 drop(rx);
                 // Wait for producer to stop; preserve the write error as the primary failure.
                 let _ = producer.await;
@@ -1213,8 +1235,21 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        producer.await??;
-        writer.finish().await
+        let encode_elapsed = producer.await??;
+        let finish_started = Instant::now();
+        let file = writer.finish().await?;
+        write_elapsed += finish_started.elapsed();
+
+        // Splits the cost of a partition write into the two halves that are
+        // otherwise indistinguishable from the outside, so a build that fails on
+        // an upload timeout shows whether encoding or the upload dominated.
+        log::info!(
+            "wrote posting lists of partition {}: {:.1?} encoding, {:.1?} writing",
+            id,
+            encode_elapsed,
+            write_elapsed
+        );
+        Ok(file)
     }
 
     #[instrument(level = "debug", skip_all)]

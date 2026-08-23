@@ -69,6 +69,7 @@ from .lance import (
     _MergeInsertBuilder,
     _parse_field_path,
     _Scanner,
+    _serialize_row_addrs,
     _write_dataset,
     indices,
 )
@@ -1169,6 +1170,8 @@ class LanceDataset(pa.dataset.Dataset):
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -1368,6 +1371,14 @@ class LanceDataset(pa.dataset.Dataset):
 
             This parameter allows you to opt-in to the new behavior early, to avoid
             being subject to breaking changes in the future.
+        row_addr_allowlist: bytes, default None
+            Restrict the scan to these row addresses. A serialized roaring treemap
+            over ``_rowid`` (``RowAddrTreeMap::serialize_into`` output). Applied
+            before KNN / BM25 ranking, so top-k is computed over the surviving rows
+            rather than filtered afterwards.
+        row_addr_blocklist: bytes, default None
+            Exclude these row addresses, same encoding as ``row_addr_allowlist``.
+            Combined with it when both are given.
 
 
         .. note::
@@ -1410,6 +1421,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         setopt(builder.filter, filter)
         setopt(builder.prefilter, prefilter)
+        if row_addr_allowlist is not None or row_addr_blocklist is not None:
+            builder.row_addr_prefilter(row_addr_allowlist, row_addr_blocklist)
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
@@ -5670,6 +5683,14 @@ class DatasetDelta:
         """
         return self._delta.get_updated_rows()
 
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
+
 
 class _DatasetDeltaBuilder:
     """Internal builder for :class:`DatasetDelta`.
@@ -5782,6 +5803,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
@@ -6412,6 +6434,18 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
+    """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
+
+    Those parameters take a serialized roaring treemap over ``_rowid``; this is
+    the way to produce one from Python.
+
+    >>> blob = serialize_row_addrs([0, 2, 4])                    # doctest: +SKIP
+    >>> ds.scanner(row_addr_allowlist=blob).to_table()           # doctest: +SKIP
+    """
+    return _serialize_row_addrs(list(addrs))
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -6420,6 +6454,8 @@ class ScannerBuilder:
         self._search_filter = None
         self._substrait_filter = None
         self._prefilter = False
+        self._row_addr_allowlist: Optional[bytes] = None
+        self._row_addr_blocklist: Optional[bytes] = None
         self._late_materialization = None
         self._blob_handling = None
         self._offset = None
@@ -6633,6 +6669,25 @@ class ScannerBuilder:
             if search_filter is not None:
                 self.filter(search_filter)
 
+        return self
+
+    def row_addr_prefilter(
+        self,
+        allowlist: Optional[bytes] = None,
+        blocklist: Optional[bytes] = None,
+    ) -> ScannerBuilder:
+        """Restrict the scan to an externally supplied set of row addresses.
+
+        allowlist / blocklist are serialized roaring treemaps over ``_rowid``
+        (``RowAddrTreeMap::serialize_into`` output); passing neither clears the
+        mask. Applied before KNN / BM25 ranking, so top-k is computed over the
+        surviving rows rather than filtered afterwards.
+
+        Bytes rather than an object so the mask can be produced by a different
+        extension module -- nothing Rust-typed crosses the boundary.
+        """
+        self._row_addr_allowlist = allowlist
+        self._row_addr_blocklist = blocklist
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -6927,6 +6982,8 @@ class ScannerBuilder:
             self._orderings,
             self._disable_scoring_autoprojection,
             self._substrait_aggregate,
+            self._row_addr_allowlist,
+            self._row_addr_blocklist,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

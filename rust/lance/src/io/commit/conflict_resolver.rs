@@ -787,15 +787,16 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
-                    let newly_indexed_fields = new_indices
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -1198,20 +1199,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::CreateIndex { new_indices, .. } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
                     //
                     // TODO: We could potentially just drop the fragments being replaced from
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
-                    let newly_indexed_fields = new_indices
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -2749,6 +2751,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -3395,7 +3398,6 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
-                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -3825,6 +3827,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
             index_details: None,
@@ -3881,6 +3884,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: MEM_WAL_INDEX_NAME.to_string(),
             fields: vec![],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -3957,6 +3961,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -4023,6 +4028,7 @@ mod tests {
                         uuid: uuid::Uuid::new_v4(),
                         name: "test".to_string(),
                         fields: vec![0],
+                        covering_fields: vec![],
                         dataset_version: 1,
                         fragment_bitmap: None,
                         index_details: None,
@@ -4055,6 +4061,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "text_ngram".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
             index_details: Some(Arc::new(prost_types::Any {
@@ -4070,6 +4077,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: FRAG_REUSE_INDEX_NAME.to_string(),
             fields: vec![],
+            covering_fields: vec![],
             dataset_version: 2,
             fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
             index_details: None,
@@ -4739,6 +4747,41 @@ mod tests {
                 },
                 Retryable,
             ),
+            (
+                // Unlike every other case here, op1 is CreateIndex and op2 is
+                // DataReplacement. This is deliberate, not an inconsistency:
+                // `check_txn` dispatches on op1's operation type, so only
+                // op1 == CreateIndex reaches `check_create_index_txn`'s
+                // `Operation::DataReplacement` arm, which is the arm this case
+                // targets. Swapping the order to match the other cases would
+                // instead exercise the mirrored `check_data_replacement_txn`'s
+                // `Operation::CreateIndex` arm, leaving the intended arm with
+                // zero coverage.
+                "CreateIndex covering a field vs DataReplacement of that field",
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: Uuid::new_v4(),
+                        name: "covering_idx".to_string(),
+                        fields: vec![0, 3],
+                        covering_fields: vec![3],
+                        dataset_version: 1,
+                        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                        files: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("path0_3", vec![3], None),
+                    )],
+                },
+                Retryable,
+            ),
         ];
 
         for (description, op1, op2, expected) in cases {
@@ -4796,7 +4839,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4805,7 +4847,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4836,7 +4877,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4845,7 +4885,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4877,7 +4916,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4886,7 +4924,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4918,7 +4955,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4927,7 +4963,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4978,7 +5013,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5004,7 +5038,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5051,7 +5084,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
