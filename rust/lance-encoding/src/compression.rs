@@ -66,6 +66,7 @@ use crate::{
         ProtobufUtils21,
         pb21::{CompressiveEncoding, compressive_encoding::Compression},
     },
+    predicate::PrimitivePredicate,
     statistics::{GetStat, Stat},
 };
 
@@ -907,6 +908,19 @@ pub fn try_raw_block(data: &DataBlock) -> Option<(Box<dyn BlockCompressor>, Comp
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Evaluates a primitive predicate without requiring an Arrow value array.
+    ///
+    /// Implementations return `None` when they do not have an encoded kernel. The caller then
+    /// falls back to `decompress` followed by a `DataBlock` comparison.
+    fn evaluate_primitive_predicate(
+        &self,
+        _data: Vec<LanceBuffer>,
+        _num_values: u64,
+        _predicate: &PrimitivePredicate,
+    ) -> Result<Option<DataBlock>> {
+        Ok(None)
+    }
 
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///

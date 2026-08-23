@@ -25,6 +25,7 @@ use lance_encoding::{
         RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
+    predicate::{PrimitivePredicate, PrimitivePredicatePlan},
 };
 use log::debug;
 use object_store::path::Path;
@@ -2258,6 +2259,36 @@ impl ProjectedFileReader {
 
     pub fn version(&self) -> ConcreteFileVersion {
         self.core.metadata_provider.version()
+    }
+
+    /// Returns a metadata-only plan for a one-column primitive predicate projection.
+    pub async fn primitive_predicate_plan(
+        &self,
+        projection: ReaderProjection,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Option<PrimitivePredicatePlan>> {
+        if projection.schema.fields.len() != 1 {
+            return Ok(None);
+        }
+        let field = &projection.schema.fields[0];
+        let data_type = field.data_type();
+        let (prepared, _) = self
+            .core
+            .read_projection
+            .prepare(
+                &self.core.metadata_provider,
+                &projection,
+                &self.core.scheduler,
+                &self.core.cache,
+            )
+            .await?;
+        let [column_index] = prepared.decoder_projection.column_indices.as_slice() else {
+            return Ok(None);
+        };
+        let Some(column_info) = prepared.column_infos.get(*column_index as usize) else {
+            return Ok(None);
+        };
+        column_info.primitive_predicate_plan(&data_type, field.nullable, predicate)
     }
 
     pub async fn read_tasks(

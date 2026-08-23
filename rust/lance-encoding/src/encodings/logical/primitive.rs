@@ -74,6 +74,7 @@ use crate::constants::{
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY,
 };
+use crate::predicate::PrimitivePredicate;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
@@ -171,6 +172,7 @@ struct DecodeMiniBlockTask {
     max_visible_level: u16,
     instructions: Vec<(ChunkDrainInstructions, LoadedChunk)>,
     has_large_chunk: bool,
+    predicate: Option<PrimitivePredicate>,
 }
 
 impl DecodeMiniBlockTask {
@@ -534,9 +536,31 @@ impl DecodeMiniBlockTask {
             })
             .collect::<Vec<_>>();
 
-        let values = self
-            .value_decompressor
-            .decompress(buffers, items_in_chunk)?;
+        let values = if let Some(predicate) = &self.predicate {
+            if self.dictionary_data.is_some() {
+                return Err(Error::not_supported_source(
+                    "Encoded primitive predicates do not support dictionary miniblocks".into(),
+                ));
+            }
+            match self.value_decompressor.evaluate_primitive_predicate(
+                buffers.clone(),
+                items_in_chunk,
+                predicate,
+            )? {
+                Some(matches) => matches,
+                None => {
+                    crate::predicate::record_fallback_values(items_in_chunk);
+                    predicate.evaluate_block(
+                        &self
+                            .value_decompressor
+                            .decompress(buffers, items_in_chunk)?,
+                    )?
+                }
+            }
+        } else {
+            self.value_decompressor
+                .decompress(buffers, items_in_chunk)?
+        };
 
         let rep = rep
             .map(|rep| {
@@ -714,6 +738,28 @@ struct MiniBlockDecoder {
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        self.drain_task(num_rows, None)
+    }
+
+    fn drain_primitive_predicate(
+        &mut self,
+        num_rows: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Box<dyn DecodePageTask>> {
+        self.drain_task(num_rows, Some(predicate.clone()))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
+
+impl MiniBlockDecoder {
+    fn drain_task(
+        &mut self,
+        num_rows: u64,
+        predicate: Option<PrimitivePredicate>,
+    ) -> Result<Box<dyn DecodePageTask>> {
         let mut items_desired = num_rows;
         let mut need_preamble = false;
         let mut skip_in_chunk = self.offset_in_current_chunk;
@@ -756,11 +802,8 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             num_buffers: self.num_buffers,
             max_visible_level,
             has_large_chunk: self.has_large_chunk,
+            predicate,
         }))
-    }
-
-    fn num_rows(&self) -> u64 {
-        self.num_rows
     }
 }
 
@@ -4383,15 +4426,25 @@ pub struct StructuralPrimitiveFieldDecoder {
     page_decoders: VecDeque<Box<dyn StructuralPageDecoder>>,
     should_validate: bool,
     rows_drained_in_current: u64,
+    predicate: Option<PrimitivePredicate>,
 }
 
 impl StructuralPrimitiveFieldDecoder {
     pub fn new(field: &Arc<ArrowField>, should_validate: bool) -> Self {
+        Self::new_with_predicate(field, should_validate, None)
+    }
+
+    pub fn new_with_predicate(
+        field: &Arc<ArrowField>,
+        should_validate: bool,
+        predicate: Option<PrimitivePredicate>,
+    ) -> Self {
         Self {
             field: field.clone(),
             page_decoders: VecDeque::new(),
             should_validate,
             rows_drained_in_current: 0,
+            predicate,
         }
     }
 }
@@ -4422,7 +4475,11 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             let num_in_page = cur_page.num_rows() - self.rows_drained_in_current;
             let to_take = num_in_page.min(remaining);
 
-            let task = cur_page.drain(to_take)?;
+            let task = if let Some(predicate) = &self.predicate {
+                cur_page.drain_primitive_predicate(to_take, predicate)?
+            } else {
+                cur_page.drain(to_take)?
+            };
             tasks.push(task);
 
             if to_take == num_in_page {
@@ -7384,6 +7441,7 @@ mod tests {
                 },
             )],
             has_large_chunk: false,
+            predicate: None,
         };
 
         let decoded = Box::new(task).decode().unwrap();

@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array};
+use arrow_array::{Array, ArrayRef, Int32Array, UInt32Array, new_empty_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -22,6 +22,7 @@ use crate::{
     encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
     format::ProtobufUtils21,
+    predicate::{PrimitiveLiteral, PrimitivePredicate},
     repdef::{DefinitionInterpretation, RepDefUnraveler},
 };
 
@@ -389,14 +390,11 @@ impl ConstantPageDecoder {
         }
         Ok(())
     }
-}
 
-impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPageDecoder {
-    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
+    fn drain_level_slices(&mut self, num_rows: u64) -> Result<(Vec<Range<usize>>, u64)> {
         let drained_ranges = self.drain_ranges(num_rows);
-
         let mut level_slices: Vec<Range<usize>> = Vec::new();
-        let mut visible_items_total: u64 = 0;
+        let mut visible_items_total = 0;
 
         for range in drained_ranges {
             self.skip_to_row(range.start)?;
@@ -412,6 +410,13 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
                 level_slices.push(level_range);
             }
         }
+        Ok((level_slices, visible_items_total))
+    }
+}
+
+impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPageDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
+        let (level_slices, visible_items_total) = self.drain_level_slices(num_rows)?;
 
         Ok(Box::new(DecodeConstantTask {
             scalar: self.scalar.clone(),
@@ -424,8 +429,73 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
         }))
     }
 
+    fn drain_primitive_predicate(
+        &mut self,
+        num_rows: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
+        let value = match predicate.literal {
+            PrimitiveLiteral::Int32(_) => self
+                .scalar
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| Error::invalid_input("Expected Int32 constant predicate page"))?
+                .value(0) as u32,
+            PrimitiveLiteral::UInt32(_) => self
+                .scalar
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::invalid_input("Expected UInt32 constant predicate page"))?
+                .value(0),
+        };
+        let (level_slices, visible_items_total) = self.drain_level_slices(num_rows)?;
+        Ok(Box::new(DecodeConstantPredicateTask {
+            value,
+            predicate: predicate.clone(),
+            rep: self.rep.clone(),
+            def: self.def.clone(),
+            level_slices,
+            visible_items_total,
+            def_meaning: self.def_meaning.clone(),
+            max_visible_def: self.max_visible_def,
+        }))
+    }
+
     fn num_rows(&self) -> u64 {
         self.num_rows
+    }
+}
+
+#[derive(Debug)]
+struct DecodeConstantPredicateTask {
+    value: u32,
+    predicate: PrimitivePredicate,
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+    level_slices: Vec<Range<usize>>,
+    visible_items_total: u64,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_def: u16,
+}
+
+impl crate::decoder::DecodePageTask for DecodeConstantPredicateTask {
+    fn decode(self: Box<Self>) -> Result<crate::decoder::DecodedPage> {
+        let rep = DecodeConstantTask::slice_levels(&self.rep, &self.level_slices);
+        let def = DecodeConstantTask::slice_levels(&self.def, &self.level_slices);
+        let visible_items_total = if let Some(def) = &def {
+            def.iter().filter(|d| **d <= self.max_visible_def).count() as u64
+        } else {
+            self.visible_items_total
+        };
+        let data = self.predicate.evaluate_u32_runs(
+            [(self.value, visible_items_total as usize)],
+            visible_items_total,
+        )?;
+        crate::predicate::record_direct_values(visible_items_total);
+        Ok(crate::decoder::DecodedPage {
+            data,
+            repdef: RepDefUnraveler::new(rep, def, self.def_meaning.clone(), visible_items_total),
+        })
     }
 }
 

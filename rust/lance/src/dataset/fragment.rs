@@ -40,7 +40,8 @@ use lance_core::{
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_encoding::decoder::DecoderPlugins;
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::predicate::{PrimitivePredicate, PrimitivePredicatePlan};
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
 };
@@ -123,6 +124,26 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
+
+    /// Reads a one-column Boolean projection produced by an encoded primitive predicate.
+    fn read_ranges_predicate_tasks(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _batch_size: u32,
+        _projection: Arc<lance_core::datatypes::Schema>,
+        _filter: FilterExpression,
+    ) -> BoxFuture<'_, Result<Option<ReadBatchTaskStream>>> {
+        async { Ok(None) }.boxed()
+    }
+
+    /// Returns a metadata-only plan for a one-column primitive predicate projection.
+    fn primitive_predicate_plan(
+        &self,
+        _projection: Arc<lance_core::datatypes::Schema>,
+        _predicate: PrimitivePredicate,
+    ) -> BoxFuture<'_, Result<Option<PrimitivePredicatePlan>>> {
+        async { Ok(None) }.boxed()
+    }
     /// Reads all rows from the file, returning as a stream of tasks
     fn read_all_tasks(
         &self,
@@ -305,8 +326,6 @@ impl GenericFileReader for V1Reader {
 }
 
 mod v2_adapter {
-    use lance_encoding::decoder::FilterExpression;
-
     use super::*;
 
     #[derive(Debug, Clone)]
@@ -394,6 +413,56 @@ mod v2_adapter {
                         num_rows: v2_task.num_rows,
                     })
                     .boxed())
+            }
+            .boxed()
+        }
+
+        fn read_ranges_predicate_tasks(
+            &self,
+            ranges: Arc<[Range<u64>]>,
+            batch_size: u32,
+            projection: Arc<Schema>,
+            filter: FilterExpression,
+        ) -> BoxFuture<'_, Result<Option<ReadBatchTaskStream>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                let tasks = self
+                    .reader
+                    .read_tasks(
+                        ReadBatchParams::Ranges(ranges),
+                        batch_size,
+                        Some(projection),
+                        filter,
+                    )
+                    .await?
+                    .map(|v2_task| ReadBatchTask {
+                        task: v2_task.task.map_err(Error::from).boxed(),
+                        num_rows: v2_task.num_rows,
+                    })
+                    .boxed();
+                Ok(Some(tasks))
+            }
+            .boxed()
+        }
+
+        fn primitive_predicate_plan(
+            &self,
+            projection: Arc<Schema>,
+            predicate: PrimitivePredicate,
+        ) -> BoxFuture<'_, Result<Option<PrimitivePredicatePlan>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .primitive_predicate_plan(projection, &predicate)
+                    .await
             }
             .boxed()
         }
@@ -3375,6 +3444,63 @@ impl FragmentReader {
                 })
                 .boxed(),
         )
+    }
+
+    /// Evaluates a one-column encoded primitive predicate over physical row ranges.
+    ///
+    /// This intentionally bypasses overlays and deletion handling. Callers use the returned
+    /// Boolean mask only to choose physical rows for a subsequent ordinary fragment read.
+    pub(crate) async fn read_ranges_predicate(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        projection: Arc<Schema>,
+        filter: FilterExpression,
+    ) -> Result<Option<ReadBatchFutStream>> {
+        if self.overlay.is_some() || projection.fields.len() != 1 {
+            return Ok(None);
+        }
+        let field_id = projection.fields[0].id;
+        let mut readers = self
+            .readers
+            .iter()
+            .filter(|reader| reader.projection().field_by_id(field_id).is_some());
+        let Some(reader) = readers.next() else {
+            return Ok(None);
+        };
+        if readers.next().is_some() {
+            return Ok(None);
+        }
+        let Some(tasks) = reader
+            .read_ranges_predicate_tasks(ranges, batch_size, projection, filter)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(tasks.map(|task| task.task).boxed()))
+    }
+
+    /// Returns a metadata-only plan for a one-column encoded primitive predicate.
+    pub(crate) async fn primitive_predicate_plan(
+        &self,
+        projection: Arc<Schema>,
+        predicate: PrimitivePredicate,
+    ) -> Result<Option<PrimitivePredicatePlan>> {
+        if self.overlay.is_some() || projection.fields.len() != 1 {
+            return Ok(None);
+        }
+        let field_id = projection.fields[0].id;
+        let mut readers = self
+            .readers
+            .iter()
+            .filter(|reader| reader.projection().field_by_id(field_id).is_some());
+        let Some(reader) = readers.next() else {
+            return Ok(None);
+        };
+        if readers.next().is_some() {
+            return Ok(None);
+        }
+        reader.primitive_predicate_plan(projection, predicate).await
     }
 
     /// Reads a range and concatenates the result into one batch.

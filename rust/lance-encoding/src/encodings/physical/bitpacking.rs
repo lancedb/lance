@@ -31,6 +31,7 @@ use crate::encodings::logical::primitive::miniblock::{
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
+use crate::predicate::PrimitivePredicate;
 use crate::statistics::{GetStat, Stat};
 use bytemuck::Pod;
 
@@ -290,6 +291,60 @@ impl InlineBitpacking {
             block_info: BlockInfo::new(),
         })
     }
+
+    fn evaluate_u32(
+        data: LanceBuffer,
+        num_values: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<DataBlock> {
+        if num_values > ELEMS_PER_CHUNK {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking chunk has {} values, expected at most {}",
+                    num_values, ELEMS_PER_CHUNK
+                ),
+            ));
+        }
+        if data.len() < std::mem::size_of::<u32>()
+            || !data.len().is_multiple_of(std::mem::size_of::<u32>())
+        {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!("Invalid 32-bit inline bitpacking chunk size {}", data.len()),
+            ));
+        }
+        let words = data.borrow_to_typed_view::<u32>();
+        let bit_width = words[0] as usize;
+        if bit_width > 32 {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!("Inline bitpacking width {bit_width} exceeds 32-bit values"),
+            ));
+        }
+        let packed = &words[1..];
+        let expected_bytes = bit_width * ELEMS_PER_CHUNK as usize / 8;
+        if std::mem::size_of_val(packed) != expected_bytes {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking payload has {} bytes, expected {expected_bytes}",
+                    std::mem::size_of_val(packed)
+                ),
+            ));
+        }
+
+        let mut decoded = [std::mem::MaybeUninit::<u32>::uninit(); ELEMS_PER_CHUNK as usize];
+        unsafe {
+            BitPackingUninit::unchecked_unpack_uninit(bit_width, packed, &mut decoded);
+        }
+        predicate.evaluate_u32_values(
+            decoded[..num_values as usize]
+                .iter()
+                .map(|value| unsafe { value.assume_init() }),
+            num_values,
+        )
+    }
 }
 
 impl MiniBlockCompressor for InlineBitpacking {
@@ -340,6 +395,20 @@ impl MiniBlockDecompressor for InlineBitpacking {
         num_values
             .checked_mul(self.uncompressed_bit_width)
             .map(|bits| bits.div_ceil(8))
+    }
+
+    fn evaluate_primitive_predicate(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        predicate: &PrimitivePredicate,
+    ) -> Result<Option<DataBlock>> {
+        if self.uncompressed_bit_width != 32 || data.len() != 1 || num_values == 0 {
+            return Ok(None);
+        }
+        let matches = Self::evaluate_u32(data.into_iter().next().unwrap(), num_values, predicate)?;
+        crate::predicate::record_direct_values(num_values);
+        Ok(Some(matches))
     }
 }
 
@@ -613,6 +682,7 @@ mod test {
 
     use arrow_array::{Array, Int8Array, Int64Array};
     use arrow_buffer::ArrowNativeType;
+    use arrow_buffer::BooleanBuffer;
     use arrow_schema::DataType;
     use bytemuck::Pod;
     use lance_bitpacking::{BitPacking, BitPackingUninit};
@@ -623,6 +693,7 @@ mod test {
         buffer::LanceBuffer,
         compression::{BlockDecompressor, MiniBlockDecompressor},
         data::{BlockInfo, DataBlock, FixedWidthDataBlock},
+        predicate::{ComparisonOperator, PrimitiveLiteral, PrimitivePredicate},
         testing::{TestCases, check_round_trip_encoding_of_data},
     };
 
@@ -717,6 +788,37 @@ mod test {
     fn unchunk_u64_bw23_full() {
         let values: Vec<u64> = (0..1024).map(|i| ((i * 3) % (1 << 23)) as u64).collect();
         roundtrip_unchunk(&values, 23);
+    }
+
+    #[test]
+    fn evaluates_u32_predicate_from_bitpacked_chunk() {
+        let values = (0..500_u32).collect::<Vec<_>>();
+        let bit_width = 9;
+        let mut padded = vec![0_u32; ELEMS_PER_CHUNK as usize];
+        padded[..values.len()].copy_from_slice(&values);
+        let packed_words = ELEMS_PER_CHUNK as usize * bit_width / u32::BITS as usize;
+        let mut chunk = vec![bit_width as u32; 1 + packed_words];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &padded, &mut chunk[1..]);
+        }
+        let predicate = PrimitivePredicate {
+            column: "value".to_string(),
+            operator: ComparisonOperator::GreaterThanOrEqual,
+            literal: PrimitiveLiteral::UInt32(250),
+        };
+        let actual = MiniBlockDecompressor::evaluate_primitive_predicate(
+            &InlineBitpacking::new(32),
+            vec![LanceBuffer::reinterpret_vec(chunk)],
+            values.len() as u64,
+            &predicate,
+        )
+        .unwrap()
+        .unwrap();
+        let actual = actual.as_fixed_width_ref().unwrap();
+        let actual = BooleanBuffer::new(actual.data.clone().into_buffer(), 0, values.len());
+        assert_eq!(actual.count_set_bits(), 250);
+        assert!(!actual.value(249));
+        assert!(actual.value(250));
     }
 
     #[rstest]
