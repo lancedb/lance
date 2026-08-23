@@ -28,6 +28,13 @@ pub enum Action {
     Delete = 3,
     /// Fail the operation if a match is found
     Fail = 4,
+    /// The row matched a target row but the conditional `when_matched` clause
+    /// did not apply to it.
+    ///
+    /// Nothing is written for the row, but it still claims its target row for
+    /// source-deduplication accounting, so a second source row matching the
+    /// same target is detected regardless of the condition.
+    MatchedNoOp = 5,
 }
 
 impl TryFrom<u8> for Action {
@@ -40,6 +47,7 @@ impl TryFrom<u8> for Action {
             2 => Ok(Self::Insert),
             3 => Ok(Self::Delete),
             4 => Ok(Self::Fail),
+            5 => Ok(Self::MatchedNoOp),
             _ => Err(crate::Error::invalid_input(format!(
                 "Invalid action code: {}",
                 value
@@ -61,7 +69,7 @@ impl Action {
 /// fast path CASE expression. `variant_name` is used to name the condition in the parse
 /// error message (e.g. "UpdateIf" or "DeleteIf"), and the failing condition string is
 /// included so it can be identified when several conditions are present.
-fn parse_when_matched_condition(
+pub(super) fn parse_when_matched_condition(
     condition_str: &str,
     schema: Option<&arrow_schema::Schema>,
     variant_name: &str,
@@ -135,13 +143,18 @@ pub fn merge_insert_action(
         }
         WhenMatched::UpdateIf(condition_str) => {
             let condition = parse_when_matched_condition(condition_str, schema, "UpdateIf")?;
-            cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
+            cases.push((
+                matched.clone().and(condition),
+                Action::UpdateAll.as_literal_expr(),
+            ));
+            cases.push((matched, Action::MatchedNoOp.as_literal_expr()));
         }
         WhenMatched::UpdateIfExpr(condition) => {
             cases.push((
-                matched.and(condition.clone()),
+                matched.clone().and(condition.clone()),
                 Action::UpdateAll.as_literal_expr(),
             ));
+            cases.push((matched, Action::MatchedNoOp.as_literal_expr()));
         }
         WhenMatched::DoNothing => {}
         WhenMatched::Fail => {
@@ -152,13 +165,18 @@ pub fn merge_insert_action(
         }
         WhenMatched::DeleteIf(condition_str) => {
             let condition = parse_when_matched_condition(condition_str, schema, "DeleteIf")?;
-            cases.push((matched.and(condition), Action::Delete.as_literal_expr()));
+            cases.push((
+                matched.clone().and(condition),
+                Action::Delete.as_literal_expr(),
+            ));
+            cases.push((matched, Action::MatchedNoOp.as_literal_expr()));
         }
         WhenMatched::DeleteIfExpr(condition) => {
             cases.push((
-                matched.and(condition.clone()),
+                matched.clone().and(condition.clone()),
                 Action::Delete.as_literal_expr(),
             ));
+            cases.push((matched, Action::MatchedNoOp.as_literal_expr()));
         }
     }
 

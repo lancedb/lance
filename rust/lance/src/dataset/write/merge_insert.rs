@@ -38,7 +38,7 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
 pub mod inserted_rows;
 
-use assign_action::merge_insert_action;
+use assign_action::{merge_insert_action, parse_when_matched_condition};
 use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
@@ -244,6 +244,50 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
         vec![Arc::new(source), Arc::new(target)],
     )
     .unwrap()
+}
+
+// Applies `source_dedupe_behavior` to matched rows, returning the rows that own their
+// target row and recording the skipped duplicates.
+//
+// This runs before a conditional "when matched" clause narrows the matched rows: a
+// condition that excludes one of two source rows matching the same target row must not
+// hide the duplicate from the policy, otherwise `Fail` silently succeeds and `FirstSeen`
+// lets the later row win.
+fn dedupe_matched_rows(
+    matched: RecordBatch,
+    row_id_col: usize,
+    on: &[String],
+    behavior: SourceDedupeBehavior,
+    processed_row_ids: &Mutex<HashSet<u64>>,
+    merge_statistics: &mut MergeStats,
+) -> datafusion::common::Result<RecordBatch> {
+    let mut keep_indices: Vec<u32> = Vec::with_capacity(matched.num_rows());
+    {
+        let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+        let mut processed_row_ids = processed_row_ids.lock().unwrap();
+        for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
+            if processed_row_ids.insert(row_id) {
+                keep_indices.push(row_idx as u32);
+            } else {
+                match behavior {
+                    SourceDedupeBehavior::Fail => {
+                        return Err(create_duplicate_row_error(&matched, row_idx, on));
+                    }
+                    SourceDedupeBehavior::FirstSeen => {}
+                }
+            }
+        }
+    }
+
+    let num_skipped = matched.num_rows() - keep_indices.len();
+    if num_skipped == 0 {
+        return Ok(matched);
+    }
+    merge_statistics.num_skipped_duplicates += num_skipped as u64;
+    Ok(take_record_batch(
+        &matched,
+        &UInt32Array::from(keep_indices),
+    )?)
 }
 
 // Evaluates a "when matched" physical filter against `matched` and returns only the rows
@@ -2359,12 +2403,42 @@ impl MergeInsertJob {
                 WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
             );
 
+        // A conditional `when_matched` clause is compiled against a combined schema built
+        // from the source stream on the indexed path, so a predicate reading a target
+        // column the source does not carry cannot be planned there. Route those merges
+        // to the standard plan, which fills missing target columns from the join.
+        let condition_reads_absent_target_column = match &self.params.when_matched {
+            WhenMatched::UpdateIf(condition) | WhenMatched::DeleteIf(condition) => {
+                let target_arrow_schema = Schema::from(full_schema);
+                let variant = match &self.params.when_matched {
+                    WhenMatched::UpdateIf(_) => "UpdateIf",
+                    _ => "DeleteIf",
+                };
+                let parsed =
+                    parse_when_matched_condition(condition, Some(&target_arrow_schema), variant)?;
+                parsed.column_refs().iter().any(|column| {
+                    let is_target_side = column
+                        .relation
+                        .as_ref()
+                        .map(|relation| relation.table() == "target")
+                        .unwrap_or(true);
+                    is_target_side
+                        && !source_schema
+                            .fields()
+                            .iter()
+                            .any(|field| field.name() == &column.name)
+                })
+            }
+            _ => false,
+        };
+
         // The indexed path requires the source to be schema-compatible with the target.
         // Delete-only sources may also carry predicate-only columns (for example, a
         // `deleted` tombstone flag) that are intentionally absent from the target. Keep
         // those sources on the standard plan, which can evaluate the extra columns.
         let would_use_scalar_index = if self.params.use_index
             && !is_partial_delete_with_insert
+            && !condition_reads_absent_target_column
             && (is_full_schema || is_subset_schema)
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -3145,9 +3219,9 @@ impl Merger {
     // For `Delete`/`DeleteIf`/`DeleteIfExpr`, matched rows are removed rather than
     // rewritten: their row ids are recorded for the commit and no replacement batch is
     // emitted. The same `source_dedupe_behavior` policy as for updates applies to
-    // duplicate source keys. For the conditional variants, `match_filter_expr` narrows
-    // matched rows to those where the condition is true before this accounting, so rows
-    // failing the condition are left untouched.
+    // duplicate source keys, and it is applied to every matched row before
+    // `match_filter_expr` narrows them, so rows failing the condition still claim their
+    // target row and are then left untouched.
     async fn execute_batch(
         self,
         batch: RecordBatch,
@@ -3184,7 +3258,15 @@ impl Merger {
         match &self.params.when_matched {
             WhenMatched::DoNothing => {}
             WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_) => {
-                let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                let mut matched = dedupe_matched_rows(
+                    matched,
+                    row_id_col,
+                    &self.params.on,
+                    self.params.source_dedupe_behavior,
+                    &self.processed_row_ids,
+                    &mut merge_statistics,
+                )?;
                 if let Some(match_filter) = &match_filter_expr {
                     matched = filter_matched_by_condition(
                         matched,
@@ -3194,27 +3276,8 @@ impl Merger {
                     )?;
                 }
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
-
-                let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
-                for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
-                    if processed_row_ids.insert(row_id) {
-                        merge_statistics.num_deleted_rows += 1;
-                        deleted_row_ids.push(row_id);
-                    } else {
-                        match self.params.source_dedupe_behavior {
-                            SourceDedupeBehavior::Fail => {
-                                return Err(create_duplicate_row_error(
-                                    &matched,
-                                    row_idx,
-                                    &self.params.on,
-                                ));
-                            }
-                            SourceDedupeBehavior::FirstSeen => {
-                                merge_statistics.num_skipped_duplicates += 1;
-                            }
-                        }
-                    }
-                }
+                merge_statistics.num_deleted_rows += matched.num_rows() as u64;
+                deleted_row_ids.extend(row_ids.values());
             }
             WhenMatched::Fail => {
                 // Any matched row aborts the whole operation.
@@ -3226,7 +3289,15 @@ impl Merger {
                 }
             }
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
-                let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                let mut matched = dedupe_matched_rows(
+                    matched,
+                    row_id_col,
+                    &self.params.on,
+                    self.params.source_dedupe_behavior,
+                    &self.processed_row_ids,
+                    &mut merge_statistics,
+                )?;
 
                 if let Some(match_filter) = &match_filter_expr {
                     matched = filter_matched_by_condition(
@@ -3243,71 +3314,33 @@ impl Merger {
                 // the batch at all.  Writing an empty batch currently panics
                 if matched.num_rows() > 0 {
                     let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
-
-                    let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
-                    let mut keep_indices: Vec<u32> = Vec::with_capacity(matched.num_rows());
-                    for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
-                        if processed_row_ids.insert(row_id) {
-                            keep_indices.push(row_idx as u32);
-                        } else {
-                            match self.params.source_dedupe_behavior {
-                                SourceDedupeBehavior::Fail => {
-                                    return Err(create_duplicate_row_error(
-                                        &matched,
-                                        row_idx,
-                                        &self.params.on,
-                                    ));
-                                }
-                                SourceDedupeBehavior::FirstSeen => {
-                                    // Skip this duplicate row (don't add to keep_indices)
-                                }
-                            }
-                        }
-                    }
-                    drop(processed_row_ids);
-
-                    // Filter out duplicate rows if any were skipped
-                    let num_skipped = matched.num_rows() - keep_indices.len();
-                    if num_skipped > 0 {
-                        merge_statistics.num_skipped_duplicates += num_skipped as u64;
-                        merge_statistics.num_updated_rows -= num_skipped as u64;
-
-                        let indices = UInt32Array::from(keep_indices);
-                        matched = take_record_batch(&matched, &indices)?;
+                    deleted_row_ids.extend(row_ids.values());
+                    if self.enable_stable_row_ids {
+                        self.updating_row_ids
+                            .lock()
+                            .unwrap()
+                            .capture(row_ids.values())?;
                     }
 
-                    // Only process and write if there are remaining rows after filtering duplicates
-                    if matched.num_rows() > 0 {
-                        // Get row_ids again after filtering (if any duplicates were removed)
-                        let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
-                        deleted_row_ids.extend(row_ids.values());
-                        if self.enable_stable_row_ids {
-                            self.updating_row_ids
-                                .lock()
-                                .unwrap()
-                                .capture(row_ids.values())?;
-                        }
-
-                        let projection = if let Some(row_addr_col) = row_addr_col {
-                            let mut cols = Vec::from_iter(left_cols.iter().cloned());
-                            cols.push(row_addr_col);
-                            cols
-                        } else {
-                            #[allow(clippy::redundant_clone)]
-                            left_cols.clone()
-                        };
-                        let matched = matched.project(&projection)?;
-                        // The payload columns of an outer join are always nullable.  We need to restore
-                        // non-nullable to columns that were originally non-nullable.  This should be safe
-                        // since the not_matched rows should all be valid on the right_cols
-                        //
-                        // Sadly we can't use with_schema because it doesn't let you toggle nullability
-                        let matched = RecordBatch::try_new(
-                            self.output_schema.clone(),
-                            Vec::from_iter(matched.columns().iter().cloned()),
-                        )?;
-                        batches.push(Ok(matched));
-                    }
+                    let projection = if let Some(row_addr_col) = row_addr_col {
+                        let mut cols = Vec::from_iter(left_cols.iter().cloned());
+                        cols.push(row_addr_col);
+                        cols
+                    } else {
+                        #[allow(clippy::redundant_clone)]
+                        left_cols.clone()
+                    };
+                    let matched = matched.project(&projection)?;
+                    // The payload columns of an outer join are always nullable.  We need to restore
+                    // non-nullable to columns that were originally non-nullable.  This should be safe
+                    // since the not_matched rows should all be valid on the right_cols
+                    //
+                    // Sadly we can't use with_schema because it doesn't let you toggle nullability
+                    let matched = RecordBatch::try_new(
+                        self.output_schema.clone(),
+                        Vec::from_iter(matched.columns().iter().cloned()),
+                    )?;
+                    batches.push(Ok(matched));
                 }
             }
         }
@@ -5731,6 +5764,187 @@ mod tests {
         );
     }
 
+    /// Source deduplication is applied to every matched row *before* a conditional
+    /// `when_matched` clause narrows them. Two source rows collide on one target row
+    /// but only the second satisfies the condition: `Fail` must still reject the
+    /// ambiguity, and `FirstSeen` must keep the first row and therefore leave the
+    /// target untouched. The outcome must not depend on whether a scalar index on the
+    /// join key sends the merge down the indexed-scan path.
+    #[rstest::rstest]
+    #[case::delete_standard_fail(true, false, SourceDedupeBehavior::Fail)]
+    #[case::delete_standard_first_seen(true, false, SourceDedupeBehavior::FirstSeen)]
+    #[case::delete_indexed_fail(true, true, SourceDedupeBehavior::Fail)]
+    #[case::delete_indexed_first_seen(true, true, SourceDedupeBehavior::FirstSeen)]
+    #[case::update_standard_fail(false, false, SourceDedupeBehavior::Fail)]
+    #[case::update_standard_first_seen(false, false, SourceDedupeBehavior::FirstSeen)]
+    #[case::update_indexed_fail(false, true, SourceDedupeBehavior::Fail)]
+    #[case::update_indexed_first_seen(false, true, SourceDedupeBehavior::FirstSeen)]
+    #[tokio::test]
+    async fn test_conditional_matched_dedupes_before_condition(
+        #[case] delete: bool,
+        #[case] indexed: bool,
+        #[case] behavior: SourceDedupeBehavior,
+    ) {
+        let initial = record_batch!(("key", Int32, [1]), ("value", Int32, [10])).unwrap();
+        let schema = initial.schema();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if indexed {
+            ds.create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Only the second source row satisfies `source.value > target.value`.
+        let source = record_batch!(("key", Int32, [1, 1]), ("value", Int32, [5, 20])).unwrap();
+        let condition = "source.value > target.value";
+        let when_matched = if delete {
+            WhenMatched::delete_if(&ds, condition).unwrap()
+        } else {
+            WhenMatched::update_if(&ds, condition).unwrap()
+        };
+
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .source_dedupe_behavior(behavior)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts") && err.contains("key = 1"),
+                "the condition must not hide the ambiguity from Fail, got: {err}"
+            );
+            return;
+        }
+
+        let (updated_ds, stats) = result.unwrap();
+        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(stats.num_deleted_rows, 0);
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("key = 1 AND value = 10".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "FirstSeen keeps the first source row, whose condition is false"
+        );
+    }
+
+    /// A conditional `when_matched` predicate may read a target column the source does
+    /// not carry. The indexed-scan path compiles the condition against a combined schema
+    /// built from the source, so those merges are routed to the standard plan, which
+    /// fills the missing target columns from the join. The result must be the same with
+    /// and without a scalar index on the join key.
+    #[rstest::rstest]
+    #[case::delete_indexed(true, true)]
+    #[case::delete_standard(true, false)]
+    #[case::update_indexed(false, true)]
+    #[case::update_standard(false, false)]
+    #[tokio::test]
+    async fn test_conditional_matched_partial_source_target_predicate(
+        #[case] delete: bool,
+        #[case] indexed: bool,
+    ) {
+        let initial = record_batch!(
+            ("key", Int32, [1, 2, 3]),
+            ("value", Int32, [10, 20, 30]),
+            ("extra", Int32, [1, 2, 3])
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if indexed {
+            ds.create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Both sources are a strict subset of the target schema and both conditions
+        // read a target column that the source omits.
+        let (source, when_matched) = if delete {
+            (
+                record_batch!(("key", Int32, [1, 2, 3])).unwrap(),
+                WhenMatched::delete_if(&ds, "target.value > 20").unwrap(),
+            )
+        } else {
+            (
+                record_batch!(("key", Int32, [1, 2, 3]), ("value", Int32, [7, 7, 7])).unwrap(),
+                WhenMatched::update_if(&ds, "target.extra > 2").unwrap(),
+            )
+        };
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(when_matched)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        if delete {
+            assert_eq!(stats.num_deleted_rows, 1);
+            assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+            assert_eq!(
+                updated_ds
+                    .count_rows(Some("key = 3".to_string()))
+                    .await
+                    .unwrap(),
+                0,
+                "only the row whose target value exceeds 20 is deleted"
+            );
+        } else {
+            assert_eq!(stats.num_updated_rows, 1);
+            assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+            assert_eq!(
+                updated_ds
+                    .count_rows(Some("key = 3 AND value = 7".to_string()))
+                    .await
+                    .unwrap(),
+                1,
+                "only the row whose target extra exceeds 2 is updated"
+            );
+        }
+    }
+
     /// The v2 plans apply the same `source_dedupe_behavior` to deletes when the
     /// source has duplicate keys matching one target row — covering both
     /// `FullSchemaMergeInsertExec` (`Delete + InsertAll`) and
@@ -7478,16 +7692,19 @@ mod tests {
 
         // The optimized plan should use Inner join and include the UpdateIf condition.
         // The sentinel IS NOT NULL condition is folded away (sentinel is lit(true)).
+        // The second CASE arm assigns `MatchedNoOp` (5) to rows that matched but failed
+        // the condition, so they still take part in source-duplicate accounting.
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec...
-          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
-            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+    ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, __merge_source_sentinel@5 as __merge_source_sentinel, CASE WHEN __common_expr_1@0 AND value@3 > 20 THEN 1 WHEN __common_expr_1@0 THEN 5 ELSE 0 END as __action]
+      ProjectionExec: expr=[_rowaddr@0 IS NOT NULL as __common_expr_1, _rowid@1 as _rowid, _rowaddr@0 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel]
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@2, _rowid@1, value@3, key@4, __merge_source_sentinel@5]
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          RepartitionExec...
+            ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
