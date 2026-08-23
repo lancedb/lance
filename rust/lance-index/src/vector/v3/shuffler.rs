@@ -5,13 +5,13 @@
 //! the corresponding IVF partitions.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::{
@@ -22,7 +22,6 @@ use lance_core::{
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::writer::FileWriterOptions;
 use lance_io::{
@@ -73,7 +72,7 @@ pub struct IvfShuffler {
     object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
@@ -84,12 +83,12 @@ impl IvfShuffler {
             object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
             progress: crate::progress::noop_progress(),
         }
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
@@ -125,7 +124,7 @@ impl Shuffler for IvfShuffler {
                 async move {
                     let writer = object_store.create(&part_path).await?;
                     let file_writer = versions::create_writer(
-                        ConcreteFileVersion::from(format_version),
+                        format_version,
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
                         FileWriterOptions::default(),
@@ -315,7 +314,7 @@ impl ShuffleReader for EmptyReader {
 pub fn create_ivf_shuffler(
     output_dir: Path,
     num_partitions: usize,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
     progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
 ) -> Box<dyn Shuffler> {
     let use_legacy = std::env::var("LANCE_LEGACY_SHUFFLER")
@@ -336,6 +335,15 @@ pub fn create_ivf_shuffler(
         Box::new(shuffler)
     }
 }
+
+/// Schema of the partition-offsets sidecar written alongside shuffled data.
+static OFFSETS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        "offset",
+        DataType::UInt64,
+        false,
+    )]))
+});
 
 const DEFAULT_SHUFFLE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 
@@ -464,11 +472,7 @@ impl Shuffler for TwoFileShuffler {
         let num_partitions = self.num_partitions;
         // No need to write partition ids since we can infer this from offsets
         let schema = data.schema().without_column(PART_ID_COLUMN);
-        let offsets_schema = Arc::new(Schema::new(vec![Field::new(
-            "offset",
-            DataType::UInt64,
-            false,
-        )]));
+        let offsets_schema = OFFSETS_SCHEMA.clone();
         let batch_size_bytes = self.batch_size_bytes;
 
         // Create data file writer
@@ -853,9 +857,33 @@ mod tests {
         // Partition 2: rows with values 30
         let batch = make_batch(&[0, 1, 2, 0, 1], &[10, 20, 30, 40, 50], None);
 
-        let shuffler = TwoFileShuffler::new(output_dir, num_partitions);
+        let shuffler = TwoFileShuffler::new(output_dir.clone(), num_partitions);
         let stream = batches_to_stream(vec![batch]);
         let reader = shuffler.shuffle(stream).await.unwrap();
+
+        let object_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        for filename in ["shuffle_data.lance", "shuffle_offsets.lance"] {
+            let file_reader = FileReader::try_open(
+                scheduler
+                    .open_file(
+                        &output_dir.clone().join(filename),
+                        &CachedFileSize::unknown(),
+                    )
+                    .await
+                    .unwrap(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(file_reader.version(), ConcreteFileVersion::V2_1);
+        }
 
         // Verify partition sizes
         assert_eq!(reader.partition_size(0).unwrap(), 2);

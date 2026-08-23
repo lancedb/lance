@@ -136,8 +136,8 @@ impl std::fmt::Display for FtsQuery {
             Self::Boolean(query) => {
                 write!(
                     f,
-                    "Boolean(must={:?}, should={:?})",
-                    query.must, query.should
+                    "Boolean(must={:?}, should={:?}, must_not={:?})",
+                    query.must, query.should, query.must_not
                 )
             }
         }
@@ -161,16 +161,7 @@ impl FtsQueryNode for FtsQuery {
                 }
                 columns
             }
-            Self::Boolean(query) => {
-                let mut columns = HashSet::new();
-                for query in &query.must {
-                    columns.extend(query.columns());
-                }
-                for query in &query.should {
-                    columns.extend(query.columns());
-                }
-                columns
-            }
+            Self::Boolean(query) => query.columns(),
         }
     }
 }
@@ -200,6 +191,7 @@ impl FtsQuery {
             Self::Boolean(query) => {
                 query.must.iter().any(|q| q.is_missing_column())
                     || query.should.iter().any(|q| q.is_missing_column())
+                    || query.must_not.iter().any(|q| q.is_missing_column())
             }
         }
     }
@@ -873,6 +865,25 @@ pub fn has_query_token(
     false
 }
 
+fn fill_match_query_columns(
+    query: &MatchQuery,
+    columns: &[String],
+    replace: bool,
+) -> Result<Vec<MatchQuery>> {
+    if query.column.is_some() && !replace {
+        return Ok(vec![query.clone()]);
+    }
+    if columns.is_empty() {
+        return Err(Error::invalid_input(
+            "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
+        ));
+    }
+    Ok(columns
+        .iter()
+        .map(|column| query.clone().with_column(Some(column.clone())))
+        .collect())
+}
+
 pub fn fill_fts_query_column(
     query: &FtsQuery,
     columns: &[String],
@@ -883,21 +894,11 @@ pub fn fill_fts_query_column(
     }
     match query {
         FtsQuery::Match(match_query) => {
-            match columns.len() {
-                0 => {
-                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
-                }
-                1 => {
-                    let column = columns[0].clone();
-                    let query = match_query.clone().with_column(Some(column));
-                    Ok(FtsQuery::Match(query))
-                }
-                _ => {
-                    // if there are multiple columns, we need to create a MultiMatch query
-                    let multi_match_query =
-                        MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
-                    Ok(FtsQuery::MultiMatch(multi_match_query))
-                }
+            let match_queries = fill_match_query_columns(match_query, columns, replace)?;
+            if let [match_query] = match_queries.as_slice() {
+                Ok(FtsQuery::Match(match_query.clone()))
+            } else {
+                Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
             }
         }
         FtsQuery::Phrase(phrase_query) => {
@@ -928,17 +929,11 @@ pub fn fill_fts_query_column(
             let match_queries = multi_match_query
                 .match_queries
                 .iter()
-                .map(|query| fill_fts_query_column(&FtsQuery::Match(query.clone()), columns, replace))
-                .map(|result| {
-                    result.map(|query| {
-                        if let FtsQuery::Match(match_query) = query {
-                            match_query
-                        } else {
-                            unreachable!("Expected MatchQuery")
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .map(|query| fill_match_query_columns(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
         FtsQuery::Boolean(bool_query) => {
@@ -964,6 +959,89 @@ pub fn fill_fts_query_column(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_boolean_query_introspection_includes_must_not() {
+        use super::*;
+
+        let implicit = MatchQuery::new("exclude".to_string())
+            .with_boost(3.0)
+            .with_fuzziness(Some(1))
+            .with_max_expansions(10)
+            .with_operator(Operator::And)
+            .with_prefix_length(2)
+            .with_document_granularity(DocumentGranularity::Row);
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("positive_text".to_string()))
+                    .into(),
+            ),
+            (Occur::MustNot, implicit.clone().into()),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["positive_text".to_string()])
+        );
+        assert!(query.is_missing_column());
+
+        let filled = fill_fts_query_column(
+            &query,
+            &["positive_text".to_string(), "negative_text".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            filled.columns(),
+            HashSet::from(["positive_text".to_string(), "negative_text".to_string()])
+        );
+        let FtsQuery::Boolean(filled) = filled else {
+            unreachable!()
+        };
+        let FtsQuery::MultiMatch(expanded) = &filled.must_not[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            expanded.match_queries,
+            ["positive_text", "negative_text"]
+                .into_iter()
+                .map(|column| implicit.clone().with_column(Some(column.to_string())))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fill_partial_multi_match_columns() {
+        use super::*;
+
+        let implicit = MatchQuery::new("include".to_string()).with_boost(2.0);
+        let query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("a".to_string()))
+                    .with_boost(3.0),
+                implicit.clone(),
+            ],
+        });
+
+        let filled =
+            fill_fts_query_column(&query, &["a".to_string(), "b".to_string()], false).unwrap();
+        let FtsQuery::MultiMatch(filled) = filled else {
+            unreachable!()
+        };
+        assert_eq!(
+            filled.match_queries,
+            vec![
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("a".to_string()))
+                    .with_boost(3.0),
+                implicit.clone().with_column(Some("a".to_string())),
+                implicit.with_column(Some("b".to_string())),
+            ]
+        );
+    }
+
     #[test]
     fn test_match_query_serde() {
         use super::*;
@@ -1077,6 +1155,38 @@ mod tests {
         assert_eq!(plan.should, vec![should]);
         assert_eq!(plan.must, vec![must]);
         assert_eq!(plan.must_not, vec![must_not]);
+    }
+
+    #[test]
+    fn test_boolean_query_columns_include_must_not() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string()).with_column(Some("body".to_string()));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["title".to_string(), "body".to_string()])
+        );
+        assert!(!query.is_missing_column());
+    }
+
+    #[test]
+    fn test_boolean_query_missing_must_not_column_is_detected() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string());
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert!(query.is_missing_column());
     }
 
     #[test]

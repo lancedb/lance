@@ -30,10 +30,10 @@ These options apply to all object stores.
 | Key                          | Description                                                                                                                                                                                                                                                                                             |
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
-| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `request_timeout`.                                                                                                    |
+| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
-| `request_timeout`            | Timeout for the entire request, from connection until the response body has finished. Default, `30s`.                                                                                                                                                                                                   |
+| `timeout`                    | Timeout for the entire request, from connection until the response body has finished. Default, `30s`. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside `LANCE_INITIAL_UPLOAD_SIZE`.                                    |
 | `user_agent`                 | User agent string to use in requests.                                                                                                                                                                                                                                                                   |
 | `proxy_url`                  | URL of a proxy server to use for requests. Default, `None`.                                                                                                                                                                                                                                             |
 | `proxy_ca_certificate`       | PEM-formatted CA certificate for proxy connections                                                                                                                                                                                                                                                      |
@@ -357,6 +357,15 @@ parameter; explicit `storage_options` override environment variables:
 | `cos_secret_id` | Secret ID used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
+
+!!! warning
+
+    Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+    ever had versioning enabled, even if versioning is now suspended. To prevent
+    silent manifest overwrites, Lance requires a custom distributed commit lock
+    for COS writes. Pass the same `commit_lock` implementation to every Python
+    writer, or provide a custom `CommitHandler` in Rust. Reads do not require a
+    commit lock.
 
 !!! note
 

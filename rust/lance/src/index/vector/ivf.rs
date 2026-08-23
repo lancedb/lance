@@ -60,6 +60,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions as file_versions,
     versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
@@ -2636,7 +2637,7 @@ async fn write_root_vector_index_from_auxiliary(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = lance_file::versions::create_writer(
+    let mut v2_writer = file_versions::create_writer(
         format_version,
         obj_writer,
         schema,
@@ -5410,6 +5411,7 @@ mod tests {
             uuid,
             dataset_version: dataset.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5449,6 +5451,7 @@ mod tests {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5508,6 +5511,7 @@ mod tests {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),

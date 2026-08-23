@@ -1685,6 +1685,7 @@ impl DirectoryNamespace {
                 timestamp_millis: None,
                 metadata: None,
             })),
+            ..Default::default()
         }
     }
 
@@ -2506,6 +2507,7 @@ impl DirectoryNamespace {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } if new_indices.is_empty() && !removed_indices.is_empty() => "DropIndex".to_string(),
             _ => transaction.operation.to_string(),
         }
@@ -2554,6 +2556,7 @@ impl DirectoryNamespace {
         DescribeTransactionResponse {
             status: effective_status,
             properties: Some(properties),
+            ..Default::default()
         }
     }
 
@@ -2580,6 +2583,7 @@ impl DirectoryNamespace {
             num_indexed_rows: get_i64("num_indexed_rows"),
             num_unindexed_rows: get_i64("num_unindexed_rows"),
             num_indices: get_i64("num_indices").and_then(|value| i32::try_from(value).ok()),
+            ..Default::default()
         }
     }
 
@@ -3914,6 +3918,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(ListTableVersionsResponse {
             versions: table_versions,
             page_token: None,
+            ..Default::default()
         })
     }
 
@@ -4107,6 +4112,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(DescribeTableVersionResponse {
             version: Box::new(table_version),
+            ..Default::default()
         })
     }
 
@@ -4160,6 +4166,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(BatchDeleteTableVersionsResponse {
             deleted_count: Some(total_deleted_count),
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -4229,7 +4236,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|transaction| transaction.uuid);
 
-        Ok(CreateTableIndexResponse { transaction_id })
+        Ok(CreateTableIndexResponse {
+            transaction_id,
+            ..Default::default()
+        })
     }
 
     async fn list_table_indices(
@@ -4324,6 +4334,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(ListTableIndicesResponse {
             indexes: indices,
             page_token,
+            ..Default::default()
         })
     }
 
@@ -4615,6 +4626,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(AlterTransactionResponse {
             status: final_status,
             properties: response.properties,
+            ..Default::default()
         })
     }
 
@@ -4637,6 +4649,7 @@ impl LanceNamespace for DirectoryNamespace {
         let response = self.create_table_index(request).await?;
         Ok(CreateTableScalarIndexResponse {
             transaction_id: response.transaction_id,
+            ..Default::default()
         })
     }
 
@@ -4697,7 +4710,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|transaction| transaction.uuid);
 
-        Ok(DropTableIndexResponse { transaction_id })
+        Ok(DropTableIndexResponse {
+            transaction_id,
+            ..Default::default()
+        })
     }
 
     async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -4767,7 +4783,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|t| t.uuid);
 
-        Ok(RestoreTableResponse { transaction_id })
+        Ok(RestoreTableResponse {
+            transaction_id,
+            ..Default::default()
+        })
     }
 
     async fn update_table_schema_metadata(
@@ -4810,6 +4829,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(UpdateTableSchemaMetadataResponse {
             metadata: Some(updated_metadata),
             transaction_id,
+            ..Default::default()
         })
     }
 
@@ -5035,6 +5055,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -5066,6 +5087,7 @@ impl LanceNamespace for DirectoryNamespace {
                 num_inserted_rows: Some(num_rows as i64),
                 num_deleted_rows: Some(0),
                 version: Some(version),
+                ..Default::default()
             });
         }
 
@@ -5136,6 +5158,7 @@ impl LanceNamespace for DirectoryNamespace {
             num_inserted_rows: Some(stats.num_inserted_rows as i64),
             num_deleted_rows: Some(stats.num_deleted_rows as i64),
             version: Some(dataset.version().version as i64),
+            ..Default::default()
         })
     }
 
@@ -5220,6 +5243,7 @@ impl LanceNamespace for DirectoryNamespace {
             updated_rows: result.rows_updated as i64,
             version,
             properties: None,
+            ..Default::default()
         })
     }
 
@@ -5249,6 +5273,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DeleteFromTableResponse {
             transaction_id: None,
             version: Some(result.new_dataset.version().version as i64),
+            ..Default::default()
         })
     }
 
@@ -5522,6 +5547,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(ListTableTagsResponse {
             tags,
             page_token: None,
+            ..Default::default()
         })
     }
 
@@ -5551,6 +5577,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(GetTableTagVersionResponse {
             version: contents.version as i64,
             branch: contents.branch,
+            ..Default::default()
         })
     }
 
@@ -5588,6 +5615,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(CreateTableTagResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -5616,6 +5644,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(DeleteTableTagResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -5653,6 +5682,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(UpdateTableTagResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -5722,6 +5752,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(CreateTableBranchResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 
@@ -5767,6 +5798,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(ListTableBranchesResponse {
             branches,
             page_token: None,
+            ..Default::default()
         })
     }
 
@@ -5803,6 +5835,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(DeleteTableBranchResponse {
             transaction_id: None,
+            ..Default::default()
         })
     }
 

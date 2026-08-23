@@ -71,6 +71,7 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
@@ -93,6 +94,7 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
+pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
@@ -134,11 +136,13 @@ static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-pub fn rt() -> &'static mut BackgroundExecutor {
+pub fn rt() -> &'static BackgroundExecutor {
     loop {
         let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            return unsafe { &mut *ptr };
+            // SAFETY: installed executors are leaked and remain valid for the
+            // process lifetime. BackgroundExecutor uses shared access only.
+            return unsafe { &*ptr };
         }
         if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
@@ -150,7 +154,8 @@ pub fn rt() -> &'static mut BackgroundExecutor {
     }
     let new_ptr = Box::into_raw(Box::new(create_background_executor()));
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
-    unsafe { &mut *new_ptr }
+    // SAFETY: the executor is leaked and all of its operations take `&self`.
+    unsafe { &*new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
@@ -296,6 +301,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Session>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
@@ -315,6 +321,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
@@ -324,6 +331,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    m.add_wrapped(wrap_pyfunction!(fts::tokenize))?;
     // OpenTelemetry metrics bridge
     m.add_class::<otel::PyMetricPoint>()?;
     m.add_class::<otel::PyMetricDescription>()?;
@@ -507,4 +515,16 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
     let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_executor_is_a_shared_singleton() {
+        let first: &'static BackgroundExecutor = rt();
+        let second: &'static BackgroundExecutor = rt();
+        assert!(std::ptr::eq(first, second));
+    }
 }
