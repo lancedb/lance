@@ -546,6 +546,49 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
 
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> "MergeInsertBuilder":
+        """
+        Selects how the merged rows are written to disk.
+
+        For a partial-schema update (the source omits some dataset columns) the
+        two modes have different cost shapes. ``rewrite_columns`` never reads or
+        writes the columns the source omits, but its replacement column file
+        covers every row of each fragment it touches, so the bytes written barely
+        fall as fewer rows match. ``rewrite_rows`` instead scales with the number
+        of matched rows. Patching columns wins once the fraction of rows matched
+        exceeds roughly the fraction of each row's bytes the source columns
+        occupy: for a KB-scale update of a MB-per-row table that is nearly
+        always, and for a table whose columns are all narrow it may never be.
+
+        The per-fragment matched row count that decides this is only known once
+        the join has run, so the caller picks rather than the planner guessing.
+
+        Parameters
+        ----------
+        mode : {'auto', 'rewrite_rows', 'rewrite_columns'}
+            ``auto`` (default) lets the engine choose. It rewrites whole rows,
+            except on the one path that predates this parameter: a
+            partial-schema update whose join key carries a scalar index patches
+            columns. ``rewrite_rows`` deletes the matched rows and writes whole
+            rows into new fragments; for a partial-schema update it gives up
+            that index probe, since the indexed path only ever patches columns.
+            ``rewrite_columns`` attaches new data files holding the source
+            columns to the fragments that already hold the matched rows; it
+            raises if the merge cannot be expressed that way, which requires
+            updating matched rows only (no inserts, no matched deletes, no
+            delete-by-source) with a source that omits at least one dataset
+            column, carries at least one column besides the join key, and
+            carries no blob column.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).write_mode(mode)
+
     def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
         """
         Write new fragments produced by this merge insert to these bases.
