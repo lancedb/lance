@@ -24,7 +24,10 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{
+    EquivalenceProperties, Partitioning, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
@@ -2106,13 +2109,39 @@ impl FilteredReadExec {
             ),
         ));
 
+        // Take mode emits one output row per input row, in input order, so the
+        // input's ordering survives. It has to be re-expressed against the output
+        // schema, whose column positions differ; the ordering prefix stops at the
+        // first expression the output schema cannot name.
+        let mut eq_properties = EquivalenceProperties::new(output_schema.clone());
+        if let Some(input_ordering) = input.properties().eq_properties.output_ordering() {
+            let mut carried = Vec::with_capacity(input_ordering.len());
+            for sort_expr in input_ordering.iter() {
+                let expr = sort_expr.expr.as_ref() as &dyn std::any::Any;
+                let Some(column) = expr.downcast_ref::<Column>() else {
+                    break;
+                };
+                let Ok(remapped) = Column::new_with_schema(column.name(), output_schema.as_ref())
+                else {
+                    break;
+                };
+                carried.push(PhysicalSortExpr::new(
+                    Arc::new(remapped) as Arc<dyn PhysicalExpr>,
+                    sort_expr.options,
+                ));
+            }
+            if !carried.is_empty() {
+                eq_properties.add_ordering(carried);
+            }
+        }
+
         // Partitioning and emission behavior follow the input
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema)),
+                .with_eq_properties(eq_properties),
         );
 
         let bare_schema = arrow_schema::Schema::from(&fields_to_read.to_bare_schema());
@@ -3337,6 +3366,8 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray,
     };
+    use arrow_schema::SortOptions;
+    use datafusion_physical_plan::sorts::sort::SortExec;
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::address::RowAddress;
@@ -4314,6 +4345,66 @@ mod tests {
             }
         }
         assert!(num_batches > 0, "expected at least one non-empty batch");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_take_carries_input_ordering() {
+        let fixture = TestFixture::new().await;
+
+        // A vector search feeds the take a stream ordered by distance. The take emits one
+        // output row per input row, in input order, so that ordering survives — but the
+        // output schema puts the columns in different positions, so it has to be
+        // re-expressed rather than copied.
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("_distance", arrow_schema::DataType::Float32, false),
+        ]));
+        let sort_options = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+        let sorted = Arc::new(SortExec::new(
+            [PhysicalSortExpr::new(
+                Arc::new(Column::new_with_schema("_distance", input_schema.as_ref()).unwrap()),
+                sort_options,
+            )]
+            .into(),
+            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(
+                input_schema,
+            ))),
+        ));
+
+        let projection = fixture
+            .dataset
+            .empty_projection()
+            .union_column("not_indexed", OnMissing::Error)
+            .unwrap()
+            .with_row_id();
+        let take = FilteredReadExec::try_new(
+            fixture.dataset,
+            FilteredReadOptions::new(projection),
+            Some(sorted),
+        )
+        .unwrap();
+
+        let output_ordering = take
+            .properties()
+            .eq_properties
+            .output_ordering()
+            .expect("take mode should advertise its input's ordering");
+        assert_eq!(output_ordering.len(), 1);
+        let sort_expr = &output_ordering[0];
+        assert_eq!(sort_expr.options, sort_options);
+        let column = (sort_expr.expr.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<Column>()
+            .expect("the carried ordering should still be a column reference");
+        assert_eq!(column.name(), "_distance");
+        // The index is the one the *output* schema uses, not the input's.
+        assert_eq!(
+            take.schema().field(column.index()).name(),
+            "_distance",
+            "ordering column index must be resolved against the output schema"
+        );
     }
 
     #[test_log::test(tokio::test)]
