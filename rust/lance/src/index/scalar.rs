@@ -129,6 +129,12 @@ impl TrainingRequest {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Overrides the scalar training scan's I/O budget without mutating process-wide state.
+    pub(crate) static TEST_TRAINING_IO_BUFFER_SIZE: u64;
+}
+
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
@@ -138,6 +144,10 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+    #[cfg(test)]
+    if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
+        scan.io_buffer_size(io_buffer_size);
+    }
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
 
@@ -666,12 +676,18 @@ pub fn index_matches_criteria(
     }
 
     if let Some(for_column) = criteria.for_column {
-        if index.fields.len() != 1 {
+        // A covered index lists its carried columns in `fields` too. Only the
+        // keyed prefix decides which column this index answers for, and there
+        // must be exactly one of it.
+        if index.keyed_field().is_none() {
             return Ok(false);
         }
         if fields.len() != 1 {
-            // This should be unreachable since we just verified index.fields.len() == 1 but
-            // return false just in case
+            // Callers must resolve `fields` from the keyed prefix alone. A caller
+            // that passes all of `index.fields` -- carried columns included --
+            // lands here for every covered index and silently gets "no match"
+            // rather than an error, which is how `describe_indices` came to omit
+            // them.
             return Ok(false);
         }
         let is_fts_index = index
@@ -865,6 +881,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![field_id],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details,
@@ -1010,6 +1027,48 @@ mod tests {
         let result =
             index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
+    }
+
+    /// A covered scalar index lists its carried columns in `fields` too. It must
+    /// still match its keyed column -- rejecting on `fields.len() != 1` would
+    /// silently stop selecting it, with no error and no failing query, just a
+    /// plan that quietly stops using the index.
+    #[test]
+    fn test_index_matches_criteria_covered_index() {
+        let mut btree_index = make_index_metadata("btree_index", 1, Some(IndexType::BTree));
+        // Keyed on field 1, carrying field 2 -- a valid trailing subset.
+        btree_index.fields = vec![1, 2];
+        btree_index.covering_fields = vec![2];
+
+        let criteria = IndexCriteria {
+            must_support_fts: false,
+            fts_document_granularity: None,
+            must_support_exact_equality: false,
+            for_column: Some("mycol"),
+            has_name: None,
+        };
+
+        let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(
+            result,
+            "a covered scalar index must still match its keyed column"
+        );
+
+        // A genuinely composite index -- two keyed fields, no declaration --
+        // stays rejected: `for_column` means the index maps to a single column.
+        let mut composite = make_index_metadata("composite", 1, Some(IndexType::BTree));
+        composite.fields = vec![1, 2];
+        composite.covering_fields = vec![];
+        let result =
+            index_matches_criteria(&composite, &criteria, &[&field], false, &schema).unwrap();
+        assert!(!result, "a composite index must not match a single column");
     }
 
     /// Regression guard for over-projection of `Map` siblings in
@@ -2094,6 +2153,53 @@ mod tests {
         assert_eq!(
             ds.statistics().column_value_range("id").await.unwrap(),
             Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
+        );
+    }
+
+    /// A covered ZoneMap (`fields=[id, other]`, `other` carried) must still be
+    /// found by `column_value_range("id")`: matching on `idx.fields` as a whole
+    /// (rather than its keyed prefix) would silently exclude it and lose range
+    /// pruning with no error.
+    #[tokio::test]
+    async fn test_column_value_range_recognizes_covered_index() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use datafusion::scalar::ScalarValue;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 2 fragments x 5 rows: `id` and `other` both step 0..9.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .col("other", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+        let other_field_id = ds.schema().field("other").unwrap().id;
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut segment = ds
+            .create_index_builder(&["id"], IndexType::Scalar, &params)
+            .name("id_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        // Nothing writes a covering declaration yet, so it is hand-constructed
+        // here on top of a real single-field segment: read plumbing never touches
+        // covered-column storage, so a declaration naming a real, uninvolved
+        // column is a faithful stand-in for a genuinely covered segment.
+        segment.fields.push(other_field_id);
+        segment.covering_fields = vec![other_field_id];
+        ds.commit_existing_index_segments("id_idx", "id", vec![segment])
+            .await
+            .unwrap();
+
+        assert_eq!(ds.load_indices_by_name("id_idx").await.unwrap().len(), 1);
+        assert_eq!(
+            ds.statistics().column_value_range("id").await.unwrap(),
+            Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9)))),
+            "covered ZoneMap must still be matched by its keyed column"
         );
     }
 

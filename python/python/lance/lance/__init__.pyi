@@ -44,6 +44,7 @@ from ..dataset import (
     Transaction,
     UpdateResult,
     Version,
+    VersionRef,
 )
 from ..fragment import (
     DataFile,
@@ -108,6 +109,37 @@ class MetricDescription:
 def register_lance_metrics_recorder() -> bool: ...
 def lance_metrics_catalog() -> List[MetricDescription]: ...
 def snapshot_lance_metrics() -> List[MetricPoint]: ...
+
+class FtsToken:
+    text: str
+    position: int
+    def __repr__(self) -> str: ...
+
+def tokenize(
+    query: str,
+    *,
+    analyzer: Optional[Literal["text", "code"]] = None,
+    base_tokenizer: Optional[str] = None,
+    language: Optional[str] = None,
+    max_token_length: Optional[int] = 40,
+    lower_case: Optional[bool] = None,
+    stem: Optional[bool] = None,
+    remove_stop_words: Optional[bool] = None,
+    custom_stop_words: Optional[List[str]] = None,
+    ascii_folding: Optional[bool] = None,
+    min_ngram_length: Optional[int] = None,
+    max_ngram_length: Optional[int] = None,
+    prefix_only: Optional[bool] = None,
+    split_identifiers: Optional[bool] = None,
+    split_on_numerics: Optional[bool] = None,
+    preserve_original: Optional[bool] = None,
+    index_operators: Optional[bool] = None,
+) -> List[FtsToken]:
+    """Tokenize an FTS query without an index.
+
+    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    """
+    ...
 
 class CleanupStats:
     bytes_removed: int
@@ -455,6 +487,7 @@ class _Dataset:
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
+    def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
     def checkout_version(
@@ -714,6 +747,7 @@ class _Fragment:
     def physical_rows(self) -> int: ...
     @property
     def num_deletions(self) -> int: ...
+    def validate(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...
@@ -740,6 +774,7 @@ def _write_fragments(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -760,6 +795,7 @@ def _write_fragments_transaction(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

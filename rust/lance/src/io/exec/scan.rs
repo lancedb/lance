@@ -168,18 +168,10 @@ impl LanceStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
-        let is_v2_scan = fragments
-            .iter()
-            .filter_map(|frag| frag.files.first().map(|f| !f.is_legacy_file()))
-            .next()
-            .unwrap_or(false);
-        if is_v2_scan {
-            Self::try_new_v2(
-                dataset, fragments, offsets, projection, config, metrics, partition,
-            )
-        } else {
-            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
-        }
+        let version = dataset.manifest().data_storage_format.lance_file_format();
+        crate::dataset::versions::create_scan_stream(
+            version, dataset, fragments, offsets, projection, config, metrics, partition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -416,6 +408,7 @@ impl LanceStream {
     pub fn try_new_v1(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        _offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,

@@ -519,8 +519,8 @@ impl RabitQuantizationStorage {
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
         match self.distance_type {
-            DistanceType::L2 => dist_q_c,
-            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
+            DistanceType::L2 | DistanceType::Cosine => dist_q_c,
+            DistanceType::Dot => dist_q_c - 1.0,
             _ => unimplemented!(
                 "RabitQ does not support distance type: {}",
                 self.distance_type
@@ -931,20 +931,25 @@ impl<'a> RabitDistCalculator<'a> {
     /// Fill `dists[0..n]` with exact per-row binary distances computed
     /// directly from the f32 dist table — the fallback when the quantized
     /// reconstruction scale would be non-finite ([`DistTableDequant::Exact`]).
-    #[allow(clippy::uninit_vec)]
     fn fill_exact_binary_distances(&self, n: usize, code_len: usize, dists: &mut Vec<f32>) {
         dists.clear();
         dists.reserve(n);
-        // SAFETY: the loop initializes every element in [0, n).
-        unsafe {
-            dists.set_len(n);
-        }
-        dists.iter_mut().enumerate().for_each(|(id, dist)| {
-            *dist = compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
-        });
+        dists.spare_capacity_mut()[..n]
+            .iter_mut()
+            .enumerate()
+            .for_each(|(id, dist)| {
+                dist.write(compute_single_rq_distance(
+                    self.codes,
+                    id,
+                    n,
+                    code_len,
+                    &self.dist_table,
+                ));
+            });
+        // Every reserved slot was initialized above.
+        unsafe { dists.set_len(n) };
     }
 
-    #[allow(clippy::uninit_vec)]
     fn binary_distances_with_scratch(
         &self,
         n: usize,
@@ -979,52 +984,50 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         quantized_dists.clear();
         quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
         unsafe {
+            // Storage construction proves the code and table layouts, and the
+            // reserved output has exactly one slot per SIMD row.
+            simd::dist_table::sum_4bit_dist_table_uninit(
+                simd_len,
+                code_len,
+                self.codes,
+                quantized_dists_table,
+                &mut quantized_dists.spare_capacity_mut()[..simd_len],
+            );
+            // The distance-table kernel initialized every SIMD output slot.
             quantized_dists.set_len(simd_len);
         }
-        simd::dist_table::sum_4bit_dist_table(
-            simd_len,
-            code_len,
-            self.codes,
-            quantized_dists_table,
-            quantized_dists,
-        );
 
         let range = (qmax - qmin) / 255.0;
         let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
         dists.reserve(n);
-        // SAFETY: the SIMD section below writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
-        }
-        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
-        simd_dists
+        let uninit_dists = &mut dists.spare_capacity_mut()[..n];
+        uninit_dists[..simd_len]
             .iter_mut()
             .zip(quantized_dists.iter())
             .for_each(|(dist, q_dist)| {
-                *dist = (*q_dist as f32) * range + sum_min;
+                dist.write((*q_dist as f32) * range + sum_min);
             });
 
-        remainder_dists
+        uninit_dists[simd_len..]
             .iter_mut()
             .enumerate()
             .for_each(|(id, dist)| {
-                *dist = compute_single_rq_distance(
+                dist.write(compute_single_rq_distance(
                     self.codes,
                     simd_len + id,
                     n,
                     code_len,
                     &self.dist_table,
-                );
+                ));
             });
+        // Both the SIMD reconstruction and scalar remainder initialized their slots.
+        unsafe { dists.set_len(n) };
         simd_len
     }
 
-    #[allow(clippy::uninit_vec)]
     fn binary_distances_hacc_with_scratch(
         &self,
         n: usize,
@@ -1049,48 +1052,47 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         quantized_dists.clear();
         quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_hacc_dist_table overwrites each element in the batch range.
         unsafe {
+            // Storage construction proves the code and table layouts, and the
+            // reserved output has exactly one slot per SIMD row.
+            simd::dist_table::sum_4bit_hacc_dist_table_uninit(
+                simd_len,
+                code_len,
+                self.codes,
+                hacc_dist_table,
+                &mut quantized_dists.spare_capacity_mut()[..simd_len],
+            );
+            // The high-accuracy kernel initialized every SIMD output slot.
             quantized_dists.set_len(simd_len);
         }
-        simd::dist_table::sum_4bit_hacc_dist_table(
-            simd_len,
-            code_len,
-            self.codes,
-            hacc_dist_table,
-            quantized_dists,
-        );
 
         let range = (qmax - qmin) / u16::MAX as f32;
         let num_tables = quantized_dist_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
         dists.reserve(n);
-        // SAFETY: the batch section writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
-        }
-        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
-        simd_dists
+        let uninit_dists = &mut dists.spare_capacity_mut()[..n];
+        uninit_dists[..simd_len]
             .iter_mut()
             .zip(quantized_dists.iter())
             .for_each(|(dist, q_dist)| {
-                *dist = (*q_dist as f32) * range + sum_min;
+                dist.write((*q_dist as f32) * range + sum_min);
             });
 
-        remainder_dists
+        uninit_dists[simd_len..]
             .iter_mut()
             .enumerate()
             .for_each(|(id, dist)| {
-                *dist = compute_single_rq_distance(
+                dist.write(compute_single_rq_distance(
                     self.codes,
                     simd_len + id,
                     n,
                     code_len,
                     &self.dist_table,
-                );
+                ));
             });
+        // Both the SIMD reconstruction and scalar remainder initialized their slots.
+        unsafe { dists.set_len(n) };
         simd_len
     }
 
@@ -1102,7 +1104,6 @@ impl<'a> RabitDistCalculator<'a> {
         }
     }
 
-    #[allow(clippy::uninit_vec)]
     fn one_bit_distances_with_scratch(
         &self,
         n: usize,
@@ -1131,7 +1132,6 @@ impl<'a> RabitDistCalculator<'a> {
         });
     }
 
-    #[allow(clippy::uninit_vec)]
     fn apply_raw_query_multi_bit_distances(
         &self,
         simd_len: usize,
@@ -1165,17 +1165,19 @@ impl<'a> RabitDistCalculator<'a> {
                     );
                     quantized_dists.clear();
                     quantized_dists.reserve(fastscan_len);
-                    // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
                     unsafe {
+                        // The packed ex-code layout and table size are fixed at
+                        // construction, and the output reserves one slot per row.
+                        simd::dist_table::sum_4bit_dist_table_uninit(
+                            fastscan_len,
+                            fastscan_code_len,
+                            packed_ex_codes,
+                            quantized_dists_table,
+                            &mut quantized_dists.spare_capacity_mut()[..fastscan_len],
+                        );
+                        // The distance-table kernel initialized every fast-scan slot.
                         quantized_dists.set_len(fastscan_len);
                     }
-                    simd::dist_table::sum_4bit_dist_table(
-                        fastscan_len,
-                        fastscan_code_len,
-                        packed_ex_codes,
-                        quantized_dists_table,
-                        quantized_dists,
-                    );
 
                     let range = (qmax - qmin) / quantization_max;
                     let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
@@ -1827,7 +1829,6 @@ impl DistCalculator for RabitDistCalculator<'_> {
     }
 
     #[inline(always)]
-    #[allow(clippy::uninit_vec)]
     fn distance_all_with_scratch(
         &self,
         _: usize,
@@ -4298,20 +4299,33 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_batch_keeps_cosine_for_legacy_residual_query() {
+    fn test_residual_query_cosine_uses_l2_query_factor() {
         let original_codes = make_test_codes(50, 64);
         let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
         metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let batch = make_test_batch(original_codes);
 
-        let storage = RabitQuantizationStorage::try_from_batch(
-            make_test_batch(original_codes),
+        let cosine_storage = RabitQuantizationStorage::try_from_batch(
+            batch.clone(),
             &metadata,
             DistanceType::Cosine,
             None,
         )
         .unwrap();
+        let l2_storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
 
-        assert_eq!(storage.distance_type(), DistanceType::Cosine);
+        assert_eq!(cosine_storage.distance_type(), DistanceType::Cosine);
+
+        let query = Arc::new(Float32Array::from(vec![0.125; 64])) as ArrayRef;
+        let dist_q_c = 0.25;
+        let cosine_distances = cosine_storage
+            .dist_calculator(query.clone(), dist_q_c)
+            .distance_all(0);
+        let l2_distances = l2_storage.dist_calculator(query, dist_q_c).distance_all(0);
+
+        assert_eq!(cosine_distances, l2_distances);
     }
 
     #[test]
