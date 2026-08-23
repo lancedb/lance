@@ -4931,8 +4931,12 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.5",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-google",
  "rstest",
  "serde",
+ "serde_json",
  "tempfile",
  "test-log",
  "tokio",
@@ -4940,6 +4944,7 @@ dependencies = [
  "tracing-mock",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
