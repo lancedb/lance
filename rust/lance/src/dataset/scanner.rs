@@ -132,6 +132,8 @@ use crate::{
     io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children_with_schema},
 };
 
+pub(crate) mod logical;
+
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
@@ -437,7 +439,7 @@ impl ColumnOrdering {
 ///
 /// This parameter only affects scans.  Vector search and full text search
 /// always use late materialization.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum MaterializationStyle {
     /// Heuristic-based materialization style
     ///
@@ -2832,6 +2834,9 @@ impl Scanner {
     #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
+        if logical::is_enabled() {
+            return logical::create_plan(self).await;
+        }
         self.validate_options()?;
 
         let full_text_query = match &self.full_text_query {
