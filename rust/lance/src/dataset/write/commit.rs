@@ -52,6 +52,8 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    migration_next_row_id: Option<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -75,6 +77,7 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
+            migration_next_row_id: None,
         }
     }
 
@@ -98,7 +101,8 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.into());
+        self.storage_format = Some(storage_format.resolve());
+
         self
     }
 
@@ -251,6 +255,17 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Configure this commit as the second step of a stable row ID migration.
+    ///
+    /// Sets `use_stable_row_ids = true` and supplies the `next_row_id` that was
+    /// computed during the first migration commit. This bypasses the normal
+    /// "cannot enable stable row IDs on an existing dataset" check so that the
+    /// flag can be activated without creating the dataset from scratch.
+    pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
+        self.migration_next_row_id = Some(next_row_id);
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -385,7 +400,11 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_stable_row_ids = if let Some(ds) = dest.dataset() {
+        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
+            // Migration activation always enables stable row IDs regardless of
+            // the current dataset state.
+            true
+        } else if let Some(ds) = dest.dataset() {
             ds.manifest.uses_stable_row_ids()
         } else {
             self.use_stable_row_ids.unwrap_or(false)
@@ -409,6 +428,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
+            migration_next_row_id: self.migration_next_row_id,
             ..Default::default()
         };
 
@@ -476,13 +496,21 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
+                    dataset.base_object_stores.clone()
+                } else {
+                    Default::default()
+                };
+                Ok(Dataset {
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    base_object_stores,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -509,6 +537,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Default::default(),
                 })
             }
         }
@@ -589,7 +618,8 @@ mod tests {
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
-            ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
+
         Fragment {
             id: 0,
             files: vec![DataFile {

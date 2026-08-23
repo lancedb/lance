@@ -41,7 +41,7 @@ use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    MaterializationStyle, QueryFilter,
+    MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
@@ -52,8 +52,8 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -1178,7 +1178,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1212,6 +1212,8 @@ impl Dataset {
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         disable_scoring_autoprojection: Option<bool>,
         substrait_aggregate: Option<Vec<u8>>,
+        row_addr_allowlist: Option<Vec<u8>>,
+        row_addr_blocklist: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1346,6 +1348,18 @@ impl Dataset {
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
+        }
+        // Serialized RowAddrTreeMap payloads rather than an object: a mask built by
+        // another extension module cannot hand over a Rust value, but both sides
+        // agree on this encoding. RowAddrMask::from_serialized_parts is the shared
+        // entry point, so no binding has to reimplement the allow/block combination.
+        if let Some(mask) = RowAddrMask::from_serialized_parts(
+            row_addr_allowlist.as_deref(),
+            row_addr_blocklist.as_deref(),
+        )
+        .infer_error()?
+        {
+            scanner.with_row_addr_prefilter(mask);
         }
 
         scanner
@@ -2031,6 +2045,19 @@ impl Dataset {
             })
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        let py = self_.py();
+        self_
+            .list_version_refs()?
+            .iter()
+            .map(|version| {
+                let dict = PyDict::new(py);
+                dict.set_item("version", version.version)?;
+                dict.into_py_any(py)
+            })
+            .collect()
     }
 
     /// Fetches the currently checked out version of the dataset.
@@ -4141,6 +4168,18 @@ impl DatasetDelta {
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
     }
+    /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_deleted_row_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_deleted_row_ids())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
 }
 
 #[pyclass(
@@ -4454,6 +4493,10 @@ impl Dataset {
         rt().block_on(None, self.ds.versions())?.infer_error()
     }
 
+    fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
+        rt().block_on(None, self.ds.version_refs())?.infer_error()
+    }
+
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
         rt().block_on(None, self.ds.tags().list())?.infer_error()
     }
@@ -4552,6 +4595,21 @@ impl Dataset {
             rt().block_on(None, future)
         }
     }
+}
+
+/// Serialize row addresses into the payload the scanner's `row_addr_allowlist` /
+/// `row_addr_blocklist` parameters accept.
+///
+/// Without this those parameters are unusable from Python: they take the roaring
+/// `RowAddrTreeMap` encoding, which nothing else exposed here can produce. The
+/// result stays plain bytes, so a mask may equally be built by another extension
+/// module and handed in.
+#[pyfunction(name = "_serialize_row_addrs")]
+pub fn serialize_row_addrs(py: Python<'_>, addrs: Vec<u64>) -> PyResult<Py<PyBytes>> {
+    let treemap = RowAddrTreeMap::from_iter(addrs);
+    let mut buf = Vec::with_capacity(treemap.serialized_size());
+    treemap.serialize_into(&mut buf).infer_error()?;
+    Ok(PyBytes::new(py, &buf).unbind())
 }
 
 #[pyfunction(name = "_write_dataset")]
@@ -4658,6 +4716,9 @@ pub fn get_write_params(
         }
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
+        }
+        if let Some(session) = get_dict_opt::<Session>(options, "session")? {
+            p.session = Some(session.inner.clone());
         }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;

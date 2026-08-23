@@ -247,6 +247,23 @@ impl<'a> TransactionRebase<'a> {
         )
     }
 
+    #[track_caller]
+    fn data_replacement_field_removed_err(
+        &self,
+        field_id: i32,
+        fragment_id: u64,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "DataReplacement target field {} in fragment {} was dropped by concurrent {} at version {}.",
+                field_id, fragment_id, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
     /// Check whether the transaction conflicts with another transaction.
     /// Mutate the current [TransactionRebase] based on `other_transaction` to be used for
     /// eventually finishing the rebase process.
@@ -599,6 +616,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => self.check_compacted_sstables_conflict(
                     other_compacted_sstables,
                     self_compacted_sstables,
@@ -680,8 +698,16 @@ impl<'a> TransactionRebase<'a> {
                     );
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids, so this should be fine.
-                Operation::Merge { .. } => Ok(()),
+                // Merge, reserve, and project don't change row ids. The MemWAL
+                // index is the exception: its install validates schema-dependent
+                // state, which a concurrent schema change invalidates.
+                Operation::Merge { .. } => {
+                    if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
@@ -761,15 +787,16 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
-                    let newly_indexed_fields = new_indices
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -780,6 +807,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
                     // as they can be rebased on each other
@@ -1086,11 +1114,28 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Project { schema, .. } => {
+                    // A project operation can drop fields.  If the project
+                    // dropped a field this operation was replacing then
+                    // we have a conflict.
+                    for replacement in replacements {
+                        for field in replacement.1.fields.iter() {
+                            if *field >= 0 && schema.field_by_id(*field).is_none() {
+                                return Err(self.data_replacement_field_removed_err(
+                                    *field,
+                                    replacement.0,
+                                    other_transaction,
+                                    other_version,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::Merge { .. } => {
                     // Merge rewrites the whole fragment list; always conflict
                     // (symmetric with check_merge_txn).
@@ -1154,20 +1199,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::CreateIndex { new_indices, .. } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
                     //
                     // TODO: We could potentially just drop the fragments being replaced from
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
-                    let newly_indexed_fields = new_indices
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -1341,8 +1387,15 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
-            Operation::CreateIndex { .. }
-            | Operation::ReserveFragments { .. }
+            // See the MemWAL exception in check_create_index_txn.
+            Operation::CreateIndex { new_indices, .. } => {
+                if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
@@ -1515,13 +1568,17 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Activation rebases like any other MemWAL state update; its preconditions
+        // are re-checked against the rebased index list when the commit applies.
         if let Operation::UpdateMemWalState {
             compacted_sstables: self_compacted_sstables,
+            ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
                     // the same shard's compacted SSTable
@@ -1926,6 +1983,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } = &mut self.transaction.operation
         {
             // Handle FRAG_REUSE_INDEX rebasing
@@ -2194,7 +2252,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::LanceFileVersion;
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2414,7 +2472,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2557,7 +2615,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2693,6 +2751,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -3693,7 +3752,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(1);
@@ -3768,6 +3827,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
             index_details: None,
@@ -3819,11 +3879,89 @@ mod tests {
     }
 
     #[test]
+    fn test_mem_wal_install_conflicts_with_merge() {
+        let mem_wal_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: MEM_WAL_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let column_index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "btree".to_string(),
+            ..mem_wal_index.clone()
+        };
+        let merge = Transaction::new(
+            0,
+            Operation::Merge {
+                fragments: vec![],
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        // Install rebasing over a committed Merge conflicts; a column index
+        // stays compatible.
+        for (index, conflicts) in [(mem_wal_index.clone(), true), (column_index, false)] {
+            let txn = Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let mut rebase = TransactionRebase {
+                transaction: txn,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&merge, 1);
+            assert_eq!(result.is_err(), conflicts, "{result:?}");
+        }
+
+        // And the reverse: a Merge rebasing over a committed install conflicts.
+        let install = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut rebase = TransactionRebase {
+            transaction: merge,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&install, 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn test_create_index_conflicts_only_on_same_name() {
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -3890,6 +4028,7 @@ mod tests {
                         uuid: uuid::Uuid::new_v4(),
                         name: "test".to_string(),
                         fields: vec![0],
+                        covering_fields: vec![],
                         dataset_version: 1,
                         fragment_bitmap: None,
                         index_details: None,
@@ -3922,6 +4061,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "text_ngram".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
             index_details: Some(Arc::new(prost_types::Any {
@@ -3937,6 +4077,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: FRAG_REUSE_INDEX_NAME.to_string(),
             fields: vec![],
+            covering_fields: vec![],
             dataset_version: 2,
             fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
             index_details: None,
@@ -4603,6 +4744,41 @@ mod tests {
                     fragments: vec![Fragment::new(0)],
                     schema: lance_core::datatypes::Schema::default(),
                     preserves_nullability: true,
+                },
+                Retryable,
+            ),
+            (
+                // Unlike every other case here, op1 is CreateIndex and op2 is
+                // DataReplacement. This is deliberate, not an inconsistency:
+                // `check_txn` dispatches on op1's operation type, so only
+                // op1 == CreateIndex reaches `check_create_index_txn`'s
+                // `Operation::DataReplacement` arm, which is the arm this case
+                // targets. Swapping the order to match the other cases would
+                // instead exercise the mirrored `check_data_replacement_txn`'s
+                // `Operation::CreateIndex` arm, leaving the intended arm with
+                // zero coverage.
+                "CreateIndex covering a field vs DataReplacement of that field",
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: Uuid::new_v4(),
+                        name: "covering_idx".to_string(),
+                        fields: vec![0, 3],
+                        covering_fields: vec![3],
+                        dataset_version: 1,
+                        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                        files: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("path0_3", vec![3], None),
+                    )],
                 },
                 Retryable,
             ),

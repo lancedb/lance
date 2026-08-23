@@ -55,15 +55,14 @@ use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
     dataset::{
-        fragment::{FileFragment, FragReadConfig},
+        fragment::FileFragment,
         transaction::{Operation, Transaction},
+        versions,
         write::merge_insert::logical_plan::MergeInsertPlanner,
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec,
-        filtered_read::{FilteredReadExec, FilteredReadOptions},
-        project,
+        Planner, project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -125,6 +124,7 @@ use lance_datafusion::{
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
 };
+#[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
@@ -967,11 +967,13 @@ impl MergeInsertJob {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
         let target_schema = self.dataset.schema();
 
-        let mut options = SchemaCompareOptions {
-            compare_dictionary: self.dataset.is_legacy_storage(),
-            compare_nullability: NullabilityComparison::Ignore,
-            ..Default::default()
-        };
+        let version = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format();
+        let mut options = versions::schema_compare_options(version);
+        options.compare_nullability = NullabilityComparison::Ignore;
 
         // Try full schema match first.
         if lance_schema
@@ -1081,7 +1083,7 @@ impl MergeInsertJob {
             .iter()
             .map(|(col, idx)| IndexLookup::new(col.clone(), idx.name.clone()))
             .collect::<Vec<_>>();
-        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+        let index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
             self.dataset.clone(),
             lookups,
             index_mapper_input,
@@ -1093,29 +1095,16 @@ impl MergeInsertJob {
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target: Arc<dyn ExecutionPlan> = if self.dataset.is_legacy_storage() {
-            if add_row_addr {
-                let pos = index_mapper.schema().fields().len(); // Add to end
-                index_mapper = Arc::new(AddRowAddrExec::try_new(
-                    index_mapper,
-                    self.dataset.clone(),
-                    pos,
-                )?);
-            }
-            Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
-        } else {
-            // Keep the mapped row ids; the read synthesizes the row addresses
-            // if requested (no AddRowAddrExec needed)
-            let mut projection = projection.with_row_id();
-            if add_row_addr {
-                projection = projection.with_row_addr();
-            }
-            Arc::new(FilteredReadExec::try_new(
-                self.dataset.clone(),
-                FilteredReadOptions::new(projection),
-                Some(index_mapper),
-            )?)
-        };
+        let mut target = versions::merge_insert_indexed_take(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format(),
+            self.dataset.clone(),
+            index_mapper,
+            projection,
+            add_row_addr,
+        )?;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so
@@ -1492,12 +1481,10 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let data_storage_version = dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?;
-                    let mut writer = crate::dataset::versions::open_writer(
-                        data_storage_version.into(),
+                    let data_storage_version =
+                        dataset.manifest().data_storage_format.lance_file_format();
+                    let mut writer = versions::open_writer(
+                        data_storage_version,
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
@@ -1533,16 +1520,12 @@ impl MergeInsertJob {
                         }
                     }
 
-                    if data_storage_version == LanceFileVersion::Legacy {
+                    if let Some(batch_size) =
+                        versions::row_group_size_for_rewrite(data_storage_version, &fragment)
+                            .await?
+                    {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
-                        let reader = fragment
-                            .open(
-                                dataset.schema(),
-                                FragReadConfig::default().with_row_address(true),
-                            )
-                            .await?;
-                        let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();
                         let stream = stream::iter(batches.into_iter().map(Ok));
                         let stream = Box::pin(RecordBatchStreamAdapter::new(
                             Arc::new((&write_schema).into()),
@@ -1577,6 +1560,7 @@ impl MergeInsertJob {
                         .updater(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
+                            None,
                             None,
                         )
                         .await?;
@@ -2993,7 +2977,6 @@ impl Merger {
         &self,
         combined_batch: &RecordBatch,
         right_offset: usize,
-        num_keys: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
         // The outer join distinguishes its three cases by which side's join
         // keys were NULL-padded: a present row always has non-null keys, while
@@ -3003,14 +2986,18 @@ impl Merger {
         // column (e.g. an all-null vector) at position 0, and checking
         // positions [0, num_keys) there misreads an all-null leading payload
         // column as an absent join side, silently dropping every matched row
-        // (https://github.com/lancedb/lancedb/issues/3515). The target half
-        // carries the same columns in the same order, offset by `right_offset`.
+        // (https://github.com/lancedb/lancedb/issues/3515). The target half is
+        // resolved independently because the indexed path keeps dataset-schema
+        // order even when the source fields are reordered. Restrict that lookup
+        // to the target half because a valid source field can have the same
+        // `target_`-prefixed name.
+        let combined_schema = combined_batch.schema();
         let source_key_cols = self
             .params
             .on
             .iter()
             .map(|key| {
-                combined_batch.schema().index_of(key).map_err(|_| {
+                combined_schema.index_of(key).map_err(|_| {
                     Error::internal(format!(
                         "merge insert key column '{}' not found in joined batch",
                         key
@@ -3018,11 +3005,26 @@ impl Merger {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        debug_assert_eq!(source_key_cols.len(), num_keys);
-        let target_key_cols = source_key_cols
+        let target_key_cols = self
+            .params
+            .on
             .iter()
-            .map(|c| c + right_offset)
-            .collect::<Vec<_>>();
+            .map(|key| {
+                let target_key = format!("target_{key}");
+                combined_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .skip(right_offset)
+                    .find_map(|(index, field)| (field.name() == &target_key).then_some(index))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "merge insert target key column '{}' not found in joined batch",
+                            target_key
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let in_left = Self::not_all_null(combined_batch, &source_key_cols)?;
         let in_right = Self::not_all_null(combined_batch, &target_key_cols)?;
@@ -3058,14 +3060,11 @@ impl Merger {
             (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
-        let num_keys = self.params.on.len();
-
         let left_cols = Vec::from_iter(0..right_offset);
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
-        let (left_only, in_both, right_only) =
-            self.extract_selections(&batch, right_offset, num_keys)?;
+        let (left_only, in_both, right_only) = self.extract_selections(&batch, right_offset)?;
 
         // There is no contention on this mutex.  We're only using it to bypass the rust
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
@@ -4733,6 +4732,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n_indexed, UPD, "expected {UPD} rows flipped to 'indexed'");
+    }
+
+    #[rstest::rstest]
+    #[case::reordered_null_payload(false, Some(42))]
+    #[case::target_name_collision(true, None)]
+    #[tokio::test]
+    async fn test_indexed_partial_merge_with_reordered_source(
+        #[case] has_target_name_collision: bool,
+        #[case] expected_payload: Option<i32>,
+    ) {
+        let (target, source, payload_column) = if has_target_name_collision {
+            (
+                record_batch!(
+                    ("id", UInt64, [1]),
+                    ("target_id", Int32, [9]),
+                    ("b", Int32, [7])
+                )
+                .unwrap(),
+                record_batch!(("target_id", Int32, [None]), ("id", UInt64, [1])).unwrap(),
+                "target_id",
+            )
+        } else {
+            (
+                record_batch!(("id", UInt64, [1]), ("a", Int32, [None]), ("b", Int32, [7]))
+                    .unwrap(),
+                record_batch!(("a", Int32, [42]), ("id", UInt64, [1])).unwrap(),
+                "a",
+            )
+        };
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![target])
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let source_schema = source.schema();
+        let (dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_deleted_rows, 0);
+        let result = dataset
+            .scan()
+            .project(&[payload_column])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let payload = result[payload_column].as_primitive::<Int32Type>();
+        let actual_payload = (!payload.is_null(0)).then(|| payload.value(0));
+        assert_eq!(actual_payload, expected_payload);
     }
 
     #[tokio::test]

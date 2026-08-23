@@ -2819,7 +2819,7 @@ mod tests {
         write_lance_file(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
             &fs,
-            ConcreteFileVersion::from(version),
+            version.resolve(),
             FileWriterOptions::default(),
         )
         .await;

@@ -46,7 +46,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
-use lance::table::format::{BasePath, Fragment};
+use lance::table::format::{BasePath, Fragment, WriterVersion};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
@@ -58,6 +58,7 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -126,6 +127,30 @@ impl BlockingDataset {
                 .map_err(|e| Error::io_error(e.to_string()))
         })
     }
+
+    pub fn list_manifest_locations(
+        uri: &str,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Vec<ManifestLocation>> {
+        let accessor = (!storage_options.is_empty()).then(|| {
+            Arc::new(lance::io::StorageOptionsAccessor::with_static_options(
+                storage_options,
+            ))
+        });
+        let params = ReadParams {
+            store_options: Some(ObjectStoreParams {
+                storage_options_accessor: accessor,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(block_on(
+            DatasetBuilder::from_uri(uri)
+                .with_read_params(params)
+                .list_manifest_locations(),
+        )?)
+    }
+
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
@@ -251,6 +276,10 @@ impl BlockingDataset {
     pub fn list_versions(&self) -> Result<Vec<Version>> {
         let versions = block_on(self.inner.versions())?;
         Ok(versions)
+    }
+
+    pub fn count_versions(&self) -> Result<u64> {
+        Ok(block_on(self.inner.count_versions())?)
     }
 
     pub fn version(&self) -> Result<Version> {
@@ -782,6 +811,60 @@ impl IntoJava for Version {
             ],
         )?;
         Ok(java_version)
+    }
+}
+
+impl IntoJava for WriterVersion {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let library = env.new_string(self.library)?;
+        let version = env.new_string(self.version)?;
+        let prerelease = match self.prerelease {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        let build_metadata = match self.build_metadata {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+
+        Ok(env.new_object(
+            "org/lance/WriterVersion",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&library),
+                JValue::Object(&version),
+                JValue::Object(&prerelease),
+                JValue::Object(&build_metadata),
+            ],
+        )?)
+    }
+}
+
+impl IntoJava for ManifestLocation {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let size = self.size.ok_or_else(|| {
+            Error::runtime_error(format!("Manifest size is unavailable for {}", self.path))
+        })?;
+        let path = env.new_string(self.path.to_string())?;
+        let naming_scheme = env.new_string(match self.naming_scheme {
+            ManifestNamingScheme::V1 => "V1",
+            ManifestNamingScheme::V2 => "V2",
+        })?;
+        let e_tag = match self.e_tag {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        Ok(env.new_object(
+            "org/lance/ManifestLocation",
+            "(JLjava/lang/String;JLjava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(self.version as i64),
+                JValue::Object(&path),
+                JValue::Long(size as i64),
+                JValue::Object(&naming_scheme),
+                JValue::Object(&e_tag),
+            ],
+        )?)
     }
 }
 
@@ -1378,6 +1461,44 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_listManifestLocationsNative<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    storage_options_obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_list_manifest_locations(&mut env, path, storage_options_obj)
+    )
+}
+
+fn inner_list_manifest_locations<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    storage_options_obj: JObject,
+) -> Result<JObject<'local>> {
+    let path: String = path.extract(env)?;
+    let storage_options = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options = to_rust_map(env, &storage_options)?;
+    let locations = BlockingDataset::list_manifest_locations(&path, storage_options)?;
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for location in locations {
+        env.with_local_frame(8, |env| {
+            let java_location = location.into_java(env)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_location)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
@@ -1667,6 +1788,20 @@ pub extern "system" fn Java_org_lance_Dataset_nativeListVersions<'local>(
     java_dataset: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(env, inner_list_versions(&mut env, java_dataset))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionCount(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_get_version_count(&mut env, java_dataset), -1) as jlong
+}
+
+fn inner_get_version_count(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.count_versions()
 }
 
 fn inner_list_versions<'local>(
@@ -2049,6 +2184,29 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetWriterVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_writer_version(&mut env, java_dataset))
+}
+
+fn inner_get_writer_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let writer_version = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.manifest().writer_version.clone()
+    };
+    match writer_version {
+        Some(writer_version) => writer_version.into_java(env),
+        None => Ok(JObject::null()),
+    }
+}
+
 fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -2074,12 +2232,13 @@ fn inner_get_lance_file_format_version<'local>(
     let version_string = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let version = dataset_guard
+        dataset_guard
             .inner
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
-        version.to_string()
+            .lance_file_format()
+            .to_manifest_string()
+            .to_string()
     };
 
     Ok(env
@@ -3157,6 +3316,30 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_rows = env
+        .call_method(
+            &java_options,
+            "getMaxSourceRows",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_source_bytes = env
+        .call_method(
+            &java_options,
+            "getMaxSourceBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let excluded_fragment_ids = env
+        .call_method(
+            &java_options,
+            "getExcludedFragmentIds",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3171,6 +3354,9 @@ fn convert_java_compaction_options_to_rust(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        &max_source_rows,
+        &max_source_bytes,
+        &excluded_fragment_ids,
         config,
     )
 }

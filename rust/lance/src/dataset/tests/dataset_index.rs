@@ -12,8 +12,10 @@ use crate::dataset::ROW_ID;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
+use crate::utils::test::covering;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -37,13 +39,18 @@ use lance_core::cache::{
 };
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
+use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
+    CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
+    CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -180,6 +187,280 @@ async fn test_create_index(
     assert!(fragment_bitmap.contains(0));
 }
 
+/// An index that merely *carries* a vector column must not be selected to
+/// answer an ANN query against that column.
+///
+/// Two traps this test is written to avoid:
+///   - `early_pruning` raises `minimum_nprobes`, which can mask selection
+///     differences behind a full scan of the partitions.
+///   - `num_partitions = 1` means the probe path is never reached at all (the
+///     fixture uses [`covering::NUM_PARTITIONS`]).
+/// Both make a broken selection rule look correct, so this asserts on the
+/// plan the scanner actually built, never on query results.
+#[tokio::test]
+async fn test_covered_vector_column_is_not_selected_for_ann() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_two_vector_column_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::declare_covering(&mut dataset, "vec", "payload_vec").await;
+
+    let query = generate_random_array(covering::DIMENSION as usize);
+
+    // An ANN query on the carried column must fall back to a flat scan.
+    let mut scan = dataset.scan();
+    // `use_index` stays on: the point is that selection declines this
+    // index, not that the caller disabled indexing.
+    scan.nearest("payload_vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("KNNVectorDistance"),
+        "expected a flat KNN plan for the covered column, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("ANNIvfPartition"),
+        "the covered column must not be served by the ANN index:\n{plan}"
+    );
+
+    // The keyed column still uses the index -- without this, the test would
+    // pass just as well against an index that was never selected at all.
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the keyed column must still use the index:\n{plan}"
+    );
+}
+
+/// A filtered `describe_indices` must still find a covered index by its keyed
+/// column. The matcher compares the caller's resolved field slice against the one
+/// column named by `for_column`, so a caller that passes all of `index.fields` --
+/// carried columns included -- pushes that slice past length one and gets a silent
+/// "no match" for every covered index.
+#[tokio::test]
+async fn test_describe_indices_filters_a_covered_index_by_its_keyed_field() {
+    use lance_index::IndexCriteria;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Baseline: the plain index is found, so a later miss is about covering.
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "precondition: the plain index is findable");
+
+    let (vec_id, _) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.len(),
+        1,
+        "a covered index must still be findable by its keyed column"
+    );
+    assert_eq!(
+        found[0].field_ids(),
+        &[vec_id as u32],
+        "and must advertise only the keyed column"
+    );
+
+    // The carried column is not searchable, so it must not match.
+    let carried = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("payload")))
+        .await
+        .unwrap();
+    assert!(
+        carried.is_empty(),
+        "a carried column must not advertise an index"
+    );
+}
+
+/// An unfiltered `optimize_indices()` is a table-wide request, so a covered index
+/// must not abort it -- that would block optimization of every other index on the
+/// table over one this build merely cannot rebuild. It is skipped with a warning.
+/// Only a caller that names the covered index gets an error (see
+/// `test_optimize_indices_rejects_a_covered_index`).
+///
+/// Both the current and the stale case are covered: erroring on the stale one
+/// aborts the loop before the replacements accumulated for the other groups are
+/// committed, leaving an unrelated index stale too.
+#[rstest]
+#[case::current(false)]
+#[case::stale(true)]
+#[tokio::test]
+async fn test_optimize_skips_a_covered_index_without_blocking_others(#[case] stale: bool) {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+
+    // A covered vector index, and a plain scalar index that optimize may touch.
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::create_btree_index(&mut dataset, "payload", Some("payload_idx")).await;
+
+    let (_, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    if stale {
+        // Now *both* groups have an unindexed fragment, so the covered group
+        // would genuinely be rebuilt -- this is where the refusal used to fire.
+        covering::append_vector_payload_rows(&mut dataset, 256).await;
+    }
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a covered index must not abort an unfiltered optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![payload_id]),
+        "the covered index must be left exactly as it was"
+    );
+
+    if stale {
+        let payload_idx = after
+            .iter()
+            .filter(|idx| idx.name == "payload_idx")
+            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+            .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+                acc |= bitmap;
+                acc
+            });
+        assert!(
+            payload_idx.contains(1),
+            "the unrelated index must still have been optimized onto the new fragment, got {payload_idx:?}"
+        );
+    } else {
+        assert_eq!(after.len(), 2, "both indices must survive");
+    }
+}
+
+/// The same skip, for a *scalar* covered index. The rule does not branch on index
+/// type, but scalar groups take their own no-work path a few lines below the
+/// covering gate, so a covered scalar index reaching that gate first is worth
+/// pinning separately from the vector case above.
+///
+/// The append is what gives this test teeth. Without it the covered group has no
+/// work either way, so the scalar no-work path below the gate produces the same
+/// observable outcome as the gate itself and the test passes with the gate
+/// removed entirely.
+#[tokio::test]
+async fn test_optimize_skips_a_stale_covered_scalar_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_three_int_column_dataset(&test_uri).await;
+    covering::create_btree_index(&mut dataset, "a", None).await;
+    covering::create_btree_index(&mut dataset, "b", None).await;
+
+    let (_, carried_id) = covering::declare_covering(&mut dataset, "a", "carried").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    // Both scalar groups now have an unindexed fragment, so the covered one
+    // would genuinely be rebuilt if the gate did not skip it first.
+    covering::append_three_int_column_rows(&mut dataset, 64).await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a stale covered scalar index must not abort optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![carried_id]),
+        "the covered scalar index must be left exactly as it was, not rebuilt"
+    );
+    // The unrelated scalar index was still maintained, so the skip is scoped to
+    // the covered group rather than aborting the loop.
+    let b_id = dataset.schema().field_id("b").unwrap();
+    let b_coverage = after
+        .iter()
+        .filter(|idx| idx.fields == vec![b_id])
+        .filter_map(|idx| idx.fragment_bitmap.as_ref())
+        .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+            acc |= bitmap;
+            acc
+        });
+    assert!(
+        b_coverage.contains(1),
+        "the unrelated scalar index must still have been optimized onto the new fragment, got {b_coverage:?}"
+    );
+}
+
+/// A caller that names the covered index asked for it specifically, so the
+/// refusal is loud rather than a skip.
+#[tokio::test]
+async fn test_optimize_indices_rejects_a_covered_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Nothing writes carried values, so the storage does not contain `payload`
+    // -- which is exactly why optimize must refuse: it rebuilds from a scan
+    // projecting the keyed field and `_rowid` only, and would republish the
+    // declaration on a segment that still has no payload.
+    let (vec_id, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    // Append AFTER declaring covering, so the group really would be rebuilt.
+    // Without it this would assert the refusal against an index optimize had no
+    // work for, and would keep passing if the refusal moved behind a no-work
+    // check.
+    covering::append_vector_payload_rows(&mut dataset, 256).await;
+
+    let before = dataset.load_indices().await.unwrap();
+    let before_uuid = before[0].uuid;
+    let covered_name = before[0].name.clone();
+
+    // Name the covered index: the refusal is reserved for a caller that targeted
+    // it. An unfiltered call skips it instead, which
+    // `test_optimize_skips_a_covered_index_without_blocking_others` covers.
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec![covered_name]))
+        .await
+        .expect_err("optimizing a targeted covered index must be refused");
+    assert!(
+        err.to_string().contains("declares covering fields"),
+        "unexpected message: {err}"
+    );
+
+    // Refused, not partially applied: the index is exactly as it was.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].uuid, before_uuid,
+        "a refused optimize must not replace the index"
+    );
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    assert_eq!(after[0].fields, vec![vec_id, payload_id]);
+
+    // The appended data above is unindexed, so this really is a case optimize
+    // would otherwise have merged -- the refusal is not the no-op path.
+    assert!(
+        after.iter().all(|idx| !idx.covering_fields.is_empty()),
+        "precondition: the only index is still the covered one"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_create_scalar_index(
@@ -224,6 +505,90 @@ async fn test_create_scalar_index(
     assert_eq!(indices[0].name, index_name);
 
     dataset.index_statistics(&index_name).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_btree_nullable_filters_match_unindexed_scan() {
+    let test_uri = TempStrDir::default();
+    let num_rows = 10_000u64;
+    let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let ids = UInt64Array::from_iter_values(0..num_rows);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("value", Arc::new(values) as ArrayRef),
+        ("id", Arc::new(ids) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2_500,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragments().len() > 1);
+
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for predicate in [
+        "value = 7",
+        "value IN (7, 99)",
+        "NOT (value = 99)",
+        "NOT (value = 7)",
+        "NOT (value = 99 OR value = 7)",
+        "NOT (NOT (value = 7))",
+        "value = 99 OR value = 7",
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "Expected BTree scalar index query for {predicate}:\n{plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+        let sorted_ids = |batch: &RecordBatch| {
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(
+            sorted_ids(&indexed),
+            sorted_ids(&baseline),
+            "indexed result differs for {predicate}"
+        );
+    }
 }
 
 async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
@@ -884,24 +1249,34 @@ async fn create_fragmented_fts_index_with_order(
     with_position: bool,
     reverse_segments: bool,
 ) {
+    let mut fragment_groups = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| vec![fragment.id() as u32])
+        .collect::<Vec<_>>();
+    if reverse_segments {
+        fragment_groups.reverse();
+    }
+    create_fragmented_fts_index_with_groups(dataset, column, with_position, fragment_groups).await;
+}
+
+async fn create_fragmented_fts_index_with_groups(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    fragment_groups: Vec<Vec<u32>>,
+) {
     let index_name = format!("{column}_idx");
     let columns = [column];
     let params = InvertedIndexParams::default().with_position(with_position);
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect::<Vec<_>>();
-    let mut segments = Vec::with_capacity(fragment_ids.len());
-    for fragment_id in &fragment_ids {
+    let expected_segments = fragment_groups.len();
+    let mut segments = Vec::with_capacity(expected_segments);
+    for fragment_ids in fragment_groups {
         let mut builder = dataset
             .create_index_builder(&columns, IndexType::Inverted, &params)
             .name(index_name.clone())
-            .fragments(vec![*fragment_id]);
+            .fragments(fragment_ids);
         segments.push(builder.execute_uncommitted().await.unwrap());
-    }
-    if reverse_segments {
-        segments.reverse();
     }
     dataset
         .commit_existing_index_segments(&index_name, column, segments)
@@ -913,7 +1288,7 @@ async fn create_fragmented_fts_index_with_order(
             .await
             .unwrap()
             .unwrap();
-    assert_eq!(segments.len(), fragment_ids.len());
+    assert_eq!(segments.len(), expected_segments);
 }
 
 fn compound_multimatch_query() -> FtsQuery {
@@ -956,6 +1331,16 @@ async fn compound_fts_results(
         .collect()
 }
 
+fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().map(|score| score.to_bits()))
+        .collect()
+}
+
 async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
     let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
     assert!(
@@ -982,6 +1367,625 @@ fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec
             .then_with(|| left_row_id.cmp(right_row_id))
     });
     expected
+}
+
+const CROSS_COLUMN_COMPOUND_FTS_SCORER: &str = "CrossColumnCompoundFtsScorer";
+
+fn independent_compound_fts_oracle<'a>(
+    dataset: &'a Dataset,
+    query: &'a FtsQuery,
+) -> Pin<Box<dyn Future<Output = HashMap<u64, f32>> + Send + 'a>> {
+    Box::pin(async move {
+        match query {
+            FtsQuery::Match(_) | FtsQuery::Phrase(_) => {
+                compound_fts_results(dataset, query.clone(), None)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            FtsQuery::MultiMatch(query) => {
+                let mut result = HashMap::new();
+                for match_query in &query.match_queries {
+                    let leaf = FtsQuery::Match(match_query.clone());
+                    for (row_id, score) in independent_compound_fts_oracle(dataset, &leaf).await {
+                        result
+                            .entry(row_id)
+                            .and_modify(|current| {
+                                if score > *current {
+                                    *current = score;
+                                }
+                            })
+                            .or_insert(score);
+                    }
+                }
+                result
+            }
+            FtsQuery::Boost(query) => {
+                let mut result =
+                    independent_compound_fts_oracle(dataset, query.positive.as_ref()).await;
+                let negative =
+                    independent_compound_fts_oracle(dataset, query.negative.as_ref()).await;
+                for (row_id, negative_score) in negative {
+                    if let Some(score) = result.get_mut(&row_id) {
+                        *score -= query.negative_boost * negative_score;
+                    }
+                }
+                result
+            }
+            FtsQuery::Boolean(query) => {
+                let mut required = None::<HashMap<u64, f32>>;
+                for clause in &query.must {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    if let Some(required) = required.as_mut() {
+                        required.retain(|row_id, score| {
+                            clause.get(row_id).is_some_and(|clause_score| {
+                                *score += *clause_score;
+                                true
+                            })
+                        });
+                    } else {
+                        required = Some(clause);
+                    }
+                }
+
+                let has_required = required.is_some();
+                let mut result = required.unwrap_or_default();
+                for clause in &query.should {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    for (row_id, clause_score) in clause {
+                        if has_required {
+                            if let Some(score) = result.get_mut(&row_id) {
+                                *score += clause_score;
+                            }
+                        } else {
+                            *result.entry(row_id).or_insert(0.0) += clause_score;
+                        }
+                    }
+                }
+
+                for clause in &query.must_not {
+                    for row_id in independent_compound_fts_oracle(dataset, clause)
+                        .await
+                        .keys()
+                    {
+                        result.remove(row_id);
+                    }
+                }
+                result
+            }
+        }
+    })
+}
+
+fn sorted_compound_fts_oracle(result: HashMap<u64, f32>) -> Vec<(u64, f32)> {
+    result
+        .into_iter()
+        .sorted_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_row_id.cmp(right_row_id))
+        })
+        .collect()
+}
+
+fn assert_scored_rows_close(case_name: &str, actual: &[(u64, f32)], expected: &[(u64, f32)]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{case_name} returned a different number of rows"
+    );
+    for ((actual_row_id, actual_score), (expected_row_id, expected_score)) in
+        actual.iter().zip(expected)
+    {
+        assert_eq!(
+            actual_row_id, expected_row_id,
+            "{case_name} returned rows in the wrong order"
+        );
+        let tolerance = 1.0e-5 * expected_score.abs().max(1.0);
+        assert!(
+            (actual_score - expected_score).abs() <= tolerance,
+            "{case_name} returned score {actual_score} for row {actual_row_id}, expected {expected_score}"
+        );
+    }
+}
+
+async fn assert_compound_matches_independent_oracle(
+    dataset: &Dataset,
+    case_name: &str,
+    query: &FtsQuery,
+    limit: usize,
+) -> Vec<(u64, f32)> {
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(dataset, query).await);
+    assert!(
+        expected.len() > limit,
+        "{case_name} must have candidates beyond k"
+    );
+    expected.truncate(limit);
+    let actual = compound_fts_results(dataset, query.clone(), Some(limit as i64)).await;
+    assert_scored_rows_close(case_name, &actual, &expected);
+    expected
+}
+
+async fn compound_fts_plan(dataset: &Dataset, query: FtsQuery, limit: usize) -> String {
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(limit as i64), None).unwrap();
+    scanner.explain_plan(false).await.unwrap()
+}
+
+async fn write_cross_column_compound_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha quick brown fox",
+                "alpha quick fox brown",
+                "quick brown fox",
+                "tie",
+                "alpha blocked",
+                "noise",
+                "alpha quick brown",
+                "tie",
+                "alpha",
+                "noise"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "gamma",
+                "gamma gamma optional",
+                "gamma",
+                "tiebody",
+                "gamma blocked",
+                "gamma optional",
+                "noise",
+                "tiebody",
+                "optional",
+                "blocked"
+            ]
+        ),
+        ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let phrase = || {
+        PhraseQuery::new("quick brown".to_owned())
+            .with_column(Some("title".to_owned()))
+            .into()
+    };
+    let phrase_approximation: FtsQuery = MatchQuery::new("quick brown".to_owned())
+        .with_column(Some("title".to_owned()))
+        .with_operator(Operator::And)
+        .into();
+    let phrase_query = phrase();
+    let phrase_matches = independent_compound_fts_oracle(&dataset, &phrase_query).await;
+    let approximation_matches =
+        independent_compound_fts_oracle(&dataset, &phrase_approximation).await;
+    assert!(
+        approximation_matches.len() > phrase_matches.len(),
+        "the fixture must include an approximation hit rejected by phrase confirmation"
+    );
+
+    let nested_required: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let staged_required_optional: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 1.0)),
+        (Occur::Should, compound_match_query("optional", "body", 4.0)),
+    ])
+    .into();
+    let cases: Vec<(&str, FtsQuery, usize)> = vec![
+        (
+            "must_sum",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            2,
+        ),
+        (
+            "should_sum",
+            BooleanQuery::new([
+                (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            3,
+        ),
+        ("required_optional", staged_required_optional.clone(), 3),
+        (
+            "must_not",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+                (
+                    Occur::MustNot,
+                    compound_match_query("blocked", "title", 1_000_000.0),
+                ),
+            ])
+            .into(),
+            3,
+        ),
+        (
+            "phrase_two_phase",
+            BooleanQuery::new([
+                (Occur::Must, phrase()),
+                (Occur::Must, compound_match_query("gamma", "body", 1.0)),
+            ])
+            .into(),
+            1,
+        ),
+        (
+            "boost",
+            BoostQuery::new(
+                compound_match_query("gamma", "body", 3.0),
+                compound_match_query("alpha", "title", 2.0),
+                Some(0.5),
+            )
+            .into(),
+            3,
+        ),
+        (
+            "nested",
+            BooleanQuery::new([
+                (Occur::Must, nested_required),
+                (Occur::Should, phrase()),
+                (Occur::MustNot, compound_match_query("blocked", "body", 1.0)),
+            ])
+            .into(),
+            3,
+        ),
+    ];
+
+    let mut plans = Vec::with_capacity(cases.len());
+    for (case_name, query, limit) in cases {
+        assert_compound_matches_independent_oracle(&dataset, case_name, &query, limit).await;
+        plans.push((case_name, compound_fts_plan(&dataset, query, limit).await));
+    }
+
+    for (case_name, plan) in plans {
+        assert!(
+            plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+            "{case_name} should use the cross-column scorer:\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashJoinExec"),
+            "{case_name} should not materialize an intermediate hash join:\n{plan}"
+        );
+    }
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(
+            staged_required_optional.clone(),
+        ))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let staged_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
+        Some(&0)
+    );
+    assert!(
+        stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_CANDIDATES_METRIC)
+            .is_some_and(|candidates| *candidates > 0),
+        "required+optional execution should materialize staged candidates"
+    );
+
+    dataset
+        .prewarm_index_with_options(
+            "title_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+    dataset
+        .prewarm_index_with_options(
+            "body_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(staged_required_optional))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let resident_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&0),
+        "prewarmed cross-column queries should use the resident bounded coordinator"
+    );
+    assert_eq!(
+        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        resident_results, staged_results,
+        "resident and staged cross-column scans must return identical ordered row ids and score bits"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_uses_one_scalar_prefilter_mask() {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed_batch = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed_batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    assert!(expected.len() > LIMIT);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "filtered cross-column search should use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+        "the shared prefilter should be built from the BTree scalar index:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        1,
+        "the cross-column scorer should have one shared scalar prefilter:\n{plan}"
+    );
+
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("scalar_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_tie_uses_final_row_id() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("tie", "title", 1.0)),
+        (Occur::Must, compound_match_query("tiebody", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[0].1, expected[1].1);
+    assert!(expected[0].0 < expected[1].0);
+
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("equal_score_row_id_tie", &actual, &expected[..1]);
+    let plan = compound_fts_plan(&dataset, query, 1).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "equal-score cross-column search should use the cross-column scorer:\n{plan}"
+    );
+}
+
+async fn assert_cross_column_layout_uses_fast_path(dataset: &Dataset, case_name: &str) {
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    assert_compound_matches_independent_oracle(dataset, case_name, &query, 2).await;
+    let plan = compound_fts_plan(dataset, query, 2).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "{case_name} should align independent segment layouts by row address:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_handles_independent_segment_layouts() {
+    let mut reordered = write_cross_column_compound_dataset().await;
+    let fragment_ids = reordered
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "body",
+        true,
+        vec![vec![fragment_ids[1]], vec![fragment_ids[0]]],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&reordered, "reordered_segments").await;
+
+    let mut differently_split = write_cross_column_compound_dataset().await;
+    let fragment_ids = differently_split
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "body",
+        true,
+        vec![fragment_ids],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&differently_split, "differently_split_segments")
+        .await;
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
+    let initial = arrow_array::record_batch!(
+        ("title", Utf8, ["old alpha", "old noise"]),
+        ("body", Utf8, ["old gamma", "old noise"])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["fresh alpha"]),
+        ("body", Utf8, ["fresh gamma"])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "title", 1.0)),
+        (Occur::Must, compound_match_query("fresh", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 1, "the appended row must be the only hit");
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("incomplete_coverage", &actual, &expected);
+
+    let plan = compound_fts_plan(&dataset, query, 1).await;
+    assert!(
+        !plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "incomplete column coverage must not use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("BooleanQuery"),
+        "incomplete column coverage should retain the exact fallback:\n{plan}"
+    );
 }
 
 #[tokio::test]
@@ -1130,8 +2134,12 @@ async fn test_boolean_must_scores_sum_across_execution_paths() {
     scanner.limit(Some(LIMIT as i64), None).unwrap();
     let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        plan.contains("HashJoinExec"),
-        "cross-column MUST should exercise the exact fallback:\n{plan}"
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column MUST should exercise the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "cross-column MUST should not materialize an intermediate hash join:\n{plan}"
     );
 }
 
@@ -1194,7 +2202,39 @@ async fn test_nested_multimatch_limit_propagation() {
             .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
         "the exhaustive result should include a deterministic score tie"
     );
-    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+    assert_compound_matches_independent_oracle(&dataset, "nested_multimatch_must", &must_query, 2)
+        .await;
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut staged_scanner = dataset.scan();
+    staged_scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(must_query.clone()))
+        .unwrap();
+    staged_scanner.limit(Some(2), None).unwrap();
+    staged_scanner.try_into_batch().await.unwrap();
+    let staged_stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        staged_stats
+            .all_counts
+            .get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
+        Some(&0)
+    );
 
     let should_query: FtsQuery = BooleanQuery::new([
         (Occur::Should, compound_multimatch_query()),
@@ -1204,21 +2244,27 @@ async fn test_nested_multimatch_limit_propagation() {
         ),
     ])
     .into();
-    assert_compound_fts_top_k(&dataset, should_query.clone(), 2).await;
-    let mut fallback_scanner = dataset.scan();
-    fallback_scanner
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_should",
+        &should_query,
+        2,
+    )
+    .await;
+    let mut scanner = dataset.scan();
+    scanner
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(should_query))
         .unwrap();
-    fallback_scanner.limit(Some(2), None).unwrap();
-    let fallback_plan = fallback_scanner.explain_plan(false).await.unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        fallback_plan.contains("BooleanQuery"),
-        "cross-column compound FTS should retain its exact fallback:\n{fallback_plan}"
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column compound FTS should use the cross-column scorer:\n{plan}"
     );
     assert!(
-        !fallback_plan.contains("CompoundFtsScorer"),
-        "cross-column compound FTS is not yet supported by the scorer tree:\n{fallback_plan}"
+        !plan.contains("HashJoinExec"),
+        "cross-column compound FTS should not materialize intermediate joins:\n{plan}"
     );
 
     let boost_query: FtsQuery = BoostQuery::new(
@@ -1227,9 +2273,22 @@ async fn test_nested_multimatch_limit_propagation() {
         Some(1.0),
     )
     .into();
-    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_boost",
+        &boost_query,
+        2,
+    )
+    .await;
 
-    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
+    let multimatch_query = compound_multimatch_query();
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "cross_column_multimatch",
+        &multimatch_query,
+        1,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1318,6 +2377,125 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     assert!(
         plan.contains("CompoundFtsScorer"),
         "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_pure_should_maxscore_is_exact_across_fragments() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "alpha beta rare blocked",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "beta",
+            "alpha"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true, true).await;
+
+    let match_query = |term: &str, boost: f32| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, match_query("alpha", 0.25)),
+        (Occur::Should, match_query("beta", 0.25)),
+        (Occur::Should, match_query("rare", 4.0)),
+        (
+            Occur::Should,
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("blocked", 1.0)),
+    ])
+    .into();
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert!(!exhaustive.iter().any(|(row_id, _)| *row_id == 0));
+    assert!(exhaustive.len() >= 3);
+    assert!(
+        exhaustive[..3]
+            .iter()
+            .all(|(_, score)| *score == exhaustive[0].1)
+            && exhaustive[..3].windows(2).all(|rows| rows[0].0 < rows[1].0),
+        "the top three identical rows should tie in ascending row-id order"
+    );
+    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(limited, exhaustive[..2]);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    for metric in [
+        COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+        COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+        COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+        COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    ] {
+        assert!(
+            stats.all_counts.contains_key(metric),
+            "pure-SHOULD execution stats should expose {metric}"
+        );
+    }
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC] > 0,
+        "pure-SHOULD execution should recompute clause bounds"
+    );
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC] > 0,
+        "pure-SHOULD execution should evaluate essential clauses"
+    );
+    assert_eq!(
+        stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
+        Some(&(4 * 5)),
+        "four index partitions should be searched once for each of five query leaves"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column pure SHOULD should use the compound scorer:\n{plan}"
     );
 }
 
@@ -4157,6 +5335,26 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
     dataset
 }
 
+#[tokio::test]
+async fn test_json_btree_index_statistics() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": 1000}"#,
+        r#"{"val": 2000}"#,
+        r#"{"val": 3000}"#,
+    ])
+    .await;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("json_idx").await.unwrap()).unwrap();
+
+    assert_eq!(stats["name"], "json_idx");
+    assert_eq!(stats["num_indices"], 1);
+    assert_eq!(stats["num_indexed_rows"], 3);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    assert_eq!(stats["indices"][0]["min"], "1000");
+    assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
 #[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
@@ -5050,7 +6248,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version.into(),
+        dataset_version.resolve(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -5079,7 +6277,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version.into(),
+            dataset_version.resolve(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -5158,7 +6356,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0.into(),
+        ConcreteFileVersion::V2_0,
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
@@ -5273,4 +6471,102 @@ async fn test_load_segment_params_full_fidelity() {
         .downcast_ref::<InvertedIndex>()
         .expect("inverted index");
     assert_eq!(&read, opened.params());
+}
+
+/// Compaction of a covered index must succeed. `remap_index` rejected any
+/// index with more than one field, so this failed outright -- a covered
+/// dataset could be created but never compacted.
+#[tokio::test]
+async fn test_compaction_withdraws_a_covered_index_without_failing() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let test_uri = TempStrDir::default();
+    let dimension = 16;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        ),
+        ArrowField::new("payload", DataType::Int32, false),
+    ]));
+
+    let make_batch = |offset: i32| {
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                generate_random_array(256 * dimension as usize),
+                dimension,
+            )
+            .unwrap(),
+        );
+        let payload = Arc::new(Int32Array::from_iter_values(offset..offset + 256));
+        RecordBatch::try_new(schema.clone(), vec![vectors, payload]).unwrap()
+    };
+
+    // Two fragments, so compaction has something to compact.
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(0))], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(256))], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    let params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 50);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let vec_id = dataset.schema().field_id("vec").unwrap();
+    let payload_id = dataset.schema().field_id("payload").unwrap();
+    let current = dataset.load_indices().await.unwrap();
+    let mut covered = current[0].clone();
+    covered.fields = vec![vec_id, payload_id];
+    covered.covering_fields = vec![payload_id];
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![covered],
+            removed_indices: current.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert!(
+        fragments_before.len() > 1,
+        "precondition: there must be something to compact"
+    );
+
+    // Compaction of the table must not be blocked by an index it cannot remap.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .expect("compaction of a covered index must succeed");
+
+    let fragments_after: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_ne!(
+        fragments_after, fragments_before,
+        "compaction rewrote nothing, so the remap path never ran"
+    );
+
+    // The entry survives untouched -- withdrawal skips remapping rather than
+    // deleting metadata -- but it now covers none of the rewritten fragments, so
+    // no query can be answered from a payload the storage never held.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    let live: roaring::RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let effective = after[0].effective_fragment_bitmap(&live);
+    assert!(
+        effective.is_none_or(|bitmap| bitmap.is_empty()),
+        "a withdrawn covered index must stop covering fragments, got {:?}",
+        after[0].fragment_bitmap
+    );
 }

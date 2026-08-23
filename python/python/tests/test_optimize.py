@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import json
 import pickle
 import random
 import re
@@ -27,6 +28,9 @@ def test_dataset_optimize(tmp_path: Path):
         target_rows_per_fragment=1000,
         materialize_deletions=False,
         num_threads=1,
+        # Loose source budgets: all fragments still compact in one run.
+        max_source_rows=100_000,
+        max_source_bytes=1024 * 1024 * 1024,
     )
 
     assert metrics.fragments_removed == 10
@@ -35,6 +39,58 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(800)}),
+        tmp_path / "dataset",
+        max_rows_per_file=200,
+    )
+    fragments = dataset.get_fragments()
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=400,
+        excluded_fragment_ids=[1, 1, 999],
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 2
+    remaining_fragment_ids = {
+        fragment.fragment_id for fragment in dataset.get_fragments()
+    }
+    assert fragments[1].fragment_id in remaining_fragment_ids
+
+
+def test_compact_files_source_budgets(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert len(dataset.get_fragments()) == 10
+
+    # A row budget of 250 admits the first two 100-row fragments only, so the
+    # run is incremental instead of compacting all 10 at once.
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_rows=250,
+    )
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+
+    # The budgets are hard upper bounds: a budget smaller than a single task
+    # produces an empty plan and compaction is a no-op.
+    version_before = dataset.version
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_bytes=1,
+    )
+    assert metrics.fragments_removed == 0
+    assert dataset.version == version_before
+
+    with pytest.raises(OSError, match="must be greater than 0"):
+        dataset.optimize.compact_files(max_source_rows=0)
 
 
 def test_compact_files_max_source_fragments(tmp_path: Path):
@@ -86,6 +142,44 @@ def test_blob_compaction(tmp_path: Path):
     blob_files = dataset.take_blobs("blob", indices=[0, 1])
     contents = [blob_files[0].readall(), blob_files[1].readall()]
     assert contents == blobs
+
+
+def test_blob_compaction_with_nested_json_sibling(tmp_path: Path):
+    dataset_uri = tmp_path / "nested_blob_json"
+    info_fields = [lance.blob_field("blob"), pa.field("meta", pa.json_())]
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("info", pa.struct(info_fields)),
+        ]
+    )
+    for index, row_id in enumerate([1, 2]):
+        info = pa.StructArray.from_arrays(
+            [
+                lance.blob_array([f"blob-{row_id}".encode()]),
+                pa.array([json.dumps({"row": row_id})], type=pa.json_()),
+            ],
+            fields=info_fields,
+        )
+        lance.write_dataset(
+            pa.Table.from_arrays([pa.array([row_id]), info], schema=schema),
+            dataset_uri,
+            mode="create" if index == 0 else "append",
+            data_storage_version="2.2",
+        )
+
+    dataset = lance.dataset(dataset_uri)
+    dataset.optimize.compact_files(num_threads=1)
+
+    assert len(dataset.get_fragments()) == 1
+    assert [data for _, data in dataset.read_blobs("info.blob", indices=[0, 1])] == [
+        b"blob-1",
+        b"blob-2",
+    ]
+    assert [
+        json.loads(value)
+        for value in dataset.to_table(columns=["info.meta"])["info.meta"].to_pylist()
+    ] == [{"row": 1}, {"row": 2}]
 
 
 @pytest.mark.parametrize("storage_version", ["2.0", "2.1", "2.2"])
@@ -510,6 +604,31 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
     assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
     assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+
+    excluded_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=[1, 1, 999],
+            num_threads=1,
+        ),
+    )
+    assert excluded_plan.num_tasks() == 1
+    assert excluded_plan.tasks[0].fragments == [
+        frag.metadata for frag in fragments[2:4]
+    ]
+    assert pickle.loads(pickle.dumps(excluded_plan)) == excluded_plan
+
+    none_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=None,
+            num_threads=1,
+        ),
+    )
+    assert none_plan == plan
+
     # Plan can be pickled
     assert pickle.loads(pickle.dumps(plan)) == plan
 
