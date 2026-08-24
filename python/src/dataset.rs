@@ -3208,7 +3208,7 @@ impl Dataset {
                 new_self.add_columns(transforms, None, batch_size).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3232,7 +3232,7 @@ impl Dataset {
                     .await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3250,7 +3250,7 @@ impl Dataset {
                 new_self.add_columns(transform, None, None).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
