@@ -1428,6 +1428,7 @@ mod tests {
         IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![2],
+            covering_fields: vec![],
             name: "desc_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,

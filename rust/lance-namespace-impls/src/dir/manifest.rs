@@ -1279,6 +1279,7 @@ impl ManifestNamespace {
         Ok(IndexMetadata {
             uuid: trained_index.uuid,
             fields: vec![lance_schema.field_id(trained_index.column_name)?],
+            covering_fields: vec![],
             name: trained_index.index_name.to_string(),
             dataset_version,
             fragment_bitmap: Some(fragment_bitmap.clone()),

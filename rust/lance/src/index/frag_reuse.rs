@@ -166,6 +166,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         uuid: index_id,
         name: FRAG_REUSE_INDEX_NAME.to_string(),
         fields: vec![],
+        covering_fields: vec![],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
         index_details: Some(Arc::new(prost_types::Any::from_msg(&proto)?)),

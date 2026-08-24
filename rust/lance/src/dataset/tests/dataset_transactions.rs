@@ -15,7 +15,11 @@ use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
+use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -1394,4 +1398,297 @@ async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
     );
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+}
+
+/// A covering declaration that is not a suffix of `fields` must be refused
+/// at commit, not silently accepted and later misread as a keyed column.
+#[tokio::test]
+async fn test_create_index_rejects_non_suffix_covering_fields() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
+    // not the trailing one, so this claims the keyed column is covered.
+    let bad_index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "bad_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![0],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![bad_index],
+            removed_indices: vec![],
+        },
+        None,
+    );
+
+    let err = dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .expect_err("a non-suffix covering declaration must not commit");
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("must come last"),
+        "unexpected message: {err}"
+    );
+}
+
+/// A shallow clone copies the index metadata wholesale, `covering_fields`
+/// included, but `Manifest::shallow_clone` builds the new manifest directly --
+/// `Operation::Clone` is refused by `build_manifest` -- so the fence is not
+/// recomputed there and has to be carried explicitly. Without that, a clone of
+/// a covered table comes back unfenced and a build predating covering can open
+/// it and read carried columns as keyed ones.
+#[tokio::test]
+async fn test_shallow_clone_preserves_the_covering_fence() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: the source table is fenced"
+    );
+
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone really does carry the covering declaration, so it really does
+    // need the fence -- assert that first, or the flag check below could pass
+    // for a clone that simply dropped the index.
+    let cloned_indices = cloned.load_indices().await.unwrap();
+    assert_eq!(
+        cloned_indices
+            .iter()
+            .find(|i| i.name == "covered_idx")
+            .map(|i| i.covering_fields.clone()),
+        Some(vec![1]),
+        "precondition: the clone carries the covering declaration"
+    );
+    assert_ne!(
+        cloned.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for readers"
+    );
+    assert_ne!(
+        cloned.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for writers"
+    );
+}
+
+/// Covering redefines what `fields` means, so a build that predates it would
+/// select a vector index by membership of `fields` and answer a query on a
+/// merely-carried column with an index keyed on a different one. The fence is
+/// the feature flag: a covering commit must set it in both words so such a
+/// build refuses the table outright, and dropping the last covering index
+/// must clear it again rather than fence the table forever.
+#[tokio::test]
+async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: a plain dataset carries no covering fence"
+    );
+
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    let uuid = index.uuid;
+
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // Both words: a reader would select the wrong index, a writer would
+    // mismaintain it.
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence readers"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence writers"
+    );
+
+    // The flag has to survive the reload, not just the in-memory manifest:
+    // `apply_feature_flags` runs a second time in `write_manifest_file` and
+    // resets both words.
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert_ne!(
+        reopened.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "the fence must be persisted, not only set in memory"
+    );
+
+    // An ordinary commit that has nothing to do with indices must not drop the
+    // fence. `Manifest::new_from_previous` zeroes both flag words, so the bit
+    // survives only because `build_manifest` re-derives it from the surviving
+    // index list on every commit rather than inheriting it -- an append is the
+    // cheapest way to pin that.
+    let mut dataset = reopened;
+    let more = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(8..16)),
+            Arc::new(Int32Array::from(vec![1_i32; 8])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(more)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the covering fence"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the writer half of the fence"
+    );
+
+    // Dropping the last covering index lifts the fence. Nothing clears the bit
+    // explicitly -- the words start zeroed and it is simply not set again -- so
+    // this is the pin against someone making the fence sticky via an inherit
+    // step, the way MemWAL catch-up is.
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![IndexMetadata { uuid, ..index }],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "dropping the last covering index must clear the fence"
+    );
 }
