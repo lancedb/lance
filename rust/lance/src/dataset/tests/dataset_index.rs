@@ -1391,7 +1391,7 @@ fn independent_compound_fts_oracle<'a>(
                         result
                             .entry(row_id)
                             .and_modify(|current| {
-                                if score > *current {
+                                if score.total_cmp(current).is_gt() {
                                     *current = score;
                                 }
                             })
@@ -1504,7 +1504,7 @@ async fn assert_compound_matches_independent_oracle(
     expected.truncate(limit);
     let actual = compound_fts_results(dataset, query.clone(), Some(limit as i64)).await;
     assert_scored_rows_close(case_name, &actual, &expected);
-    expected
+    actual
 }
 
 async fn compound_fts_plan(dataset: &Dataset, query: FtsQuery, limit: usize) -> String {
@@ -1758,6 +1758,136 @@ async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
     assert_eq!(
         resident_results, staged_results,
         "resident and staged cross-column scans must return identical ordered row ids and score bits"
+    );
+}
+
+#[tokio::test]
+async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorers() {
+    const LIMIT: usize = 2;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let explicit_query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let explicit_oracle = sorted_compound_fts_oracle(
+        independent_compound_fts_oracle(&dataset, &explicit_query).await,
+    );
+    assert_eq!(
+        explicit_oracle[1].1, explicit_oracle[2].1,
+        "the fixture should exercise an equal-score tie at the top-k boundary"
+    );
+    assert!(explicit_oracle[1].0 < explicit_oracle[2].0);
+    let explicit_results = assert_compound_matches_independent_oracle(
+        &dataset,
+        "top_level_cross_column_multimatch",
+        &explicit_query,
+        LIMIT,
+    )
+    .await;
+    let explicit_plan = compound_fts_plan(&dataset, explicit_query.clone(), LIMIT).await;
+    assert!(
+        !explicit_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{explicit_plan}"
+    );
+    assert!(
+        explicit_plan.matches("CompoundFtsScorer").count() >= 2,
+        "each indexed field should use its own bounded compound scorer:\n{explicit_plan}"
+    );
+    let inferred_query = FtsQuery::Match(MatchQuery::new("noise".to_owned()));
+    let inferred_results =
+        compound_fts_results(&dataset, inferred_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(
+        inferred_results, explicit_results,
+        "a fieldless Match expanded across all FTS columns should match an explicit MultiMatch"
+    );
+    let inferred_plan = compound_fts_plan(&dataset, inferred_query, LIMIT).await;
+    assert!(
+        !inferred_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "a fieldless Match expanded to MultiMatch should keep field scoring independent:\n{inferred_plan}"
+    );
+    assert!(
+        inferred_plan.matches("CompoundFtsScorer").count() >= 2,
+        "each inferred field should use its own bounded compound scorer:\n{inferred_plan}"
+    );
+
+    let blocked_query = |boosts: Vec<f32>| -> FtsQuery {
+        MultiMatchQuery::try_new(
+            "blocked".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap()
+        .try_with_boosts(boosts)
+        .unwrap()
+        .into()
+    };
+    let signed_zero = compound_fts_results(&dataset, blocked_query(vec![-0.0, 0.0]), Some(1)).await;
+    let normalized = compound_fts_results(&dataset, blocked_query(vec![0.0, 0.0]), None).await;
+    assert_eq!(signed_zero, normalized[..1]);
+    assert_eq!(signed_zero[0].0, 4);
+    assert_eq!(signed_zero[0].1.to_bits(), 0.0_f32.to_bits());
+
+    let unbounded_results = compound_fts_results(&dataset, explicit_query.clone(), None).await;
+    assert_scored_rows_close(
+        "unbounded_top_level_cross_column_multimatch",
+        &unbounded_results,
+        &explicit_oracle,
+    );
+    let mut unbounded_scanner = dataset.scan();
+    unbounded_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query.clone()))
+        .unwrap();
+    let unbounded_plan = unbounded_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !unbounded_plan.contains("CompoundFtsScorer"),
+        "an unbounded MultiMatch should retain exhaustive leaf planning:\n{unbounded_plan}"
+    );
+
+    let mut partial_dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut partial_dataset, "body", true).await;
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["noise"]),
+        ("body", Utf8, ["noise"]),
+        ("id", Int32, [10])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    partial_dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    // Index only the title after the append so it can retain a bounded plan
+    // while the partially covered body uses the exhaustive leaf fallback.
+    create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
+    assert_compound_matches_independent_oracle(
+        &partial_dataset,
+        "partial_top_level_cross_column_multimatch",
+        &explicit_query,
+        LIMIT,
+    )
+    .await;
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
+    assert!(
+        !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
+    );
+    assert_eq!(
+        partial_plan.matches("CompoundFtsScorer").count(),
+        1,
+        "the fully indexed title should retain its bounded compound scorer:\n{partial_plan}"
+    );
+    assert!(
+        partial_plan.contains("FlatMatchQuery"),
+        "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
     );
 }
 

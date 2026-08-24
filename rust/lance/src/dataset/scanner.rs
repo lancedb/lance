@@ -311,6 +311,39 @@ fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
     }
 }
 
+fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
+    fn normalize_zero(value: &mut f32) {
+        if *value == 0.0 {
+            *value = 0.0;
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => normalize_zero(&mut query.boost),
+        FtsQuery::Phrase(_) => {}
+        FtsQuery::Boost(query) => {
+            normalize_zero(&mut query.negative_boost);
+            normalize_fts_zero_boosts(&mut query.positive);
+            normalize_fts_zero_boosts(&mut query.negative);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &mut query.match_queries {
+                normalize_zero(&mut match_query.boost);
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter_mut()
+                .chain(&mut query.must)
+                .chain(&mut query.must_not)
+            {
+                normalize_fts_zero_boosts(child);
+            }
+        }
+    }
+}
+
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
 where
@@ -4049,6 +4082,7 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {
         let mut resolved = query.clone();
+        normalize_fts_zero_boosts(&mut resolved.query);
         if resolved.query.is_missing_column() {
             if Self::query_requests_list_element(&resolved.query) {
                 return Err(Error::invalid_input(
@@ -4298,13 +4332,43 @@ impl Scanner {
             }
 
             FtsQuery::MultiMatch(query) => {
-                let mut children = Vec::with_capacity(query.match_queries.len());
-                for match_query in &query.match_queries {
-                    let child =
-                        self.plan_match_query(match_query, params, filter_plan, prefilter_source);
-                    children.push(child);
-                }
-                let children = futures::future::try_join_all(children).await?;
+                // A top-level cross-column MultiMatch scores each field independently and takes
+                // the maximum score for each row. A field's bounded compound top-k is therefore
+                // sufficient to determine the global top-k independently of the other fields.
+                // Preserve that bounded plan for every eligible field, while planning only
+                // partial-index and overlay-backed fields through the exhaustive leaf fallback.
+                let unlimited_params = params.clone().with_limit(None);
+                let can_use_bounded_compound =
+                    !document_granularity.is_list_element() && params.limit.is_some();
+                let children =
+                    futures::future::try_join_all(query.match_queries.iter().map(|match_query| {
+                        let unlimited_params = &unlimited_params;
+                        async move {
+                            if can_use_bounded_compound {
+                                let child_query = FtsQuery::Match(match_query.clone());
+                                if let Some(plan) = self
+                                    .plan_compound_scorer(
+                                        &child_query,
+                                        params,
+                                        prefilter_source,
+                                        document_granularity,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(plan);
+                                }
+                            }
+
+                            self.plan_match_query(
+                                match_query,
+                                unlimited_params,
+                                filter_plan,
+                                prefilter_source,
+                            )
+                            .await
+                        }
+                    }))
+                    .await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
@@ -7068,6 +7132,63 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_normalize_fts_zero_boosts_recurses_and_preserves_nonzero_values() {
+        fn boost_bits(query: &FtsQuery) -> Vec<u32> {
+            match query {
+                FtsQuery::Match(query) => vec![query.boost.to_bits()],
+                FtsQuery::Phrase(_) => Vec::new(),
+                FtsQuery::Boost(query) => std::iter::once(query.negative_boost.to_bits())
+                    .chain(boost_bits(&query.positive))
+                    .chain(boost_bits(&query.negative))
+                    .collect(),
+                FtsQuery::MultiMatch(query) => query
+                    .match_queries
+                    .iter()
+                    .map(|query| query.boost.to_bits())
+                    .collect(),
+                FtsQuery::Boolean(query) => query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                    .flat_map(boost_bits)
+                    .collect(),
+            }
+        }
+
+        let match_query =
+            |terms: &str, boost| MatchQuery::new(terms.to_string()).with_boost(boost).into();
+        let multi_match = MultiMatchQuery::try_new(
+            "needle".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![-0.0, 2.5])
+        .unwrap();
+        let negative = BooleanQuery::new([
+            (Occur::Should, multi_match.into()),
+            (Occur::Must, match_query("required", 3.5)),
+            (Occur::MustNot, match_query("blocked", -0.0)),
+        ]);
+        let boost = BoostQuery::new(match_query("positive", -0.0), negative.into(), Some(-0.0));
+        let mut query: FtsQuery = BooleanQuery::new([
+            (Occur::Should, match_query("outer", -0.0)),
+            (Occur::Must, boost.into()),
+            (Occur::MustNot, match_query("unchanged", 4.5)),
+        ])
+        .into();
+
+        let nz = (-0.0_f32).to_bits();
+        let pz = 0.0_f32.to_bits();
+        let b2 = 2.5_f32.to_bits();
+        let b3 = 3.5_f32.to_bits();
+        let b4 = 4.5_f32.to_bits();
+        assert_eq!(boost_bits(&query), vec![nz, nz, nz, nz, b2, b3, nz, b4]);
+        normalize_fts_zero_boosts(&mut query);
+        assert_eq!(boost_bits(&query), vec![pz, pz, pz, pz, b2, b3, pz, b4]);
     }
 
     #[test]
