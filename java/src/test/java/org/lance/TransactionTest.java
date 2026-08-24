@@ -17,9 +17,11 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.memwal.CompactedSsTable;
 import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
 import org.lance.operation.Overwrite;
+import org.lance.operation.Update;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -193,5 +195,25 @@ public class TransactionTest {
         }
       }
     }
+  }
+
+  @Test
+  public void testUpdateOperationProperties() {
+    CompactedSsTable sstable = new CompactedSsTable("550e8400-e29b-41d4-a716-446655440000", 42L);
+    byte[] filterBytes = new byte[] {1, 2, 3, 4};
+    Update op =
+        Update.builder()
+            .removedFragmentIds(Collections.singletonList(1L))
+            .compactedSstables(Collections.singletonList(sstable))
+            .insertedRowsFilter(filterBytes)
+            .build();
+
+    assertEquals(Collections.singletonList(1L), op.removedFragmentIds());
+    assertEquals(1, op.compactedSstables().size());
+    assertEquals("550e8400-e29b-41d4-a716-446655440000", op.compactedSstables().get(0).shardId());
+    assertEquals(42L, op.compactedSstables().get(0).generation());
+    org.junit.jupiter.api.Assertions.assertArrayEquals(filterBytes, op.insertedRowsFilter());
+    assertEquals(op.compactedSstables(), op.getCompactedSstables());
+    org.junit.jupiter.api.Assertions.assertArrayEquals(filterBytes, op.getInsertedRowsFilter());
   }
 }

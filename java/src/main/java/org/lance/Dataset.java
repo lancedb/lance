@@ -36,6 +36,7 @@ import org.lance.memwal.ShardWriter;
 import org.lance.memwal.ShardWriterConfig;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.merge.UncommittedMergeInsertResult;
 import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
@@ -633,6 +634,40 @@ public class Dataset implements Closeable {
    */
   public Dataset commitTransaction(Transaction transaction) {
     return commitTransaction(transaction, false, true);
+  }
+
+  /**
+   * Commit an uncommitted merge insert result and return a new Dataset with the new version.
+   *
+   * @param uncommitted The uncommitted merge insert result
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(UncommittedMergeInsertResult uncommitted) {
+    return commitTransaction(uncommitted, false, true);
+  }
+
+  /**
+   * Commit an uncommitted merge insert result and return a new Dataset with the new version.
+   *
+   * @param uncommitted The uncommitted merge insert result
+   * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, uses V2 manifest paths.
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(
+      UncommittedMergeInsertResult uncommitted, boolean detached, boolean enableV2ManifestPaths) {
+    Preconditions.checkNotNull(uncommitted, "uncommitted must not be null");
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(uncommitted);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
+    }
+    return dataset;
   }
 
   /**
@@ -2160,6 +2195,29 @@ public class Dataset implements Closeable {
   }
 
   private native MergeInsertResult nativeMergeInsert(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Perform an uncommitted merge insert operation.
+   *
+   * <p>Executes merge insert logic without committing the resulting transaction to the dataset.
+   * Callers can inspect or customize the resulting {@link Transaction} before committing it via
+   * {@link CommitBuilder} or {@link #commitTransaction(Transaction)}.
+   *
+   * @param mergeInsert merge insert options
+   * @param source ArrowArrayStream source data
+   * @return UncommittedMergeInsertResult containing the dataset, uncommitted Transaction, and
+   *     stats.
+   */
+  public UncommittedMergeInsertResult mergeInsertUncommitted(
+      MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeMergeInsertUncommitted(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native UncommittedMergeInsertResult nativeMergeInsertUncommitted(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**
