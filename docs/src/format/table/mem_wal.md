@@ -341,10 +341,9 @@ Important fields:
 - `index_catchup`: per-index coverage progress after data has been compacted into the base table.
 - `snapshot_ts_millis`, `num_shards`, and `inline_snapshots`: optional shard snapshot fields for read optimization.
 
-What an absent entry means depends on the `FLAG_MEM_WAL_INDEX_CATCHUP` feature bit:
-
-- **Without the bit**, a shard absent from `index_catchup` for an index means that index is assumed fully caught up for the shard.
-- **With the bit**, absence means the opposite: the index is *not* known to have caught up, so the shard's SSTables must be retained until some commit records that it has.
+A shard absent from `index_catchup` for an index means that index is *not* known
+to have caught up, so the shard's SSTables must be retained until some commit
+records that it has.
 
 Catch-up is derived at commit time, not reported by the writer. An index whose segments together span every fragment live at the transaction's read version holds every row compaction had copied into the base table by then, so the commit records it as caught up to that version's `compacted_sstables`. That is the only proof available — nothing maps a compaction generation to the fragments its rows landed in — so covering the table as the transaction read it is how an index shows it covered those rows. Fragments appended since that read are a later catch-up gap and are not required.
 
@@ -353,8 +352,6 @@ Two rules bound what a commit may record. It never credits more than its own `co
 Because the position is derived rather than transmitted, it cannot go stale between inspection and commit, and it survives rebase — `read_version` is fixed for a transaction's life, so what a commit can prove does not move, though a rebased attempt may record a different result because the head it commits against has changed. Any commit can earn a position, so an ordinary index build that happens to cover the table records catch-up as a side effect. A dedicated repair is still needed where no such commit occurs, or where an index does not yet span the table.
 
 A read version with no fragments proves nothing, even though an index trivially covers an empty table. An empty fragment list is also what a manifest written before the `UpdateMemWalState` fragment fix looks like, where the SSTables are the last copy of those rows; crediting coverage there would retire them. The cost is that a table whose rows have all been deleted keeps its SSTables.
-
-Setting the bit is one-way. Once SSTables have stopped being served against a recorded catch-up position, reading absence as "caught up" again could drop rows that only those SSTables still hold, so the bit is never cleared as a rollback. Writers must also hold the bit: a writer that does not maintain `index_catchup` can change an index without withdrawing the position recorded for it, leaving a position that no longer describes the index it names.
 
 Shard snapshots, when present, use the following Lance file schema:
 
@@ -507,7 +504,7 @@ On commit conflict, a compactor reloads the conflicting base-table version:
 The garbage collector may remove obsolete SSTables after:
 
 1. The SSTable has been compacted into the base table.
-2. Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. With `FLAG_MEM_WAL_INDEX_CATCHUP` set, an index absent from `index_catchup` has *not* caught up, so this condition is not met for it.
+2. Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. An index absent from `index_catchup` has *not* caught up, so this condition is not met for it.
 3. No retained base-table version needs the SSTable for time travel or consistency.
 
 !!! warning

@@ -136,7 +136,8 @@ pub(in crate::index) async fn merge_segments(
     Ok(IndexMetadata {
         uuid: new_uuid,
         name: segments[0].name.clone(),
-        fields: vec![field_id],
+        fields: segments[0].fields.clone(),
+        covering_fields: segments[0].covering_fields.clone(),
         dataset_version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),

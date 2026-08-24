@@ -48,7 +48,8 @@ public class Compaction {
           compactionOptions.getBinaryCopyReadBatchBytes(),
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
-          compactionOptions.getMaxSourceBytes());
+          compactionOptions.getMaxSourceBytes(),
+          compactionOptions.getExcludedFragmentIds());
     }
   }
 
@@ -72,7 +73,8 @@ public class Compaction {
         compactionOptions.getBinaryCopyReadBatchBytes(),
         compactionOptions.getMaxSourceFragments(),
         compactionOptions.getMaxSourceRows(),
-        compactionOptions.getMaxSourceBytes());
+        compactionOptions.getMaxSourceBytes(),
+        compactionOptions.getExcludedFragmentIds());
   }
 
   /**
@@ -95,7 +97,8 @@ public class Compaction {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes) {
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return commitCompactionNative(
           dataset,
@@ -112,7 +115,8 @@ public class Compaction {
           binaryCopyReadBatchBytes,
           maxSourceFragments,
           maxSourceRows,
-          maxSourceBytes);
+          maxSourceBytes,
+          excludedFragmentIds);
     }
   }
 
@@ -131,7 +135,8 @@ public class Compaction {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes);
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -147,5 +152,6 @@ public class Compaction {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes);
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 }
