@@ -370,7 +370,7 @@ pub fn apply_row_id_and_deletes(
 
 #[derive(Default)]
 struct PrecomputedSystemColumns {
-    row_ids: Option<Arc<UInt64Array>>,
+    row_ids: Option<Result<Arc<UInt64Array>>>,
     last_updated_versions: Option<Result<Arc<UInt64Array>>>,
     created_versions: Option<Result<Arc<UInt64Array>>>,
 }
@@ -468,6 +468,7 @@ fn apply_row_id_and_deletes_with_system_columns(
     let row_ids = if config.with_row_id {
         let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
         if let Some(row_ids) = precomputed_row_ids {
+            let row_ids = row_ids?;
             debug_assert_eq!(row_ids.len(), num_rows as usize);
             Some(row_ids)
         } else if let Some(row_id_sequence) = &config.row_id_sequence {
@@ -634,13 +635,13 @@ pub fn wrap_with_row_id_and_delete(
                     let logical_offset = this_offset as usize;
                     let num_rows = num_rows as usize;
                     if num_rows == 0 {
-                        return Arc::new(UInt64Array::from(Vec::<u64>::new()));
+                        return Ok(Arc::new(UInt64Array::from(Vec::<u64>::new())));
                     }
                     if let Some(row_ids) = row_id_chunk
                         .as_ref()
                         .and_then(|chunk| chunk.slice(logical_offset, num_rows))
                     {
-                        return row_ids;
+                        return Ok(row_ids);
                     }
 
                     let batches_per_chunk = ROW_ID_READ_AHEAD_ROWS.div_ceil(num_rows);
@@ -670,11 +671,17 @@ pub fn wrap_with_row_id_and_delete(
                         logical_offset,
                         values: Arc::new(values),
                     };
-                    let row_ids = chunk
-                        .slice(logical_offset, num_rows)
-                        .expect("new row-id chunk must cover the current batch");
+                    let row_ids = chunk.slice(logical_offset, num_rows).ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            "row ID metadata",
+                            format!(
+                                "decoded row ID chunk at selected offset {logical_offset} contains {} rows, but the current batch requires {num_rows} rows",
+                                chunk.values.len()
+                            ),
+                        )
+                    })?;
                     row_id_chunk = Some(chunk);
-                    row_ids
+                    Ok(row_ids)
                 })
             });
             let last_updated_versions =
@@ -1071,6 +1078,40 @@ mod tests {
             batches[1][ROW_ID].as_primitive::<UInt64Type>().values(),
             &[42]
         );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_stable_row_ids_returns_error() {
+        let task = ReadBatchTask {
+            num_rows: 10,
+            task: std::future::ready(Ok(
+                arrow_array::record_batch!(("x", Int32, vec![0; 10])).unwrap()
+            ))
+            .boxed(),
+        };
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(RowIdSequence::try_from_iter(0_u64..5).unwrap())),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 10,
+        };
+
+        let error = super::wrap_with_row_id_and_delete(stream::iter([task]).boxed(), 0, config)
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(
+            "decoded row ID chunk at selected offset 0 contains 5 rows, but the current batch requires 10 rows"
+        ));
     }
 
     #[tokio::test]
