@@ -1920,10 +1920,12 @@ def test_strict_overwrite(tmp_path: Path):
     )
     with pytest.raises(
         OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
-    ):
+    ) as exc_info:
         lance.LanceDataset.commit(
             base_dir, operation, read_version=dataset_v1.version, max_retries=0
         )
+    # CommitConflict means commit-step retries were exhausted; it is safe to retry.
+    assert exc_info.value.retryable is True
 
 
 def test_commit_timeout(tmp_path: Path):
