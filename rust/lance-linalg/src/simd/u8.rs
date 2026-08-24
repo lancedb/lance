@@ -330,6 +330,9 @@ impl AddAssign for u8x16 {
 impl Mul for u8x16 {
     type Output = Self;
 
+    /// Lane-wise product, keeping the low 8 bits of each result.
+    ///
+    /// Multiplication wraps on overflow on every supported architecture.
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
@@ -339,8 +342,11 @@ impl Mul for u8x16 {
             let b_lo = _mm_unpacklo_epi8(rhs.0, _mm_setzero_si128());
             let b_hi = _mm_unpackhi_epi8(rhs.0, _mm_setzero_si128());
 
-            let res_lo = _mm_mullo_epi16(a_lo, b_lo);
-            let res_hi = _mm_mullo_epi16(a_hi, b_hi);
+            // Packing saturates signed 16-bit lanes, so mask first to make the
+            // narrowing exact after discarding each product's high byte.
+            let low_byte_mask = _mm_set1_epi16(u8::MAX as i16);
+            let res_lo = _mm_and_si128(_mm_mullo_epi16(a_lo, b_lo), low_byte_mask);
+            let res_hi = _mm_and_si128(_mm_mullo_epi16(a_hi, b_hi), low_byte_mask);
 
             Self(_mm_packus_epi16(res_lo, res_hi))
         }
@@ -426,15 +432,9 @@ mod tests {
             .zip(simd_add.as_array().iter())
             .for_each(|(x, &y)| assert_eq!((x + x + 16) as u8, y));
 
-        // on x86_64, the result of simd_mul is saturated
-        // on aarch64, the result of simd_mul is not saturated
         let simd_mul = simd_a * simd_b;
-        (0..16).zip(simd_mul.as_array().iter()).for_each(|(x, &y)| {
-            #[cfg(target_arch = "x86_64")]
-            assert_eq!(std::cmp::min(x * (x + 16), 255_i32) as u8, y);
-            #[cfg(target_arch = "aarch64")]
-            assert_eq!((x * (x + 16_i32)) as u8, y);
-        });
+        let expected_mul: [u8; 16] = std::array::from_fn(|i| a[i].wrapping_mul(b[i]));
+        assert_eq!(simd_mul.as_array(), expected_mul);
     }
 
     #[test]
