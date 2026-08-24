@@ -113,6 +113,7 @@ include = [
     "python/lance/tracing.py",
     "python/lance/dependencies.py",
     "python/lance/schema.py",
+    "python/tests/test_schema.py",
     "python/lance/file.py",
     "python/lance/util.py",
     "python/lance/arrow.py",
