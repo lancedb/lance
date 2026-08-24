@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Per-fragment column writes: staging a column's data as a standalone file
-//! with `FileFragment::write_column`, and committing it as a `DataReplacement`
+//! Per-fragment column writes: staging columns' data as a standalone file with
+//! `FileFragment::write_columns`, and committing it as a `DataReplacement`
 //! whose coverage may not line up with any single file -- the case a computed
 //! column reaches once compaction folds it into a shared base file.
 
@@ -89,7 +89,7 @@ async fn stage(
     schema: &LanceSchema,
 ) -> Result<DataReplacementGroup> {
     only_fragment(dataset)
-        .write_column(stream::iter([Ok(batch)]), schema)
+        .write_columns(stream::iter([Ok(batch)]), schema)
         .await
 }
 
@@ -157,7 +157,7 @@ async fn stage_column(
         .into_iter()
         .find(|fragment| fragment.id() as u64 == fragment_id)
         .expect("fragment to stage for")
-        .write_column(stream::iter([Ok(batch)]), &schema)
+        .write_columns(stream::iter([Ok(batch)]), &schema)
         .await
         .unwrap()
 }
@@ -240,7 +240,7 @@ async fn test_records_writer_layout(
     // Streamed as two batches: the DataFile must record the writer's
     // field/column layout and the dataset's file version.
     let DataReplacementGroup(replaced, data_file) = fragment
-        .write_column(
+        .write_columns(
             stream::iter([
                 Ok(arrow_array::record_batch!(("value", Int32, [1])).unwrap()),
                 Ok(arrow_array::record_batch!(("value", Int32, [2])).unwrap()),
@@ -260,7 +260,7 @@ async fn test_records_writer_layout(
     );
 }
 
-/// Input `write_column` turns down before anything can be committed. The
+/// Input `write_columns` turns down before anything can be committed. The
 /// container cases matter twice over: projection reorders by name but downcasts
 /// by shape, so an unchecked batch is dropped silently or panics.
 #[rstest]
@@ -428,7 +428,7 @@ async fn test_rejects_empty_stream() {
 
     let before = count_files(&dataset).await;
     let err = only_fragment(&dataset)
-        .write_column(stream::iter(Vec::<Result<RecordBatch>>::new()), &schema)
+        .write_columns(stream::iter(Vec::<Result<RecordBatch>>::new()), &schema)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("physical rows"), "got: {err}");
@@ -976,7 +976,7 @@ async fn test_discards_staged_artifacts_on_stream_error() {
     let before = count_files(&dataset).await;
     let schema = dataset.schema().clone();
     let err = only_fragment(&dataset)
-        .write_column(
+        .write_columns(
             stream::iter([
                 Ok(blobs(2)),
                 Err(Error::invalid_input("stream failed".to_string())),
