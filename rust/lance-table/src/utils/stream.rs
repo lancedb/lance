@@ -759,6 +759,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repeated_row_id_after_bulk_segment_boundary() {
+        let mut row_ids = RowIdSequence::from(0..5);
+        row_ids.extend(RowIdSequence::from(10..20));
+        let batches = [1_u32, 2].into_iter().map(|num_rows| ReadBatchTask {
+            num_rows,
+            task: std::future::ready(Ok(arrow_array::record_batch!((
+                "x",
+                Int32,
+                vec![0; num_rows as usize]
+            ))
+            .unwrap()))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(UInt32Array::from(vec![4, 4, 5])),
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(row_ids)),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 15,
+        };
+
+        let actual = super::wrap_with_row_id_and_delete(stream::iter(batches).boxed(), 0, config)
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![4, 4, 10]);
+    }
+
+    #[tokio::test]
     async fn test_zip_with_different_batch_boundaries() {
         let left_batch =
             arrow_array::record_batch!(("x", Int32, (0..10).collect::<Vec<_>>())).unwrap();
