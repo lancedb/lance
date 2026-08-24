@@ -28,6 +28,9 @@ def test_dataset_optimize(tmp_path: Path):
         target_rows_per_fragment=1000,
         materialize_deletions=False,
         num_threads=1,
+        # Loose source budgets: all fragments still compact in one run.
+        max_source_rows=100_000,
+        max_source_bytes=1024 * 1024 * 1024,
     )
 
     assert metrics.fragments_removed == 10
@@ -36,6 +39,58 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(800)}),
+        tmp_path / "dataset",
+        max_rows_per_file=200,
+    )
+    fragments = dataset.get_fragments()
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=400,
+        excluded_fragment_ids=[1, 1, 999],
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 2
+    remaining_fragment_ids = {
+        fragment.fragment_id for fragment in dataset.get_fragments()
+    }
+    assert fragments[1].fragment_id in remaining_fragment_ids
+
+
+def test_compact_files_source_budgets(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert len(dataset.get_fragments()) == 10
+
+    # A row budget of 250 admits the first two 100-row fragments only, so the
+    # run is incremental instead of compacting all 10 at once.
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_rows=250,
+    )
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+
+    # The budgets are hard upper bounds: a budget smaller than a single task
+    # produces an empty plan and compaction is a no-op.
+    version_before = dataset.version
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_bytes=1,
+    )
+    assert metrics.fragments_removed == 0
+    assert dataset.version == version_before
+
+    with pytest.raises(OSError, match="must be greater than 0"):
+        dataset.optimize.compact_files(max_source_rows=0)
 
 
 def test_compact_files_max_source_fragments(tmp_path: Path):
@@ -549,6 +604,31 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
     assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
     assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+
+    excluded_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=[1, 1, 999],
+            num_threads=1,
+        ),
+    )
+    assert excluded_plan.num_tasks() == 1
+    assert excluded_plan.tasks[0].fragments == [
+        frag.metadata for frag in fragments[2:4]
+    ]
+    assert pickle.loads(pickle.dumps(excluded_plan)) == excluded_plan
+
+    none_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=None,
+            num_threads=1,
+        ),
+    )
+    assert none_plan == plan
+
     # Plan can be pickled
     assert pickle.loads(pickle.dumps(plan)) == plan
 

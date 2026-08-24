@@ -190,7 +190,10 @@ mod test {
             if let Some(store) = &self.verify_store {
                 let final_meta = store.head(&Path::from(path)).await?;
                 assert_eq!(size, final_meta.size);
-                assert_eq!(e_tag, final_meta.e_tag);
+                assert_eq!(
+                    e_tag, None,
+                    "the generic workflow must not persist a physical generation"
+                );
             }
             Ok(())
         }
@@ -316,7 +319,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn finalized_external_manifest_location_rejects_etag_mismatch() {
+    async fn finalized_external_manifest_location_without_stored_etag_uses_current_etag() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
@@ -335,22 +338,26 @@ mod test {
                     path: final_path,
                     size: Some(body.len() as u64),
                     naming_scheme: ManifestNamingScheme::V2,
-                    e_tag: Some("stale-etag".to_string()),
+                    e_tag: None,
                 },
                 verify_store: None,
             }),
         };
 
-        let err = handler
+        let resolved = handler
             .resolve_latest_location(&base_path, &object_store)
             .await
-            .expect_err("stale external manifest e_tag should be rejected");
-        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
-        assert!(err.to_string().contains("Manifest e_tag mismatch"), "{err}");
+            .expect("the canonical manifest should resolve from object storage");
+        let current_meta = object_store
+            .inner
+            .head(&resolved.path)
+            .await
+            .expect("read current object-store metadata");
+        assert_eq!(resolved.e_tag, current_meta.e_tag);
     }
 
     #[tokio::test]
-    async fn external_manifest_store_put_records_destination_metadata() {
+    async fn external_manifest_store_put_returns_destination_etag() {
         let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
@@ -395,11 +402,14 @@ mod test {
             "test store must assign a new ETag to the copied object"
         );
         assert_eq!(location.size, Some(final_meta.size));
-        assert_eq!(location.e_tag, final_meta.e_tag);
+        assert_eq!(
+            location.e_tag, final_meta.e_tag,
+            "the caller must receive the finalized physical generation"
+        );
     }
 
     #[tokio::test]
-    async fn external_manifest_handler_finalize_records_destination_metadata() {
+    async fn external_manifest_handler_finalize_returns_destination_etag() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 1;
@@ -443,7 +453,10 @@ mod test {
             "test store must assign a new ETag to the copied object"
         );
         assert_eq!(location.size, Some(final_meta.size));
-        assert_eq!(location.e_tag, final_meta.e_tag);
+        assert_eq!(
+            location.e_tag, final_meta.e_tag,
+            "the caller must receive the finalized physical generation"
+        );
     }
 
     #[tokio::test]
@@ -899,10 +912,8 @@ mod test {
     /// our `CopyCapStore` wrapper rejects with the same `EntityTooLarge`
     /// error S3 returns in production.
     ///
-    /// Today this test is RED: the copy step fails on >5 GB.
-    /// After `copy_size_aware` lands, it should turn GREEN by falling back
-    /// to a multipart-equivalent path (option 1: read+rewrite via
-    /// `ObjectWriter`).
+    /// The regression verifies that `copy_size_aware` falls back to the
+    /// multipart-equivalent read+rewrite path instead of calling CopyObject.
     #[tokio::test]
     async fn manifest_commit_succeeds_when_staging_exceeds_5gb_copy_cap() {
         let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
@@ -925,6 +936,12 @@ mod test {
         // path the failing CTAS hits via ExternalManifestCommitHandler).
         let external = SleepyExternalManifestStore::new();
         let head_meta = capped.head(&staging_path).await.unwrap();
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
+        // The fixture stores only a tiny body, so its source-size override must
+        // also apply to the destination metadata. This keeps the fake object
+        // store internally consistent with the real 14 GB object it models
+        // when finalization verifies that the copy preserved size.
+        capped.override_size(&final_path, head_meta.size).await;
 
         let location = external
             .put(
