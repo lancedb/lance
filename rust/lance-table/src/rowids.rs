@@ -59,6 +59,7 @@ pub(crate) struct RowIdSequenceCursor {
     segment_idx: usize,
     rows_passed: usize,
     segment_len: Option<usize>,
+    use_dense_range_expansion: Option<bool>,
     segment_cursor: SegmentCursorState,
     last_index: Option<usize>,
 }
@@ -68,6 +69,7 @@ impl RowIdSequenceCursor {
         self.rows_passed += self.segment_len.unwrap_or_default();
         self.segment_idx += 1;
         self.segment_len = None;
+        self.use_dense_range_expansion = None;
         self.segment_cursor = SegmentCursorState::default();
     }
 
@@ -118,8 +120,16 @@ impl RowIdSequenceCursor {
 
             let count = (selection.end - index).min(segment_len - local_start);
             let local_end = local_start + count;
-            self.segment_cursor
-                .extend_range(segment, local_start..local_end, row_ids);
+            let use_dense_range_expansion = *self
+                .use_dense_range_expansion
+                .get_or_insert_with(|| segment.use_dense_range_expansion());
+            if use_dense_range_expansion {
+                self.segment_cursor
+                    .extend_dense_range(segment, local_start..local_end, row_ids);
+            } else {
+                self.segment_cursor
+                    .extend_range(segment, local_start..local_end, row_ids);
+            }
             index += count;
             if local_end == segment_len {
                 self.advance_segment();
