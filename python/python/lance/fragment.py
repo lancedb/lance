@@ -1051,12 +1051,12 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
-    def data_files(self):
+    def data_files(self) -> List[DataFile]:
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
 
-    def deletion_file(self):
+    def deletion_file(self) -> Optional[str]:
         """Return the deletion file, if any"""
         return self._fragment.deletion_file()
 
