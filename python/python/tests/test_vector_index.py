@@ -1296,6 +1296,57 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
         )
 
 
+def test_multivec_search_paths(tmp_path: Path):
+    vector_type = pa.list_(pa.list_(pa.float32(), 2))
+    query = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    uri = tmp_path / "multivec_distance.lance"
+
+    indexed_rows = pa.table(
+        {
+            "id": pa.array([0, 1], type=pa.int32()),
+            "vector": pa.array(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[1.0, 0.0], [1.0, 0.0]],
+                ],
+                type=vector_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(indexed_rows, uri)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        metric="cosine",
+        num_partitions=1,
+    )
+
+    unindexed_rows = pa.table(
+        {
+            "id": pa.array([2, 3], type=pa.int32()),
+            "vector": pa.array(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[-1.0, 0.0], [0.0, -1.0]],
+                ],
+                type=vector_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(unindexed_rows, uri, mode="append")
+
+    nearest = {"column": "vector", "q": query, "k": 4, "metric": "cosine"}
+    flat = dataset.to_table(columns=["id"], nearest={**nearest, "use_index": False})
+    mixed = dataset.to_table(columns=["id"], nearest=nearest)
+
+    dataset.optimize.optimize_indices()
+    fully_indexed = dataset.to_table(columns=["id"], nearest=nearest, fast_search=True)
+
+    for result in [flat, mixed, fully_indexed]:
+        assert result["id"].to_pylist() == [0, 2, 1, 3]
+        np.testing.assert_allclose(result["_distance"].to_numpy(), [0.0, 0.0, 1.0, 2.0])
+
+
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(

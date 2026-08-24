@@ -343,6 +343,11 @@ impl TryFrom<&str> for DistanceType {
     }
 }
 
+/// Computes the additive late-interaction distance from a multivector query.
+///
+/// For each query sub-vector, this finds the minimum distance to any stored
+/// sub-vector in the row, then sums those minimum distances. Null or empty
+/// stored rows produce `NaN`.
 pub fn multivec_distance(
     query: &dyn Array,
     vectors: &ListArray,
@@ -363,7 +368,7 @@ pub fn multivec_distance(
     // and then downcasts the *stored* values to that same type. The dim, null
     // and length checks prevent a `chunks_exact` panic and, worse, silently
     // wrong results: a short query yields no sub-vectors and scores every row
-    // `1.0`, and a null slot is scored from whatever the values buffer holds.
+    // `0.0`, and a null slot is scored from whatever the values buffer holds.
     let query_type = query.data_type();
     // Which element types have a kernel here at all. `Int8` is a valid vector
     // element type elsewhere in the stack (`l2_distance_arrow_batch` and its
@@ -424,7 +429,7 @@ pub fn multivec_distance(
                     continue;
                 }
 
-                let sim = match distance_type {
+                let distance = match distance_type {
                     DistanceType::Hamming => {
                         let query = query.as_primitive::<UInt8Type>().values();
                         query
@@ -436,7 +441,7 @@ pub fn multivec_distance(
                                     .values()
                                     .chunks_exact(dim)
                                     .map(|v| hamming::hamming(q, v))
-                                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                                    .min_by(|a, b| a.total_cmp(b))
                                     .unwrap()
                             })
                             .sum()
@@ -464,7 +469,7 @@ pub fn multivec_distance(
                     },
                 };
 
-                dists.push(1.0 - sim);
+                dists.push(distance);
             }
         }
     }
@@ -489,8 +494,8 @@ where
                 .as_primitive::<T>()
                 .values()
                 .chunks_exact(dim)
-                .map(|v| 1.0 - distance_type.func()(q, v))
-                .max_by(|a, b| a.total_cmp(b))
+                .map(|v| distance_type.func()(q, v))
+                .min_by(|a, b| a.total_cmp(b))
                 .unwrap()
         })
         .sum()
@@ -506,7 +511,7 @@ mod tests {
 
     use arrow_array::types::{Float16Type, Float32Type, Int8Type};
     use arrow_array::{Float32Array, Int8Array, ListArray, PrimitiveArray, UInt8Array};
-    use arrow_buffer::OffsetBuffer;
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
     use half::f16;
 
@@ -529,9 +534,17 @@ mod tests {
         .expect("write x86 runtime feature report");
     }
 
-    /// Build a single-row `List<FixedSizeList<T, dim>>` holding one sub-vector.
-    fn multivec_of<T: ArrowPrimitiveType>(values: Vec<T::Native>, dim: i32) -> ListArray {
-        let inner = PrimitiveArray::<T>::from_iter_values(values);
+    /// Build `List<FixedSizeList<T, dim>>` rows from flattened sub-vector values.
+    fn multivecs_of<T: ArrowPrimitiveType>(rows: Vec<Vec<T::Native>>, dim: i32) -> ListArray {
+        let lengths = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.len() % dim as usize, 0);
+                row.len() / dim as usize
+            })
+            .collect::<Vec<_>>();
+        let values = ScalarBuffer::from(rows.into_iter().flatten().collect::<Vec<_>>());
+        let inner = PrimitiveArray::<T>::new(values, None);
         let fsl = FixedSizeListArray::try_new(
             Arc::new(Field::new("item", T::DATA_TYPE, true)),
             dim,
@@ -539,9 +552,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let offsets = OffsetBuffer::from_lengths([1_usize]);
+        let offsets = OffsetBuffer::from_lengths(lengths);
         let field = Arc::new(Field::new("item", fsl.data_type().clone(), true));
         ListArray::try_new(field, offsets, Arc::new(fsl), None).unwrap()
+    }
+
+    /// Build one `List<FixedSizeList<T, dim>>` row.
+    fn multivec_of<T: ArrowPrimitiveType>(values: Vec<T::Native>, dim: i32) -> ListArray {
+        multivecs_of::<T>(vec![values], dim)
     }
 
     /// The `(query dtype, distance type)` pre-check and the dispatch must agree.
@@ -608,7 +626,7 @@ mod tests {
 
     /// A query length that is not a positive multiple of `dim` is structurally
     /// invalid: `chunks_exact` would silently drop the tail, and a query shorter
-    /// than `dim` would yield no sub-vectors at all and score every row `1.0`.
+    /// than `dim` would yield no sub-vectors at all and score every row `0.0`.
     #[test]
     fn test_multivec_distance_rejects_bad_query_length() {
         let vectors = multivec_of::<Float32Type>(vec![1.0, 2.0], 2);
@@ -670,24 +688,62 @@ mod tests {
         );
     }
 
-    /// The guards must not reject the combinations that do work: `UInt8` with
-    /// Hamming is the one non-float path through this function.
-    ///
-    /// Note the expected value is `1.0 - hamming`, matching what the function
-    /// computes. Unlike the float paths — which accumulate `1.0 - distance` and
-    /// so end up with a distance again — the Hamming path accumulates a raw
-    /// distance, so `1.0 - sim` inverts its ranking. That inversion is
-    /// pre-existing and out of scope here; this test pins current behavior
-    /// rather than endorsing it.
+    /// Each query sub-vector contributes its minimum Hamming distance to the
+    /// row total.
     #[test]
-    fn test_multivec_distance_accepts_u8_hamming() {
-        let vectors = multivec_of::<UInt8Type>(vec![0b0000_1111, 0b0000_0000], 2);
-        let query: Arc<dyn Array> = Arc::new(UInt8Array::from(vec![0b0000_1111_u8, 0b0000_0001]));
+    fn test_multivec_distance_hamming() {
+        let vectors =
+            multivecs_of::<UInt8Type>(vec![vec![0b0000_0000, 0b0000_1111], vec![0b0000_0011]], 1);
+        let query: Arc<dyn Array> = Arc::new(UInt8Array::from(vec![0b0000_0000_u8, 0b0000_1111]));
 
         let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::Hamming).unwrap();
-        assert_eq!(dists.len(), 1);
-        // One differing bit between the query and the single stored sub-vector.
-        assert_eq!(dists[0], 1.0 - 1.0);
+
+        assert_eq!(dists, vec![0.0, 4.0]);
+    }
+
+    #[rstest::rstest]
+    #[case::l2_perfect(
+        DistanceType::L2,
+        vec![1.0, 0.0, 0.0, 1.0],
+        vec![1.0, 0.0, 0.0, 1.0],
+        0.0
+    )]
+    #[case::cosine_perfect(
+        DistanceType::Cosine,
+        vec![1.0, 0.0, 0.0, 1.0],
+        vec![1.0, 0.0, 0.0, 1.0],
+        0.0
+    )]
+    #[case::dot_perfect(
+        DistanceType::Dot,
+        vec![1.0, 0.0, 0.0, 1.0],
+        vec![1.0, 0.0, 0.0, 1.0],
+        0.0
+    )]
+    #[case::cosine_repeated_query(
+        DistanceType::Cosine,
+        vec![0.6, 0.8],
+        vec![1.0, 0.0, 1.0, 0.0],
+        0.8
+    )]
+    #[case::cosine_single_query(
+        DistanceType::Cosine,
+        vec![0.0, 1.0],
+        vec![1.0, 0.0],
+        1.0
+    )]
+    fn test_multivec_distance_float(
+        #[case] distance_type: DistanceType,
+        #[case] vectors: Vec<f32>,
+        #[case] query: Vec<f32>,
+        #[case] expected: f32,
+    ) {
+        let vectors = multivec_of::<Float32Type>(vectors, 2);
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from(query));
+
+        let dists = multivec_distance(query.as_ref(), &vectors, distance_type).unwrap();
+
+        assert!((dists[0] - expected).abs() < 1e-6);
     }
 
     #[test]
