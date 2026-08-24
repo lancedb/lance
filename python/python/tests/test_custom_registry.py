@@ -15,10 +15,9 @@ here — that is a follow-up. See the module docstring in
 ``python/src/object_store.rs``.
 """
 
+import lance
 import pyarrow as pa
 import pytest
-
-import lance
 from lance.lance import (
     _ObjectStoreProvider,
     _ObjectStoreRegistry,
@@ -119,3 +118,50 @@ def test_register_provider_rejects_empty_scheme():
     registry = _ObjectStoreRegistry()
     with pytest.raises(ValueError):
         registry.register_provider("", _ObjectStoreProvider.memory())
+
+
+def test_from_capsule_roundtrip():
+    """Exercise the ``PyCapsule`` handoff end to end with an in-process producer.
+
+    ``_memory_capsule()`` mirrors what an external, ABI-compatible wheel emits:
+    a ``PyCapsule`` named ``lance_object_store_provider`` holding an
+    ``Arc<dyn ObjectStoreProvider>``. ``from_capsule`` must accept it (name
+    check passes), adopt the provider, and the result must be registrable and
+    usable for a read/write round-trip — covering the clone-on-adopt and the
+    capsule's own drop when it is garbage-collected.
+    """
+    registry = _ObjectStoreRegistry()
+    capsule = _ObjectStoreProvider._memory_capsule()
+    provider = _ObjectStoreProvider.from_capsule(capsule)
+    # Drop our reference to the capsule; the adopted Arc must keep the provider
+    # alive independently of the capsule.
+    del capsule
+    registry.register_provider("test-cap", provider)
+    session = _Session(store_registry=registry)
+
+    table = pa.table({"i": pa.array([1, 2, 3, 4], type=pa.int64())})
+    uri = "test-cap://cache/cap.lance"
+    written = lance.write_dataset(table, uri, session=session)
+    assert written.count_rows() == 4
+
+    read_ds = lance.dataset(uri, session=session)
+    assert read_ds.to_table().equals(table)
+
+
+def test_from_capsule_rejects_wrong_name():
+    """A capsule whose name does not match is rejected before its pointer is
+    ever dereferenced (regression for the ``pointer_checked(None)`` bug, which
+    rejected *every* correctly-named capsule).
+    """
+    import ctypes
+
+    make = ctypes.pythonapi.PyCapsule_New
+    make.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    make.restype = ctypes.py_object
+    # A capsule with the wrong name and a dummy pointer. The name check must
+    # fail first, so the bogus pointer is never read.
+    storage = (ctypes.c_void_p * 2)()
+    capsule = make(ctypes.addressof(storage), b"not-a-lance-provider", None)
+
+    with pytest.raises(ValueError):
+        _ObjectStoreProvider.from_capsule(capsule)

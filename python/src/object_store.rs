@@ -142,34 +142,41 @@ impl PyObjectStoreProvider {
     /// source and toolchain as this one.
     #[staticmethod]
     fn from_capsule(capsule: &Bound<'_, PyCapsule>) -> PyResult<Self> {
-        // pyo3 0.28's `PyCapsule::name()` yields a `CapsuleName`; `as_cstr` is
-        // unsafe only because the name pointer's lifetime is not tied to the
-        // capsule. Our capsule names are statically allocated, and we use the
-        // borrow immediately (compare, or copy into an owned String), so the
-        // pointer is valid for the duration of each use.
-        match capsule.name()? {
-            Some(name) if unsafe { name.as_cstr() } == PROVIDER_CAPSULE_NAME => {}
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "expected a PyCapsule named {:?}, got {:?}",
+        // `pointer_checked(Some(name))` asks CPython for the pointer *and*
+        // requires the capsule to carry exactly this name and a non-null
+        // pointer, so a foreign or mis-named capsule is rejected here rather
+        // than dereferenced. (Passing `None` asks for a *nameless* capsule and
+        // would reject every correctly-named one.)
+        let ptr = capsule
+            .pointer_checked(Some(PROVIDER_CAPSULE_NAME))
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "expected a PyCapsule named {:?}: {e}",
                     PROVIDER_CAPSULE_NAME.to_string_lossy(),
-                    other.map(|c| unsafe { c.as_cstr() }.to_string_lossy().into_owned()),
-                )));
-            }
-        }
+                ))
+            })?;
 
         // SAFETY: by the capsule-name contract above, the capsule carries an
         // `Arc<dyn ObjectStoreProvider>` built against the identical lance-io /
         // object_store types (same source, rustc, and resolved dependency
-        // versions). The name was validated above, so we retrieve the pointer
-        // (`pointer_checked` re-verifies the capsule is non-null and valid),
-        // dereference it only long enough to clone the `Arc` (bumping the
-        // strong count); the capsule keeps its own reference and drops it on GC.
-        let ptr = capsule.pointer_checked(None)?;
+        // versions). We dereference only long enough to clone the `Arc`
+        // (bumping the strong count); the capsule keeps its own reference and
+        // its destructor drops that on GC.
         let provider = unsafe { ptr.cast::<Arc<dyn ObjectStoreProvider>>().as_ref() };
         Ok(Self {
             inner: provider.clone(),
         })
+    }
+
+    /// Test/reference producer: wrap the built-in memory provider in a
+    /// `PyCapsule` named [`PROVIDER_CAPSULE_NAME`], mirroring what an external,
+    /// ABI-compatible wheel emits. Lets `from_capsule` be exercised end to end
+    /// from Python without a second wheel in the tree.
+    #[staticmethod]
+    fn _memory_capsule(py: Python<'_>) -> PyResult<Bound<'_, PyCapsule>> {
+        let provider: Arc<dyn ObjectStoreProvider> =
+            Arc::new(PyProviderBridge::Memory(MemoryStoreProvider));
+        PyCapsule::new(py, provider, Some(PROVIDER_CAPSULE_NAME.to_owned()))
     }
 
     fn __repr__(&self) -> String {
