@@ -2969,11 +2969,6 @@ mod tests {
 
     #[test]
     fn test_check_column_indices_rejects_after_dedup() {
-        // Validation skips repeated (fields, column_indices) list pairs by Arc
-        // pointer identity (decoded manifests share them via
-        // DataFileFieldInterner). Two files share valid lists, a third has its
-        // own invalid ones: the error must come from the third file — an error
-        // naming a shared file would mean dedup broke the valid path.
         let mut struct_field = Field::try_from(ArrowField::new(
             "s",
             DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),

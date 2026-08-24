@@ -285,11 +285,6 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
 }
 
 fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
-    // `field_by_id` is an O(C) tree search, so resolving fields inside the
-    // per-file loop makes this pass O(F * C^2) on wide tables. Build the id
-    // lookup (and the needs-column verdict) once up front. `or_insert` keeps
-    // the first pre-order match, same as `field_by_id` on a corrupt schema
-    // with duplicate ids.
     let mut fields_by_id: HashMap<i32, (&Field, bool)> = HashMap::new();
     for field in manifest.schema.fields_pre_order() {
         let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
@@ -298,12 +293,6 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
             .or_insert((field, needs_column));
     }
 
-    // Decoding interns identical `fields` / `column_indices` lists into shared
-    // `Arc<[i32]>`s (see `DataFileFieldInterner`), so on homogeneous tables
-    // every stored data file points at the same pair of allocations and
-    // pointer identity proves the pair was already validated. Files built by
-    // the current commit don't go through the interner; they just miss this
-    // cache and are validated normally.
     let mut validated_lists: HashSet<(usize, usize)> = HashSet::new();
 
     for fragment in manifest.fragments.iter() {
