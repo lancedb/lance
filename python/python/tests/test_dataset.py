@@ -1920,10 +1920,12 @@ def test_strict_overwrite(tmp_path: Path):
     )
     with pytest.raises(
         OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
-    ):
+    ) as exc_info:
         lance.LanceDataset.commit(
             base_dir, operation, read_version=dataset_v1.version, max_retries=0
         )
+    # CommitConflict means commit-step retries were exhausted; it is safe to retry.
+    assert exc_info.value.retryable is True
 
 
 def test_commit_timeout(tmp_path: Path):
@@ -2758,6 +2760,88 @@ def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: s
     )
     assert result["other"].to_pylist() == [10, 200]
     assert result["nested"].to_pylist() == expected_nested
+
+
+def test_merge_insert_subcols_in_place(tmp_path: Path):
+    """`write_mode("rewrite_columns")` patches the source columns into the
+    fragments that already hold the matched rows.
+
+    Compare with `test_merge_insert_subcols`, which runs the same merge in the
+    default `"auto"` mode and gets whole rows rewritten into a new fragment
+    instead.
+    """
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data, tmp_path / "dataset", max_rows_per_file=5
+    )
+    fragments_before = [f.fragment_id for f in dataset.get_fragments()]
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_matched_update_all()
+        .write_mode("rewrite_columns")
+        .execute(new_values)
+    )
+
+    # No fragment is added, removed, or renumbered, and column `c` (absent from
+    # the source) is neither read nor written.
+    assert [f.fragment_id for f in dataset.get_fragments()] == fragments_before
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+    # Patching columns cannot add rows, so asking for it explicitly on a merge
+    # that also inserts is rejected rather than quietly rewriting whole rows.
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    with pytest.raises(OSError, match="adds rows, which patching cannot do"):
+        (
+            dataset.merge_insert("a")
+            .when_not_matched_insert_all()
+            .when_matched_update_all()
+            .write_mode("rewrite_columns")
+            .execute(new_values)
+        )
+
+    # The same merge under the default mode picks the row-rewrite sink.
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
 
 
 def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
@@ -5697,6 +5781,33 @@ def test_dataset_sql(tmp_path: Path):
     complex_result = complex_query.to_batch_records()
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_dataset_sql_batch_size_rows(tmp_path: Path):
+    table = pa.table({"id": range(50)})
+    ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
+
+    batches = list(
+        ds.sql("SELECT * FROM dataset").batch_size(7).build().to_stream_reader()
+    )
+
+    assert sum(batch.num_rows for batch in batches) == 50
+    assert all(batch.num_rows <= 7 for batch in batches)
+
+
+@pytest.mark.parametrize("batch_size", [0, 2**32])
+def test_dataset_sql_rejects_invalid_batch_size(tmp_path: Path, batch_size: int):
+    ds = lance.write_dataset(
+        pa.table({"id": range(3)}), tmp_path / "test_sql_invalid_batch_size"
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 4294967295"):
+        (
+            ds.sql("SELECT * FROM dataset")
+            .batch_size(batch_size)
+            .build()
+            .to_batch_records()
+        )
 
 
 def test_file_reader_options(tmp_path: Path):

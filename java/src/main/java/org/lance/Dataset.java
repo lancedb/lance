@@ -1736,6 +1736,26 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Acquires a shared read lock that pins the native dataset handle, blocking a concurrent {@link
+   * #close()} until the lock is released.
+   *
+   * <p>Any code that passes this {@link Dataset} into a native method must hold this lock for the
+   * whole native call; otherwise {@code close()} can release the native dataset mid-call and crash
+   * the JVM. The lock is reentrant and intended for try-with-resources use.
+   *
+   * @return the acquired read lock
+   * @throws IllegalArgumentException if the dataset is already closed
+   */
+  public LockManager.ReadLock acquireReadLock() {
+    LockManager.ReadLock readLock = lockManager.acquireReadLock();
+    if (nativeDatasetHandle == 0) {
+      readLock.close();
+      throw new IllegalArgumentException("Dataset is closed");
+    }
+    return readLock;
+  }
+
+  /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is
    * already closed, then invoking this method has no effect.
    */

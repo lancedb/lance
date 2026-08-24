@@ -360,6 +360,76 @@ async fn test_merge_segments_preserves_format_version(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::empty_first(true)]
+#[case::empty_last(false)]
+#[tokio::test]
+async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool) -> Result<()> {
+    let empty_dir = TempObjDir::default();
+    let populated_dir = TempObjDir::default();
+    let dest_dir = TempObjDir::default();
+    let empty_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        empty_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let populated_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        populated_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let dest_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dest_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
+
+    write_test_metadata(&empty_store, Vec::new(), params.clone()).await;
+    let empty = InvertedIndex::load(empty_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(empty.partition_count(), 0);
+    assert_eq!(empty.format_version(), InvertedListFormatVersion::V1);
+
+    let populated = write_single_partition_index(
+        populated_store,
+        params,
+        TokenSetFormat::default(),
+        "hello",
+        100,
+    )
+    .await?;
+    let segments = if is_empty_first {
+        vec![empty, populated]
+    } else {
+        vec![populated, empty]
+    };
+
+    let created = InvertedIndex::merge_segments(
+        &segments,
+        empty_doc_stream(),
+        dest_store.as_ref(),
+        None,
+        crate::progress::noop_progress(),
+    )
+    .await?;
+    assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V1);
+
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(merged.format_version(), InvertedListFormatVersion::V1);
+    assert_eq!(merged.index_version(), INVERTED_INDEX_VERSION_V1);
+
+    let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+    let prefilter = Arc::new(NoFilter);
+    let metrics = Arc::new(NoOpMetricsCollector);
+    let (row_ids, _) = merged
+        .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+        .await?;
+    assert_eq!(row_ids, vec![100]);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()> {
     let src_dir_1 = TempObjDir::default();

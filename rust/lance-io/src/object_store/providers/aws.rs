@@ -10,14 +10,13 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::S3};
 
-use aws_config::Region;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
+use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
@@ -30,6 +29,7 @@ use object_store::{
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
@@ -41,12 +41,47 @@ use lance_core::error::{Error, Result};
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
 
+struct ResolvedS3StorageOptions {
+    options: HashMap<AmazonS3ConfigKey, String>,
+    profile_region: Option<String>,
+}
+
+impl ResolvedS3StorageOptions {
+    fn new(
+        mut options: HashMap<AmazonS3ConfigKey, String>,
+        profile_config: Option<&SdkConfig>,
+    ) -> Self {
+        if effective_s3_endpoint(&options).is_none()
+            && let Some(endpoint) = profile_config.and_then(SdkConfig::endpoint_url)
+        {
+            options.insert(AmazonS3ConfigKey::Endpoint, endpoint.to_string());
+        }
+        let profile_region = profile_config
+            .and_then(SdkConfig::region)
+            .map(|region| region.as_ref().to_string());
+        Self {
+            options,
+            profile_region,
+        }
+    }
+
+    fn effective_endpoint(&self) -> Option<&str> {
+        effective_s3_endpoint(&self.options)
+    }
+
+    fn requires_constant_size_upload_parts(&self) -> bool {
+        self.effective_endpoint()
+            .is_some_and(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
+    }
+}
+
 impl AwsStoreProvider {
     async fn build_amazon_s3_store(
         &self,
         base_path: &mut Url,
         params: &ObjectStoreParams,
         storage_options: &StorageOptions,
+        mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
     ) -> Result<Arc<dyn OSObjectStore>> {
@@ -58,8 +93,7 @@ impl AwsStoreProvider {
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
-        let mut s3_storage_options = storage_options.as_s3_options();
-        let region = resolve_s3_region(base_path, &s3_storage_options).await?;
+        let region = resolve_s3_region(base_path, &resolved_s3_options).await?;
 
         // Get accessor from params
         let accessor = params.get_accessor();
@@ -69,7 +103,7 @@ impl AwsStoreProvider {
         let (aws_creds, region) = build_aws_credential(
             params.s3_credentials_refresh_offset,
             params.aws_credentials.clone(),
-            Some(&s3_storage_options),
+            Some(&resolved_s3_options.options),
             region,
             accessor,
             provider_scheme,
@@ -78,7 +112,9 @@ impl AwsStoreProvider {
 
         // Set S3Express flag if detected
         if is_s3_express {
-            s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
+            resolved_s3_options
+                .options
+                .insert(AmazonS3ConfigKey::S3Express, true.to_string());
         }
 
         // Compute the metrics label before rewriting the URL below so it
@@ -93,7 +129,7 @@ impl AwsStoreProvider {
         // we can't use parse_url_opts here because we need to manually set the credentials provider
         let mut builder =
             AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
-        for (key, value) in s3_storage_options {
+        for (key, value) in resolved_s3_options.options {
             builder = builder.with_config(key, value);
         }
         builder = builder
@@ -163,14 +199,19 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+        let profile_config = if std::env::var_os("AWS_PROFILE").is_some() {
+            Some(aws_config::load_defaults(BehaviorVersion::latest()).await)
+        } else {
+            None
+        };
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(storage_options.as_s3_options(), profile_config.as_ref());
+
         // Determine S3 Express and constant size upload parts before building the store
         let is_s3_express = check_s3_express(&base_path, &storage_options);
 
-        let use_constant_size_upload_parts = storage_options
-            .0
-            .get("aws_endpoint")
-            .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
-            .unwrap_or(false);
+        let use_constant_size_upload_parts =
+            resolved_s3_options.requires_constant_size_upload_parts();
 
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
         let throttle_state = if throttle_config.is_disabled() {
@@ -189,6 +230,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
                 &mut base_path,
                 params,
                 &storage_options,
+                resolved_s3_options,
                 is_s3_express,
                 throttle_state.as_ref(),
             )
@@ -206,6 +248,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            local_dir_operations: None,
             scheme: String::from(base_path.scheme()),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -230,20 +273,29 @@ fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
         || url.authority().ends_with("--x-s3")
 }
 
+fn effective_s3_endpoint(storage_options: &HashMap<AmazonS3ConfigKey, String>) -> Option<&str> {
+    storage_options
+        .get(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| storage_options.get(&AmazonS3ConfigKey::Endpoint))
+        .map(String::as_str)
+}
+
 /// Figure out the S3 region of the bucket.
 ///
 /// This resolves in order of precedence:
 /// 1. The region provided in the storage options
-/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
+/// 2. The selected AWS profile's region when a custom endpoint is configured
+/// 3. (If endpoint is not set), the region returned by the S3 API for the bucket
 ///
 /// It can return None if no region is provided and the endpoint is set.
 async fn resolve_s3_region(
     url: &Url,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
+    resolved_s3_options: &ResolvedS3StorageOptions,
 ) -> Result<Option<String>> {
+    let storage_options = &resolved_s3_options.options;
     if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
         Ok(Some(region.clone()))
-    } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
+    } else if resolved_s3_options.effective_endpoint().is_none() {
         // If no endpoint is set, we can assume this is AWS S3 and the region
         // can be resolved from the bucket.
         let bucket = url.host_str().ok_or_else(|| {
@@ -261,7 +313,7 @@ async fn resolve_s3_region(
             object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
         Ok(Some(bucket_region))
     } else {
-        Ok(None)
+        Ok(resolved_s3_options.profile_region.clone())
     }
 }
 
@@ -582,6 +634,8 @@ pub type DynamicStorageOptionsCredentialProvider =
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
     use crate::object_store::StorageOptionsProvider;
+    #[allow(deprecated)]
+    use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
@@ -606,6 +660,18 @@ mod tests {
                 token: None,
             }))
         }
+    }
+
+    #[allow(deprecated)]
+    async fn load_test_profile(config: &str) -> SdkConfig {
+        let profile_files = ProfileFiles::builder()
+            .with_contents(ProfileFileKind::Config, config)
+            .build();
+        aws_config::defaults(BehaviorVersion::latest())
+            .profile_name("selected")
+            .profile_files(profile_files)
+            .load()
+            .await
     }
 
     #[derive(Debug)]
@@ -675,6 +741,79 @@ mod tests {
 
         // Not called yet
         assert!(mock_provider.called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_s3_region_from_aws_profile() {
+        let profile_config = load_test_profile(
+            "[profile selected]\n\
+             region = us-west-004\n\
+             endpoint_url = https://s3.us-west-004.backblazeb2.com\n\
+             aws_access_key_id = test-key\n\
+             aws_secret_access_key = test-secret",
+        )
+        .await;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+        let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
+
+        assert_eq!(region.as_deref(), Some("us-west-004"));
+        assert_eq!(
+            resolved_s3_options
+                .options
+                .get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://s3.us-west-004.backblazeb2.com".to_string())
+        );
+
+        let explicit_options = HashMap::from([
+            (AmazonS3ConfigKey::Region, "explicit-region".to_string()),
+            (
+                AmazonS3ConfigKey::Endpoint,
+                "https://explicit.example.com".to_string(),
+            ),
+        ]);
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config));
+        let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
+
+        assert_eq!(region.as_deref(), Some("explicit-region"));
+        assert_eq!(
+            resolved_s3_options
+                .options
+                .get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://explicit.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_region_only_aws_profile_preserves_bucket_discovery() {
+        let profile_config = load_test_profile("[profile selected]\nregion = us-east-1").await;
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+
+        let url = Url::parse("s3:///path").unwrap();
+        let error = resolve_s3_region(&url, &resolved_s3_options)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Could not parse bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_r2_aws_profile_requires_constant_size_upload_parts() {
+        let profile_config = load_test_profile(
+            "[profile selected]\n\
+             region = auto\n\
+             endpoint_url = https://account.r2.cloudflarestorage.com",
+        )
+        .await;
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+
+        assert!(resolved_s3_options.requires_constant_size_upload_parts());
     }
 
     #[test]
