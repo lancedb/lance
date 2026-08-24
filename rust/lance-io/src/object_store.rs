@@ -26,7 +26,10 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
+    path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -42,6 +45,17 @@ pub(crate) mod dynamic_opendal;
 mod list_retry;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+    feature = "goosefs",
+))]
+pub(crate) mod opendal_store;
 pub mod providers;
 pub mod storage_options;
 #[cfg(test)]
@@ -108,6 +122,11 @@ pub trait ObjectStoreExt {
 }
 
 #[async_trait]
+pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+}
+
+#[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     fn read_dir_all<'a, 'b>(
         &'a self,
@@ -138,6 +157,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // Provider-owned native directory operations for rooted local stores.
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -495,6 +516,28 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, true).await
+    }
+
+    /// Parse a URI and build a fresh object store outside the registry cache.
+    ///
+    /// The caller must retain the returned store for as long as its
+    /// provider-local state should be reused.
+    #[doc(hidden)]
+    pub async fn from_uri_and_params_uncached(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+    ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, false).await
+    }
+
+    async fn from_uri_and_params_impl(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+        use_registry_cache: bool,
+    ) -> Result<(Arc<Self>, Path)> {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
@@ -513,6 +556,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
+                local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -528,7 +572,11 @@ impl ObjectStore {
         }
         let url = uri_to_url(uri)?;
 
-        let store = registry.get_store(url.clone(), params).await?;
+        let store = if use_registry_cache {
+            registry.get_store(url.clone(), params).await?
+        } else {
+            registry.new_store(url.clone(), params).await?
+        };
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
         let path = provider.extract_path(&url)?;
@@ -591,6 +639,14 @@ impl ObjectStore {
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
         self.scheme == "file" || self.scheme == "file+uring"
+    }
+
+    /// Returns true when object paths directly encode absolute local filesystem paths.
+    ///
+    /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
+    /// their inner object-store implementation instead of direct filesystem access.
+    pub fn has_direct_local_paths(&self) -> bool {
+        self.is_local() && self.store_prefix == self.scheme
     }
 
     pub fn is_cloud(&self) -> bool {
@@ -664,7 +720,7 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -726,7 +782,7 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -789,7 +845,7 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 if let Some(parent) = local_path.parent() {
@@ -821,6 +877,57 @@ impl ObjectStore {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
         Writer::shutdown(writer.as_mut()).await
+    }
+
+    /// Atomically creates an object without replacing an existing object.
+    ///
+    /// Local stores publish a uniquely named staging object with a conditional
+    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// is rejected because it can silently ignore conditional create requests.
+    ///
+    /// Returns [`object_store::Error::NotSupported`] without writing when the
+    /// backend cannot reliably provide put-if-absent semantics.
+    pub async fn put_if_absent(
+        &self,
+        path: &Path,
+        content: PutPayload,
+    ) -> object_store::Result<()> {
+        if self.scheme == "cos" {
+            return Err(object_store::Error::NotSupported {
+                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
+                         versioning has ever been enabled"
+                    .into(),
+            });
+        }
+
+        if self.is_local() {
+            let staging_path =
+                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            self.inner.put(&staging_path, content).await?;
+            let result = self.inner.rename_if_not_exists(&staging_path, path).await;
+            if result.is_err()
+                && let Err(error) = self.inner.delete(&staging_path).await
+            {
+                log::warn!(
+                    "Failed to remove staging object {} after atomic create failed: {}",
+                    staging_path,
+                    error
+                );
+            }
+            result
+        } else {
+            self.inner
+                .put_opts(
+                    path,
+                    content,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -860,7 +967,7 @@ impl ObjectStore {
         multipart_copy_fallback: bool,
         max_single_copy: u64,
     ) -> Result<()> {
-        if self.is_local() {
+        if self.has_direct_local_paths() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -927,7 +1034,13 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = local_dir_operations.remove_dir_all(&path).await;
+            metrics.record(&result, 0);
+            return result;
+        }
+        if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -985,7 +1098,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.is_local() && self.scheme != "file-object-store" {
+        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
             return Ok(());
         }
 
@@ -1217,6 +1330,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1295,6 +1409,44 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent() {
+        let temp_dir = TempStrDir::default();
+        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let store = ObjectStore::local();
+        store
+            .put_if_absent(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"second").into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ));
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"first".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent_rejects_cos() {
+        let mut store = ObjectStore::memory();
+        store.scheme = "cos".to_string();
+        let path = Path::from("atomic-create");
+
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(!store.exists(&path).await.unwrap());
     }
 
     #[test]

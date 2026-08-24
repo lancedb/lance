@@ -33,6 +33,7 @@ use lance_core::{
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -46,7 +47,14 @@ use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
+    CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
+    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -58,11 +66,11 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
-    compound_search_with_base_scorer, flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    MemBM25Scorer, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
+    compound_search_with_base_scorer, cross_column_compound_search,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -478,6 +486,52 @@ fn count_fts_leaves(query: &FtsQuery) -> usize {
     }
 }
 
+/// Return every leaf column, including prohibited Boolean leaves.
+///
+/// The repeated, ordered list is useful beyond the distinct set returned by
+/// `FtsQueryNode::columns`: each leaf contributes its own posting-partition
+/// work and must use the tokenizer and statistics of its field.
+fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
+    fn visit<'a>(query: &'a FtsQuery, columns: &mut Vec<&'a str>) -> Result<()> {
+        let required_column = |column: &'a Option<String>, kind: &str| {
+            column.as_deref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "cross-column compound FTS {kind} leaf is missing its resolved column"
+                ))
+            })
+        };
+
+        match query {
+            FtsQuery::Match(query) => columns.push(required_column(&query.column, "Match")?),
+            FtsQuery::Phrase(query) => columns.push(required_column(&query.column, "Phrase")?),
+            FtsQuery::Boost(query) => {
+                visit(&query.positive, columns)?;
+                visit(&query.negative, columns)?;
+            }
+            FtsQuery::MultiMatch(query) => {
+                for query in &query.match_queries {
+                    columns.push(required_column(&query.column, "MultiMatch")?);
+                }
+            }
+            FtsQuery::Boolean(query) => {
+                for query in query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                {
+                    visit(query, columns)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut columns = Vec::with_capacity(count_fts_leaves(query));
+    visit(query, &mut columns)?;
+    Ok(columns)
+}
+
 /// One DataFusion boundary around a posting-backed compound scorer tree.
 #[derive(Debug)]
 pub struct CompoundQueryExec {
@@ -490,6 +544,10 @@ pub struct CompoundQueryExec {
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Caller-supplied row-address mask, intersected into the prefilter so the
+    /// compound scorer ranks only surviving rows (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -542,6 +600,7 @@ impl CompoundQueryExec {
             prefilter_source,
             base_scorer: None,
             segment_selection,
+            external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -550,6 +609,12 @@ impl CompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
     }
 
     /// Override locally computed BM25 statistics with a corpus-wide scorer.
@@ -584,6 +649,52 @@ impl CompoundQueryExec {
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WandExactnessCertificate {
+    Exhaustive,
+    Strict,
+    Ambiguous,
+}
+
+/// Classify a globally merged k+1 Match WAND result.
+///
+/// Sorting before classification is essential: per-segment WAND output is not
+/// a final cross-segment ordering. A strict score gap after result k proves
+/// that score-only pruning could not have discarded a row-id tie at the final
+/// boundary. Ties wholly inside top-k remain safe because all members of their
+/// score group are present before the strict boundary.
+fn classify_wand_exactness_certificate(
+    documents: &mut [ScoredDoc],
+    limit: usize,
+) -> WandExactnessCertificate {
+    if limit == 0
+        || documents
+            .iter()
+            .any(|document| !document.score.0.is_finite())
+    {
+        return WandExactnessCertificate::Ambiguous;
+    }
+    documents.sort_unstable_by(|left, right| {
+        right
+            .score
+            .0
+            .total_cmp(&left.score.0)
+            .then_with(|| left.row_id.cmp(&right.row_id))
+    });
+    if documents.len() <= limit {
+        WandExactnessCertificate::Exhaustive
+    } else if documents[limit - 1]
+        .score
+        .0
+        .total_cmp(&documents[limit].score.0)
+        == Ordering::Greater
+    {
+        WandExactnessCertificate::Strict
+    } else {
+        WandExactnessCertificate::Ambiguous
     }
 }
 
@@ -661,6 +772,7 @@ impl ExecutionPlan for CompoundQueryExec {
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -679,6 +791,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -716,6 +829,7 @@ impl ExecutionPlan for CompoundQueryExec {
                 dataset,
                 &segments,
                 None,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -740,8 +854,57 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let (row_ids, scores) = match base_scorer {
-                Some(base_scorer) => {
+            let certificate_limit = match (&query, params.limit) {
+                (FtsQuery::Match(match_query), Some(limit))
+                    if limit > 0
+                        && params.wand_factor == 1.0
+                        && match_query.boost.is_finite()
+                        && match_query.boost > 0.0
+                        && base_scorer.is_none()
+                        && indices
+                            .iter()
+                            .all(|index| index.supports_wand_exactness_certificate()) =>
+                {
+                    limit
+                        .checked_add(1)
+                        .map(|wand_limit| (match_query.clone(), limit, wand_limit))
+                }
+                _ => None,
+            };
+            let (row_ids, scores) = if let Some((match_query, limit, wand_limit)) =
+                certificate_limit
+            {
+                let first_index = indices.first().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "FTS index for column {column} has no segments"
+                    ))
+                })?;
+                let mut tokenizer =
+                    tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
+                let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+                let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
+                    .with_phrase_slop(None)
+                    .with_limit(Some(wand_limit));
+                let scorer_start = std::time::Instant::now();
+                let base_scorer = Arc::new(
+                    build_global_bm25_scorer(
+                        &indices,
+                        &tokens,
+                        &wand_params,
+                        Some(metrics.as_ref()),
+                    )
+                    .await?,
+                );
+                metrics.record_scorer_build(scorer_start.elapsed());
+
+                // Zero-weight terms can match documents without contributing a
+                // positive score. A short score-only WAND result therefore does
+                // not prove exhaustion. Preserve exact membership semantics for
+                // those rare corpora without recording a certificate attempt.
+                if base_scorer.token_docs.keys().any(|token| {
+                    let weight = base_scorer.query_weight(token);
+                    !weight.is_finite() || weight <= 0.0
+                }) {
                     compound_search_with_base_scorer(
                         &indices,
                         &query,
@@ -751,11 +914,449 @@ impl ExecutionPlan for CompoundQueryExec {
                         base_scorer,
                     )
                     .await?
+                } else {
+                    metrics.record_wand_exactness_certificate_attempts(1);
+                    prefilter.wait_for_ready().await?;
+                    let mut documents = search_segments(
+                        &indices,
+                        Arc::new(tokens),
+                        Arc::new(wand_params),
+                        match_query.operator,
+                        prefilter.clone(),
+                        metrics.clone(),
+                        base_scorer.clone(),
+                    )
+                    .await?;
+                    documents.iter_mut().for_each(|document| {
+                        document.score.0 *= match_query.boost;
+                    });
+                    metrics.record_wand_exactness_certificate_candidates(documents.len());
+                    match classify_wand_exactness_certificate(&mut documents, limit) {
+                        WandExactnessCertificate::Exhaustive => {
+                            metrics.record_wand_exactness_certificate_exhaustive(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Strict => {
+                            metrics.record_wand_exactness_certificate_strict(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Ambiguous => {
+                            metrics.record_wand_exactness_certificate_fallbacks(1);
+                            compound_search_with_base_scorer(
+                                &indices,
+                                &query,
+                                &params,
+                                prefilter,
+                                metrics.clone(),
+                                base_scorer,
+                            )
+                            .await?
+                        }
+                    }
                 }
-                None => {
-                    compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?
+            } else {
+                match base_scorer {
+                    Some(base_scorer) => {
+                        compound_search_with_base_scorer(
+                            &indices,
+                            &query,
+                            &params,
+                            prefilter,
+                            metrics.clone(),
+                            base_scorer,
+                        )
+                        .await?
+                    }
+                    None => {
+                        compound_search(&indices, &query, &params, prefilter, metrics.clone())
+                            .await?
+                    }
                 }
             };
+            metrics.baseline_metrics.record_output(row_ids.len());
+            Ok::<_, DataFusionError>(RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(row_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompoundColumnSelection {
+    column: String,
+    segment_selection: FtsSegmentSelection,
+}
+
+/// One DataFusion boundary around a cross-column posting-backed scorer tree.
+///
+/// Each column keeps its own ordered segment selection and tokenizer. The
+/// lower-level scorer joins leaves in the common row-address domain; segment
+/// ordinals are deliberately never paired across columns.
+#[derive(Debug)]
+pub struct CrossColumnCompoundQueryExec {
+    dataset: Arc<Dataset>,
+    query: FtsQuery,
+    tokenized_query: Arc<OnceLock<TokenizedCompoundQuery>>,
+    params: FtsSearchParams,
+    prefilter_source: PreFilterSource,
+    columns: Arc<[CompoundColumnSelection]>,
+    /// Combined into the prefilter so only masked rows are scored (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl CrossColumnCompoundQueryExec {
+    pub fn new_with_segments(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        columns: Vec<(String, Vec<IndexMetadata>)>,
+    ) -> Result<Self> {
+        if params.limit.is_none() {
+            return Err(Error::invalid_input(
+                "cross-column compound FTS requires a bounded result limit",
+            ));
+        }
+        let leaf_columns = compound_leaf_columns(&query)?;
+        let query_columns = leaf_columns.iter().copied().collect::<HashSet<_>>();
+        if query_columns.len() < 2 {
+            return Err(Error::invalid_input(format!(
+                "cross-column compound FTS requires at least two query columns, got {}",
+                query_columns.len()
+            )));
+        }
+
+        let mut selected_columns = HashSet::with_capacity(columns.len());
+        for (column, segments) in &columns {
+            if column.is_empty() {
+                return Err(Error::invalid_input(
+                    "cross-column compound FTS segment selection has an empty column name",
+                ));
+            }
+            if segments.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "cross-column compound FTS requires at least one segment for column {column}"
+                )));
+            }
+            if !selected_columns.insert(column.as_str()) {
+                return Err(Error::invalid_input(format!(
+                    "cross-column compound FTS has duplicate segment selections for column {column}"
+                )));
+            }
+        }
+
+        if selected_columns != query_columns {
+            let mut missing = query_columns
+                .difference(&selected_columns)
+                .copied()
+                .collect::<Vec<_>>();
+            let mut unexpected = selected_columns
+                .difference(&query_columns)
+                .copied()
+                .collect::<Vec<_>>();
+            missing.sort_unstable();
+            unexpected.sort_unstable();
+            return Err(Error::invalid_input(format!(
+                "cross-column compound FTS segment selections do not match query leaves: \
+                 missing={missing:?}, unexpected={unexpected:?}"
+            )));
+        }
+
+        let columns = columns
+            .into_iter()
+            .map(|(column, segments)| CompoundColumnSelection {
+                column,
+                segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            dataset,
+            query,
+            tokenized_query: Arc::new(OnceLock::new()),
+            params,
+            prefilter_source,
+            columns: Arc::from(columns),
+            external_mask: None,
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(FTS_SCHEMA.clone()),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+}
+
+impl DisplayAs for CrossColumnCompoundQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "CrossColumnCompoundFtsScorer: query={}", self.query)?;
+                fmt_tokenized_compound_query(&self.tokenized_query, ", ", f)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "CrossColumnCompoundFtsScorer\nquery={}", self.query)?;
+                fmt_tokenized_compound_query(&self.tokenized_query, "\n", f)
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for CrossColumnCompoundQueryExec {
+    fn name(&self) -> &str {
+        "CrossColumnCompoundQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
+                vec![source]
+            }
+        }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let prefilter_source = match children.len() {
+            0 if matches!(self.prefilter_source, PreFilterSource::None) => PreFilterSource::None,
+            1 => {
+                let Some(source) = children.pop() else {
+                    return Err(DataFusionError::Internal(
+                        "cross-column compound FTS lost its prefilter child".to_string(),
+                    ));
+                };
+                match &self.prefilter_source {
+                    PreFilterSource::FilteredRowIds(_) => PreFilterSource::FilteredRowIds(source),
+                    PreFilterSource::ScalarIndexQuery(_) => {
+                        PreFilterSource::ScalarIndexQuery(source)
+                    }
+                    PreFilterSource::None => {
+                        return Err(DataFusionError::Internal(
+                            "cross-column compound FTS received an unexpected prefilter child"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            count => {
+                return Err(DataFusionError::Internal(format!(
+                    "cross-column compound FTS expected at most one prefilter child, got {count}"
+                )));
+            }
+        };
+
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            prefilter_source,
+            columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(
+        name = "cross_column_compound_fts_scorer_exec",
+        level = "debug",
+        skip_all
+    )]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let dataset = self.dataset.clone();
+        let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
+        let params = self.params.clone();
+        let prefilter_source = self.prefilter_source.clone();
+        let columns = self.columns.clone();
+        let external_mask = self.external_mask.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let selected_segments = columns
+                .iter()
+                .flat_map(|selection| {
+                    selection
+                        .segment_selection
+                        .preset_segments()
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            if selected_segments.is_empty() {
+                return Err(DataFusionError::Internal(
+                    "cross-column compound FTS lost its exact segment selections".to_string(),
+                ));
+            }
+            // DatasetPreFilter starts its deletion and filter prerequisites in
+            // the background. Construct it before opening index segments so
+            // both I/O paths can make progress concurrently.
+            let mut prefilter = build_prefilter(
+                context,
+                partition,
+                &prefilter_source,
+                dataset.clone(),
+                &selected_segments,
+                None,
+                external_mask,
+            )?;
+            let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
+                let dataset = dataset.clone();
+                let metrics = metrics.clone();
+                async move {
+                    let segments = selection
+                        .segment_selection
+                        .resolve(
+                            &dataset,
+                            &selection.column,
+                            DocumentGranularity::Row,
+                            &metrics.segment_bind_duration,
+                        )
+                        .await?;
+                    let indices = open_fts_segments(
+                        &dataset,
+                        &selection.column,
+                        &segments,
+                        &metrics.index_metrics,
+                    )
+                    .await?;
+                    Ok::<_, DataFusionError>((selection.column, indices))
+                }
+            }))
+            .await?;
+
+            let mut tokenizer_indices = HashMap::with_capacity(opened_columns.len());
+            let mut partition_counts = HashMap::with_capacity(opened_columns.len());
+            for (column, indices) in &opened_columns {
+                let first_index = indices.first().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "cross-column compound FTS opened no segments for column {column}"
+                    ))
+                })?;
+                tokenizer_indices.insert(column.as_str(), first_index.as_ref());
+                partition_counts.insert(
+                    column.as_str(),
+                    indices
+                        .iter()
+                        .map(|index| index.partition_count())
+                        .sum::<usize>(),
+                );
+            }
+            let tokens = tokenize_cross_column_compound_query(&query, &tokenizer_indices)?;
+            tokenized_query.get_or_init(|| tokens);
+
+            let searched_parts = compound_leaf_columns(&query)?.into_iter().try_fold(
+                0usize,
+                |searched, column| {
+                    let column_parts = partition_counts.get(column).copied().ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "cross-column compound FTS has no opened index for query column \
+                             {column}"
+                        ))
+                    })?;
+                    Ok::<_, DataFusionError>(searched.saturating_add(column_parts))
+                },
+            )?;
+            metrics.record_parts_searched(searched_parts);
+
+            let deleted_fragments = opened_columns.iter().flat_map(|(_, indices)| indices).fold(
+                roaring::RoaringBitmap::new(),
+                |mut deleted, index| {
+                    deleted |= index.deleted_fragments().clone();
+                    deleted
+                },
+            );
+            if !deleted_fragments.is_empty() {
+                let prefilter = Arc::get_mut(&mut prefilter).ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "cross-column compound FTS prefilter was unexpectedly shared before \
+                         initialization"
+                            .to_string(),
+                    )
+                })?;
+                prefilter.set_deleted_fragments(deleted_fragments);
+            }
+
+            let search_columns = opened_columns;
+            let (row_ids, scores) = cross_column_compound_search(
+                &search_columns,
+                &query,
+                &params,
+                prefilter,
+                metrics.clone(),
+            )
+            .await?;
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -858,6 +1459,90 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
     let mut leaves = Vec::with_capacity(count_fts_leaves(query));
     visit(query, index, &mut leaves);
     TokenizedCompoundQuery(leaves)
+}
+
+fn tokenize_cross_column_compound_query(
+    query: &FtsQuery,
+    indices: &HashMap<&str, &InvertedIndex>,
+) -> Result<TokenizedCompoundQuery> {
+    fn index_for_leaf<'a>(
+        column: Option<&str>,
+        kind: &str,
+        indices: &HashMap<&str, &'a InvertedIndex>,
+    ) -> Result<(&'a InvertedIndex, String)> {
+        let column = column.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "cross-column compound FTS {kind} leaf is missing its resolved column"
+            ))
+        })?;
+        let index = indices.get(column).copied().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "cross-column compound FTS has no opened index for {kind} column {column}"
+            ))
+        })?;
+        Ok((index, column.to_string()))
+    }
+
+    fn visit(
+        query: &FtsQuery,
+        indices: &HashMap<&str, &InvertedIndex>,
+        leaves: &mut Vec<TokenizedQueryLeaf>,
+    ) -> Result<()> {
+        match query {
+            FtsQuery::Match(query) => {
+                let (index, column) = index_for_leaf(query.column.as_deref(), "Match", indices)?;
+                let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
+                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                leaves.push(TokenizedQueryLeaf {
+                    kind: TokenizedLeafKind::Match,
+                    column: Some(column),
+                    tokens: TokenizedQuery::from_tokens(&tokens),
+                });
+            }
+            FtsQuery::Phrase(query) => {
+                let (index, column) = index_for_leaf(query.column.as_deref(), "Phrase", indices)?;
+                let mut tokenizer = index.tokenizer();
+                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                leaves.push(TokenizedQueryLeaf {
+                    kind: TokenizedLeafKind::Phrase,
+                    column: Some(column),
+                    tokens: TokenizedQuery::from_tokens(&tokens),
+                });
+            }
+            FtsQuery::Boost(query) => {
+                visit(&query.positive, indices, leaves)?;
+                visit(&query.negative, indices, leaves)?;
+            }
+            FtsQuery::MultiMatch(query) => {
+                for query in &query.match_queries {
+                    let (index, column) =
+                        index_for_leaf(query.column.as_deref(), "MultiMatch", indices)?;
+                    let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
+                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    leaves.push(TokenizedQueryLeaf {
+                        kind: TokenizedLeafKind::Match,
+                        column: Some(column),
+                        tokens: TokenizedQuery::from_tokens(&tokens),
+                    });
+                }
+            }
+            FtsQuery::Boolean(query) => {
+                for query in query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                {
+                    visit(query, indices, leaves)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut leaves = Vec::with_capacity(count_fts_leaves(query));
+    visit(query, indices, &mut leaves)?;
+    Ok(TokenizedCompoundQuery(leaves))
 }
 
 type SharedScorerResult = std::result::Result<Arc<MemBM25Scorer>, Arc<str>>;
@@ -1058,6 +1743,19 @@ pub struct FtsIndexMetrics {
     compound_peak_address_resolution_batch_size: Gauge,
     compound_score_floor_overflows: Count,
     compound_peak_buffered_candidates: Gauge,
+    compound_should_skipped_windows: Count,
+    compound_should_bound_recomputations: Count,
+    compound_should_essential_evaluations: Count,
+    compound_should_non_essential_evaluations: Count,
+    cross_column_staged_attempts: Count,
+    cross_column_staged_successes: Count,
+    cross_column_staged_fallbacks: Count,
+    cross_column_staged_candidates: Count,
+    wand_exactness_certificate_attempts: Count,
+    wand_exactness_certificate_strict: Count,
+    wand_exactness_certificate_exhaustive: Count,
+    wand_exactness_certificate_fallbacks: Count,
+    wand_exactness_certificate_candidates: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1087,6 +1785,32 @@ impl FtsIndexMetrics {
                 .new_count(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, partition),
             compound_peak_buffered_candidates: metrics
                 .new_gauge(COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, partition),
+            compound_should_skipped_windows: metrics
+                .new_count(COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, partition),
+            compound_should_bound_recomputations: metrics
+                .new_count(COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC, partition),
+            compound_should_essential_evaluations: metrics
+                .new_count(COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, partition),
+            compound_should_non_essential_evaluations: metrics
+                .new_count(COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, partition),
+            cross_column_staged_attempts: metrics
+                .new_count(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC, partition),
+            cross_column_staged_successes: metrics
+                .new_count(CROSS_COLUMN_STAGED_SUCCESSES_METRIC, partition),
+            cross_column_staged_fallbacks: metrics
+                .new_count(CROSS_COLUMN_STAGED_FALLBACKS_METRIC, partition),
+            cross_column_staged_candidates: metrics
+                .new_count(CROSS_COLUMN_STAGED_CANDIDATES_METRIC, partition),
+            wand_exactness_certificate_attempts: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, partition),
+            wand_exactness_certificate_strict: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, partition),
+            wand_exactness_certificate_exhaustive: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, partition),
+            wand_exactness_certificate_fallbacks: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, partition),
+            wand_exactness_certificate_candidates: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1160,6 +1884,63 @@ impl MetricsCollector for FtsIndexMetrics {
         self.compound_peak_buffered_candidates
             .set_max(num_candidates);
     }
+
+    fn record_compound_should_skipped_windows(&self, num_windows: usize) {
+        self.compound_should_skipped_windows.add(num_windows);
+    }
+
+    fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
+        self.compound_should_bound_recomputations
+            .add(num_recomputations);
+    }
+
+    fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
+        self.compound_should_essential_evaluations
+            .add(num_evaluations);
+    }
+
+    fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
+        self.compound_should_non_essential_evaluations
+            .add(num_evaluations);
+    }
+
+    fn record_cross_column_staged_attempts(&self, num_attempts: usize) {
+        self.cross_column_staged_attempts.add(num_attempts);
+    }
+
+    fn record_cross_column_staged_successes(&self, num_successes: usize) {
+        self.cross_column_staged_successes.add(num_successes);
+    }
+
+    fn record_cross_column_staged_fallbacks(&self, num_fallbacks: usize) {
+        self.cross_column_staged_fallbacks.add(num_fallbacks);
+    }
+
+    fn record_cross_column_staged_candidates(&self, num_candidates: usize) {
+        self.cross_column_staged_candidates.add(num_candidates);
+    }
+
+    fn record_wand_exactness_certificate_attempts(&self, num_attempts: usize) {
+        self.wand_exactness_certificate_attempts.add(num_attempts);
+    }
+
+    fn record_wand_exactness_certificate_strict(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_strict.add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_exhaustive(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_exhaustive
+            .add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_fallbacks(&self, num_fallbacks: usize) {
+        self.wand_exactness_certificate_fallbacks.add(num_fallbacks);
+    }
+
+    fn record_wand_exactness_certificate_candidates(&self, num_candidates: usize) {
+        self.wand_exactness_certificate_candidates
+            .add(num_candidates);
+    }
 }
 
 #[derive(Debug)]
@@ -1179,6 +1960,9 @@ pub struct MatchQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`Self::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -1264,6 +2048,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1326,6 +2111,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1366,6 +2152,7 @@ impl MatchQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -1398,6 +2185,15 @@ impl MatchQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// Restrict BM25 scoring to rows selected by an external row-address mask.
+    /// The mask is combined (logical AND) with the prefilter built by
+    /// `build_prefilter`, so top-k is computed over masked rows only. No-op when
+    /// `mask` is `None`.
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -1480,6 +2276,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1512,6 +2309,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1536,6 +2334,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -1567,6 +2366,7 @@ impl ExecutionPlan for MatchQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -2496,6 +3296,9 @@ pub struct PhraseQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -2572,6 +3375,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -2625,6 +3429,7 @@ impl PhraseQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -2670,6 +3475,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -2689,6 +3495,12 @@ impl PhraseQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -2764,6 +3576,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 overlay_block: self.overlay_block.clone(),
                 document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -2794,6 +3607,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -2818,6 +3632,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -2849,6 +3664,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -3461,7 +4277,8 @@ mod tests {
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
-    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+    use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery, collect_query_tokens, has_query_token,
@@ -3485,9 +4302,10 @@ mod tests {
     };
 
     use super::{
-        BoolSlot, BoostQueryExec, CompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC,
-        FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
-        build_boolean_query_children, default_text_tokenizer, open_fts_segments,
+        BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
+        FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
+        PhraseQueryExec, WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -3511,6 +4329,106 @@ mod tests {
         fn consume(self) -> ExecutionSummaryCounts {
             self.collected_stats.lock().unwrap().take().unwrap()
         }
+    }
+
+    #[test]
+    fn test_compound_should_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_compound_should_skipped_windows(2);
+        metrics.record_compound_should_bound_recomputations(3);
+        metrics.record_compound_should_essential_evaluations(5);
+        metrics.record_compound_should_non_essential_evaluations(7);
+
+        assert_eq!(metrics.compound_should_skipped_windows.value(), 2);
+        assert_eq!(metrics.compound_should_bound_recomputations.value(), 3);
+        assert_eq!(metrics.compound_should_essential_evaluations.value(), 5);
+        assert_eq!(metrics.compound_should_non_essential_evaluations.value(), 7);
+    }
+
+    #[test]
+    fn test_cross_column_staged_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_cross_column_staged_attempts(2);
+        metrics.record_cross_column_staged_successes(1);
+        metrics.record_cross_column_staged_fallbacks(1);
+        metrics.record_cross_column_staged_candidates(17);
+
+        assert_eq!(metrics.cross_column_staged_attempts.value(), 2);
+        assert_eq!(metrics.cross_column_staged_successes.value(), 1);
+        assert_eq!(metrics.cross_column_staged_fallbacks.value(), 1);
+        assert_eq!(metrics.cross_column_staged_candidates.value(), 17);
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_classification() {
+        let documents = |scores: &[f32]| {
+            scores
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(row_id, score)| ScoredDoc::new(row_id as u64, *score))
+                .collect::<Vec<_>>()
+        };
+
+        let mut exhaustive = documents(&[3.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut exhaustive, 3),
+            WandExactnessCertificate::Exhaustive
+        );
+
+        let mut strict = documents(&[4.0, 3.0, 3.0, 1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut strict, 3),
+            WandExactnessCertificate::Strict
+        );
+        assert_eq!(
+            strict
+                .iter()
+                .map(|document| document.row_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "ties wholly inside top-k must use row-id ordering without forcing fallback"
+        );
+
+        let mut ambiguous = documents(&[4.0, 3.0, 2.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut ambiguous, 3),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut non_finite = documents(&[4.0, f32::INFINITY]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut non_finite, 1),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut zero_limit = documents(&[1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut zero_limit, 0),
+            WandExactnessCertificate::Ambiguous
+        );
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_wand_exactness_certificate_attempts(2);
+        metrics.record_wand_exactness_certificate_strict(3);
+        metrics.record_wand_exactness_certificate_exhaustive(5);
+        metrics.record_wand_exactness_certificate_fallbacks(7);
+        metrics.record_wand_exactness_certificate_candidates(11);
+
+        assert_eq!(metrics.wand_exactness_certificate_attempts.value(), 2);
+        assert_eq!(metrics.wand_exactness_certificate_strict.value(), 3);
+        assert_eq!(metrics.wand_exactness_certificate_exhaustive.value(), 5);
+        assert_eq!(metrics.wand_exactness_certificate_fallbacks.value(), 7);
+        assert_eq!(metrics.wand_exactness_certificate_candidates.value(), 11);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {
@@ -3888,7 +4806,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![legacy_index_meta],
                 removed_indices: vec![index_meta],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
         )
         .build();
@@ -4852,6 +5769,78 @@ mod tests {
                 .to_string()
                 .contains("injected BM25 scorer is missing compound FTS token 'quick'"),
             "unexpected fuzzy-scorer error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_column_compound_exec_validates_constructor_inputs() {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("quick".to_string())
+                    .with_column(Some("title".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::MustNot,
+                MatchQuery::new("blocked".to_string())
+                    .with_column(Some("body".to_string()))
+                    .into(),
+            ),
+        ])
+        .into();
+        let params = FtsSearchParams::default().with_limit(Some(10));
+
+        let error = CrossColumnCompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![("title".to_string(), segments.clone())],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(r#"missing=["body"]"#),
+            "unexpected missing-column error: {error}"
+        );
+
+        let error = CrossColumnCompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+            vec![
+                ("title".to_string(), segments.clone()),
+                ("body".to_string(), segments.clone()),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a bounded result limit"),
+            "unexpected unbounded-query error: {error}"
+        );
+
+        let exec = CrossColumnCompoundQueryExec::new_with_segments(
+            dataset,
+            query,
+            params,
+            PreFilterSource::None,
+            vec![
+                ("title".to_string(), segments.clone()),
+                ("body".to_string(), segments),
+            ],
+        )
+        .unwrap();
+        let display = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&exec).one_line()
+        );
+        assert!(
+            display.contains("CrossColumnCompoundFtsScorer:"),
+            "unexpected display name: {display}"
         );
     }
 

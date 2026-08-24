@@ -239,9 +239,23 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token observed at `path`.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity. The generic
+    /// [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// workflow therefore neither persists nor validates it: COPY and external
+    /// index publication are not atomic, so an otherwise correct equivalent
+    /// materialization can make a stored token stale before it is published.
+    ///
+    /// When present, the token still distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
 }
 
@@ -280,7 +294,7 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
+    if object_store.has_direct_local_paths() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
@@ -656,7 +670,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     let path = lance_io::local::to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
-    let mut latest_entry: Option<(u64, DirEntry)> = None;
+    let mut latest_entry: Option<(u64, DirEntry, ManifestNamingScheme)> = None;
 
     let mut scheme: Option<ManifestNamingScheme> = None;
 
@@ -689,24 +703,22 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             continue;
         };
 
-        if let Some((latest_version, _)) = &latest_entry {
+        if let Some((latest_version, _, _)) = &latest_entry {
             if version > *latest_version {
-                latest_entry = Some((version, entry));
+                latest_entry = Some((version, entry, entry_scheme));
             }
         } else {
-            latest_entry = Some((version, entry));
+            latest_entry = Some((version, entry, entry_scheme));
         }
     }
 
-    if let Some((version, entry)) = latest_entry {
-        let path = Path::from_filesystem_path(entry.path())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if let Some((version, entry, naming_scheme)) = latest_entry {
         let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
-            path,
+            path: naming_scheme.manifest_path(base, version),
             size: Some(metadata.len()),
-            naming_scheme: scheme.unwrap(),
+            naming_scheme,
             e_tag: Some(get_etag(&metadata)),
         }))
     } else {

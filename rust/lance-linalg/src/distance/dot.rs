@@ -18,7 +18,6 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, cast::AsArray, types:
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::assume_eq;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Num, real::Real};
@@ -29,6 +28,7 @@ use crate::Result;
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
 use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
+use crate::distance::{assert_batch_layout, assert_equal_lengths};
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
@@ -82,37 +82,7 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// needed on top of the generic [`dot`].
 #[inline]
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use lance_core::utils::cpu::SimdSupport;
-        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-            // SAFETY: guarded by the runtime AVX-512 detection above.
-            return unsafe { dot_f32_avx512(x, y) };
-        }
-    }
-    dot(x, y)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    debug_assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let a = _mm512_loadu_ps(x.as_ptr().add(i));
-        let b = _mm512_loadu_ps(y.as_ptr().add(i));
-        acc = _mm512_fmadd_ps(a, b, acc);
-        i += 16;
-    }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    while i < n {
-        sum += x[i] * y[i];
-        i += 1;
-    }
-    sum
+    f32::dot(x, y)
 }
 
 /// Negative [Dot] distance.
@@ -141,6 +111,7 @@ pub trait Dot: Num {
         batch: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = f32> + 'a {
+        assert_batch_layout(x.len(), batch.len(), dimension);
         batch.chunks_exact(dimension).map(move |y| Self::dot(x, y))
     }
 }
@@ -168,6 +139,7 @@ mod bf16_kernel {
 impl Dot for bf16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -224,6 +196,7 @@ mod kernel {
 impl Dot for f16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -260,6 +233,7 @@ impl Dot for f16 {
 impl Dot for f32 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 or AVX-512 inner kernel on capable hosts, or a portable
@@ -273,6 +247,7 @@ impl Dot for f32 {
         batch: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
+        assert_batch_layout(x.len(), batch.len(), dimension);
         // Exactly one arm compiles. Keeping each a tail expression (rather than
         // an early `return` guarded by `cfg`) mirrors `dot_f32_dispatched` and
         // avoids an unreachable tail on AVX2-baseline builds.
@@ -318,7 +293,12 @@ impl Dot for f32 {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            batch.chunks_exact(dimension).map(move |y| Self::dot(x, y))
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `Dot::dot` validation for every vector.
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| dot_f32_dispatched(x, y))
         }
     }
 }
@@ -478,6 +458,7 @@ fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 impl Dot for f64 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         dot_f64_simd(x, y)
     }
 }
@@ -769,6 +750,7 @@ fn dot_f64_simd_other(x: &[f64], y: &[f64]) -> f32 {
 impl Dot for u8 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         super::dot_u8::dot_u8(x, y) as f32
     }
 }
@@ -779,8 +761,6 @@ pub fn dot_distance_batch<'a, T: Dot>(
     to: &'a [T],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    assume_eq!(from.len(), dimension);
-    assume_eq!(to.len() % dimension, 0);
     Box::new(T::dot_batch(from, to, dimension).map(|d| 1.0 - d))
 }
 
@@ -861,6 +841,20 @@ mod tests {
     };
     use num_traits::{Float, FromPrimitive};
     use proptest::prelude::*;
+
+    #[test]
+    fn test_dot_rejects_mismatched_lengths() {
+        let short = [1.0_f32];
+        let long = [1.0_f32, 2.0];
+
+        assert!(std::panic::catch_unwind(|| dot(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| dot_f32(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| f32::dot(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| dot_distance(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| dot_distance_batch(&short, &long, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| dot_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
+        assert!(std::panic::catch_unwind(|| dot_distance_batch::<f32>(&[], &[], 0)).is_err());
+    }
 
     #[test]
     fn test_dot_f32_dispatch_matches_scalar() {

@@ -5411,6 +5411,7 @@ mod tests {
             uuid,
             dataset_version: dataset.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5427,7 +5428,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_meta.clone()],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -5451,6 +5451,7 @@ mod tests {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5510,6 +5511,7 @@ mod tests {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5525,7 +5527,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

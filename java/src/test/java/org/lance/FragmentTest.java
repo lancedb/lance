@@ -39,6 +39,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -511,6 +516,54 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(0, dataset.getFragmentStatistics().size());
+      }
+    }
+  }
+
+  @Test
+  void testCountRowsConcurrentWithClose(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("count_rows_close_race").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(100);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L));
+      Fragment fragment = dataset.getFragments().get(0);
+
+      int threadCount = 8;
+      ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+      try {
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threadCount; i++) {
+          futures.add(
+              executor.submit(
+                  () -> {
+                    start.await();
+                    // Hammer countRows until close() wins the race. The only acceptable
+                    // failure is the "Dataset is closed" rejection; anything else (a native
+                    // crash or "Null pointer in rust value from Java") means the native
+                    // handle was released while still in use.
+                    while (true) {
+                      try {
+                        fragment.countRows();
+                      } catch (IllegalArgumentException e) {
+                        assertEquals("Dataset is closed", e.getMessage());
+                        return null;
+                      }
+                    }
+                  }));
+        }
+        start.countDown();
+        Thread.sleep(50);
+        dataset.close();
+        for (Future<?> future : futures) {
+          future.get(30, TimeUnit.SECONDS);
+        }
+      } finally {
+        executor.shutdownNow();
       }
     }
   }

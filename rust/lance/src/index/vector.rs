@@ -1947,6 +1947,7 @@ pub async fn initialize_vector_index(
         uuid: new_uuid,
         name: source_index.name.clone(),
         fields: vec![field.id],
+        covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
         index_details: source_index.index_details.clone(),
@@ -1961,7 +1962,6 @@ pub async fn initialize_vector_index(
         Operation::CreateIndex {
             new_indices: vec![new_idx],
             removed_indices: vec![],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );
