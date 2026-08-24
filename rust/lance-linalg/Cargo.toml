@@ -60,9 +60,5 @@ harness = false
 name = "dist_table"
 harness = false
 
-[[bench]]
-name = "batch_distance"
-harness = false
-
 [lints]
 workspace = true

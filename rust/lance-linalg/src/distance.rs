@@ -51,196 +51,79 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
     );
 }
 
-/// Number of distances computed per call into a runtime-selected batch kernel.
+/// What a per-batch distance kernel yields.
 ///
-/// Keeping a small output buffer amortizes the `#[target_feature]` call while
-/// avoiding the allocation and full-batch materialization that dominate the
-/// common dimension-8 case.
+/// The two batch paths produce different shapes: the build-baseline path maps
+/// lazily over the batch and allocates nothing, while a `#[target_feature]`
+/// kernel must collect eagerly because it cannot be inlined into a lazy
+/// closure. A concrete enum keeps both statically dispatched.
+///
+/// Only sub-AVX2 builds need this. On an AVX2-baseline build the batch methods
+/// return the bare `Map` instead, because any wrapper — trait object or enum —
+/// loses `TrustedLen` (so `.collect()` stops preallocating) and loses
+/// `Map::fold`'s inlined loop. Benchmarks showed that costing 2.5x on the dim-8
+/// batch, far more than the per-vector dispatch it was meant to remove.
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-const BATCH_BUFFER_SIZE: usize = 64;
-
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
-
-/// Runtime-selected target-feature tier for a batch kernel.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-#[derive(Clone, Copy)]
-pub(crate) enum BatchKind {
-    Scalar,
-    Avx,
-    AvxFma,
-    Avx512,
-}
-
-/// Per-vector operations used when a batch consumer can be folded directly.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-pub(crate) trait BatchOperation {
-    fn fold_scalar<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
-    where
-        F: FnMut(B, f32) -> B;
-
-    unsafe fn fold_avx<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
-    where
-        F: FnMut(B, f32) -> B;
-
-    unsafe fn fold_avx_fma<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
-    where
-        F: FnMut(B, f32) -> B;
-
-    unsafe fn fold_avx512<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, f: F) -> B
-    where
-        F: FnMut(B, f32) -> B;
-}
-
-/// Allocation-free iterator over a runtime-selected f32 distance kernel.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-pub(crate) struct BatchIter<'a, O> {
-    key: &'a [f32],
-    batch: &'a [f32],
-    dimension: usize,
-    kernel: BatchKernel,
-    kind: BatchKind,
-    buffer: [f32; BATCH_BUFFER_SIZE],
-    buffer_index: usize,
-    buffer_len: usize,
-    operation: std::marker::PhantomData<O>,
+pub(crate) enum BatchIter<L> {
+    /// Lazy per-vector map. No allocation.
+    Lazy(L),
+    /// Eagerly collected by a `#[target_feature]` kernel.
+    Eager(std::vec::IntoIter<f32>),
 }
 
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-impl<'a, O> BatchIter<'a, O> {
-    /// Creates an iterator after the caller has verified `kernel`'s CPU feature
-    /// requirements.
-    ///
-    /// # Safety
-    /// The host must support every target feature required by `kernel`.
-    #[inline]
-    pub(crate) unsafe fn new(
-        key: &'a [f32],
-        batch: &'a [f32],
-        dimension: usize,
-        kernel: BatchKernel,
-        kind: BatchKind,
-    ) -> Self {
-        // Match `chunks_exact` validation before the buffered iterator performs
-        // division by the dimension.
-        let _ = batch.chunks_exact(dimension);
-        Self {
-            key,
-            batch,
-            dimension,
-            kernel,
-            kind,
-            buffer: [0.0; BATCH_BUFFER_SIZE],
-            buffer_index: 0,
-            buffer_len: 0,
-            operation: std::marker::PhantomData,
-        }
-    }
-
-    #[inline]
-    fn refill(&mut self) -> bool {
-        let num_vectors = (self.batch.len() / self.dimension).min(BATCH_BUFFER_SIZE);
-        if num_vectors == 0 {
-            return false;
-        }
-
-        let num_values = num_vectors * self.dimension;
-        let (input, remaining) = self.batch.split_at(num_values);
-        // SAFETY: `new` requires the caller to verify the selected kernel's
-        // target features before constructing the iterator.
-        unsafe {
-            (self.kernel)(
-                self.key,
-                input,
-                self.dimension,
-                &mut self.buffer[..num_vectors],
-            );
-        }
-        self.batch = remaining;
-        self.buffer_index = 0;
-        self.buffer_len = num_vectors;
-        true
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-impl<O: BatchOperation> Iterator for BatchIter<'_, O> {
+impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
     type Item = f32;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buffer_index == self.buffer_len && !self.refill() {
-            return None;
+        match self {
+            Self::Lazy(iter) => iter.next(),
+            Self::Eager(iter) => iter.next(),
         }
-        let value = self.buffer[self.buffer_index];
-        self.buffer_index += 1;
-        Some(value)
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-
-    /// Processes each filled buffer directly so consumers such as `sum` do not
-    /// pay a refill check for every distance.
-    #[inline]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
-    where
-        F: FnMut(B, Self::Item) -> B,
-    {
-        let accumulator = self.buffer[self.buffer_index..self.buffer_len]
-            .iter()
-            .copied()
-            .fold(init, &mut f);
-
-        // SAFETY: `new` requires the caller to verify the selected tier's
-        // target features. Each helper runs the complete remaining loop in
-        // that target-feature context, avoiding intermediate output writes.
-        match self.kind {
-            BatchKind::Scalar => {
-                O::fold_scalar(self.key, self.batch, self.dimension, accumulator, f)
-            }
-            BatchKind::Avx => unsafe {
-                O::fold_avx(self.key, self.batch, self.dimension, accumulator, f)
-            },
-            BatchKind::AvxFma => unsafe {
-                O::fold_avx_fma(self.key, self.batch, self.dimension, accumulator, f)
-            },
-            BatchKind::Avx512 => unsafe {
-                O::fold_avx512(self.key, self.batch, self.dimension, accumulator, f)
-            },
+        match self {
+            Self::Lazy(iter) => iter.size_hint(),
+            Self::Eager(iter) => iter.size_hint(),
         }
     }
 
+    /// Delegated, not defaulted. `Map` overrides `fold` to drive the underlying
+    /// `ChunksExact` in one inlined, auto-vectorized loop; the default `fold`
+    /// would instead call `next()` per element, paying an enum branch and
+    /// losing that loop. On the dim-8 batch that costs ~2.5x.
     #[inline]
-    fn for_each<F>(self, mut f: F)
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        match self {
+            Self::Lazy(iter) => iter.fold(init, f),
+            Self::Eager(iter) => iter.fold(init, f),
+        }
+    }
+
+    /// `for_each`, `sum` and `collect` all route through `fold`, so delegating
+    /// it covers them too. (`try_fold` cannot be overridden on stable: its
+    /// `Try` bound is unstable.)
+    #[inline]
+    fn for_each<F>(self, f: F)
     where
         F: FnMut(Self::Item),
     {
-        self.fold((), |(), value| f(value));
+        match self {
+            Self::Lazy(iter) => iter.for_each(f),
+            Self::Eager(iter) => iter.for_each(f),
+        }
     }
 }
 
@@ -248,10 +131,13 @@ impl<O: BatchOperation> Iterator for BatchIter<'_, O> {
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
-impl<O: BatchOperation> ExactSizeIterator for BatchIter<'_, O> {
+impl<L: ExactSizeIterator<Item = f32>> ExactSizeIterator for BatchIter<L> {
     #[inline]
     fn len(&self) -> usize {
-        self.buffer_len - self.buffer_index + self.batch.len() / self.dimension
+        match self {
+            Self::Lazy(iter) => iter.len(),
+            Self::Eager(iter) => iter.len(),
+        }
     }
 }
 
