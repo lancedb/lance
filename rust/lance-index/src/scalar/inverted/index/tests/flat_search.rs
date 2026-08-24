@@ -2,6 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::record_batch;
+
+#[test]
+fn flat_full_text_search_supports_utf8_view() {
+    let batch = record_batch!(
+        (ROW_ID, UInt64, [0, 1, 2]),
+        (
+            "text",
+            Utf8View,
+            [Some("alpha beta"), None, Some("beta gamma")]
+        )
+    )
+    .unwrap();
+
+    assert_eq!(
+        flat_full_text_search(&[&batch], "text", "beta", None).unwrap(),
+        vec![0, 2]
+    );
+}
 
 #[tokio::test]
 async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {

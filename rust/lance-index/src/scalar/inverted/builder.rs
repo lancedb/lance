@@ -1493,7 +1493,7 @@ impl IndexWorker {
             }
             data_type => {
                 return Err(Error::index(format!(
-                    "expect data type String, LargeString, List(String), or LargeList(String) but got {}",
+                    "expect String, LargeString, StringView, List(String), or LargeList(String) but got {}",
                     data_type
                 )));
             }
@@ -1509,10 +1509,12 @@ impl IndexWorker {
     ) -> Result<()> {
         let docs = doc_col.as_list::<Offset>();
         match docs.value_type() {
-            datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => {}
+            datatypes::DataType::Utf8
+            | datatypes::DataType::LargeUtf8
+            | datatypes::DataType::Utf8View => {}
             data_type => {
                 return Err(Error::index(format!(
-                    "expect list item data type String or LargeString but got {}",
+                    "expect list item data type String, LargeString, or StringView but got {}",
                     data_type
                 )));
             }
@@ -2378,8 +2380,8 @@ async fn merge_metadata_files(
 /// Convert input stream into a stream of documents.
 ///
 /// The input stream must be one of:
-/// 1. Document in Utf8 or LargeUtf8 format.
-/// 2. Document in List(Utf8) or List(LargeUtf8) format.
+/// 1. Document in Utf8, LargeUtf8, or Utf8View format.
+/// 2. Document in List(Utf8), List(LargeUtf8), or List(Utf8View) format.
 /// 3. Json document in LargeBinary format.
 pub fn document_input(
     input: SendableRecordBatchStream,
@@ -2390,7 +2392,10 @@ pub fn document_input(
     match field.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(input),
         DataType::List(field) | DataType::LargeList(field)
-            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+            if matches!(
+                field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ) =>
         {
             Ok(input)
         }
@@ -2404,7 +2409,7 @@ pub fn document_input(
         },
         _ => Err(Error::invalid_input_source(
             format!(
-                "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
+                "column {} has type {}, is not utf8, large utf8, utf8 view type/list, or large binary",
                 column,
                 field.data_type()
             )

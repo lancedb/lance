@@ -28,9 +28,12 @@ impl TryFrom<&Field> for DocType {
 
     fn try_from(field: &Field) -> Result<Self, Self::Error> {
         match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(Self::Text),
             DataType::List(field) | DataType::LargeList(field)
-                if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+                if matches!(
+                    field.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) =>
             {
                 Ok(Self::Text)
             }
@@ -304,10 +307,30 @@ impl TokenStream for TTStream {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
-        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
+        DocType, JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use arrow_schema::{DataType, Field};
     use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use rstest::rstest;
     use serde_json::Value;
+
+    #[rstest]
+    #[case::utf8_view(DataType::Utf8View)]
+    #[case::list_utf8_view(DataType::List(std::sync::Arc::new(Field::new(
+        "item",
+        DataType::Utf8View,
+        true,
+    ))))]
+    #[case::large_list_utf8_view(DataType::LargeList(std::sync::Arc::new(Field::new(
+        "item",
+        DataType::Utf8View,
+        true,
+    ))))]
+    fn test_doc_type_supports_utf8_view(#[case] data_type: DataType) {
+        let field = Field::new("text", data_type, true);
+
+        assert!(matches!(DocType::try_from(&field), Ok(DocType::Text)));
+    }
 
     #[test]
     fn test_json_tokenizer() {
