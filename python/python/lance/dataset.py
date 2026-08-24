@@ -5685,6 +5685,26 @@ class SqlQueryBuilder:
         self._builder = self._builder.blob_handling(blob_handling)
         return self
 
+    def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
+        """
+        Set the maximum number of rows produced by each query batch.
+
+        If :meth:`batch_size_bytes` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size(batch_size)
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> "SqlQueryBuilder":
+        """
+        Set the approximate maximum bytes produced by each scan batch.
+
+        If :meth:`batch_size` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size_bytes(batch_size_bytes)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.

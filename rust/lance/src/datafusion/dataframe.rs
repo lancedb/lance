@@ -40,6 +40,8 @@ pub struct LanceTableProvider {
     row_addr_idx: Option<usize>,
     ordered: bool,
     blob_handling: Option<lance_core::datatypes::BlobHandling>,
+    batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
 }
 
 impl LanceTableProvider {
@@ -71,6 +73,8 @@ impl LanceTableProvider {
             row_addr_idx,
             ordered,
             blob_handling: None,
+            batch_size: None,
+            batch_size_bytes: None,
         }
     }
 
@@ -92,6 +96,21 @@ impl LanceTableProvider {
         }
         self.full_schema = Arc::new(full_schema);
         self.blob_handling = Some(handling);
+        self
+    }
+
+    /// Overrides the maximum number of rows produced by each dataset scan batch.
+    ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive. Invalid
+    /// values are rejected when DataFusion creates the scan plan.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Overrides the approximate maximum bytes produced by each dataset scan batch.
+    pub fn with_batch_size_bytes(mut self, batch_size_bytes: u64) -> Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
         self
     }
 
@@ -120,6 +139,12 @@ impl TableProvider for LanceTableProvider {
         let mut scan = self.dataset.scan();
         if let Some(handling) = self.blob_handling.clone() {
             scan.blob_handling(handling);
+        }
+        if let Some(batch_size) = self.batch_size {
+            scan.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scan.batch_size_bytes(batch_size_bytes);
         }
 
         match projection {
@@ -310,5 +335,40 @@ mod tests {
         assert_eq!(results.num_rows(), 1);
         // SUM(0..100) - SUM(0..50) = 3675
         assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
+    }
+
+    #[tokio::test]
+    async fn test_table_provider_rejects_invalid_batch_size() {
+        let data = Arc::new(
+            lance_datagen::gen_batch()
+                .col("x", array::step::<Int32Type>())
+                .into_dataset(
+                    "memory://test_table_provider_rejects_invalid_batch_size",
+                    FragmentCount::from(1),
+                    FragmentRowCount::from(3),
+                )
+                .await
+                .unwrap(),
+        );
+
+        for batch_size in [0, u32::MAX as usize + 1] {
+            let provider =
+                LanceTableProvider::new(data.clone(), false, false).with_batch_size(batch_size);
+            let ctx = SessionContext::new();
+            ctx.register_table("dataset", Arc::new(provider)).unwrap();
+
+            let error = ctx
+                .sql("SELECT x FROM dataset")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .expect_err("invalid batch size should be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("batch_size must be between 1 and {}", u32::MAX))
+            );
+        }
     }
 }

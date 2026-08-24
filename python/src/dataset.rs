@@ -4136,6 +4136,20 @@ impl SqlQueryBuilder {
         })
     }
 
+    #[pyo3(signature = (batch_size))]
+    fn batch_size(&self, batch_size: usize) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size(batch_size),
+        }
+    }
+
+    #[pyo3(signature = (batch_size_bytes))]
+    fn batch_size_bytes(&self, batch_size_bytes: u64) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size_bytes(batch_size_bytes),
+        }
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {
