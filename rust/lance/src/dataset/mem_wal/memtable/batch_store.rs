@@ -461,7 +461,7 @@ impl BatchStore {
 
     /// Get estimated size in bytes.
     #[inline]
-    pub fn estimated_bytes(&self) -> usize {
+    pub fn row_bytes(&self) -> usize {
         self.estimated_bytes.load(Ordering::Relaxed)
     }
 
@@ -1093,7 +1093,7 @@ mod tests {
 
         // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
         let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
-        let estimated = store.estimated_bytes();
+        let estimated = store.row_bytes();
         assert!(
             estimated >= payload_bytes,
             "estimate {estimated} should cover the actual payload {payload_bytes}"

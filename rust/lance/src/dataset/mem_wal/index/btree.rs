@@ -833,7 +833,7 @@ impl Backend {
         }
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         fn null_bytes(nulls: &Mutex<Vec<RowPosition>>) -> usize {
             nulls
                 .lock()
@@ -841,9 +841,9 @@ impl Backend {
                 .unwrap_or(0)
         }
         match self {
-            Self::FixedInt(b) => b.reader.memory_size() + null_bytes(&b.null_positions),
-            Self::Bytes(b) => b.reader.memory_size() + null_bytes(&b.null_positions),
-            Self::Scalar(b) => b.reader.memory_size(),
+            Self::FixedInt(b) => b.reader.resident_bytes() + null_bytes(&b.null_positions),
+            Self::Bytes(b) => b.reader.resident_bytes() + null_bytes(&b.null_positions),
+            Self::Scalar(b) => b.reader.resident_bytes(),
         }
     }
 
@@ -955,8 +955,8 @@ impl BTreeMemIndex {
     ///
     /// Grows with rows (unlike the pre-allocated HNSW index). Arena-chunk
     /// granular, so it steps rather than climbs smoothly.
-    pub fn memory_size(&self) -> usize {
-        self.backend.get().map(|b| b.memory_size()).unwrap_or(0)
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.backend.get().map(|b| b.resident_bytes()).unwrap_or(0)
     }
 
     /// Check if the index is empty.

@@ -380,7 +380,7 @@ impl HnswGraph {
     /// the node arena is allocated in full at construction, sized by `capacity`.
     /// Callers budgeting memtable memory must account for this the moment a
     /// vector memtable takes its first row.
-    pub fn memory_size(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         self.base_bytes + self.packed_bytes.load(Ordering::Relaxed)
     }
 

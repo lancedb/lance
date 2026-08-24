@@ -1258,19 +1258,19 @@ impl IndexStore {
 
     /// Heap bytes held by every index in the registry.
     ///
-    /// `MemTable::estimated_size` deliberately omits this — it sizes the flush
+    /// `MemTable::row_bytes` deliberately omits this — it sizes the flush
     /// unit, which is row data. Callers budgeting *resident* memory must add it:
     /// a configured HNSW index pre-allocates its whole graph on the first insert
-    /// (see [`HnswMemIndex::memory_size`]), so it can dwarf a memtable's row
-    /// bytes while `estimated_size` still reads near zero.
-    pub fn memory_size(&self) -> usize {
-        let btrees: usize = self.btree_indexes.values().map(|b| b.memory_size()).sum();
-        let hnsw: usize = self.hnsw_indexes.values().map(|h| h.memory_size()).sum();
-        let fts: usize = self.fts_indexes.values().map(|f| f.memory_size()).sum();
+    /// (see [`HnswMemIndex::resident_bytes`]), so it can dwarf a memtable's row
+    /// bytes while `row_bytes` still reads near zero.
+    pub fn resident_bytes(&self) -> usize {
+        let btrees: usize = self.btree_indexes.values().map(|b| b.resident_bytes()).sum();
+        let hnsw: usize = self.hnsw_indexes.values().map(|h| h.resident_bytes()).sum();
+        let fts: usize = self.fts_indexes.values().map(|f| f.resident_bytes()).sum();
         // A `Single` PK aliases a `btree_indexes` entry, already counted above.
         // A composite PK's index is held only here.
         let pk = match &self.pk_index {
-            Some(PkIndex::Composite { index, .. }) => index.memory_size(),
+            Some(PkIndex::Composite { index, .. }) => index.resident_bytes(),
             Some(PkIndex::Single(_)) | None => 0,
         };
         btrees + hnsw + fts + pk

@@ -202,7 +202,7 @@ impl ArrowFixedSizeListVectorStore {
     /// Excludes the vectors themselves: batches are held by reference, so their
     /// bytes belong to the MemTable's batch store and counting them here would
     /// double-count. That also makes this independent of `dim`.
-    pub fn memory_size(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         self.max_batches * std::mem::size_of::<StoredArrowBatch>()
             + self.capacity * (std::mem::size_of::<RowLookup>() + std::mem::size_of::<u64>())
     }

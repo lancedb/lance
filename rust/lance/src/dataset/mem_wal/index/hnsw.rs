@@ -162,10 +162,10 @@ impl HnswMemIndex {
     /// (the writer's `max_memtable_rows`) rather than by rows inserted — the
     /// graph and lookup slabs are pre-allocated in full on that first insert.
     /// So an idle-but-touched vector memtable costs the same as a full one.
-    pub fn memory_size(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         self.state
             .get()
-            .map(|s| s.graph.memory_size() + s.storage.memory_size())
+            .map(|s| s.graph.resident_bytes() + s.storage.resident_bytes())
             .unwrap_or(0)
     }
 
@@ -479,7 +479,7 @@ mod tests {
     /// full on the first insert and barely moves as rows arrive. A memory
     /// budget that samples only row bytes would miss all of it.
     #[test]
-    fn test_memory_size_is_preallocated_not_proportional_to_rows() {
+    fn test_resident_bytes_is_preallocated_not_proportional_to_rows() {
         let dim = 8;
         let capacity = 4_000;
         let index = || {
@@ -495,18 +495,18 @@ mod tests {
 
         let untouched = index();
         assert_eq!(
-            untouched.memory_size(),
+            untouched.resident_bytes(),
             0,
             "an index with no state built holds nothing"
         );
 
         let sparse = index();
         sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
-        let one_row = sparse.memory_size();
+        let one_row = sparse.resident_bytes();
 
         let full = index();
         full.insert(&make_batch(0, capacity, dim), 0).unwrap();
-        let all_rows = full.memory_size();
+        let all_rows = full.resident_bytes();
 
         // One row already pays for the whole graph: well over a KB per slot of
         // capacity, and within a small factor of the fully-populated index.

@@ -638,7 +638,7 @@ fn push_sample(
         "memtable_flush_rows": stats.memtable_flush_rows,
         "active_memtable_rows": memtable.as_ref().map(|stats| stats.row_count),
         "active_memtable_batches": memtable.as_ref().map(|stats| stats.batch_count),
-        "active_memtable_bytes": memtable.as_ref().map(|stats| stats.estimated_size),
+        "active_memtable_bytes": memtable.as_ref().map(|stats| stats.row_bytes),
         "active_memtable_generation": memtable.as_ref().map(|stats| stats.generation),
         "active_memtable_max_buffered_batch_position": memtable.as_ref().and_then(|stats| stats.max_buffered_batch_position),
         "active_memtable_durable_batch_count": memtable.as_ref().map(|stats| stats.durable_batch_count),
@@ -655,7 +655,7 @@ fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
         Some(stats) => json!({
             "row_count": stats.row_count,
             "batch_count": stats.batch_count,
-            "estimated_size": stats.estimated_size,
+            "estimated_size": stats.row_bytes,
             "generation": stats.generation,
             "max_buffered_batch_position": stats.max_buffered_batch_position,
             "durable_batch_count": stats.durable_batch_count,

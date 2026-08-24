@@ -14,10 +14,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
@@ -47,6 +48,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
+use super::memtable::MemTableBytes;
 use super::memtable::flush::TriggerMemTableFlush;
 use super::observer::WalObserver;
 use super::scanner::SsTableWarmer;
@@ -728,86 +730,146 @@ pub struct BackpressureStatsSnapshot {
     pub active_count: u64,
 }
 
-/// A **live** view of the calling shard's resident memtable bytes, handed to
-/// the controller so it can apply a per-shard rule without a back-reference
-/// into the writer that is calling it.
+/// A **live** view of what one shard is holding in memory.
+///
+/// The single place a shard's byte totals are computed. Everything that wants
+/// them — the admission controller, [`ShardWriter::memory`], an operator gauge
+/// — goes through this, so there is no second implementation to drift from it.
 ///
 /// Re-read it on every poll rather than reading once: a controller that delays
 /// is waiting for exactly these numbers to fall, so a captured copy would never
-/// observe the drain and the wait would never end. Each accessor is a relaxed
-/// atomic load, so polling is cheap.
+/// observe the drain and the wait would never end. A read is one `ArcSwap` load
+/// and a sum over the live memtables, so polling is cheap.
 #[derive(Clone)]
 pub struct ShardMemory(ShardMemorySource);
 
+/// Where a [`ShardMemory`] reads from. A dispatch over the two write modes, not
+/// a second accounting: every arm is a field read, and the arithmetic that
+/// combines them lives once, in `ShardMemory`.
 #[derive(Clone)]
 enum ShardMemorySource {
-    Memtable(Arc<MemoryCounters>),
-    /// WAL-only mode has no memtable; the pending queue is the whole pool.
-    WalOnly(Arc<WalOnlyState>),
+    /// Memtable mode: the published set of resident memtables.
+    MemTables(Arc<ArcSwap<ResidentMemTables>>),
+    /// WAL-only mode has no memtable; the pending queue is the whole pool, and
+    /// there is no flush to await, so a waiter falls back to a short sleep.
+    Queue(Arc<WalOnlyState>),
+    /// Test-only: synthetic unflushed bytes, re-read each poll, so a controller
+    /// can be driven without standing up a writer. Carries no watcher — a
+    /// waiter falls back to its sleep, which keeps one poll to one call so a
+    /// test can count them.
+    #[cfg(test)]
+    Fake(Arc<dyn Fn() -> usize + Send + Sync>),
 }
 
 impl ShardMemory {
+    fn memtables(tables: Arc<ArcSwap<ResidentMemTables>>) -> Self {
+        Self(ShardMemorySource::MemTables(tables))
+    }
+
+    fn queue(state: Arc<WalOnlyState>) -> Self {
+        Self(ShardMemorySource::Queue(state))
+    }
+
     /// Resident bytes of the active memtable — row data plus its in-memory
     /// indexes. In WAL-only mode, the pending queue's bytes.
-    pub fn active(&self) -> usize {
+    pub fn active_bytes(&self) -> usize {
         match &self.0 {
-            ShardMemorySource::Memtable(m) => m.active(),
-            ShardMemorySource::WalOnly(s) => s.estimated_size(),
+            ShardMemorySource::MemTables(t) => t
+                .load()
+                .active
+                .as_ref()
+                .map_or(0, MemTableBytes::resident_bytes),
+            ShardMemorySource::Queue(q) => q.queue_bytes(),
+            #[cfg(test)]
+            ShardMemorySource::Fake(f) => f(),
         }
     }
 
     /// Resident bytes of sealed memtables whose flush has not committed.
     /// Always `0` in WAL-only mode.
-    pub fn frozen(&self) -> usize {
+    pub fn frozen_bytes(&self) -> usize {
         match &self.0 {
-            ShardMemorySource::Memtable(m) => m.frozen(),
-            ShardMemorySource::WalOnly(_) => 0,
+            ShardMemorySource::MemTables(t) => {
+                t.load().frozen.iter().map(MemTableBytes::resident_bytes).sum()
+            }
+            ShardMemorySource::Queue(_) => 0,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => 0,
         }
     }
 
-    /// Bytes only a flush can reclaim. Sums two independent loads, which may
-    /// cross a freeze — never derive one term from the other.
-    pub fn unflushed(&self) -> usize {
-        self.active() + self.frozen()
+    /// Bytes only a flush can reclaim: the pool to bound against OOM.
+    ///
+    /// One load covers both terms, so this cannot cross a freeze and
+    /// double-count or lose a memtable the way two separate reads could — which
+    /// is why this is not `active_bytes() + frozen_bytes()`.
+    pub fn unflushed_bytes(&self) -> usize {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => {
+                let tables = t.load();
+                tables
+                    .active
+                    .as_ref()
+                    .map_or(0, MemTableBytes::resident_bytes)
+                    + tables
+                        .frozen
+                        .iter()
+                        .map(MemTableBytes::resident_bytes)
+                        .sum::<usize>()
+            }
+            ShardMemorySource::Queue(q) => q.queue_bytes(),
+            #[cfg(test)]
+            ShardMemorySource::Fake(f) => f(),
+        }
+    }
+
+    /// The oldest outstanding flush, for a waiter that wants to park until the
+    /// pool drains rather than poll. `None` in WAL-only mode, which has no
+    /// flush — such a waiter should fall back to a short sleep.
+    pub fn flush_watcher(&self) -> Option<DurabilityWatcher> {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => t.load().oldest_flush.clone(),
+            ShardMemorySource::Queue(_) => None,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => None,
+        }
     }
 }
 
 impl Debug for ShardMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardMemory")
-            .field("active", &self.active())
-            .field("frozen", &self.frozen())
+            .field("active_bytes", &self.active_bytes())
+            .field("frozen_bytes", &self.frozen_bytes())
             .finish()
     }
 }
 
 /// Admission control for [`ShardWriter::put`], consulted before each write.
 ///
-/// The default ([`LocalBackpressureController`]) bounds one shard's memtable
-/// pool and only ever delays. An embedder running many shards in one process
-/// has budgets lance cannot see — a process-wide memtable total, a page-cache
-/// working set — and can **replace** the default via
-/// [`ShardWriterConfig::backpressure`].
+/// Two implementations ship in-tree and exactly one runs per writer:
+/// [`LocalBackpressureController`] by default, or whatever an embedder installs
+/// via [`ShardWriterConfig::backpressure`]. They do not layer — the injected
+/// one owns the whole policy, per-shard rules included, which is what
+/// [`ShardMemory`] is for.
 ///
-/// A replacement owns the whole policy, per-shard rules included: nothing else
-/// gates the write. That is what [`ShardMemory`] is for — the controller is
-/// told what this shard holds, so it can enforce a per-shard ceiling in the
-/// same place it enforces its process-wide one, rather than relying on a second
-/// valve underneath it.
+/// An embedder replaces the default when it has budgets lance cannot see: a
+/// process-wide memtable total across shards, a page-cache working set. Because
+/// [`ShardMemory`] is self-sufficient, a replacement that also wants the
+/// built-in per-shard behaviour can call [`LocalBackpressureController`] from
+/// inside its own implementation rather than reimplementing it.
 #[async_trait::async_trait]
 pub trait BackpressureController: Send + Sync + Debug {
-    /// Decide whether to admit a write of `incoming_bytes` into a shard
-    /// currently holding `shard`.
+    /// Decide whether to admit a write into a shard currently holding `shard`.
     ///
     /// May await to delay the writer, or return [`Error::Backpressure`] to
-    /// refuse it. Any other error is a real failure. `incoming_bytes` is the
-    /// batch's in-memory size, so an implementation can size relief against
-    /// what is about to be admitted, or refuse before it is buffered.
-    async fn maybe_apply_backpressure(
-        &self,
-        incoming_bytes: usize,
-        shard: ShardMemory,
-    ) -> Result<()>;
+    /// refuse it. Any other error is a real failure.
+    ///
+    /// Deliberately not told the incoming batch's size. Batches are already
+    /// decoded and resident by the time this runs, so there is nothing to
+    /// reserve against — refusing does not un-allocate them. Bounding a single
+    /// write's memory is the ingress's job, not this one's.
+    async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()>;
 
     /// Throttling counters for [`ShardWriter::backpressure_stats`]. An injected
     /// controller keeps its own metrics, so the default reports zeros rather
@@ -817,49 +879,12 @@ pub trait BackpressureController: Send + Sync + Debug {
     }
 }
 
-/// In-memory size of a batch list, for sizing an admission decision against
-/// what is about to be inserted. Matches how `WalOnlyState` sizes its queue.
-fn batches_memory_size(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.get_array_memory_size()).sum()
-}
-
 /// The controller guarding this writer: the embedder's if one was injected,
 /// otherwise lance's own [`LocalBackpressureController`].
-fn resolve_backpressure(
-    config: &ShardWriterConfig,
-    default_source: impl FnOnce() -> LocalSource,
-) -> Arc<dyn BackpressureController> {
+fn resolve_backpressure(config: &ShardWriterConfig) -> Arc<dyn BackpressureController> {
     match &config.backpressure {
         Some(injected) => injected.clone(),
-        None => Arc::new(LocalBackpressureController::new(default_source(), config)),
-    }
-}
-
-/// Which pool a [`LocalBackpressureController`] watches, and how it waits.
-///
-/// The two write modes differ only in where the bytes live and whether a flush
-/// can be awaited — both known in-crate, so this is an enum rather than another
-/// trait.
-enum LocalSource {
-    /// Memtable mode: active + frozen bytes, with a flush to wait on.
-    Memtable(Arc<SharedWriterState>),
-    /// WAL-only mode: the pending queue, with no flush watcher, so the loop
-    /// falls back to a short sleep.
-    WalOnly(Arc<WalOnlyState>),
-    /// Test-only: a synthetic reading, re-polled each iteration, so the loop
-    /// can be driven without standing up a writer.
-    #[cfg(test)]
-    Fake(Box<dyn Fn() -> (usize, Option<DurabilityWatcher>) + Send + Sync>),
-}
-
-impl LocalSource {
-    fn read(&self) -> (usize, Option<DurabilityWatcher>) {
-        match self {
-            Self::Memtable(s) => (s.unflushed_memtable_bytes(), s.oldest_memtable_watcher()),
-            Self::WalOnly(s) => (s.estimated_size(), None),
-            #[cfg(test)]
-            Self::Fake(f) => f(),
-        }
+        None => Arc::new(LocalBackpressureController::new(config)),
     }
 }
 
@@ -870,37 +895,16 @@ impl LocalSource {
 /// [`ShardWriterConfig::backpressure`], so an embedder that injects a
 /// controller takes on the per-shard ceiling this provides (see
 /// [`ShardMemory`]).
+#[derive(Debug)]
 pub struct LocalBackpressureController {
-    source: LocalSource,
     max_unflushed_memtable_bytes: usize,
     log_interval: Duration,
     stats: Arc<BackpressureStats>,
 }
 
-impl Debug for LocalBackpressureController {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalBackpressureController")
-            .field(
-                "mode",
-                match &self.source {
-                    LocalSource::Memtable(_) => &"memtable",
-                    LocalSource::WalOnly(_) => &"wal_only",
-                    #[cfg(test)]
-                    LocalSource::Fake(_) => &"fake",
-                },
-            )
-            .field(
-                "max_unflushed_memtable_bytes",
-                &self.max_unflushed_memtable_bytes,
-            )
-            .finish()
-    }
-}
-
 impl LocalBackpressureController {
-    fn new(source: LocalSource, config: &ShardWriterConfig) -> Self {
+    fn new(config: &ShardWriterConfig) -> Self {
         Self {
-            source,
             max_unflushed_memtable_bytes: config.max_unflushed_memtable_bytes,
             log_interval: config.backpressure_log_interval,
             stats: Arc::new(BackpressureStats::new()),
@@ -922,15 +926,7 @@ impl BackpressureController for LocalBackpressureController {
     /// Blocks while this shard's unflushed bytes are at or above
     /// `max_unflushed_memtable_bytes`, waiting on the oldest flush. Never
     /// returns [`Error::Backpressure`] — this valve only ever delays.
-    ///
-    /// Reads its own source rather than the passed-in `shard`: it must re-poll
-    /// each iteration to see the flush drain, and in WAL-only mode the pool it
-    /// guards is the pending queue.
-    async fn maybe_apply_backpressure(
-        &self,
-        _incoming_bytes: usize,
-        _shard: ShardMemory,
-    ) -> Result<()> {
+    async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()> {
         let start = std::time::Instant::now();
         let mut iteration = 0u32;
         // Held for the whole stall so an operator polling mid-wait sees it; the
@@ -938,7 +934,9 @@ impl BackpressureController for LocalBackpressureController {
         let mut active_wait = None;
 
         loop {
-            let (unflushed_memtable_bytes, oldest_watcher) = self.source.read();
+            // Re-read every iteration: this loop is waiting for exactly these
+            // bytes to fall, so a value captured once would never see the drain.
+            let unflushed_memtable_bytes = shard.unflushed_bytes();
 
             // Check if under threshold
             if unflushed_memtable_bytes < self.max_unflushed_memtable_bytes {
@@ -960,7 +958,7 @@ impl BackpressureController for LocalBackpressureController {
             );
 
             // Wait for oldest memtable to flush
-            if let Some(mut mem_watcher) = oldest_watcher {
+            if let Some(mut mem_watcher) = shard.flush_watcher() {
                 tokio::select! {
                     _ = mem_watcher.await_value() => {}
                     _ = tokio::time::sleep(self.log_interval) => {
@@ -997,73 +995,80 @@ struct FrozenMemTable {
     flushed_at_ms: Option<u64>,
 }
 
-/// Resident memtable bytes for one shard: what is actually held in memory and
-/// reclaimable only by flushing.
+/// What one shard holds in memory: detached size handles, plus the flush a
+/// waiter should park on.
+///
+/// Data only. The byte arithmetic lives on [`ShardMemory`], which is the single
+/// place it exists — this is just what gets published.
 ///
 /// Lives outside [`WriterState`] on purpose. A caller deciding whether to admit
-/// a write must read these *while* the writer holds the write lock, which is
+/// a write must read this *while* the writer holds the write lock, which is
 /// exactly when a `try_read()` on that lock fails — and tokio's `RwLock` is
 /// write-preferring, so it fails whenever a writer is merely queued. Reading
-/// through the lock would therefore report zero precisely under load. These are
-/// plain atomics instead: every mutation happens under the write lock (so the
-/// per-shard counters are single-writer), and any reader gets a relaxed load.
+/// through the lock would therefore report zero precisely under load.
 ///
-/// Counts row data *and* index memory ([`MemTable::memory_size`]), since the
-/// point is to bound RSS.
-struct MemoryCounters {
-    /// The active memtable's resident bytes.
-    active: AtomicUsize,
-    /// Resident bytes of every sealed memtable still awaiting its flush.
-    frozen: AtomicUsize,
+/// Replaced wholesale by [`publish_memory`] at the moments the memtable set
+/// changes, and **derived** from `WriterState` each time rather than adjusted.
+/// So there is no counter to keep paired with anything, nothing on the per-put
+/// path, and no way for this and [`ShardWriter::memtable_stats`] to disagree
+/// about what the shard holds: they read the same memtables through the same
+/// filter.
+///
+/// The handles stay live, so byte totals track a memtable that is still growing
+/// without anyone republishing.
+#[derive(Debug, Default)]
+struct ResidentMemTables {
+    /// The active memtable, or `None` before the first publish.
+    active: Option<MemTableBytes>,
+    /// Sealed memtables whose flush has not committed — including any left
+    /// resident by a *failed* flush, which are the ones most worth metering.
+    /// Excludes flushed memtables still inside `frozen_memtable_grace`: those
+    /// are reclaimable, and throttling on them would meter memory that is about
+    /// to go away by itself.
+    frozen: Vec<MemTableBytes>,
+    /// The oldest flush still outstanding — the frozen queue's front, else the
+    /// active memtable's (it has a completion cell from construction, so this is
+    /// always available). Published here rather than read through the writer
+    /// lock, which has the blind spot described above.
+    oldest_flush: Option<DurabilityWatcher>,
 }
 
-impl MemoryCounters {
-    fn new() -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            frozen: AtomicUsize::new(0),
-        }
-    }
-
-    /// Record the active memtable's size. Call under the write lock after any
-    /// mutation of it.
-    fn set_active(&self, bytes: usize) {
-        self.active.store(bytes, Ordering::Relaxed);
-    }
-
-    /// A memtable of `sealed` bytes was frozen and replaced by a fresh active
-    /// one of `new_active` bytes: the bytes are reclassified, not released.
-    fn seal(&self, sealed: usize, new_active: usize) {
-        self.set_active(new_active);
-        self.frozen.fetch_add(sealed, Ordering::Relaxed);
-    }
-
-    /// Release a frozen memtable's bytes once its flush has committed.
-    fn release_frozen(&self, bytes: usize) {
-        let prev = self.frozen.load(Ordering::Relaxed);
-        self.frozen
-            .store(prev.saturating_sub(bytes), Ordering::Relaxed);
-    }
-
-    fn active(&self) -> usize {
-        self.active.load(Ordering::Relaxed)
-    }
-
-    fn frozen(&self) -> usize {
-        self.frozen.load(Ordering::Relaxed)
-    }
-
-    fn unflushed(&self) -> usize {
-        self.active() + self.frozen()
-    }
+/// Re-derive a shard's resident-memtable set from its writer state.
+///
+/// Call under the write lock after any change to that set: `open`,
+/// `freeze_memtable`, and a flush commit. `SweepExpired` deliberately does not
+/// — it only evicts memtables already stamped `flushed_at_ms`, which the filter
+/// below has excluded since the commit that stamped them.
+///
+/// Cheap: two `Arc` clones per live memtable, no byte walk — the totals are
+/// computed on read.
+fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) {
+    memory.store(Arc::new(ResidentMemTables {
+        active: Some(state.memtable.bytes()),
+        frozen: state
+            .frozen_memtables
+            .iter()
+            .filter(|frozen| frozen.flushed_at_ms.is_none())
+            .map(|frozen| frozen.memtable.bytes())
+            .collect(),
+        // Oldest first, so the front of the queue is what a waiter should park
+        // on; with nothing frozen, the active memtable is what will flush next.
+        oldest_flush: state
+            .frozen_flush_watchers
+            .front()
+            .cloned()
+            .or_else(|| state.memtable.get_memtable_flush_watcher()),
+    }));
 }
 
 /// ShardWriter state shared across tasks.
 struct WriterState {
     memtable: MemTable,
     last_flushed_wal_entry_position: u64,
-    /// Flush watchers for frozen memtables (for backpressure).
-    frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
+    /// Flush watchers for frozen memtables, oldest first. Carries no byte
+    /// count: sizes are read live off `frozen_memtables` (see
+    /// [`ResidentMemTables`]), so there is nothing here to keep paired.
+    frozen_flush_watchers: VecDeque<DurabilityWatcher>,
     /// Sealed memtables, kept queryable so a concurrent reader sees no hole
     /// between `freeze_memtable` and the flush task's manifest commit, and for
     /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
@@ -1294,7 +1299,7 @@ fn memtable_reached_flush_threshold(
     max_memtable_size: usize,
     incoming_batches: usize,
 ) -> bool {
-    memtable.estimated_size() >= max_memtable_size
+    memtable.bytes().row_bytes() >= max_memtable_size
         || memtable.batch_store().remaining_capacity() < incoming_batches
 }
 
@@ -1392,10 +1397,9 @@ fn build_tombstone_batch(
 
 /// Shared state for writer operations.
 struct SharedWriterState {
-    state: Arc<RwLock<WriterState>>,
-    /// Resident-bytes counters, shared with the memtable flush handler (which
-    /// releases frozen bytes on commit).
-    memory: Arc<MemoryCounters>,
+    /// Detached size handles for every memtable this shard holds, shared with
+    /// the memtable flush handler (which re-derives them on commit).
+    memory: Arc<ArcSwap<ResidentMemTables>>,
     wal_flusher: Arc<WalFlusher>,
     wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
     /// The index-apply task's channel. Separate from the WAL flusher's on
@@ -1417,8 +1421,7 @@ struct SharedWriterState {
 impl SharedWriterState {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        state: Arc<RwLock<WriterState>>,
-        memory: Arc<MemoryCounters>,
+        memory: Arc<ArcSwap<ResidentMemTables>>,
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         index_apply_tx: mpsc::UnboundedSender<TriggerIndexApply>,
@@ -1432,7 +1435,6 @@ impl SharedWriterState {
         index_configs: Vec<MemIndexConfig>,
     ) -> Self {
         Self {
-            state,
             memory,
             wal_flusher,
             wal_flush_tx,
@@ -1543,19 +1545,10 @@ impl SharedWriterState {
             None
         };
 
-        // Resident bytes, not `estimated_size`: the sealed memtable keeps its
-        // indexes in memory until the flush takes them. `flush_memtable`
-        // re-reads `memory_size` on the same (now immutable) memtable to
-        // release exactly this much, so the two stay paired.
-        let frozen_size = old_memtable.memory_size();
-        self.memory.seal(frozen_size, state.memtable.memory_size());
-
         let flush_watcher = old_memtable
             .get_memtable_flush_watcher()
             .expect("Flush watcher should exist after create_memtable_flush_completion");
-        state
-            .frozen_flush_watchers
-            .push_back((frozen_size, flush_watcher));
+        state.frozen_flush_watchers.push_back(flush_watcher);
 
         let frozen_memtable = Arc::new(old_memtable);
 
@@ -1569,6 +1562,10 @@ impl SharedWriterState {
             memtable: frozen_memtable.clone(),
             flushed_at_ms: None,
         });
+
+        // The memtable set changed: re-derive. Before the fallible dispatches
+        // below, so a poisoned writer still reports the bytes it is holding.
+        publish_memory(&self.memory, state);
 
         // Dispatch can only fail if a background task's channel is already closed,
         // i.e. the writer is being torn down. Poison so the read path fails fast
@@ -1648,7 +1645,7 @@ impl SharedWriterState {
         let threshold = self.config.max_wal_buffer_size;
 
         let batch_count = state.memtable.batch_count();
-        let total_bytes = state.memtable.estimated_size();
+        let total_bytes = state.memtable.bytes().row_bytes();
         let batch_store = state.memtable.batch_store();
 
         // Check if there are any unflushed batches
@@ -1711,33 +1708,6 @@ impl SharedWriterState {
                 done: None,
             });
         }
-    }
-}
-
-impl SharedWriterState {
-    /// Resident bytes of the active plus all frozen memtables.
-    ///
-    /// A relaxed load of counters maintained under the write lock. It replaced
-    /// a `try_read()` on that lock, which reported `0` whenever the writer held
-    /// it — and because tokio's `RwLock` is write-preferring, also whenever a
-    /// writer was merely queued. That zeroed exactly the shards taking writes,
-    /// so a budget built on it read lowest under the heaviest load.
-    fn unflushed_memtable_bytes(&self) -> usize {
-        self.memory.unflushed()
-    }
-
-    fn oldest_memtable_watcher(&self) -> Option<DurabilityWatcher> {
-        // Return a watcher for the oldest frozen memtable's flush completion.
-        // If no frozen memtables, return the active memtable's watcher since it will
-        // eventually be frozen and flushed.
-        self.state.try_read().ok().and_then(|s| {
-            // First try frozen memtable watchers
-            s.frozen_flush_watchers
-                .front()
-                .map(|(_, watcher)| watcher.clone())
-                // If no frozen memtables, use active memtable's watcher
-                .or_else(|| s.memtable.get_memtable_flush_watcher())
-        })
     }
 }
 
@@ -2106,11 +2076,9 @@ impl ShardWriter {
         // means "no entry covered yet."
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
 
-        let memory = Arc::new(MemoryCounters::new());
-        // Replay above may already have filled the memtable.
-        memory.set_active(memtable.memory_size());
+        let memory = Arc::new(ArcSwap::<ResidentMemTables>::default());
 
-        let state = Arc::new(RwLock::new(WriterState {
+        let state = WriterState {
             memtable,
             last_flushed_wal_entry_position: initial_covered_wal_entry_position,
             frozen_flush_watchers: VecDeque::new(),
@@ -2118,7 +2086,11 @@ impl ShardWriter {
             flush_requested: false,
             wal_flush_trigger_count: 0,
             last_wal_flush_trigger_time: 0,
-        }));
+        };
+        // Seed before the first freeze: replay above may already have filled the
+        // memtable, and nothing else publishes until it seals.
+        publish_memory(&memory, &state);
+        let state = Arc::new(RwLock::new(state));
 
         let (memtable_flush_tx, memtable_flush_rx) = mpsc::unbounded_channel();
 
@@ -2179,7 +2151,6 @@ impl ShardWriter {
 
         // Shared state used by `put()` to dispatch trigger checks.
         let writer_state = Arc::new(SharedWriterState::new(
-            state.clone(),
             memory,
             wal_flusher,
             wal_flush_tx,
@@ -2194,9 +2165,7 @@ impl ShardWriter {
             index_configs.to_vec(),
         ));
 
-        // After `writer_state`: the default valve reads its byte counters.
-        let backpressure =
-            resolve_backpressure(config, || LocalSource::Memtable(writer_state.clone()));
+        let backpressure = resolve_backpressure(config);
 
         Ok(WriterMode::MemTable {
             state,
@@ -2240,14 +2209,14 @@ impl ShardWriter {
         )?;
 
         // Reuse the memtable valve (keyed off `max_unflushed_memtable_bytes`)
-        // as the WAL-only budget, fed `WalOnlyState::estimated_size()`. Keeps
+        // as the WAL-only budget, fed `WalOnlyState::queue_bytes()`. Keeps
         // the config knob meaningful in WAL-only mode and prevents the pending
         // queue from growing unbounded under non-durable writes.
         //
         // The *same* `state` the flush handler was given above: a second
         // `WalOnlyState` here would leave writes queuing on one and the
         // background append draining the other, forever empty.
-        let backpressure = resolve_backpressure(config, || LocalSource::WalOnly(state.clone()));
+        let backpressure = resolve_backpressure(config);
 
         Ok(WriterMode::WalOnly {
             state,
@@ -2515,10 +2484,7 @@ impl ShardWriter {
 
         // Apply backpressure if needed (before acquiring main lock)
         backpressure
-            .maybe_apply_backpressure(
-                batches_memory_size(&batches),
-                ShardMemory(ShardMemorySource::Memtable(writer_state.memory.clone())),
-            )
+            .maybe_apply_backpressure(ShardMemory::memtables(writer_state.memory.clone()))
             .await?;
 
         let start = std::time::Instant::now();
@@ -2541,10 +2507,6 @@ impl ShardWriter {
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
             let batch_positions = start_pos..end_pos;
-
-            // 3. Publish the memtable's new resident size before any freeze
-            // below reclassifies it, so `seal` reads the same value it moves.
-            writer_state.memory.set_active(state.memtable.memory_size());
 
             // 4. Watch for this write to become *visible*: indexed, and — under
             //    `durable_write` — WAL-durable too.
@@ -2624,10 +2586,7 @@ impl ShardWriter {
         // shape as MemTable mode. WAL-only mode has no per-frozen-MemTable
         // watcher, so the backpressure loop falls back to its short sleep.
         backpressure
-            .maybe_apply_backpressure(
-                batches_memory_size(&batches),
-                ShardMemory(ShardMemorySource::WalOnly(state.clone())),
-            )
+            .maybe_apply_backpressure(ShardMemory::queue(state.clone()))
             .await?;
 
         let start = std::time::Instant::now();
@@ -2663,7 +2622,7 @@ impl ShardWriter {
             wal_flush_tx,
             trigger,
             batch_positions.end,
-            state.estimated_size(),
+            state.queue_bytes(),
         );
 
         self.stats.record_put(start.elapsed());
@@ -2754,30 +2713,21 @@ impl ShardWriter {
         self.stats.clone()
     }
 
-    /// Resident bytes of the active memtable — row data plus its in-memory
-    /// indexes. `0` in WAL-only mode (no memtable).
+    /// What this writer is holding in memory, in both write modes.
     ///
-    /// A relaxed load of a counter maintained under the write lock, so it stays
-    /// accurate for a shard that is actively taking writes. Read this together
-    /// with [`Self::frozen_bytes`] and **sum** them for the unflushed total;
-    /// never subtract one from the other, as two non-atomic reads can cross and
-    /// underflow.
+    /// The same [`ShardMemory`] the admission controller is handed, so an
+    /// embedder ranking shards by size and the controller gating a write read
+    /// one implementation rather than two that can disagree.
     ///
-    /// Only a flush reclaims these bytes, so this is the pool to bound against
-    /// OOM. It can far exceed `max_memtable_size`, which gates row data alone.
-    pub fn active_bytes(&self) -> usize {
+    /// Only a flush reclaims these bytes, so `unflushed_bytes` is the pool to
+    /// bound against OOM. It can far exceed `max_memtable_size`, which gates row
+    /// data alone.
+    pub fn memory(&self) -> ShardMemory {
         match &self.mode {
-            WriterMode::MemTable { writer_state, .. } => writer_state.memory.active(),
-            WriterMode::WalOnly { .. } => 0,
-        }
-    }
-
-    /// Resident bytes of sealed memtables whose flush has not yet committed.
-    /// `0` in WAL-only mode. See [`Self::active_bytes`].
-    pub fn frozen_bytes(&self) -> usize {
-        match &self.mode {
-            WriterMode::MemTable { writer_state, .. } => writer_state.memory.frozen(),
-            WriterMode::WalOnly { .. } => 0,
+            WriterMode::MemTable { writer_state, .. } => {
+                ShardMemory::memtables(writer_state.memory.clone())
+            }
+            WriterMode::WalOnly { state, .. } => ShardMemory::queue(state.clone()),
         }
     }
 
@@ -2810,13 +2760,15 @@ impl ShardWriter {
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
+        let memory = state.memtable.bytes();
         let batch_store = state.memtable.batch_store();
         let durable = self.wal_flusher.durable();
         let pending_wal = batch_store.pending_wal_flush_stats(durable);
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
-            estimated_size: state.memtable.estimated_size(),
+            row_bytes: memory.row_bytes(),
+            index_bytes: memory.index_bytes(),
             generation: state.memtable.generation(),
             max_buffered_batch_position: batch_store.max_buffered_batch_position(),
             durable_batch_count: durable,
@@ -2827,14 +2779,11 @@ impl ShardWriter {
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
             frozen_count: state.frozen_memtables.len(),
-            // Summed from the read view rather than read off `frozen_memtable_bytes`:
-            // that counter drains on flush *completion* so a failure cannot wedge
-            // writes, which would report zero for a table still sitting in memory.
             frozen_bytes: state
                 .frozen_memtables
                 .iter()
                 .filter(|frozen| frozen.flushed_at_ms.is_none())
-                .map(|frozen| frozen.memtable.estimated_size())
+                .map(|frozen| frozen.memtable.bytes().resident_bytes())
                 .sum(),
         })
     }
@@ -2964,11 +2913,7 @@ impl ShardWriter {
                 // whatever remains here is exactly what is still owed.
                 Ok(SealFence {
                     sealed_generation,
-                    watchers: state
-                        .frozen_flush_watchers
-                        .iter()
-                        .map(|(_, w)| w.clone())
-                        .collect(),
+                    watchers: state.frozen_flush_watchers.iter().cloned().collect(),
                 })
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
@@ -3001,10 +2946,7 @@ impl ShardWriter {
         loop {
             let watchers: Vec<DurabilityWatcher> = {
                 let st = state_lock.read().await;
-                st.frozen_flush_watchers
-                    .iter()
-                    .map(|(_, w)| w.clone())
-                    .collect()
+                st.frozen_flush_watchers.iter().cloned().collect()
             };
             if watchers.is_empty() {
                 return Ok(());
@@ -3188,10 +3130,7 @@ impl ShardWriter {
                             freeze_result,
                         );
                     }
-                    st.frozen_flush_watchers
-                        .iter()
-                        .map(|(_, w)| w.clone())
-                        .collect()
+                    st.frozen_flush_watchers.iter().cloned().collect()
                 };
                 for mut watcher in watchers {
                     let stage_result = match watcher.await_value().await {
@@ -3251,7 +3190,17 @@ impl ShardWriter {
 pub struct MemTableStats {
     pub row_count: usize,
     pub batch_count: usize,
-    pub estimated_size: usize,
+    /// Row-data bytes of the active memtable — the flush unit, excluding index
+    /// memory. See [`MemTable::row_bytes`].
+    pub row_bytes: usize,
+    /// Heap bytes held by the active memtable's in-memory indexes; `0` when it
+    /// has none.
+    ///
+    /// Broken out from `row_bytes` because it is the term that explains an
+    /// indexed table's footprint, and it does not behave like row data: an HNSW
+    /// index pre-allocates its whole graph on the first insert, so this jumps to
+    /// its full value immediately and barely moves as rows arrive.
+    pub index_bytes: usize,
     pub generation: u64,
     pub max_buffered_batch_position: Option<usize>,
     /// Writer-global count of WAL-durable batches. Exclusive: 0 means none.
@@ -3268,15 +3217,14 @@ pub struct MemTableStats {
     /// Frozen memtables in the read view: sealed-awaiting-flush, plus flushed
     /// ones still inside `frozen_memtable_grace`.
     pub frozen_count: usize,
-    /// Heap bytes still owed to flush: frozen memtables awaiting a first flush,
-    /// plus any left resident by a failed one. Drains on flush commit, so unlike
-    /// `frozen_count` it excludes in-grace tables.
+    /// Resident heap bytes still owed to flush: frozen memtables awaiting a
+    /// first flush, plus any left resident by a failed one. Drains on flush
+    /// commit, so unlike `frozen_count` it excludes in-grace tables.
     ///
-    /// Plus the active memtable's `estimated_size`, this is roughly what
-    /// backpressure meters against `max_unflushed_memtable_bytes` — but only
-    /// roughly: backpressure's own counter drains whenever a flush *completes*,
-    /// so bytes stranded by a failed flush stay visible here while no longer
-    /// throttling writes.
+    /// `row_bytes + index_bytes + frozen_bytes` is **exactly** what backpressure
+    /// meters against `max_unflushed_memtable_bytes` — same memtables, same
+    /// filter, same accounting. A gate that disagreed with this gauge is the bug
+    /// this pairing exists to prevent.
     pub frozen_bytes: usize,
 }
 
@@ -3635,9 +3583,9 @@ impl WalFlushHandler {
 /// handler flushes in the background.
 struct MemTableFlushHandler {
     state: Arc<RwLock<WriterState>>,
-    /// Shared with `SharedWriterState`; this handler releases a memtable's
-    /// frozen bytes once its flush commits.
-    memory: Arc<MemoryCounters>,
+    /// Shared with `SharedWriterState`; this handler re-derives it once a
+    /// flush commits and the memtable set changes.
+    memory: Arc<ArcSwap<ResidentMemTables>>,
     flusher: Arc<MemTableFlusher>,
     /// Source of the writer-global durability cursor, which the L0 flush asserts
     /// covers the whole frozen memtable before it writes a generation.
@@ -3660,7 +3608,7 @@ impl MemTableFlushHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
         state: Arc<RwLock<WriterState>>,
-        memory: Arc<MemoryCounters>,
+        memory: Arc<ArcSwap<ResidentMemTables>>,
         flusher: Arc<MemTableFlusher>,
         wal_flusher: Arc<WalFlusher>,
         epoch: u64,
@@ -3745,11 +3693,6 @@ impl MemTableFlushHandler {
         memtable: Arc<MemTable>,
     ) -> Result<super::memtable::flush::FlushResult> {
         let start = Instant::now();
-        // Read before the flush below takes the indexes, so this matches the
-        // `memory_size` that `freeze_memtable` charged to `frozen` for this
-        // same (now immutable) memtable. Reading it after the flush would
-        // release less than was charged and leak the counter upward.
-        let memtable_size = memtable.memory_size();
 
         let flush_result = async {
             // Step 1: Wait for WAL flush completion (already queued at freeze time).
@@ -3824,14 +3767,11 @@ impl MemTableFlushHandler {
         {
             let mut state = self.state.write().await;
             // Backpressure drain: unconditional so `wait_for_flush_drain`
-            // sees the watcher's error signal, not a dropped channel. The
-            // popped entry gates the release but does not size it — flushes
-            // complete out of order, so the queue front may belong to another
-            // generation. Releasing *this* memtable's charge keeps the total
-            // right regardless of completion order.
-            if state.frozen_flush_watchers.pop_front().is_some() {
-                self.memory.release_frozen(memtable_size);
-            }
+            // sees the watcher's error signal, not a dropped channel. Which
+            // entry comes off the front does not matter — flushes complete out
+            // of order, and the snapshot re-derived at the end of this block
+            // reads the frozen queue itself rather than tracking a charge.
+            state.frozen_flush_watchers.pop_front();
             // Retire the frozen handle on commit success, keyed by generation
             // (non-FIFO completion is fine). Zero grace evicts here; otherwise
             // stamp the grace clock so it lingers for multi-part as-of reads
@@ -3853,6 +3793,10 @@ impl MemTableFlushHandler {
                     }
                 }
             }
+            // Re-derive after both branches above. A *failed* flush leaves its
+            // memtable un-stamped and so still counted, which is the point: its
+            // bytes are resident and only another flush can reclaim them.
+            publish_memory(&self.memory, &state);
         }
 
         let result = flush_result?;
@@ -4157,6 +4101,7 @@ mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
+    use std::sync::atomic::AtomicUsize;
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
     use rstest::rstest;
@@ -5981,30 +5926,29 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    fn fake_local(
-        config: &ShardWriterConfig,
-        read: impl Fn() -> (usize, Option<DurabilityWatcher>) + Send + Sync + 'static,
-    ) -> LocalBackpressureController {
-        LocalBackpressureController::new(LocalSource::Fake(Box::new(read)), config)
+    /// A `ShardMemory` backed by a closure instead of a live writer, re-read on
+    /// every poll exactly as the real one is.
+    fn fake_memory(read: impl Fn() -> usize + Send + Sync + 'static) -> ShardMemory {
+        ShardMemory(ShardMemorySource::Fake(Arc::new(read)))
     }
 
-    fn shard_memory(counters: Arc<MemoryCounters>) -> ShardMemory {
-        ShardMemory(ShardMemorySource::Memtable(counters))
+    fn fixed_memory(unflushed: usize) -> ShardMemory {
+        fake_memory(move || unflushed)
     }
 
     fn empty_shard_memory() -> ShardMemory {
-        shard_memory(Arc::new(MemoryCounters::new()))
+        fixed_memory(0)
     }
 
     #[tokio::test]
     async fn test_no_backpressure_when_under_threshold() {
         let config = ShardWriterConfig::default().with_max_unflushed_memtable_bytes(1024 * 1024); // 1MB
 
-        let controller = fake_local(&config, || (100, None));
+        let controller = LocalBackpressureController::new(&config);
 
         // Should return immediately - well under threshold (100 bytes < 1MB)
         controller
-            .maybe_apply_backpressure(0, empty_shard_memory())
+            .maybe_apply_backpressure(fixed_memory(100))
             .await
             .unwrap();
 
@@ -6024,19 +5968,19 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let controller = fake_local(&config, move || {
+        let controller = LocalBackpressureController::new(&config);
+        let draining = fake_memory(move || {
             let count = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // 1000 -> 600 -> 200 -> under threshold (need 3 iterations)
-            let unflushed = 1000usize.saturating_sub(count * 400);
-            (unflushed, None)
+            1000usize.saturating_sub(count * 400)
         });
 
         controller
-            .maybe_apply_backpressure(0, empty_shard_memory())
+            .maybe_apply_backpressure(draining)
             .await
             .unwrap();
 
-        // Should have called get_state 4 times (initial + 3 waits until under 100)
+        // Should have read the shard 4 times (initial + 3 waits until under 100)
         assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 4);
         // Should have recorded backpressure wait time (waited 3 times)
         assert_eq!(controller.stats().count(), 1);
@@ -6062,12 +6006,11 @@ mod tests {
         let unflushed = Arc::new(AtomicUsize::new(1000));
         let release = unflushed.clone();
 
-        let controller = fake_local(&config, move || {
-            (unflushed.load(AtomicOrdering::Relaxed), None)
-        });
+        let controller = LocalBackpressureController::new(&config);
         let stats = controller.stats().clone();
 
-        let parked = controller.maybe_apply_backpressure(0, empty_shard_memory());
+        let parked = controller
+            .maybe_apply_backpressure(fake_memory(move || unflushed.load(AtomicOrdering::Relaxed)));
 
         let observer = async {
             // Bounded so a regression that never publishes the park fails here
@@ -6109,13 +6052,13 @@ mod tests {
             .with_max_unflushed_memtable_bytes(100)
             .with_backpressure_log_interval(Duration::from_millis(50));
 
-        let controller = fake_local(&config, || (1000, None));
+        let controller = LocalBackpressureController::new(&config);
 
         // Never drops below the threshold, so the timeout is what ends the wait.
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
-                controller.maybe_apply_backpressure(0, empty_shard_memory()),
+                controller.maybe_apply_backpressure(fixed_memory(1000)),
             )
             .await
             .is_err()
@@ -6138,15 +6081,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BackpressureController for SpyController {
-        async fn maybe_apply_backpressure(
-            &self,
-            incoming_bytes: usize,
-            shard: ShardMemory,
-        ) -> Result<()> {
+        async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()> {
             self.seen
                 .write()
                 .unwrap()
-                .push((incoming_bytes, shard.unflushed()));
+                .push((shard.active_bytes(), shard.frozen_bytes()));
             if self.reject {
                 return Err(Error::backpressure("full"));
             }
@@ -6155,43 +6094,33 @@ mod tests {
     }
 
     /// An injected controller *replaces* the built-in valve rather than
-    /// stacking on it, and is handed both the incoming batch size and what the
-    /// calling shard already holds — everything it needs to own the whole
-    /// policy, per-shard rules included.
+    /// stacking on it, and is handed what the calling shard holds, split the
+    /// way relief cares about — everything it needs to own the whole policy,
+    /// per-shard rules included.
     #[tokio::test]
-    async fn test_injected_controller_replaces_default_and_sees_write_context() {
+    async fn test_injected_controller_replaces_default_and_sees_shard_memory() {
         let seen = Arc::new(StdRwLock::new(Vec::new()));
         let spy = Arc::new(SpyController {
             seen: seen.clone(),
             reject: false,
         });
-        let config = ShardWriterConfig::default().with_backpressure(spy);
+        // A budget the built-in valve would trip on instantly, to prove it is
+        // not the thing being consulted.
+        let config = ShardWriterConfig::default()
+            .with_max_unflushed_memtable_bytes(1)
+            .with_backpressure(spy);
 
-        // A source that would trip the built-in valve immediately, to prove it
-        // is not the thing being consulted.
-        let default_polls = Arc::new(AtomicUsize::new(0));
-        let default_polls_clone = default_polls.clone();
-        let controller = resolve_backpressure(&config, || {
-            LocalSource::Fake(Box::new(move || {
-                default_polls_clone.fetch_add(1, Ordering::Relaxed);
-                (usize::MAX, None)
-            }))
-        });
-
-        let counters = Arc::new(MemoryCounters::new());
-        counters.set_active(700);
-        counters.seal(300, 700);
+        let controller = resolve_backpressure(&config);
         controller
-            .maybe_apply_backpressure(4096, shard_memory(counters))
+            .maybe_apply_backpressure(fixed_memory(1000))
             .await
             .unwrap();
 
         assert_eq!(
-            default_polls.load(Ordering::Relaxed),
-            0,
-            "the built-in valve must not run once a controller is injected"
+            *seen.read().unwrap(),
+            vec![(1000, 0)],
+            "the injected controller ran, and the built-in valve did not park the write"
         );
-        assert_eq!(*seen.read().unwrap(), vec![(4096, 1000)]);
     }
 
     /// `ShardMemory` must stay live across polls: a controller that delays is
@@ -6205,8 +6134,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl BackpressureController for DrainWaiter {
-            async fn maybe_apply_backpressure(&self, _: usize, shard: ShardMemory) -> Result<()> {
-                while shard.unflushed() > 0 {
+            async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()> {
+                while shard.unflushed_bytes() > 0 {
                     self.polls.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
@@ -6214,42 +6143,38 @@ mod tests {
             }
         }
 
-        let counters = Arc::new(MemoryCounters::new());
-        counters.set_active(0);
-        counters.seal(4_096, 0);
+        let resident = Arc::new(AtomicUsize::new(4_096));
+        let drain = resident.clone();
+        let view = fake_memory(move || resident.load(Ordering::Relaxed));
 
         let controller = Arc::new(DrainWaiter {
             polls: AtomicUsize::new(0),
         });
         let gate = controller.clone();
-        let view = shard_memory(counters.clone());
-        let waiting = tokio::spawn(async move { gate.maybe_apply_backpressure(1, view).await });
+        let waiting = tokio::spawn(async move { gate.maybe_apply_backpressure(view).await });
 
         // Let the gate observe the full pool, then drain it as a flush commit
         // would. A stale copy would never see this and the task would hang.
         tokio::task::yield_now().await;
-        counters.release_frozen(4_096);
+        drain.store(0, Ordering::Relaxed);
 
         waiting.await.unwrap().unwrap();
         assert!(controller.polls.load(Ordering::Relaxed) > 0);
-        assert_eq!(counters.unflushed(), 0);
     }
 
     /// With nothing injected, lance keeps its own per-shard valve.
     #[tokio::test]
     async fn test_default_backpressure_is_used_when_none_injected() {
         let config = ShardWriterConfig::default().with_max_unflushed_memtable_bytes(100);
+        let controller = resolve_backpressure(&config);
+
         let polls = Arc::new(AtomicUsize::new(0));
         let polls_clone = polls.clone();
-        let controller = resolve_backpressure(&config, || {
-            LocalSource::Fake(Box::new(move || {
-                polls_clone.fetch_add(1, Ordering::Relaxed);
-                (0, None)
-            }))
-        });
-
         controller
-            .maybe_apply_backpressure(1, empty_shard_memory())
+            .maybe_apply_backpressure(fake_memory(move || {
+                polls_clone.fetch_add(1, Ordering::Relaxed);
+                0
+            }))
             .await
             .unwrap();
 
@@ -6265,11 +6190,10 @@ mod tests {
             reject: true,
         });
         let config = ShardWriterConfig::default().with_backpressure(spy);
-        let controller =
-            resolve_backpressure(&config, || LocalSource::Fake(Box::new(|| (0, None))));
+        let controller = resolve_backpressure(&config);
 
         let err = controller
-            .maybe_apply_backpressure(1, empty_shard_memory())
+            .maybe_apply_backpressure(empty_shard_memory())
             .await
             .unwrap_err();
         assert!(err.is_backpressure(), "expected backpressure, got {err:?}");
@@ -8504,7 +8428,7 @@ mod tests {
         let stats = writer_a.memtable_stats().await.unwrap();
         assert_eq!(stats.frozen_count, 1);
         assert!(
-            stats.frozen_bytes >= refs.frozen[0].batch_store.estimated_bytes(),
+            stats.frozen_bytes >= refs.frozen[0].batch_store.row_bytes(),
             "a failed flush must keep owing its resident bytes, got {}",
             stats.frozen_bytes
         );

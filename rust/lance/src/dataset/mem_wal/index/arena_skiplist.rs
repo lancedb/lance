@@ -355,7 +355,7 @@ impl<K: Ord> SkipListReader<K> {
     /// Counts chunks, not entries, so it steps by `CHUNK_SIZE` and overshoots
     /// the live nodes by at most one partly-filled chunk. Excludes any bytes a
     /// key owns outside its node (e.g. a long `Box<[u8]>` key).
-    pub fn memory_size(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         self.core.arena_bytes.load(Ordering::Relaxed)
     }
 
