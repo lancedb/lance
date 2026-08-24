@@ -15,6 +15,8 @@
 
 use std::sync::OnceLock;
 
+use super::assert_equal_lengths;
+
 /// Intermediate results from the fused u8 cosine kernel: (dot_ab, norm_a², norm_b²).
 ///
 /// Separated from the final normalization so SIMD backends can be tested
@@ -27,9 +29,13 @@ pub struct CosineAccumulators {
 }
 
 /// Portable scalar fused cosine accumulation.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8_accum_scalar(a: &[u8], b: &[u8]) -> CosineAccumulators {
-    debug_assert_eq!(a.len(), b.len());
+    assert_equal_lengths(a.len(), b.len());
     let (mut dot_ab, mut norm_a_sq, mut norm_b_sq) = (0u32, 0u32, 0u32);
     for (&x, &y) in a.iter().zip(b.iter()) {
         let (xu, yu) = (x as u32, y as u32);
@@ -59,6 +65,10 @@ fn normalize(acc: CosineAccumulators) -> f32 {
 }
 
 /// Portable scalar u8 cosine distance.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8_scalar(a: &[u8], b: &[u8]) -> f32 {
     normalize(cosine_u8_accum_scalar(a, b))
@@ -66,7 +76,7 @@ pub fn cosine_u8_scalar(a: &[u8], b: &[u8]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::CosineAccumulators;
+    use super::{CosineAccumulators, assert_equal_lengths};
     use std::arch::x86_64::*;
 
     /// Horizontal sum of all 8 × i32 lanes in a __m256i.
@@ -83,7 +93,7 @@ mod x86 {
     /// AVX2 fused cosine: three VPMADDWD products per half, 32 elements/iter.
     #[target_feature(enable = "avx2")]
     pub unsafe fn cosine_u8_accum_avx2(a: &[u8], b: &[u8]) -> CosineAccumulators {
-        debug_assert_eq!(a.len(), b.len());
+        assert_equal_lengths(a.len(), b.len());
         let n = a.len();
         let mut acc_dot = _mm256_setzero_si256();
         let mut acc_na = _mm256_setzero_si256();
@@ -133,7 +143,7 @@ mod x86 {
     /// AVX-512 VNNI fused cosine: VPDPWSSD for each product, 64 elements/iter.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn cosine_u8_accum_avx512_vnni(a: &[u8], b: &[u8]) -> CosineAccumulators {
-        debug_assert_eq!(a.len(), b.len());
+        assert_equal_lengths(a.len(), b.len());
         let n = a.len();
         let zeros = _mm512_setzero_si512();
         let mut acc_dot = _mm512_setzero_si512();
@@ -217,6 +227,10 @@ fn cosine_u8_accum(a: &[u8], b: &[u8]) -> CosineAccumulators {
 /// Dispatched u8 cosine distance, selecting the best available SIMD backend.
 ///
 /// Returns `1 - dot(a,b) / (‖a‖ × ‖b‖)` computed in a single pass.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8(a: &[u8], b: &[u8]) -> f32 {
     normalize(cosine_u8_accum(a, b))
@@ -225,6 +239,18 @@ pub fn cosine_u8(a: &[u8], b: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::shorter_right(64, 1)]
+    #[case::longer_right(1, 64)]
+    fn rejects_mismatched_lengths(#[case] a_len: usize, #[case] b_len: usize) {
+        let a = vec![1; a_len];
+        let b = vec![1; b_len];
+
+        assert!(std::panic::catch_unwind(|| cosine_u8_accum_scalar(&a, &b)).is_err());
+        assert!(std::panic::catch_unwind(|| cosine_u8_scalar(&a, &b)).is_err());
+        assert!(std::panic::catch_unwind(|| cosine_u8(&a, &b)).is_err());
+    }
 
     fn fill_random(buf: &mut [u8], seed: &mut u32) {
         for slot in buf.iter_mut() {
