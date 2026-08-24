@@ -72,7 +72,7 @@ impl RowIdSequenceCursor {
     }
 
     fn get(&mut self, sequence: &RowIdSequence, index: usize) -> Option<u64> {
-        if self.last_index.is_some_and(|last| index < last) {
+        if index < self.rows_passed || self.last_index.is_some_and(|last| index < last) {
             *self = Self::default();
         }
         self.last_index = Some(index);
