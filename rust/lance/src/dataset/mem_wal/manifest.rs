@@ -330,9 +330,7 @@ impl ShardManifestStore {
 
             let mut found_any = false;
             while let Some((version, result)) = futures.next().await {
-                if let Ok(true) = result
-                    && version > latest_found
-                {
+                if result? && version > latest_found {
                     latest_found = version;
                     found_any = true;
                 }
@@ -667,6 +665,8 @@ impl ShardManifestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, TempDir) {
@@ -1181,5 +1181,69 @@ mod tests {
             ours.cached().is_none(),
             "a collision must drop the position so the retry re-reads"
         );
+    }
+
+    /// A HEAD that fails is not a version that is absent, and the scan must not
+    /// read it as the end of the sequence: the answer becomes a position.
+    #[tokio::test]
+    async fn a_failed_head_is_not_read_as_the_end_of_the_sequence() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        // The durable tip is v3, written by a peer that claimed epoch 2.
+        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        for version in 1..=3u64 {
+            let epoch = if version == 3 { 2 } else { 1 };
+            peer.write(&create_test_manifest(shard_id, version, epoch))
+                .await
+                .unwrap();
+        }
+
+        // The hint is written after the manifest and is best-effort, so lagging
+        // by one is the ordinary state during any commit.
+        let hint_path = shard_manifest_path(&base_path, &shard_id).join("version_hint.json");
+        store
+            .inner
+            .put(
+                &hint_path,
+                Bytes::from(serde_json::to_vec(&VersionHint { version: 2 }).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        // A store whose HEAD on v3 gets a transient 503.
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let v3_file = manifest_filename(3);
+        policy.lock().unwrap().set_before_policy(
+            "503",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "get_opts" && path.as_ref().ends_with(v3_file.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "503 slow down".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy.clone()));
+        let ours = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+
+        let err = ours.refresh_latest().await.unwrap_err();
+        assert!(
+            err.to_string().contains("503"),
+            "the scan must surface the HEAD failure, got: {err}"
+        );
+        assert!(ours.cached().is_none(), "a failed scan takes no position");
+        assert!(
+            ours.check_fenced(1).await.is_err(),
+            "a fence check that could not read the tip must not report clear"
+        );
+
+        // Once the blip clears, the scan sees the durable tip.
+        policy.lock().unwrap().clear_before_policy("503");
+        assert_eq!(ours.latest().await.unwrap().unwrap().version, 3);
     }
 }
