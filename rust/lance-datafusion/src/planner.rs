@@ -17,6 +17,7 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
@@ -1035,6 +1036,16 @@ impl Planner {
             df_schema.as_ref(),
             &Default::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.

@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
@@ -142,6 +143,22 @@ use lance_datafusion::substrait::parse_substrait;
 /// Rows per output batch when neither the scan options nor
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
+
+pub(crate) fn validate_batch_size(batch_size: usize) -> Result<u32> {
+    let validated = u32::try_from(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        ))
+    })?;
+    if validated == 0 {
+        return Err(Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        )));
+    }
+    Ok(validated)
+}
 
 enum FtsOverlayPlan {
     Unchanged(Option<Vec<IndexMetadata>>),
@@ -306,6 +323,39 @@ fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
                 validate_fts_query_contract(child)?;
             }
             Ok(())
+        }
+    }
+}
+
+fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
+    fn normalize_zero(value: &mut f32) {
+        if *value == 0.0 {
+            *value = 0.0;
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => normalize_zero(&mut query.boost),
+        FtsQuery::Phrase(_) => {}
+        FtsQuery::Boost(query) => {
+            normalize_zero(&mut query.negative_boost);
+            normalize_fts_zero_boosts(&mut query.positive);
+            normalize_fts_zero_boosts(&mut query.negative);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &mut query.match_queries {
+                normalize_zero(&mut match_query.boost);
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter_mut()
+                .chain(&mut query.must)
+                .chain(&mut query.must_not)
+            {
+                normalize_fts_zero_boosts(child);
+            }
         }
     }
 }
@@ -564,6 +614,7 @@ impl FilterPlan {
         &self,
         input: Arc<dyn ExecutionPlan>,
         scanner: &Scanner,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plan = input;
 
@@ -580,9 +631,12 @@ impl FilterPlan {
         }
 
         if let Some(refine_expr) = &self.expr_filter_plan.refine_expr {
-            // We create a new planner specific to the node's schema, since
-            // physical expressions reference column by index rather than by name.
-            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            plan = Arc::new(match session {
+                Some(session) => {
+                    LanceFilterExec::try_new_with_session(refine_expr.clone(), plan, session)?
+                }
+                None => LanceFilterExec::try_new(refine_expr.clone(), plan)?,
+            });
         }
 
         Ok(plan)
@@ -1546,6 +1600,8 @@ impl Scanner {
 
     /// Set the maximum number of rows per batch.
     ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive.
+    ///
     /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
     /// both limits apply and the one reached first determines the batch size.
@@ -2084,9 +2140,7 @@ impl Scanner {
             .or_else(|| self.dataset.file_reader_options.clone());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
-                if opts.batch_size_bytes.is_none() {
-                    opts.batch_size_bytes = Some(bsb);
-                }
+                opts.batch_size_bytes = Some(bsb);
                 Some(opts)
             }
             (Some(opts), None) => Some(opts),
@@ -2686,6 +2740,10 @@ impl Scanner {
             ));
         }
 
+        if let Some(batch_size) = self.batch_size {
+            validate_batch_size(batch_size)?;
+        }
+
         if self.strict_batch_size
             && let Some(batch_size_bytes) = self
                 .resolved_file_reader_options()
@@ -2882,8 +2940,22 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    pub fn create_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(None))
+    }
+
+    pub(crate) fn create_plan_with_session<'a>(
+        &'a self,
+        session: &'a dyn Session,
+    ) -> BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(Some(session)))
+    }
+
     #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan_impl(
+        &self,
+        session: Option<&dyn Session>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
@@ -2946,7 +3018,7 @@ impl Scanner {
                     self.take_source(take_op).await?
                 } else {
                     let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                        .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
                         .await?;
                     if planned_read.limit_pushed_down {
                         use_limit_node = false;
@@ -2991,7 +3063,7 @@ impl Scanner {
         plan = self.take(plan, pre_filter_projection)?;
 
         // Filter
-        plan = filter_plan.refine_filter(plan, self).await?;
+        plan = filter_plan.refine_filter(plan, self, session).await?;
 
         // Aggregate (if set, applies aggregate and returns early)
         if let Some(agg) = &self.aggregate {
@@ -3244,6 +3316,7 @@ impl Scanner {
         make_deletions_null: bool,
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Kept for the overlay stale-Take path below, which re-evaluates blocked stale rows.
         let user_projection = projection.clone();
@@ -3263,7 +3336,7 @@ impl Scanner {
         }
 
         if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(batch_size as u32);
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
         }
 
         // Bound the decode fan-out by `batch_readahead`.
@@ -3289,6 +3362,10 @@ impl Scanner {
 
         if self.fast_search && filter_plan.has_index_query() {
             read_options = read_options.with_only_indexed_fragments();
+        }
+
+        if let Some(session) = session {
+            read_options = read_options.with_physical_filters(session)?;
         }
 
         // Mask data overlay files: a row with an overlay committed after an index it relies on
@@ -3343,7 +3420,12 @@ impl Scanner {
             .await?;
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
-        let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
+        let filtered = Arc::new(match session {
+            Some(session) => {
+                LanceFilterExec::try_new_with_session(optimized_filter, stale_node, session)?
+            }
+            None => LanceFilterExec::try_new(optimized_filter, stale_node)?,
+        });
         let stale_path: Arc<dyn ExecutionPlan> =
             Arc::new(project(filtered, plan.schema().as_ref())?);
 
@@ -3357,6 +3439,7 @@ impl Scanner {
     // Helper function for filtered read
     //
     // Delegates to legacy or new filtered read based on dataset storage version
+    #[allow(clippy::too_many_arguments)]
     fn filtered_read<'a>(
         &'a self,
         filter_plan: &'a ExprFilterPlan,
@@ -3365,6 +3448,7 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
+        session: Option<&'a dyn Session>,
     ) -> BoxFuture<'a, Result<PlannedFilteredScan>> {
         // The plain-scan mask path lives in new_filtered_read; legacy_filtered_read
         // has no equivalent, so a masked plain scan there would silently drop the
@@ -3397,6 +3481,7 @@ impl Scanner {
             fragments,
             scan_range,
             is_prefilter,
+            session,
         )
         .boxed()
     }
@@ -3469,6 +3554,7 @@ impl Scanner {
     async fn filtered_read_source(
         &self,
         filter_plan: &mut ExprFilterPlan,
+        session: Option<&dyn Session>,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
@@ -3530,6 +3616,7 @@ impl Scanner {
             self.fragments.clone().map(Arc::new),
             scan_range,
             /*is_prefilter= */ false,
+            session,
         )
         .await
     }
@@ -4015,6 +4102,7 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {
         let mut resolved = query.clone();
+        normalize_fts_zero_boosts(&mut resolved.query);
         if resolved.query.is_missing_column() {
             if Self::query_requests_list_element(&resolved.query) {
                 return Err(Error::invalid_input(
@@ -4264,13 +4352,43 @@ impl Scanner {
             }
 
             FtsQuery::MultiMatch(query) => {
-                let mut children = Vec::with_capacity(query.match_queries.len());
-                for match_query in &query.match_queries {
-                    let child =
-                        self.plan_match_query(match_query, params, filter_plan, prefilter_source);
-                    children.push(child);
-                }
-                let children = futures::future::try_join_all(children).await?;
+                // A top-level cross-column MultiMatch scores each field independently and takes
+                // the maximum score for each row. A field's bounded compound top-k is therefore
+                // sufficient to determine the global top-k independently of the other fields.
+                // Preserve that bounded plan for every eligible field, while planning only
+                // partial-index and overlay-backed fields through the exhaustive leaf fallback.
+                let unlimited_params = params.clone().with_limit(None);
+                let can_use_bounded_compound =
+                    !document_granularity.is_list_element() && params.limit.is_some();
+                let children =
+                    futures::future::try_join_all(query.match_queries.iter().map(|match_query| {
+                        let unlimited_params = &unlimited_params;
+                        async move {
+                            if can_use_bounded_compound {
+                                let child_query = FtsQuery::Match(match_query.clone());
+                                if let Some(plan) = self
+                                    .plan_compound_scorer(
+                                        &child_query,
+                                        params,
+                                        prefilter_source,
+                                        document_granularity,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(plan);
+                                }
+                            }
+
+                            self.plan_match_query(
+                                match_query,
+                                unlimited_params,
+                                filter_plan,
+                                prefilter_source,
+                            )
+                            .await
+                        }
+                    }))
+                    .await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
@@ -4825,6 +4943,7 @@ impl Scanner {
                     Some(Arc::new(fragments)),
                     None,
                     /*is_prefilter=*/ true,
+                    None,
                 )
                 .await?;
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -5133,6 +5252,7 @@ impl Scanner {
                     self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
+                    None,
                 )
                 .await?;
 
@@ -6442,6 +6562,7 @@ impl Scanner {
                 Some(fragments),
                 None,
                 /*is_prefilter= */ true,
+                None,
             )
             .await?;
         Ok(PreFilterSource::FilteredRowIds(plan))
@@ -6502,7 +6623,7 @@ impl Scanner {
                 read_options = read_options.with_deleted_rows()?;
             }
             if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(batch_size as u32);
+                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
             }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -7031,6 +7152,63 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_normalize_fts_zero_boosts_recurses_and_preserves_nonzero_values() {
+        fn boost_bits(query: &FtsQuery) -> Vec<u32> {
+            match query {
+                FtsQuery::Match(query) => vec![query.boost.to_bits()],
+                FtsQuery::Phrase(_) => Vec::new(),
+                FtsQuery::Boost(query) => std::iter::once(query.negative_boost.to_bits())
+                    .chain(boost_bits(&query.positive))
+                    .chain(boost_bits(&query.negative))
+                    .collect(),
+                FtsQuery::MultiMatch(query) => query
+                    .match_queries
+                    .iter()
+                    .map(|query| query.boost.to_bits())
+                    .collect(),
+                FtsQuery::Boolean(query) => query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                    .flat_map(boost_bits)
+                    .collect(),
+            }
+        }
+
+        let match_query =
+            |terms: &str, boost| MatchQuery::new(terms.to_string()).with_boost(boost).into();
+        let multi_match = MultiMatchQuery::try_new(
+            "needle".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![-0.0, 2.5])
+        .unwrap();
+        let negative = BooleanQuery::new([
+            (Occur::Should, multi_match.into()),
+            (Occur::Must, match_query("required", 3.5)),
+            (Occur::MustNot, match_query("blocked", -0.0)),
+        ]);
+        let boost = BoostQuery::new(match_query("positive", -0.0), negative.into(), Some(-0.0));
+        let mut query: FtsQuery = BooleanQuery::new([
+            (Occur::Should, match_query("outer", -0.0)),
+            (Occur::Must, boost.into()),
+            (Occur::MustNot, match_query("unchanged", 4.5)),
+        ])
+        .into();
+
+        let nz = (-0.0_f32).to_bits();
+        let pz = 0.0_f32.to_bits();
+        let b2 = 2.5_f32.to_bits();
+        let b3 = 3.5_f32.to_bits();
+        let b4 = 4.5_f32.to_bits();
+        assert_eq!(boost_bits(&query), vec![nz, nz, nz, nz, b2, b3, nz, b4]);
+        normalize_fts_zero_boosts(&mut query);
+        assert_eq!(boost_bits(&query), vec![pz, pz, pz, pz, b2, b3, pz, b4]);
     }
 
     #[test]

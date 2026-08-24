@@ -24,6 +24,14 @@ pub const CROSS_COLUMN_STAGED_ATTEMPTS_METRIC: &str = "cross_column_staged_attem
 pub const CROSS_COLUMN_STAGED_SUCCESSES_METRIC: &str = "cross_column_staged_successes";
 pub const CROSS_COLUMN_STAGED_FALLBACKS_METRIC: &str = "cross_column_staged_fallbacks";
 pub const CROSS_COLUMN_STAGED_CANDIDATES_METRIC: &str = "cross_column_staged_candidates";
+pub const WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC: &str = "wand_exactness_certificate_attempts";
+pub const WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC: &str = "wand_exactness_certificate_strict";
+pub const WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC: &str =
+    "wand_exactness_certificate_exhaustive";
+pub const WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC: &str =
+    "wand_exactness_certificate_fallbacks";
+pub const WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC: &str =
+    "wand_exactness_certificate_candidates";
 
 /// A trait used by the index to report metrics
 ///
@@ -140,6 +148,21 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record unique row-address candidates produced by successful staging.
     fn record_cross_column_staged_candidates(&self, _num_candidates: usize) {}
+
+    /// Record root Match WAND executions that attempted a k+1 exactness certificate.
+    fn record_wand_exactness_certificate_attempts(&self, _num_attempts: usize) {}
+
+    /// Record certificates proven by a strict score gap after the kth result.
+    fn record_wand_exactness_certificate_strict(&self, _num_certificates: usize) {}
+
+    /// Record certificates proven because WAND exhausted all matching documents.
+    fn record_wand_exactness_certificate_exhaustive(&self, _num_certificates: usize) {}
+
+    /// Record ambiguous certificates that fell back to the exact compound scorer.
+    fn record_wand_exactness_certificate_fallbacks(&self, _num_fallbacks: usize) {}
+
+    /// Record WAND candidates returned to the certificate classifier.
+    fn record_wand_exactness_certificate_candidates(&self, _num_candidates: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
