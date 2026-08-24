@@ -50,7 +50,9 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
     CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
-    CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
+    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -1331,6 +1333,34 @@ async fn compound_fts_results(
         .collect()
 }
 
+async fn compound_fts_results_with_stats(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: i64,
+) -> (Vec<(u64, f32)>, ExecutionSummaryCounts) {
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scan = dataset.scan();
+    scan.scan_stats_callback(Arc::new(move |stats| {
+        *stats_setter.lock().unwrap() = Some(stats.clone());
+    }))
+    .with_row_id()
+    .full_text_search(FullTextSearchQuery::new_query(query))
+    .unwrap()
+    .limit(Some(limit), None)
+    .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    let results = row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    (results, stats)
+}
+
 fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
@@ -1875,6 +1905,18 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         LIMIT,
     )
     .await;
+    let (_, partial_stats) =
+        compound_fts_results_with_stats(&partial_dataset, explicit_query.clone(), LIMIT as i64)
+            .await;
+    assert_eq!(
+        partial_stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "only the fully indexed title field should attempt a bounded WAND certificate"
+    );
     let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
@@ -1888,6 +1930,195 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     assert!(
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_field_local_match_wand_exactness_certificates() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+
+    let field_local_query = |term: &str| -> FtsQuery {
+        MultiMatchQuery::try_new(term.to_owned(), vec!["title".to_owned(), "body".to_owned()])
+            .unwrap()
+            .into()
+    };
+
+    let strict_query = field_local_query("alpha");
+    let strict_plan = compound_fts_plan(&dataset, strict_query.clone(), 1).await;
+    assert!(
+        strict_plan.matches("CompoundFtsScorer").count() >= 2
+            && !strict_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "certificate coverage must execute through field-local compound children:\n{strict_plan}"
+    );
+    let strict_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &strict_query).await);
+    assert!(strict_oracle[0].1.total_cmp(&strict_oracle[1].1).is_gt());
+    let (strict, stats) = compound_fts_results_with_stats(&dataset, strict_query, 1).await;
+    assert_scored_rows_close("wand_certificate_strict", &strict, &strict_oracle[..1]);
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
+        Some(&2)
+    );
+
+    let exhaustive_query = field_local_query("tiebody");
+    let exhaustive_oracle = sorted_compound_fts_oracle(
+        independent_compound_fts_oracle(&dataset, &exhaustive_query).await,
+    );
+    let (exhaustive, stats) = compound_fts_results_with_stats(&dataset, exhaustive_query, 3).await;
+    assert_scored_rows_close(
+        "wand_certificate_exhaustive",
+        &exhaustive,
+        &exhaustive_oracle,
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
+        Some(&2)
+    );
+
+    let tied_query = field_local_query("tie");
+    let tied_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &tied_query).await);
+    assert_eq!(tied_oracle.len(), 2);
+    assert_eq!(tied_oracle[0].1, tied_oracle[1].1);
+    assert!(tied_oracle[0].0 < tied_oracle[1].0);
+    let (tied, stats) = compound_fts_results_with_stats(&dataset, tied_query, 1).await;
+    assert_scored_rows_close("wand_certificate_tie_fallback", &tied, &tied_oracle[..1]);
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
+        Some(&2)
+    );
+
+    let mixed_query = field_local_query("noise");
+    let mixed_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &mixed_query).await);
+    let (mixed, stats) = compound_fts_results_with_stats(&dataset, mixed_query, 1).await;
+    assert_scored_rows_close("wand_certificate_mixed_fields", &mixed, &mixed_oracle[..1]);
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+        Some(&2)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
+        Some(&3)
+    );
+
+    let zero_boost_query: FtsQuery = MultiMatchQuery::try_new(
+        "blocked".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![0.0, 0.0])
+    .unwrap()
+    .into();
+    let (_, stats) = compound_fts_results_with_stats(&dataset, zero_boost_query, 1).await;
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+        Some(&0),
+        "zero-boost fields must use the exact path without attempting a certificate"
     );
 }
 
