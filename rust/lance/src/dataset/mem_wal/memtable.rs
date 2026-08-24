@@ -57,57 +57,6 @@ impl Default for CacheConfig {
 /// - **Writer**: Only one thread should call `insert_with_seq()` at a time.
 ///   This is enforced by the WriteBatchHandler architecture.
 /// - **Readers**: Multiple threads can safely call read methods concurrently.
-/// A detached, lock-free view of one memtable's byte counters.
-///
-/// Everything a size reads is behind an `Arc` or an atomic and is set once,
-/// before the memtable is published — so a handle stays correct for that
-/// memtable's whole life and can be read without the writer lock.
-///
-/// That is the point. A caller deciding whether to admit a write must read
-/// these *while* the writer holds the write lock, which is exactly when a
-/// `try_read()` on it fails; and because tokio's `RwLock` is write-preferring,
-/// it also fails whenever a writer is merely queued. Reading through the lock
-/// therefore reports zero precisely under load. A handle has no such blind
-/// spot, and unlike a counter there is nothing to keep in step: the numbers are
-/// computed live off the same allocations the memtable itself uses.
-#[derive(Clone)]
-pub struct MemTableBytes {
-    batch_store: Arc<BatchStore>,
-    indexes: Option<Arc<IndexStore>>,
-    /// `Sbbf` sizes its block vec at construction and never resizes it, so this
-    /// is fixed for the memtable's life.
-    bloom_bytes: usize,
-}
-
-impl MemTableBytes {
-    /// Mirrors [`MemTable::row_bytes`].
-    pub fn row_bytes(&self) -> usize {
-        self.batch_store.row_bytes() + self.bloom_bytes
-    }
-
-    /// Heap bytes held by this memtable's in-memory indexes; `0` when it has
-    /// none. Broken out because it is the term that explains an indexed table's
-    /// footprint — an HNSW graph is pre-allocated in full on the first insert,
-    /// so it can dwarf row bytes while `row_bytes` reads near zero.
-    pub fn index_bytes(&self) -> usize {
-        self.indexes.as_ref().map_or(0, |i| i.resident_bytes())
-    }
-
-    /// Mirrors [`MemTable::resident_bytes`].
-    pub fn resident_bytes(&self) -> usize {
-        self.row_bytes() + self.index_bytes()
-    }
-}
-
-impl std::fmt::Debug for MemTableBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemTableBytes")
-            .field("row_bytes", &self.row_bytes())
-            .field("index_bytes", &self.index_bytes())
-            .finish()
-    }
-}
-
 pub struct MemTable {
     /// Schema for this MemTable.
     schema: Arc<ArrowSchema>,
@@ -173,6 +122,24 @@ const PK_BLOOM_FILTER_EXPECTED_ITEMS: u64 = 8192;
 /// Default false positive probability for primary key bloom filter.
 /// Consistent with lance-index scalar bloomfilter defaults (≈ 1 in 1754).
 const PK_BLOOM_FILTER_FPP: f64 = 0.00057;
+
+/// Heap one memtable's PK bloom filter holds.
+///
+/// The same for every memtable, because it is sized from two constants rather
+/// than from the rows in it — so this is a property of the build, not a
+/// measurement, and a memory view need not carry it per memtable.
+///
+/// Counted as index memory rather than row data: it is an auxiliary lookup
+/// structure, and a fixed term in the `max_memtable_size` seal trigger would
+/// make every memtable seal a constant early.
+pub fn pk_bloom_filter_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        Sbbf::with_ndv_fpp(PK_BLOOM_FILTER_EXPECTED_ITEMS, PK_BLOOM_FILTER_FPP)
+            .map(|f| f.estimated_memory_size())
+            .unwrap_or(0)
+    })
+}
 
 impl MemTable {
     /// Create a new MemTable with default capacity.
@@ -748,17 +715,6 @@ impl MemTable {
         self.batch_count()
     }
 
-    /// Detached, lock-free view of this memtable's byte counters.
-    ///
-    /// Cheap: two `Arc` clones and a copy. See [`MemTableBytes`].
-    pub fn bytes(&self) -> MemTableBytes {
-        MemTableBytes {
-            batch_store: self.batch_store.clone(),
-            indexes: self.indexes.clone(),
-            bloom_bytes: self.pk_bloom_filter.estimated_memory_size(),
-        }
-    }
-
     /// Get the bloom filter for serialization.
     pub fn bloom_filter(&self) -> &Sbbf {
         &self.pk_bloom_filter
@@ -1154,39 +1110,4 @@ mod tests {
         assert!(memtable.should_flush(1024 * 1024));
     }
 
-    /// A detached handle must report what the memtable itself reports, and keep
-    /// doing so as rows arrive — the whole point is that a caller can read it
-    /// without holding the writer lock, so a handle that went stale would gate
-    /// writes on a snapshot instead of on what the shard actually holds.
-    #[tokio::test]
-    async fn test_memory_handle_tracks_the_live_memtable() {
-        let schema = create_test_schema();
-        let mut memtable =
-            MemTable::with_capacity(schema.clone(), 1, vec![], CacheConfig::default(), 8).unwrap();
-
-        // Taken up front, before any of the rows it must account for exist.
-        let handle = memtable.bytes();
-        let empty = handle.row_bytes();
-        for _ in 0..3 {
-            memtable
-                .insert(create_test_batch(&schema, 10))
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            handle.row_bytes() > empty,
-            "a handle taken before the writes must still see them"
-        );
-        assert_eq!(
-            handle.row_bytes(),
-            memtable.bytes().row_bytes(),
-            "a handle and a freshly taken one must agree"
-        );
-        assert_eq!(
-            handle.index_bytes(),
-            0,
-            "an unindexed memtable holds no index heap"
-        );
-    }
 }

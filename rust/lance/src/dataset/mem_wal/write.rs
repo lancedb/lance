@@ -48,8 +48,8 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
-use super::memtable::MemTableBytes;
 use super::memtable::flush::TriggerMemTableFlush;
+use super::scanner::InMemoryMemTableRef;
 use super::observer::WalObserver;
 use super::scanner::SsTableWarmer;
 use super::wal::{
@@ -778,10 +778,30 @@ impl ShardMemory {
                 .load()
                 .active
                 .as_ref()
-                .map_or(0, MemTableBytes::resident_bytes),
+                .map_or(0, InMemoryMemTableRef::resident_bytes),
             ShardMemorySource::Queue(q) => q.queue_bytes(),
             #[cfg(test)]
             ShardMemorySource::Fake(f) => f(),
+        }
+    }
+
+    /// The part of [`Self::active_bytes`] held by the active memtable's
+    /// in-memory indexes (its PK bloom filter included). A **subset** of that
+    /// figure, not another term to add. `0` in WAL-only mode, which has none.
+    ///
+    /// Broken out because it does not behave like row data and is usually what
+    /// explains a shard near its ceiling with few rows in it: an HNSW graph is
+    /// pre-allocated in full on the first insert.
+    pub fn index_bytes(&self) -> usize {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => t
+                .load()
+                .active
+                .as_ref()
+                .map_or(0, InMemoryMemTableRef::index_bytes),
+            ShardMemorySource::Queue(_) => 0,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => 0,
         }
     }
 
@@ -790,7 +810,7 @@ impl ShardMemory {
     pub fn frozen_bytes(&self) -> usize {
         match &self.0 {
             ShardMemorySource::MemTables(t) => {
-                t.load().frozen.iter().map(MemTableBytes::resident_bytes).sum()
+                t.load().frozen.iter().map(InMemoryMemTableRef::resident_bytes).sum()
             }
             ShardMemorySource::Queue(_) => 0,
             #[cfg(test)]
@@ -810,11 +830,11 @@ impl ShardMemory {
                 tables
                     .active
                     .as_ref()
-                    .map_or(0, MemTableBytes::resident_bytes)
+                    .map_or(0, InMemoryMemTableRef::resident_bytes)
                     + tables
                         .frozen
                         .iter()
-                        .map(MemTableBytes::resident_bytes)
+                        .map(InMemoryMemTableRef::resident_bytes)
                         .sum::<usize>()
             }
             ShardMemorySource::Queue(q) => q.queue_bytes(),
@@ -1016,16 +1036,16 @@ struct FrozenMemTable {
 ///
 /// The handles stay live, so byte totals track a memtable that is still growing
 /// without anyone republishing.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ResidentMemTables {
     /// The active memtable, or `None` before the first publish.
-    active: Option<MemTableBytes>,
+    active: Option<InMemoryMemTableRef>,
     /// Sealed memtables whose flush has not committed — including any left
     /// resident by a *failed* flush, which are the ones most worth metering.
     /// Excludes flushed memtables still inside `frozen_memtable_grace`: those
     /// are reclaimable, and throttling on them would meter memory that is about
     /// to go away by itself.
-    frozen: Vec<MemTableBytes>,
+    frozen: Vec<InMemoryMemTableRef>,
     /// The oldest flush still outstanding — the frozen queue's front, else the
     /// active memtable's (it has a completion cell from construction, so this is
     /// always available). Published here rather than read through the writer
@@ -1044,12 +1064,12 @@ struct ResidentMemTables {
 /// computed on read.
 fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) {
     memory.store(Arc::new(ResidentMemTables {
-        active: Some(state.memtable.bytes()),
+        active: Some(in_memory_ref(&state.memtable)),
         frozen: state
             .frozen_memtables
             .iter()
             .filter(|frozen| frozen.flushed_at_ms.is_none())
-            .map(|frozen| frozen.memtable.bytes())
+            .map(|frozen| in_memory_ref(&frozen.memtable))
             .collect(),
         // Oldest first, so the front of the queue is what a waiter should park
         // on; with nothing frozen, the active memtable is what will flush next.
@@ -1084,11 +1104,15 @@ struct WriterState {
     last_wal_flush_trigger_time: u64,
 }
 
-/// Capture a point-in-time scan handle to one in-memory memtable (active
-/// or frozen — same shape). Shared by `active_memtable_ref` and
-/// `in_memory_memtable_refs` so both stamp identical fields.
-fn in_memory_ref(mt: &MemTable) -> crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
-    crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
+/// Capture a point-in-time handle to one in-memory memtable (active or frozen
+/// — same shape).
+///
+/// The single projection of a memtable in this crate: the read path scans
+/// through it, and [`ShardMemory`] sizes through it. Everything it holds is an
+/// `Arc` or a copy, so a handle is cheap and stays live as the memtable grows —
+/// which is what lets the memory view be read without the writer lock.
+fn in_memory_ref(mt: &MemTable) -> InMemoryMemTableRef {
+    InMemoryMemTableRef {
         batch_store: mt.batch_store(),
         index_store: mt
             .indexes_arc()
@@ -1299,7 +1323,7 @@ fn memtable_reached_flush_threshold(
     max_memtable_size: usize,
     incoming_batches: usize,
 ) -> bool {
-    memtable.bytes().row_bytes() >= max_memtable_size
+    memtable.batch_store().row_bytes() >= max_memtable_size
         || memtable.batch_store().remaining_capacity() < incoming_batches
 }
 
@@ -1645,7 +1669,7 @@ impl SharedWriterState {
         let threshold = self.config.max_wal_buffer_size;
 
         let batch_count = state.memtable.batch_count();
-        let total_bytes = state.memtable.bytes().row_bytes();
+        let total_bytes = state.memtable.batch_store().row_bytes();
         let batch_store = state.memtable.batch_store();
 
         // Check if there are any unflushed batches
@@ -2760,15 +2784,12 @@ impl ShardWriter {
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
-        let memory = state.memtable.bytes();
         let batch_store = state.memtable.batch_store();
         let durable = self.wal_flusher.durable();
         let pending_wal = batch_store.pending_wal_flush_stats(durable);
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
-            row_bytes: memory.row_bytes(),
-            index_bytes: memory.index_bytes(),
             generation: state.memtable.generation(),
             max_buffered_batch_position: batch_store.max_buffered_batch_position(),
             durable_batch_count: durable,
@@ -2779,12 +2800,6 @@ impl ShardWriter {
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
             frozen_count: state.frozen_memtables.len(),
-            frozen_bytes: state
-                .frozen_memtables
-                .iter()
-                .filter(|frozen| frozen.flushed_at_ms.is_none())
-                .map(|frozen| frozen.memtable.bytes().resident_bytes())
-                .sum(),
         })
     }
 
@@ -3185,22 +3200,17 @@ impl ShardWriter {
     }
 }
 
-/// MemTable statistics.
+/// MemTable statistics: rows, generation, and what the memtable still owes the
+/// WAL.
+///
+/// Deliberately carries **no byte totals**. [`ShardWriter::memory`] is the one
+/// way to ask what a shard is holding — it answers without the writer lock, and
+/// a second set of byte fields here would be a second implementation of the
+/// same filter and sum, free to disagree with the gate.
 #[derive(Debug, Clone)]
 pub struct MemTableStats {
     pub row_count: usize,
     pub batch_count: usize,
-    /// Row-data bytes of the active memtable — the flush unit, excluding index
-    /// memory. See [`MemTable::row_bytes`].
-    pub row_bytes: usize,
-    /// Heap bytes held by the active memtable's in-memory indexes; `0` when it
-    /// has none.
-    ///
-    /// Broken out from `row_bytes` because it is the term that explains an
-    /// indexed table's footprint, and it does not behave like row data: an HNSW
-    /// index pre-allocates its whole graph on the first insert, so this jumps to
-    /// its full value immediately and barely moves as rows arrive.
-    pub index_bytes: usize,
     pub generation: u64,
     pub max_buffered_batch_position: Option<usize>,
     /// Writer-global count of WAL-durable batches. Exclusive: 0 means none.
@@ -3217,15 +3227,6 @@ pub struct MemTableStats {
     /// Frozen memtables in the read view: sealed-awaiting-flush, plus flushed
     /// ones still inside `frozen_memtable_grace`.
     pub frozen_count: usize,
-    /// Resident heap bytes still owed to flush: frozen memtables awaiting a
-    /// first flush, plus any left resident by a failed one. Drains on flush
-    /// commit, so unlike `frozen_count` it excludes in-grace tables.
-    ///
-    /// `row_bytes + index_bytes + frozen_bytes` is **exactly** what backpressure
-    /// meters against `max_unflushed_memtable_bytes` — same memtables, same
-    /// filter, same accounting. A gate that disagreed with this gauge is the bug
-    /// this pairing exists to prevent.
-    pub frozen_bytes: usize,
 }
 
 /// WAL statistics.
@@ -5387,9 +5388,11 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// The two fields count different things on purpose: bytes drain on flush
-    /// commit, the handle lingers for `frozen_memtable_grace`. A long grace
-    /// therefore leaves count non-zero with bytes back at zero.
+    /// `MemTableStats::frozen_count` and `ShardMemory::frozen_bytes` count
+    /// different things on purpose: bytes drop on flush commit, the handle
+    /// lingers for `frozen_memtable_grace`. A long grace therefore leaves count
+    /// non-zero with bytes back at zero — and pins that the two surfaces are
+    /// answering different questions, not disagreeing about one.
     #[tokio::test]
     async fn test_memtable_stats_frozen_count_outlives_frozen_bytes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -5413,7 +5416,7 @@ mod tests {
 
         let fresh = writer.memtable_stats().await.unwrap();
         assert_eq!(fresh.frozen_count, 0);
-        assert_eq!(fresh.frozen_bytes, 0);
+        assert_eq!(writer.memory().frozen_bytes(), 0);
 
         for i in 0..20 {
             let batch = create_test_batch(&schema, i * 10, 10);
@@ -5427,7 +5430,8 @@ mod tests {
             "flushed memtables must stay in the read view for the grace window"
         );
         assert_eq!(
-            stats.frozen_bytes, 0,
+            writer.memory().frozen_bytes(),
+            0,
             "every seal flushed, so nothing is owed to flush"
         );
 
@@ -5924,6 +5928,235 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Recompute what the shard is holding straight from `WriterState`, the
+    /// way [`ShardWriter::memtable_stats`] reads it — independent of the
+    /// publish mechanism, which is the thing that can drift.
+    async fn ground_truth(writer: &ShardWriter) -> (usize, usize) {
+        let state = writer.memtable_state_lock().unwrap().read().await;
+        let active = in_memory_ref(&state.memtable).resident_bytes();
+        let frozen = state
+            .frozen_memtables
+            .iter()
+            .filter(|frozen| frozen.flushed_at_ms.is_none())
+            .map(|frozen| in_memory_ref(&frozen.memtable).resident_bytes())
+            .sum();
+        (active, frozen)
+    }
+
+    async fn assert_no_drift(writer: &ShardWriter, after: &str) {
+        let (active, frozen) = ground_truth(writer).await;
+        let memory = writer.memory();
+        assert_eq!(
+            (memory.active_bytes(), memory.frozen_bytes()),
+            (active, frozen),
+            "published memory drifted from the writer state after {after}"
+        );
+        assert_eq!(
+            memory.unflushed_bytes(),
+            active + frozen,
+            "unflushed must be the sum of the two terms after {after}"
+        );
+    }
+
+    /// The keystone invariant: the published snapshot is **derived** from
+    /// `WriterState`, never adjusted, so it cannot drift from it — across every
+    /// event that changes the memtable set.
+    ///
+    /// This is what replaced a pair of incremented counters. A counter has no
+    /// way back: one missed decrement is permanent, and the pod eventually
+    /// refuses every write with a memtable that reads empty. So this walks the
+    /// writer through open, puts, a seal, a flush commit, and puts into the
+    /// fresh memtable, checking the invariant after each.
+    #[rstest]
+    #[case::grace_keeps_handles(Duration::from_secs(600))]
+    #[case::zero_grace_evicts_on_commit(Duration::ZERO)]
+    #[tokio::test]
+    async fn test_memory_snapshot_never_drifts_from_writer_state(#[case] grace: Duration) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            // Small enough that the loop below seals several times.
+            max_memtable_size: 2048,
+            frozen_memtable_grace: grace,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        // Seeded at open, before anything has been written.
+        assert_no_drift(&writer, "open").await;
+
+        for i in 0..24 {
+            writer
+                .put(vec![create_test_batch(&schema, i * 10, 10)])
+                .await
+                .unwrap();
+            assert_no_drift(&writer, &format!("put {i}")).await;
+        }
+
+        // Seals happened above; make sure at least one did, or this test proves
+        // nothing about the freeze path.
+        assert!(
+            writer.memory().frozen_bytes() > 0 || writer.memtable_stats().await.unwrap().frozen_count > 0,
+            "the loop must have sealed at least once for this to cover freeze"
+        );
+
+        writer.wait_for_flush_drain().await.unwrap();
+        assert_no_drift(&writer, "flush drain").await;
+
+        // A long grace keeps the flushed handles in the read view and a zero
+        // grace evicts them on commit — two different publish paths. Either way
+        // they are reclaimable, so neither may keep metering.
+        assert_eq!(
+            writer.memory().frozen_bytes(),
+            0,
+            "flushed memtables are reclaimable and must stop metering (grace {grace:?})"
+        );
+
+        for i in 24..32 {
+            writer
+                .put(vec![create_test_batch(&schema, i * 10, 10)])
+                .await
+                .unwrap();
+            assert_no_drift(&writer, &format!("post-flush put {i}")).await;
+        }
+
+        writer.close().await.unwrap();
+    }
+
+    /// The bug the whole design exists to avoid: the old accounting read
+    /// `WriterState` through `try_read()`, which fails while a writer holds the
+    /// lock — and, because tokio's `RwLock` is write-preferring, also while one
+    /// is merely queued. It therefore reported **zero** on exactly the shards
+    /// taking writes, so a pod under load looked empty.
+    ///
+    /// Holding the write lock outright is the deterministic version of that
+    /// race.
+    #[tokio::test]
+    async fn test_memory_is_readable_while_a_writer_holds_the_lock() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                durable_write: false,
+                ..Default::default()
+            },
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 100)])
+            .await
+            .unwrap();
+        let unlocked = writer.memory().unflushed_bytes();
+        assert!(unlocked > 0, "rows are resident, so this cannot be zero");
+
+        let state_lock = writer.memtable_state_lock().unwrap().clone();
+        let held = state_lock.write().await;
+        assert_eq!(
+            writer.memory().unflushed_bytes(),
+            unlocked,
+            "a writer holding the lock must not zero the memory view"
+        );
+        assert!(
+            writer.memory().flush_watcher().is_some(),
+            "the flush watcher is published too, so it is readable under the lock"
+        );
+        drop(held);
+
+        writer.close().await.unwrap();
+    }
+
+    /// Two seal predicates exist — `MemTable::should_flush` and
+    /// `memtable_reached_flush_threshold` — and their byte arms must trip at the
+    /// same byte. They did not: one counted the PK bloom filter and the other
+    /// did not, so they disagreed by a fixed offset on every memtable.
+    #[tokio::test]
+    async fn test_both_seal_predicates_share_one_byte_arm() {
+        let schema = create_test_schema();
+        let mut memtable =
+            MemTable::with_capacity(schema.clone(), 1, vec![], CacheConfig::default(), 64).unwrap();
+        memtable
+            .insert(create_test_batch(&schema, 0, 50))
+            .await
+            .unwrap();
+
+        let at = memtable.batch_store().row_bytes();
+        assert!(at > 0, "the memtable must hold something to be a test");
+        // `incoming_batches` of 1 against a capacity of 64 keeps the batch-count
+        // arm out of it, so only the byte arms are being compared.
+        for (bytes, expected) in [(at, true), (at + 1, false)] {
+            assert_eq!(
+                memtable.should_flush(bytes),
+                expected,
+                "should_flush at {bytes}"
+            );
+            assert_eq!(
+                memtable_reached_flush_threshold(&memtable, bytes, 1),
+                expected,
+                "the two seal predicates disagree at {bytes}; a bloom-sized offset \
+                 between them makes every memtable seal early on one path"
+            );
+        }
+    }
+
+    /// A handle taken before any rows exist must still see them arrive: the
+    /// memory view is read without the writer lock, so a handle that captured a
+    /// value instead of a live counter would gate writes on a stale reading.
+    /// Index heap is counted, row bytes are not inflated by it.
+    #[tokio::test]
+    async fn test_memory_handle_tracks_the_live_memtable() {
+        let schema = create_test_schema();
+        let mut memtable =
+            MemTable::with_capacity(schema.clone(), 1, vec![], CacheConfig::default(), 8).unwrap();
+
+        let handle = in_memory_ref(&memtable);
+        let empty_rows = handle.row_bytes();
+        for _ in 0..3 {
+            memtable
+                .insert(create_test_batch(&schema, 0, 10))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            handle.row_bytes() > empty_rows,
+            "a handle taken before the writes must still see them"
+        );
+        assert_eq!(
+            handle.row_bytes(),
+            in_memory_ref(&memtable).row_bytes(),
+            "a handle and a freshly taken one must agree"
+        );
+        // The bloom filter is fixed-size and lives in the index term, so it
+        // never moves the flush unit.
+        assert_eq!(
+            handle.row_bytes(),
+            memtable.batch_store().row_bytes(),
+            "row bytes are the flush unit: batches only"
+        );
+        assert_eq!(
+            handle.index_bytes(),
+            super::super::memtable::pk_bloom_filter_bytes(),
+            "an unindexed memtable still holds its PK bloom filter"
+        );
+        assert_eq!(
+            handle.resident_bytes(),
+            handle.row_bytes() + handle.index_bytes()
+        );
     }
 
     /// A `ShardMemory` backed by a closure instead of a live writer, re-read on
@@ -8421,16 +8654,16 @@ mod tests {
         );
         assert_eq!(refs.active.generation, initial_gen + 1);
 
-        // Nor did it vanish from the stats. Backpressure released these bytes on
-        // flush completion so the failure cannot wedge writes, but the memtable
-        // is still resident, and this snapshot is what an operator reads to
-        // decide whether to evict the shard.
+        // Nor did it vanish from the accounting. A failed flush leaves its
+        // memtable un-stamped, so it stays in the owed-to-flush set and keeps
+        // metering — those bytes are resident and only another flush reclaims
+        // them. This is also what an operator reads to decide whether to evict.
         let stats = writer_a.memtable_stats().await.unwrap();
         assert_eq!(stats.frozen_count, 1);
+        let frozen_bytes = writer_a.memory().frozen_bytes();
         assert!(
-            stats.frozen_bytes >= refs.frozen[0].batch_store.row_bytes(),
-            "a failed flush must keep owing its resident bytes, got {}",
-            stats.frozen_bytes
+            frozen_bytes >= refs.frozen[0].batch_store.row_bytes(),
+            "a failed flush must keep owing its resident bytes, got {frozen_bytes}"
         );
 
         writer_b.close().await.unwrap();
