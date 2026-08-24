@@ -142,6 +142,7 @@ impl ObjectStoreProvider for TosStoreProvider {
         Ok(ObjectStore {
             scheme: "tos".to_string(),
             inner,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
