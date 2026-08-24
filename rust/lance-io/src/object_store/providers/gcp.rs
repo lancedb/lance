@@ -7,7 +7,6 @@ use object_store::{
     ClientOptions, CredentialProvider, ObjectStore as OSObjectStore, Result as ObjectStoreResult,
     client::{HttpClient, HttpConnector, HttpRequestBody, ReqwestConnector},
 };
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Gcs};
 use reqsign_core::{Context as ReqsignContext, HttpSend, OsEnv, ProvideCredential};
 use reqsign_file_read_tokio::TokioFileRead;
@@ -20,6 +19,7 @@ use object_store::{
 };
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
