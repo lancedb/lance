@@ -63,18 +63,59 @@ pub struct RowDatasetVersionSequence {
 ///
 /// The cursor caches the current run length. Readers normally request adjacent
 /// batches, so this avoids rebuilding all run offsets and rescanning the run
-/// prefix for every batch. A backwards selection rewinds the cursor.
+/// prefix for every batch. A backwards selection uses a lazily built run
+/// offset index to seek without rescanning the prefix.
 #[derive(Debug, Default)]
 pub(crate) struct RowDatasetVersionCursor {
     run_index: usize,
     offset_in_run: usize,
     position: usize,
     run_len: Option<usize>,
+    run_offsets: Option<Vec<usize>>,
+    indexed_total_len: usize,
 }
 
 impl RowDatasetVersionCursor {
-    fn reset(&mut self) {
-        *self = Self::default();
+    fn seek_backwards(
+        &mut self,
+        sequence: &RowDatasetVersionSequence,
+        position: usize,
+    ) -> Result<()> {
+        if self.run_offsets.is_none() {
+            let mut total_len = 0;
+            let run_offsets = sequence
+                .runs
+                .iter()
+                .map(|run| {
+                    let offset = total_len;
+                    total_len += run.len();
+                    offset
+                })
+                .collect();
+            self.run_offsets = Some(run_offsets);
+            self.indexed_total_len = total_len;
+        }
+
+        if position >= self.indexed_total_len {
+            return Err(Error::internal(format!(
+                "version column position {} out of range (total_len={})",
+                position, self.indexed_total_len
+            )));
+        }
+
+        let run_offsets = self.run_offsets.as_ref().unwrap();
+        let mut run_index = match run_offsets.binary_search(&position) {
+            Ok(run_index) => run_index,
+            Err(run_index) => run_index - 1,
+        };
+        while run_index + 1 < run_offsets.len() && run_offsets[run_index + 1] <= position {
+            run_index += 1;
+        }
+        self.run_index = run_index;
+        self.offset_in_run = position - run_offsets[run_index];
+        self.position = position;
+        self.run_len = None;
+        Ok(())
     }
 
     fn current_run<'a>(
@@ -109,7 +150,7 @@ impl RowDatasetVersionCursor {
             return Ok(());
         }
         if selection.start < self.position {
-            self.reset();
+            self.seek_backwards(sequence, selection.start)?;
         }
 
         while self.position < selection.start {
@@ -834,6 +875,30 @@ mod tests {
 
         cursor.extend_range(&seq, 6..6, &mut actual).unwrap();
         assert_eq!(actual, expected[1..6]);
+    }
+
+    #[test]
+    fn test_version_cursor_descending_ranges_use_indexed_seek() {
+        const RUNS: usize = 10_000;
+        let seq = RowDatasetVersionSequence {
+            runs: (0..RUNS)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position as u64..position as u64 + 1),
+                    version: position as u64,
+                })
+                .collect(),
+        };
+        let mut cursor = seq.cursor();
+        let mut actual = Vec::with_capacity(RUNS);
+
+        for position in (0..RUNS).rev() {
+            cursor
+                .extend_range(&seq, position..position + 1, &mut actual)
+                .unwrap();
+        }
+
+        assert_eq!(actual, (0..RUNS as u64).rev().collect::<Vec<_>>());
+        assert_eq!(cursor.run_offsets.as_ref().unwrap().len(), RUNS);
     }
 
     #[test]
