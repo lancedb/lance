@@ -9,7 +9,6 @@ use std::{
 };
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
@@ -18,6 +17,7 @@ use object_store::{
 };
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
@@ -288,6 +288,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            local_dir_operations: None,
             scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
