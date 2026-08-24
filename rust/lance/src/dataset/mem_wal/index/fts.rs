@@ -1184,11 +1184,15 @@ impl FtsMemIndex {
 
     /// Estimated bytes of heap memory held by this index.
     ///
-    /// Walks every tail term. Prefer [`Self::resident_bytes`] on the write path.
+    /// Walks every tail term. Prefer `resident_bytes` on the write path.
     pub fn resident_bytes_exact(&self) -> usize {
         let st = self.state.load_full();
         let mut total = std::mem::size_of::<Self>();
-        total += st.partitions.iter().map(|p| p.resident_bytes()).sum::<usize>();
+        total += st
+            .partitions
+            .iter()
+            .map(|p| p.resident_bytes())
+            .sum::<usize>();
         total += st.tail.resident_bytes();
         total
     }
@@ -1199,7 +1203,10 @@ impl FtsMemIndex {
     pub(crate) fn resident_bytes(&self) -> usize {
         let st = self.state.load();
         std::mem::size_of::<Self>()
-            + st.partitions.iter().map(|p| p.resident_bytes()).sum::<usize>()
+            + st.partitions
+                .iter()
+                .map(|p| p.resident_bytes())
+                .sum::<usize>()
             + st.tail.resident_bytes_cached()
     }
 

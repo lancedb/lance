@@ -1261,10 +1261,14 @@ impl IndexStore {
     /// `MemTable::row_bytes` deliberately omits this — it sizes the flush
     /// unit, which is row data. Callers budgeting *resident* memory must add it:
     /// a configured HNSW index pre-allocates its whole graph on the first insert
-    /// (see [`HnswMemIndex::resident_bytes`]), so it can dwarf a memtable's row
+    /// (see `HnswMemIndex::resident_bytes`), so it can dwarf a memtable's row
     /// bytes while `row_bytes` still reads near zero.
     pub fn resident_bytes(&self) -> usize {
-        let btrees: usize = self.btree_indexes.values().map(|b| b.resident_bytes()).sum();
+        let btrees: usize = self
+            .btree_indexes
+            .values()
+            .map(|b| b.resident_bytes())
+            .sum();
         let hnsw: usize = self.hnsw_indexes.values().map(|h| h.resident_bytes()).sum();
         let fts: usize = self.fts_indexes.values().map(|f| f.resident_bytes()).sum();
         // A `Single` PK aliases a `btree_indexes` entry, already counted above.

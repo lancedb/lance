@@ -1109,5 +1109,4 @@ mod tests {
         // Now full
         assert!(memtable.should_flush(1024 * 1024));
     }
-
 }

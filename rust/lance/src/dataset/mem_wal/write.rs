@@ -49,8 +49,8 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
-use super::scanner::InMemoryMemTableRef;
 use super::observer::WalObserver;
+use super::scanner::InMemoryMemTableRef;
 use super::scanner::SsTableWarmer;
 use super::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
@@ -785,6 +785,22 @@ impl ShardMemory {
         }
     }
 
+    /// Row-data bytes of the active memtable: [`Self::active_bytes`] minus
+    /// [`Self::index_bytes`], but taken off one load so the two terms cannot
+    /// cross. In WAL-only mode, the pending queue's bytes.
+    pub fn row_bytes(&self) -> usize {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => t
+                .load()
+                .active
+                .as_ref()
+                .map_or(0, InMemoryMemTableRef::row_bytes),
+            ShardMemorySource::Queue(q) => q.queue_bytes(),
+            #[cfg(test)]
+            ShardMemorySource::Fake(f) => f(),
+        }
+    }
+
     /// The part of [`Self::active_bytes`] held by the active memtable's
     /// in-memory indexes (its PK bloom filter included). A **subset** of that
     /// figure, not another term to add. `0` in WAL-only mode, which has none.
@@ -809,9 +825,12 @@ impl ShardMemory {
     /// Always `0` in WAL-only mode.
     pub fn frozen_bytes(&self) -> usize {
         match &self.0 {
-            ShardMemorySource::MemTables(t) => {
-                t.load().frozen.iter().map(InMemoryMemTableRef::resident_bytes).sum()
-            }
+            ShardMemorySource::MemTables(t) => t
+                .load()
+                .frozen
+                .iter()
+                .map(InMemoryMemTableRef::resident_bytes)
+                .sum(),
             ShardMemorySource::Queue(_) => 0,
             #[cfg(test)]
             ShardMemorySource::Fake(_) => 0,
@@ -4102,10 +4121,10 @@ mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
-    use std::sync::atomic::AtomicUsize;
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
     use rstest::rstest;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -6003,7 +6022,8 @@ mod tests {
         // Seals happened above; make sure at least one did, or this test proves
         // nothing about the freeze path.
         assert!(
-            writer.memory().frozen_bytes() > 0 || writer.memtable_stats().await.unwrap().frozen_count > 0,
+            writer.memory().frozen_bytes() > 0
+                || writer.memtable_stats().await.unwrap().frozen_count > 0,
             "the loop must have sealed at least once for this to cover freeze"
         );
 
@@ -6208,10 +6228,7 @@ mod tests {
             1000usize.saturating_sub(count * 400)
         });
 
-        controller
-            .maybe_apply_backpressure(draining)
-            .await
-            .unwrap();
+        controller.maybe_apply_backpressure(draining).await.unwrap();
 
         // Should have read the shard 4 times (initial + 3 waits until under 100)
         assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 4);

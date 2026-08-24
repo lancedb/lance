@@ -272,12 +272,16 @@ fn inner_memtable_stats<'local>(
     env: &mut JNIEnv<'local>,
     this: JObject<'local>,
 ) -> Result<JObject<'local>> {
-    let stats = {
+    let (stats, row_bytes) = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-        block_on(guard.writer.memtable_stats())?
+        // Byte totals live on `memory()` now, not on `MemTableStats`.
+        (
+            block_on(guard.writer.memtable_stats())?,
+            guard.writer.memory().row_bytes(),
+        )
     };
-    memtable_stats_to_java(env, &stats)
+    memtable_stats_to_java(env, &stats, row_bytes)
 }
 
 #[unsafe(no_mangle)]
@@ -1355,7 +1359,11 @@ fn write_stats_to_java<'a>(
     )?)
 }
 
-fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Result<JObject<'a>> {
+fn memtable_stats_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    stats: &MemTableStats,
+    row_bytes: usize,
+) -> Result<JObject<'a>> {
     let max_buffered = box_u64_opt(env, stats.max_buffered_batch_position)?;
     let pending_start = box_u64_opt(env, stats.pending_wal_start_batch_position)?;
     let pending_end = box_u64_opt(env, stats.pending_wal_end_batch_position)?;
@@ -1365,7 +1373,7 @@ fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Re
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
-            JValueGen::Long(stats.estimated_size as i64),
+            JValueGen::Long(row_bytes as i64),
             JValueGen::Long(stats.generation as i64),
             JValueGen::Object(&max_buffered),
             JValueGen::Long(stats.durable_batch_count as i64),
