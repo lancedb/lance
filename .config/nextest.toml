@@ -1,0 +1,13 @@
+[profile.default]
+# Several workspace tests legitimately need multiple minutes on slower runners. This still
+# prevents a single stuck process from consuming the Rust job's entire 75-minute timeout.
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+[test-groups]
+io-uring = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Each nextest case is a separate process with its own large rings. Running the io_uring
+# cases together can exhaust per-runner kernel resources while their workers initialize.
+filter = 'package(lance-io) & test(uring::tests::)'
+test-group = 'io-uring'

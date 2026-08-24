@@ -3,9 +3,13 @@
 
 //! Tests for io_uring reader implementation.
 
+use super::requests::{IoRequest, RequestState};
+use super::thread::{start_uring_threads, submit_request_to};
 use crate::object_store::ObjectStore;
+use bytes::BytesMut;
 use lance_core::Result;
-use std::io::Write;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -16,6 +20,34 @@ fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
     file.write_all(&data)?;
     file.flush()?;
     Ok((file, data))
+}
+
+#[test]
+fn test_failed_uring_initialization_is_not_published() {
+    let threads = start_uring_threads(2, 16, || {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "io_uring unavailable for test",
+        ))
+    });
+    let request = Arc::new(IoRequest {
+        fd: -1,
+        offset: 0,
+        length: 1,
+        thread_id: std::thread::current().id(),
+        state: Mutex::new(RequestState {
+            completed: false,
+            waker: None,
+            err: None,
+            buffer: BytesMut::zeroed(1),
+            bytes_read: 0,
+        }),
+    });
+
+    let err = submit_request_to(request, &threads).expect_err("empty pool must reject requests");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("no initialized io_uring workers"));
+    assert!(err.to_string().contains("io_uring unavailable for test"));
 }
 
 #[tokio::test]

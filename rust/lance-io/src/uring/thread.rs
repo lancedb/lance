@@ -21,40 +21,80 @@ use std::time::{Duration, Instant};
 ///
 /// This provides a channel sender for submitting read requests to the thread.
 pub(super) struct UringThreadHandle {
-    pub request_tx: SyncSender<Arc<IoRequest>>,
+    request_tx: SyncSender<Arc<IoRequest>>,
+}
+
+pub(super) struct UringThreadPool {
+    threads: Vec<UringThreadHandle>,
+    last_startup_error: Option<io::Error>,
 }
 
 /// Lazy-initialized io_uring thread pool.
 ///
 /// Multiple threads are spawned on first access and run until process exit.
-pub(super) static URING_THREADS: LazyLock<Vec<UringThreadHandle>> = LazyLock::new(|| {
+static URING_THREADS: LazyLock<UringThreadPool> = LazyLock::new(|| {
     let queue_depth = get_queue_depth();
     let thread_count = get_thread_count();
 
-    let mut threads = Vec::with_capacity(thread_count);
+    start_uring_threads(thread_count, queue_depth, || {
+        IoUring::builder()
+            // .setup_sqpoll(100)
+            .build(queue_depth as u32)
+    })
+});
 
-    for i in 0..thread_count {
+/// Initialize io_uring instances before publishing their worker handles.
+///
+/// A worker whose ring cannot be initialized must never become selectable. Otherwise,
+/// a request can be queued before the worker exits and remain pending indefinitely.
+pub(super) fn start_uring_threads<F>(
+    thread_count: usize,
+    queue_depth: usize,
+    mut create_ring: F,
+) -> UringThreadPool
+where
+    F: FnMut() -> io::Result<IoUring>,
+{
+    let mut threads = Vec::with_capacity(thread_count);
+    let mut last_startup_error = None;
+
+    for thread_id in 0..thread_count {
+        let ring = match create_ring() {
+            Ok(ring) => ring,
+            Err(err) => {
+                log::warn!("Failed to initialize io_uring worker {thread_id}: {err}");
+                last_startup_error = Some(err);
+                continue;
+            }
+        };
         let (tx, rx) = sync_channel(queue_depth);
 
-        std::thread::Builder::new()
-            .name(format!("lance-uring-{}", i))
-            .spawn(move || run_uring_thread(rx, queue_depth, i))
-            .expect("Failed to spawn io_uring thread");
-
-        threads.push(UringThreadHandle { request_tx: tx });
+        match std::thread::Builder::new()
+            .name(format!("lance-uring-{thread_id}"))
+            .spawn(move || run_uring_thread(rx, ring, queue_depth, thread_id))
+        {
+            Ok(_) => threads.push(UringThreadHandle { request_tx: tx }),
+            Err(err) => {
+                log::warn!("Failed to spawn io_uring worker {thread_id}: {err}");
+                last_startup_error = Some(err);
+            }
+        }
     }
 
     log::info!(
         "io_uring thread pool spawned ({} threads, queue_depth={})",
-        thread_count,
+        threads.len(),
         queue_depth
     );
 
-    threads
-});
+    UringThreadPool {
+        threads,
+        last_startup_error,
+    }
+}
 
 /// Atomic counter for round-robin thread selection.
-pub(super) static THREAD_SELECTOR: AtomicU64 = AtomicU64::new(0);
+static THREAD_SELECTOR: AtomicU64 = AtomicU64::new(0);
 
 /// Counter for generating unique user_data values.
 ///
@@ -65,7 +105,49 @@ static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Counter for requests that have been submitted to the thread but not yet received.
 ///
 /// This tracks requests sitting in the channel queue waiting to be received by the thread.
-pub(super) static SUBMITTED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SUBMITTED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Submit a request to an initialized worker.
+pub(super) fn submit_request(request: Arc<IoRequest>) -> io::Result<()> {
+    submit_request_to(request, &URING_THREADS)
+}
+
+/// Submit a request to a specific worker pool.
+///
+/// Kept separate from [`submit_request`] so initialization-failure behavior can be
+/// tested without initializing the process-wide pool.
+pub(super) fn submit_request_to(request: Arc<IoRequest>, pool: &UringThreadPool) -> io::Result<()> {
+    if pool.threads.is_empty() {
+        if let Some(startup_error) = &pool.last_startup_error {
+            return Err(io::Error::new(
+                startup_error.kind(),
+                format!("no initialized io_uring workers are available: {startup_error}"),
+            ));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no io_uring workers were configured",
+        ));
+    }
+
+    let selection = THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed);
+    let thread_idx = (selection % pool.threads.len() as u64) as usize;
+
+    SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if pool.threads[thread_idx]
+        .request_tx
+        .send(Arc::clone(&request))
+        .is_err()
+    {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "io_uring worker stopped before accepting request",
+        ));
+    }
+
+    Ok(())
+}
 
 /// Default batch size for submission - how many requests to batch before calling submit().
 const DEFAULT_SUBMIT_BATCH_SIZE: usize = 128;
@@ -114,13 +196,12 @@ fn get_thread_count() -> usize {
 /// 2. Submits them to io_uring
 /// 3. Processes completions
 /// 4. Wakes futures via their wakers
-fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, thread_id: usize) {
-    // Create local io_uring instance
-    let mut ring = IoUring::builder()
-        // .setup_sqpoll(100)
-        .build(queue_depth as u32)
-        .expect("Failed to create io_uring");
-
+fn run_uring_thread(
+    request_rx: Receiver<Arc<IoRequest>>,
+    mut ring: IoUring,
+    queue_depth: usize,
+    thread_id: usize,
+) {
     let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::with_capacity(queue_depth);
     let poll_timeout = get_poll_timeout();
     let submit_batch_size = get_submit_batch_size();
