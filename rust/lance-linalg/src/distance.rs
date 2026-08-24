@@ -500,6 +500,8 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
+    use std::io::Write;
     use std::sync::Arc;
 
     use arrow_array::types::{Float16Type, Float32Type, Int8Type};
@@ -507,6 +509,25 @@ mod tests {
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::Field;
     use half::f16;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_x86_runtime_feature_report() {
+        // Write directly to stderr so this remains visible when libtest captures
+        // ordinary output from passing tests.
+        writeln!(
+            std::io::stderr().lock(),
+            "lance-linalg x86 runtime features: avx={}, fma={}, avx2={}, avx512f={}, avx512bw={}, avx512vnni={}, avx512vpopcntdq={}",
+            std::is_x86_feature_detected!("avx"),
+            std::is_x86_feature_detected!("fma"),
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("avx512f"),
+            std::is_x86_feature_detected!("avx512bw"),
+            std::is_x86_feature_detected!("avx512vnni"),
+            std::is_x86_feature_detected!("avx512vpopcntdq"),
+        )
+        .expect("write x86 runtime feature report");
+    }
 
     /// Build a single-row `List<FixedSizeList<T, dim>>` holding one sub-vector.
     fn multivec_of<T: ArrowPrimitiveType>(values: Vec<T::Native>, dim: i32) -> ListArray {
