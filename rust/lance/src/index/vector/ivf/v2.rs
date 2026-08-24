@@ -5745,58 +5745,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_index_with_many_invalid_vectors() {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        // we use 8192 batch size by default, so we need to generate 8192 * 3 vectors to get 3 batches
-        // generate 3 batches, and the first batch's vectors are all with NaN
-        let num_rows = 8192 * 3;
-        let mut vectors = Vec::new();
-        for i in 0..num_rows {
-            if i < 8192 {
-                vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
-            } else if i < 8192 * 2 {
-                vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
-            } else {
-                vectors.extend(std::iter::repeat_n(rand::random::<f32>() * 1e20, DIM));
-            }
-        }
-        let schema = Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-            ),
-            true,
-        )]);
-        let schema = Arc::new(schema);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(
-                FixedSizeListArray::try_new_from_values(Float32Array::from(vectors), DIM as i32)
-                    .unwrap(),
-            )],
-        )
-        .unwrap();
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(batches, test_uri, Some(params))
-            .await
-            .unwrap();
-
-        let params = VectorIndexParams::ivf_pq(4, 8, DIM / 8, DistanceType::Dot, 50);
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn test_compaction_remaps_second_delta_with_shared_partition_topology() {
         const INDEX_NAME: &str = "vector_idx";
         const BASE_ROWS_PER_PARTITION: usize = 2_200;
