@@ -345,12 +345,22 @@ impl RowIdAndDeletesConfig {
     }
 }
 
-#[instrument(level = "debug", skip_all)]
 pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
+) -> Result<RecordBatch> {
+    apply_row_id_and_deletes_with_row_ids(batch, batch_offset, fragment_id, config, None)
+}
+
+#[instrument(name = "apply_row_id_and_deletes", level = "debug", skip_all)]
+fn apply_row_id_and_deletes_with_row_ids(
+    batch: RecordBatch,
+    batch_offset: u32,
+    fragment_id: u32,
+    config: &RowIdAndDeletesConfig,
+    precomputed_row_ids: Option<Arc<UInt64Array>>,
 ) -> Result<RecordBatch> {
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
@@ -391,7 +401,10 @@ pub fn apply_row_id_and_deletes(
 
     let row_ids = if config.with_row_id {
         let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
-        if let Some(row_id_sequence) = &config.row_id_sequence {
+        if let Some(row_ids) = precomputed_row_ids {
+            debug_assert_eq!(row_ids.len(), num_rows as usize);
+            Some(row_ids)
+        } else if let Some(row_id_sequence) = &config.row_id_sequence {
             let selection = config
                 .params
                 .slice(batch_offset as usize, num_rows as usize)
@@ -494,6 +507,11 @@ pub fn wrap_with_row_id_and_delete(
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
+    let mut row_id_cursor = config
+        .row_id_sequence
+        .as_ref()
+        .filter(|_| config.with_row_id)
+        .map(|sequence| sequence.cursor());
     let mut offset = 0;
     stream
         .map(move |batch_task| {
@@ -501,10 +519,47 @@ pub fn wrap_with_row_id_and_delete(
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
+            // Materialize row ids while polling the ordered task stream. Batch
+            // futures may complete concurrently, so doing this inside the
+            // future would require locking the shared cursor or would reorder
+            // its accesses.
+            let row_ids = config.row_id_sequence.as_ref().and_then(|sequence| {
+                row_id_cursor.as_mut().map(|cursor| {
+                    let selection = config
+                        .params
+                        .slice(this_offset as usize, num_rows as usize)
+                        .unwrap()
+                        .to_ranges()
+                        .unwrap();
+                    let values = match selection.as_slice() {
+                        [range] => UInt64Array::from(sequence.select_range_with_cursor(
+                            cursor,
+                            range.start as usize..range.end as usize,
+                        )),
+                        _ => UInt64Array::from(
+                            sequence
+                                .select_with_cursor(
+                                    cursor,
+                                    selection
+                                        .iter()
+                                        .flat_map(|range| range.start as usize..range.end as usize),
+                                )
+                                .collect::<Vec<_>>(),
+                        ),
+                    };
+                    Arc::new(values)
+                })
+            });
             batch_task
                 .task
                 .map(move |batch| {
-                    apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
+                    apply_row_id_and_deletes_with_row_ids(
+                        batch?,
+                        this_offset,
+                        fragment_id,
+                        config.as_ref(),
+                        row_ids,
+                    )
                 })
                 .boxed()
         })
@@ -530,7 +585,7 @@ mod tests {
     use lance_io::{ReadBatchParams, stream::arrow_stream_to_lance_stream};
     use roaring::RoaringBitmap;
 
-    use crate::utils::stream::ReadBatchTask;
+    use crate::{rowids::RowIdSequence, utils::stream::ReadBatchTask};
 
     use super::RowIdAndDeletesConfig;
 
@@ -574,6 +629,133 @@ mod tests {
             .collect::<Result<Vec<_>, ArrowError>>()
             .unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_ids_across_concurrent_batches_and_deletes() {
+        let expected = (10_000..120_000)
+            .filter(|row_id| row_id % 13 != 0)
+            .collect::<Vec<u64>>();
+        let row_id_sequence = Arc::new(RowIdSequence::try_from_iter(expected.clone()).unwrap());
+        let deletion_offsets = (0..expected.len() as u32).step_by(997).collect::<Vec<_>>();
+        let deletion_vector = Some(Arc::new(DeletionVector::Bitmap(
+            deletion_offsets.iter().copied().collect(),
+        )));
+
+        let batches = expected
+            .chunks(257)
+            .map(|chunk| arrow_array::record_batch!(("x", Int32, vec![0; chunk.len()])).unwrap())
+            .map(Ok)
+            .collect::<Vec<std::result::Result<RecordBatch, ArrowError>>>();
+        let data = batch_task_stream(stream::iter(batches).boxed());
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: true,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector,
+            row_id_sequence: Some(row_id_sequence),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: expected.len() as u32,
+        };
+
+        let batches = super::wrap_with_row_id_and_delete(data, 7, config)
+            .buffered(8)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual_row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        let actual_row_addrs = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[lance_core::ROW_ADDR]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let expected_survivors = expected
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| deletion_offsets.binary_search(&(*offset as u32)).is_err())
+            .map(|(offset, row_id)| {
+                (
+                    *row_id,
+                    u64::from(RowAddress::new_from_parts(7, offset as u32)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual_row_ids,
+            expected_survivors
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual_row_addrs,
+            expected_survivors
+                .iter()
+                .map(|(_, row_addr)| *row_addr)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_ids_with_unsorted_indices() {
+        let expected = (100..140)
+            .filter(|row_id| row_id % 3 != 0)
+            .collect::<Vec<u64>>();
+        let indices = UInt32Array::from(vec![8, 2, 9, 1, 6]);
+        let batches = [2, 2, 1].into_iter().map(|num_rows| ReadBatchTask {
+            num_rows,
+            task: std::future::ready(Ok(arrow_array::record_batch!((
+                "x",
+                Int32,
+                vec![0; num_rows as usize]
+            ))
+            .unwrap()))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(indices.clone()),
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(
+                RowIdSequence::try_from_iter(expected.clone()).unwrap(),
+            )),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: expected.len() as u32,
+        };
+
+        let actual = super::wrap_with_row_id_and_delete(stream::iter(batches).boxed(), 7, config)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = indices
+            .values()
+            .iter()
+            .map(|index| expected[*index as usize])
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
