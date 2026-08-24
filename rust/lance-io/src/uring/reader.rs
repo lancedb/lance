@@ -5,7 +5,7 @@
 
 use super::future::UringReadFuture;
 use super::requests::IoRequest;
-use super::thread::{SUBMITTED_COUNTER, THREAD_SELECTOR, URING_THREADS};
+use super::thread::{QueuedRequest, THREAD_SELECTOR, URING_THREADS};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
@@ -238,36 +238,21 @@ impl UringReader {
             });
         }
 
-        // Increment submitted counter before sending to channel
-        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
-
         // Send to selected thread via channel
-        match thread.request_tx.send(Arc::clone(&request)) {
-            Ok(()) => {
-                // The worker may have shut down after the pre-send liveness
-                // check but before accepting this request from the channel.
-                if !thread.is_alive.load(Ordering::Acquire) {
-                    request.fail(io::Error::new(
+        match thread
+            .request_tx
+            .send(QueuedRequest::new(Arc::clone(&request)))
+        {
+            Ok(()) => Box::pin(UringReadFuture { request }),
+            Err(_) => Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "io_uring thread died",
-                    ));
-                }
-                // Return future that will be woken when operation completes
-                Box::pin(UringReadFuture { request })
-            }
-            Err(_) => {
-                // Thread died - decrement counter and return error future
-                SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    Err(object_store::Error::Generic {
-                        store: "UringReader",
-                        source: Box::new(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "io_uring thread died",
-                        )),
-                    })
+                    )),
                 })
-            }
+            }),
         }
     }
 }

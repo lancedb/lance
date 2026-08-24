@@ -21,8 +21,48 @@ use std::time::{Duration, Instant};
 ///
 /// This provides a channel sender for submitting read requests to the thread.
 pub(super) struct UringThreadHandle {
-    pub request_tx: SyncSender<Arc<IoRequest>>,
+    pub request_tx: SyncSender<QueuedRequest>,
     pub is_alive: Arc<AtomicBool>,
+}
+
+/// Owns the obligation to fail a request until a worker accepts it.
+///
+/// Dropping the receiver also drops every queued item. Keeping the failure
+/// obligation with the queued item guarantees that a request accepted during
+/// worker shutdown cannot be abandoned without waking its future.
+pub(super) struct QueuedRequest {
+    request: Option<Arc<IoRequest>>,
+}
+
+impl QueuedRequest {
+    pub(super) fn new(request: Arc<IoRequest>) -> Self {
+        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            request: Some(request),
+        }
+    }
+
+    fn into_request(mut self) -> Arc<IoRequest> {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        self.request.take().unwrap()
+    }
+
+    fn fail(mut self, error: io::Error) {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        self.request.take().unwrap().fail(error);
+    }
+}
+
+impl Drop for QueuedRequest {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+            request.fail(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring worker stopped before accepting request",
+            ));
+        }
+    }
 }
 
 pub(super) struct UringThreadPool {
@@ -144,7 +184,7 @@ fn get_thread_count() -> usize {
 /// 4. Wakes futures via their wakers
 fn run_uring_thread(
     mut ring: IoUring,
-    request_rx: Receiver<Arc<IoRequest>>,
+    request_rx: Receiver<QueuedRequest>,
     is_alive: Arc<AtomicBool>,
     thread_id: usize,
 ) {
@@ -225,8 +265,7 @@ fn run_uring_thread(
 
             match recv_result {
                 Ok(request) => {
-                    // Decrement submitted counter when we receive the request from channel
-                    SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+                    let request = request.into_request();
 
                     // Push to submission queue (but don't submit yet)
                     if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
@@ -311,7 +350,7 @@ fn submit_all(mut queued: usize, mut submit: impl FnMut() -> io::Result<usize>) 
 fn shutdown_with_error(
     ring: IoUring,
     mut pending: HashMap<u64, Arc<IoRequest>>,
-    request_rx: &Receiver<Arc<IoRequest>>,
+    request_rx: &Receiver<QueuedRequest>,
     is_alive: &AtomicBool,
     thread_id: usize,
     error: io::Error,
@@ -329,7 +368,6 @@ fn shutdown_with_error(
         request.fail(io::Error::new(error_kind, error_message.clone()));
     }
     for request in request_rx.try_iter() {
-        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
         request.fail(io::Error::new(error_kind, error_message.clone()));
     }
 }
@@ -482,9 +520,14 @@ fn process_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{start_uring_thread, submit_all};
+    use super::{QueuedRequest, start_uring_thread, submit_all};
+    use crate::uring::requests::{IoRequest, RequestState};
+    use bytes::BytesMut;
     use std::collections::VecDeque;
     use std::io;
+    use std::sync::mpsc::sync_channel;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
 
     #[test]
     fn test_submit_all_retries_interrupted_and_partial_submissions() {
@@ -512,5 +555,49 @@ mod tests {
         let result = start_uring_thread(0, 0);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_late_queued_request_is_failed_when_worker_receiver_drops() {
+        let request = Arc::new(IoRequest {
+            fd: -1,
+            offset: 0,
+            length: 1,
+            thread_id: thread::current().id(),
+            state: Mutex::new(RequestState {
+                completed: false,
+                waker: None,
+                err: None,
+                buffer: BytesMut::zeroed(1),
+                bytes_read: 0,
+            }),
+        });
+        let (request_tx, request_rx) = sync_channel(1);
+        let drained = Arc::new(Barrier::new(2));
+        let request_sent = Arc::new(Barrier::new(2));
+
+        let sender = {
+            let request = Arc::clone(&request);
+            let drained = Arc::clone(&drained);
+            let request_sent = Arc::clone(&request_sent);
+            thread::spawn(move || {
+                drained.wait();
+                assert!(request_tx.send(QueuedRequest::new(request)).is_ok());
+                request_sent.wait();
+            })
+        };
+
+        assert!(request_rx.try_recv().is_err());
+        drained.wait();
+        request_sent.wait();
+        drop(request_rx);
+        sender.join().unwrap();
+
+        let state = request.state.lock().unwrap();
+        assert!(state.completed);
+        assert_eq!(
+            state.err.as_ref().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 }
