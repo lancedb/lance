@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
-use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
+use arrow_array::{
+    ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array,
+};
 use arrow_buffer::NullBuffer;
+use arrow_schema::{Field, Schema, SchemaRef};
 use futures::{
     FutureExt, Stream, StreamExt,
     future::{BoxFuture, Shared},
@@ -358,6 +364,7 @@ pub fn apply_row_id_and_deletes(
         fragment_id,
         config,
         PrecomputedSystemColumns::default(),
+        None,
     )
 }
 
@@ -368,6 +375,45 @@ struct PrecomputedSystemColumns {
     created_versions: Option<Result<Arc<UInt64Array>>>,
 }
 
+const ROW_ID_READ_AHEAD_ROWS: usize = 64 * 1024;
+
+struct PrecomputedRowIdChunk {
+    logical_offset: usize,
+    values: Arc<UInt64Array>,
+}
+
+struct CachedOutputSchema {
+    input: SchemaRef,
+    output: SchemaRef,
+}
+
+impl PrecomputedRowIdChunk {
+    fn slice(&self, logical_offset: usize, num_rows: usize) -> Option<Arc<UInt64Array>> {
+        let offset_in_chunk = logical_offset.checked_sub(self.logical_offset)?;
+        if offset_in_chunk + num_rows > self.values.len() {
+            return None;
+        }
+        if offset_in_chunk == 0 && num_rows == self.values.len() {
+            return Some(self.values.clone());
+        }
+        Some(Arc::new(self.values.slice(offset_in_chunk, num_rows)))
+    }
+}
+
+fn selected_row_count(params: &ReadBatchParams, total_num_rows: usize) -> usize {
+    match params {
+        ReadBatchParams::Range(range) => range.len(),
+        ReadBatchParams::Ranges(ranges) => ranges
+            .iter()
+            .map(|range| (range.end - range.start) as usize)
+            .sum(),
+        ReadBatchParams::RangeFull => total_num_rows,
+        ReadBatchParams::RangeTo(range) => range.end,
+        ReadBatchParams::RangeFrom(range) => total_num_rows.saturating_sub(range.start),
+        ReadBatchParams::Indices(indices) => indices.len(),
+    }
+}
+
 #[instrument(name = "apply_row_id_and_deletes", level = "debug", skip_all)]
 fn apply_row_id_and_deletes_with_system_columns(
     batch: RecordBatch,
@@ -375,6 +421,7 @@ fn apply_row_id_and_deletes_with_system_columns(
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
     precomputed: PrecomputedSystemColumns,
+    output_schema_cache: Option<&OnceLock<CachedOutputSchema>>,
 ) -> Result<RecordBatch> {
     let PrecomputedSystemColumns {
         row_ids: precomputed_row_ids,
@@ -454,62 +501,85 @@ fn apply_row_id_and_deletes_with_system_columns(
         v.build_predicate(row_addrs.iter())
     });
 
-    let batch = if config.with_row_id {
-        let row_id_arr = row_ids.unwrap();
-        batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
-    } else {
-        batch
-    };
+    let mut system_columns: Vec<(Field, ArrayRef)> = Vec::with_capacity(4);
+    if config.with_row_id {
+        system_columns.push((ROW_ID_FIELD.clone(), row_ids.unwrap()));
+    }
+    if config.with_row_addr {
+        system_columns.push((ROW_ADDR_FIELD.clone(), row_addrs.unwrap()));
+    }
+    if config.with_row_last_updated_at_version {
+        let version_arr = if let Some(version_arr) = last_updated_versions {
+            version_arr?
+        } else if let Some(sequence) = &config.last_updated_at_sequence {
+            Arc::new(UInt64Array::from(version_values_for_selection(
+                sequence,
+                &config.params,
+                batch_offset,
+                num_rows,
+            )?))
+        } else {
+            // Default to version 1 if sequence not provided
+            Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
+        };
+        system_columns.push((ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr));
+    }
+    if config.with_row_created_at_version {
+        let version_arr = if let Some(version_arr) = created_versions {
+            version_arr?
+        } else if let Some(sequence) = &config.created_at_sequence {
+            Arc::new(UInt64Array::from(version_values_for_selection(
+                sequence,
+                &config.params,
+                batch_offset,
+                num_rows,
+            )?))
+        } else {
+            // Default to version 1 if sequence not provided
+            Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
+        };
+        system_columns.push((ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr));
+    }
 
-    let batch = if config.with_row_addr {
-        let row_addr_arr = row_addrs.unwrap();
-        batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
-    } else {
-        batch
-    };
-
-    // Add version columns if requested
-    let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
-        let mut batch = batch;
-
-        if config.with_row_last_updated_at_version {
-            let version_arr = if let Some(version_arr) = last_updated_versions {
-                version_arr?
-            } else if let Some(sequence) = &config.last_updated_at_sequence {
-                Arc::new(UInt64Array::from(version_values_for_selection(
-                    sequence,
-                    &config.params,
-                    batch_offset,
-                    num_rows,
-                )?))
-            } else {
-                // Default to version 1 if sequence not provided
-                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
-            };
-            batch =
-                batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
-        }
-
-        if config.with_row_created_at_version {
-            let version_arr = if let Some(version_arr) = created_versions {
-                version_arr?
-            } else if let Some(sequence) = &config.created_at_sequence {
-                Arc::new(UInt64Array::from(version_values_for_selection(
-                    sequence,
-                    &config.params,
-                    batch_offset,
-                    num_rows,
-                )?))
-            } else {
-                // Default to version 1 if sequence not provided
-                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
-            };
-            batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
-        }
-
+    let batch = if system_columns.is_empty() {
         batch
     } else {
-        batch
+        let input_schema = batch.schema();
+        let make_output_schema = || {
+            let mut fields = input_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            fields.extend(system_columns.iter().map(|(field, _)| field.clone()));
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                input_schema.metadata().clone(),
+            ))
+        };
+        let output_schema = output_schema_cache
+            .map(|cache| {
+                let cached = cache.get_or_init(|| CachedOutputSchema {
+                    input: input_schema.clone(),
+                    output: make_output_schema(),
+                });
+                if Arc::ptr_eq(&cached.input, &input_schema)
+                    || cached.input.as_ref() == input_schema.as_ref()
+                {
+                    cached.output.clone()
+                } else {
+                    make_output_schema()
+                }
+            })
+            .unwrap_or_else(make_output_schema);
+        let mut columns = Vec::with_capacity(batch.num_columns() + system_columns.len());
+        columns.extend_from_slice(batch.columns());
+        columns.extend(system_columns.into_iter().map(|(_, array)| array));
+        RecordBatch::try_new_with_options(
+            output_schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )?
     };
 
     match (deletion_mask, config.make_deletions_null) {
@@ -530,11 +600,14 @@ pub fn wrap_with_row_id_and_delete(
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
+    let output_schema_cache = Arc::new(OnceLock::new());
     let mut row_id_cursor = config
         .row_id_sequence
         .as_ref()
         .filter(|_| config.with_row_id)
         .map(|sequence| sequence.cursor());
+    let mut row_id_chunk: Option<PrecomputedRowIdChunk> = None;
+    let selected_rows = selected_row_count(&config.params, config.total_num_rows as usize);
     let mut last_updated_cursor = config
         .last_updated_at_sequence
         .as_ref()
@@ -549,18 +622,33 @@ pub fn wrap_with_row_id_and_delete(
     stream
         .map(move |batch_task| {
             let config = config.clone();
+            let output_schema_cache = output_schema_cache.clone();
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
-            // Materialize row ids while polling the ordered task stream. Batch
-            // futures may complete concurrently, so doing this inside the
-            // future would require locking the shared cursor or would reorder
-            // its accesses.
+            // Build row ids while pulling the ordered task stream, before the
+            // batch futures can run concurrently. Adjacent batches share a
+            // bounded chunk and take zero-copy Arrow slices from it.
             let row_ids = config.row_id_sequence.as_ref().and_then(|sequence| {
                 row_id_cursor.as_mut().map(|cursor| {
+                    let logical_offset = this_offset as usize;
+                    let num_rows = num_rows as usize;
+                    if num_rows == 0 {
+                        return Arc::new(UInt64Array::from(Vec::<u64>::new()));
+                    }
+                    if let Some(row_ids) = row_id_chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.slice(logical_offset, num_rows))
+                    {
+                        return row_ids;
+                    }
+
+                    let batches_per_chunk = ROW_ID_READ_AHEAD_ROWS.div_ceil(num_rows);
+                    let chunk_len = (num_rows * batches_per_chunk)
+                        .min(selected_rows.saturating_sub(logical_offset));
                     let selection = config
                         .params
-                        .slice(this_offset as usize, num_rows as usize)
+                        .slice(logical_offset, chunk_len)
                         .unwrap()
                         .to_ranges()
                         .unwrap();
@@ -569,18 +657,24 @@ pub fn wrap_with_row_id_and_delete(
                             cursor,
                             range.start as usize..range.end as usize,
                         )),
-                        _ => UInt64Array::from(
-                            sequence
-                                .select_with_cursor(
-                                    cursor,
-                                    selection
-                                        .iter()
-                                        .flat_map(|range| range.start as usize..range.end as usize),
-                                )
-                                .collect::<Vec<_>>(),
-                        ),
+                        _ => sequence
+                            .select_with_cursor(
+                                cursor,
+                                selection
+                                    .iter()
+                                    .flat_map(|range| range.start as usize..range.end as usize),
+                            )
+                            .collect::<UInt64Array>(),
                     };
-                    Arc::new(values)
+                    let chunk = PrecomputedRowIdChunk {
+                        logical_offset,
+                        values: Arc::new(values),
+                    };
+                    let row_ids = chunk
+                        .slice(logical_offset, num_rows)
+                        .expect("new row-id chunk must cover the current batch");
+                    row_id_chunk = Some(chunk);
+                    row_ids
                 })
             });
             let last_updated_versions =
@@ -626,6 +720,7 @@ pub fn wrap_with_row_id_and_delete(
                             last_updated_versions,
                             created_versions,
                         },
+                        Some(output_schema_cache.as_ref()),
                     )
                 })
                 .boxed()
@@ -863,6 +958,182 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(actual, vec![4, 4, 10]);
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_read_ahead_range_boundary_and_tail() {
+        let all_row_ids = (10_000..120_000)
+            .filter(|row_id| row_id % 11 != 0)
+            .collect::<Vec<u64>>();
+        let selection = 1_234..71_237;
+        let selected_len = selection.len();
+        let mut remaining = selected_len;
+        let tasks = std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let num_rows = remaining.min(1_025);
+            remaining -= num_rows;
+            Some(ReadBatchTask {
+                num_rows: num_rows as u32,
+                task: std::future::ready(Ok(arrow_array::record_batch!((
+                    "x",
+                    Int32,
+                    vec![0; num_rows]
+                ))
+                .unwrap()))
+                .boxed(),
+            })
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Range(selection.clone()),
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(
+                RowIdSequence::try_from_iter(all_row_ids.clone()).unwrap(),
+            )),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: all_row_ids.len() as u32,
+        };
+
+        let batches = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 3, config)
+            .buffered(8)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 69);
+        assert_eq!(batches.last().unwrap().num_rows(), 303);
+
+        fn row_ids(batch: &RecordBatch) -> &arrow_array::UInt64Array {
+            batch[ROW_ID].as_primitive::<UInt64Type>()
+        }
+        assert_eq!(
+            row_ids(&batches[63]).values().as_ptr(),
+            row_ids(&batches[0])
+                .values()
+                .as_ptr()
+                .wrapping_add(63 * 1_025)
+        );
+        assert_eq!(
+            row_ids(&batches[68]).values().as_ptr(),
+            row_ids(&batches[64])
+                .values()
+                .as_ptr()
+                .wrapping_add(4 * 1_025)
+        );
+
+        let actual = batches
+            .iter()
+            .flat_map(|batch| row_ids(batch).values())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, all_row_ids[selection]);
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_read_ahead_empty_task() {
+        let tasks = [0_u32, 1].into_iter().map(|num_rows| ReadBatchTask {
+            num_rows,
+            task: std::future::ready(Ok(arrow_array::record_batch!((
+                "x",
+                Int32,
+                vec![0; num_rows as usize]
+            ))
+            .unwrap()))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(RowIdSequence::try_from_iter([42]).unwrap())),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 1,
+        };
+
+        let batches = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 0, config)
+            .buffered(2)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 0);
+        assert_eq!(
+            batches[1][ROW_ID].as_primitive::<UInt64Type>().values(),
+            &[42]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_system_columns_share_schema_for_equivalent_payload_batches() {
+        let batches = (0..3)
+            .map(|batch_index| {
+                arrow_array::record_batch!((
+                    "payload",
+                    Int32,
+                    (batch_index * 10..(batch_index + 1) * 10).collect::<Vec<_>>()
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!Arc::ptr_eq(&batches[0].schema(), &batches[1].schema()));
+        let tasks = batches.into_iter().map(|batch| ReadBatchTask {
+            num_rows: batch.num_rows() as u32,
+            task: std::future::ready(Ok(batch)).boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: true,
+            with_row_last_updated_at_version: true,
+            with_row_created_at_version: true,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(
+                RowIdSequence::try_from_iter((0..30).map(|row_id| 100 + row_id + row_id / 7))
+                    .unwrap(),
+            )),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 30,
+        };
+
+        let batches = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 7, config)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let expected_fields = [
+            "payload",
+            lance_core::ROW_ID,
+            lance_core::ROW_ADDR,
+            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+            lance_core::ROW_CREATED_AT_VERSION,
+        ];
+        assert_eq!(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_fields
+        );
+        assert!(
+            batches
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0].schema(), &pair[1].schema()))
+        );
+        assert!(batches.iter().all(|batch| batch.num_columns() == 5));
     }
 
     #[tokio::test]
