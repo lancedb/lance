@@ -726,13 +726,11 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
-                    require_index_catchup: a_activate,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
-                    require_index_catchup: b_activate,
                 },
-            ) => compare_vec(a_compacted, b_compacted) && a_activate == b_activate,
+            ) => compare_vec(a_compacted, b_compacted),
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }

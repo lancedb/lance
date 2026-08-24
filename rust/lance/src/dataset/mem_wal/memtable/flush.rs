@@ -778,6 +778,7 @@ impl MemTableFlusher {
                 uuid: index_uuid,
                 name: fts_cfg.name.clone(),
                 fields: vec![field_idx],
+                covering_fields: vec![],
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
@@ -1108,6 +1109,7 @@ impl MemTableFlusher {
             uuid: index_uuid,
             name: config.name.clone(),
             fields: vec![0], // updated by caller
+            covering_fields: vec![],
             dataset_version: 0,
             fragment_bitmap: None,
             index_details,

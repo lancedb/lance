@@ -357,6 +357,11 @@ impl RowIdSequence {
     /// Get the row id at the given index.
     ///
     /// If the index is out of bounds, this will return None.
+    /// The segments backing the sequence, in offset order.
+    pub fn segments(&self) -> &[U64Segment] {
+        &self.0
+    }
+
     pub fn get(&self, index: usize) -> Option<u64> {
         let mut offset = 0;
         for segment in &self.0 {

@@ -1409,6 +1409,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "text_ngram".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 5,
             fragment_bitmap: Some(RoaringBitmap::from_iter([1u32])),
             index_details: None,

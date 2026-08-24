@@ -136,8 +136,8 @@ impl std::fmt::Display for FtsQuery {
             Self::Boolean(query) => {
                 write!(
                     f,
-                    "Boolean(must={:?}, should={:?})",
-                    query.must, query.should
+                    "Boolean(must={:?}, should={:?}, must_not={:?})",
+                    query.must, query.should, query.must_not
                 )
             }
         }
@@ -1155,6 +1155,38 @@ mod tests {
         assert_eq!(plan.should, vec![should]);
         assert_eq!(plan.must, vec![must]);
         assert_eq!(plan.must_not, vec![must_not]);
+    }
+
+    #[test]
+    fn test_boolean_query_columns_include_must_not() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string()).with_column(Some("body".to_string()));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["title".to_string(), "body".to_string()])
+        );
+        assert!(!query.is_missing_column());
+    }
+
+    #[test]
+    fn test_boolean_query_missing_must_not_column_is_detected() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string());
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert!(query.is_missing_column());
     }
 
     #[test]

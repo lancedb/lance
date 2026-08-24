@@ -13,6 +13,7 @@ use std::{
 };
 
 use arrow_schema::{DataType, Field as ArrowField};
+use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -726,6 +727,7 @@ pub(in crate::dataset) async fn filtered_read(
     fragments: Option<Arc<Vec<Fragment>>>,
     scan_range: Option<Range<u64>>,
     is_prefilter: bool,
+    session: Option<&dyn Session>,
 ) -> Result<PlannedFilteredScan> {
     match version {
         ConcreteFileVersion::V1 => {
@@ -752,6 +754,7 @@ pub(in crate::dataset) async fn filtered_read(
                     make_deletions_null,
                     fragments,
                     scan_range,
+                    session,
                 )
                 .await?;
             Ok(PlannedFilteredScan {
