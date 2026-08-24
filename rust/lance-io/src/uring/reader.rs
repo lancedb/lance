@@ -205,19 +205,53 @@ impl UringReader {
             }),
         });
 
+        if URING_THREADS.threads.is_empty() {
+            let initialization_errors = if URING_THREADS.initialization_errors.is_empty() {
+                "LANCE_URING_THREAD_COUNT is 0".to_owned()
+            } else {
+                URING_THREADS.initialization_errors.join("; ")
+            };
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::other(format!(
+                        "no io_uring worker threads are available: {initialization_errors}"
+                    ))),
+                })
+            });
+        }
+
+        // Select thread in round-robin fashion
+        let thread_idx = (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize)
+            % URING_THREADS.threads.len();
+        let thread = &URING_THREADS.threads[thread_idx];
+
+        if !thread.is_alive.load(Ordering::Acquire) {
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    )),
+                })
+            });
+        }
+
         // Increment submitted counter before sending to channel
         SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Select thread in round-robin fashion
-        let thread_idx =
-            (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize) % URING_THREADS.len();
-
         // Send to selected thread via channel
-        match URING_THREADS[thread_idx]
-            .request_tx
-            .send(Arc::clone(&request))
-        {
+        match thread.request_tx.send(Arc::clone(&request)) {
             Ok(()) => {
+                // The worker may have shut down after the pre-send liveness
+                // check but before accepting this request from the channel.
+                if !thread.is_alive.load(Ordering::Acquire) {
+                    request.fail(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    ));
+                }
                 // Return future that will be woken when operation completes
                 Box::pin(UringReadFuture { request })
             }

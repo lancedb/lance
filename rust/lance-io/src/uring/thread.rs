@@ -12,7 +12,7 @@ use super::requests::IoRequest;
 use io_uring::{IoUring, opcode, types};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -22,36 +22,64 @@ use std::time::{Duration, Instant};
 /// This provides a channel sender for submitting read requests to the thread.
 pub(super) struct UringThreadHandle {
     pub request_tx: SyncSender<Arc<IoRequest>>,
+    pub is_alive: Arc<AtomicBool>,
+}
+
+pub(super) struct UringThreadPool {
+    pub threads: Vec<UringThreadHandle>,
+    pub initialization_errors: Vec<String>,
 }
 
 /// Lazy-initialized io_uring thread pool.
 ///
 /// Multiple threads are spawned on first access and run until process exit.
-pub(super) static URING_THREADS: LazyLock<Vec<UringThreadHandle>> = LazyLock::new(|| {
+pub(super) static URING_THREADS: LazyLock<UringThreadPool> = LazyLock::new(|| {
     let queue_depth = get_queue_depth();
     let thread_count = get_thread_count();
 
     let mut threads = Vec::with_capacity(thread_count);
+    let mut initialization_errors = Vec::new();
 
     for i in 0..thread_count {
-        let (tx, rx) = sync_channel(queue_depth);
-
-        std::thread::Builder::new()
-            .name(format!("lance-uring-{}", i))
-            .spawn(move || run_uring_thread(rx, queue_depth, i))
-            .expect("Failed to spawn io_uring thread");
-
-        threads.push(UringThreadHandle { request_tx: tx });
+        match start_uring_thread(queue_depth, i) {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                let message = format!("thread {i}: {error}");
+                log::error!("Failed to start io_uring {message}");
+                initialization_errors.push(message);
+            }
+        }
     }
 
     log::info!(
         "io_uring thread pool spawned ({} threads, queue_depth={})",
-        thread_count,
+        threads.len(),
         queue_depth
     );
 
-    threads
+    UringThreadPool {
+        threads,
+        initialization_errors,
+    }
 });
+
+fn start_uring_thread(queue_depth: usize, thread_id: usize) -> io::Result<UringThreadHandle> {
+    // Initialize the ring before publishing its sender so a request can never be
+    // accepted by a worker that subsequently fails during startup.
+    let ring = IoUring::builder().build(queue_depth as u32)?;
+    let (request_tx, request_rx) = sync_channel(queue_depth);
+    let is_alive = Arc::new(AtomicBool::new(true));
+    let worker_is_alive = Arc::clone(&is_alive);
+
+    std::thread::Builder::new()
+        .name(format!("lance-uring-{}", thread_id))
+        .spawn(move || run_uring_thread(ring, request_rx, worker_is_alive, thread_id))?;
+
+    Ok(UringThreadHandle {
+        request_tx,
+        is_alive,
+    })
+}
 
 /// Atomic counter for round-robin thread selection.
 pub(super) static THREAD_SELECTOR: AtomicU64 = AtomicU64::new(0);
@@ -114,13 +142,13 @@ fn get_thread_count() -> usize {
 /// 2. Submits them to io_uring
 /// 3. Processes completions
 /// 4. Wakes futures via their wakers
-fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, thread_id: usize) {
-    // Create local io_uring instance
-    let mut ring = IoUring::builder()
-        // .setup_sqpoll(100)
-        .build(queue_depth as u32)
-        .expect("Failed to create io_uring");
-
+fn run_uring_thread(
+    mut ring: IoUring,
+    request_rx: Receiver<Arc<IoRequest>>,
+    is_alive: Arc<AtomicBool>,
+    thread_id: usize,
+) {
+    let queue_depth = ring.submission().capacity();
     let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::with_capacity(queue_depth);
     let poll_timeout = get_poll_timeout();
     let submit_batch_size = get_submit_batch_size();
@@ -218,14 +246,19 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     // All senders dropped - submit batch and shutdown
-                    if batch_count > 0
-                        && let Err(e) = ring.submit()
-                    {
-                        log::error!(
-                            "io_uring[{}]: Failed to submit io_uring batch: {}",
-                            thread_id,
-                            e
-                        );
+                    if batch_count > 0 {
+                        let queued = ring.submission().len();
+                        if let Err(error) = submit_all(queued, || ring.submit()) {
+                            shutdown_with_error(
+                                ring,
+                                pending,
+                                &request_rx,
+                                &is_alive,
+                                thread_id,
+                                error,
+                            );
+                            return;
+                        }
                     }
                     log::info!(
                         "io_uring thread {} shutting down (channel disconnected)",
@@ -237,15 +270,67 @@ fn run_uring_thread(request_rx: Receiver<Arc<IoRequest>>, queue_depth: usize, th
         }
 
         // Submit if we have any requests (from channel or retries)
-        if (batch_count > 0 || needs_submit)
-            && let Err(e) = ring.submit()
-        {
-            log::error!(
-                "Failed to submit io_uring batch of {} requests: {}",
-                batch_count,
-                e
-            );
+        if batch_count > 0 || needs_submit {
+            let queued = ring.submission().len();
+            if let Err(error) = submit_all(queued, || ring.submit()) {
+                shutdown_with_error(ring, pending, &request_rx, &is_alive, thread_id, error);
+                return;
+            }
         }
+    }
+}
+
+/// Submit every entry currently published to the submission queue.
+///
+/// `io_uring_enter` may be interrupted or accept only part of a batch. The
+/// remaining entries stay in the userspace submission queue and must be retried;
+/// otherwise their requests remain pending without a possible completion.
+fn submit_all(mut queued: usize, mut submit: impl FnMut() -> io::Result<usize>) -> io::Result<()> {
+    while queued > 0 {
+        match submit() {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("io_uring submitted 0 of {queued} queued requests"),
+                ));
+            }
+            Ok(submitted) if submitted <= queued => queued -= submitted,
+            Ok(submitted) => {
+                return Err(io::Error::other(format!(
+                    "io_uring reported {submitted} submissions for {queued} queued requests"
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn shutdown_with_error(
+    ring: IoUring,
+    mut pending: HashMap<u64, Arc<IoRequest>>,
+    request_rx: &Receiver<Arc<IoRequest>>,
+    is_alive: &AtomicBool,
+    thread_id: usize,
+    error: io::Error,
+) {
+    let error_kind = error.kind();
+    let error_message = format!("io_uring worker {thread_id} stopped: {error}");
+    log::error!("{}", error_message);
+
+    // Closing the ring cancels in-flight operations before their request buffers
+    // can be released by the futures receiving the errors below.
+    drop(ring);
+    is_alive.store(false, Ordering::Release);
+
+    for request in pending.drain().map(|(_, request)| request) {
+        request.fail(io::Error::new(error_kind, error_message.clone()));
+    }
+    for request in request_rx.try_iter() {
+        SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        request.fail(io::Error::new(error_kind, error_message.clone()));
     }
 }
 
@@ -393,4 +478,39 @@ fn process_completions(
         sectors,
         retries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{start_uring_thread, submit_all};
+    use std::collections::VecDeque;
+    use std::io;
+
+    #[test]
+    fn test_submit_all_retries_interrupted_and_partial_submissions() {
+        let mut results = VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Ok(1),
+            Ok(2),
+        ]);
+
+        submit_all(3, || results.pop_front().unwrap()).unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_submit_all_rejects_zero_progress() {
+        let error = submit_all(1, || Ok(0)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert!(error.to_string().contains("submitted 0 of 1"));
+    }
+
+    #[test]
+    fn test_worker_is_not_published_when_ring_initialization_fails() {
+        let result = start_uring_thread(0, 0);
+
+        assert!(result.is_err());
+    }
 }
