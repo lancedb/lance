@@ -151,6 +151,7 @@ pub(super) fn rescore_partition_candidates<C>(
         .iter()
         .map(|group| group.position)
         .collect::<HashSet<_>>();
+    let mut position_scores = vec![0.0_f32; idf_by_position.len()];
 
     candidates
         .into_iter()
@@ -161,23 +162,31 @@ pub(super) fn rescore_partition_candidates<C>(
                  freqs,
                  doc_length,
              }| {
-                let mut score = 0.0;
+                position_scores.fill(0.0);
                 for (term_index, freq) in freqs {
                     if grouped_positions.contains(&term_index) {
                         continue;
                     }
                     debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
+                    position_scores[term_index as usize] +=
                         idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
                 for group in &grouped_expansions {
-                    for term in group.terms.iter() {
-                        let Some(freq) = term.frequency(posting_doc_id) else {
-                            continue;
-                        };
-                        score += term.query_weight() * scorer.doc_weight(freq, doc_length);
-                    }
+                    debug_assert!((group.position as usize) < position_scores.len());
+                    let grouped_score = group
+                        .terms
+                        .iter()
+                        .filter_map(|term| {
+                            term.frequency(posting_doc_id).map(|freq| {
+                                term.query_weight() * scorer.doc_weight(freq, doc_length)
+                            })
+                        })
+                        .fold(0.0_f32, |sum, score| sum + score);
+                    position_scores[group.position as usize] += grouped_score;
                 }
+                let score = position_scores
+                    .iter()
+                    .fold(0.0_f32, |sum, score| sum + *score);
                 (document, score)
             },
         )

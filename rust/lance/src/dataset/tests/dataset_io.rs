@@ -17,7 +17,7 @@ use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
-use lance_table::format::DataStorageFormat;
+use lance_table::format::{DataStorageFormat, Fragment};
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
@@ -2859,4 +2859,104 @@ async fn test_open_dataset_non_not_found_error_is_not_masked() {
         "Expected IO error but got: {:?}",
         err,
     );
+}
+
+#[tokio::test]
+async fn test_get_fragment_by_id() {
+    // 4 fragments of 10 rows each, ids 0..=3.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 4);
+
+    for id in 0..4 {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+    assert!(dataset.get_fragment(4).is_none());
+    assert!(dataset.get_fragment(usize::MAX).is_none());
+
+    // Deleting all rows of fragment 1 leaves a hole in the id space.
+    dataset.delete("i >= 10 AND i < 20").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    assert!(dataset.get_fragment(1).is_none());
+    for id in [0, 2, 3] {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+}
+
+/// Replace the manifest fragments, rebuilding the derived state exactly as
+/// opening a dataset does, so the lookups see a manifest Lance would read off
+/// disk rather than one it just built.
+fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    dataset.fragment_bitmap = Arc::new(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+    );
+}
+
+/// Manifests written before fragments were forced into id order (Lance 0.10 and
+/// earlier) and manifests with duplicate fragment ids (Lance 0.16 and earlier)
+/// are still readable -- neither is rejected on open. A lookup that trusted the
+/// sorted-by-id invariant would hand back a different fragment's data.
+#[rstest]
+#[case::unsorted(vec![3, 1, 2, 0])]
+#[case::duplicate_ids(vec![0, 0, 2, 3])]
+#[tokio::test]
+async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let by_id: HashMap<u64, Fragment> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.clone()))
+        .collect();
+    let fragments: Vec<Fragment> = ids.iter().map(|id| by_id[id].clone()).collect();
+    install_fragments(&mut dataset, fragments);
+
+    for id in ids.iter().map(|id| *id as usize) {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(
+            fragment.id(),
+            id,
+            "get_fragment({id}) returned the wrong fragment"
+        );
+        assert_eq!(
+            fragment.count_rows(None).await.unwrap(),
+            10,
+            "get_fragment({id}) returned unreadable metadata"
+        );
+    }
+    assert!(dataset.get_fragment(4).is_none());
 }

@@ -118,13 +118,13 @@ message Manifest {
   // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
   //   not understand overlays must refuse the dataset, since ignoring an overlay
   //   would silently return stale base values.
-  // * 1 << 7: index_catchup is maintained on this table, so an index absent from
-  //   it is *not* caught up rather than fully caught up (see MemWalIndexDetails).
-  //   Readers that do not understand it must refuse the dataset, since reading
-  //   absence as caught up could answer from an index missing rows that only the
-  //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
-  //   maintain index_catchup can change an index without withdrawing the
-  //   position recorded for it. Setting it is one-way.
+  // * 1 << 7: some index declares covering columns, so IndexMetadata.fields means
+  //   the keyed columns followed by the carried ones named in covering_fields (see
+  //   IndexMetadata). Readers that do not understand it must refuse the dataset,
+  //   since selecting an index by membership of fields would answer a query on a
+  //   merely-carried column with an index keyed on a different column. Writers must
+  //   refuse it too: one that treats every entry of fields as keyed would maintain
+  //   the index against the wrong dependency set.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -246,6 +246,9 @@ message IndexMetadata {
   UUID uuid = 1;
 
   // The columns to build the index. These refer to file.Field.id.
+  //
+  // fields[0] is always a column the index is keyed on. Trailing entries may
+  // instead be merely carried, not keyed on -- see `covering_fields` below.
   repeated int32 fields = 2;
 
   // Index name. Must be unique within one dataset version.
@@ -298,6 +301,29 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // The subset of `fields` whose values this index co-locates alongside its own
+  // data, so a query projecting only those columns can be answered from the
+  // index without a take against the base table.
+  //
+  // Must be a suffix of `fields`: the columns the index is keyed on come first,
+  // the columns it merely carries come last, and at least one keyed column
+  // always remains. Empty for an index that carries no extra columns, which is
+  // every index written before this field existed.
+  //
+  // Carried columns are listed in `fields` as well. That is deliberate: every
+  // consumer that reads `fields` as the index's dependency set -- staleness,
+  // commit conflict detection, schema evolution guards -- then covers them with
+  // no change and no way to forget one.
+  //
+  // This declaration is not authoritative for what the segment can actually
+  // serve. The segment's own storage schema is: a reader must confirm the
+  // storage carries a column before answering a query from it, and fall back to
+  // a take against the base table otherwise. A declaration naming columns the
+  // storage does not hold is a legal state, not corruption -- a maintenance
+  // operation that cannot carry the values through a rebuild is permitted to
+  // withdraw the payload while leaving this declaration in place.
+  repeated int32 covering_fields = 11;
 }
 
 // Metadata about a single file within an index segment.
@@ -699,11 +725,8 @@ message IndexCatchupProgress {
 
   // Per-shard progress: the generation up to which this index covers.
   //
-  // An absent shard means "fully caught up" ONLY on a legacy table. On a table
-  // with the MemWAL index-catchup feature bit set it means *unknown*: this
-  // index has recorded no catch-up for that shard, so its SSTables must be retained
-  // and a repair scheduled. The manifest feature bit, not this message, selects
-  // which reading applies.
+  // An absent shard means *unknown*: this index has recorded no catch-up for
+  // that shard, so its SSTables must be retained and a repair scheduled.
   repeated CompactedSsTable caught_up_generations = 2;
 }
 
@@ -769,10 +792,9 @@ message MemWalIndexDetails {
   // readers should use SSTable indexes for the gap instead of
   // scanning unindexed data in the base table.
   //
-  // An index absent from this list is "fully caught up" ONLY on a legacy table.
-  // With the MemWAL index-catchup feature bit set, absence means the index has
-  // recorded no catch-up, so the SSTables it would need stay live until a repair
-  // records it. Only the dedicated WAL index-repair path may add entries here;
+  // An index absent from this list has recorded no catch-up, so the SSTables it
+  // would need stay live until a repair records it. Only the dedicated WAL
+  // index-repair path may add entries here;
   // ordinary index operations have their entry removed automatically when they
   // change an index, since they do not report what the new index covers.
   repeated IndexCatchupProgress index_catchup = 10;
