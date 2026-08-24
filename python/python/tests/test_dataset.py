@@ -5329,6 +5329,69 @@ def test_dataset_drop(tmp_path: Path):
         lance.LanceDataset.drop(tmp_path)
 
 
+def test_dataset_drop_rejects_non_dataset_directory(tmp_path: Path):
+    warehouse = tmp_path / "warehouse"
+    lance.write_dataset(pa.table({"x": [0]}), warehouse / "t.lance")
+
+    # Pointing at the parent of a dataset must not wipe out the whole warehouse.
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(warehouse)
+    assert (warehouse / "t.lance").exists()
+
+    lance.LanceDataset.drop(warehouse / "t.lance")
+    assert not (warehouse / "t.lance").exists()
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # A storage root holding a "data" prefix is indistinguishable from the
+        # leftovers of a write that died before committing.
+        ["data/0.lance"],
+        # A file merely sitting under _versions/, or merely named like a manifest, is
+        # not evidence that a dataset was ever committed here.
+        ["_versions/README", "reports/q1.csv"],
+        ["_versions/1.manifest", "reports/q1.csv"],
+    ],
+)
+def test_dataset_drop_rejects_paths_without_readable_manifest(
+    tmp_path: Path, entries: list
+):
+    storage_root = tmp_path / "storage_root"
+    for entry in entries:
+        path = storage_root / entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"irreplaceable")
+
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(storage_root)
+    for entry in entries:
+        assert (storage_root / entry).exists()
+
+
+def test_dataset_drop_allows_create_over_uncommitted_leftovers(tmp_path: Path):
+    # Refusing to drop data files without a manifest costs nothing, because those
+    # leftovers do not stop the dataset from being created and then dropped.
+    dataset_dir = tmp_path / "t.lance"
+    (dataset_dir / "data").mkdir(parents=True)
+    (dataset_dir / "data" / "0.lance").write_bytes(b"partial")
+
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
+def test_dataset_drop_allows_dataset_with_unmanaged_files(tmp_path: Path):
+    # Cleanup deliberately preserves unmanaged files under a dataset root, so their
+    # presence must not stop a drop either.
+    dataset_dir = tmp_path / "t.lance"
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    (dataset_dir / "notes.txt").write_text("kept next to the dataset")
+
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
 def test_dataset_schema(tmp_path: Path):
     table = pa.table({"x": [0]})
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
