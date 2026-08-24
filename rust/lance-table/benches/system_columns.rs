@@ -76,10 +76,6 @@ fn bench_stream_row_ids(c: &mut Criterion) {
         .map(|value| value.parse().unwrap())
         .unwrap_or(1_024_usize)
         .min(total_rows);
-    let sequence = Arc::new(
-        RowIdSequence::try_from_iter((0_u64..).filter(|value| value % 17 != 0).take(total_rows))
-            .unwrap(),
-    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -88,33 +84,44 @@ fn bench_stream_row_ids(c: &mut Criterion) {
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
-    for has_payload in [false, true] {
-        let batch = make_batch(batch_size, has_payload);
-        group.bench_with_input(
-            BenchmarkId::new("payload", has_payload),
-            &has_payload,
-            |b, _| {
-                b.iter_batched(
-                    || {
-                        (
-                            make_tasks(batch.clone(), total_rows, batch_size),
-                            make_config(total_rows, sequence.clone()),
-                        )
-                    },
-                    |(tasks, config)| {
-                        let batches = runtime
-                            .block_on(
-                                wrap_with_row_id_and_delete(tasks, 0, config)
-                                    .buffered(8)
-                                    .try_collect::<Vec<_>>(),
-                            )
-                            .unwrap();
-                        black_box(batches);
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
+    for hole_stride in [2_u64, 17] {
+        let sequence = Arc::new(
+            RowIdSequence::try_from_iter(
+                (0_u64..)
+                    .filter(|value| value % hole_stride != 0)
+                    .take(total_rows),
+            )
+            .unwrap(),
         );
+        for has_payload in [false, true] {
+            let batch = make_batch(batch_size, has_payload);
+            let parameter = format!("holes_{hole_stride}/payload_{has_payload}");
+            group.bench_with_input(
+                BenchmarkId::new("shape", parameter),
+                &has_payload,
+                |b, _| {
+                    b.iter_batched(
+                        || {
+                            (
+                                make_tasks(batch.clone(), total_rows, batch_size),
+                                make_config(total_rows, sequence.clone()),
+                            )
+                        },
+                        |(tasks, config)| {
+                            let batches = runtime
+                                .block_on(
+                                    wrap_with_row_id_and_delete(tasks, 0, config)
+                                        .buffered(8)
+                                        .try_collect::<Vec<_>>(),
+                                )
+                                .unwrap();
+                            black_box(batches);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
     }
     group.finish();
 }
