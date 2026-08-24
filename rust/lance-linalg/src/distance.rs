@@ -430,40 +430,30 @@ pub fn multivec_distance(
                 }
 
                 let distance = match distance_type {
-                    DistanceType::Hamming => {
-                        let query = query.as_primitive::<UInt8Type>().values();
-                        query
-                            .chunks_exact(dim)
-                            .map(|q| {
-                                multivector
-                                    .values()
-                                    .as_primitive::<UInt8Type>()
-                                    .values()
-                                    .chunks_exact(dim)
-                                    .map(|v| hamming::hamming(q, v))
-                                    .min_by(|a, b| a.total_cmp(b))
-                                    .unwrap()
-                            })
-                            .sum()
-                    }
+                    DistanceType::Hamming => multivec_distance_impl::<UInt8Type>(
+                        query,
+                        multivector,
+                        dim,
+                        hamming::hamming,
+                    ),
                     _ => match query.data_type() {
                         DataType::Float16 => multivec_distance_impl::<Float16Type>(
                             query,
                             multivector,
                             dim,
-                            distance_type,
+                            distance_type.func(),
                         ),
                         DataType::Float32 => multivec_distance_impl::<Float32Type>(
                             query,
                             multivector,
                             dim,
-                            distance_type,
+                            distance_type.func(),
                         ),
                         DataType::Float64 => multivec_distance_impl::<Float64Type>(
                             query,
                             multivector,
                             dim,
-                            distance_type,
+                            distance_type.func(),
                         ),
                         _ => unreachable!("missed to check query type"),
                     },
@@ -480,11 +470,8 @@ fn multivec_distance_impl<T: ArrowPrimitiveType>(
     query: &dyn Array,
     multivector: &FixedSizeListArray,
     dim: usize,
-    distance_type: DistanceType,
-) -> f32
-where
-    T::Native: L2 + Cosine + Dot,
-{
+    distance_func: DistanceFunc<T::Native>,
+) -> f32 {
     let query = query.as_primitive::<T>().values();
     query
         .chunks_exact(dim)
@@ -494,7 +481,7 @@ where
                 .as_primitive::<T>()
                 .values()
                 .chunks_exact(dim)
-                .map(|v| distance_type.func()(q, v))
+                .map(|v| distance_func(q, v))
                 .min_by(|a, b| a.total_cmp(b))
                 .unwrap()
         })
