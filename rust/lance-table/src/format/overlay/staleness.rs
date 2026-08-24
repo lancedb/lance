@@ -321,6 +321,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "idx".into(),
             fields,
+            covering_fields: vec![],
             dataset_version,
             fragment_bitmap,
             index_details: None,

@@ -1387,10 +1387,12 @@ pub(crate) async fn create_seed_writers_current(
     let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
 
     for index in indices.iter() {
-        if index.fields.len() != 1 {
+        // A covered index lists its carried columns in `fields` too; the seed
+        // writer keys on the single keyed column. System indices commit no
+        // fields at all, so this also skips them.
+        let Some(field_id) = index.keyed_field() else {
             continue;
-        }
-        let field_id = index.fields[0];
+        };
         let Ok(field_path) = dataset.schema().field_path(field_id) else {
             continue;
         };
@@ -4672,5 +4674,84 @@ mod tests {
         );
         let frags = scalar_index.calculate_included_frags().await.unwrap();
         assert_eq!(frags.len(), 2, "Index should cover both fragments");
+    }
+
+    /// A covered scalar index must still get a seed writer. The loop skipped any
+    /// index with more than one field, silently dropping seed writing for it.
+    #[tokio::test]
+    async fn test_seed_writers_for_a_covered_index() {
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let test_uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..256)),
+                Arc::new(Int32Array::from_iter_values(0..256)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+        // BTree (the default `ScalarIndexParams`) never writes seeds -- only ZoneMap
+        // does, and only when `use_seeds` is explicitly requested for a fixed-width
+        // type like Int32 (see `test_zone_map_seeds_used_during_update` above).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["id"], IndexType::ZoneMap, None, &params, true)
+            .await
+            .unwrap();
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let baseline = create_seed_writers_current(Some(&dataset), &append_params)
+            .await
+            .unwrap();
+        assert!(
+            !baseline.is_empty(),
+            "a plain scalar index should produce a seed writer; if this is empty \
+             the rest of the test proves nothing"
+        );
+
+        // Declare `payload` as carried, then re-check.
+        let id_field = dataset.schema().field_id("id").unwrap();
+        let payload_field = dataset.schema().field_id("payload").unwrap();
+        let current = dataset.load_indices().await.unwrap();
+        let mut covered = current[0].clone();
+        covered.fields = vec![id_field, payload_field];
+        covered.covering_fields = vec![payload_field];
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let covered_writers = create_seed_writers_current(Some(&dataset), &append_params)
+            .await
+            .unwrap();
+        assert_eq!(
+            covered_writers.len(),
+            baseline.len(),
+            "a covered index must still produce a seed writer"
+        );
     }
 }
