@@ -91,18 +91,25 @@ impl ObjectStoreProvider for PyProviderBridge {
 
 /// Python-facing wrapper around `Arc<dyn ObjectStoreProvider>`.
 ///
-/// Three ways to construct one from Python:
-/// - `ObjectStoreProvider(py_obj)` — hold a Python object implementing
-///   `new_store(base_path, storage_options)`. Registration succeeds; dispatch
-///   currently raises because the full Python-to-Rust `ObjectStore` bridge
-///   is a follow-up.
-/// - `ObjectStoreProvider.memory()` — wrap the built-in `MemoryStoreProvider`.
-///   Registrable under any scheme and fully functional for read/write.
-/// - `ObjectStoreProvider.from_capsule(capsule)` — adopt an
-///   `Arc<dyn ObjectStoreProvider>` produced by a separate, ABI-compatible
-///   wheel (see the module docs on the `PyCapsule` handoff and its lockstep
-///   build requirement). This is how an out-of-tree Rust provider registers
-///   itself without living in the Lance source tree.
+/// There are three ways to construct one from Python, ordered here by how
+/// complete they are today:
+///
+/// 1. `_ObjectStoreProvider.from_capsule(capsule)` — **fully dispatches.**
+///    Adopt an `Arc<dyn ObjectStoreProvider>` built by a separate,
+///    ABI-compatible wheel and handed over in a `PyCapsule`. `new_store` then
+///    calls that provider's own Rust implementation directly — the
+///    `PyProviderBridge` below is not involved. This is how an out-of-tree Rust
+///    provider (e.g. an on-node NVMe cache) plugs in without living in the
+///    Lance source tree; see the module docs for the `PyCapsule` handoff and
+///    its ABI-lockstep build requirement.
+/// 2. `_ObjectStoreProvider.memory()` — **fully dispatches.** Wrap the built-in
+///    `MemoryStoreProvider`; registrable under any scheme and functional for
+///    read/write. Primarily a test/reference vehicle.
+/// 3. `_ObjectStoreProvider(py_obj)` — **stub; does not dispatch yet.** Hold a
+///    Python object implementing `new_store(base_path, storage_options)`.
+///    Registration succeeds, but dispatch raises `not_supported`: the full
+///    Python-to-Rust `ObjectStore` bridge (calling back into Python from
+///    `new_store` under the GIL) is a follow-up.
 #[pyclass(name = "_ObjectStoreProvider", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct PyObjectStoreProvider {
