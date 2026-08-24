@@ -160,7 +160,7 @@ impl HnswMemIndex {
     ///
     /// Zero until the first insert, then a near-constant sized by `capacity`
     /// (the writer's `max_memtable_rows`) rather than by rows inserted — the
-    /// graph and lookup slabs are pre-allocated in full by [`Self::ensure_state`].
+    /// graph and lookup slabs are pre-allocated in full on that first insert.
     /// So an idle-but-touched vector memtable costs the same as a full one.
     pub fn memory_size(&self) -> usize {
         self.state

@@ -633,7 +633,6 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     // Measure the built-in per-shard valve, not
                                     // an injected policy.
                                     backpressure: None,
-                                    pod_memory_bytes: None,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)

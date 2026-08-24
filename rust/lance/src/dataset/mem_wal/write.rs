@@ -2239,12 +2239,14 @@ impl ShardWriter {
             wal_flush_rx,
         )?;
 
-        let state = Arc::new(WalOnlyState::default());
-
         // Reuse the memtable valve (keyed off `max_unflushed_memtable_bytes`)
         // as the WAL-only budget, fed `WalOnlyState::estimated_size()`. Keeps
         // the config knob meaningful in WAL-only mode and prevents the pending
         // queue from growing unbounded under non-durable writes.
+        //
+        // The *same* `state` the flush handler was given above: a second
+        // `WalOnlyState` here would leave writes queuing on one and the
+        // background append draining the other, forever empty.
         let backpressure = resolve_backpressure(config, || LocalSource::WalOnly(state.clone()));
 
         Ok(WriterMode::WalOnly {
