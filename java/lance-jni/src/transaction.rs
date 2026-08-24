@@ -185,6 +185,10 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         let fields: Vec<i32> = import_vec_from_method(env, self, "fields", |env, field_id| {
             field_id.extract_object(env)
         })?;
+        let covering_fields: Vec<i32> =
+            import_vec_from_method(env, self, "coveringFields", |env, field_id| {
+                field_id.extract_object(env)
+            })?;
 
         let name = env.get_string_from_method(self, "name")?;
         let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
@@ -225,6 +229,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         Ok(IndexMetadata {
             uuid,
             fields,
+            covering_fields,
             name,
             dataset_version,
             fragment_bitmap,

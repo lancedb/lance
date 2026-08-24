@@ -16,6 +16,7 @@ use itertools::Itertools;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
+use smallvec::SmallVec;
 
 use crate::metrics::MetricsCollector;
 
@@ -25,7 +26,7 @@ use super::{
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
-    scorer::{K1, MemBM25Scorer, bm25_doc_weight_with_norm, idf},
+    scorer::{BM25_DOC_WEIGHT_UPPER_BOUND, MemBM25Scorer, bm25_doc_weight_with_norm, idf},
 };
 use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
@@ -209,6 +210,31 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
 // WAND loop. LANCE_FTS_MAXSCORE=0 opts back into the classic loop.
 static USE_MAXSCORE_SEARCH: LazyLock<bool> =
     LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CompetitiveFloorMode {
+    #[default]
+    Exclusive,
+    Inclusive,
+}
+
+impl CompetitiveFloorMode {
+    #[inline]
+    fn rejects_upper_bound(self, upper_bound: f64, floor: f32) -> bool {
+        match self {
+            Self::Exclusive => upper_bound <= f64::from(floor),
+            Self::Inclusive => upper_bound < f64::from(floor),
+        }
+    }
+
+    #[inline]
+    fn accepts_score(self, score: f32, floor: f32) -> bool {
+        match self {
+            Self::Exclusive => score > floor,
+            Self::Inclusive => score >= floor,
+        }
+    }
+}
 // Bulk conjunction path for top-k AND / phrase queries: block-max window
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
@@ -321,7 +347,7 @@ fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
     if query_weight <= 0.0 {
         0.0
     } else {
-        query_weight * (K1 + 1.0)
+        query_weight * BM25_DOC_WEIGHT_UPPER_BOUND
     }
 }
 
@@ -799,11 +825,9 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
     ) -> Self {
-        // BM25's doc weight is bounded by K1 + 1 for any freq and doc length,
-        // so query_weight * (K1 + 1) is a valid global bound even when index
-        // stats drift after appends. Keeping it finite matters: an INFINITY
-        // bound can never park the iterator in the WAND tail, forcing a deep
-        // advance on every candidate.
+        // Keep a finite scorer-independent BM25 ceiling even when index stats
+        // drift after appends.  The ceiling includes f32 evaluation error; an
+        // INFINITY bound can never park the iterator in the WAND tail.
         let approximate_upper_bound = match &list {
             PostingList::Compressed(posting) if posting.impacts.is_some() => f32::INFINITY,
             PostingList::Compressed(posting) if posting.block_size == MAX_POSTING_BLOCK_SIZE => {
@@ -811,7 +835,7 @@ impl PostingIterator {
             }
             _ => match list.max_score() {
                 Some(max_score) => max_score,
-                None => idf(list.len(), num_doc) * (K1 + 1.0),
+                None => conservative_bm25_upper_bound(idf(list.len(), num_doc)),
             },
         };
         let compressed = match &list {
@@ -846,8 +870,46 @@ impl PostingIterator {
     }
 
     pub(super) fn with_grouped_terms(mut self, terms: Arc<[GroupedTermScorer]>) -> Self {
+        // Grouped postings are built at query time with the same scoring
+        // lengths and scorer as this cursor.  Their baked list maximum is the
+        // authoritative bound, including on 256-document blocks where normal
+        // persisted postings must fall back to a scorer-wide ceiling.
+        self.approximate_upper_bound = self.list.max_score().unwrap_or(f32::INFINITY);
         self.grouped_terms = Some(terms);
         self
+    }
+
+    /// Create an independent cursor over the same immutable posting payload.
+    ///
+    /// Staged cross-column execution uses one cursor to enumerate exact
+    /// membership before asynchronous candidate-side document reads, then a
+    /// fresh cursor to compute the canonical score. Arrow buffers and grouped
+    /// term tables remain shared; only mutable decode and position state is
+    /// recreated.
+    pub(super) fn fork_from_start(&self) -> Self {
+        let compressed = match &self.list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
+        };
+        let mut posting = Self {
+            token: self.token.clone(),
+            token_id: self.token_id,
+            position: self.position,
+            query_weight: self.query_weight,
+            list: self.list.clone(),
+            index: 0,
+            block_idx: 0,
+            current_doc: None,
+            approximate_upper_bound: self.approximate_upper_bound,
+            use_scorer_upper_bound: self.use_scorer_upper_bound,
+            grouped_terms: self.grouped_terms.clone(),
+            position_scratch: RefCell::new(Some(Vec::new())),
+            compressed,
+        };
+        posting.refresh_current_doc();
+        posting
     }
 
     #[inline]
@@ -872,6 +934,9 @@ impl PostingIterator {
     /// iterators park in the WAND tail instead of being force-advanced.
     #[inline]
     fn global_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
+        if self.has_grouped_terms() {
+            return self.approximate_upper_bound;
+        }
         if self.query_weight <= 0.0 {
             return 0.0;
         }
@@ -925,6 +990,16 @@ impl PostingIterator {
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
         self.current_doc
+    }
+
+    /// The posting's current local document before it is moved into a scorer.
+    ///
+    /// Cross-partition row-address merging uses this only to derive a
+    /// conservative lower bound for lazy source activation. It is not an
+    /// exact match decision: visibility and phrase confirmation still happen
+    /// in [`WandCursor`].
+    pub(super) fn current_doc_id(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
     }
 
     fn refresh_current_doc(&mut self) {
@@ -1213,6 +1288,9 @@ impl PostingIterator {
     fn block_max_score<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
         match self.list {
             PostingList::Compressed(ref list) => {
+                if self.has_grouped_terms() && list.block_size == MAX_POSTING_BLOCK_SIZE {
+                    return self.approximate_upper_bound;
+                }
                 if let Some(impacts) = list.impacts.as_ref() {
                     return self.impact_level0(impacts, scorer).1;
                 }
@@ -1243,6 +1321,12 @@ impl PostingIterator {
     ) -> BlockMaxScore {
         match self.list {
             PostingList::Compressed(ref list) => {
+                if self.has_grouped_terms() && list.block_size == MAX_POSTING_BLOCK_SIZE {
+                    return BlockMaxScore {
+                        score: self.approximate_upper_bound,
+                        blocks_scanned: 0,
+                    };
+                }
                 if let Some(impacts) = list.impacts.as_ref() {
                     let (level0_up_to, level0_score) = self.impact_level0(impacts, scorer);
                     if up_to <= u64::from(level0_up_to) {
@@ -1483,13 +1567,30 @@ pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
 }
 
 #[inline]
-fn score_sum_cannot_exceed(
+fn score_sum_cannot_compete(
     partial_score: f32,
     remaining_upper_bound: f64,
-    threshold: f32,
+    floor: f32,
     upper_bound_factor: f64,
+    floor_mode: CompetitiveFloorMode,
 ) -> bool {
-    ((f64::from(partial_score) + remaining_upper_bound) * upper_bound_factor) as f32 <= threshold
+    let upper_bound = (f64::from(partial_score) + remaining_upper_bound) * upper_bound_factor;
+    floor_mode.rejects_upper_bound(f64::from(outward_f32_upper_bound(upper_bound)), floor)
+}
+
+type ScoreContribution = ((u32, u32), f32);
+
+#[inline]
+fn score_contributions_in_query_order(mut contributions: SmallVec<[ScoreContribution; 8]>) -> f32 {
+    if !contributions
+        .windows(2)
+        .all(|window| window[0].0 <= window[1].0)
+    {
+        contributions.sort_unstable_by_key(|contribution| contribution.0);
+    }
+    contributions
+        .into_iter()
+        .fold(0.0_f32, |score, (_, contribution)| score + contribution)
 }
 
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
@@ -1545,12 +1646,17 @@ pub struct DocCandidate<C> {
 
 /// Document-side contract consumed by WAND.  Implementations fix candidate
 /// identity and visibility before the CPU executor starts.
-type FlatDocuments<'a> = (usize, Box<dyn Iterator<Item = (u64, u64)> + 'a>);
+pub(super) type FlatDocuments<'a> = (usize, Box<dyn Iterator<Item = (u64, u64)> + 'a>);
 
 pub(super) trait WandDocuments {
     type Candidate: Copy + Debug;
 
     fn len(&self) -> usize;
+    /// Conservative upper bound on documents that can survive visibility.
+    /// Used only to estimate scorer cost; iteration remains authoritative.
+    fn visible_cost_upper_bound(&self) -> usize {
+        self.len()
+    }
     fn scoring_norms(&self) -> Option<&[u8]>;
     fn scoring_num_tokens(&self, doc_id: u32) -> u32;
     fn doc_length(&self, doc: &DocInfo) -> u32;
@@ -1628,6 +1734,10 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn len(&self) -> usize {
         self.lengths.len()
+    }
+
+    fn visible_cost_upper_bound(&self) -> usize {
+        self.visibility.len(self.lengths.len())
     }
 
     fn scoring_norms(&self) -> Option<&[u8]> {
@@ -1932,6 +2042,7 @@ impl Ord for TailPosting {
 
 pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
+    floor_mode: CompetitiveFloorMode,
     operator: Operator,
     num_terms: usize,
     // Posting iterators whose current doc id is >= the next target doc.
@@ -1946,10 +2057,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // in play because their score upper bound could affect the decision for the
     // current candidate.
     tail: BinaryHeap<TailPosting>,
-    // Sum of upper bounds for all iterators currently held in `tail`.
-    // This lets us cheaply decide whether the current candidate can still beat
-    // the threshold before fully advancing every lagging iterator.
-    tail_max_score: f32,
+    // Conservatively rounded sum of upper bounds for all iterators in `tail`.
+    // It is maintained in f64 so candidate checks stay O(1) without allowing
+    // repeated f32 add/subtract rounding to underestimate the remaining score.
+    tail_max_score: f64,
     // Block-max scores are valid for all candidate docs up to this doc id.
     // `None` means the window has not been initialized yet and the next
     // candidate must refresh block-max state before making pruning decisions.
@@ -1967,6 +2078,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     bulk_and_mode_override: Option<BulkAndMode>,
     #[cfg(test)]
     bulk_and_searches: usize,
+    #[cfg(test)]
+    maxscore_single_essential_windows: usize,
+    #[cfg(test)]
+    maxscore_general_windows: usize,
     documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -2015,7 +2130,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         Self {
+            // Standalone leaf top-k keeps its established exclusive floor.
+            // Composable cursors switch to an inclusive floor because their
+            // downstream collector applies the final document-key tie-breaker.
             threshold: 0.0,
+            floor_mode: CompetitiveFloorMode::Exclusive,
             operator,
             num_terms: if operator == Operator::And {
                 lead.len()
@@ -2034,6 +2153,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
+            #[cfg(test)]
+            maxscore_single_essential_windows: 0,
+            #[cfg(test)]
+            maxscore_general_windows: 0,
             documents,
             scorer,
             shared_threshold: None,
@@ -2045,6 +2168,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    fn with_floor_mode(mut self, mode: CompetitiveFloorMode) -> Self {
+        self.floor_mode = mode;
         self
     }
 
@@ -2159,7 +2287,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         });
         loop {
             self.raise_to_shared_floor(params.wand_factor);
-            let Some((doc, mut score)) = self.next()? else {
+            let Some((doc, _)) = self.next()? else {
                 break;
             };
             num_comparisons += 1;
@@ -2178,14 +2306,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let doc_length = self.documents.doc_length(&doc);
 
             let score = if self.operator == Operator::Or {
-                self.advance_all_tail(doc.doc_id(), Some(doc_length), Some(&mut score));
+                self.advance_all_tail(doc.doc_id(), None, None);
                 if params.phrase_slop.is_some()
                     && !self.check_positions(params.phrase_slop.unwrap() as i32)?
                 {
                     self.push_back_leads(doc.doc_id() + 1);
                     continue;
                 }
-                score
+                self.score_in_query_order(doc_length)
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
                 if params.phrase_slop.is_some()
@@ -2196,7 +2324,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.full_scores += 1;
                 }
-                self.score(doc_length)
+                self.score_in_query_order(doc_length)
             };
 
             if candidates.insert(
@@ -2310,7 +2438,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             self.collect_tail_matches(doc_id);
-            let score = self.score(doc_length);
+            let score = self.score_in_query_order(doc_length);
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
@@ -2345,6 +2473,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
         struct MaxScoreClause {
             posting: Box<PostingIterator>,
+            query_rank: usize,
             bound: f32,
             prefix_bound: f64,
         }
@@ -2355,11 +2484,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .into_iter()
             .map(|head| MaxScoreClause {
                 posting: head.posting,
+                query_rank: 0,
                 bound: 0.0,
                 prefix_bound: 0.0,
             })
             .collect::<Vec<_>>();
-        let total_sum_upper_bound_factor = score_sum_upper_bound_factor(clauses.len());
+        // Before a competitive floor exists every clause is essential. Keep
+        // that exhaustive accumulator in canonical query order so its score
+        // can be emitted directly instead of recomputing every contribution.
+        clauses.sort_unstable_by_key(|clause| (clause.posting.position, clause.posting.token_id));
+        for (query_rank, clause) in clauses.iter_mut().enumerate() {
+            clause.query_rank = query_rank;
+        }
+        let num_query_terms = clauses.len();
+        let total_sum_upper_bound_factor = score_sum_upper_bound_factor(num_query_terms);
 
         let mut acc = WindowAccumulator::new(clauses.len());
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -2428,14 +2566,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         .score
                 };
             }
-            clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
+            let mut clauses_in_query_order = true;
             let mut first_essential = 0;
             let mut prefix = 0.0_f64;
             if self.threshold > 0.0 {
+                clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
+                clauses_in_query_order = clauses
+                    .windows(2)
+                    .all(|window| window[0].query_rank <= window[1].query_rank);
                 for (i, clause) in clauses.iter_mut().enumerate() {
                     let next_prefix = prefix + f64::from(clause.bound);
-                    let widened = (next_prefix * score_sum_upper_bound_factor(i + 1)) as f32;
-                    if widened > self.threshold {
+                    let widened = next_prefix * score_sum_upper_bound_factor(i + 1);
+                    if widened > f64::from(self.threshold) {
                         break;
                     }
                     prefix = next_prefix;
@@ -2502,13 +2644,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // competitive): stream it directly against the non-essential
             // prefix, skipping the accumulator entirely.
             if first_essential + 1 == clauses.len() {
+                #[cfg(test)]
+                {
+                    self.maxscore_single_essential_windows += 1;
+                }
                 let (non_essential, essential) = clauses.split_at_mut(first_essential);
+                let essential_query_rank = essential[0].query_rank;
                 let posting = &mut essential[0].posting;
                 if posting.doc().is_some_and(|doc| doc.doc_id() < window_min) {
                     posting.next(window_min);
                 }
                 let essential_term = posting.term_index();
                 let essential_weight = posting.query_weight;
+                let sole_query_clause = non_essential.is_empty();
 
                 macro_rules! consider_candidate {
                     ($doc:expr, $freq:expr) => {{
@@ -2532,30 +2680,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                         };
                         if !(self.threshold > 0.0
-                            && score_sum_cannot_exceed(
+                            && score_sum_cannot_compete(
                                 score,
                                 total_non_essential_bound,
                                 self.threshold,
                                 total_sum_upper_bound_factor,
+                                CompetitiveFloorMode::Exclusive,
                             ))
                         {
                             if let Some(document_key) =
                                 self.documents.document_key_for_doc_id(doc as u32)
                             {
                                 let mut total = score;
+                                let mut scores_by_query_rank = SmallVec::<[f32; 8]>::new();
+                                if !sole_query_clause {
+                                    scores_by_query_rank.resize(num_query_terms, 0.0);
+                                    scores_by_query_rank[essential_query_rank] = score;
+                                }
                                 let mut rejected = false;
                                 for i in (0..non_essential.len()).rev() {
                                     if self.threshold > 0.0
-                                        && score_sum_cannot_exceed(
+                                        && score_sum_cannot_compete(
                                             total,
                                             non_essential[i].prefix_bound,
                                             self.threshold,
                                             total_sum_upper_bound_factor,
+                                            CompetitiveFloorMode::Exclusive,
                                         )
                                     {
                                         rejected = true;
                                         break;
                                     }
+                                    let query_rank = non_essential[i].query_rank;
                                     let probe = &mut non_essential[i].posting;
                                     if probe.doc().is_some_and(|d| d.doc_id() < doc) {
                                         probe.next(doc);
@@ -2563,7 +2719,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     if let Some(d) = probe.doc()
                                         && d.doc_id() == doc
                                     {
-                                        total += match norm_addend {
+                                        let contribution = match norm_addend {
                                             Some(addend) => {
                                                 probe.query_weight
                                                     * bm25_doc_weight_with_norm(
@@ -2577,31 +2733,44 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                                 self.documents.scoring_num_tokens(doc as u32),
                                             ),
                                         };
+                                        total += contribution;
+                                        scores_by_query_rank[query_rank] = contribution;
                                     }
                                 }
 
-                                // Match the classic path's emission rule: a
-                                // candidate must beat the running threshold,
-                                // which drops zero-score matches (e.g. terms
-                                // with idf 0) exactly like Wand::next does.
-                                if !rejected && total > self.threshold {
-                                    let doc_length = self.documents.scoring_num_tokens(doc as u32);
-                                    if candidates.insert(
-                                        ScoredDoc::new(document_key, total),
-                                        doc_length,
-                                        doc,
-                                        std::iter::once((essential_term, freq)).chain(
-                                            non_essential.iter().filter_map(|clause| {
-                                                clause.posting.doc().and_then(|d| {
-                                                    (d.doc_id() == doc).then(|| {
-                                                        (clause.posting.term_index(), d.frequency())
+                                // Apply the caller's floor mode only after the
+                                // canonical query-order score is available.
+                                if !rejected {
+                                    let canonical_score = if sole_query_clause {
+                                        score
+                                    } else {
+                                        scores_by_query_rank
+                                            .into_iter()
+                                            .fold(0.0_f32, |sum, contribution| sum + contribution)
+                                    };
+                                    if canonical_score > self.threshold {
+                                        let doc_length =
+                                            self.documents.scoring_num_tokens(doc as u32);
+                                        if candidates.insert(
+                                            ScoredDoc::new(document_key, canonical_score),
+                                            doc_length,
+                                            doc,
+                                            std::iter::once((essential_term, freq)).chain(
+                                                non_essential.iter().filter_map(|clause| {
+                                                    clause.posting.doc().and_then(|d| {
+                                                        (d.doc_id() == doc).then(|| {
+                                                            (
+                                                                clause.posting.term_index(),
+                                                                d.frequency(),
+                                                            )
+                                                        })
                                                     })
-                                                })
-                                            }),
-                                        ),
-                                    )? && let Some(kth) = candidates.kth_score_if_full()
-                                    {
-                                        self.update_threshold(kth, params.wand_factor);
+                                                }),
+                                            ),
+                                        )? && let Some(kth) = candidates.kth_score_if_full()
+                                        {
+                                            self.update_threshold(kth, params.wand_factor);
+                                        }
                                     }
                                 }
                             }
@@ -2673,6 +2842,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             // Stream the essential clauses through inner windows.
+            #[cfg(test)]
+            {
+                self.maxscore_general_windows += 1;
+            }
             let mut inner_min = window_min;
             loop {
                 let mut next_essential_doc = TERMINATED_DOC_ID;
@@ -2717,11 +2890,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         num_comparisons += 1;
 
                         if self.threshold > 0.0
-                            && score_sum_cannot_exceed(
+                            && score_sum_cannot_compete(
                                 score,
                                 total_non_essential_bound,
                                 self.threshold,
                                 total_sum_upper_bound_factor,
+                                CompetitiveFloorMode::Exclusive,
                             )
                         {
                             acc.clear_slot(slot);
@@ -2740,19 +2914,27 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let norm_addend =
                             norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
                         let mut doc_length_cell: Option<u32> = None;
+                        let needs_canonical_rescore =
+                            first_essential != 0 || !clauses_in_query_order;
+                        let mut scores_by_query_rank = SmallVec::<[f32; 8]>::new();
+                        if needs_canonical_rescore {
+                            scores_by_query_rank.resize(num_query_terms, 0.0);
+                        }
                         let mut rejected = false;
                         for i in (0..first_essential).rev() {
                             if self.threshold > 0.0
-                                && score_sum_cannot_exceed(
+                                && score_sum_cannot_compete(
                                     score,
                                     clauses[i].prefix_bound,
                                     self.threshold,
                                     total_sum_upper_bound_factor,
+                                    CompetitiveFloorMode::Exclusive,
                                 )
                             {
                                 rejected = true;
                                 break;
                             }
+                            let query_rank = clauses[i].query_rank;
                             let posting = &mut clauses[i].posting;
                             if posting.doc().is_some_and(|d| d.doc_id() < doc) {
                                 posting.next(doc);
@@ -2760,7 +2942,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             if let Some(d) = posting.doc()
                                 && d.doc_id() == doc
                             {
-                                score += match norm_addend {
+                                let contribution = match norm_addend {
                                     Some(addend) => {
                                         posting.query_weight
                                             * bm25_doc_weight_with_norm(d.frequency(), addend)
@@ -2773,12 +2955,48 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                         posting.score(&self.scorer, d.frequency(), doc_length)
                                     }
                                 };
+                                score += contribution;
+                                if needs_canonical_rescore {
+                                    scores_by_query_rank[query_rank] = contribution;
+                                }
                             }
                         }
 
-                        if !rejected && score > self.threshold {
+                        if !rejected {
                             let doc_length = doc_length_cell
                                 .unwrap_or_else(|| self.documents.scoring_num_tokens(doc as u32));
+                            let score = if !needs_canonical_rescore {
+                                // `collect_window_scores` visited every
+                                // essential clause in query order, so the
+                                // accumulator already contains the canonical
+                                // f32 fold. Avoid rescoring exhaustive hits.
+                                score
+                            } else {
+                                for (i, clause) in clauses.iter().enumerate().skip(first_essential)
+                                {
+                                    let freq = acc.clause_freq(i, slot);
+                                    if freq == 0 {
+                                        continue;
+                                    }
+                                    let contribution = match norm_addend {
+                                        Some(addend) => {
+                                            clause.posting.query_weight
+                                                * bm25_doc_weight_with_norm(freq, addend)
+                                        }
+                                        None => {
+                                            clause.posting.score(&self.scorer, freq, doc_length)
+                                        }
+                                    };
+                                    scores_by_query_rank[clause.query_rank] = contribution;
+                                }
+                                scores_by_query_rank
+                                    .iter()
+                                    .fold(0.0_f32, |sum, contribution| sum + contribution)
+                            };
+                            if score <= self.threshold {
+                                acc.clear_slot(slot);
+                                continue;
+                            }
                             if candidates.insert(
                                 ScoredDoc::new(document_key, score),
                                 doc_length,
@@ -2820,15 +3038,35 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
-    // calculate the score of the current document
-    fn score(&self, doc_length: u32) -> f32 {
-        let mut score = 0.0;
-        for posting in &self.lead {
-            if let Some(doc) = posting.doc() {
-                score += posting.score(&self.scorer, doc.frequency(), doc_length);
-            }
+    /// Calculate the current document's score in query order.
+    ///
+    /// WAND deliberately reorders postings by doc id, cost, and score bound.
+    /// Floating-point addition is not associative, so that execution order
+    /// must not leak into the public score or top-k tie boundary.
+    fn score_in_query_order(&self, doc_length: u32) -> f32 {
+        if self.lead.windows(2).all(|window| {
+            (window[0].position, window[0].token_id) <= (window[1].position, window[1].token_id)
+        }) {
+            return self.lead.iter().fold(0.0_f32, |score, posting| {
+                score
+                    + posting.doc().map_or(0.0, |doc| {
+                        posting.score(&self.scorer, doc.frequency(), doc_length)
+                    })
+            });
         }
-        score
+        let contributions = self
+            .lead
+            .iter()
+            .filter_map(|posting| {
+                posting.doc().map(|doc| {
+                    (
+                        (posting.position, posting.token_id),
+                        posting.score(&self.scorer, doc.frequency(), doc_length),
+                    )
+                })
+            })
+            .collect::<SmallVec<[ScoreContribution; 8]>>();
+        score_contributions_in_query_order(contributions)
     }
 
     // iterate over all the preceding terms and collect the term index and frequency
@@ -2858,10 +3096,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         let remaining_upper_bound = remaining
             .iter()
-            .map(|posting| posting.block_max_score(&self.scorer))
-            .sum::<f32>();
-        first.score(&self.scorer, doc.frequency(), doc_length) + remaining_upper_bound
-            <= self.threshold
+            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+            .sum::<f64>();
+        score_sum_cannot_compete(
+            first.score(&self.scorer, doc.frequency(), doc_length),
+            remaining_upper_bound,
+            self.threshold,
+            score_sum_upper_bound_factor(self.num_terms),
+            self.floor_mode,
+        )
     }
 
     // find the next doc candidate
@@ -2895,7 +3138,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             // Block-Max WAND pruning: skip the whole window when its score upper
             // bound cannot reach the top-k threshold.
-            if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
+            if self.threshold > 0.0
+                && self
+                    .floor_mode
+                    .rejects_upper_bound(f64::from(self.or_block_window_max()), self.threshold)
+            {
                 // On the final block `up_to` is the `u64::MAX` sentinel; step once
                 // there to avoid seeking past the valid doc id range.
                 let mut skip_to = match self.up_to {
@@ -2927,13 +3174,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
 
-            while lead_score <= self.threshold {
-                if lead_score + self.tail_max_score <= self.threshold {
+            while !self.floor_mode.accepts_score(lead_score, self.threshold) {
+                if score_sum_cannot_compete(
+                    lead_score,
+                    self.tail_upper_bound_sum(),
+                    self.threshold,
+                    score_sum_upper_bound_factor(self.num_terms),
+                    self.floor_mode,
+                ) {
                     self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
                 if !self.advance_tail_top(target, doc_length, &mut lead_score) {
-                    self.push_back_leads(first_doc.doc_id() + 1);
+                    // Dynamic heap-order accumulation may be below the query-
+                    // order score. Let the final canonical scorer decide.
                     break;
                 }
             }
@@ -3037,6 +3291,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         let num_lists = self.lead.len();
         let phrase_slop = params.phrase_slop;
+        let mut score_order = (0..num_lists).collect::<Vec<_>>();
+        score_order.sort_unstable_by_key(|&index| {
+            let posting = &self.lead[index];
+            (posting.position, posting.token_id)
+        });
 
         // Per-window view of one clause's current block. Raw pointers into the
         // clause's `CompressedState`; valid for the whole window because the
@@ -3072,25 +3331,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 $(#[$feat])?
                 unsafe fn $name2(
                     wins: &[WindowList],
-                    lut: &[f32; FREQ_LUT_BUCKETS],
-                    others_block_max: f32,
-                    threshold: f32,
+                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
                     docs_out: &mut Vec<u32>,
                     offs_out: &mut Vec<u8>,
                 ) {
                     let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
                     let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
                     let f0 = wins[0].freqs;
-                    let prune = threshold > f32::NEG_INFINITY;
                     unsafe {
                         while p0 < e0 {
                             let doc = *d0.add(p0);
-                            if prune {
-                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                                if lut[freq] + others_block_max <= threshold {
-                                    p0 += 1;
-                                    continue;
-                                }
+                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                            if freq_cannot_beat[freq] {
+                                p0 += 1;
+                                continue;
                             }
                             p1 = $geq(d1, p1, e1, doc);
                             if p1 >= e1 {
@@ -3112,9 +3366,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 $(#[$feat])?
                 unsafe fn $name3(
                     wins: &[WindowList],
-                    lut: &[f32; FREQ_LUT_BUCKETS],
-                    others_block_max: f32,
-                    threshold: f32,
+                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
                     docs_out: &mut Vec<u32>,
                     offs_out: &mut Vec<u8>,
                 ) {
@@ -3122,16 +3374,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
                     let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
                     let f0 = wins[0].freqs;
-                    let prune = threshold > f32::NEG_INFINITY;
                     unsafe {
                         'outer: while p0 < e0 {
                             let doc = *d0.add(p0);
-                            if prune {
-                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                                if lut[freq] + others_block_max <= threshold {
-                                    p0 += 1;
-                                    continue 'outer;
-                                }
+                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                            if freq_cannot_beat[freq] {
+                                p0 += 1;
+                                continue 'outer;
                             }
                             p1 = $geq(d1, p1, e1, doc);
                             if p1 >= e1 {
@@ -3183,25 +3432,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         #[allow(clippy::too_many_arguments)]
         fn merge_window_n(
             wins: &[WindowList],
-            lut: &[f32; FREQ_LUT_BUCKETS],
-            others_block_max: f32,
-            threshold: f32,
+            freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
             cursors: &mut Vec<usize>,
             docs_out: &mut Vec<u32>,
             offs_out: &mut Vec<u8>,
         ) {
-            let prune = threshold > f32::NEG_INFINITY;
             cursors.clear();
             cursors.extend(wins.iter().map(|win| win.pos));
             'outer: while cursors[0] < wins[0].end {
                 let doc = unsafe { *wins[0].docs.add(cursors[0]) };
-                if prune {
-                    let freq = unsafe { *wins[0].freqs.add(cursors[0]) as usize }
-                        .min(FREQ_LUT_BUCKETS - 1);
-                    if lut[freq] + others_block_max <= threshold {
-                        cursors[0] += 1;
-                        continue 'outer;
-                    }
+                let freq =
+                    unsafe { *wins[0].freqs.add(cursors[0]) as usize }.min(FREQ_LUT_BUCKETS - 1);
+                if freq_cannot_beat[freq] {
+                    cursors[0] += 1;
+                    continue 'outer;
                 }
                 for j in 1..wins.len() {
                     let win = &wins[j];
@@ -3359,19 +3603,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // Constant within the window (block-anchored); mirrors
                 // `and_candidate_cannot_beat_threshold`'s remaining-clause
                 // bound of first-clause-exact + rest-block-max.
-                let others_block_max: f32 = self.lead[1..]
+                let others_block_max = self.lead[1..]
                     .iter()
-                    .map(|posting| posting.block_max_score(&self.scorer))
-                    .sum();
+                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                    .sum::<f64>();
 
                 batch_docs.clear();
                 batch_offs.clear();
-                // NEG_INFINITY disables the kernel-level freq-bound prune
-                // (single clause, or no threshold yet).
-                let kernel_threshold = if self.threshold > 0.0 && num_lists >= 2 {
-                    self.threshold
+                // Precompute the conservative decision once per frequency
+                // bucket so the scalar and SIMD merge kernels stay
+                // floating-point-free.
+                let freq_cannot_beat = if self.threshold > 0.0 && num_lists >= 2 {
+                    std::array::from_fn(|frequency| {
+                        score_sum_cannot_compete(
+                            freq_bound_lut[frequency],
+                            others_block_max,
+                            self.threshold,
+                            score_sum_upper_bound_factor(num_lists),
+                            CompetitiveFloorMode::Exclusive,
+                        )
+                    })
                 } else {
-                    f32::NEG_INFINITY
+                    [false; FREQ_LUT_BUCKETS]
                 };
                 #[cfg(target_arch = "x86_64")]
                 let use_avx2 = *HAS_AVX2;
@@ -3383,9 +3636,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (2, true) => unsafe {
                         merge_window_2_avx2(
                             &wins,
-                            &freq_bound_lut,
-                            others_block_max,
-                            kernel_threshold,
+                            &freq_cannot_beat,
                             &mut batch_docs,
                             &mut batch_offs,
                         )
@@ -3394,38 +3645,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, true) => unsafe {
                         merge_window_3_avx2(
                             &wins,
-                            &freq_bound_lut,
-                            others_block_max,
-                            kernel_threshold,
+                            &freq_cannot_beat,
                             &mut batch_docs,
                             &mut batch_offs,
                         )
                     },
                     (2, _) => unsafe {
-                        merge_window_2(
-                            &wins,
-                            &freq_bound_lut,
-                            others_block_max,
-                            kernel_threshold,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
+                        merge_window_2(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
                     },
                     (3, _) => unsafe {
-                        merge_window_3(
-                            &wins,
-                            &freq_bound_lut,
-                            others_block_max,
-                            kernel_threshold,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
+                        merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
                     },
                     _ => merge_window_n(
                         &wins,
-                        &freq_bound_lut,
-                        others_block_max,
-                        kernel_threshold,
+                        &freq_cannot_beat,
                         &mut cursor_scratch,
                         &mut batch_docs,
                         &mut batch_offs,
@@ -3478,7 +3711,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             None => self.lead[0].score(&self.scorer, first_freq, doc_length),
                         };
-                        if first_score + others_block_max <= self.threshold {
+                        if score_sum_cannot_compete(
+                            first_score,
+                            others_block_max,
+                            self.threshold,
+                            score_sum_upper_bound_factor(num_lists),
+                            CompetitiveFloorMode::Exclusive,
+                        ) {
                             self.and_candidates_pruned_before_return += 1;
                             continue;
                         }
@@ -3516,9 +3755,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     }
                     stats.full_scores += 1;
 
-                    let mut score = 0.0f32;
-                    for ((win, posting), &off) in wins.iter().zip(self.lead.iter()).zip(offs.iter())
-                    {
+                    let mut score = 0.0_f32;
+                    for &clause_index in &score_order {
+                        let win = &wins[clause_index];
+                        let posting = &self.lead[clause_index];
+                        let off = offs[clause_index];
                         let freq = unsafe { *win.freqs.add(off as usize) };
                         score += match norm_addend {
                             Some(addend) => {
@@ -3597,11 +3838,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .map(|posting| Self::posting_block_up_to(posting, target))
             .min()
             .unwrap_or(TERMINATED_DOC_ID);
-        let narrow_max_score = self
-            .lead
-            .iter()
-            .map(|posting| posting.block_max_score(&self.scorer))
-            .sum::<f32>();
+        let narrow_max_score = conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.block_max_score(&self.scorer)),
+        );
 
         if narrow_max_score >= self.threshold {
             self.up_to = Some(narrow_up_to);
@@ -3620,13 +3861,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && self.lead.iter().all(|posting| posting.is_compressed());
 
         if can_try_wide {
-            let mut wide_max_score = 0.0;
+            let mut wide_bounds = SmallVec::<[f32; 8]>::new();
             let mut range_blocks_scanned = 0;
             for posting in &mut self.lead {
                 let block_max = posting.block_max_score_up_to_with_stats(lead_up_to, &self.scorer);
-                wide_max_score += block_max.score;
+                wide_bounds.push(block_max.score);
                 range_blocks_scanned += block_max.blocks_scanned;
             }
+            let wide_max_score = conservative_score_sum(wide_bounds.into_iter());
             self.and_window_stats.range_blocks_scanned += range_blocks_scanned;
 
             if wide_max_score < self.threshold {
@@ -3711,19 +3953,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// Upper bound on the score of any document in the window `[target, up_to]`
     /// for a disjunction. Sums the block-max of every overlapping iterator:
     /// `lead`, `head` (later docs still in the window, which
-    /// `can_target_beat_threshold` omits), and the tail via `tail_max_score`.
+    /// `can_target_beat_threshold` omits), and the individual tail bounds.
     fn or_block_window_max(&self) -> f32 {
-        let lead: f32 = self
-            .lead
-            .iter()
-            .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
-            .sum();
-        let head: f32 = self
-            .head
-            .iter()
-            .map(|posting| posting.posting.window_max_score(self.up_to, &self.scorer))
-            .sum();
-        lead + head + self.tail_max_score
+        conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
+                .chain(
+                    self.head
+                        .iter()
+                        .map(|posting| posting.posting.window_max_score(self.up_to, &self.scorer)),
+                )
+                .chain(self.tail.iter().map(|posting| posting.upper_bound)),
+        )
     }
 
     fn can_target_beat_threshold(&mut self, target: u64) -> bool {
@@ -3731,22 +3973,39 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.update_max_scores(target);
         }
 
-        let mut sum = self
-            .lead
-            .iter()
-            .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
-            .sum::<f32>();
         let mut possible_matches = self.lead.len();
         for posting in &self.tail {
             if matches!(posting.posting.block_first_doc(), Some(block_doc) if block_doc <= target) {
-                sum += posting.posting.window_max_score(self.up_to, &self.scorer);
                 possible_matches += 1;
             }
         }
+        let sum = conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
+                .chain(
+                    self.tail
+                        .iter()
+                        .filter(|posting| {
+                            matches!(
+                                posting.posting.block_first_doc(),
+                                Some(block_doc) if block_doc <= target
+                            )
+                        })
+                        .map(|posting| posting.posting.window_max_score(self.up_to, &self.scorer)),
+                ),
+        );
 
         match self.operator {
-            Operator::And => possible_matches >= self.num_terms && sum > self.threshold,
-            Operator::Or => sum > self.threshold,
+            Operator::And => {
+                possible_matches >= self.num_terms
+                    && !self
+                        .floor_mode
+                        .rejects_upper_bound(f64::from(sum), self.threshold)
+            }
+            Operator::Or => !self
+                .floor_mode
+                .rejects_upper_bound(f64::from(sum), self.threshold),
         }
     }
 
@@ -3843,29 +4102,29 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Second pass over the memoized bounds: sum only the iterators that
         // can produce a doc inside the skipped range.
-        let mut bounds_sum = 0.0_f32;
+        let mut bounds = SmallVec::<[f32; 8]>::new();
         for posting in &self.lead {
-            let (_, score) = posting.impact_group_bound(&self.scorer)?;
-            bounds_sum += score;
+            bounds.push(posting.impact_group_bound(&self.scorer)?.1);
         }
-        for posting in self.head.iter() {
-            if posting.doc_id() > group_up_to {
-                continue;
-            }
-            let (_, score) = posting.posting.impact_group_bound(&self.scorer)?;
-            bounds_sum += score;
+        for posting in self
+            .head
+            .iter()
+            .filter(|posting| posting.doc_id() <= group_up_to)
+        {
+            bounds.push(posting.posting.impact_group_bound(&self.scorer)?.1);
         }
-        for tail_posting in self.tail.iter() {
-            if !matches!(
+        for tail_posting in self.tail.iter().filter(|tail_posting| {
+            matches!(
                 tail_posting.posting.block_first_doc(),
                 Some(block_doc) if block_doc <= group_up_to
-            ) {
-                continue;
-            }
-            let (_, score) = tail_posting.posting.impact_group_bound(&self.scorer)?;
-            bounds_sum += score;
+            )
+        }) {
+            bounds.push(tail_posting.posting.impact_group_bound(&self.scorer)?.1);
         }
-        (bounds_sum <= self.threshold).then_some(group_up_to.saturating_add(1))
+        let bounds_sum = conservative_score_sum(bounds.into_iter());
+        self.floor_mode
+            .rejects_upper_bound(f64::from(bounds_sum), self.threshold)
+            .then_some(group_up_to.saturating_add(1))
     }
 
     fn refine_or_candidate(&mut self, target: u64, doc_length: u32) -> bool {
@@ -3883,12 +4142,21 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             })
             .sum::<f32>();
 
-        while lead_score <= self.threshold {
-            if lead_score + self.tail_max_score <= self.threshold {
+        while !self.floor_mode.accepts_score(lead_score, self.threshold) {
+            if score_sum_cannot_compete(
+                lead_score,
+                self.tail_upper_bound_sum(),
+                self.threshold,
+                score_sum_upper_bound_factor(self.num_terms),
+                self.floor_mode,
+            ) {
                 return false;
             }
             if !self.advance_tail_top(target, doc_length, &mut lead_score) {
-                return false;
+                // No remaining posting can be advanced, but f32 execution-
+                // order rounding may still leave the canonical score at or
+                // above the inclusive floor.
+                return true;
             }
         }
 
@@ -3947,7 +4215,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     fn insert_tail(&mut self, posting: Box<PostingIterator>, upper_bound: f32) {
-        self.tail_max_score += upper_bound;
+        self.tail_max_score = next_up_f64(self.tail_max_score + f64::from(upper_bound));
         self.tail
             .push(TailPosting::new(upper_bound, posting.cost(), posting));
     }
@@ -3964,7 +4232,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Some(posting);
         }
 
-        if self.tail_max_score + upper_bound < self.threshold {
+        let parked_upper_bound = self.tail_upper_bound_sum() + f64::from(upper_bound);
+        if score_sum_cannot_compete(
+            0.0,
+            parked_upper_bound,
+            self.threshold,
+            score_sum_upper_bound_factor(self.num_terms),
+            self.floor_mode,
+        ) {
             self.insert_tail(posting, upper_bound);
             return None;
         }
@@ -3978,7 +4253,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && top > &candidate
         {
             let evicted = self.tail.pop().expect("peeked tail posting should exist");
-            self.tail_max_score = self.tail_max_score - evicted.upper_bound + upper_bound;
+            self.remove_tail_upper_bound(evicted.upper_bound);
+            self.tail_max_score = next_up_f64(self.tail_max_score + f64::from(upper_bound));
             self.tail.push(candidate);
             return Some(evicted.posting);
         }
@@ -4057,7 +4333,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         else {
             return false;
         };
-        self.tail_max_score -= upper_bound;
+        self.remove_tail_upper_bound(upper_bound);
         posting.next(target);
         match posting.doc() {
             Some(doc) if doc.doc_id() == target => {
@@ -4068,6 +4344,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             None => {}
         }
         true
+    }
+
+    #[inline]
+    fn tail_upper_bound_sum(&self) -> f64 {
+        self.tail_max_score
+    }
+
+    #[inline]
+    fn remove_tail_upper_bound(&mut self, upper_bound: f32) {
+        if self.tail.is_empty() {
+            self.tail_max_score = 0.0;
+            return;
+        }
+        self.tail_max_score = next_up_f64((self.tail_max_score - f64::from(upper_bound)).max(0.0));
     }
 
     fn advance_all_tail(
@@ -4400,9 +4690,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                     .fold(0, usize::saturating_add),
             ),
         }
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .min(documents.visible_cost_upper_bound());
         Self {
-            wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            wand: Wand::new(operator, postings.into_iter(), documents, scorer)
+                .with_floor_mode(CompetitiveFloorMode::Inclusive),
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
             cost,
@@ -4443,7 +4735,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     fn position_next(&mut self) -> Result<Option<u64>> {
         loop {
-            let Some((doc, mut score)) = self.wand.next()? else {
+            let Some((doc, _)) = self.wand.next()? else {
                 self.clear_current();
                 self.record_metrics();
                 return Ok(None);
@@ -4457,13 +4749,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 continue;
             };
             let doc_length = self.wand.documents.doc_length(&doc);
-            if self.wand.operator == Operator::Or {
-                self.wand
-                    .advance_all_tail(doc_id, Some(doc_length), Some(&mut score));
-            } else {
-                self.wand.advance_all_tail(doc_id, None, None);
-                score = self.wand.score(doc_length);
-            }
+            self.wand.advance_all_tail(doc_id, None, None);
+            let score = self.wand.score_in_query_order(doc_length);
             self.current_doc = Some(doc);
             self.current_document_key = Some(document_key);
             self.current_score = score;
@@ -4551,9 +4838,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 "minimum competitive FTS score cannot be NaN",
             ));
         }
-        let threshold = next_down_f32(min_score) * self.wand_factor;
-        if threshold > self.wand.threshold {
-            self.wand.threshold = threshold;
+        let floor = min_score * self.wand_factor;
+        if floor > self.wand.threshold {
+            self.wand.threshold = floor;
         }
         Ok(())
     }
@@ -4677,8 +4964,14 @@ fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
         (count + 1, sum + f64::from(score))
     });
     let widened = exact * score_sum_upper_bound_factor(num_scores);
-    let rounded = widened as f32;
-    if f64::from(rounded) < widened {
+    outward_f32_upper_bound(widened)
+}
+
+/// Round a wide score bound to the least `f32` that still covers it.
+#[inline]
+pub(super) fn outward_f32_upper_bound(value: f64) -> f32 {
+    let rounded = value as f32;
+    if f64::from(rounded) < value {
         next_up_f32(rounded)
     } else {
         rounded
@@ -4700,18 +4993,19 @@ fn next_up_f32(value: f32) -> f32 {
     }
 }
 
-fn next_down_f32(value: f32) -> f32 {
+#[inline]
+fn next_up_f64(value: f64) -> f64 {
     if !value.is_finite() {
         return value;
     }
     if value == 0.0 {
-        return f32::from_bits((1_u32 << 31) | 1);
+        return f64::from_bits(1);
     }
     let bits = value.to_bits();
     if value > 0.0 {
-        f32::from_bits(bits - 1)
+        f64::from_bits(bits + 1)
     } else {
-        f32::from_bits(bits + 1)
+        f64::from_bits(bits - 1)
     }
 }
 
@@ -4722,6 +5016,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::documents::resident_row_address_projection_for_test;
     use super::super::impact::build_impact_skip_data;
     use super::*;
     use crate::scalar::inverted::scorer::{IndexBM25Scorer, MemBM25Scorer};
@@ -4736,6 +5031,129 @@ mod tests {
             },
         },
     };
+
+    struct CostOnlyDocuments {
+        total_docs: usize,
+        visible_cost_upper_bound: usize,
+    }
+
+    impl WandDocuments for CostOnlyDocuments {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.total_docs
+        }
+
+        fn visible_cost_upper_bound(&self) -> usize {
+            self.visible_cost_upper_bound
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
+            1
+        }
+
+        fn doc_length(&self, _doc: &DocInfo) -> u32 {
+            1
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            Some(doc.doc_id())
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            Some(u64::from(doc_id))
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, _doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
+            1
+        }
+    }
+
+    #[test]
+    fn wand_cursor_cost_uses_materialized_visibility_upper_bound() {
+        let total_docs = 10;
+        let selected = DocVisibility::Selected(roaring::RoaringBitmap::from_iter([1, 7]));
+        let selected_bound = <&DocVisibility as ModernVisibility>::len(&&selected, total_docs);
+
+        let filtered = DocVisibility::Filtered {
+            projection: resident_row_address_projection_for_test((0..total_docs as u64).collect()),
+            mask: Arc::new(RowAddrMask::all_rows()),
+        };
+        let filtered_bound = <&DocVisibility as ModernVisibility>::len(&&filtered, total_docs);
+        let all_bound = AllModernDocuments.len(total_docs);
+
+        assert_eq!(selected_bound, 2);
+        assert_eq!(filtered_bound, total_docs);
+        assert_eq!(all_bound, total_docs);
+
+        let scorer = Arc::new(MemBM25Scorer::new(
+            total_docs as u64,
+            total_docs,
+            std::collections::HashMap::from([("term".to_owned(), 8)]),
+        ));
+        let posting = || {
+            PostingIterator::new(
+                "term".to_owned(),
+                0,
+                0,
+                generate_posting_list((0..8).collect(), 1.0, None, true),
+                total_docs,
+            )
+        };
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let selected_documents = CostOnlyDocuments {
+            total_docs,
+            visible_cost_upper_bound: selected_bound,
+        };
+        let selected_cursor = WandCursor::new(
+            Operator::Or,
+            vec![posting()],
+            &selected_documents,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        assert_eq!(selected_cursor.cost(), 2);
+
+        for visible_cost_upper_bound in [filtered_bound, all_bound] {
+            let documents = CostOnlyDocuments {
+                total_docs,
+                visible_cost_upper_bound,
+            };
+            let cursor = WandCursor::new(
+                Operator::Or,
+                vec![posting()],
+                &documents,
+                scorer.clone(),
+                &params,
+                &metrics,
+            );
+            assert_eq!(cursor.cost(), 8);
+        }
+
+        let mut complete_docs = DocSet::default();
+        for doc_id in 0..total_docs {
+            complete_docs.append(doc_id as u64, 1);
+        }
+        assert_eq!(
+            WandDocuments::visible_cost_upper_bound(&complete_docs),
+            total_docs
+        );
+    }
 
     #[test]
     fn conservative_score_sum_covers_query_order_f32_rounding() {
@@ -4816,11 +5234,28 @@ mod tests {
         assert!(actual_score > threshold);
 
         let prefix_bound = remaining_bounds.into_iter().map(f64::from).sum::<f64>();
-        assert!(!score_sum_cannot_exceed(
+        assert!(!score_sum_cannot_compete(
             essential_score,
             prefix_bound,
             threshold,
             score_sum_upper_bound_factor(3),
+            CompetitiveFloorMode::Exclusive,
+        ));
+    }
+
+    #[test]
+    fn two_clause_inclusive_bound_rounds_outward_at_f32_boundary() {
+        let partial_score = 1.0_f32;
+        let remaining_upper_bound = f32::from_bits(0x3380_0001);
+        let floor = partial_score + remaining_upper_bound;
+
+        assert_eq!(floor.to_bits(), 0x3f80_0001);
+        assert!(!score_sum_cannot_compete(
+            partial_score,
+            f64::from(remaining_upper_bound),
+            floor,
+            score_sum_upper_bound_factor(2),
+            CompetitiveFloorMode::Inclusive,
         ));
     }
 
@@ -4834,6 +5269,256 @@ mod tests {
         fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
             freq as f32
         }
+    }
+
+    struct AdjacentScoreScorer;
+
+    impl Scorer for AdjacentScoreScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
+            match freq {
+                1 => f32::from_bits(1.0_f32.to_bits() - 1),
+                2 => 1.0,
+                _ => unreachable!("test only defines two score buckets"),
+            }
+        }
+    }
+
+    #[test]
+    fn inclusive_floor_keeps_tie_without_admitting_lower_ulp() {
+        let posting = PostingIterator::with_query_weight(
+            "term".to_owned(),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(vec![0, 1], vec![1, 2], 1.0, None, false),
+            2,
+        );
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.append(1, 1);
+        let mut wand = Wand::new(
+            Operator::Or,
+            std::iter::once(posting),
+            &docs,
+            AdjacentScoreScorer,
+        )
+        .with_floor_mode(CompetitiveFloorMode::Inclusive);
+        wand.update_threshold(1.0, 1.0);
+
+        let (doc, score) = wand.next().unwrap().unwrap();
+        assert_eq!(doc.doc_id(), 1);
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn final_score_uses_query_order_and_keeps_floor_ties() {
+        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32];
+        // Bounds deliberately make the WAND heap visit positions 2, 0, 1.
+        let bounds = [2.0_f32, 1.0, 3.0];
+        let postings = || {
+            contributions
+                .into_iter()
+                .zip(bounds)
+                .enumerate()
+                .map(|(position, (query_weight, max_score))| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        query_weight,
+                        generate_posting_list(vec![0], max_score, None, false),
+                        1,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let mut wand = Wand::new(Operator::Or, postings().into_iter(), &docs, UnitScorer);
+
+        let (_, heap_order_score) = wand.next().unwrap().unwrap();
+        let query_order_score = contributions
+            .into_iter()
+            .fold(0.0_f32, |score, contribution| score + contribution);
+        let wide_score = contributions
+            .into_iter()
+            .fold(0.0_f64, |score, contribution| {
+                score + f64::from(contribution)
+            }) as f32;
+
+        assert_eq!(query_order_score.to_bits(), 0x3be0_094c);
+        assert_eq!(wide_score.to_bits(), 0x3be0_094b);
+        assert_eq!(heap_order_score.to_bits(), 0x3be0_094a);
+        assert_eq!(wand.score_in_query_order(1), query_order_score);
+
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        // Equal-score candidates remain competitive because row id is the
+        // final tie-breaker. The internal heap-order sum is slightly lower.
+        cursor.set_min_competitive_score(query_order_score).unwrap();
+        assert_eq!(cursor.next().unwrap(), Some(0));
+        assert_eq!(cursor.current_score().unwrap(), query_order_score);
+    }
+
+    #[rstest]
+    #[case::initial_floor(false)]
+    #[case::explicit_zero_floor(true)]
+    fn wand_cursor_preserves_zero_score_membership(#[case] set_zero_floor: bool) {
+        let posting = PostingIterator::with_query_weight(
+            "common".to_owned(),
+            0,
+            0,
+            0.0,
+            generate_posting_list(vec![0], 0.0, None, false),
+            1,
+        );
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![posting],
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        if set_zero_floor {
+            cursor.set_min_competitive_score(0.0).unwrap();
+        }
+
+        assert_eq!(cursor.next().unwrap(), Some(0));
+        assert_eq!(cursor.current_score().unwrap(), 0.0);
+    }
+
+    #[rstest]
+    #[case::all_essential(false)]
+    #[case::single_essential(true)]
+    fn maxscore_publishes_query_order_score_bits(#[case] single_essential: bool) {
+        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32];
+        // Each bound covers its term's exact contribution. Sorted by bound,
+        // the two smallest fit below a floor just under the exact score while
+        // all three do not, which forces the single-essential MAXSCORE path.
+        let bounds = [0.002_99_f32, 0.001_99_f32, 0.003_f32];
+        let postings = contributions
+            .into_iter()
+            .zip(bounds)
+            .enumerate()
+            .map(|(position, (query_weight, max_score))| {
+                PostingIterator::with_query_weight(
+                    format!("t{position}"),
+                    position as u32,
+                    position as u32,
+                    query_weight,
+                    generate_posting_list(vec![0], max_score, None, true),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        )
+        .with_shared_threshold(shared_floor.clone());
+        let query_order_score = contributions
+            .into_iter()
+            .fold(0.0_f32, |score, contribution| score + contribution);
+        if single_essential {
+            wand.threshold = f32::from_bits(query_order_score.to_bits() - 1);
+        }
+
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(1)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, 0);
+        assert_eq!(shared_floor.load(Ordering::Relaxed), 0x3be0_094c);
+        assert_eq!(scored.load(Ordering::Relaxed), contributions.len());
+        assert_eq!(wand.maxscore_single_essential_windows > 0, single_essential);
+        assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
+    }
+
+    #[test]
+    fn bulk_and_and_classic_publish_identical_query_order_score_bits() {
+        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32];
+        let bounds = [0.002_99_f32, 0.001_99_f32, 0.003_f32];
+        // Different posting lengths force cost order 1, 2, 0 instead of query
+        // order 0, 1, 2.
+        let clause_docs = [vec![0, 1, 2], vec![0], vec![0, 1]];
+        let mut docs = DocSet::default();
+        for doc_id in 0..3 {
+            docs.append(doc_id, 1);
+        }
+
+        let run = |mode| {
+            let postings = contributions
+                .into_iter()
+                .zip(bounds)
+                .zip(clause_docs.iter())
+                .enumerate()
+                .map(|(position, ((query_weight, max_score), doc_ids))| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        query_weight,
+                        generate_posting_list(doc_ids.clone(), max_score, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_shared_threshold(shared_floor.clone());
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(1)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            (
+                hits,
+                shared_floor.load(Ordering::Relaxed),
+                wand.bulk_and_searches > 0,
+            )
+        };
+
+        let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On);
+        let (classic, classic_score, classic_used) = run(BulkAndMode::Off);
+        assert!(bulk_used);
+        assert!(!classic_used);
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(classic.len(), 1);
+        assert_eq!(bulk[0].document, 0);
+        assert_eq!(classic[0].document, 0);
+        assert_eq!(bulk_score, 0x3be0_094c);
+        assert_eq!(classic_score, bulk_score);
     }
 
     struct PartialNormScorer;
@@ -5411,6 +6096,30 @@ mod tests {
 
         iter.next(num_docs as u64 + 10);
         assert!(iter.doc().is_none());
+    }
+
+    #[test]
+    fn posting_iterator_fork_restarts_shared_compressed_payload() {
+        let num_docs = (BLOCK_SIZE * 2 + 5) as u32;
+        let posting = generate_posting_list((0..num_docs).collect(), 1.0, None, true);
+        let mut original =
+            PostingIterator::new(String::from("term"), 7, 3, posting, num_docs as usize);
+
+        original.next(BLOCK_SIZE as u64 + 3);
+        assert_eq!(
+            original.doc().map(|doc| doc.doc_id()),
+            Some(BLOCK_SIZE as u64 + 3)
+        );
+
+        let mut replay = original.fork_from_start();
+        assert_eq!(replay.doc().map(|doc| doc.doc_id()), Some(0));
+        replay.next(5);
+        assert_eq!(replay.doc().map(|doc| doc.doc_id()), Some(5));
+        assert_eq!(
+            original.doc().map(|doc| doc.doc_id()),
+            Some(BLOCK_SIZE as u64 + 3),
+            "fork advancement must not mutate the membership cursor"
+        );
     }
 
     #[test]
@@ -6707,7 +7416,7 @@ mod tests {
             None,
         ));
         let posting = PostingIterator::new(String::from("term"), 0, 0, posting_list, doc_ids.len());
-        let expected_bound = K1 + 1.0;
+        let expected_bound = BM25_DOC_WEIGHT_UPPER_BOUND;
 
         assert_eq!(posting.approximate_upper_bound(), expected_bound);
         assert_eq!(posting.global_upper_bound(&scorer), expected_bound);
