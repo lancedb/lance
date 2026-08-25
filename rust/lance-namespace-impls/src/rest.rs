@@ -2279,4 +2279,123 @@ mod tests {
         let result = namespace.list_namespaces(request).await;
         assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
+
+    #[tokio::test]
+    async fn test_alter_table_backfill_columns_with_extra_forwards_unknown_fields() {
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/backfill_column".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-123"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = AlterTableBackfillColumnsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            column: "embedding".to_string(),
+            concurrency: Some(Some(4)),
+            ..Default::default()
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("use_cpu_only_pool".to_string(), serde_json::json!(true));
+        extra.insert("task_size".to_string(), serde_json::json!(65536));
+
+        let result = namespace
+            .alter_table_backfill_columns_with_extra(request, extra)
+            .await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        assert_eq!(result.unwrap().job_id, "job-123");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+
+        // Fields the typed request declares are still there, untouched.
+        assert_eq!(body["column"], serde_json::json!("embedding"));
+        assert_eq!(body["concurrency"], serde_json::json!(4));
+        // Fields the typed request has no slot for made it through anyway.
+        assert_eq!(body["use_cpu_only_pool"], serde_json::json!(true));
+        assert_eq!(body["task_size"], serde_json::json!(65536));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_backfill_columns_with_extra_empty_matches_plain_request() {
+        // With no extras, the two call styles should be indistinguishable.
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/backfill_column".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-456"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = AlterTableBackfillColumnsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            column: "embedding".to_string(),
+            ..Default::default()
+        };
+
+        let result = namespace.alter_table_backfill_columns(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert!(body.get("use_cpu_only_pool").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_materialized_view_with_extra_forwards_unknown_fields() {
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/materialized_view/test$namespace$view/refresh".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-789"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = RefreshMaterializedViewRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "view".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("max_rows_per_fragment".to_string(), serde_json::json!(1000));
+
+        let result = namespace
+            .refresh_materialized_view_with_extra(request, extra)
+            .await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["max_rows_per_fragment"], serde_json::json!(1000));
+    }
 }
