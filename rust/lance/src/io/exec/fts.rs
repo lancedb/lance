@@ -308,6 +308,7 @@ async fn open_fts_segments(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,
