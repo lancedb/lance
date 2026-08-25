@@ -5342,25 +5342,38 @@ impl Scanner {
         })?;
         let stats_fragments = fragments.clone();
         let stats_stale_rows = stale_rows.clone();
-        let (plan, document_column) = self
+        let (mut plan, document_column) = self
             .plan_flat_match_input(fragments, stale_rows, query, filter_plan)
             .await?;
+        if plan.properties().output_partitioning().partition_count() > 1 {
+            plan = Arc::new(CoalescePartitionsExec::new(plan));
+        }
         let corpus_stats_input =
             if corpus_stats_input.is_some() || shared_scorer.is_none() || filter_plan.is_empty() {
                 corpus_stats_input
             } else {
                 let corpus_filter_plan = ExprFilterPlan::default();
-                Some(
-                    self.plan_flat_match_input(
+                let mut input = self
+                    .plan_flat_match_input(
                         stats_fragments,
                         stats_stale_rows,
                         query,
                         &corpus_filter_plan,
                     )
                     .await?
-                    .0,
-                )
+                    .0;
+                if input.properties().output_partitioning().partition_count() > 1 {
+                    input = Arc::new(CoalescePartitionsExec::new(input));
+                }
+                Some(input)
             };
+        let corpus_stats_input = corpus_stats_input.map(|input| {
+            if input.properties().output_partitioning().partition_count() > 1 {
+                Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+            } else {
+                input
+            }
+        });
         let mut flat_match_plan = FlatMatchQueryExec::new_with_document_granularity(
             self.dataset.clone(),
             query.clone(),
@@ -14765,8 +14778,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
         // pushes into the unindexed-fragment scan too — no more `FilterExec` on
-        // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
-        // shape, v2 uses `LanceRead` with `full_filter` set.
+        // top of an unfiltered `LanceScan`. A second unfiltered child collects
+        // corpus statistics so candidate filtering cannot change BM25 scores.
+        // Legacy uses the `MaterializeIndex` shape, v2 uses `LanceRead` with
+        // `full_filter` set on the candidate child only.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -14789,7 +14804,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                       MaterializeIndex: query=[i > 10]@i_idx(BTree)
                   ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
                     FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
+                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
@@ -14801,7 +14817,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
           FlatMatchQuery: column=s, query=hello
             LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
         assert_plan_equals(
             &dataset.dataset,
