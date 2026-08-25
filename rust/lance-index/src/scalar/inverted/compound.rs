@@ -5887,22 +5887,21 @@ mod tests {
             let params = FtsSearchParams::default().with_phrase_slop(Some(slop));
             let metrics = PhraseMetrics::default();
             let phrase = zero_weight_wand(&documents, scorer.clone(), &params, &metrics);
-            // A sum parent retains the shared floor and combines the phrase's
-            // doc-local upper with its sibling instead of pushing the full
-            // threshold into either child WAND cursor.
+            // The high-scoring sibling keeps the shared block competitive, while
+            // doc 0 still has a combined doc-local upper below the score floor.
             let mut phrase = DisjunctionScorer::try_new(
-                vec![phrase, materialized(&[(0, 0.0)])],
+                vec![phrase, materialized(&[(0, 0.0), (1, 2.0)])],
                 DisjunctionScore::Sum,
             )
             .unwrap();
             let competitive_score = Arc::new(CompetitiveScore::default());
             competitive_score.raise(1.0);
 
-            assert!(
+            assert_eq!(
                 TopKCollector::with_competitive_score(1, competitive_score)
                     .collect(&mut phrase)
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                rows(&[(1, 2.0)])
             );
 
             if slop == 0 {
