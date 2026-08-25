@@ -5058,7 +5058,7 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        FixedSizeListArray, Float16Array, Float32Array, Int8Array, RecordBatch,
+        FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, RecordBatch,
         RecordBatchIterator, RecordBatchReader, UInt64Array, make_array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
@@ -6861,6 +6861,207 @@ mod tests {
         assert_eq!(coreset.values, vec![EXPECTED_MEAN]);
         assert_eq!(coreset.weights, vec![2.0]);
         assert_eq!(coreset.losses, vec![2.0]);
+    }
+
+    #[test]
+    fn test_weighted_f64_coreset_preserves_extreme_magnitudes() {
+        let subnormal = f64::MIN_POSITIVE;
+        let mut tiny = WeightedCoreset::<Float64Type>::new(1, 2);
+        tiny.push(&[subnormal], 1.0, 0.0);
+        tiny.push(&[subnormal * 2.0], 1.0, 0.0);
+        tiny.reduce_to_budget(1, 1);
+        assert_eq!(tiny.values, vec![subnormal * 1.5]);
+        assert_ne!(tiny.values[0], tiny.values[0] as f32 as f64);
+
+        let large = 1.0e100_f64;
+        let delta = 2.0e84_f64;
+        let mut huge = WeightedCoreset::<Float64Type>::new(1, 2);
+        huge.push(&[large], 1.0, 0.0);
+        huge.push(&[large + delta], 1.0, 0.0);
+        huge.reduce_to_budget(1, 1);
+        assert!(huge.values[0].is_finite());
+        assert!(huge.losses[0].is_finite());
+        assert_ne!(huge.values[0], huge.values[0] as f32 as f64);
+    }
+
+    #[tokio::test]
+    async fn test_fixed_cosine_sampler_preserves_f64_normalization() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/cosine-f64", test_dir.as_str());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 2),
+            false,
+        )]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float64Array::from(vec![3.0, 4.0, 5.0, 12.0]),
+            2,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let sampler = FixedIvfTrainingSampler::try_new(&dataset, "vector")
+            .unwrap()
+            .unwrap();
+        let (sample, metric) = sampler
+            .sample_ranges(&[0..2], MetricType::Cosine)
+            .await
+            .unwrap();
+        assert_eq!(metric, MetricType::L2);
+        assert_eq!(sample.value_type(), DataType::Float64);
+        let values = sample.values().as_primitive::<Float64Type>().values();
+        for vector in values.chunks_exact(2) {
+            assert!((vector.iter().map(|value| value * value).sum::<f64>() - 1.0).abs() < 1e-14);
+        }
+        assert!((values[0] - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_f64_refinement_sources_retain_exact_mean() {
+        const BASE: f64 = 16_777_216.0;
+        const EXPECTED_MEAN: f64 = 16_777_216.5;
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/refine-f64", test_dir.as_str());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 1),
+            false,
+        )]));
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![BASE, BASE + 1.0]), 1)
+                .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let initial = streaming_kmeans_fsl_from_values::<Float64Type>(vec![BASE], 1).unwrap();
+        let sampler = FixedIvfTrainingSampler::try_new(&dataset, "vector")
+            .unwrap()
+            .unwrap();
+        let ranges = FixedIvfTrainingRanges::new(vec![0..2]);
+        let fixed = refine_streaming_kmeans_with_sampler::<Float64Type>(
+            &sampler,
+            MetricType::L2,
+            2,
+            &ranges,
+            &initial,
+            1,
+            Arc::new(|_, _| {}),
+        )
+        .await
+        .unwrap();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let resampled = refine_streaming_kmeans_with_resampling::<Float64Type>(
+            &dataset,
+            "vector",
+            MetricType::L2,
+            2,
+            2,
+            1,
+            &initial,
+            Some(&fragment_ids),
+            1,
+            Arc::new(|_, _| {}),
+        )
+        .await
+        .unwrap();
+        for refined in [fixed, resampled] {
+            assert_eq!(refined.value_type(), DataType::Float64);
+            let value = refined.values().as_primitive::<Float64Type>().value(0);
+            assert_eq!(value, EXPECTED_MEAN);
+            assert_ne!(value, value as f32 as f64);
+        }
+    }
+
+    #[rstest]
+    #[case::f16("f16", DataType::Float32)]
+    #[case::f32("f32", DataType::Float32)]
+    #[case::f64("f64", DataType::Float64)]
+    #[case::int8("int8", DataType::Float32)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_output_type_contract(
+        #[case] input_type: &str,
+        #[case] expected_output: DataType,
+    ) {
+        const DIMENSION: usize = 2;
+        const ROWS: usize = 600;
+        let value_count = ROWS * DIMENSION;
+        let (value_type, values): (DataType, ArrayRef) = match input_type {
+            "f16" => (
+                DataType::Float16,
+                Arc::new(Float16Array::from_iter_values(
+                    (0..value_count).map(|value| f16::from_f32(value as f32 / 100.0)),
+                )),
+            ),
+            "f32" => (
+                DataType::Float32,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..value_count).map(|value| value as f32 / 100.0),
+                )),
+            ),
+            "f64" => (
+                DataType::Float64,
+                Arc::new(Float64Array::from_iter_values(
+                    (0..value_count).map(|value| value as f64 / 100.0 + f64::EPSILON),
+                )),
+            ),
+            "int8" => (
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values((0..ROWS).flat_map(|row| {
+                    [(row & 0xff) as u8 as i8, (row >> 8) as u8 as i8]
+                }))),
+            ),
+            _ => unreachable!(),
+        };
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/type-{input_type}", test_dir.as_str());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", value_type, true)),
+                DIMENSION as i32,
+            ),
+            false,
+        )]));
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 2;
+        params.streaming_sample_rate = Some(1);
+        params.max_iters = 1;
+        let model = build_ivf_model(
+            &dataset,
+            "vector",
+            DIMENSION,
+            MetricType::L2,
+            &params,
+            None,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.centroids.unwrap().value_type(), expected_output);
     }
 
     #[tokio::test]
