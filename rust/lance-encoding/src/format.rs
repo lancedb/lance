@@ -706,6 +706,24 @@ impl ProtobufUtils21 {
         }
     }
 
+    pub fn dictionary(
+        indices: crate::format::pb21::CompressiveEncoding,
+        items: crate::format::pb21::CompressiveEncoding,
+        num_dictionary_items: u32,
+    ) -> crate::format::pb21::CompressiveEncoding {
+        crate::format::pb21::CompressiveEncoding {
+            compression: Some(
+                crate::format::pb21::compressive_encoding::Compression::Dictionary(Box::new(
+                    crate::format::pb21::Dictionary {
+                        indices: Some(Box::new(indices)),
+                        items: Some(Box::new(items)),
+                        num_dictionary_items,
+                    },
+                )),
+            ),
+        }
+    }
+
     pub fn constant_layout(
         def_meaning: &[DefinitionInterpretation],
         inline_value: Option<Vec<u8>>,
