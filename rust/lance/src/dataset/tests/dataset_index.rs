@@ -2038,12 +2038,42 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     .await;
     let filtered_limited = compound_fts_results_with_filter(
         &partial_dataset,
-        explicit_query,
+        explicit_query.clone(),
         "id >= 10",
         Some(LIMIT as i64),
     )
     .await;
     assert_eq!(filtered_limited, filtered_exhaustive[..LIMIT]);
+
+    let filtered_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let filtered_stats_setter = filtered_stats.clone();
+    let mut filtered_scan = partial_dataset.scan();
+    filtered_scan
+        .scan_stats_callback(Arc::new(move |stats| {
+            *filtered_stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .filter("id >= 10")
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let filtered_batch = filtered_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        filtered_batch["id"].as_primitive::<Int32Type>().values(),
+        &[10, 11],
+        "filtered bounded MultiMatch must retain two residual fragments"
+    );
+    let filtered_stats = filtered_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        filtered_stats
+            .all_counts
+            .get(BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC),
+        Some(&3),
+        "all three matching residual fragments must reach source top-k"
+    );
 
     let body_query: FtsQuery =
         MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
