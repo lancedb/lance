@@ -571,13 +571,18 @@ fn vector_segments_share_merge_model(
         && vector_model_mismatch(&indices).is_none()
 }
 
-/// Partition a logical vector index into the exact groups accepted by the
-/// segment merger. Groups retain the committed segment order.
-pub(crate) fn vector_segment_merge_groups(logical_index: &LogicalIvfView<'_>) -> Vec<Vec<Uuid>> {
+fn partition_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+    can_merge_after_remap: impl Fn(&dyn VectorIndex) -> bool,
+) -> Vec<Vec<Uuid>> {
     let segments = logical_index.segments().collect::<Vec<_>>();
     let mut groups = Vec::<Vec<usize>>::new();
 
     for segment_idx in 0..segments.len() {
+        if !can_merge_after_remap(segments[segment_idx].1.as_ref()) {
+            groups.push(vec![segment_idx]);
+            continue;
+        }
         if let Some(group) = groups.iter_mut().find(|group| {
             vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
         }) {
@@ -598,6 +603,21 @@ pub(crate) fn vector_segment_merge_groups(logical_index: &LogicalIvfView<'_>) ->
         .collect()
 }
 
+/// Partition a logical vector index into groups that remain acceptable to the
+/// distributed merger after compaction remaps their row addresses.
+pub(crate) fn compaction_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+) -> Vec<Vec<Uuid>> {
+    partition_vector_segment_merge_groups(logical_index, |index| {
+        // Remapping writes PQ codes transposed and RQ codes packed for query
+        // execution, while the distributed merger accepts row-major shards.
+        !matches!(
+            index.sub_index_type().1,
+            QuantizationType::Product | QuantizationType::Rabit
+        )
+    })
+}
+
 pub(crate) fn vector_segment_compatibility(
     logical_index: &LogicalIvfView<'_>,
     operation: &str,
@@ -605,11 +625,13 @@ pub(crate) fn vector_segment_compatibility(
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
 
-    Ok(if vector_segment_merge_groups(logical_index).len() == 1 {
-        VectorSegmentCompatibility::SharedModel
-    } else {
-        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
-    })
+    Ok(
+        if partition_vector_segment_merge_groups(logical_index, |_| true).len() == 1 {
+            VectorSegmentCompatibility::SharedModel
+        } else {
+            VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+        },
+    )
 }
 
 fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {

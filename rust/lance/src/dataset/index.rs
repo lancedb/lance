@@ -12,7 +12,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
-use crate::index::vector::ivf::vector_segment_merge_groups;
+use crate::index::vector::ivf::compaction_vector_segment_merge_groups;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -104,7 +104,7 @@ pub(crate) async fn vector_segment_merge_groups_for_compaction<'a>(
         .iter()
         .map(|segment| (segment.uuid, *segment))
         .collect::<HashMap<_, _>>();
-    let groups = vector_segment_merge_groups(&ivf)
+    let groups = compaction_vector_segment_merge_groups(&ivf)
         .into_iter()
         .filter_map(|group| {
             let group = group
