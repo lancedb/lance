@@ -2748,6 +2748,27 @@ impl ShardWriter {
         // poisoned writer can't drift further from the durable WAL.
         self.wal_flusher.check_poisoned()?;
 
+        // The seal check runs inside the lock immediately after an insert, but the
+        // index apply that follows it runs *outside* — and replay hands back a
+        // memtable whose indexes were built after its last check too. Either way
+        // the ceiling can be reached with nothing sealed, and the valve below
+        // would then refuse a write that a seal would have admitted. Re-run the
+        // check here so the wait has a flush to end on.
+        //
+        // The read is two relaxed loads; the lock is taken only when the shard is
+        // actually at its ceiling, which is the path already about to block.
+        if ShardMemory::memtables(writer_state.memory.clone()).unflushed_bytes()
+            >= self.config.max_unflushed_memtable_bytes
+        {
+            let mut state = state_lock.write().await;
+            // Nothing to seal in an empty memtable, and freezing one would spin:
+            // an injected controller skips the open-time reservation check, so a
+            // fresh memtable can sit above this ceiling on its indexes alone.
+            if state.memtable.batch_count() > 0 {
+                writer_state.maybe_trigger_memtable_flush(&mut state)?;
+            }
+        }
+
         // Apply backpressure if needed (before acquiring main lock)
         backpressure
             .maybe_apply_backpressure(ShardMemory::memtables(writer_state.memory.clone()))
@@ -9065,6 +9086,80 @@ mod tests {
             !memtable_reached_flush_threshold(&memtable, usize::MAX, resident + 1, 1),
             "and must not seal below it"
         );
+    }
+
+    /// The post-insert seal check runs inside the writer lock; the index apply
+    /// that follows it runs outside. So a put's index growth is invisible to the
+    /// only check that put makes, and the *next* put is gated by the valve before
+    /// it can insert and check again — leaving a shard over its ceiling with
+    /// nothing sealed and every write refused. Replay reaches the same state by
+    /// building its final memtable's indexes after its last check.
+    #[tokio::test]
+    async fn test_index_growth_after_the_seal_check_still_drains() {
+        let (store, base_path, base_uri, _t) = create_local_store().await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        // Keys long enough to spill out of the skiplist nodes, so the index heap
+        // grows with the column instead of staying a fixed reservation.
+        let btree = vec![MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "text_idx".to_string(),
+            field_id: 1,
+            column: "text".to_string(),
+        })];
+
+        let rows = 2_000usize;
+        let width = 512usize;
+        let payload = rows * width;
+        let ceiling = payload + payload / 2;
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            // As high as the open-time check allows, keeping the row arm out of
+            // reach of the rows below so only the resident arm can seal.
+            max_memtable_size: ceiling - 64 * 1024,
+            max_memtable_batches: 1024,
+            // Above the rows alone, below rows plus the index heap they build.
+            max_unflushed_memtable_bytes: ceiling,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), btree)
+            .await
+            .unwrap();
+
+        for i in 0..3i32 {
+            let ids: Vec<i32> = (0..rows as i32).map(|v| v + i * rows as i32).collect();
+            let texts: Vec<String> = ids
+                .iter()
+                .map(|v| format!("{v:07}{}", "z".repeat(width - 7)))
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(
+                        texts.iter().map(|t| Some(t.as_str())).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+
+            tokio::time::timeout(STALL_GRACE * 10, writer.put(vec![batch]))
+                .await
+                .expect("a shard with a sealable memtable must not park forever")
+                .unwrap_or_else(|e| {
+                    panic!("put {i} was refused; index growth outran the seal check: {e}")
+                });
+        }
+
+        assert!(
+            writer.memory().index_bytes() > writer.memory().row_bytes(),
+            "the fixture must be index-dominated, or it is not testing this path"
+        );
+
+        writer.close().await.unwrap();
     }
 
     /// Schema for the reservation tests: `vector` is field 1, the id 0 is `id`.
