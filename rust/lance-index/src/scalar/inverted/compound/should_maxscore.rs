@@ -552,6 +552,79 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        self.child_scores.fill(None);
+        for (index, child) in self.children.iter_mut().enumerate() {
+            if self.essential[index] {
+                if child.doc() != Some(current) {
+                    self.child_scores[index] = Some(0.0);
+                    continue;
+                }
+                let Some(upper) = child.current_score_upper_bound()? else {
+                    return Ok(None);
+                };
+                if !upper.is_finite() {
+                    return Ok(None);
+                }
+                self.child_scores[index] = Some(upper.max(0.0));
+            }
+        }
+        let mut upper = self.partial_score_upper();
+        if upper < self.min_competitive_score {
+            return Ok(Some(upper));
+        }
+
+        // The residual range bound was inconclusive. Tighten it with each
+        // non-essential posting approximation for this document, largest
+        // global bound first. Stop as soon as the unresolved residual can no
+        // longer reach the floor, still without touching phrase positions.
+        for index in self.bound_order.iter().rev().copied() {
+            if self.essential[index] {
+                continue;
+            }
+            let child = &mut self.children[index];
+            if child.doc().is_some_and(|doc| doc < current) {
+                child.advance(current)?;
+            }
+            self.child_scores[index] = if child.doc() == Some(current) {
+                let Some(upper) = child.current_score_upper_bound()? else {
+                    return Ok(None);
+                };
+                if !upper.is_finite() {
+                    return Ok(None);
+                }
+                Some(upper.max(0.0))
+            } else {
+                Some(0.0)
+            };
+            upper = self.partial_score_upper();
+            if upper < self.min_competitive_score {
+                return Ok(Some(upper));
+            }
+        }
+        Ok(upper.is_finite().then_some(upper))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| child.supports_doc_local_confirmation_pruning())
+    }
+
+    fn record_confirmation_avoided(&mut self) {
+        let Some(current) = self.current else {
+            return;
+        };
+        for child in &mut self.children {
+            if child.doc() == Some(current) {
+                child.record_confirmation_avoided();
+            }
+        }
+    }
+
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }

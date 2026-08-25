@@ -47,20 +47,24 @@ use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
-    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
-    CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
-    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
-    WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, WAND_EXACTNESS_PROBE_COMPARISONS_METRIC,
-    WAND_EXACTNESS_PROBE_MS_METRIC, WAND_SEEDED_FALLBACK_COMPARISONS_METRIC,
-    WAND_SEEDED_FALLBACK_MS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
-    WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_CANDIDATES_METRIC,
-    WAND_TIE_COMPLETION_COMPARISONS_METRIC, WAND_TIE_COMPLETION_MS_METRIC,
-    WAND_TIE_COMPLETION_OVERFLOWS_METRIC, WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC,
-    WAND_TIE_COMPLETION_SUCCESSES_METRIC,
+    COMPOUND_PHRASE_EXACT_APPROXIMATIONS_METRIC,
+    COMPOUND_PHRASE_EXACT_CONFIRMATIONS_AVOIDED_METRIC, COMPOUND_PHRASE_EXACT_CONFIRMATIONS_METRIC,
+    COMPOUND_PHRASE_SLOPPY_APPROXIMATIONS_METRIC,
+    COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_AVOIDED_METRIC,
+    COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_METRIC, COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC, COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+    CROSS_COLUMN_STAGED_ATTEMPTS_METRIC, CROSS_COLUMN_STAGED_CANDIDATES_METRIC,
+    CROSS_COLUMN_STAGED_FALLBACKS_METRIC, CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
+    WAND_EXACTNESS_PROBE_COMPARISONS_METRIC, WAND_EXACTNESS_PROBE_MS_METRIC,
+    WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, WAND_SEEDED_FALLBACK_MS_METRIC,
+    WAND_SEEDED_FALLBACKS_METRIC, WAND_TIE_COMPLETION_ATTEMPTS_METRIC,
+    WAND_TIE_COMPLETION_CANDIDATES_METRIC, WAND_TIE_COMPLETION_COMPARISONS_METRIC,
+    WAND_TIE_COMPLETION_MS_METRIC, WAND_TIE_COMPLETION_OVERFLOWS_METRIC,
+    WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC, WAND_TIE_COMPLETION_SUCCESSES_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -1954,6 +1958,12 @@ pub struct FtsIndexMetrics {
     compound_should_bound_recomputations: Count,
     compound_should_essential_evaluations: Count,
     compound_should_non_essential_evaluations: Count,
+    compound_phrase_exact_approximations: Count,
+    compound_phrase_sloppy_approximations: Count,
+    compound_phrase_exact_confirmations: Count,
+    compound_phrase_sloppy_confirmations: Count,
+    compound_phrase_exact_confirmations_avoided: Count,
+    compound_phrase_sloppy_confirmations_avoided: Count,
     cross_column_staged_attempts: Count,
     cross_column_staged_successes: Count,
     cross_column_staged_fallbacks: Count,
@@ -2012,6 +2022,22 @@ impl FtsIndexMetrics {
                 .new_count(COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, partition),
             compound_should_non_essential_evaluations: metrics
                 .new_count(COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, partition),
+            compound_phrase_exact_approximations: metrics
+                .new_count(COMPOUND_PHRASE_EXACT_APPROXIMATIONS_METRIC, partition),
+            compound_phrase_sloppy_approximations: metrics
+                .new_count(COMPOUND_PHRASE_SLOPPY_APPROXIMATIONS_METRIC, partition),
+            compound_phrase_exact_confirmations: metrics
+                .new_count(COMPOUND_PHRASE_EXACT_CONFIRMATIONS_METRIC, partition),
+            compound_phrase_sloppy_confirmations: metrics
+                .new_count(COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_METRIC, partition),
+            compound_phrase_exact_confirmations_avoided: metrics.new_count(
+                COMPOUND_PHRASE_EXACT_CONFIRMATIONS_AVOIDED_METRIC,
+                partition,
+            ),
+            compound_phrase_sloppy_confirmations_avoided: metrics.new_count(
+                COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_AVOIDED_METRIC,
+                partition,
+            ),
             cross_column_staged_attempts: metrics
                 .new_count(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC, partition),
             cross_column_staged_successes: metrics
@@ -2173,6 +2199,36 @@ impl MetricsCollector for FtsIndexMetrics {
     fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
         self.compound_should_non_essential_evaluations
             .add(num_evaluations);
+    }
+
+    fn record_compound_phrase_exact_approximations(&self, num_approximations: usize) {
+        self.compound_phrase_exact_approximations
+            .add(num_approximations);
+    }
+
+    fn record_compound_phrase_sloppy_approximations(&self, num_approximations: usize) {
+        self.compound_phrase_sloppy_approximations
+            .add(num_approximations);
+    }
+
+    fn record_compound_phrase_exact_confirmations(&self, num_confirmations: usize) {
+        self.compound_phrase_exact_confirmations
+            .add(num_confirmations);
+    }
+
+    fn record_compound_phrase_sloppy_confirmations(&self, num_confirmations: usize) {
+        self.compound_phrase_sloppy_confirmations
+            .add(num_confirmations);
+    }
+
+    fn record_compound_phrase_exact_confirmations_avoided(&self, num_confirmations: usize) {
+        self.compound_phrase_exact_confirmations_avoided
+            .add(num_confirmations);
+    }
+
+    fn record_compound_phrase_sloppy_confirmations_avoided(&self, num_confirmations: usize) {
+        self.compound_phrase_sloppy_confirmations_avoided
+            .add(num_confirmations);
     }
 
     fn record_cross_column_staged_attempts(&self, num_attempts: usize) {
@@ -4639,6 +4695,32 @@ mod tests {
         assert_eq!(metrics.compound_should_bound_recomputations.value(), 3);
         assert_eq!(metrics.compound_should_essential_evaluations.value(), 5);
         assert_eq!(metrics.compound_should_non_essential_evaluations.value(), 7);
+    }
+
+    #[test]
+    fn test_compound_phrase_metrics_separate_exact_and_sloppy_work() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_compound_phrase_exact_approximations(2);
+        metrics.record_compound_phrase_sloppy_approximations(3);
+        metrics.record_compound_phrase_exact_confirmations(5);
+        metrics.record_compound_phrase_sloppy_confirmations(7);
+        metrics.record_compound_phrase_exact_confirmations_avoided(11);
+        metrics.record_compound_phrase_sloppy_confirmations_avoided(13);
+
+        assert_eq!(metrics.compound_phrase_exact_approximations.value(), 2);
+        assert_eq!(metrics.compound_phrase_sloppy_approximations.value(), 3);
+        assert_eq!(metrics.compound_phrase_exact_confirmations.value(), 5);
+        assert_eq!(metrics.compound_phrase_sloppy_confirmations.value(), 7);
+        assert_eq!(
+            metrics.compound_phrase_exact_confirmations_avoided.value(),
+            11
+        );
+        assert_eq!(
+            metrics.compound_phrase_sloppy_confirmations_avoided.value(),
+            13
+        );
     }
 
     #[test]
