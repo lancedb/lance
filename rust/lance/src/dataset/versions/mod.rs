@@ -19,7 +19,7 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{chunk_concat_stream_with_bytes, chunk_stream};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -168,6 +168,16 @@ pub async fn write_fragments_direct(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
 ) -> Result<Vec<Fragment>> {
+    if params.max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero".to_string(),
+        ));
+    }
+    if params.max_bytes_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_bytes_per_file must be greater than zero".to_string(),
+        ));
+    }
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
     let buffered_reader = match version {
@@ -175,9 +185,29 @@ pub async fn write_fragments_direct(
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+        | ConcreteFileVersion::V2_3 => {
+            // Coalesce small input batches (e.g. one per source fragment from
+            // compaction) up to the per-file row limit and a byte budget.  This
+            // ensures a re-encode compaction does not write one page per source
+            // fragment.  The byte budget bounds memory for wide columns, which
+            // would otherwise accumulate up to `max_rows_per_file` rows.
+            //
+            // NOTE: This byte budget is intentionally large so that above-budget
+            // source fragments (e.g. compaction's one-batch-per-fragment inputs
+            // that individually exceed the encoder's per-column accumulation
+            // budget) are still coalesced with their neighbours, making page
+            // formation independent of source batch boundaries (#7502).  The
+            // memory cost is the buffered input plus one `concat_batches` copy;
+            // `test_insert_memory` is expected to be re-baselined separately as
+            // part of that discussion.  It is also capped by `max_bytes_per_file`
+            // so the downstream file-size limit is not undermined.
+            const MAX_CHUNK_BYTES: usize = 48 * 1024 * 1024;
+            let max_chunk_bytes = params.max_bytes_per_file.min(MAX_CHUNK_BYTES);
+            chunk_concat_stream_with_bytes(data, params.max_rows_per_file, max_chunk_bytes)
+                .map_ok(|batch| vec![batch])
+                .map_err(Into::into)
+                .boxed()
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -185,6 +215,11 @@ pub async fn write_fragments_direct(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    // V2 coalesces input batches in the chunker, which can emit chunks that
+    // would push a file past `max_rows_per_file`; split those at the file
+    // boundary.  V1 chunks by `max_rows_per_group` and rotates only after a
+    // chunk exceeds the cap, so keep the legacy behavior there.
+    let split_chunks_at_file_boundary = !matches!(version, ConcreteFileVersion::V1);
     write::do_write_fragments_impl(
         dataset,
         object_store,
@@ -198,6 +233,7 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        split_chunks_at_file_boundary,
     )
     .await
 }
