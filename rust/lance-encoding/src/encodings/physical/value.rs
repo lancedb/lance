@@ -789,7 +789,7 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -877,10 +877,27 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
-        for data_type in PRIMITIVE_TYPES {
+        const NUM_ROWS: u32 = 1025;
+
+        let test_cases = TestCases::default()
+            .with_batch_size(NUM_ROWS)
+            .with_page_sizes(vec![4096])
+            .with_expected_encoding("flat");
+        let value_metadata =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+
+        for (seed, data_type) in PRIMITIVE_TYPES.iter().enumerate() {
             log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
+            let data = gen_batch()
+                .with_seed(Seed::from(seed as u64))
+                .anon_col(array::rand_type(data_type))
+                .into_batch_rows(RowCount::from(NUM_ROWS as u64))
+                .unwrap()
+                .column(0)
+                .clone();
+
+            check_round_trip_encoding_of_data(vec![data], &test_cases, value_metadata.clone())
+                .await;
         }
     }
 

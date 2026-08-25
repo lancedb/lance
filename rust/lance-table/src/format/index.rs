@@ -449,6 +449,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "my_index".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(bitmap.clone()),
             index_details: None,
