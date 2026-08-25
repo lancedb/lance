@@ -65,7 +65,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) mod branch_location;
@@ -157,8 +157,8 @@ pub use schema_evolution::{
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
-    WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,
+    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
@@ -2077,8 +2077,7 @@ impl Dataset {
         cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
-            object_store.inner =
-                wrapper.wrap(&object_store.store_prefix, object_store.inner.clone());
+            object_store.apply_wrapper(wrapper.as_ref());
         }
         cloned.object_store = Arc::new(object_store);
         cloned.refs = Refs::new(
@@ -4138,6 +4137,131 @@ pub(crate) async fn write_manifest_file(
 impl Projectable for Dataset {
     fn schema(&self) -> &Schema {
         self.schema()
+    }
+}
+
+/// Marker files that `DirectoryNamespace` writes for a table that is declared or
+/// deregistered but was never materialized. Spelled out here because
+/// `lance-namespace-impls` depends on this crate, not the other way around.
+const NAMESPACE_TABLE_MARKERS: &[&str] = &[".lance-reserved", ".lance-deregistered"];
+
+/// Check that `base` is a Lance dataset root before deleting it recursively.
+///
+/// Dropping a dataset removes whatever the caller pointed at, so a mistyped or
+/// misconfigured URI — a warehouse root, a bucket root, a home directory — destroys
+/// unrelated data with no way back. Requiring the target to actually be a dataset
+/// turns that class of mistake into an error instead of silent data loss.
+///
+/// A path qualifies on positive evidence only, which is one of:
+///
+/// * a file under `_versions/` that both parses as a manifest location and deserializes
+///   as a manifest, attached or detached. Every dataset that has ever committed has one,
+///   whatever naming scheme or commit handler produced it.
+/// * a `DirectoryNamespace` declare or deregister marker, for a table that a namespace
+///   reserved but never wrote.
+///
+/// Nothing weaker qualifies. A non-empty `_versions/` is not evidence, because any file
+/// can be put there; neither are data files, which look identical to a storage root whose
+/// only prefix happens to be `data/`. Leftovers from a write that never committed,
+/// manifests that are corrupt, and the staging manifest an external store writes before
+/// it materializes the canonical path therefore need an explicit storage-level delete
+/// rather than a weaker default guard here. That costs little: leftovers do not block
+/// re-creating the dataset, because creation only refuses a path that already holds a
+/// manifest, and [`Dataset::cleanup_old_versions`] removes data files no manifest
+/// references.
+///
+/// Unmanaged files that a user keeps next to a committed dataset do not change the
+/// answer, matching the way cleanup leaves them alone. Note that the recursive delete
+/// this guards still removes them.
+///
+/// A missing or empty path also qualifies, so callers keep whatever not-found behavior
+/// they have today rather than seeing a new error kind.
+///
+/// This cannot protect files that another dataset references through `base_paths`;
+/// shallow-clone sources still need the reference tracking discussed in
+/// [#7514](https://github.com/lance-format/lance/issues/7514).
+pub async fn validate_dataset_root_for_drop(object_store: &ObjectStore, base: &Path) -> Result<()> {
+    if holds_readable_manifest(object_store, base).await? {
+        return Ok(());
+    }
+
+    for marker in NAMESPACE_TABLE_MARKERS {
+        if object_store.exists(&base.clone().join(*marker)).await? {
+            return Ok(());
+        }
+    }
+
+    // Rejecting a path that holds nothing would replace the not-found error callers
+    // already handle, and `ignore_not_found` relies on, with a different error kind.
+    if !has_any_entry(object_store, base).await? {
+        return Ok(());
+    }
+
+    Err(Error::invalid_input(format!(
+        "Refusing to drop '{base}': no readable Lance manifest was found under \
+         '{VERSIONS_DIR}', so this is not a dataset root. Check that the path points at a \
+         dataset and not at a parent directory, and check the logs for manifests that \
+         could not be read. A path holding only data files, or only manifests that cannot \
+         be read, needs an explicit storage-level delete instead: such leftovers neither \
+         block re-creating the dataset nor survive cleanup."
+    )))
+}
+
+/// Whether `base` holds a manifest that actually deserializes, which is the only proof
+/// that a dataset was ever committed here.
+///
+/// Returns on the first manifest that reads, so a real dataset costs one listing plus one
+/// manifest read no matter how many versions it has.
+async fn holds_readable_manifest(object_store: &ObjectStore, base: &Path) -> Result<bool> {
+    let mut entries = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
+    loop {
+        let meta = match entries.try_next().await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return Ok(false),
+            // Local filesystems report a missing directory as an error where object stores
+            // return an empty listing. Neither holds a manifest.
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        if !is_manifest_location(&meta) {
+            continue;
+        }
+
+        match read_manifest(object_store, &meta.location, Some(meta.size)).await {
+            Ok(_) => return Ok(true),
+            // A file that only looks like a manifest proves nothing, so keep looking
+            // rather than authorizing the delete. The reason is logged because a read
+            // that failed for an unrelated cause, such as a transient storage error,
+            // otherwise leaves no trace of why the path was refused.
+            Err(e) => warn!(
+                "Ignoring '{}' while checking whether '{base}' is a dataset root: {e}",
+                meta.location
+            ),
+        }
+    }
+}
+
+/// Whether `meta` names a manifest, using the same parsing that manifest discovery uses.
+fn is_manifest_location(meta: &object_store::ObjectMeta) -> bool {
+    if ManifestLocation::try_from(meta.clone()).is_ok() {
+        return true;
+    }
+    meta.location
+        .filename()
+        .and_then(ManifestNamingScheme::parse_detached_version)
+        .is_some()
+}
+
+/// Whether anything at all lives under `prefix`. Stops at the first entry, so this stays
+/// cheap even on a storage root holding millions of objects.
+async fn has_any_entry(object_store: &ObjectStore, prefix: &Path) -> Result<bool> {
+    match object_store.list(Some(prefix.clone())).try_next().await {
+        Ok(entry) => Ok(entry.is_some()),
+        // Local filesystems report a missing directory as an error where object stores
+        // return an empty listing. Neither has anything to protect.
+        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

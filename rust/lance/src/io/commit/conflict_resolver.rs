@@ -460,6 +460,8 @@ impl<'a> TransactionRebase<'a> {
             compacted_sstables: self_compacted_sstables,
             new_fragments: self_new_fragments,
             update_mode: self_update_mode,
+            updated_fragments: self_updated_fragments,
+            fields_modified: self_fields_modified,
             ..
         } = &self.transaction.operation
         {
@@ -516,13 +518,43 @@ impl<'a> TransactionRebase<'a> {
                 Operation::DataOverlay { groups } => {
                     // Our update recomputed rows from the pre-overlay base, so if
                     // it commits over an overlay it would silently undo the
-                    // overlay's values for any cell it recomputed. A row-moving
-                    // update (RewriteRows) relocates the rows it touches out to
-                    // new fragments; only the rows it actually moved lose their
-                    // overlay, so we conflict only when the moved rows intersect
-                    // the overlay's coverage. An in-place column rewrite
-                    // (RewriteColumns) preserves offsets and just tombstones the
-                    // overlaid fields at build time, so it never conflicts.
+                    // overlay's values for any cell it recomputed.
+                    //
+                    // An in-place column rewrite (RewriteColumns) writes a
+                    // replacement file covering *every* row of each fragment it
+                    // touches, filled from the snapshot it read. `build_manifest`
+                    // then tombstones every overlay for the fields it rewrote, so
+                    // an overlay value on a row this update never matched is
+                    // dropped and the stale copied value becomes visible. Retry
+                    // whenever the overlay touches a fragment we rewrote and a
+                    // field we rewrote; the retry re-reads the overlaid values.
+                    if matches!(self_update_mode, Some(UpdateMode::RewriteColumns)) {
+                        let rewritten: HashSet<u64> = self_updated_fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .collect();
+                        for group in groups {
+                            if !rewritten.contains(&group.fragment_id) {
+                                continue;
+                            }
+                            let overlaps_rewritten_field = group.overlays.iter().any(|overlay| {
+                                overlay.data_file.fields.iter().any(|&field| {
+                                    field >= 0 && self_fields_modified.contains(&(field as u32))
+                                })
+                            });
+                            if overlaps_rewritten_field {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    // A row-moving update (RewriteRows) relocates the rows it
+                    // touches out to new fragments; only the rows it actually
+                    // moved lose their overlay, so we conflict only when the
+                    // moved rows intersect the overlay's coverage.
                     let moves_rows = !self_new_fragments.is_empty()
                         && matches!(self_update_mode, Some(UpdateMode::RewriteRows) | None);
                     if !moves_rows {
@@ -3666,21 +3698,24 @@ mod tests {
         // Update and a concurrent DataOverlay has already committed. A row-moving
         // update relocates the rows it touches, so an overlay on one of those
         // fragments can no longer be applied (retryable); an overlay on any other
-        // fragment, or an in-place column rewrite, is compatible.
+        // fragment is compatible. An in-place column rewrite preserves rows but
+        // replaces the whole column from its own snapshot, so it conflicts
+        // whenever the overlay covers a fragment and field it rewrote.
         use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
         use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
         use roaring::RoaringBitmap;
 
-        let overlay_on = |fragment_id: u64| Operation::DataOverlay {
+        let overlay_on_field = |fragment_id: u64, field: i32| Operation::DataOverlay {
             groups: vec![DataOverlayGroup {
                 fragment_id,
                 overlays: vec![DataOverlayFile {
-                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![field], None),
                     coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
                     committed_version: 0,
                 }],
             }],
         };
+        let overlay_on = |fragment_id: u64| overlay_on_field(fragment_id, 0);
         // Our update always touches fragment 1.
         let update =
             |update_mode: Option<UpdateMode>, new_fragments: Vec<Fragment>| Operation::Update {
@@ -3730,10 +3765,36 @@ mod tests {
                 Some(rows_on(1, &[0])),
                 false,
             ),
-            // An in-place column rewrite preserves rows -> compatible.
+            // An in-place column rewrite replaces field 0 across all of fragment
+            // 1 from its own snapshot, and `build_manifest` tombstones the
+            // overlay for that field, so the overlay's value would be lost even
+            // though it sits on a row the update never matched -> conflict.
             (
                 update(Some(UpdateMode::RewriteColumns), vec![]),
                 overlay_on(1),
+                Some(rows_on(1, &[0])),
+                true,
+            ),
+            // ...and the coverage is irrelevant: an overlay on a row the update
+            // did not match is exactly the case that gets silently dropped.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on(1),
+                Some(rows_on(1, &[5])),
+                true,
+            ),
+            // An overlay on a field the rewrite did not touch survives the
+            // tombstoning, so it stays compatible.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on_field(1, 7),
+                Some(rows_on(1, &[0])),
+                false,
+            ),
+            // So does an overlay on a fragment the rewrite did not touch.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on(0),
                 Some(rows_on(1, &[0])),
                 false,
             ),

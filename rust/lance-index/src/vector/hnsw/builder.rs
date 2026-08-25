@@ -622,7 +622,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist <= lower_bound || dist > upper_bound {
+                    if dist < lower_bound || dist >= upper_bound {
                         continue;
                     }
                     if heap.len() < k {
@@ -636,7 +636,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist <= lower_bound || dist > upper_bound {
+                    if dist < lower_bound || dist >= upper_bound {
                         continue;
                     }
                     if heap.len() < k {
@@ -1538,18 +1538,21 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
     use arrow_schema::Schema;
+    use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{Error, deepsize::DeepSizeOf};
+    use lance_core::{Error, Result, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
@@ -1561,6 +1564,8 @@ mod tests {
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::PreFilter;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1581,6 +1586,29 @@ mod tests {
         );
         let schema = batch.schema().as_ref().clone().with_metadata(metadata);
         RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap()
+    }
+
+    struct MaskPreFilter {
+        mask: Arc<RowAddrMask>,
+    }
+
+    #[async_trait]
+    impl PreFilter for MaskPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            self.mask.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
     }
 
     #[tokio::test]
@@ -2177,37 +2205,6 @@ mod tests {
     /// exact flat scan, and both return only mask-passing row ids.
     #[tokio::test]
     async fn test_subindex_prefilter_dispatch() {
-        use arrow_array::cast::AsArray;
-        use async_trait::async_trait;
-        use lance_core::Result;
-        use lance_select::{RowAddrMask, RowAddrTreeMap};
-
-        use crate::metrics::NoOpMetricsCollector;
-        use crate::prefilter::PreFilter;
-
-        struct MaskPreFilter {
-            mask: Arc<RowAddrMask>,
-        }
-
-        #[async_trait]
-        impl PreFilter for MaskPreFilter {
-            async fn wait_for_ready(&self) -> Result<()> {
-                Ok(())
-            }
-            fn is_empty(&self) -> bool {
-                false
-            }
-            fn mask(&self) -> Arc<RowAddrMask> {
-                self.mask.clone()
-            }
-            fn filter_row_ids<'a>(
-                &self,
-                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-            ) -> Vec<u64> {
-                self.mask.selected_indices(row_ids)
-            }
-        }
-
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
         let fsl =
@@ -2295,6 +2292,64 @@ mod tests {
         let mut expected = truth;
         expected.sort_unstable();
         assert_eq!(got, expected);
+    }
+
+    #[rstest]
+    #[case::prefetch(Some(2))]
+    #[case::no_prefetch(None)]
+    fn test_distance_range_prefilter_dispatch(#[case] prefetch_distance: Option<usize>) {
+        const DIM: usize = 32;
+        const TOTAL: usize = 100;
+
+        let mut values = vec![0.0; TOTAL * DIM];
+        for row in 1..TOTAL {
+            values[row * DIM] = row as f32;
+        }
+        let fsl = FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+            .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let hnsw = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams {
+                prefetch_distance,
+                ..HnswBuildParams::default()
+            },
+        )
+        .unwrap();
+        let query = fsl.value(0);
+
+        let search_row_ids = |allowed: Vec<u64>| {
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    allowed,
+                ))),
+            });
+            let batch = hnsw
+                .search(
+                    query.clone(),
+                    10,
+                    HnswQueryParams {
+                        ef: TOTAL,
+                        lower_bound: Some(0.0),
+                        upper_bound: Some(1.0),
+                        dist_q_c: 0.0,
+                        use_acorn: false,
+                    },
+                    store.as_ref(),
+                    filter,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            batch[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        };
+
+        // Sparse masks take the exact flat scan, while dense masks traverse
+        // the graph. Both must include the lower bound and exclude the upper.
+        assert_eq!(search_row_ids(vec![0, 1, 2]), vec![0]);
+        assert_eq!(search_row_ids((0..60).collect()), vec![0]);
     }
 
     /// Every fresh `level_offsets` range must exactly delimit the rows emitted
