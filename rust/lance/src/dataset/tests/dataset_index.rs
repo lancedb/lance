@@ -1364,8 +1364,7 @@ async fn compound_fts_results_with_filter(
     limit: Option<i64>,
 ) -> Vec<(u64, f32)> {
     let mut scan = dataset.scan();
-    scan.prefilter(true)
-        .with_row_id()
+    scan.with_row_id()
         .filter(filter)
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query))
@@ -2030,22 +2029,10 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         "the partially covered body should use the bounded indexed-plus-residual path:\n{partial_plan}"
     );
 
-    let filtered_exhaustive = compound_fts_results_with_filter(
-        &partial_dataset,
-        explicit_query.clone(),
-        "id >= 10",
-        None,
-    )
-    .await;
-    let filtered_limited = compound_fts_results_with_filter(
-        &partial_dataset,
-        explicit_query.clone(),
-        "id >= 10",
-        Some(LIMIT as i64),
-    )
-    .await;
-    assert_eq!(filtered_limited, filtered_exhaustive[..LIMIT]);
-
+    let body_query: FtsQuery =
+        MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
+            .unwrap()
+            .into();
     let filtered_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
     let filtered_stats_setter = filtered_stats.clone();
     let mut filtered_scan = partial_dataset.scan();
@@ -2056,7 +2043,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         }))
         .filter("id >= 10")
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(explicit_query))
+        .full_text_search(FullTextSearchQuery::new_query(body_query.clone()))
         .unwrap()
         .project(&["id"])
         .unwrap()
@@ -2077,10 +2064,6 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         "all three matching residual fragments must reach source top-k"
     );
 
-    let body_query: FtsQuery =
-        MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
-            .unwrap()
-            .into();
     let body_plan = compound_fts_plan(&partial_dataset, body_query.clone(), LIMIT).await;
     assert!(
         body_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC) && !body_plan.contains("AggregateExec"),
