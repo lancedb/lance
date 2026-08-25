@@ -6493,6 +6493,50 @@ class ColumnOrdering:
     nulls_first: bool = False
 
 
+# PyArrow reports an unsupported compute function as e.g. "No conversion function
+# exists to convert the Arrow function starts_with to a Substrait call".
+_SUBSTRAIT_UNSUPPORTED_FUNCTION = re.compile(
+    r"convert the Arrow function (\w+) to a Substrait call"
+)
+
+# PyArrow compute functions with no Substrait mapping whose predicate has a
+# direct equivalent in Lance's SQL dialect.
+_SQL_EQUIVALENT = {
+    "starts_with": "starts_with(column, 'prefix')",
+    "ends_with": "ends_with(column, 'suffix')",
+    "match_substring": "contains(column, 'substring')",
+}
+
+
+def _substrait_serialization_error(
+    filter: pa.compute.Expression, err: pa.ArrowNotImplementedError
+) -> pa.ArrowNotImplementedError:
+    """Build an actionable error for an expression PyArrow cannot serialize.
+
+    Lance ingests a PyArrow expression by serializing it to Substrait, which
+    PyArrow implements for only a subset of its compute functions.  Lance SQL
+    covers many of the rest, so name the offending function and point at the
+    string form instead of surfacing the Arrow internals error.  The exception
+    type is preserved so existing handlers keep working.
+    """
+    match = _SUBSTRAIT_UNSUPPORTED_FUNCTION.search(str(err))
+    function = match.group(1) if match else None
+    if function is None:
+        detail = f"PyArrow cannot serialize this expression to Substrait ({err})"
+        hint = "Pass the filter as a Lance SQL string instead."
+    else:
+        detail = (
+            f"PyArrow cannot serialize the compute function '{function}' to Substrait"
+        )
+        equivalent = _SQL_EQUIVALENT.get(function)
+        hint = "Pass the filter as a Lance SQL string instead"
+        hint += f', e.g. filter="{equivalent}".' if equivalent else "."
+    return pa.ArrowNotImplementedError(
+        f"Cannot push down the filter expression `{filter}`: {detail}, which is"
+        f" how Lance consumes PyArrow expressions. {hint}"
+    )
+
+
 def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     """Return True if *t* contains a type that PyArrow's substrait serializer
     cannot handle at any nesting depth.
@@ -6697,6 +6741,10 @@ class ScannerBuilder:
 
         :param filter: The filter to apply.  This can be a string, a pyarrow compute
             expression, a FullTextQuery, a VectorSearchQuery, or a dictionary.
+            A pyarrow expression is passed to Lance as Substrait; functions
+            PyArrow cannot serialize to Substrait (``starts_with``,
+            ``ends_with``, ``match_substring``) must be given as a Lance SQL
+            string instead.
 
         :return: The scanner builder.
         """
@@ -6731,9 +6779,12 @@ class ScannerBuilder:
                         # that as a filter.
                         counter += 1
                 scalar_schema = pa.schema(fields_without_lists)
-                substrait_filter = serialize_expressions(
-                    [filter], ["my_filter"], scalar_schema
-                )
+                try:
+                    substrait_filter = serialize_expressions(
+                        [filter], ["my_filter"], scalar_schema
+                    )
+                except pa.ArrowNotImplementedError as err:
+                    raise _substrait_serialization_error(filter, err) from err
                 if isinstance(substrait_filter, memoryview):
                     self._substrait_filter = substrait_filter.tobytes()
                 else:

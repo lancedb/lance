@@ -370,6 +370,55 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
     assert result["id"].to_pylist() == [1]
 
 
+@pytest.mark.parametrize(
+    ("expression", "function", "hint", "sql"),
+    [
+        pytest.param(
+            pc.starts_with(pc.field("str"), "ab"),
+            "starts_with",
+            "starts_with(column, 'prefix')",
+            "starts_with(str, 'ab')",
+            id="starts_with",
+        ),
+        pytest.param(
+            pc.ends_with(pc.field("str"), "bc"),
+            "ends_with",
+            "ends_with(column, 'suffix')",
+            "ends_with(str, 'bc')",
+            id="ends_with",
+        ),
+        pytest.param(
+            pc.match_substring(pc.field("str"), "b"),
+            "match_substring",
+            "contains(column, 'substring')",
+            "contains(str, 'b')",
+            id="match_substring",
+        ),
+    ],
+)
+def test_filter_expression_without_substrait_mapping(
+    tmp_path, expression, function, hint, sql
+):
+    """PyArrow has no Substrait mapping for these string functions.
+
+    Lance consumes pyarrow expressions through Substrait, so such a filter
+    cannot be pushed down; the error should name the function and the
+    equivalent Lance SQL filter rather than surface Arrow's internal failure.
+    """
+    ds = lance.write_dataset(pa.table({"str": ["abc", "xyz"]}), tmp_path)
+
+    # ArrowNotImplementedError (a NotImplementedError subclass) is what the
+    # unimproved path already raised; only the message changes.
+    with pytest.raises(pa.ArrowNotImplementedError) as exc_info:
+        ds.to_table(filter=expression)
+    message = str(exc_info.value)
+    assert function in message
+    assert hint in message
+
+    # The SQL form the error points at expresses the same predicate.
+    assert ds.to_table(filter=sql)["str"].to_pylist() == ["abc"]
+
+
 @pytest.mark.skip(
     reason="requires a release build; see "
     "https://github.com/lance-format/lance/pull/4190"
