@@ -837,6 +837,26 @@ impl ShardMemory {
         }
     }
 
+    /// Resident bytes of sealed memtables that have flushed and are lingering
+    /// out `frozen_memtable_grace` so in-flight as-of reads stay batch-resolved.
+    ///
+    /// Real memory, but no flush reclaims it — the sweeper does, on a timer. A
+    /// waiter that blocks on this is waiting for the clock, not for a flush.
+    /// `0` in WAL-only mode, and `0` under the default zero grace.
+    pub fn grace_bytes(&self) -> usize {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => t
+                .load()
+                .grace
+                .iter()
+                .map(InMemoryMemTableRef::resident_bytes)
+                .sum(),
+            ShardMemorySource::Queue(_) => 0,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => 0,
+        }
+    }
+
     /// Bytes only a flush can reclaim: the pool to bound against OOM.
     ///
     /// One load covers both terms, so this cannot cross a freeze and
@@ -862,17 +882,77 @@ impl ShardMemory {
         }
     }
 
-    /// The oldest outstanding flush, for a waiter that wants to park until the
-    /// pool drains rather than poll. `None` in WAL-only mode, which has no
-    /// flush — such a waiter should fall back to a short sleep.
-    pub fn flush_watcher(&self) -> Option<DurabilityWatcher> {
+    /// Every resident byte the shard is holding: [`Self::unflushed_bytes`] plus
+    /// the generations already flushed but still inside `frozen_memtable_grace`.
+    ///
+    /// This is the figure a process-wide budget wants. `unflushed_bytes` is the
+    /// narrower one — what a flush can still reclaim — and is what the per-shard
+    /// valve throttles on, because throttling on grace-retained memory would
+    /// stall the writer waiting for a sweeper tick. The two differ only when a
+    /// grace is configured; under the default zero grace they are equal.
+    pub fn retained_bytes(&self) -> usize {
         match &self.0 {
-            ShardMemorySource::MemTables(t) => t.load().oldest_flush.clone(),
-            ShardMemorySource::Queue(_) => None,
+            ShardMemorySource::MemTables(t) => {
+                let tables = t.load();
+                tables
+                    .active
+                    .as_ref()
+                    .map_or(0, InMemoryMemTableRef::resident_bytes)
+                    + tables
+                        .frozen
+                        .iter()
+                        .chain(tables.grace.iter())
+                        .map(InMemoryMemTableRef::resident_bytes)
+                        .sum::<usize>()
+            }
+            ShardMemorySource::Queue(q) => q.queue_bytes(),
             #[cfg(test)]
-            ShardMemorySource::Fake(_) => None,
+            ShardMemorySource::Fake(f) => f(),
         }
     }
+
+    /// What could reclaim memory here while a writer waits on it.
+    ///
+    /// A blocking controller must consult this rather than assume that waiting
+    /// eventually works: a shard can be over its ceiling with nothing running
+    /// that would bring it back down. See [`Drain`].
+    pub fn drain(&self) -> Drain {
+        match &self.0 {
+            ShardMemorySource::MemTables(t) => {
+                let tables = t.load();
+                match tables.oldest_flush.clone() {
+                    Some(flush) => Drain::Flush(flush),
+                    // The sweeper will drop these once their grace elapses.
+                    None if !tables.grace.is_empty() => Drain::Background,
+                    None => Drain::Stalled,
+                }
+            }
+            // The WAL flusher drains the queue on its own schedule.
+            ShardMemorySource::Queue(_) => Drain::Background,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => Drain::Background,
+        }
+    }
+}
+
+/// What can bring a shard back under its ceiling while a writer waits.
+///
+/// Returned by [`ShardMemory::drain`] so a blocking controller can tell a wait
+/// that ends from one that cannot. The distinction is not academic: a flush
+/// that fails leaves its generation resident and charged with nothing queued to
+/// retry it, and index memory is charged to the ceiling while the seal trigger
+/// measures row bytes — either can put a shard over budget with no flush in
+/// flight, and only a new write would start one.
+#[derive(Debug)]
+pub enum Drain {
+    /// Park on this flush. Completing it retires a whole generation.
+    Flush(DurabilityWatcher),
+    /// Nothing to park on, but something is draining the shard on its own
+    /// schedule — the WAL flusher, or the grace sweeper. Poll.
+    Background,
+    /// Nothing outstanding. Only a new write would start a flush, and a waiter
+    /// here is precisely what is keeping writes out, so waiting cannot end.
+    Stalled,
 }
 
 impl Debug for ShardMemory {
@@ -880,6 +960,7 @@ impl Debug for ShardMemory {
         f.debug_struct("ShardMemory")
             .field("active_bytes", &self.active_bytes())
             .field("frozen_bytes", &self.frozen_bytes())
+            .field("grace_bytes", &self.grace_bytes())
             .finish()
     }
 }
@@ -927,10 +1008,26 @@ fn resolve_backpressure(config: &ShardWriterConfig) -> Arc<dyn BackpressureContr
     }
 }
 
+/// Poll cadence while a shard is over its ceiling and something other than a
+/// flush is expected to bring it back down — there is no watcher to park on.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long a shard must keep reading as [`Drain::Stalled`] before the valve
+/// gives up on it rather than waiting.
+///
+/// The classification is momentarily wrong under concurrency: another writer
+/// holding the state lock has already grown the active memtable past the
+/// ceiling but has not yet reached the `freeze_memtable` that publishes a
+/// watcher, so a waiter sampling in between sees over-budget with nothing
+/// outstanding. That window is one locked section of in-memory work, orders of
+/// magnitude under this. A real stall never closes.
+const STALL_GRACE: Duration = Duration::from_secs(1);
+
 /// The per-shard memtable valve: lance's default when nothing is injected.
 ///
-/// Soft and blocking — it stalls the producer until a flush drains the pool and
-/// never refuses a write. Replaced wholesale by
+/// Soft and blocking — it stalls the producer until a flush drains the pool.
+/// It refuses a write only when the pool *cannot* drain (see [`Drain`]);
+/// waiting there would park the writer for good. Replaced wholesale by
 /// [`ShardWriterConfig::backpressure`], so an embedder that injects a
 /// controller takes on the per-shard ceiling this provides (see
 /// [`ShardMemory`]).
@@ -963,14 +1060,27 @@ impl BackpressureController for LocalBackpressureController {
     }
 
     /// Blocks while this shard's unflushed bytes are at or above
-    /// `max_unflushed_memtable_bytes`, waiting on the oldest flush. Never
-    /// returns [`Error::Backpressure`] — this valve only ever delays.
+    /// `max_unflushed_memtable_bytes`, waiting on the oldest flush.
+    ///
+    /// Returns [`Error::Backpressure`] in the one case where blocking would
+    /// never end: over the ceiling with no flush outstanding and nothing
+    /// draining in the background, for `STALL_GRACE` running. Only a write
+    /// starts a flush, and this valve is what holds writes out, so the wait
+    /// would have no event to end on. The
+    /// error names the breakdown, because the two ways to get there — a flush
+    /// that failed and left its generation charged, or index memory carrying a
+    /// memtable past the ceiling while the seal trigger still sees small row
+    /// bytes — are both configuration or operational conditions an operator has
+    /// to act on rather than wait out.
     async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()> {
         let start = std::time::Instant::now();
         let mut iteration = 0u32;
         // Held for the whole stall so an operator polling mid-wait sees it; the
         // totals below cannot, since they only move once the wait ends.
         let mut active_wait = None;
+        // When the shard first read as un-drainable, cleared the moment it
+        // stops. See `STALL_GRACE`.
+        let mut stalled_since: Option<std::time::Instant> = None;
 
         loop {
             // Re-read every iteration: this loop is waiting for exactly these
@@ -996,22 +1106,46 @@ impl BackpressureController for LocalBackpressureController {
                 unflushed_memtable_bytes, self.max_unflushed_memtable_bytes, iteration
             );
 
-            // Wait for oldest memtable to flush
-            if let Some(mut mem_watcher) = shard.flush_watcher() {
-                tokio::select! {
-                    _ = mem_watcher.await_value() => {}
-                    _ = tokio::time::sleep(self.log_interval) => {
-                        warn!(
-                            "Backpressure wait timeout, continuing to wait: unflushed_bytes={}, interval={}s, iteration={}",
-                            unflushed_memtable_bytes,
-                            self.log_interval.as_secs(),
-                            iteration
-                        );
+            match shard.drain() {
+                Drain::Flush(mut mem_watcher) => {
+                    stalled_since = None;
+                    tokio::select! {
+                        _ = mem_watcher.await_value() => {}
+                        _ = tokio::time::sleep(self.log_interval) => {
+                            warn!(
+                                "Backpressure wait timeout, continuing to wait: unflushed_bytes={}, interval={}s, iteration={}",
+                                unflushed_memtable_bytes,
+                                self.log_interval.as_secs(),
+                                iteration
+                            );
+                        }
                     }
                 }
-            } else {
-                // No watcher available - sleep briefly to avoid busy loop
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                // Someone else is draining on a schedule of their own; poll
+                // rather than busy-loop.
+                Drain::Background => {
+                    stalled_since = None;
+                    tokio::time::sleep(DRAIN_POLL_INTERVAL).await
+                }
+                Drain::Stalled => {
+                    let since = *stalled_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() < STALL_GRACE {
+                        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    return Err(Error::backpressure(format!(
+                        "shard is at its memtable ceiling with no flush outstanding, so waiting \
+                         cannot drain it: unflushed_bytes={}, max={}, active_bytes={} (of which \
+                         index_bytes={}), frozen_bytes={}. Either a flush failed and left its \
+                         generation resident, or index memory carries the active memtable past \
+                         the ceiling before max_memtable_size seals it",
+                        unflushed_memtable_bytes,
+                        self.max_unflushed_memtable_bytes,
+                        shard.active_bytes(),
+                        shard.index_bytes(),
+                        shard.frozen_bytes(),
+                    )));
+                }
             }
         }
     }
@@ -1061,42 +1195,52 @@ struct ResidentMemTables {
     active: Option<InMemoryMemTableRef>,
     /// Sealed memtables whose flush has not committed — including any left
     /// resident by a *failed* flush, which are the ones most worth metering.
-    /// Excludes flushed memtables still inside `frozen_memtable_grace`: those
-    /// are reclaimable, and throttling on them would meter memory that is about
-    /// to go away by itself.
     frozen: Vec<InMemoryMemTableRef>,
-    /// The oldest flush still outstanding — the frozen queue's front, else the
-    /// active memtable's (it has a completion cell from construction, so this is
-    /// always available). Published here rather than read through the writer
-    /// lock, which has the blind spot described above.
+    /// Sealed memtables whose flush *did* commit, lingering out
+    /// `frozen_memtable_grace` before `SweepExpired` drops them.
+    ///
+    /// Held apart from `frozen` rather than dropped from the view: no flush can
+    /// reclaim these, so metering the flush valve on them would throttle against
+    /// memory that is going away on a timer. They are still resident, though,
+    /// and a process-wide budget has to see them — hence
+    /// [`ShardMemory::retained_bytes`] alongside
+    /// [`ShardMemory::unflushed_bytes`].
+    grace: Vec<InMemoryMemTableRef>,
+    /// The oldest flush still outstanding, or `None` when none is.
+    ///
+    /// Deliberately not backfilled with the active memtable's watcher. That
+    /// watcher only fires when the active memtable is sealed, which only a put
+    /// does — so offering it to a waiter that is itself holding puts out names
+    /// an event that cannot arrive. `None` is the honest answer, and
+    /// [`ShardMemory::drain`] turns it into one.
     oldest_flush: Option<DurabilityWatcher>,
 }
 
 /// Re-derive a shard's resident-memtable set from its writer state.
 ///
 /// Call under the write lock after any change to that set: `open`,
-/// `freeze_memtable`, and a flush commit. `SweepExpired` deliberately does not
-/// — it only evicts memtables already stamped `flushed_at_ms`, which the filter
-/// below has excluded since the commit that stamped them.
+/// `freeze_memtable`, a flush commit, and `SweepExpired` — which changes it by
+/// evicting grace-expired generations that are still counted until it runs.
 ///
 /// Cheap: two `Arc` clones per live memtable, no byte walk — the totals are
 /// computed on read.
 fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) {
+    let (grace, frozen) = state
+        .frozen_memtables
+        .iter()
+        .partition::<Vec<_>, _>(|frozen| frozen.flushed_at_ms.is_some());
+    let refs = |tables: Vec<&FrozenMemTable>| {
+        tables
+            .into_iter()
+            .map(|frozen| in_memory_ref(&frozen.memtable))
+            .collect()
+    };
     memory.store(Arc::new(ResidentMemTables {
         active: Some(in_memory_ref(&state.memtable)),
-        frozen: state
-            .frozen_memtables
-            .iter()
-            .filter(|frozen| frozen.flushed_at_ms.is_none())
-            .map(|frozen| in_memory_ref(&frozen.memtable))
-            .collect(),
-        // Oldest first, so the front of the queue is what a waiter should park
-        // on; with nothing frozen, the active memtable is what will flush next.
-        oldest_flush: state
-            .frozen_flush_watchers
-            .front()
-            .cloned()
-            .or_else(|| state.memtable.get_memtable_flush_watcher()),
+        frozen: refs(frozen),
+        grace: refs(grace),
+        // Oldest first, so the front of the queue is what a waiter parks on.
+        oldest_flush: state.frozen_flush_watchers.front().cloned(),
     }));
 }
 
@@ -2762,9 +2906,10 @@ impl ShardWriter {
     /// embedder ranking shards by size and the controller gating a write read
     /// one implementation rather than two that can disagree.
     ///
-    /// Only a flush reclaims these bytes, so `unflushed_bytes` is the pool to
-    /// bound against OOM. It can far exceed `max_memtable_size`, which gates row
-    /// data alone.
+    /// Only a flush reclaims `unflushed_bytes`, so that is the pool to bound
+    /// against OOM; `retained_bytes` adds what is resident but already flushed
+    /// and waiting out `frozen_memtable_grace`. Either can far exceed
+    /// `max_memtable_size`, which gates row data alone.
     pub fn memory(&self) -> ShardMemory {
         match &self.mode {
             WriterMode::MemTable { writer_state, .. } => {
@@ -3656,12 +3801,18 @@ impl MemTableFlushHandler {
         let now = now_millis();
         let grace_ms = self.grace.as_millis() as u64;
         let mut state = self.state.write().await;
+        let before = state.frozen_memtables.len();
         state
             .frozen_memtables
             .retain(|frozen| match frozen.flushed_at_ms {
                 Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
                 None => true,
             });
+        // Eviction is the only thing that reclaims a grace-retained generation,
+        // so this is where its bytes leave the memory view.
+        if state.frozen_memtables.len() != before {
+            publish_memory(&self.memory, &state);
+        }
     }
 }
 
@@ -5448,10 +5599,25 @@ mod tests {
             stats.frozen_count > 0,
             "flushed memtables must stay in the read view for the grace window"
         );
+        let memory = writer.memory();
         assert_eq!(
-            writer.memory().frozen_bytes(),
+            memory.frozen_bytes(),
             0,
             "every seal flushed, so nothing is owed to flush"
+        );
+
+        // Owing nothing to flush is not the same as holding nothing. Those
+        // generations stay resident for the whole grace window, and a
+        // process-wide budget has to see them even though the per-shard flush
+        // valve deliberately does not meter them.
+        assert!(
+            memory.grace_bytes() > 0,
+            "flushed-but-retained generations hold real memory"
+        );
+        assert_eq!(
+            memory.retained_bytes(),
+            memory.unflushed_bytes() + memory.grace_bytes(),
+            "retained is the whole footprint; unflushed is only what a flush can reclaim"
         );
 
         writer.close().await.unwrap();
@@ -6091,9 +6257,12 @@ mod tests {
             unlocked,
             "a writer holding the lock must not zero the memory view"
         );
+        // The drain classification comes off the same published snapshot, so it
+        // answers under the lock as well. Nothing is frozen here, so the honest
+        // answer is that no flush is outstanding.
         assert!(
-            writer.memory().flush_watcher().is_some(),
-            "the flush watcher is published too, so it is readable under the lock"
+            matches!(writer.memory().drain(), Drain::Stalled),
+            "the drain classification is published too, so it reads under the lock"
         );
         drop(held);
 
@@ -6173,9 +6342,15 @@ mod tests {
             super::super::memtable::pk_bloom_filter_bytes(),
             "an unindexed memtable still holds its PK bloom filter"
         );
+        // The ceiling is built on what the batches keep alive, not on the flush
+        // unit. The two row measures are close but never identical even for
+        // owned batches — buffer capacity is padded, and `row_bytes` charges a
+        // `RecordBatch` header per batch that an allocation walk does not see.
+        // How far they diverge for zero-copy slices, which is the case that
+        // matters, is pinned in `BatchStore`'s own tests.
         assert_eq!(
             handle.resident_bytes(),
-            handle.row_bytes() + handle.index_bytes()
+            handle.retained_row_bytes() + handle.index_bytes()
         );
     }
 
@@ -8681,6 +8856,31 @@ mod tests {
         assert!(
             frozen_bytes >= refs.frozen[0].batch_store.row_bytes(),
             "a failed flush must keep owing its resident bytes, got {frozen_bytes}"
+        );
+
+        // Charging those bytes must not become a trap. Nothing retries the
+        // failed generation, and its watcher came off the queue when the flush
+        // reported, so there is no event left that would drain the pool — while
+        // the valve itself is what keeps the puts that could seal a new
+        // generation from arriving. Waiting here would never end, so the
+        // controller refuses instead.
+        assert!(
+            matches!(writer_a.memory().drain(), Drain::Stalled),
+            "a failed flush leaves nothing outstanding to wait on"
+        );
+        let controller = LocalBackpressureController::new(&ShardWriterConfig {
+            max_unflushed_memtable_bytes: writer_a.memory().unflushed_bytes(),
+            ..Default::default()
+        });
+        let refused = tokio::time::timeout(
+            STALL_GRACE * 10,
+            controller.maybe_apply_backpressure(writer_a.memory()),
+        )
+        .await
+        .expect("a shard nothing can drain must refuse, not park the writer");
+        assert!(
+            refused.is_err_and(|e| e.is_backpressure()),
+            "the refusal must be the retryable backpressure signal"
         );
 
         writer_b.close().await.unwrap();

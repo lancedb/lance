@@ -50,10 +50,17 @@ impl InMemoryMemTableRef {
             + crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes()
     }
 
+    /// Heap the buffered batches keep alive, which is not [`Self::row_bytes`]
+    /// once any batch is a zero-copy slice: a slice's window is a fraction of
+    /// the parent buffer it pins. See [`BatchStore::retained_bytes`].
+    pub fn retained_row_bytes(&self) -> usize {
+        self.batch_store.retained_bytes()
+    }
+
     /// Total resident heap bytes. This, not [`Self::row_bytes`], is what a
     /// memory ceiling must be built on.
     pub fn resident_bytes(&self) -> usize {
-        self.row_bytes() + self.index_bytes()
+        self.retained_row_bytes() + self.index_bytes()
     }
 }
 

@@ -985,6 +985,15 @@ fn memtable_stats_to_pydict(
     )?;
     dict.set_item("frozen_count", stats.frozen_count)?;
     dict.set_item("frozen_bytes", bytes.map_or(0, ShardMemory::frozen_bytes))?;
+    // Flushed generations still lingering out `frozen_memtable_grace`. Resident,
+    // but no flush reclaims them, so they are not in `frozen_bytes`.
+    dict.set_item("grace_bytes", bytes.map_or(0, ShardMemory::grace_bytes))?;
+    // The whole footprint: what a process-wide budget meters, as opposed to
+    // `frozen_bytes` + active, which is only what a flush can give back.
+    dict.set_item(
+        "retained_bytes",
+        bytes.map_or(0, ShardMemory::retained_bytes),
+    )?;
     Ok(dict.into_any().unbind())
 }
 

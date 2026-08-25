@@ -347,20 +347,17 @@ impl HnswGraph {
             nodes.push(Node::new(target_level, params.m));
         }
 
-        let pool_size = rayon::current_num_threads().max(1) * 2;
+        let pool_size = visited_pool_size();
         let visited_pool = ArrayQueue::new(pool_size);
         for _ in 0..pool_size {
             let _ = visited_pool.push(VisitedList::new(0));
         }
-        // Pooled lists start empty but `VisitedList::reset` resizes each to one
-        // bit per node on first use.
-        let visited_bytes = pool_size
-            * (std::mem::size_of::<VisitedList>()
-                + capacity.div_ceil(WORD_BITS) * std::mem::size_of::<usize>());
 
         Ok(Self {
             params,
-            base_bytes: capacity * std::mem::size_of::<Node>() + node_bytes + visited_bytes,
+            base_bytes: capacity * std::mem::size_of::<Node>()
+                + node_bytes
+                + visited_pool_bytes(capacity),
             nodes,
             build_entry_point: AtomicU32::new(0),
             build_max_level: AtomicU16::new(0),
@@ -382,6 +379,38 @@ impl HnswGraph {
     /// vector memtable takes its first row.
     pub(crate) fn resident_bytes(&self) -> usize {
         self.base_bytes + self.packed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a graph of this shape,
+    /// answerable before one is built.
+    ///
+    /// Everything `try_new` allocates is sized from `capacity`; the only random
+    /// input is how nodes divide across levels, and that division is a
+    /// geometric ladder — every node holds level 0, and the share reaching each
+    /// level above it falls by a factor of `m`. Walking that ladder lands close
+    /// to the built graph instead of sampling it, and level 0 — which dominates
+    /// — is not an estimate at all.
+    ///
+    /// Exists because the allocation is committed well before it happens: the
+    /// first vector row into a memtable materializes the whole graph. Charging
+    /// it only from that row on would put the largest single allocation in a
+    /// vector memtable beyond the reach of admission control.
+    pub(crate) fn reserved_bytes(capacity: usize, params: &BuildParams) -> usize {
+        // Guard the ladder's divisor rather than `params.m` itself: `validate`
+        // rejects m < 2, but this is reachable before that runs.
+        let ratio = params.m.max(2);
+        let mut reaching = capacity;
+        let mut links = 0;
+        for level in 0..params.max_level {
+            links += reaching
+                * (std::mem::size_of::<LevelLinks>()
+                    + LevelLinks::allocated_bytes(max_neighbors(params.m, level)));
+            reaching /= ratio;
+            if reaching == 0 {
+                break;
+            }
+        }
+        capacity * std::mem::size_of::<Node>() + links + visited_pool_bytes(capacity)
     }
 
     /// Number of nodes visible to readers.
@@ -1134,6 +1163,20 @@ fn random_level(params: &BuildParams, rng: &mut SmallRng) -> u16 {
 
 fn max_neighbors(m: usize, level: u16) -> usize {
     if level == 0 { m * 2 } else { m }
+}
+
+/// One list per worker, doubled so a searcher never blocks on the queue.
+fn visited_pool_size() -> usize {
+    rayon::current_num_threads().max(1) * 2
+}
+
+/// Heap the visited pool settles at for a graph of `capacity` nodes. The lists
+/// are pushed empty but `VisitedList::reset` resizes each to one bit per node
+/// on first use, so the pool is charged at its grown size from the start.
+fn visited_pool_bytes(capacity: usize) -> usize {
+    visited_pool_size()
+        * (std::mem::size_of::<VisitedList>()
+            + capacity.div_ceil(WORD_BITS) * std::mem::size_of::<usize>())
 }
 
 #[derive(Debug)]

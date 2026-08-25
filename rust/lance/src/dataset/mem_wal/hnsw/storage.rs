@@ -203,8 +203,16 @@ impl ArrowFixedSizeListVectorStore {
     /// bytes belong to the MemTable's batch store and counting them here would
     /// double-count. That also makes this independent of `dim`.
     pub(crate) fn resident_bytes(&self) -> usize {
-        self.max_batches * std::mem::size_of::<StoredArrowBatch>()
-            + self.capacity * (std::mem::size_of::<RowLookup>() + std::mem::size_of::<u64>())
+        Self::reserved_bytes(self.capacity, self.max_batches)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a store of this shape,
+    /// answerable before one exists — the slabs are sized from these two
+    /// numbers alone, and `dim` never enters. Lets a memory ceiling charge for
+    /// the store ahead of the first insert that allocates it.
+    pub(crate) fn reserved_bytes(capacity: usize, max_batches: usize) -> usize {
+        max_batches * std::mem::size_of::<StoredArrowBatch>()
+            + capacity * (std::mem::size_of::<RowLookup>() + std::mem::size_of::<u64>())
     }
 
     /// Number of committed vectors.

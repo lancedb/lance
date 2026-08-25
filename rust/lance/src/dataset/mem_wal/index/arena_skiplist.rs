@@ -354,7 +354,9 @@ impl<K: Ord> SkipListReader<K> {
     ///
     /// Counts chunks, not entries, so it steps by `CHUNK_SIZE` and overshoots
     /// the live nodes by at most one partly-filled chunk. Excludes any bytes a
-    /// key owns outside its node (e.g. a long `Box<[u8]>` key).
+    /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
+    /// never sees those, so whoever built the key charges them; see
+    /// `BytesBackend::key_heap_bytes`.
     pub(crate) fn resident_bytes(&self) -> usize {
         self.core.arena_bytes.load(Ordering::Relaxed)
     }

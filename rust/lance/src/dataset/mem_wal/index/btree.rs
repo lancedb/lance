@@ -23,6 +23,7 @@
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use arrow_array::types::*;
@@ -184,6 +185,16 @@ impl InlineBytes {
         match self {
             Self::Inline { len, buf } => &buf[..*len as usize],
             Self::Heap(b) => b,
+        }
+    }
+
+    /// Bytes this key owns outside its node. Inline keys own none; a spilled
+    /// key owns exactly its payload, since `Box<[u8]>` allocates no slack.
+    #[inline]
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(b) => b.len(),
         }
     }
 }
@@ -458,6 +469,10 @@ struct BytesBackend {
     writer: Mutex<SkipListWriter<BytesKey>>,
     null_positions: Mutex<Vec<RowPosition>>,
     data_type: DataType,
+    /// Payload of keys too long to live inline in their node. The skiplist's
+    /// own counter measures arena chunks only, so without this a column of long
+    /// strings would duplicate its whole payload uncharged.
+    key_heap_bytes: AtomicUsize,
 }
 
 impl BytesBackend {
@@ -468,6 +483,7 @@ impl BytesBackend {
             writer: Mutex::new(writer),
             null_positions: Mutex::new(Vec::new()),
             data_type,
+            key_heap_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -483,6 +499,7 @@ impl BytesBackend {
                 let mut nulls: Vec<RowPosition> = Vec::new();
                 let had_existing_nulls = !self.null_positions.lock().unwrap().is_empty();
                 let mut saw_null = false;
+                let mut spilled_key_bytes = 0;
                 for row_idx in 0..typed.len() {
                     let position = row_offset + row_idx as u64;
                     if typed.is_null(row_idx) {
@@ -498,6 +515,7 @@ impl BytesBackend {
                             bytes: InlineBytes::new(bytes),
                             position,
                         };
+                        spilled_key_bytes += key.bytes.heap_bytes();
                         had_existing |= writer.insert_and_check_neighbors(key, |prev, next| {
                             prev.is_some_and(|key| key.bytes.as_slice() == bytes)
                                 || next.is_some_and(|key| key.bytes.as_slice() == bytes)
@@ -505,6 +523,8 @@ impl BytesBackend {
                     }
                 }
                 drop(writer);
+                self.key_heap_bytes
+                    .fetch_add(spilled_key_bytes, Ordering::Relaxed);
                 if !nulls.is_empty() {
                     self.null_positions.lock().unwrap().extend(nulls);
                 }
@@ -842,7 +862,11 @@ impl Backend {
         }
         match self {
             Self::FixedInt(b) => b.reader.resident_bytes() + null_bytes(&b.null_positions),
-            Self::Bytes(b) => b.reader.resident_bytes() + null_bytes(&b.null_positions),
+            Self::Bytes(b) => {
+                b.reader.resident_bytes()
+                    + null_bytes(&b.null_positions)
+                    + b.key_heap_bytes.load(Ordering::Relaxed)
+            }
             Self::Scalar(b) => b.reader.resident_bytes(),
         }
     }
@@ -954,7 +978,8 @@ impl BTreeMemIndex {
     /// Heap bytes held by this index; zero before the first insert.
     ///
     /// Grows with rows (unlike the pre-allocated HNSW index). Arena-chunk
-    /// granular, so it steps rather than climbs smoothly.
+    /// granular, so it steps rather than climbs smoothly — plus the exact
+    /// payload of any key too long to live inline in its node.
     pub(crate) fn resident_bytes(&self) -> usize {
         self.backend.get().map(|b| b.resident_bytes()).unwrap_or(0)
     }
@@ -1290,6 +1315,40 @@ mod tests {
         assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
         assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
         assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
+    }
+
+    /// Keys longer than `INLINE_CAP` spill to a `Box<[u8]>` outside the
+    /// skiplist's arena, so the arena counter alone would leave an arbitrarily
+    /// large duplicate of the column uncharged.
+    #[test]
+    fn test_resident_bytes_counts_spilled_keys() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "s".to_string());
+
+        let rows = 256;
+        let width = 16 * 1024;
+        let values: Vec<String> = (0..rows)
+            .map(|i| format!("{i:07}{}", "z".repeat(width - 7)))
+            .collect();
+        let key_bytes = rows * width;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(
+                values.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        assert!(
+            index.resident_bytes() >= key_bytes,
+            "resident {} must cover the {key_bytes} bytes of spilled key payload",
+            index.resident_bytes()
+        );
     }
 
     #[test]
