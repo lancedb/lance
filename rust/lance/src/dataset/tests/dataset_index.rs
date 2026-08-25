@@ -1364,7 +1364,8 @@ async fn compound_fts_results_with_filter(
     limit: Option<i64>,
 ) -> Vec<(u64, f32)> {
     let mut scan = dataset.scan();
-    scan.with_row_id()
+    scan.prefilter(true)
+        .with_row_id()
         .filter(filter)
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query))
@@ -2049,6 +2050,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     let filtered_stats_setter = filtered_stats.clone();
     let mut filtered_scan = partial_dataset.scan();
     filtered_scan
+        .prefilter(true)
         .scan_stats_callback(Arc::new(move |stats| {
             *filtered_stats_setter.lock().unwrap() = Some(stats.clone());
         }))
