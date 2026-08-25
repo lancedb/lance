@@ -11,7 +11,7 @@ use futures::TryStreamExt;
 
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
@@ -19,8 +19,8 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
-use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams, SCORE_COL};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
@@ -31,13 +31,14 @@ use rstest::rstest;
 use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
+use crate::dataset::ROW_ID;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
-use crate::dataset::transaction::{DataOverlayGroup, Operation};
+use crate::dataset::transaction::{DataOverlayGroup, Operation, Transaction};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
-use crate::io::exec::fts::FlatMatchQueryExec;
+use crate::io::exec::fts::{BOUNDED_MIXED_FIELD_ROWS_METRIC, FlatMatchQueryExec};
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -795,6 +796,24 @@ async fn build_text_fts_index_with_positions(dataset: &mut Dataset) {
         .unwrap();
 }
 
+async fn make_text_index_coverage_unknown(dataset: &mut Dataset) {
+    let committed = dataset.load_indices_by_name("text_idx").await.unwrap();
+    let mut replacement = committed.to_vec();
+    replacement[0].fragment_bitmap = None;
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: replacement,
+            removed_indices: committed.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+}
+
 /// Collect sorted IDs of rows returned by an FTS query on `text`.
 async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
     let results = dataset
@@ -816,6 +835,48 @@ async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
 
 async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
+}
+
+async fn bounded_multimatch_ids(dataset: &Dataset, term: &str, limit: Option<i64>) -> Vec<i32> {
+    let query: FtsQuery = MultiMatchQuery::try_new(term.to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    batch["id"].as_primitive::<Int32Type>().values().to_vec()
+}
+
+async fn scored_fts_rows(
+    dataset: &Dataset,
+    query: FullTextSearchQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, u32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id().full_text_search(query).unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|score| score.to_bits()),
+        )
+        .collect()
 }
 
 #[tokio::test]
@@ -1030,6 +1091,214 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
         mango_ids.contains(&6),
         "id=6 mango sorbet should still be found: {mango_ids:?}"
     );
+
+    for term in ["apple", "mango"] {
+        let exhaustive = bounded_multimatch_ids(&dataset, term, None).await;
+        let limited = bounded_multimatch_ids(&dataset, term, Some(2)).await;
+        assert_eq!(limited, exhaustive[..exhaustive.len().min(2)]);
+        if term == "apple" {
+            assert_eq!(
+                limited,
+                vec![0],
+                "limit=2 must not resurrect id=1's stale indexed apple posting"
+            );
+        }
+
+        let query: FtsQuery = MultiMatchQuery::try_new(term.to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("fts_bounded_mixed_fallback_full_scan")
+                && plan.contains("AggregateExec")
+                && !plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+            "overlay MultiMatch should fail closed to current-value flat scoring:\n{plan}"
+        );
+    }
+
+    let multi_match_query: FtsQuery =
+        MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let unbounded = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(multi_match_query.clone()),
+        None,
+    )
+    .await;
+    let bounded = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(multi_match_query),
+        Some(2),
+    )
+    .await;
+    assert_eq!(bounded, unbounded[..bounded.len()]);
+
+    let plain_query = FullTextSearchQuery::new("mango".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut plain = scored_fts_rows(&dataset, plain_query, None).await;
+    let mut multi_match = unbounded;
+    plain.sort_unstable_by_key(|(row_id, _)| *row_id);
+    multi_match.sort_unstable_by_key(|(row_id, _)| *row_id);
+    assert_eq!(
+        plain, multi_match,
+        "plain Match and unbounded one-field MultiMatch must share current-value scores"
+    );
+
+    let mut fuzzy = MultiMatchQuery::try_new("applf".to_owned(), vec!["text".to_owned()]).unwrap();
+    fuzzy.match_queries[0].fuzziness = Some(1);
+    let mut fuzzy_scan = dataset.scan();
+    fuzzy_scan
+        .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
+    assert!(
+        fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy"),
+        "known-coverage stale fuzzy queries must retain indexed fuzzy execution:\n{fuzzy_plan}"
+    );
+    let fuzzy_batch = fuzzy_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        fuzzy_batch["id"].as_primitive::<Int32Type>().values(),
+        &[0],
+        "the unaffected indexed fuzzy hit must survive while stale id=1 remains blocked"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_multimatch_overlay_zero_token_row_becomes_match(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [0]), ("text", Utf8, [""])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_text_fts_index(&mut dataset).await;
+    let dataset = commit_overlay(
+        dataset,
+        "zero_token_to_needle",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+        vec![Arc::new(StringArray::from(vec![Some("needle")]))],
+    )
+    .await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new("needle".to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("fts_bounded_mixed_fallback_full_scan"),
+        "zero-token stale rows require current-value corpus statistics:\n{plan}"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(
+        batch[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+
+    let plain_query = FullTextSearchQuery::new("needle".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let plain = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(plain_query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(plain.num_rows(), 1);
+    assert!(
+        plain[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+
+    let unbounded_query: FtsQuery =
+        MultiMatchQuery::try_new("needle".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let unbounded = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(unbounded_query))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(unbounded.num_rows(), 1);
+    assert!(
+        unbounded[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_unknown_coverage_overlay_full_scan_is_executable() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+    make_text_index_coverage_unknown(&mut dataset).await;
+    let dataset = commit_overlay(
+        dataset,
+        "unknown_coverage_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("fts_bounded_mixed_fallback_full_scan") && plan.contains("FlatMatchQuery"),
+        "unknown overlay ownership must produce an executable FullScan fallback:\n{plan}"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 6]);
 }
 
 /// A phrase query must drop stale indexed positions and re-evaluate the current
@@ -1197,6 +1466,28 @@ async fn test_fts_overlay_row_level_masking_under_fast_search(
     assert_eq!(
         new_phrase_scan.try_into_batch().await.unwrap().num_rows(),
         0
+    );
+
+    let query: FtsQuery = MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut multi_match_scan = dataset.scan();
+    multi_match_scan.fast_search();
+    multi_match_scan
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    let plan = multi_match_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("FlatMatchQuery") && !plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "fast_search overlay MultiMatch must keep the index-only plan:\n{plan}"
+    );
+    let result = multi_match_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&result)),
+        vec![6],
+        "the overlay-current mango row must remain excluded under fast_search"
     );
 }
 

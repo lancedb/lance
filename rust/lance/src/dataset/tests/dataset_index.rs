@@ -21,6 +21,11 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
+use crate::io::exec::fts::{
+    BOUNDED_MIXED_FIELD_ROWS_METRIC, BOUNDED_MIXED_INDEXED_CANDIDATES_METRIC,
+    BOUNDED_MIXED_INDEXED_ROWS_METRIC, BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC,
+    BOUNDED_MIXED_RESIDUAL_ROWS_METRIC,
+};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -56,7 +61,7 @@ use lance_index::metrics::{
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
+    DocumentGranularity, InvertedListFormatVersion, MemBM25Scorer, SCORE_COL, Scorer,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -1293,6 +1298,28 @@ async fn create_fragmented_fts_index_with_groups(
     assert_eq!(segments.len(), expected_segments);
 }
 
+async fn replace_index_segments_for_test(
+    dataset: &mut Dataset,
+    index_name: &str,
+    mutate: impl FnOnce(&mut [lance_table::format::IndexMetadata]),
+) {
+    let committed = dataset.load_indices_by_name(index_name).await.unwrap();
+    let mut replacement = committed.to_vec();
+    mutate(&mut replacement);
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: replacement,
+            removed_indices: committed.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+}
+
 fn compound_multimatch_query() -> FtsQuery {
     MultiMatchQuery::try_new(
         "common".to_owned(),
@@ -1318,6 +1345,31 @@ async fn compound_fts_results(
 ) -> Vec<(u64, f32)> {
     let mut scan = dataset.scan();
     scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn compound_fts_results_with_filter(
+    dataset: &Dataset,
+    query: FtsQuery,
+    filter: &str,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .filter(filter)
+        .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap();
     if let Some(limit) = limit {
@@ -1548,6 +1600,12 @@ async fn compound_fts_plan(dataset: &Dataset, query: FtsQuery, limit: usize) -> 
 }
 
 async fn write_cross_column_compound_dataset() -> Dataset {
+    write_cross_column_compound_dataset_with_stable_row_ids(false).await
+}
+
+async fn write_cross_column_compound_dataset_with_stable_row_ids(
+    enable_stable_row_ids: bool,
+) -> Dataset {
     let batch = arrow_array::record_batch!(
         (
             "title",
@@ -1590,6 +1648,7 @@ async fn write_cross_column_compound_dataset() -> Dataset {
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 5,
+            enable_stable_row_ids,
             ..Default::default()
         }),
     )
@@ -1799,6 +1858,17 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     create_fragmented_fts_index(&mut dataset, "title", true).await;
     create_fragmented_fts_index(&mut dataset, "body", true).await;
 
+    let single_indexed_query: FtsQuery =
+        MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
+            .unwrap()
+            .into();
+    let single_indexed_plan = compound_fts_plan(&dataset, single_indexed_query, LIMIT).await;
+    assert!(
+        single_indexed_plan.contains("CompoundFtsScorer")
+            && !single_indexed_plan.contains("AggregateExec"),
+        "a completed fully-indexed field top-k should bypass outer MAX/top-k:\n{single_indexed_plan}"
+    );
+
     let explicit_query: FtsQuery = MultiMatchQuery::try_new(
         "noise".to_owned(),
         vec!["title".to_owned(), "body".to_owned()],
@@ -1881,22 +1951,24 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
 
     let mut partial_dataset = write_cross_column_compound_dataset().await;
     create_fragmented_fts_index(&mut partial_dataset, "body", true).await;
-    let appended = arrow_array::record_batch!(
-        ("title", Utf8, ["noise"]),
-        ("body", Utf8, ["noise"]),
-        ("id", Int32, [10])
-    )
-    .unwrap();
-    let schema = appended.schema();
-    partial_dataset
-        .append(
-            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
+    for id in [10, 11, 12] {
+        let appended = arrow_array::record_batch!(
+            ("title", Utf8, ["noise"]),
+            ("body", Utf8, ["noise"]),
+            ("id", Int32, [id])
         )
-        .await
         .unwrap();
-    // Index only the title after the append so it can retain a bounded plan
-    // while the partially covered body uses the exhaustive leaf fallback.
+        let schema = appended.schema();
+        partial_dataset
+            .append(
+                RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // Index only the title after the append. The partially covered body has
+    // three residual fragments and more equal-score residual matches than k.
     create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
     assert_compound_matches_independent_oracle(
         &partial_dataset,
@@ -1917,20 +1989,279 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         1,
         "only the fully indexed title field should attempt a bounded WAND certificate"
     );
-    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
+    assert!(
+        partial_stats
+            .all_counts
+            .get(BOUNDED_MIXED_INDEXED_CANDIDATES_METRIC)
+            .is_some_and(|rows| *rows <= LIMIT),
+        "the indexed source must emit at most k exact candidates"
+    );
+    assert!(
+        partial_stats
+            .all_counts
+            .get(BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC)
+            .is_some_and(|rows| *rows > LIMIT),
+        "three appended fragments should exercise residual candidates beyond k"
+    );
+    for metric in [
+        BOUNDED_MIXED_INDEXED_ROWS_METRIC,
+        BOUNDED_MIXED_RESIDUAL_ROWS_METRIC,
+        BOUNDED_MIXED_FIELD_ROWS_METRIC,
+    ] {
+        assert!(
+            partial_stats
+                .all_counts
+                .get(metric)
+                .is_some_and(|rows| *rows <= LIMIT),
+            "{metric} must remain bounded by k"
+        );
+    }
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
         "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
     );
     assert_eq!(
         partial_plan.matches("CompoundFtsScorer").count(),
-        1,
-        "the fully indexed title should retain its bounded compound scorer:\n{partial_plan}"
+        2,
+        "both the fully indexed title and indexed-live body source should be bounded:\n{partial_plan}"
     );
     assert!(
-        partial_plan.contains("FlatMatchQuery"),
-        "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
+        partial_plan.contains("FlatMatchQuery")
+            && partial_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "the partially covered body should use the bounded indexed-plus-residual path:\n{partial_plan}"
     );
+
+    let filtered_exhaustive = compound_fts_results_with_filter(
+        &partial_dataset,
+        explicit_query.clone(),
+        "id >= 10",
+        None,
+    )
+    .await;
+    let filtered_limited = compound_fts_results_with_filter(
+        &partial_dataset,
+        explicit_query,
+        "id >= 10",
+        Some(LIMIT as i64),
+    )
+    .await;
+    assert_eq!(filtered_limited, filtered_exhaustive[..LIMIT]);
+
+    let body_query: FtsQuery =
+        MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
+            .unwrap()
+            .into();
+    let body_plan = compound_fts_plan(&partial_dataset, body_query.clone(), LIMIT).await;
+    assert!(
+        body_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC) && !body_plan.contains("AggregateExec"),
+        "a completed partial-field top-k should bypass outer MAX/top-k:\n{body_plan}"
+    );
+    let residual_noise =
+        compound_fts_results_with_filter(&partial_dataset, body_query.clone(), "id = 12", Some(1))
+            .await;
+    assert_eq!(residual_noise.len(), 1);
+    let mut residual_scan = partial_dataset.scan();
+    residual_scan
+        .filter("id = 12")
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(body_query.clone()))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let residual_batch = residual_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        residual_batch["id"].as_primitive::<Int32Type>().values(),
+        &[12],
+        "candidate filtering must select residual business id 12, not a lower row-id tie"
+    );
+    let scorer = MemBM25Scorer::new(17, 13, HashMap::from([("noise".to_owned(), 4_usize)]));
+    let expected_score = scorer.query_weight("noise") * scorer.doc_weight(1, 1);
+    assert!(
+        (residual_noise[0].1 - expected_score).abs() <= 1.0e-6,
+        "a residual match must use filter-independent corpus statistics"
+    );
+
+    for fuzziness in [Some(1), None] {
+        let mut fuzzy =
+            MultiMatchQuery::try_new("nois".to_owned(), vec!["body".to_owned()]).unwrap();
+        fuzzy.match_queries[0].fuzziness = fuzziness;
+        let fuzzy_query: FtsQuery = fuzzy.into();
+        let fuzzy_exhaustive =
+            compound_fts_results(&partial_dataset, fuzzy_query.clone(), None).await;
+        let fuzzy_limited =
+            compound_fts_results(&partial_dataset, fuzzy_query.clone(), Some(1)).await;
+        assert_eq!(
+            fuzzy_limited,
+            fuzzy_exhaustive.into_iter().take(1).collect::<Vec<_>>()
+        );
+        let fuzzy_plan = compound_fts_plan(&partial_dataset, fuzzy_query, 1).await;
+        assert!(
+            fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy")
+                && !fuzzy_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+            "fuzziness={fuzziness:?} must retain the exhaustive scorer path:\n{fuzzy_plan}"
+        );
+    }
+
+    let mut fast_scan = partial_dataset.scan();
+    fast_scan.fast_search();
+    fast_scan
+        .full_text_search(FullTextSearchQuery::new_query(body_query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(10), None)
+        .unwrap();
+    let fast_plan = fast_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !fast_plan.contains("FlatMatchQuery")
+            && !fast_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "fast_search must keep the existing index-only partial-field plan:\n{fast_plan}"
+    );
+    let fast_batch = fast_scan.try_into_batch().await.unwrap();
+    assert_eq!(fast_batch["id"].as_primitive::<Int32Type>().values(), &[6]);
+}
+
+#[tokio::test]
+async fn test_bounded_partial_multimatch_stable_row_ids_and_deletes() {
+    let mut dataset = write_cross_column_compound_dataset_with_stable_row_ids(true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["residual", "residual", "residual"]),
+        ("body", Utf8, ["noise", "noise", "noise"]),
+        ("id", Int32, [10, 11, 12])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset.delete("id = 6").await.unwrap();
+
+    let query: FtsQuery = MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
+        .unwrap()
+        .into();
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(limited, exhaustive[..2]);
+    let plan = compound_fts_plan(&dataset, query.clone(), 2).await;
+    assert!(
+        plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "stable row ids should retain the bounded partial-field path:\n{plan}"
+    );
+
+    let mut limited_scan = dataset.scan();
+    limited_scan
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let ids = limited_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids["id"].as_primitive::<Int32Type>().values(),
+        &[10, 11],
+        "deleting indexed winner id=6 must promote residual ids 10 and 11"
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_multimatch_metadata_fallbacks_execute_target_flat_scan() {
+    for (case_name, expected_metric, append_residual) in [
+        (
+            "unknown",
+            "fts_bounded_mixed_fallback_unknown_coverage",
+            true,
+        ),
+        (
+            "overlap",
+            "fts_bounded_mixed_fallback_overlapping_coverage",
+            true,
+        ),
+        (
+            "overlap_full",
+            "fts_bounded_mixed_fallback_overlapping_coverage",
+            false,
+        ),
+    ] {
+        let mut dataset = write_cross_column_compound_dataset().await;
+        create_fragmented_fts_index(&mut dataset, "body", true).await;
+        if append_residual {
+            let appended = arrow_array::record_batch!(
+                ("title", Utf8, ["residual"]),
+                ("body", Utf8, ["noise"]),
+                ("id", Int32, [10])
+            )
+            .unwrap();
+            let schema = appended.schema();
+            dataset
+                .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+                .await
+                .unwrap();
+        }
+        replace_index_segments_for_test(&mut dataset, "body_idx", |segments| match case_name {
+            "unknown" => segments[0].fragment_bitmap = None,
+            "overlap" | "overlap_full" => {
+                let overlapping_fragment =
+                    segments[0].fragment_bitmap.as_ref().unwrap().min().unwrap();
+                segments[1]
+                    .fragment_bitmap
+                    .as_mut()
+                    .unwrap()
+                    .insert(overlapping_fragment);
+            }
+            _ => unreachable!(),
+        })
+        .await;
+
+        let query: FtsQuery = MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
+            .unwrap()
+            .into();
+        let plan = compound_fts_plan(&dataset, query.clone(), 2).await;
+        assert!(
+            plan.contains(expected_metric)
+                && plan.contains("FlatMatchQuery")
+                && plan.contains("AggregateExec"),
+            "{case_name} coverage must produce an executable target-flat fallback:\n{plan}"
+        );
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let expected_ids: &[i32] = if append_residual { &[6, 10] } else { &[6] };
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected_ids,
+            "{case_name} coverage fallback returned the wrong current rows"
+        );
+
+        if case_name == "unknown" {
+            let mut fuzzy =
+                MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
+            fuzzy.match_queries[0].fuzziness = Some(1);
+            let mut fuzzy_scan = dataset.scan();
+            fuzzy_scan
+                .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            let error = fuzzy_scan.explain_plan(false).await.unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "cannot be evaluated safely with unknown or overlapping FTS fragment coverage"
+                ),
+                "unexpected unknown-coverage fuzzy error: {error}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3243,6 +3574,34 @@ async fn test_fts_v1_remains_queryable_after_append_optimize() {
     let schema = batch.schema();
     let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
     dataset.append(batches, None).await.unwrap();
+
+    let legacy_partial_query: FtsQuery =
+        MultiMatchQuery::try_new("alpha".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let exhaustive = compound_fts_results(&dataset, legacy_partial_query.clone(), None).await;
+    let limited = compound_fts_results(&dataset, legacy_partial_query.clone(), Some(1)).await;
+    assert_eq!(limited, exhaustive[..1]);
+    let plan = compound_fts_plan(&dataset, legacy_partial_query, 1).await;
+    assert!(
+        plan.contains("FlatMatchQuery")
+            && plan.contains("fts_bounded_mixed_fallback_legacy")
+            && plan.contains("AggregateExec")
+            && !plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "V1 postings must retain the exhaustive mixed-field fallback:\n{plan}"
+    );
+    let missing_query: FtsQuery =
+        MultiMatchQuery::try_new("missing".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let (missing, stats) = compound_fts_results_with_stats(&dataset, missing_query, 1).await;
+    assert!(missing.is_empty());
+    assert_eq!(
+        stats.all_counts.get("fts_bounded_mixed_fallback_legacy"),
+        Some(&1),
+        "fallback metrics count planner invocations even when no rows are returned"
+    );
+
     dataset
         .optimize_indices(&OptimizeOptions::append())
         .await

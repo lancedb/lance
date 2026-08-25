@@ -862,6 +862,57 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     base_scorer: Option<MemBM25Scorer>,
     options: FlatBm25SearchOptions,
 ) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
+    flat_bm25_search_stream_with_scorer_mode(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        FlatScorerMode::Extend(base_scorer),
+        options,
+    )
+    .await
+}
+
+/// Run a flat BM25 search with fixed corpus-wide statistics.
+///
+/// Unlike [`flat_bm25_search_stream_with_options_and_scorer`], documents in
+/// `input` are scored but are not added to the supplied scorer. This is used
+/// when corpus statistics were collected from an unfiltered stream while the
+/// candidate stream has already applied a query filter.
+#[doc(hidden)]
+pub async fn flat_bm25_search_stream_with_options_and_fixed_scorer(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    scorer: MemBM25Scorer,
+    options: FlatBm25SearchOptions,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    Ok(flat_bm25_search_stream_with_scorer_mode(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        FlatScorerMode::Fixed(scorer),
+        options,
+    )
+    .await?
+    .0)
+}
+
+enum FlatScorerMode {
+    Extend(Option<MemBM25Scorer>),
+    Fixed(MemBM25Scorer),
+}
+
+async fn flat_bm25_search_stream_with_scorer_mode(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    scorer_mode: FlatScorerMode,
+    options: FlatBm25SearchOptions,
+) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
     let FlatBm25SearchOptions {
         target_batch_size,
         elapsed_compute,
@@ -882,7 +933,12 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     // proceeding. This mirrors the indexed search path, which already
     // short-circuits on empty query tokens.
     if query_tokens.is_empty() {
-        let scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        let scorer = match scorer_mode {
+            FlatScorerMode::Extend(base_scorer) => {
+                base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()))
+            }
+            FlatScorerMode::Fixed(scorer) => scorer,
+        };
         return Ok((
             Box::pin(RecordBatchStreamAdapter::new(
                 output_schema,
@@ -936,7 +992,12 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
     // All post-await work is synchronous; time the scorer + score + slicing loop together.
     let post_await_start = std::time::Instant::now();
-    let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
+    let scorer = match scorer_mode {
+        FlatScorerMode::Extend(base_scorer) => {
+            initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input)
+        }
+        FlatScorerMode::Fixed(scorer) => scorer,
+    };
     let scores = flat_bm25_score(
         query_tokens.as_ref(),
         &counted_input,
