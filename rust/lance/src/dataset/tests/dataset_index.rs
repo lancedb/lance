@@ -3299,22 +3299,30 @@ async fn test_compound_tie_uses_resolved_row_id() {
     assert_eq!(exhaustive.len(), 384);
 
     let stats = collected_stats.lock().unwrap().take().unwrap();
-    // Both duplicate-field children project 384 addresses, but only the first
-    // cold collector overflows and performs a resolution batch. The second
-    // child reuses the resident row-address projection.
-    assert_eq!(
-        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
-        Some(&1)
+    // Both duplicate-field children project 384 addresses. Depending on their
+    // scheduling, the second child may enter the cold path before the first
+    // publishes the resident row-address projection.
+    let score_floor_overflows = stats
+        .all_counts
+        .get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC)
+        .copied()
+        .unwrap_or_default();
+    assert!(
+        (1..=2).contains(&score_floor_overflows),
+        "expected one or two cold collector overflows, got {score_floor_overflows}"
     );
     assert_eq!(
         stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
         Some(&768)
     );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
-        Some(&1)
+    let address_resolution_batches = stats
+        .all_counts
+        .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC)
+        .copied()
+        .unwrap_or_default();
+    assert!(
+        (1..=2).contains(&address_resolution_batches),
+        "expected one or two cold address-resolution batches, got {address_resolution_batches}"
     );
 
     let mut analyze_scanner = dataset.scan();
