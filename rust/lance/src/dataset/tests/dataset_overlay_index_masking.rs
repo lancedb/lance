@@ -19,8 +19,10 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery};
-use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
+};
+use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams, SCORE_COL};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
@@ -1165,6 +1167,35 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
             "{name} fuzzy fast_search must mask the stale posting"
         );
     }
+
+    let nested: FtsQuery = BooleanQuery::new([
+        (
+            Occur::Must,
+            FtsQuery::Match(
+                MatchQuery::new("applf".to_owned())
+                    .with_column(Some("text".to_owned()))
+                    .with_fuzziness(Some(1)),
+            ),
+        ),
+        (
+            Occur::Should,
+            FtsQuery::Match(
+                MatchQuery::new("apple".to_owned()).with_column(Some("text".to_owned())),
+            ),
+        ),
+    ])
+    .into();
+    let mut nested_scan = dataset.scan();
+    nested_scan
+        .full_text_search(FullTextSearchQuery::new_query(nested))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let nested_plan = nested_scan.explain_plan(false).await.unwrap();
+    assert!(
+        nested_plan.contains("FlatMatchQuery"),
+        "nested fuzzy queries must leave compound execution when deletion state is newer than the index: {nested_plan}"
+    );
 }
 
 #[rstest]

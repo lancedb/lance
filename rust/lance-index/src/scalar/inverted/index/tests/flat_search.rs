@@ -111,6 +111,7 @@ async fn flat_json_fuzzy_candidates_keep_path_exact_and_unicode_prefix() {
     );
     let tokenizer = InvertedIndexParams::default()
         .lance_tokenizer("json".to_string())
+        .ascii_folding(false)
         .build()
         .unwrap();
     let candidates = collect_flat_fuzzy_candidates(
@@ -376,6 +377,32 @@ async fn fixed_flat_scorer_yields_before_input_eof() {
         0
     );
     drop(sender);
+}
+
+#[tokio::test]
+async fn fixed_flat_scorer_does_not_invent_weight_for_missing_term() {
+    let scorer = MemBM25Scorer::new(14, 10, HashMap::new());
+    let result = flat_bm25_search_stream_with_options_and_fixed_scorer(
+        text_stream(vec![vec!["needle".to_string()]]),
+        "text".to_string(),
+        "needle".to_string(),
+        simple_text_tokenizer(),
+        scorer,
+        FlatBm25SearchOptions {
+            target_batch_size: 16,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::Or,
+            boost: 1.0,
+            phrase_slop: None,
+        },
+    )
+    .await
+    .unwrap()
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    assert!(result.is_empty(), "missing scorer terms have zero weight");
 }
 
 #[tokio::test]

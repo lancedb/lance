@@ -3262,6 +3262,10 @@ pub struct FlatMatchQueryExec {
     tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
+    /// Independent unfiltered residual scan used to discover fuzzy vocabulary.
+    vocabulary_input: Option<Arc<dyn ExecutionPlan>>,
+    /// Unfiltered residual documents used only to extend corpus statistics.
+    corpus_stats_input: Option<Arc<dyn ExecutionPlan>>,
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
@@ -3350,6 +3354,8 @@ impl FlatMatchQueryExec {
             tokenized_query: Arc::new(OnceLock::new()),
             params,
             unindexed_input,
+            vocabulary_input: None,
+            corpus_stats_input: None,
             base_scorer: None,
             shared_scorer: None,
             shared_prepared: None,
@@ -3408,6 +3414,8 @@ impl FlatMatchQueryExec {
             tokenized_query: Arc::new(OnceLock::new()),
             params,
             unindexed_input,
+            vocabulary_input: None,
+            corpus_stats_input: None,
             base_scorer: None,
             shared_scorer: None,
             shared_prepared: None,
@@ -3447,6 +3455,31 @@ impl FlatMatchQueryExec {
         self
     }
 
+    /// Configure the two independent, unfiltered current-value scans required
+    /// by fuzzy flat execution.
+    ///
+    /// `vocabulary_input` discovers the globally capped expansion terms and
+    /// `corpus_stats_input` computes exact BM25 statistics for those final
+    /// terms. They must be separately planned execution trees over the same
+    /// logical document corpus; passing the same stateful plan twice is not
+    /// supported because consuming the vocabulary pass may exhaust it before
+    /// statistics are collected. The candidate input supplied to [`Self::new`]
+    /// or [`Self::new_with_document_granularity`] remains the independently
+    /// filtered stream that is scored.
+    ///
+    /// Exact queries do not require these inputs. A fuzzy query constructed
+    /// with the legacy constructors returns a clear execution error until this
+    /// method is called.
+    pub fn with_fuzzy_preparation_inputs(
+        mut self,
+        vocabulary_input: Arc<dyn ExecutionPlan>,
+        corpus_stats_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        self.vocabulary_input = Some(vocabulary_input);
+        self.corpus_stats_input = Some(corpus_stats_input);
+        self
+    }
+
     pub fn query(&self) -> &MatchQuery {
         &self.query
     }
@@ -3474,7 +3507,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.unindexed_input]
+        let mut children = vec![&self.unindexed_input];
+        if let Some(vocabulary_input) = &self.vocabulary_input {
+            children.push(vocabulary_input);
+        }
+        if let Some(corpus_stats_input) = &self.corpus_stats_input {
+            children.push(corpus_stats_input);
+        }
+        children
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -3503,18 +3543,36 @@ impl ExecutionPlan for FlatMatchQueryExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(
-                "Unexpected number of children".to_string(),
-            ));
+        let expected_children = 1
+            + usize::from(self.vocabulary_input.is_some())
+            + usize::from(self.corpus_stats_input.is_some());
+        if children.len() != expected_children {
+            return Err(DataFusionError::Internal(format!(
+                "FlatMatchQueryExec expected {expected_children} children, got {}",
+                children.len()
+            )));
         }
-        let unindexed_input = children.pop().unwrap();
+        let corpus_stats_input = if self.corpus_stats_input.is_some() {
+            children.pop()
+        } else {
+            None
+        };
+        let vocabulary_input = if self.vocabulary_input.is_some() {
+            children.pop()
+        } else {
+            None
+        };
+        let unindexed_input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("FlatMatchQueryExec lost its candidate input".to_string())
+        })?;
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
             tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             unindexed_input,
+            vocabulary_input,
+            corpus_stats_input,
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             shared_prepared: self.shared_prepared.clone(),
@@ -3551,6 +3609,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let document_column = self.document_column.clone();
         let phrase_slop = self.params.phrase_slop;
         let params = MatchQueryExec::effective_params(&query, self.params.clone());
+        let vocabulary_input = self.vocabulary_input.clone();
         let corpus_stats_input = self.corpus_stats_input.clone();
         let unindexed_plan = self.unindexed_input.clone();
         let current_values_only = self.current_values_only;
@@ -3657,9 +3716,24 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             ));
                         return Ok((stream, prepared.scorer().as_ref().clone(), Some(prepared)));
                     }
-                    let stats_plan = corpus_stats_input
-                        .clone()
-                        .unwrap_or_else(|| unindexed_plan.clone());
+                    let vocabulary_plan = vocabulary_input.ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "fuzzy FlatMatchQueryExec requires an independent vocabulary input"
+                                .to_string(),
+                        )
+                    })?;
+                    let stats_plan = corpus_stats_input.ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "fuzzy FlatMatchQueryExec requires an independent corpus-stats input"
+                                .to_string(),
+                        )
+                    })?;
+                    let vocabulary_stream = || {
+                        document_input(
+                            vocabulary_plan.execute(partition, context.clone())?,
+                            &document_column,
+                        )
+                    };
                     let stats_stream = || {
                         document_input(
                             stats_plan.execute(partition, context.clone())?,
@@ -3667,7 +3741,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         )
                     };
                     let candidates = collect_flat_fuzzy_candidates(
-                        stats_stream()?,
+                        vocabulary_stream()?,
                         &document_column,
                         document_tokenizer.box_clone(),
                         query_tokens.clone(),
@@ -4985,7 +5059,10 @@ mod tests {
             lance_core::ROW_ID_FIELD.clone(),
             arrow_schema::Field::new("text", DataType::Utf8, true),
         ]));
-        let input = Arc::new(EmptyExec::new(input_schema)) as Arc<dyn ExecutionPlan>;
+        let input = Arc::new(EmptyExec::new(input_schema.clone())) as Arc<dyn ExecutionPlan>;
+        let vocabulary_input =
+            Arc::new(EmptyExec::new(input_schema.clone())) as Arc<dyn ExecutionPlan>;
+        let stats_input = Arc::new(EmptyExec::new(input_schema)) as Arc<dyn ExecutionPlan>;
         let shared = Arc::new(SharedPreparedMatch::new());
         let exec = Arc::new(
             FlatMatchQueryExec::new(
@@ -4998,10 +5075,26 @@ mod tests {
                 input.clone(),
             )
             .unwrap()
+            .with_fuzzy_preparation_inputs(vocabulary_input.clone(), stats_input.clone())
             .with_shared_prepared(shared.clone()),
         );
-        let rewritten_plan = exec.with_new_children(vec![input]).unwrap();
+        let rewritten_plan = exec
+            .with_new_children(vec![
+                input.clone(),
+                vocabulary_input.clone(),
+                stats_input.clone(),
+            ])
+            .unwrap();
         let rewritten = rewritten_plan.downcast_ref::<FlatMatchQueryExec>().unwrap();
+        assert!(Arc::ptr_eq(&rewritten.unindexed_input, &input));
+        assert!(Arc::ptr_eq(
+            rewritten.vocabulary_input.as_ref().unwrap(),
+            &vocabulary_input
+        ));
+        assert!(Arc::ptr_eq(
+            rewritten.corpus_stats_input.as_ref().unwrap(),
+            &stats_input
+        ));
         let rewritten_shared = rewritten.shared_prepared.as_ref().unwrap();
         assert!(Arc::ptr_eq(rewritten_shared, &shared));
 

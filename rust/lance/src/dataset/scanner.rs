@@ -180,6 +180,12 @@ enum BoundedMixedFtsFieldPlan {
     TargetFlatFallback(&'static str),
 }
 
+struct FlatFuzzyPreparationScope {
+    fragments: Vec<Fragment>,
+    stale_rows: HashMap<u32, RoaringBitmap>,
+    current_values_only: bool,
+}
+
 const BOUNDED_MIXED_FUZZY_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_fuzzy";
 const BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_full_scan";
 const BOUNDED_MIXED_UNKNOWN_COVERAGE_FALLBACK_METRIC: &str =
@@ -207,6 +213,80 @@ fn fts_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
             .chain(&query.must_not)
             .any(fts_query_uses_fuzzy_expansion),
     }
+}
+
+async fn has_post_index_deletions(dataset: &Dataset, segments: &[IndexMetadata]) -> Result<bool> {
+    let mut deletion_files_by_version = HashMap::new();
+    for fragment in dataset.fragments().iter() {
+        let Some(deletion_file) = fragment.deletion_file.as_ref() else {
+            continue;
+        };
+        for segment in segments.iter().filter(|segment| {
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.contains(fragment.id as u32))
+        }) {
+            if deletion_file.read_version >= segment.dataset_version {
+                return Ok(true);
+            }
+            // A deletion can be based on an old snapshot and commit after a
+            // newer index. Prove freshness by checking that the exact deletion
+            // file was already present in the segment's dataset snapshot;
+            // otherwise fail closed to all-current execution.
+            if !deletion_files_by_version.contains_key(&segment.dataset_version) {
+                let snapshot = match dataset.checkout_version(segment.dataset_version).await {
+                    Ok(snapshot) => snapshot,
+                    Err(Error::NotFound { .. } | Error::VersionNotFound { .. }) => {
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(error),
+                };
+                deletion_files_by_version.insert(
+                    segment.dataset_version,
+                    snapshot
+                        .fragments()
+                        .iter()
+                        .map(|fragment| (fragment.id as u32, fragment.deletion_file.clone()))
+                        .collect::<HashMap<_, _>>(),
+                );
+            }
+            let reflected = deletion_files_by_version
+                .get(&segment.dataset_version)
+                .and_then(|fragments| fragments.get(&(fragment.id as u32)))
+                .and_then(Option::as_ref)
+                == Some(deletion_file);
+            if !reflected {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn has_retired_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
+    let current_fragments = RoaringBitmap::from_iter(
+        dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32),
+    );
+    segments.iter().any(|segment| {
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|coverage| !coverage.is_subset(&current_fragments))
+    })
+}
+
+fn has_unknown_fts_coverage(segments: &[IndexMetadata]) -> bool {
+    segments
+        .iter()
+        .any(|segment| segment.fragment_bitmap.is_none())
+}
+
+fn has_retired_or_unknown_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
+    has_retired_fts_coverage(dataset, segments) || has_unknown_fts_coverage(segments)
 }
 
 fn bounded_mixed_overlay_fallback(plan: &FtsOverlayPlan) -> Option<&'static str> {
@@ -4282,6 +4362,7 @@ impl Scanner {
         }
         let mut phrase_columns = HashSet::new();
         collect_phrase_columns(query, &mut phrase_columns);
+        let query_uses_fuzzy = fts_query_uses_fuzzy_expansion(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
             let phrase_columns = &phrase_columns;
@@ -4299,11 +4380,19 @@ impl Scanner {
                     return Ok(None);
                 };
 
+                let overlay_fragments = if query_uses_fuzzy && !self.fast_search {
+                    self.dataset.fragments()
+                } else {
+                    target_fragments
+                };
                 let (unindexed_fragments, overlay_plan) = futures::future::try_join(
                     self.dataset.unindexed_fragments(&index.name),
-                    self.fts_overlay_plan(&column, document_granularity, target_fragments),
+                    self.fts_overlay_plan(&column, document_granularity, overlay_fragments),
                 )
                 .await?;
+                if query_uses_fuzzy && !self.fast_search && !unindexed_fragments.is_empty() {
+                    return Ok(None);
+                }
                 if !self.retain_target_fragments(unindexed_fragments).is_empty() {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
@@ -4323,16 +4412,18 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
-                if fts_query_uses_fuzzy_expansion(query)
-                    && !self.fast_search
-                    && fts_segments_have_deleted_fragments(
-                        &self.dataset,
-                        &column,
-                        &segments,
-                    )
-                    .await?
-                {
-                    return Ok(None);
+                if fts_query_uses_fuzzy_expansion(query) && !self.fast_search {
+                    if has_retired_or_unknown_fts_coverage(&self.dataset, &segments)
+                        || has_post_index_deletions(&self.dataset, &segments).await?
+                        || fts_segments_have_deleted_fragments(
+                            &self.dataset,
+                            &column,
+                            &segments,
+                        )
+                        .await?
+                    {
+                        return Ok(None);
+                    }
                 }
 
                 if cross_column {
@@ -4854,8 +4945,25 @@ impl Scanner {
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
-                let unindexed_fragments = self
-                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+                let global_unindexed_fragments =
+                    self.dataset.unindexed_fragments(&index.name).await?;
+                let unindexed_fragments =
+                    self.retain_target_fragments(global_unindexed_fragments.clone());
+                if uses_fuzzy_expansion(query.fuzziness)
+                    && !self.fast_search
+                    && self.fragments.is_some()
+                {
+                    let global_overlay = self
+                        .fts_overlay_plan(&column, document_granularity, self.dataset.fragments())
+                        .await?;
+                    if !global_unindexed_fragments.is_empty()
+                        || !matches!(global_overlay, FtsOverlayPlan::Unchanged(_))
+                    {
+                        return self
+                            .plan_target_flat_match_leaf_query(query, params, filter_plan)
+                            .await;
+                    }
+                }
                 if !target_fragments.is_empty()
                     && unindexed_fragments.len() == target_fragments.len()
                 {
@@ -4916,17 +5024,6 @@ impl Scanner {
                 let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
                 let has_flat_path = !self.fast_search
                     && (!unindexed_fragments.is_empty() || !stale_rows.is_empty());
-                let has_deletions = target_fragments
-                    .iter()
-                    .any(|fragment| fragment.deletion_file.is_some());
-                if uses_fuzzy_expansion(query.fuzziness)
-                    && !self.fast_search
-                    && (!stale_rows.is_empty() || has_deletions)
-                {
-                    return self
-                        .plan_target_flat_match_leaf_query(query, params, filter_plan)
-                        .await;
-                }
                 let resolved_segments = match preset_segments.clone() {
                     Some(segments) => segments,
                     None => load_segments(&self.dataset, &column, document_granularity)
@@ -4937,6 +5034,16 @@ impl Scanner {
                             ))
                         })?,
                 };
+                if uses_fuzzy_expansion(query.fuzziness)
+                    && !self.fast_search
+                    && (has_retired_or_unknown_fts_coverage(&self.dataset, &resolved_segments)
+                        || !stale_rows.is_empty()
+                        || has_post_index_deletions(&self.dataset, &resolved_segments).await?)
+                {
+                    return self
+                        .plan_target_flat_match_leaf_query(query, params, filter_plan)
+                        .await;
+                }
                 if uses_fuzzy_expansion(query.fuzziness)
                     && !self.fast_search
                     && fts_segments_have_deleted_fragments(
@@ -5075,7 +5182,7 @@ impl Scanner {
         })?;
         resolve_fts_field(self.dataset.schema(), column, DocumentGranularity::Row)?;
 
-        let Some(_) = self
+        let Some(index) = self
             .dataset
             .load_scalar_index(
                 IndexCriteria::default()
@@ -5094,12 +5201,41 @@ impl Scanner {
         if target_fragments.is_empty() {
             return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
         }
+        let is_explicit_exact = query.fuzziness == Some(0);
         let Some(loaded_segments) =
             load_segments(&self.dataset, column, DocumentGranularity::Row).await?
         else {
             return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
         };
-        let is_explicit_exact = query.fuzziness == Some(0);
+        let target_fragment_ids =
+            RoaringBitmap::from_iter(target_fragments.iter().map(|fragment| fragment.id as u32));
+        if !is_explicit_exact && self.fragments.is_some() {
+            let all_fragment_ids = RoaringBitmap::from_iter(
+                self.dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32),
+            );
+            if let Err(metric) = bounded_mixed_indexed_coverage(
+                loaded_segments
+                    .iter()
+                    .map(|segment| segment.fragment_bitmap.as_ref()),
+                &all_fragment_ids,
+            ) {
+                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
+            }
+            let global_unindexed = self.dataset.unindexed_fragments(&index.name).await?;
+            let global_overlay = self
+                .fts_overlay_plan(column, DocumentGranularity::Row, self.dataset.fragments())
+                .await?;
+            if !global_unindexed.is_empty()
+                || !matches!(global_overlay, FtsOverlayPlan::Unchanged(_))
+            {
+                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
+                    BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
+                ));
+            }
+        }
         let overlay_plan = self
             .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
             .await?;
@@ -5122,18 +5258,11 @@ impl Scanner {
                 ));
             }
         };
-        if !is_explicit_exact
-            && fts_segments_have_deleted_fragments(&self.dataset, column, &segments).await?
-        {
+        if !is_explicit_exact && has_retired_fts_coverage(&self.dataset, &segments) {
             return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
                 BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
             ));
         }
-        let target_fragment_ids =
-            RoaringBitmap::from_iter(target_fragments.iter().map(|fragment| fragment.id as u32));
-        let has_deletions = target_fragments
-            .iter()
-            .any(|fragment| fragment.deletion_file.is_some());
         let indexed_fragment_ids = match bounded_mixed_indexed_coverage(
             segments
                 .iter()
@@ -5154,7 +5283,16 @@ impl Scanner {
             .filter(|fragment| unindexed_fragment_ids.contains(fragment.id as u32))
             .cloned()
             .collect::<Vec<_>>();
-        if (!stale_rows.is_empty() || has_deletions) && !is_explicit_exact {
+        if !is_explicit_exact
+            && fts_segments_have_deleted_fragments(&self.dataset, column, &segments).await?
+        {
+            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
+                BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
+            ));
+        }
+        if (!stale_rows.is_empty() || has_post_index_deletions(&self.dataset, &segments).await?)
+            && !is_explicit_exact
+        {
             return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
                 BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
             ));
@@ -5347,6 +5485,7 @@ impl Scanner {
             .as_deref()
             .unwrap_or_else(|| self.dataset.fragments())
             .to_vec();
+        let all_fragments = self.dataset.fragments().as_ref().clone();
         if target_fragments.is_empty() {
             return Ok(Arc::new(EmptyExec::new(fts_schema(document_granularity))));
         }
@@ -5363,10 +5502,24 @@ impl Scanner {
         )
         .with_base_scorer(Arc::new(MemBM25Scorer::new(0, 0, HashMap::new())))
         .with_current_values_only();
-        if !filter_plan.is_empty() || uses_fuzzy_expansion(query.fuzziness) {
+        if uses_fuzzy_expansion(query.fuzziness) {
+            let corpus_filter_plan = ExprFilterPlan::default();
+            let (vocabulary_input, _) = self
+                .plan_flat_match_input(
+                    all_fragments.clone(),
+                    HashMap::new(),
+                    query,
+                    &corpus_filter_plan,
+                )
+                .await?;
+            let (corpus_stats_input, _) = self
+                .plan_flat_match_input(all_fragments, HashMap::new(), query, &corpus_filter_plan)
+                .await?;
+            exec = exec.with_fuzzy_preparation_inputs(vocabulary_input, corpus_stats_input);
+        } else if !filter_plan.is_empty() {
             let corpus_filter_plan = ExprFilterPlan::default();
             let (corpus_stats_input, _) = self
-                .plan_flat_match_input(target_fragments, HashMap::new(), query, &corpus_filter_plan)
+                .plan_flat_match_input(all_fragments, HashMap::new(), query, &corpus_filter_plan)
                 .await?;
             exec = exec.with_corpus_stats_input(corpus_stats_input);
         }
@@ -5375,6 +5528,59 @@ impl Scanner {
             return Ok(Arc::new(RowAddrMaskFilterExec::new(plan, mask)));
         }
         Ok(plan)
+    }
+
+    /// Resolve the corpus-wide current-value domain used by fuzzy rewrite and
+    /// BM25 statistics. Candidate execution may be restricted by
+    /// `with_fragments`, filters, or rerank inputs, but preparation follows the
+    /// complete dataset/index corpus.
+    async fn flat_fuzzy_preparation_scope(
+        &self,
+        query: &MatchQuery,
+        candidate_fragments: &[Fragment],
+        candidate_stale_rows: &HashMap<u32, RoaringBitmap>,
+    ) -> Result<FlatFuzzyPreparationScope> {
+        let column = query.column.as_ref().ok_or_else(|| {
+            Error::invalid_input("the column must be specified in the query".to_string())
+        })?;
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::internal("FTS Match query granularity was not resolved".to_string())
+        })?;
+        let all_fragments = self.dataset.fragments().as_ref().clone();
+        let Some(index) = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(column)
+                    .supports_fts()
+                    .with_fts_document_granularity(document_granularity),
+            )
+            .await?
+        else {
+            return Ok(FlatFuzzyPreparationScope {
+                fragments: candidate_fragments.to_vec(),
+                stale_rows: candidate_stale_rows.clone(),
+                current_values_only: true,
+            });
+        };
+        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        match self
+            .fts_overlay_plan(column, document_granularity, self.dataset.fragments())
+            .await?
+        {
+            FtsOverlayPlan::Unchanged(_) => Ok(FlatFuzzyPreparationScope {
+                fragments: unindexed_fragments,
+                stale_rows: HashMap::new(),
+                current_values_only: false,
+            }),
+            FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => {
+                Ok(FlatFuzzyPreparationScope {
+                    fragments: all_fragments,
+                    stale_rows: HashMap::new(),
+                    current_values_only: true,
+                })
+            }
+        }
     }
 
     /// Plan match query on unindexed fragments
@@ -5398,14 +5604,49 @@ impl Scanner {
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::internal("FTS Match query granularity was not resolved".to_string())
         })?;
-        let stats_fragments = fragments.clone();
-        let stats_stale_rows = stale_rows.clone();
+        let fuzzy_scope = if uses_fuzzy_expansion(query.fuzziness) {
+            Some(
+                self.flat_fuzzy_preparation_scope(query, &fragments, &stale_rows)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let stats_fragments = fuzzy_scope
+            .as_ref()
+            .map_or_else(|| fragments.clone(), |scope| scope.fragments.clone());
+        let stats_stale_rows = fuzzy_scope
+            .as_ref()
+            .map_or_else(|| stale_rows.clone(), |scope| scope.stale_rows.clone());
+        let vocabulary_fragments = stats_fragments.clone();
+        let vocabulary_stale_rows = stats_stale_rows.clone();
+        let current_values_only = fuzzy_scope
+            .as_ref()
+            .is_some_and(|scope| scope.current_values_only);
         let (mut plan, document_column) = self
             .plan_flat_match_input(fragments, stale_rows, query, filter_plan)
             .await?;
         if plan.properties().output_partitioning().partition_count() > 1 {
             plan = Arc::new(CoalescePartitionsExec::new(plan));
         }
+        let vocabulary_input = if uses_fuzzy_expansion(query.fuzziness) {
+            let corpus_filter_plan = ExprFilterPlan::default();
+            let mut input = self
+                .plan_flat_match_input(
+                    vocabulary_fragments,
+                    vocabulary_stale_rows,
+                    query,
+                    &corpus_filter_plan,
+                )
+                .await?
+                .0;
+            if input.properties().output_partitioning().partition_count() > 1 {
+                input = Arc::new(CoalescePartitionsExec::new(input));
+            }
+            Some(input)
+        } else {
+            None
+        };
         let corpus_stats_input = if uses_fuzzy_expansion(query.fuzziness)
             || (shared_scorer.is_some() && !filter_plan.is_empty())
         {
@@ -5434,14 +5675,29 @@ impl Scanner {
             document_granularity,
             document_column,
         );
+        if current_values_only {
+            flat_match_plan = flat_match_plan.with_current_values_only();
+        }
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
         }
         if let Some(shared_prepared) = shared_prepared {
             flat_match_plan = flat_match_plan.with_shared_prepared(shared_prepared);
         }
-        if let Some(corpus_stats_input) = corpus_stats_input {
-            flat_match_plan = flat_match_plan.with_corpus_stats_input(corpus_stats_input);
+        match (vocabulary_input, corpus_stats_input) {
+            (Some(vocabulary_input), Some(corpus_stats_input)) => {
+                flat_match_plan = flat_match_plan
+                    .with_fuzzy_preparation_inputs(vocabulary_input, corpus_stats_input);
+            }
+            (None, Some(corpus_stats_input)) => {
+                flat_match_plan = flat_match_plan.with_corpus_stats_input(corpus_stats_input);
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(Error::internal(
+                    "fuzzy flat planning produced vocabulary input without corpus stats",
+                ));
+            }
         }
         let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(flat_match_plan);
         // Unindexed fragments and stale rows never reach the index-side prefilter,
@@ -6703,14 +6959,39 @@ impl Scanner {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchQueryExec::new_with_document_granularity(
+                let mut exec = FlatMatchQueryExec::new_with_document_granularity(
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
                     input,
                     document_granularity,
                     document_column,
-                )))
+                );
+                if uses_fuzzy_expansion(match_query.fuzziness) {
+                    let all_fragments = self.dataset.fragments().as_ref().clone();
+                    let corpus_filter_plan = ExprFilterPlan::default();
+                    let (vocabulary_input, _) = self
+                        .plan_flat_match_input(
+                            all_fragments.clone(),
+                            HashMap::new(),
+                            match_query,
+                            &corpus_filter_plan,
+                        )
+                        .await?;
+                    let (corpus_stats_input, _) = self
+                        .plan_flat_match_input(
+                            all_fragments,
+                            HashMap::new(),
+                            match_query,
+                            &corpus_filter_plan,
+                        )
+                        .await?;
+                    exec = exec
+                        .with_base_scorer(Arc::new(MemBM25Scorer::new(0, 0, HashMap::new())))
+                        .with_current_values_only()
+                        .with_fuzzy_preparation_inputs(vocabulary_input, corpus_stats_input);
+                }
+                Ok(Arc::new(exec))
             }
             _ => {
                 let default_filter = ExprFilterPlan::default();

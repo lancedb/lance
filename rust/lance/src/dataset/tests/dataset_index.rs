@@ -2323,13 +2323,17 @@ async fn test_deleted_index_fragment_does_not_pollute_fuzzy_rewrite() {
     )
     .await
     .unwrap();
-    create_fragmented_fts_index(&mut dataset, "text", false).await;
+    create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]]).await;
     dataset.delete("id = 0").await.unwrap();
     let residual =
         arrow_array::record_batch!(("text", Utf8, ["aaab"]), ("id", Int32, [2])).unwrap();
     let schema = residual.schema();
     dataset
         .append(RecordBatchIterator::new(vec![Ok(residual)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
         .await
         .unwrap();
     assert!(
@@ -2371,6 +2375,387 @@ async fn test_deleted_index_fragment_does_not_pollute_fuzzy_rewrite() {
         .unwrap();
     let results = scan.try_into_batch().await.unwrap();
     assert_eq!(results["id"].as_primitive::<Int32Type>().values(), &[2]);
+}
+
+#[tokio::test]
+async fn test_retired_segment_coverage_does_not_pollute_fuzzy_rewrite() {
+    let batch = arrow_array::record_batch!(("text", Utf8, ["aaaa", "zzzz"]), ("id", Int32, [0, 1]))
+        .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]]).await;
+    dataset.delete("id = 0").await.unwrap();
+    let residual =
+        arrow_array::record_batch!(("text", Utf8, ["aaab"]), ("id", Int32, [2])).unwrap();
+    let schema = residual.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(residual)], schema), None)
+        .await
+        .unwrap();
+
+    let segments =
+        crate::index::scalar::inverted::load_segments(&dataset, "text", DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        segments[0].fragment_bitmap.as_ref().unwrap().contains(0),
+        "the selected segment must still advertise the retired fragment"
+    );
+    assert!(
+        !fts_segments_have_deleted_fragments(&dataset, "text", &segments)
+            .await
+            .unwrap(),
+        "the pre-optimize window must not rely on persisted deleted_fragments"
+    );
+
+    let query = FtsQuery::Match(
+        MatchQuery::new("aaax".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1),
+    );
+    let plan = compound_fts_plan(&dataset, query.clone(), 1).await;
+    assert!(
+        plan.contains("FlatMatchQuery"),
+        "retired segment coverage requires all-current preparation before optimize: {plan}"
+    );
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    assert_eq!(
+        scan.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values(),
+        &[2]
+    );
+}
+
+#[tokio::test]
+async fn test_fuzzy_index_built_after_delete_stays_posting_backed() {
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, ["alpha", "bravo", "charlie"]),
+        ("id", Int32, [0, 1, 2])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.delete("id = 0").await.unwrap();
+    let deletion_read_version = dataset.fragments()[0]
+        .deletion_file
+        .as_ref()
+        .expect("partial delete should write a deletion file")
+        .read_version;
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+    let segments =
+        crate::index::scalar::inverted::load_segments(&dataset, "text", DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        segments
+            .iter()
+            .all(|segment| deletion_read_version < segment.dataset_version),
+        "the index fixture must be newer than its deletion file"
+    );
+
+    let query = FtsQuery::Match(
+        MatchQuery::new("bravx".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1)),
+    );
+    let plan = compound_fts_plan(&dataset, query.clone(), 1).await;
+    assert!(
+        !plan.contains("FlatMatchQuery"),
+        "an index built after the deletion already has fresh postings: {plan}"
+    );
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    assert_eq!(
+        scan.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values(),
+        &[1]
+    );
+}
+
+#[tokio::test]
+async fn test_fragment_subset_uses_segment_global_deletion_freshness() {
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, ["aaaa", "keep", "aaab", "other"]),
+        ("id", Int32, [0, 1, 2, 3])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]]).await;
+    dataset.delete("id = 0").await.unwrap();
+    let target_fragment = dataset
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id == 1)
+        .unwrap()
+        .clone();
+    assert!(
+        dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == 0)
+            .unwrap()
+            .deletion_file
+            .is_some(),
+        "the stale deletion must live outside the scanner's fragment subset"
+    );
+
+    let query = FtsQuery::Match(
+        MatchQuery::new("aaax".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1),
+    );
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![target_fragment]);
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("FlatMatchQuery"),
+        "segment-global stats must observe deletions outside the target subset: {plan}"
+    );
+    assert_eq!(
+        scan.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values(),
+        &[2]
+    );
+}
+
+#[tokio::test]
+async fn test_fragment_subset_fuzzy_budget_uses_full_current_corpus() {
+    async fn build(index_before_delete: bool) -> Dataset {
+        let batch = arrow_array::record_batch!(
+            ("text", Utf8, ["aaaa", "aaab", "aaac", "other"]),
+            ("id", Int32, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if index_before_delete {
+            create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]])
+                .await;
+        }
+        dataset.delete("id = 0").await.unwrap();
+        if !index_before_delete {
+            create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]])
+                .await;
+        }
+        dataset
+    }
+
+    async fn target_result(dataset: &Dataset, query: FtsQuery) -> (String, RecordBatch) {
+        let target = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == 1)
+            .unwrap()
+            .clone();
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![target]);
+        scan.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .limit(Some(1), None)
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        (plan, result)
+    }
+
+    let stale = build(true).await;
+    let rebuilt = build(false).await;
+    let query = FtsQuery::Match(
+        MatchQuery::new("aaax".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1),
+    );
+    let (stale_plan, stale_result) = target_result(&stale, query.clone()).await;
+    let (rebuilt_plan, rebuilt_result) = target_result(&rebuilt, query).await;
+    assert!(stale_plan.contains("FlatMatchQuery"));
+    assert!(!rebuilt_plan.contains("FlatMatchQuery"));
+    assert_eq!(stale_result.num_rows(), 0);
+    assert_eq!(rebuilt_result.num_rows(), 0);
+}
+
+#[tokio::test]
+async fn test_fragment_subset_fuzzy_budget_includes_non_target_residual() {
+    async fn build(index_before_append: bool) -> Dataset {
+        let batch = arrow_array::record_batch!(
+            ("text", Utf8, ["left", "other", "aaac", "right"]),
+            ("id", Int32, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if index_before_append {
+            create_fragmented_fts_index_with_groups(&mut dataset, "text", false, vec![vec![0, 1]])
+                .await;
+        }
+        let residual =
+            arrow_array::record_batch!(("text", Utf8, ["aaab"]), ("id", Int32, [4])).unwrap();
+        let schema = residual.schema();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(residual)], schema), None)
+            .await
+            .unwrap();
+        if !index_before_append {
+            create_fragmented_fts_index_with_groups(
+                &mut dataset,
+                "text",
+                false,
+                vec![vec![0, 1, 2]],
+            )
+            .await;
+        }
+        dataset
+    }
+
+    async fn target_result(dataset: &Dataset, query: FtsQuery) -> (String, usize) {
+        let target = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == 1)
+            .unwrap()
+            .clone();
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![target]);
+        scan.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .limit(Some(1), None)
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let rows = scan.try_into_batch().await.unwrap().num_rows();
+        (plan, rows)
+    }
+
+    let partial = build(true).await;
+    let rebuilt = build(false).await;
+    let query = FtsQuery::Match(
+        MatchQuery::new("aaax".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1),
+    );
+    let (partial_plan, partial_rows) = target_result(&partial, query.clone()).await;
+    let (rebuilt_plan, rebuilt_rows) = target_result(&rebuilt, query).await;
+    assert!(
+        partial_plan.contains("FlatMatchQuery"),
+        "non-target residual vocabulary requires full-current fallback: {partial_plan}"
+    );
+    assert!(!rebuilt_plan.contains("FlatMatchQuery"));
+    assert_eq!(partial_rows, rebuilt_rows);
+    assert_eq!(partial_rows, 0);
+}
+
+#[tokio::test]
+async fn test_fragment_subset_fuzzy_budget_without_index_remains_target_scoped() {
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, ["aaab", "left", "aaac", "right"]),
+        ("id", Int32, [0, 1, 2, 3])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let target = dataset
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id == 1)
+        .unwrap()
+        .clone();
+    let query = FtsQuery::Match(
+        MatchQuery::new("aaax".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1),
+    );
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![target]);
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("FlatMatchQuery"));
+    assert_eq!(
+        scan.try_into_batch().await.unwrap().num_rows(),
+        1,
+        "flat-only fragment scans retain their existing target-corpus rewrite semantics"
+    );
 }
 
 #[tokio::test]
@@ -2565,9 +2950,10 @@ async fn test_mixed_multimatch_metadata_fallbacks_execute_target_flat_scan() {
             let mut fuzzy =
                 MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
             fuzzy.match_queries[0].fuzziness = Some(1);
+            let fuzzy_query: FtsQuery = fuzzy.into();
             let mut fuzzy_scan = dataset.scan();
             fuzzy_scan
-                .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
+                .full_text_search(FullTextSearchQuery::new_query(fuzzy_query.clone()))
                 .unwrap()
                 .limit(Some(1), None)
                 .unwrap();
@@ -2576,6 +2962,38 @@ async fn test_mixed_multimatch_metadata_fallbacks_execute_target_flat_scan() {
                 fuzzy_plan.contains("fts_bounded_mixed_fallback_unknown_coverage")
                     && fuzzy_plan.contains("FlatMatchQuery"),
                 "unknown-coverage fuzzy query must use all-current prepared fallback: {fuzzy_plan}"
+            );
+
+            let target_fragment = dataset.fragments()[0].clone();
+            let mut scoped_scan = dataset.scan();
+            scoped_scan.with_fragments(vec![target_fragment]);
+            scoped_scan
+                .full_text_search(FullTextSearchQuery::new_query(fuzzy_query))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            let scoped_plan = scoped_scan.explain_plan(false).await.unwrap();
+            assert!(
+                scoped_plan.contains("fts_bounded_mixed_fallback_unknown_coverage"),
+                "fragment-scoped unknown coverage must preserve its metric: {scoped_plan}"
+            );
+        }
+        if case_name == "overlap" {
+            let mut fuzzy =
+                MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
+            fuzzy.match_queries[0].fuzziness = Some(1);
+            let target_fragment = dataset.fragments().last().unwrap().clone();
+            let mut scoped_scan = dataset.scan();
+            scoped_scan.with_fragments(vec![target_fragment]);
+            scoped_scan
+                .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            let scoped_plan = scoped_scan.explain_plan(false).await.unwrap();
+            assert!(
+                scoped_plan.contains("fts_bounded_mixed_fallback_overlapping_coverage"),
+                "non-target overlap must preserve its fallback metric: {scoped_plan}"
             );
         }
     }

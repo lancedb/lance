@@ -684,8 +684,8 @@ pub(super) fn flat_bm25_score(
         let mut score = 0.0;
         for (token, freq) in query_tokens.into_iter().zip(query_token_counts) {
             let freq = freq as f32;
-            let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
-            score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+            let query_weight = scorer.query_weight(token);
+            score += query_weight * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         if score > 0.0 {
             row_ids_builder.append_value(row_id);
