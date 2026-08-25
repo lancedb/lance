@@ -50,6 +50,7 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
+use lance_table::io::commit::CANDIDATES_DIR;
 use lance_table::{
     format::{IndexMetadata, Manifest},
     io::{
@@ -302,6 +303,10 @@ struct CleanupTask<'a> {
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
+    /// Listed manifests whose object is already gone (a cleanup that failed
+    /// between deleting objects and forgetting records); forgotten here so
+    /// a retry converges.
+    missing_manifests: HashMap<Path, u64>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -513,10 +518,29 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
+        // Objects go before records: a record is forgotten only once its
+        // manifest is gone, so a retry lists the same records, finds the
+        // objects missing and forgets them (`missing_manifests`). A candidate
+        // manifest is thus never left without a record naming it.
+        let forgotten: Vec<(Path, u64)> = inspection
+            .old_manifests
+            .iter()
+            .chain(&inspection.missing_manifests)
+            .map(|(path, version)| (path.clone(), *version))
+            .collect();
         final_result.merge(
             self.delete_unreferenced_files(inspection).await?,
             candidate_file_limit,
         );
+        if self.action.deletes_files() {
+            let generation = self.dataset.manifest_location.generation.as_deref();
+            for (path, version) in forgotten {
+                self.dataset
+                    .commit_handler
+                    .forget_version(&self.dataset.base, version, &path, generation)
+                    .await?;
+            }
+        }
         Ok(final_result)
     }
 
@@ -526,9 +550,37 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
+        let generation = &self.dataset.manifest_location.generation;
+        // A handler whose store owns publication fences drops by generation;
+        // without one on both sides nothing tells a recreation apart.
+        let requires_generation = self.dataset.commit_handler.supports_predecessor_condition();
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+            // Every manifest listed must belong to the snapshot's generation:
+            // a handle over a dataset since dropped and recreated would judge
+            // the recreation by its own version numbers.
+            .and_then(|location| {
+                future::ready(
+                    if requires_generation
+                        && (location.generation.is_none() || generation.is_none())
+                    {
+                        Err(Error::invalid_input(format!(
+                            "cleanup refused: the dataset at '{}' has no generation to fence a \
+                             recreation with (listed {:?}, snapshot {:?})",
+                            self.dataset.base, location.generation, generation
+                        )))
+                    } else if location.generation != *generation {
+                        Err(Error::invalid_input(format!(
+                            "cleanup refused: the dataset at '{}' is not the one this snapshot was \
+                             loaded from (generation {:?}, snapshot {:?}); reload it and retry",
+                            self.dataset.base, location.generation, generation
+                        )))
+                    } else {
+                        Ok(location)
+                    },
+                )
+            })
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
@@ -568,6 +620,11 @@ impl<'a> CleanupTask<'a> {
                     manifest_path = %location.path,
                     "Skipping old manifest removed by concurrent cleanup"
                 );
+                inspection
+                    .lock()
+                    .unwrap()
+                    .missing_manifests
+                    .insert(location.path, location.version);
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -719,7 +776,8 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
-        let streams = vec![
+        let naming_scheme = self.dataset.manifest_location.naming_scheme;
+        let mut streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), unmodified_since),
@@ -730,6 +788,33 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
+        // Candidate manifests exist only under a handler whose store owns
+        // publication. Each is put to the handler right before deletion:
+        // only one its store will never record again, and does not record
+        // now, in the snapshot's generation is reclaimed.
+        if self.dataset.commit_handler.supports_predecessor_condition() {
+            let candidates = self.dataset.base.clone().join(CANDIDATES_DIR);
+            let generation = self.dataset.manifest_location.generation.as_deref();
+            streams.push(
+                build_listing_stream(candidates, None)
+                    .try_filter_map(move |file| async move {
+                        let Some(version) = file
+                            .path
+                            .filename()
+                            .and_then(|name| naming_scheme.parse_version(name))
+                        else {
+                            return Ok(None);
+                        };
+                        let reclaim = self
+                            .dataset
+                            .commit_handler
+                            .may_reclaim(&self.dataset.base, version, &file.path, generation)
+                            .await?;
+                        Ok(reclaim.then_some(file))
+                    })
+                    .boxed(),
+            );
+        }
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
         let old_manifests = inspection.old_manifests.clone();
@@ -884,6 +969,14 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.as_ref().starts_with(CANDIDATES_DIR) {
+            // Decided by the commit handler at the listing (see the caller).
+            return Ok(if maybe_in_progress {
+                None
+            } else {
+                cleanup_file(path, CleanupFileKind::Manifest, true, size_bytes)
+            });
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID

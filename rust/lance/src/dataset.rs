@@ -4094,6 +4094,68 @@ impl ManifestWriteConfig {
     }
 }
 
+/// [`write_manifest_file`], published only if `predecessor` still holds; see
+/// `CommitHandler::commit_after`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_manifest_file_after(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    manifest: &mut Manifest,
+    indices: Option<Vec<IndexMetadata>>,
+    config: &ManifestWriteConfig,
+    naming_scheme: ManifestNamingScheme,
+    transaction: Option<lance_table::format::Transaction>,
+    predecessor: Option<&lance_table::io::commit::PredecessorIdentity>,
+) -> std::result::Result<ManifestLocation, CommitError> {
+    let Some(predecessor) = predecessor else {
+        return write_manifest_file(
+            object_store,
+            commit_handler,
+            base_path,
+            manifest,
+            indices,
+            config,
+            naming_scheme,
+            transaction,
+        )
+        .await;
+    };
+    prepare_manifest_for_write(manifest, config)?;
+    commit_handler
+        .commit_after(
+            manifest,
+            indices,
+            base_path,
+            object_store,
+            write_manifest_file_to_path,
+            naming_scheme,
+            transaction,
+            predecessor,
+        )
+        .await
+}
+
+fn prepare_manifest_for_write(
+    manifest: &mut Manifest,
+    config: &ManifestWriteConfig,
+) -> std::result::Result<(), CommitError> {
+    if config.auto_set_feature_flags {
+        // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
+        // Preserve it here so this second apply_feature_flags call does not clear it
+        // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
+        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        apply_feature_flags(
+            manifest,
+            use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
+    }
+    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+    manifest.update_max_fragment_id();
+    Ok(())
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
@@ -4106,22 +4168,7 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
-    if config.auto_set_feature_flags {
-        // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
-        // Preserve it here so this second apply_feature_flags call does not clear it
-        // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
-        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
-        apply_feature_flags(
-            manifest,
-            use_stable_row_ids,
-            config.disable_transaction_file,
-        )?;
-    }
-
-    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
-
-    manifest.update_max_fragment_id();
-
+    prepare_manifest_for_write(manifest, config)?;
     commit_handler
         .commit(
             manifest,

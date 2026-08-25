@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
@@ -22,11 +23,136 @@ use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path
 use tracing::info;
 
 use super::{
-    MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
-    default_resolve_version, make_staging_manifest_path, write_version_hint,
+    CANDIDATES_DIR, MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme,
+    PredecessorIdentity, current_manifest_path, default_resolve_version, list_manifests,
+    make_staging_manifest_path, write_version_hint,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
+
+/// A store record as `(version, path, size)`.
+pub type VersionRecord = (u64, String, Option<u64>);
+
+/// Where a predecessor-conditioned commit publishes its manifest: under
+/// [`CANDIDATES_DIR`] in a directory unique to this attempt, with the
+/// canonical file name so its naming scheme still parses. No other attempt
+/// or incarnation can name the object, and generic `_versions` listings
+/// never see it; the store's record is the only way to reach it.
+fn candidate_manifest_path(
+    base: &Path,
+    naming_scheme: ManifestNamingScheme,
+    version: u64,
+) -> Result<Path> {
+    let canonical = naming_scheme.manifest_path(base, version);
+    let filename = canonical
+        .filename()
+        .ok_or_else(|| Error::io("canonical manifest path has no file name"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
+    Ok(base
+        .clone()
+        .join(CANDIDATES_DIR)
+        .join(attempt.as_str())
+        .join(filename))
+}
+
+/// A store that enumerates its records is the history; one that cannot is
+/// listed from the object store as any dataset is.
+async fn history<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+    records: Option<(Option<String>, Vec<VersionRecord>)>,
+    sorted_descending: bool,
+) -> Result<BoxStream<'a, Result<ManifestLocation>>> {
+    let mut locations = match records {
+        Some((generation, records)) => records
+            .into_iter()
+            .map(|(version, path, size)| {
+                location_from_record(version, &path, size, generation.clone())
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => {
+            list_manifests(base_path, &object_store.inner)
+                .try_collect::<Vec<_>>()
+                .await?
+        }
+    };
+    if sorted_descending {
+        locations.sort_by_key(|location| std::cmp::Reverse(location.version));
+    }
+    Ok(stream::iter(locations.into_iter().map(Ok)).boxed())
+}
+
+/// Evaluate `$observe` under `$store`'s generation: the generation before
+/// and after must agree, so the observation belongs to it. Yields
+/// `(generation, observed)`; a store that keeps none yields `None`.
+macro_rules! under_generation {
+    ($store:expr, $base_uri:expr, $observe:expr) => {{
+        let mut attempts = 0;
+        loop {
+            let before = $store.generation($base_uri).await?;
+            let observed = $observe.await?;
+            let after = $store.generation($base_uri).await?;
+            if before == after {
+                break (before, observed);
+            }
+            attempts += 1;
+            if attempts == 8 {
+                return Err(Error::io(format!(
+                    "the dataset at '{}' was recreated repeatedly while it was being read",
+                    $base_uri
+                ))
+                .into());
+            }
+        }
+    }};
+}
+
+/// A store that owns publication holds the only path to its manifests, so
+/// its records are the history and nothing else may stand in for them.
+fn enumerated(
+    store: &dyn ExternalManifestStore,
+    base_uri: &str,
+    records: Option<Vec<VersionRecord>>,
+) -> Result<Option<Vec<VersionRecord>>> {
+    if records.is_none() && store.supports_predecessor_condition() {
+        return Err(Error::not_supported(format!(
+            "the external manifest store owns publication for '{base_uri}' but cannot enumerate \
+             its records; there is no other history to fall back on"
+        )));
+    }
+    Ok(records)
+}
+
+/// A store record as a [`ManifestLocation`].
+fn location_from_record(
+    version: u64,
+    path: &str,
+    size: Option<u64>,
+    generation: Option<String>,
+) -> Result<ManifestLocation> {
+    let path = Path::parse(path).map_err(|e| Error::invalid_input(e.to_string()))?;
+    let naming_scheme = detect_naming_scheme_from_path(&path)?;
+    Ok(ManifestLocation {
+        version,
+        path,
+        size,
+        naming_scheme,
+        e_tag: None,
+        generation,
+    })
+}
+
+/// The outcome of [`ExternalManifestStore::put_if_predecessor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reservation {
+    /// The version is reserved for the candidate; its minted identity.
+    Reserved { identity: String },
+    /// Nothing was written: the predecessor is no longer the manifest at
+    /// its version.
+    Refused { reason: String },
+    /// Nothing was written: the version already has an entry.
+    Taken,
+}
 
 /// External manifest store
 ///
@@ -91,6 +217,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             size: None,
             naming_scheme,
             e_tag: None,
+            generation: None,
         })
     }
 
@@ -118,6 +245,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     size: None,
                     naming_scheme,
                     e_tag: None,
+                    generation: None,
                 })
             })
             .transpose()
@@ -132,6 +260,114 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// The default implementation uses put_if_not_exists and put_if_exists to
     /// implement a staging-based workflow. Implementations that can write directly
     /// (e.g., namespace-backed stores) should override this method.
+    /// Whether [`Self::put_if_predecessor`] is available. A store that
+    /// supports it owns publication: every manifest, conditioned or not, is
+    /// published at a candidate path and reached only through its record,
+    /// so it must also enumerate ([`Self::list_versions`]) and keep a
+    /// generation ([`Self::generation`]).
+    fn supports_predecessor_condition(&self) -> bool {
+        false
+    }
+
+    /// The identity recorded for `version`, unique to that physical manifest.
+    async fn get_identity(&self, _base_uri: &str, _version: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Reserve `version` only if the entry at `predecessor.version` still
+    /// carries `predecessor.identity` and `version` is above the no-reuse
+    /// floor ([`Self::reuse_floor`]), as one atomic decision. The `Ok`
+    /// outcomes are definitive: [`Reservation::Refused`] and
+    /// [`Reservation::Taken`] promise no entry was written. Anything the
+    /// store cannot vouch for -- a lost response, an internal retry that
+    /// saw its own write -- must be an `Err`, which the handler reads back.
+    async fn put_if_predecessor(
+        &self,
+        _base_uri: &str,
+        _version: u64,
+        _path: &str,
+        _size: u64,
+        _predecessor: &PredecessorIdentity,
+    ) -> Result<Reservation> {
+        Err(Error::not_supported(
+            "this external manifest store cannot condition a reservation on its predecessor",
+        ))
+    }
+
+    /// Every record for `base_uri` as `(version, path, size)`, in any order,
+    /// or `None` where the store cannot enumerate. A store that enumerates
+    /// is the dataset's whole history -- conditioned commits exist only as
+    /// records -- so it must hold a record for every live version, including
+    /// any that existed before it started recording.
+    async fn list_versions(&self, _base_uri: &str) -> Result<Option<Vec<VersionRecord>>> {
+        Ok(None)
+    }
+
+    /// [`Self::list_versions`] bounded to `version > since`, the conflict
+    /// scan every commit attempt makes.
+    async fn list_versions_since(
+        &self,
+        base_uri: &str,
+        since: u64,
+    ) -> Result<Option<Vec<VersionRecord>>> {
+        Ok(self.list_versions(base_uri).await?.map(|records| {
+            records
+                .into_iter()
+                .filter(|(version, _, _)| *version > since)
+                .collect()
+        }))
+    }
+
+    /// Forget the record for `version` once its manifest is gone, as one
+    /// atomic decision: only while the record still names `path` and
+    /// `generation` is still the current one. Any other record at that
+    /// version belongs to a later writer or incarnation and is kept.
+    /// Forgetting also raises the dataset's no-reuse floor
+    /// ([`Self::reuse_floor`]) to `version`, durably: a forgotten version is
+    /// never reserved again, so a reservation delayed past cleanup cannot
+    /// reopen it.
+    async fn forget_version(
+        &self,
+        _base_uri: &str,
+        _version: u64,
+        _path: &str,
+        _generation: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The highest version forgotten in the current generation:
+    /// [`Self::put_if_predecessor`] and [`Self::put_if_not_exists`] refuse
+    /// any version at or below it, decided atomically with the reservation.
+    /// It ends with the generation ([`Self::delete`]), so a recreation
+    /// starts at version 1 again. `None` where the store keeps none; cleanup
+    /// then never reclaims a candidate manifest.
+    async fn reuse_floor(&self, _base_uri: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// The dataset generation the records belong to: minted when the first
+    /// record is written, ended by [`Self::delete`], which must end it before
+    /// removing any record and must never remove a record of a newer
+    /// generation, so a reservation racing a drop is refused rather than
+    /// inherited by the recreation. A store that supports the predecessor
+    /// condition must keep one; without it nothing fences a drop, and
+    /// cleanup refuses to act.
+    async fn generation(&self, _base_uri: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The entry for `version` as `(path, identity)`, read as one
+    /// observation: a path and an identity read separately can belong to two
+    /// incarnations.
+    async fn get_reservation(
+        &self,
+        _base_uri: &str,
+        _version: u64,
+    ) -> Result<Option<(String, String)>> {
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn put(
         &self,
@@ -172,6 +408,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             size: Some(size),
             naming_scheme,
             e_tag: final_e_tag,
+            generation: None,
         };
 
         // Step 3: Update the external index to the final path.
@@ -447,6 +684,244 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
+    /// An unconditioned commit through a store that owns publication. Once
+    /// the dataset has a record, the reservation is bound to the latest
+    /// identity and its generation exactly as a conditioned commit's is, so
+    /// a writer paused across a drop cannot join the recreation; only the
+    /// first record is reserved unconditionally. The manifest is published
+    /// at a candidate path, reached only through its record, so no object
+    /// path is ever shared with another incarnation (see [`CANDIDATES_DIR`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_owned(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: super::ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let store = self.external_manifest_store.as_ref();
+        let base_uri = base_path.as_ref();
+        let version = manifest.version;
+        if let Some(predecessor) = self
+            .resolve_latest_identity(base_path, object_store)
+            .await?
+        {
+            if predecessor.version + 1 != version {
+                return Err(CommitError::CommitConflict);
+            }
+            return self
+                .commit_after(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                    &predecessor,
+                )
+                .await;
+        }
+        let candidate = candidate_manifest_path(base_path, naming_scheme, version)?;
+        let write_res =
+            manifest_writer(object_store, manifest, indices, &candidate, transaction).await?;
+        let size = write_res.size as u64;
+
+        if let Err(error) = store
+            .put_if_not_exists(base_uri, version, candidate.as_ref(), size, None)
+            .await
+        {
+            // As in `commit`: only a record naming another path proves loss.
+            let recorded = store.get_reservation(base_uri, version).await;
+            if matches!(&recorded, Ok(Some((path, _))) if path != candidate.as_ref()) {
+                match object_store.inner.delete(&candidate).await {
+                    Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
+                    Err(delete_error) => warn!(
+                        "Failed to delete losing manifest '{}': {}",
+                        candidate, delete_error
+                    ),
+                }
+                return Err(CommitError::CommitConflict);
+            }
+            warn!(
+                "Reservation of version {version} at '{base_uri}' failed; retaining manifest '{}' \
+                 until the outcome is resolved: {error}",
+                candidate
+            );
+            return Err(CommitError::CommitConflict);
+        }
+        // The record is read back under the generation so the one returned
+        // is the one it lives in -- a first record mints it.
+        let (generation, recorded) =
+            under_generation!(store, base_uri, store.get_reservation(base_uri, version));
+        let generation = match recorded {
+            Some((path, _)) if path == candidate.as_ref() => generation,
+            _ => None,
+        };
+        write_version_hint(object_store, base_path, version).await;
+        Ok(ManifestLocation {
+            version,
+            path: candidate,
+            size: Some(size),
+            naming_scheme,
+            e_tag: write_res.e_tag,
+            generation,
+        })
+    }
+
+    async fn recorded_latest_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<ManifestLocation, Error> {
+        let location = self
+            .external_manifest_store
+            .get_latest_manifest_location(base_path.as_ref())
+            .await?;
+
+        match location {
+            Some(location) => {
+                if location.path.extension() == Some(MANIFEST_EXTENSION) {
+                    return self
+                        .verify_finalized_manifest_location(
+                            base_path,
+                            location,
+                            object_store.inner.as_ref(),
+                        )
+                        .await;
+                }
+
+                let ManifestLocation {
+                    version,
+                    path,
+                    size,
+                    naming_scheme,
+                    e_tag: _,
+                    generation: _,
+                } = location;
+
+                let size = if let Some(size) = size {
+                    size
+                } else {
+                    match object_store.inner.head(&path).await {
+                        Ok(meta) => meta.size,
+                        Err(ObjectStoreError::NotFound { .. }) => {
+                            // there may be other threads that have finished executing finalize_manifest.
+                            let new_location = self
+                                .external_manifest_store
+                                .get_manifest_location(base_path.as_ref(), version)
+                                .await?;
+                            return Ok(new_location);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+
+                let final_location = self
+                    .finalize_manifest(
+                        base_path,
+                        &path,
+                        version,
+                        size,
+                        &object_store.inner,
+                        naming_scheme,
+                    )
+                    .await?;
+
+                Ok(final_location)
+            }
+            // Dataset not found in the external store, this could be because the dataset did not
+            // use external store for commit before. In this case, we search for the latest manifest
+            None => current_manifest_path(object_store, base_path).await,
+        }
+    }
+    async fn recorded_version_location(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+    ) -> std::result::Result<ManifestLocation, Error> {
+        let location_res = self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await;
+
+        let location = match location_res {
+            Ok(p) => p,
+            // not board external manifest yet, direct to object store
+            Err(Error::NotFound { .. }) => {
+                let path = default_resolve_version(base_path, version, object_store)
+                    .await
+                    .map_err(|_| Error::not_found(format!("{}@{}", base_path, version)))?
+                    .path;
+                match object_store.head(&path).await {
+                    Ok(ObjectMeta { size, e_tag, .. }) => {
+                        let res = self
+                            .external_manifest_store
+                            .put_if_not_exists(
+                                base_path.as_ref(),
+                                version,
+                                path.as_ref(),
+                                size,
+                                None,
+                            )
+                            .await;
+                        if let Err(e) = res {
+                            warn!(
+                                "could not update external manifest store during load, with error: {}",
+                                e
+                            );
+                        }
+                        let naming_scheme =
+                            ManifestNamingScheme::detect_scheme_staging(path.filename().unwrap());
+                        return Ok(ManifestLocation {
+                            version,
+                            path,
+                            size: Some(size),
+                            naming_scheme,
+                            e_tag,
+                            generation: None,
+                        });
+                    }
+                    Err(ObjectStoreError::NotFound { .. }) => {
+                        return Err(Error::not_found(path.to_string()));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        if location.path.extension() == Some(MANIFEST_EXTENSION) {
+            return self
+                .verify_finalized_manifest_location(base_path, location, object_store)
+                .await;
+        }
+
+        let naming_scheme =
+            ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
+
+        let size = if let Some(size) = location.size {
+            size
+        } else {
+            let meta = object_store.head(&location.path).await?;
+            meta.size
+        };
+
+        self.finalize_manifest(
+            base_path,
+            &location.path,
+            version,
+            size,
+            object_store,
+            naming_scheme,
+        )
+        .await
+    }
+
     async fn verify_finalized_manifest_location(
         &self,
         base_path: &Path,
@@ -461,6 +936,7 @@ impl ExternalManifestCommitHandler {
                     size: expected_size,
                     naming_scheme,
                     e_tag: _,
+                    generation: _,
                 } = location;
 
                 let size = match expected_size {
@@ -489,6 +965,7 @@ impl ExternalManifestCommitHandler {
                     size,
                     naming_scheme,
                     e_tag,
+                    generation: None,
                 })
             }
             Err(ObjectStoreError::NotFound { .. }) => {
@@ -535,6 +1012,7 @@ impl ExternalManifestCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag: final_e_tag,
+            generation: None,
         };
 
         // Step 2: point the external index at the final location without an
@@ -590,65 +1068,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
-        let location = self
-            .external_manifest_store
-            .get_latest_manifest_location(base_path.as_ref())
-            .await?;
-
-        match location {
-            Some(location) => {
-                if location.path.extension() == Some(MANIFEST_EXTENSION) {
-                    return self
-                        .verify_finalized_manifest_location(
-                            base_path,
-                            location,
-                            object_store.inner.as_ref(),
-                        )
-                        .await;
-                }
-
-                let ManifestLocation {
-                    version,
-                    path,
-                    size,
-                    naming_scheme,
-                    e_tag: _,
-                } = location;
-
-                let size = if let Some(size) = size {
-                    size
-                } else {
-                    match object_store.inner.head(&path).await {
-                        Ok(meta) => meta.size,
-                        Err(ObjectStoreError::NotFound { .. }) => {
-                            // there may be other threads that have finished executing finalize_manifest.
-                            let new_location = self
-                                .external_manifest_store
-                                .get_manifest_location(base_path.as_ref(), version)
-                                .await?;
-                            return Ok(new_location);
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                };
-
-                let final_location = self
-                    .finalize_manifest(
-                        base_path,
-                        &path,
-                        version,
-                        size,
-                        &object_store.inner,
-                        naming_scheme,
-                    )
-                    .await?;
-
-                Ok(final_location)
-            }
-            // Dataset not found in the external store, this could be because the dataset did not
-            // use external store for commit before. In this case, we search for the latest manifest
-            None => current_manifest_path(object_store, base_path).await,
-        }
+        let (generation, mut location) = under_generation!(
+            self.external_manifest_store,
+            base_path.as_ref(),
+            self.recorded_latest_location(base_path, object_store)
+        );
+        location.generation = generation;
+        Ok(location)
     }
 
     async fn resolve_version_location(
@@ -657,81 +1083,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
         version: u64,
         object_store: &dyn OSObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
-        let location_res = self
-            .external_manifest_store
-            .get_manifest_location(base_path.as_ref(), version)
-            .await;
-
-        let location = match location_res {
-            Ok(p) => p,
-            // not board external manifest yet, direct to object store
-            Err(Error::NotFound { .. }) => {
-                let path = default_resolve_version(base_path, version, object_store)
-                    .await
-                    .map_err(|_| Error::not_found(format!("{}@{}", base_path, version)))?
-                    .path;
-                match object_store.head(&path).await {
-                    Ok(ObjectMeta { size, e_tag, .. }) => {
-                        let res = self
-                            .external_manifest_store
-                            .put_if_not_exists(
-                                base_path.as_ref(),
-                                version,
-                                path.as_ref(),
-                                size,
-                                None,
-                            )
-                            .await;
-                        if let Err(e) = res {
-                            warn!(
-                                "could not update external manifest store during load, with error: {}",
-                                e
-                            );
-                        }
-                        let naming_scheme =
-                            ManifestNamingScheme::detect_scheme_staging(path.filename().unwrap());
-                        return Ok(ManifestLocation {
-                            version,
-                            path,
-                            size: Some(size),
-                            naming_scheme,
-                            e_tag,
-                        });
-                    }
-                    Err(ObjectStoreError::NotFound { .. }) => {
-                        return Err(Error::not_found(path.to_string()));
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(e) => return Err(e),
-        };
-
-        if location.path.extension() == Some(MANIFEST_EXTENSION) {
-            return self
-                .verify_finalized_manifest_location(base_path, location, object_store)
-                .await;
-        }
-
-        let naming_scheme =
-            ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
-
-        let size = if let Some(size) = location.size {
-            size
-        } else {
-            let meta = object_store.head(&location.path).await?;
-            meta.size
-        };
-
-        self.finalize_manifest(
-            base_path,
-            &location.path,
-            version,
-            size,
-            object_store,
-            naming_scheme,
-        )
-        .await
+        let (generation, mut location) = under_generation!(
+            self.external_manifest_store,
+            base_path.as_ref(),
+            self.recorded_version_location(base_path, version, object_store)
+        );
+        location.generation = generation;
+        Ok(location)
     }
 
     async fn version_exists(
@@ -759,6 +1117,220 @@ impl CommitHandler for ExternalManifestCommitHandler {
         }
     }
 
+    /// A store that enumerates its records is the dataset's history: the
+    /// manifests of conditioned commits exist only as records, and the
+    /// commit-time scan is the store's bounded `version > since` range. A
+    /// store that cannot enumerate is listed from the object store.
+    fn list_manifest_locations<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        sorted_descending: bool,
+    ) -> BoxStream<'a, std::result::Result<ManifestLocation, Error>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        async move {
+            let (generation, records) = under_generation!(
+                store,
+                base_path.as_ref(),
+                store.list_versions(base_path.as_ref())
+            );
+            let records = enumerated(store.as_ref(), base_path.as_ref(), records)?
+                .map(|records| (generation, records));
+            history(&base_path, object_store, records, sorted_descending).await
+        }
+        .try_flatten_stream()
+        .boxed()
+    }
+
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, std::result::Result<ManifestLocation, Error>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        async move {
+            let (generation, records) = under_generation!(
+                store,
+                base_path.as_ref(),
+                store.list_versions_since(base_path.as_ref(), since_version)
+            );
+            let records = enumerated(store.as_ref(), base_path.as_ref(), records)?
+                .map(|records| (generation, records));
+            history(&base_path, object_store, records, true).await
+        }
+        .try_flatten_stream()
+        .try_filter(move |location| future::ready(location.version > since_version))
+        .boxed()
+    }
+
+    async fn forget_version(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        generation: Option<&str>,
+    ) -> Result<()> {
+        self.external_manifest_store
+            .forget_version(base_path.as_ref(), version, path.as_ref(), generation)
+            .await
+    }
+
+    async fn may_reclaim(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        generation: Option<&str>,
+    ) -> Result<bool> {
+        let store = self.external_manifest_store.as_ref();
+        let base_uri = base_path.as_ref();
+        // One observation: the floor and the record at `version`, under the
+        // generation they belong to.
+        let (current, (floor, recorded)) = under_generation!(store, base_uri, async {
+            Ok::<_, Error>((
+                store.reuse_floor(base_uri).await?,
+                store.get_reservation(base_uri, version).await?,
+            ))
+        });
+        Ok(current.is_some()
+            && current.as_deref() == generation
+            && floor.is_some_and(|floor| version <= floor)
+            && recorded.is_none_or(|(recorded, _)| recorded != path.as_ref()))
+    }
+
+    fn supports_predecessor_condition(&self) -> bool {
+        self.external_manifest_store
+            .supports_predecessor_condition()
+    }
+
+    async fn resolve_latest_identity(
+        &self,
+        base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> std::result::Result<Option<PredecessorIdentity>, Error> {
+        let Some((version, _)) = self
+            .external_manifest_store
+            .get_latest_version(base_path.as_ref())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let generation = self
+            .external_manifest_store
+            .generation(base_path.as_ref())
+            .await?;
+        Ok(self
+            .external_manifest_store
+            .get_identity(base_path.as_ref(), version)
+            .await?
+            .map(|identity| PredecessorIdentity {
+                version,
+                identity,
+                generation,
+            }))
+    }
+
+    async fn commit_after(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: super::ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+        predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let store = self.external_manifest_store.as_ref();
+        let base_uri = base_path.as_ref();
+        let version = manifest.version;
+        // The manifest is published where it is written: a path no other
+        // writer or incarnation can name, so nothing is ever copied onto the
+        // canonical path shared with a recreated dataset. The name keeps the
+        // canonical form so listings and cleanup parse its version.
+        let candidate = candidate_manifest_path(base_path, naming_scheme, version)?;
+        let write_res =
+            manifest_writer(object_store, manifest, indices, &candidate, transaction).await?;
+        let size = write_res.size as u64;
+        let delete_candidate = || async {
+            match object_store.inner.delete(&candidate).await {
+                Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
+                Err(error) => warn!(
+                    "Failed to delete unreserved manifest '{}': {}",
+                    candidate, error
+                ),
+            }
+        };
+
+        // The reservation is the commit point and the only atomic step; the
+        // store decides the predecessor condition together with it.
+        match store
+            .put_if_predecessor(base_uri, version, candidate.as_ref(), size, predecessor)
+            .await
+        {
+            Ok(Reservation::Reserved { .. }) => {}
+            // Only the store's definitive outcomes prove nothing was
+            // written; only then is the candidate safe to delete.
+            Ok(Reservation::Refused { reason }) => {
+                delete_candidate().await;
+                return Err(CommitError::OtherError(
+                    lance_core::error::PrerequisiteFailedSnafu { message: reason }.build(),
+                ));
+            }
+            Ok(Reservation::Taken) => {
+                delete_candidate().await;
+                return Err(CommitError::CommitConflict);
+            }
+            // Any error may follow a reservation the store applied and lost
+            // the response to (its own retry then sees the version taken or
+            // the predecessor changed). An entry naming this candidate
+            // proves it landed; an entry naming another path proves it
+            // lost. An absent entry proves nothing -- the write may still be
+            // in flight -- so the candidate is retained and the outcome
+            // reported unknown, since a late entry pointing at deleted bytes
+            // would corrupt the version.
+            Err(error) => match store.get_reservation(base_uri, version).await {
+                Ok(Some((path, _))) if path == candidate.as_ref() => {}
+                Ok(Some(_)) => {
+                    delete_candidate().await;
+                    return Err(CommitError::CommitConflict);
+                }
+                Ok(None) | Err(Error::NotFound { .. }) => {
+                    warn!(
+                        "Reservation of version {version} at '{base_uri}' has an unknown outcome; \
+                         retaining manifest '{}': {}",
+                        candidate, error
+                    );
+                    return Err(CommitError::OtherError(
+                        Error::commit_status_unknown_source(version, Box::new(error)),
+                    ));
+                }
+                Err(readback) => {
+                    warn!(
+                        "Reservation of version {version} at '{base_uri}' has an unknown outcome; \
+                         retaining manifest '{}': {} (readback: {})",
+                        candidate, error, readback
+                    );
+                    return Err(CommitError::OtherError(
+                        Error::commit_status_unknown_source(version, Box::new(error)),
+                    ));
+                }
+            },
+        }
+        write_version_hint(object_store, base_path, version).await;
+        Ok(ManifestLocation {
+            version,
+            path: candidate,
+            size: Some(size),
+            naming_scheme,
+            e_tag: write_res.e_tag,
+            generation: predecessor.generation.clone(),
+        })
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -769,6 +1341,23 @@ impl CommitHandler for ExternalManifestCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
+        if self
+            .external_manifest_store
+            .supports_predecessor_condition()
+        {
+            return self
+                .commit_owned(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await;
+        }
+
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
 
@@ -855,6 +1444,7 @@ mod tests {
 
     use super::*;
     use crate::format::DataStorageFormat;
+    use crate::io::commit::ConditionalPutCommitHandler;
     use crate::io::commit::write_manifest_file_to_path;
 
     #[derive(Debug, Clone)]
@@ -862,11 +1452,13 @@ mod tests {
         path: String,
         size: u64,
         e_tag: Option<String>,
+        identity: String,
     }
 
     #[derive(Debug)]
     struct TestExternalManifestStore {
         manifests: Mutex<HashMap<(String, u64), StoredManifest>>,
+        generation: Mutex<Option<String>>,
         fail_next_put_response: AtomicBool,
         fail_next_final_publish: AtomicBool,
         block_first_final_publish: bool,
@@ -879,6 +1471,7 @@ mod tests {
         fn new(fail_next_put_response: bool) -> Self {
             Self {
                 manifests: Mutex::new(HashMap::new()),
+                generation: Mutex::new(None),
                 fail_next_put_response: AtomicBool::new(fail_next_put_response),
                 fail_next_final_publish: AtomicBool::new(false),
                 block_first_final_publish: false,
@@ -933,6 +1526,7 @@ mod tests {
                 path,
                 size: Some(stored.size),
                 e_tag: stored.e_tag,
+                generation: None,
             })
         }
 
@@ -963,12 +1557,14 @@ mod tests {
                     "manifest already exists".to_string().into(),
                 ));
             }
+            let identity = format!("identity-{}", manifests.len());
             manifests.insert(
                 key,
                 StoredManifest {
                     path: path.to_string(),
                     size,
                     e_tag,
+                    identity,
                 },
             );
             drop(manifests);
@@ -977,6 +1573,73 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        async fn get_identity(&self, base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self
+                .manifests
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|manifest| manifest.identity.clone()))
+        }
+
+        async fn get_reservation(
+            &self,
+            base_uri: &str,
+            version: u64,
+        ) -> Result<Option<(String, String)>> {
+            Ok(self
+                .manifests
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|manifest| (manifest.path.clone(), manifest.identity.clone())))
+        }
+
+        async fn list_versions(&self, base_uri: &str) -> Result<Option<Vec<VersionRecord>>> {
+            Ok(Some(
+                self.manifests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|((stored_base, _), _)| stored_base == base_uri)
+                    .map(|((_, version), manifest)| {
+                        (*version, manifest.path.clone(), Some(manifest.size))
+                    })
+                    .collect(),
+            ))
+        }
+
+        async fn forget_version(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            generation: Option<&str>,
+        ) -> Result<()> {
+            if self.generation.lock().unwrap().as_deref() != generation {
+                return Ok(());
+            }
+            let mut manifests = self.manifests.lock().unwrap();
+            let key = (base_uri.to_string(), version);
+            if manifests.get(&key).is_some_and(|m| m.path == path) {
+                manifests.remove(&key);
+            }
+            Ok(())
+        }
+
+        async fn generation(&self, _base_uri: &str) -> Result<Option<String>> {
+            Ok(self.generation.lock().unwrap().clone())
+        }
+
+        async fn delete(&self, base_uri: &str) -> Result<()> {
+            *self.generation.lock().unwrap() = None;
+            self.manifests
+                .lock()
+                .unwrap()
+                .retain(|(stored_base, _), _| stored_base != base_uri);
+            Ok(())
         }
 
         async fn put_if_exists(
@@ -1001,11 +1664,9 @@ mod tests {
             let manifest = manifests
                 .get_mut(&key)
                 .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
-            *manifest = StoredManifest {
-                path: path.to_string(),
-                size,
-                e_tag,
-            };
+            manifest.path = path.to_string();
+            manifest.size = size;
+            manifest.e_tag = e_tag;
             Ok(())
         }
     }
@@ -1018,6 +1679,107 @@ mod tests {
             DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         )
+    }
+
+    /// A store that enumerates is the whole history: a canonical manifest it
+    /// holds no record for is not history, and cleanup forgetting a record
+    /// removes the version.
+    #[tokio::test]
+    async fn test_history_is_the_store_records() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let scheme = ManifestNamingScheme::V2;
+        let v1 = scheme.manifest_path(&base_path, 1);
+        object_store.put(&v1, b"one").await.unwrap();
+        let v2 = candidate_manifest_path(&base_path, scheme, 2).unwrap();
+        object_store.put(&v2, b"two").await.unwrap();
+        external_store
+            .put_if_not_exists(base_path.as_ref(), 2, v2.as_ref(), 3, None)
+            .await
+            .unwrap();
+
+        let versions = |locations: Vec<ManifestLocation>| {
+            locations.iter().map(|m| m.version).collect::<Vec<_>>()
+        };
+        let listed = handler
+            .list_manifest_locations(&base_path, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let generation = listed[0].generation.clone();
+        assert_eq!(versions(listed), vec![2]);
+        let newer = handler
+            .list_manifest_locations_since(&base_path, &object_store, 1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(versions(newer), vec![2]);
+
+        handler
+            .forget_version(&base_path, 2, &v2, generation.as_deref())
+            .await
+            .unwrap();
+        let listed = handler
+            .list_manifest_locations(&base_path, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+    }
+
+    /// Candidates live outside `_versions`, so the generic listing never
+    /// reports them; the handler's own listing comes from the store's
+    /// records, ordered by version regardless of key order.
+    #[tokio::test]
+    async fn test_history_is_enumerated_from_the_store_records() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let scheme = ManifestNamingScheme::V2;
+        let v1 = scheme.manifest_path(&base_path, 1);
+        let v2 = candidate_manifest_path(&base_path, scheme, 2).unwrap();
+        assert!(v2.as_ref().starts_with("dataset/_candidates/"));
+        for (path, version) in [(&v1, 1), (&v2, 2)] {
+            object_store.put(path, b"m").await.unwrap();
+            external_store
+                .put_if_not_exists(base_path.as_ref(), version, path.as_ref(), 1, None)
+                .await
+                .unwrap();
+        }
+
+        let generic = ConditionalPutCommitHandler
+            .list_manifest_locations(&base_path, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            generic.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let listed = handler
+            .list_manifest_locations(&base_path, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(listed[0].path, v2);
+        let newer = handler
+            .list_manifest_locations_since(&base_path, &object_store, 1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(newer.iter().map(|m| m.version).collect::<Vec<_>>(), vec![2]);
     }
 
     #[tokio::test]

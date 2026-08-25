@@ -22,6 +22,7 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -68,6 +69,10 @@ use {
 };
 
 pub const VERSIONS_DIR: &str = "_versions";
+/// Where predecessor-conditioned commits publish their manifests, outside
+/// the committed-manifest namespace so generic listings never see them;
+/// only the external manifest store's records name them.
+pub const CANDIDATES_DIR: &str = "_candidates";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 /// File name for the JSON version hint file, stored under `_versions/`.
@@ -257,6 +262,11 @@ pub struct ManifestLocation {
     /// be interpreted as proof that two observations belong to the same dataset
     /// incarnation.
     pub e_tag: Option<String>,
+    /// The dataset generation the manifest belongs to, where the commit
+    /// handler keeps one (see `ExternalManifestStore::generation`); `None`
+    /// where it keeps none or could not tell. Cleanup refuses to act on a
+    /// snapshot whose generation is not the one it lists.
+    pub generation: Option<String>,
 }
 
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
@@ -277,6 +287,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            generation: None,
         })
     }
 }
@@ -400,6 +411,7 @@ async fn read_version_hint_and_probe(
         size: Some(meta.size),
         naming_scheme: scheme,
         e_tag: meta.e_tag,
+        generation: None,
     })
 }
 
@@ -528,6 +540,7 @@ async fn list_manifests_since_version_with_hint(
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            generation: None,
         })
         .collect();
 
@@ -549,6 +562,7 @@ async fn list_manifests_since_version_with_hint(
                             size: Some(meta.size),
                             naming_scheme: scheme,
                             e_tag: meta.e_tag,
+                            generation: None,
                         })
                 })
                 .buffer_unordered(object_store.io_parallelism())
@@ -622,6 +636,7 @@ async fn resolve_version_from_listing(
                 size: Some(meta.size),
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
+                generation: None,
             })
         }
         // If the list is not lexically ordered, we need to iterate all manifests
@@ -655,6 +670,7 @@ async fn resolve_version_from_listing(
                 size: Some(current_meta.size),
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
+                generation: None,
             })
         }
         (None, _) => Err(Error::not_found(
@@ -720,13 +736,14 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             size: Some(metadata.len()),
             naming_scheme,
             e_tag: Some(get_etag(&metadata)),
+            generation: None,
         }))
     } else {
         Ok(None)
     }
 }
 
-fn list_manifests<'a>(
+pub(crate) fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
@@ -754,6 +771,7 @@ fn detached_manifest_location_from_meta(
         size: Some(meta.size),
         naming_scheme: ManifestNamingScheme::V2,
         e_tag: meta.e_tag,
+        generation: None,
     })
 }
 
@@ -983,9 +1001,76 @@ pub trait CommitHandler: Debug + Send + Sync {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError>;
 
+    /// Whether [`Self::commit_after`] is available: the handler can decide,
+    /// atomically with reserving a version, that the predecessor manifest is
+    /// still the one a writer judged.
+    fn supports_predecessor_condition(&self) -> bool {
+        false
+    }
+
+    /// The identity of the latest manifest, for [`Self::commit_after`].
+    /// `None` where the handler cannot condition on it.
+    async fn resolve_latest_identity(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<Option<PredecessorIdentity>> {
+        Ok(None)
+    }
+
+    /// Commit `manifest` only if `predecessor` is still the manifest at its
+    /// version, decided atomically with the version reservation. A
+    /// predecessor that changed fails with [`Error::PrerequisiteFailed`]
+    /// (as [`CommitError::OtherError`]), never with a conflict.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_after(
+        &self,
+        _manifest: &mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: ManifestWriter,
+        _naming_scheme: ManifestNamingScheme,
+        _transaction: Option<Transaction>,
+        _predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        Err(CommitError::OtherError(Error::not_supported(
+            "this commit handler cannot condition publication on the predecessor manifest",
+        )))
+    }
+
     /// Delete the recorded manifest information for a dataset at the base_path
     async fn delete(&self, _base_path: &Path) -> Result<()> {
         Ok(())
+    }
+
+    /// Forget what this handler recorded for `version` once cleanup deleted
+    /// the manifest at `path` -- only while the record still names that path
+    /// and `generation` (the snapshot's, see [`ManifestLocation::generation`])
+    /// is still current, so a record a recreation wrote at the same version
+    /// since the listing is left alone.
+    async fn forget_version(
+        &self,
+        _base_path: &Path,
+        _version: u64,
+        _path: &Path,
+        _generation: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the manifest at `path`, for `version`, can never be recorded
+    /// again and is not recorded now, decided against the handler's current
+    /// state for `generation` (the snapshot's) and asked immediately before
+    /// deleting it. `false` where the handler cannot tell.
+    async fn may_reclaim(
+        &self,
+        _base_path: &Path,
+        _version: u64,
+        _path: &Path,
+        _generation: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -1004,6 +1089,7 @@ async fn default_resolve_version(
             path: ManifestNamingScheme::V2.manifest_path(base_path, version),
             size: None,
             e_tag: None,
+            generation: None,
         });
     }
 
@@ -1017,6 +1103,7 @@ async fn default_resolve_version(
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            generation: None,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -1027,6 +1114,7 @@ async fn default_resolve_version(
                 size: None,
                 naming_scheme: scheme,
                 e_tag: None,
+                generation: None,
             })
         }
         Err(e) => Err(e.into()),
@@ -1277,6 +1365,7 @@ impl CommitHandler for UnsafeCommitHandler {
             naming_scheme,
             path: version_path,
             e_tag: res.e_tag,
+            generation: None,
         })
     }
 }
@@ -1427,6 +1516,7 @@ where
             naming_scheme,
             path,
             e_tag: res.e_tag,
+            generation: None,
         })
     }
 }
@@ -1514,7 +1604,8 @@ impl CommitHandler for RenameCommitHandler {
                     path,
                     size: Some(res.size as u64),
                     naming_scheme,
-                    e_tag: None, // Re-name can change e-tag.
+                    e_tag: None, // Re-name can change e-tag.,
+                    generation: None,
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1600,6 +1691,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag: res.e_tag,
+            generation: None,
         })
     }
 }
@@ -1649,10 +1741,26 @@ impl Debug for TencentCosCommitHandler {
     }
 }
 
+/// A manifest as a commit handler identifies it: its version and a token
+/// unique to that physical manifest, so a dataset recreated at the same
+/// version is told apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredecessorIdentity {
+    pub version: u64,
+    pub identity: String,
+    /// The dataset generation the manifest belongs to, where the handler
+    /// records one: dropping the dataset ends it, so a commit judged before
+    /// a drop cannot land in the dataset recreated after it.
+    pub generation: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    /// Schema metadata the latest manifest must carry for the commit to
+    /// land, re-checked on every attempt after the manifest reload.
+    pub required_schema_metadata: HashMap<String, String>,
     // TODO: add isolation_level
 }
 
@@ -1661,6 +1769,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            required_schema_metadata: HashMap::new(),
         }
     }
 }

@@ -317,6 +317,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             // it and let the commit handler obtain the current token from the
             // authoritative object store when it validates the final path.
             e_tag: None,
+            generation: None,
         })
     }
 
@@ -388,6 +389,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                             // are physical-generation observations, not
                             // version identity, and are intentionally ignored.
                             e_tag: None,
+                            generation: None,
                         };
                         Ok(Some(location))
                     }

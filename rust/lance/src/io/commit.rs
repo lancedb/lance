@@ -38,6 +38,7 @@ use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
     is_detached_version, list_index_files_with_sizes, pb,
 };
+use lance_table::io::commit::PredecessorIdentity;
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
@@ -51,7 +52,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    write_manifest_file, write_manifest_file_after,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
@@ -292,6 +293,97 @@ async fn read_manifest_transaction(
     } else {
         Ok(None)
     }
+}
+
+/// Judge `required` on the latest manifest and return the identity the
+/// publication must be conditioned on. Identity first, then the manifest it
+/// names: a recreation between the two reads leaves the metadata check to
+/// refuse it, and one after both leaves the reservation to.
+async fn judge_required_metadata(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    required: &HashMap<String, String>,
+) -> Result<Option<PredecessorIdentity>> {
+    if required.is_empty() {
+        return Ok(None);
+    }
+    let Some(predecessor) = commit_handler
+        .resolve_latest_identity(base_path, object_store)
+        .await?
+    else {
+        return Err(lance_core::error::PrerequisiteFailedSnafu {
+            message: "the latest manifest carries no identity to condition the commit on"
+                .to_string(),
+        }
+        .build());
+    };
+    let Some((manifest, _)) =
+        try_read_manifest_at(object_store, commit_handler, base_path, predecessor.version).await?
+    else {
+        return Err(lance_core::error::PrerequisiteFailedSnafu {
+            message: format!("manifest {} is no longer readable", predecessor.version),
+        }
+        .build());
+    };
+    for (key, expected) in required {
+        let actual = manifest.schema.metadata.get(key);
+        if actual != Some(expected) {
+            return Err(lance_core::error::PrerequisiteFailedSnafu {
+                message: format!(
+                    "commit requires schema metadata {key:?} = {expected:?} on version {}, \
+                     found {actual:?}",
+                    manifest.version
+                ),
+            }
+            .build());
+        }
+    }
+    Ok(Some(predecessor))
+}
+
+/// Bind a reservation through a handler that owns publication to the
+/// generation the committing handle was loaded under: the latest identity
+/// (resolved here when no metadata requirement already did) must belong to
+/// it, and it is what the store compares atomically at reservation.
+async fn bind_to_generation(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    predecessor: Option<PredecessorIdentity>,
+    expected_generation: Option<&str>,
+) -> Result<PredecessorIdentity> {
+    let Some(expected_generation) = expected_generation else {
+        return Err(lance_core::error::PrerequisiteFailedSnafu {
+            message: "this handle carries no dataset generation to commit under; reload it"
+                .to_string(),
+        }
+        .build());
+    };
+    let predecessor = match predecessor {
+        Some(predecessor) => predecessor,
+        None => commit_handler
+            .resolve_latest_identity(base_path, object_store)
+            .await?
+            .ok_or_else(|| {
+                lance_core::error::PrerequisiteFailedSnafu {
+                    message: "the latest manifest carries no identity to bind the commit to"
+                        .to_string(),
+                }
+                .build()
+            })?,
+    };
+    if predecessor.generation.as_deref() != Some(expected_generation) {
+        return Err(lance_core::error::PrerequisiteFailedSnafu {
+            message: format!(
+                "the dataset at '{base_path}' was dropped and recreated since this handle was \
+                 loaded (generation {:?}, handle {expected_generation:?})",
+                predecessor.generation
+            ),
+        }
+        .build());
+    }
+    Ok(predecessor)
 }
 
 /// Read the manifest at `version`, distinguishing "no such version"
@@ -1316,9 +1408,23 @@ pub(crate) async fn commit_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
+    if !commit_config.required_schema_metadata.is_empty()
+        && !commit_handler.supports_predecessor_condition()
+    {
+        return Err(Error::not_supported(
+            "required schema metadata needs a commit handler that can condition publication \
+             on the predecessor manifest, which this store's cannot",
+        ));
+    }
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
+    // The generation this handle was loaded under, captured before any
+    // rebase moves `dataset` forward: every reservation below is bound to
+    // it, so a recreation at the same URI refuses this transaction rather
+    // than absorbing it.
+    let expected_generation = dataset.manifest_location.generation.clone();
+    let binds_generation = commit_handler.supports_predecessor_condition();
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
@@ -1388,6 +1494,28 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        let predecessor = judge_required_metadata(
+            object_store,
+            commit_handler,
+            &dataset.base,
+            &commit_config.required_schema_metadata,
+        )
+        .await?;
+        let predecessor = if binds_generation {
+            Some(
+                bind_to_generation(
+                    object_store,
+                    commit_handler,
+                    &dataset.base,
+                    predecessor,
+                    expected_generation.as_deref(),
+                )
+                .await?,
+            )
+        } else {
+            predecessor
+        };
+
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
@@ -1456,7 +1584,7 @@ pub(crate) async fn commit_transaction(
         )?;
 
         // Try to commit the manifest
-        let result = write_manifest_file(
+        let result = write_manifest_file_after(
             object_store,
             commit_handler,
             &dataset.base,
@@ -1469,6 +1597,7 @@ pub(crate) async fn commit_transaction(
             write_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
+            predecessor.as_ref(),
         )
         .await;
 
@@ -1560,6 +1689,17 @@ pub(crate) async fn commit_transaction(
                 } else {
                     break;
                 }
+            }
+            // A refused reservation applied nothing: the predecessor is not
+            // the manifest this commit was judged against.
+            Err(CommitError::OtherError(err @ Error::PrerequisiteFailed { .. })) => {
+                cleanup_transaction_file(object_store, &dataset.base, transaction_file).await;
+                return Err(err);
+            }
+            // The handler retained a manifest whose reservation may still
+            // land; nothing it references may be removed.
+            Err(CommitError::OtherError(err)) if err.is_commit_status_unknown() => {
+                return Err(err);
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(

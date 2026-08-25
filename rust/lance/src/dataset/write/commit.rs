@@ -213,6 +213,26 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Require the latest manifest to carry `value` under schema-metadata
+    /// `key`, and make that part of the commit: on every attempt the latest
+    /// manifest is judged, and publication is conditioned atomically on that
+    /// same manifest still being the predecessor (`CommitHandler::commit_after`),
+    /// so a dataset recreated at the same path at any point is refused with
+    /// [`Error::PrerequisiteFailed`]. Only commit handlers whose store can
+    /// make that decision atomically accept the option (the external
+    /// manifest store); others fail with [`Error::NotSupported`]. Not
+    /// available on detached commits.
+    pub fn with_required_schema_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.commit_config
+            .required_schema_metadata
+            .insert(key.into(), value.into());
+        self
+    }
+
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
         self
@@ -432,6 +452,20 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
+        if !self.commit_config.required_schema_metadata.is_empty() {
+            if self.detached {
+                return Err(Error::invalid_input(
+                    "required schema metadata cannot be enforced on a detached commit",
+                ));
+            }
+            // Creation has no predecessor to judge, so the option would be
+            // meaningless there rather than enforced.
+            if dest.dataset().is_none() {
+                return Err(Error::invalid_input(
+                    "required schema metadata cannot apply to creating a dataset",
+                ));
+            }
+        }
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
@@ -608,11 +642,17 @@ mod tests {
     use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
     use std::time::Duration;
 
+    use object_store::path::Path;
     use object_store::throttle::ThrottleConfig;
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::io::commit::external_manifest::{
+        ExternalManifestCommitHandler, ExternalManifestStore, Reservation,
+    };
+    use lance_table::io::commit::{CANDIDATES_DIR, PredecessorIdentity};
 
     use super::*;
 
@@ -674,6 +714,1302 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Err(CommitError::CommitConflict)
         }
+    }
+
+    /// An external manifest store that identifies each row and can reserve a
+    /// version conditioned on its predecessor. `hold_next_reservation` parks
+    /// the next conditioned reservation so a test can move the dataset
+    /// underneath it.
+    /// `(path, size, identity)` per `(base_uri, version)`.
+    type StoredRow = (String, u64, String);
+    type StoredRows = HashMap<(String, u64), StoredRow>;
+
+    #[derive(Debug, Default)]
+    struct IdentifiedStore {
+        rows: std::sync::Mutex<StoredRows>,
+        generation: std::sync::Mutex<Option<String>>,
+        next_identity: std::sync::atomic::AtomicU64,
+        hold_next_reservation: std::sync::atomic::AtomicBool,
+        reservation_held: tokio::sync::Notify,
+        release_reservation: tokio::sync::Notify,
+        /// Apply the next reservation but report an error for it.
+        lose_next_reservation_response: std::sync::atomic::AtomicBool,
+        /// Park the next reservation read before it observes the row.
+        hold_next_reservation_read: std::sync::atomic::AtomicBool,
+        reservation_read_held: tokio::sync::Notify,
+        release_reservation_read: tokio::sync::Notify,
+        /// Apply the next reservation but report a conflict for it, as a
+        /// store whose internal retry saw its own write does.
+        conflict_after_applying_next_reservation: std::sync::atomic::AtomicBool,
+        /// Apply the next reservation but report `PrerequisiteFailed` for it.
+        refuse_after_applying_next_reservation: std::sync::atomic::AtomicBool,
+        /// Fail the n-th `forget_version` call (1-based; 0 = never) before
+        /// it touches a row.
+        fail_forget_call: std::sync::atomic::AtomicUsize,
+        forget_calls: std::sync::atomic::AtomicUsize,
+        /// Behave as a store that keeps no generation.
+        hide_generation: std::sync::atomic::AtomicBool,
+        /// Behave as a store that cannot enumerate its records.
+        hide_records: std::sync::atomic::AtomicBool,
+        /// The highest forgotten version per dataset; never reserved again.
+        reuse_floor: std::sync::Mutex<HashMap<String, u64>>,
+        /// Report an error for the next reservation without applying it,
+        /// holding it for [`Self::apply_pending_reservation`].
+        delay_next_reservation: std::sync::atomic::AtomicBool,
+        pending_reservation: std::sync::Mutex<Option<((String, u64), StoredRow)>>,
+    }
+
+    impl IdentifiedStore {
+        /// The remote write of a delayed reservation finally lands.
+        fn apply_pending_reservation(&self) {
+            let (key, row) = self.pending_reservation.lock().unwrap().take().unwrap();
+            self.rows.lock().unwrap().insert(key, row);
+        }
+
+        fn mint(&self) -> String {
+            format!(
+                "identity-{}",
+                self.next_identity
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )
+        }
+
+        fn handler(self: &Arc<Self>) -> Arc<dyn CommitHandler> {
+            Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: self.clone(),
+            })
+        }
+
+        fn below_floor(&self, base_uri: &str, version: u64) -> bool {
+            self.reuse_floor
+                .lock()
+                .unwrap()
+                .get(base_uri)
+                .is_some_and(|floor| version <= *floor)
+        }
+
+        fn versions(&self) -> Vec<u64> {
+            let mut versions: Vec<u64> = self.rows.lock().unwrap().keys().map(|k| k.1).collect();
+            versions.sort();
+            versions
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalManifestStore for IdentifiedStore {
+        async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|row| row.0.clone())
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))
+        }
+
+        async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.0 == base_uri)
+                .max_by_key(|(key, _)| key.1)
+                .map(|(key, row)| (key.1, row.0.clone())))
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            self.generation
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| self.mint());
+            let identity = self.mint();
+            let mut rows = self.rows.lock().unwrap();
+            let key = (base_uri.to_string(), version);
+            if rows.contains_key(&key) {
+                return Err(Error::commit_conflict_source(
+                    version,
+                    "manifest already exists".into(),
+                ));
+            }
+            if self.below_floor(base_uri, version) {
+                return Err(lance_core::error::PrerequisiteFailedSnafu {
+                    message: format!("version {version} was forgotten and is never reused"),
+                }
+                .build());
+            }
+            rows.insert(key, (path.to_string(), size, identity));
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&(base_uri.to_string(), version))
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
+            row.0 = path.to_string();
+            row.1 = size;
+            Ok(())
+        }
+
+        async fn delete(&self, base_uri: &str) -> Result<()> {
+            *self.generation.lock().unwrap() = None;
+            self.reuse_floor.lock().unwrap().remove(base_uri);
+            self.rows.lock().unwrap().retain(|key, _| key.0 != base_uri);
+            Ok(())
+        }
+
+        async fn reuse_floor(&self, base_uri: &str) -> Result<Option<u64>> {
+            Ok(self.reuse_floor.lock().unwrap().get(base_uri).copied())
+        }
+
+        async fn generation(&self, _base_uri: &str) -> Result<Option<String>> {
+            if self
+                .hide_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(None);
+            }
+            Ok(self.generation.lock().unwrap().clone())
+        }
+
+        async fn forget_version(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            generation: Option<&str>,
+        ) -> Result<()> {
+            let call = self
+                .forget_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self
+                .fail_forget_call
+                .compare_exchange(
+                    call,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Err(Error::io("simulated coordinator outage"));
+            }
+            if self.generation.lock().unwrap().as_deref() != generation {
+                return Ok(());
+            }
+            let mut rows = self.rows.lock().unwrap();
+            let key = (base_uri.to_string(), version);
+            if rows.get(&key).is_some_and(|row| row.0 == path) {
+                rows.remove(&key);
+                let mut floors = self.reuse_floor.lock().unwrap();
+                let floor = floors.entry(base_uri.to_string()).or_insert(version);
+                *floor = (*floor).max(version);
+            }
+            Ok(())
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn get_identity(&self, base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|row| row.2.clone()))
+        }
+
+        async fn list_versions(
+            &self,
+            base_uri: &str,
+        ) -> Result<Option<Vec<(u64, String, Option<u64>)>>> {
+            if self.hide_records.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.0 == base_uri)
+                    .map(|(key, row)| (key.1, row.0.clone(), Some(row.1)))
+                    .collect(),
+            ))
+        }
+
+        async fn get_reservation(
+            &self,
+            base_uri: &str,
+            version: u64,
+        ) -> Result<Option<(String, String)>> {
+            if self
+                .hold_next_reservation_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reservation_read_held.notify_one();
+                self.release_reservation_read.notified().await;
+            }
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|row| (row.0.clone(), row.2.clone())))
+        }
+
+        async fn put_if_predecessor(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            predecessor: &PredecessorIdentity,
+        ) -> Result<Reservation> {
+            if self
+                .hold_next_reservation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reservation_held.notify_one();
+                self.release_reservation.notified().await;
+            }
+            let identity = self.mint();
+            let visible_generation = if self
+                .hide_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                None
+            } else {
+                self.generation.lock().unwrap().clone()
+            };
+            let mut rows = self.rows.lock().unwrap();
+            let current = rows
+                .get(&(base_uri.to_string(), predecessor.version))
+                .map(|row| row.2.clone());
+            if visible_generation != predecessor.generation
+                || current.as_deref() != Some(predecessor.identity.as_str())
+            {
+                return Ok(Reservation::Refused {
+                    reason: format!("manifest {} changed", predecessor.version),
+                });
+            }
+            if self.below_floor(base_uri, version) {
+                return Ok(Reservation::Refused {
+                    reason: format!("version {version} was forgotten and is never reused"),
+                });
+            }
+            let key = (base_uri.to_string(), version);
+            if rows.contains_key(&key) {
+                return Ok(Reservation::Taken);
+            }
+            if self
+                .delay_next_reservation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                *self.pending_reservation.lock().unwrap() =
+                    Some((key, (path.to_string(), size, identity)));
+                return Err(Error::io("simulated reservation timeout"));
+            }
+            rows.insert(key, (path.to_string(), size, identity.clone()));
+            if self
+                .conflict_after_applying_next_reservation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::commit_conflict_source(
+                    version,
+                    "simulated retry observed the applied reservation".into(),
+                ));
+            }
+            if self
+                .refuse_after_applying_next_reservation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(lance_core::error::PrerequisiteFailedSnafu {
+                    message: "simulated retry saw the predecessor superseded".to_string(),
+                }
+                .build());
+            }
+            if self
+                .lose_next_reservation_response
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::io("simulated lost reservation response"));
+            }
+            Ok(Reservation::Reserved { identity })
+        }
+    }
+
+    fn gen_schema(generation: &str) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new_with_metadata(
+            vec![ArrowField::new("i", DataType::Int32, false)],
+            HashMap::from([("gen".to_string(), generation.to_string())]),
+        ))
+    }
+
+    fn gen_batch(generation: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            gen_schema(generation),
+            vec![Arc::new(Int32Array::from_iter_values(0..3_i32))],
+        )
+        .unwrap()
+    }
+
+    async fn create_with(uri: &str, generation: &str, handler: Arc<dyn CommitHandler>) -> Dataset {
+        InsertBuilder::new(uri)
+            .with_params(&WriteParams {
+                commit_handler: Some(handler),
+                ..Default::default()
+            })
+            .execute(vec![gen_batch(generation)])
+            .await
+            .unwrap()
+    }
+
+    async fn staged_append(dataset: &Dataset, generation: &str) -> Transaction {
+        InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![gen_batch(generation)])
+            .await
+            .unwrap()
+    }
+
+    /// Drop the dataset at `uri` from storage and from the store, then
+    /// declare a new one there with a different generation.
+    async fn recreate(uri: &str, store: &Arc<IdentifiedStore>, generation: &str) -> Dataset {
+        std::fs::remove_dir_all(uri).unwrap();
+        store.delete(uri.trim_start_matches('/')).await.unwrap();
+        create_with(uri, generation, store.handler()).await
+    }
+
+    /// Stores that cannot decide the predecessor condition atomically refuse
+    /// the option outright rather than checking it on the side.
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_where_publication_cannot_be_conditioned() {
+        let dataset = InsertBuilder::new("memory://required-unsupported")
+            .execute(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let txn = staged_append(&dataset, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    /// Matching metadata lands; metadata changed before the commit fails it
+    /// even though the stale handle still shows the old value.
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_judged_on_the_latest_manifest() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+
+        let txn = staged_append(&dataset, "a").await;
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 2);
+
+        let stale = committed.clone();
+        let txn = staged_append(&stale, "a").await;
+        let mut moved = committed.clone();
+        moved
+            .update_schema_metadata([("gen".to_string(), Some("b".to_string()))])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(store.versions(), vec![1, 2, 3]);
+    }
+
+    /// A dataset recreated at the same path restarts its versions, so the
+    /// stale handle's conflict scan sees nothing newer; the requirement is
+    /// judged on the store's latest entry and refuses the writer.
+    #[tokio::test]
+    async fn test_required_schema_metadata_refuses_a_same_version_recreation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let mut recreated = recreate(uri.as_str(), &store, "b").await;
+        assert_eq!(recreated.version().version, stale.version().version);
+
+        let txn = staged_append(&stale, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// A recreation landing after the judgement but before the reservation
+    /// is refused by the reservation itself: nothing is published, and the
+    /// recreated dataset is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_recreation_between_judgement_and_reservation_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale, "a").await;
+
+        store
+            .hold_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let committing = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), store.reservation_held.notified())
+            .await
+            .expect("the commit never reached its reservation");
+
+        let mut recreated = recreate(uri.as_str(), &store, "b").await;
+        store.release_reservation.notify_one();
+
+        let err = committing.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+        assert!(
+            recreated.schema().metadata.get("gen").map(String::as_str) == Some("b"),
+            "the recreated dataset kept its own manifest"
+        );
+    }
+
+    /// A reservation the store applied but did not acknowledge -- whether
+    /// it reports an error or a conflict its own retry saw -- is read back
+    /// rather than abandoned: the row names this commit's staging object,
+    /// so the commit proceeds and lands.
+    #[rstest::rstest]
+    #[case::lost_response("lost")]
+    #[case::conflict_after_apply("conflict")]
+    #[case::refused_after_apply("refused")]
+    #[tokio::test]
+    async fn test_a_lost_reservation_response_is_read_back(#[case] reported_as: &str) {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&dataset, "a").await;
+        let hook = match reported_as {
+            "conflict" => &store.conflict_after_applying_next_reservation,
+            "refused" => &store.refuse_after_applying_next_reservation,
+            _ => &store.lose_next_reservation_response,
+        };
+        hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 2);
+        assert_eq!(store.versions(), vec![1, 2]);
+    }
+
+    /// Drop and recreate at `uri` while the stale writer is parked, and give
+    /// the recreated dataset its own version 2. Returns it and its version-2
+    /// store row.
+    async fn recreate_and_publish_v2(
+        uri: &str,
+        store: &Arc<IdentifiedStore>,
+    ) -> (Dataset, (String, u64, String)) {
+        let recreated = recreate(uri, store, "b").await;
+        let own = staged_append(&recreated, "b").await;
+        let recreated = CommitBuilder::new(WriteDestination::Dataset(Arc::new(recreated)))
+            .execute(own)
+            .await
+            .unwrap();
+        let row = store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.1 == 2)
+            .map(|(_, row)| row.clone())
+            .unwrap();
+        (recreated, row)
+    }
+
+    fn v2_row(store: &IdentifiedStore) -> (String, u64, String) {
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.1 == 2)
+            .map(|(_, row)| row.clone())
+            .unwrap()
+    }
+
+    /// A lost reservation response is read back as one `(path, identity)`
+    /// observation. When a recreation has replaced the entry by then, the
+    /// observation names the replacement's manifest, not this commit's, so
+    /// nothing is adopted and the replacement is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_lost_reservation_readback_does_not_adopt_a_replacement() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale, "a").await;
+
+        store
+            .lose_next_reservation_response
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .hold_next_reservation_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let committing = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.reservation_read_held.notified(),
+        )
+        .await
+        .expect("the commit never read its reservation back");
+
+        let (mut recreated, own_row) = recreate_and_publish_v2(uri.as_str(), &store).await;
+        store.release_reservation_read.notify_one();
+
+        let err = committing.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(v2_row(&store), own_row);
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 2);
+        assert_eq!(
+            recreated.schema().metadata.get("gen").map(String::as_str),
+            Some("b")
+        );
+    }
+
+    /// A conditioned commit publishes its manifest at a path of its own and
+    /// never at the canonical one, so a recreated dataset's canonical
+    /// manifest for the same version can never be touched by it.
+    #[tokio::test]
+    async fn test_conditioned_publication_never_uses_the_canonical_path() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&dataset, "a").await;
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        let canonical = committed
+            .manifest_location()
+            .naming_scheme
+            .manifest_path(&committed.base, 2);
+        let published = committed.manifest_location().path.clone();
+        assert_ne!(published, canonical);
+        assert_eq!(published.filename(), canonical.filename());
+        assert_eq!(v2_row(&store).0, published.to_string());
+        let object_store = committed.object_store.clone();
+        assert!(object_store.exists(&published).await.unwrap());
+        assert!(!object_store.exists(&canonical).await.unwrap());
+
+        // The published manifest is what a fresh open reads.
+        let reopened = DatasetBuilder::from_uri(uri.as_str())
+            .with_commit_handler(store.handler())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.version().version, 2);
+        assert_eq!(reopened.manifest_location().path, published);
+    }
+
+    /// A conditioned version is history like any other: a handle that never
+    /// saw it discovers it through the store and rebases onto it instead of
+    /// conflicting forever, and the dataset's version list includes it.
+    #[tokio::test]
+    async fn test_conditioned_versions_are_discovered_as_history() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let stale = dataset.clone();
+        let txn = staged_append(&dataset, "a").await;
+        CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let txn = staged_append(&stale, "a").await;
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .execute(txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 3);
+        assert_eq!(store.versions(), vec![1, 2, 3]);
+        let versions: Vec<u64> = committed
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(versions, vec![1, 2, 3]);
+    }
+
+    /// A drop ends the generation before anything else: a reservation that
+    /// reaches the store after the drop began is refused even where the
+    /// recreation happens to carry the predecessor's identity again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_drop_fences_a_conditioned_reservation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale, "a").await;
+        let predecessor_identity = v_row(&store, 1).2;
+
+        store
+            .hold_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let committing = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), store.reservation_held.notified())
+            .await
+            .expect("the commit never reached its reservation");
+
+        // Drop, then recreate with the *same* metadata and force the old
+        // identity back onto version 1: only the generation tells them apart.
+        let mut recreated = recreate(uri.as_str(), &store, "a").await;
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .get_mut(&(uri.as_str().trim_start_matches('/').to_string(), 1))
+            .unwrap()
+            .2 = predecessor_identity;
+        store.release_reservation.notify_one();
+
+        let err = committing.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// Cleanup forgets the record of a manifest it deleted, so history stays
+    /// what exists.
+    #[tokio::test]
+    async fn test_cleanup_forgets_deleted_conditioned_versions() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let mut dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        for _ in 0..2 {
+            let txn = staged_append(&dataset, "a").await;
+            dataset = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.versions(), vec![1, 2, 3]);
+        crate::dataset::cleanup::cleanup_old_versions(
+            &dataset,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(3),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.versions(), vec![3]);
+    }
+
+    /// A forget carries the path and generation cleanup listed, so a
+    /// recreation that reused the version since keeps its record.
+    #[tokio::test]
+    async fn test_a_delayed_forget_leaves_a_recreated_row() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let old = create_with(uri.as_str(), "a", store.handler()).await;
+        let base = old.base.clone();
+        let handler = store.handler();
+        let txn = staged_append(&old, "a").await;
+        let old = CommitBuilder::new(WriteDestination::Dataset(Arc::new(old)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        // What cleanup carries: the snapshot's generation and the listed path.
+        let generation = old.manifest_location.generation.clone();
+        assert!(generation.is_some());
+        let old_path = Path::parse(v_row(&store, 2).0).unwrap();
+
+        let replacement = recreate(uri.as_str(), &store, "b").await;
+        let txn = staged_append(&replacement, "b").await;
+        let replacement = CommitBuilder::new(WriteDestination::Dataset(Arc::new(replacement)))
+            .with_required_schema_metadata("gen", "b")
+            .execute(txn)
+            .await
+            .unwrap();
+        let replacement_row = v_row(&store, 2);
+
+        handler
+            .forget_version(&base, 2, &old_path, generation.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(store.versions(), vec![1, 2]);
+        assert_eq!(v_row(&store, 2), replacement_row);
+
+        // The current generation's own record still forgets.
+        let generation = replacement.manifest_location.generation.clone();
+        handler
+            .forget_version(
+                &base,
+                2,
+                &Path::parse(replacement_row.0).unwrap(),
+                generation.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// A reservation that errors without a readable outcome may still land:
+    /// its manifest is retained and the commit reports an unknown status.
+    #[tokio::test]
+    async fn test_an_absent_readback_retains_the_candidate() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let object_store = dataset.object_store(None).await.unwrap();
+        let txn = staged_append(&dataset, "a").await;
+        store
+            .delay_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .with_max_retries(1)
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(err.is_commit_status_unknown(), "{err}");
+        assert_eq!(store.versions(), vec![1]);
+
+        store.apply_pending_reservation();
+        assert!(
+            object_store
+                .exists(&Path::parse(v2_row(&store).0).unwrap())
+                .await
+                .unwrap()
+        );
+        let mut dataset = dataset;
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+    }
+
+    /// Commit `n` conditioned appends and return the last snapshot.
+    async fn append_n(mut dataset: Dataset, generation: &str, n: usize) -> Dataset {
+        for _ in 0..n {
+            let txn = staged_append(&dataset, generation).await;
+            dataset = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_required_schema_metadata("gen", generation)
+                .execute(txn)
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    /// A handle over a dataset since dropped and recreated cannot clean it
+    /// up: the listing carries the recreation's generation, not the
+    /// snapshot's, and nothing is touched.
+    #[tokio::test]
+    async fn test_stale_cleanup_is_refused_after_a_recreation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            2,
+        )
+        .await;
+        assert_eq!(stale.version().version, 3);
+
+        let mut recreated = append_n(recreate(uri.as_str(), &store, "b").await, "b", 1).await;
+        let rows_before = store.rows.lock().unwrap().clone();
+
+        let err = crate::dataset::cleanup::cleanup_old_versions(
+            &stale,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(3),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cleanup refused"), "{err}");
+        assert_eq!(*store.rows.lock().unwrap(), rows_before);
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 2);
+        assert_eq!(recreated.count_rows(None).await.unwrap(), 6);
+    }
+
+    /// A forget that fails part-way leaves records whose manifests are gone;
+    /// the retry lists them, finds the objects missing and forgets them, so
+    /// cleanup converges with nothing dangling and nothing orphaned.
+    #[tokio::test]
+    async fn test_cleanup_retry_converges_after_a_forget_failure() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            2,
+        )
+        .await;
+        let old_paths: Vec<Path> = [1, 2]
+            .iter()
+            .map(|v| Path::parse(v_row(&store, *v).0).unwrap())
+            .collect();
+        let policy = || crate::dataset::cleanup::CleanupPolicy {
+            before_version: Some(3),
+            delete_unverified: true,
+            ..Default::default()
+        };
+        store
+            .fail_forget_call
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        crate::dataset::cleanup::cleanup_old_versions(&dataset, policy())
+            .await
+            .unwrap_err();
+        let after_failure = store.versions();
+        assert!(
+            after_failure.len() == 2 && after_failure.contains(&3),
+            "the failed forget kept its record: {after_failure:?}"
+        );
+
+        crate::dataset::cleanup::cleanup_old_versions(&dataset, policy())
+            .await
+            .unwrap();
+        assert_eq!(store.versions(), vec![3]);
+        for path in old_paths {
+            assert!(
+                !dataset.object_store.exists(&path).await.unwrap(),
+                "orphaned candidate manifest {path}"
+            );
+        }
+    }
+
+    /// A store that owns publication but keeps no generation can fence
+    /// nothing: commits beyond creation and cleanup through it are refused
+    /// rather than trusted.
+    #[tokio::test]
+    async fn test_an_owning_store_without_a_generation_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        store
+            .hide_generation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let uri = TempStrDir::default();
+        let created = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&created, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(created.clone())))
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert!(err.to_string().contains("generation"), "{err}");
+        let err = crate::dataset::cleanup::cleanup_old_versions(
+            &created,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(1),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no generation"), "{err}");
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// A store that owns publication holds the only path to its manifests;
+    /// when it cannot enumerate them nothing may stand in, least of all a
+    /// cleanup that would take an empty listing for an empty history.
+    #[tokio::test]
+    async fn test_cleanup_refuses_an_owning_store_that_cannot_enumerate() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        store
+            .hide_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = crate::dataset::cleanup::cleanup_old_versions(
+            &dataset,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(1),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot enumerate"), "{err}");
+        assert!(
+            dataset
+                .object_store
+                .exists(&dataset.manifest_location.path)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A stray candidate manifest is reclaimed only once its version is at
+    /// or below the no-reuse floor cleanup itself raised; one above it may
+    /// still be reserved and is left alone.
+    #[tokio::test]
+    async fn test_cleanup_reclaims_only_candidates_below_the_reuse_floor() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            2,
+        )
+        .await;
+        let current = dataset.manifest_location.path.clone();
+        let stray = |version: u64| {
+            let canonical = dataset
+                .manifest_location
+                .naming_scheme
+                .manifest_path(&dataset.base, version);
+            dataset
+                .base
+                .clone()
+                .join(CANDIDATES_DIR)
+                .join("stray")
+                .join(canonical.filename().unwrap())
+        };
+        let forgotten = stray(2);
+        let pending = stray(99);
+        for path in [&forgotten, &pending] {
+            dataset.object_store.put(path, b"stray").await.unwrap();
+        }
+        let policy = || crate::dataset::cleanup::CleanupPolicy {
+            before_version: Some(3),
+            delete_unverified: true,
+            ..Default::default()
+        };
+
+        // The first pass forgets 1 and 2 -- the floor rises after the sweep.
+        crate::dataset::cleanup::cleanup_old_versions(&dataset, policy())
+            .await
+            .unwrap();
+        assert_eq!(store.reuse_floor("dummy").await.unwrap(), None);
+        assert!(dataset.object_store.exists(&forgotten).await.unwrap());
+        // The second pass reclaims what is below the floor and nothing else.
+        crate::dataset::cleanup::cleanup_old_versions(&dataset, policy())
+            .await
+            .unwrap();
+        assert!(!dataset.object_store.exists(&forgotten).await.unwrap());
+        assert!(dataset.object_store.exists(&pending).await.unwrap());
+        assert!(dataset.object_store.exists(&current).await.unwrap());
+    }
+
+    /// A reservation delayed past the cleanup that forgot its version is
+    /// refused by the floor, even though its predecessor is retained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_forgotten_version_is_never_reserved_again() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        stale.tags().create("keep", 1).await.unwrap();
+        let txn = staged_append(&stale, "a").await;
+        store
+            .hold_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let delayed = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), store.reservation_held.notified())
+            .await
+            .expect("the commit never reached its reservation");
+
+        // Versions 2 and 3 land meanwhile; cleanup then forgets 2 (1 is tagged).
+        let other = crate::dataset::builder::DatasetBuilder::from_uri(uri.as_str())
+            .with_commit_handler(store.handler())
+            .load()
+            .await
+            .unwrap();
+        let other = append_n(other, "a", 2).await;
+        crate::dataset::cleanup::cleanup_old_versions(
+            &other,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(3),
+                delete_unverified: true,
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.versions(), vec![1, 3]);
+
+        store.release_reservation.notify_one();
+        let err = delayed.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(store.versions(), vec![1, 3]);
+    }
+
+    /// A version retained by a tag may sit below the no-reuse floor; its
+    /// manifest is still recorded and is never reclaimed.
+    #[tokio::test]
+    async fn test_cleanup_preserves_a_tagged_manifest_below_the_reuse_floor() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            2,
+        )
+        .await;
+        dataset.tags().create("keep", 1).await.unwrap();
+        let tagged = Path::parse(v_row(&store, 1).0).unwrap();
+        let policy = || crate::dataset::cleanup::CleanupPolicy {
+            before_version: Some(3),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            crate::dataset::cleanup::cleanup_old_versions(&dataset, policy())
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.versions(), vec![1, 3]);
+        assert!(dataset.object_store.exists(&tagged).await.unwrap());
+    }
+
+    /// The floor ends with the generation: a dataset dropped and recreated
+    /// at the same URI starts at version 1 again, and a stale handle's
+    /// reclaim decision is refused.
+    #[tokio::test]
+    async fn test_the_reuse_floor_ends_with_the_generation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let old = append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            2,
+        )
+        .await;
+        crate::dataset::cleanup::cleanup_old_versions(
+            &old,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(3),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.reuse_floor(old.base.as_ref()).await.unwrap(), Some(2));
+        let old_generation = old.manifest_location.generation.clone();
+
+        let recreated = recreate(uri.as_str(), &store, "b").await;
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+        let live = Path::parse(v_row(&store, 1).0).unwrap();
+        let handler = store.handler();
+        assert!(
+            !handler
+                .may_reclaim(&recreated.base, 1, &live, old_generation.as_deref())
+                .await
+                .unwrap(),
+            "a stale generation may not reclaim"
+        );
+    }
+
+    /// An unconditioned commit through an owning store is bound to the
+    /// generation it began in: paused across a drop, it is refused rather
+    /// than recorded in the recreation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_delayed_unconditioned_reservation_cannot_cross_a_recreation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale, "a").await;
+        store
+            .hold_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let delayed = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), store.reservation_held.notified())
+            .await
+            .expect("the commit never reached its reservation");
+
+        let mut recreated = recreate(uri.as_str(), &store, "b").await;
+        store.release_reservation.notify_one();
+        let err = delayed.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(store.versions(), vec![1]);
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(
+            recreated.schema().metadata.get("gen").map(String::as_str),
+            Some("b")
+        );
+    }
+
+    /// A handle over a dataset since dropped and recreated -- even at the
+    /// same version, so nothing rebases -- cannot commit into the
+    /// recreation: the transaction is bound to the generation the handle
+    /// was loaded under.
+    #[tokio::test]
+    async fn test_a_stale_handle_cannot_commit_into_a_recreation_at_the_same_version() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = plain_append_n(
+            create_with(uri.as_str(), "a", store.handler()).await,
+            "a",
+            1,
+        )
+        .await;
+        assert_eq!(stale.version().version, 2);
+        let mut recreated = plain_append_n(recreate(uri.as_str(), &store, "b").await, "b", 1).await;
+        assert_eq!(recreated.version().version, 2);
+        let rows_before = store.rows.lock().unwrap().clone();
+
+        let txn = staged_append(&stale, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(*store.rows.lock().unwrap(), rows_before);
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 2);
+    }
+
+    /// The handle that creates a dataset already carries the generation its
+    /// first record minted, so it can clean up without reloading.
+    #[tokio::test]
+    async fn test_a_creation_handle_carries_its_generation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let created = create_with(uri.as_str(), "a", store.handler()).await;
+        let minted = store.generation.lock().unwrap().clone();
+        assert!(minted.is_some());
+        assert_eq!(created.manifest_location.generation, minted);
+        crate::dataset::cleanup::cleanup_old_versions(
+            &created,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_version: Some(1),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Commit `n` unconditioned appends and return the last snapshot.
+    async fn plain_append_n(mut dataset: Dataset, generation: &str, n: usize) -> Dataset {
+        for _ in 0..n {
+            let txn = staged_append(&dataset, generation).await;
+            dataset = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .execute(txn)
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    fn v_row(store: &IdentifiedStore, version: u64) -> (String, u64, String) {
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.1 == version)
+            .map(|(_, row)| row.clone())
+            .unwrap()
+    }
+
+    /// Creating a dataset has no predecessor to judge; the option is refused
+    /// rather than dropped.
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_for_new_datasets() {
+        let uri = TempStrDir::default();
+        let txn = InsertBuilder::new(uri.as_str())
+            .execute_uncommitted(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(uri.as_str())
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    /// Detached commits never chain onto the judged manifest, so the option
+    /// is refused rather than silently ignored.
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_on_detached_commits() {
+        let dataset = InsertBuilder::new("memory://required-detached")
+            .execute(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let txn = staged_append(&dataset, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_detached(true)
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 
     #[tokio::test]
