@@ -42,7 +42,10 @@ default = [
     "unicode_expressions",
     "unparser",
 ]
-recursive_protection = ["dep:recursive"]
+recursive_protection = [
+    "dep:recursive",
+    "dep:stacker",
+]
 unicode_expressions = []
 unparser = []
 
@@ -107,6 +110,10 @@ features = [
     "visitor",
 ]
 default-features = false
+
+[dependencies.stacker]
+version = "0.1.24"
+optional = true
 
 [dev-dependencies.ctor]
 version = "1.0.5"

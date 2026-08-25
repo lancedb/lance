@@ -230,7 +230,7 @@ uuid = { version = "1.2", features = ["v4", "serde"] }
 wiremock = "0.6"
 pretty_assertions = "1.4.0"
 
-# Remove after a DataFusion release includes https://github.com/apache/datafusion/pull/23058.
+# Remove after adopting a DataFusion release with the fixes from #23058 and #23284.
 [patch.crates-io]
 datafusion-sql = { path = "vendor/datafusion-sql" }
 
