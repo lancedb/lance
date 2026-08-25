@@ -761,11 +761,17 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                    RepartitionExec: ...
+                  RepartitionExec: ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        StreamingTableExec: ..., metrics=[]
+                        DataSourceExec: ..., metrics=[]
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+
+        `new_data` above is a `pa.Table`, so it is wrapped in an in-memory table
+        whose exact row count lets the join collect the source rather than the
+        target. Passing a `pa.RecordBatchReader` instead reports no statistics, and
+        the plan collects the target and reads `StreamingTableExec` on the source
+        side. The plan reported here is always the one that source would run.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -786,6 +792,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - requests: number of storage requests made
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
+
+        # Route exactly as execute() does, so the reported plan is the one that
+        # would run. A materialized source reports exact statistics and gets a
+        # different join shape than a stream, which reports none.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
+
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(

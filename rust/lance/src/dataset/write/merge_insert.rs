@@ -2979,19 +2979,44 @@ impl MergeInsertJob {
     ///
     /// * `source` - The source data stream that would be used in the merge insert
     ///
+    /// A stream reports no statistics, so the plan this returns is the streaming
+    /// one. Callers holding materialized data or a re-scannable provider should
+    /// use [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`],
+    /// which report the plan those sources actually run.
+    ///
     /// # Errors
     ///
     /// Returns Error::NotSupported if the merge insert configuration doesn't support
     /// the fast path required for plan generation.
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
+        self.analyze_plan_provider(one_shot_provider(source)?).await
+    }
+
+    /// [`Self::analyze_plan`] for materialized batches.
+    ///
+    /// Mirrors [`Self::execute_batches`]: the batches are wrapped in a
+    /// [`MemTable`], so the reported plan is the one an in-memory source actually
+    /// runs. That plan can differ from the streaming one, because the join picks
+    /// its build side from the statistics the source reports.
+    ///
+    /// [`MemTable`]: datafusion::datasource::MemTable
+    pub async fn analyze_plan_batches(&self, batches: Vec<RecordBatch>) -> Result<String> {
+        self.analyze_plan_provider(self.batches_to_provider(batches)?)
+            .await
+    }
+
+    /// [`Self::analyze_plan`] from a re-scannable [`TableProvider`].
+    ///
+    /// Mirrors [`Self::execute_provider`].
+    pub async fn analyze_plan_provider(&self, provider: Arc<dyn TableProvider>) -> Result<String> {
         // Check if we can use create_plan
-        if !self.can_use_create_plan(source.schema().as_ref()).await? {
+        if !self.can_use_create_plan(provider.schema().as_ref()).await? {
             return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(one_shot_provider(source)?).await?;
+        let plan = cloned_job.create_plan(provider).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
@@ -9054,6 +9079,60 @@ mod tests {
         assert!(
             probe.contains("StreamingTableExec"),
             "the source stays the probe side:\n{probe}"
+        );
+    }
+
+    /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
+    /// was handed would actually run. The batches entry point must therefore not
+    /// fall back to the streaming plan: materialized batches are collected as the
+    /// join's build side and the join type is rewritten, while a stream is not.
+    #[tokio::test]
+    async fn test_analyze_plan_reports_the_given_source_shape() {
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let ds = Arc::new(Dataset::write(data, "memory://", None).await.unwrap());
+
+        // Full schema: `analyze_plan` only supports sources that cover it.
+        let source =
+            record_batch!(("key", UInt32, [1, 100]), ("value", UInt32, [999, 999])).unwrap();
+
+        let new_job = || {
+            crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+
+        let materialized = new_job()
+            .analyze_plan_batches(vec![source.clone()])
+            .await
+            .unwrap();
+        assert!(
+            materialized.contains("DataSourceExec") && !materialized.contains("StreamingTableExec"),
+            "materialized batches must be reported as an in-memory source:\n{materialized}"
+        );
+        assert!(
+            materialized.contains("join_type=Left"),
+            "collecting the source rewrites the join type:\n{materialized}"
+        );
+
+        let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
+        let streaming = new_job()
+            .analyze_plan(reader_to_stream(Box::new(reader)))
+            .await
+            .unwrap();
+        assert!(
+            streaming.contains("StreamingTableExec") && !streaming.contains("DataSourceExec"),
+            "a stream must still be reported as a stream:\n{streaming}"
+        );
+        assert!(
+            streaming.contains("join_type=Right"),
+            "nothing is swapped without source statistics:\n{streaming}"
         );
     }
 
