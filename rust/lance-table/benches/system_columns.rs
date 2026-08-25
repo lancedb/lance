@@ -52,13 +52,17 @@ fn make_tasks(batch: RecordBatch, total_rows: usize, batch_size: usize) -> ReadB
     stream::iter(tasks).boxed()
 }
 
-fn make_config(total_rows: usize, sequence: Arc<RowIdSequence>) -> RowIdAndDeletesConfig {
+fn make_config(
+    total_rows: usize,
+    sequence: Arc<RowIdSequence>,
+    with_all_system_columns: bool,
+) -> RowIdAndDeletesConfig {
     RowIdAndDeletesConfig {
         params: ReadBatchParams::RangeFull,
         with_row_id: true,
-        with_row_addr: false,
-        with_row_last_updated_at_version: false,
-        with_row_created_at_version: false,
+        with_row_addr: with_all_system_columns,
+        with_row_last_updated_at_version: with_all_system_columns,
+        with_row_created_at_version: with_all_system_columns,
         deletion_vector: None,
         row_id_sequence: Some(sequence),
         last_updated_at_sequence: None,
@@ -94,33 +98,45 @@ fn bench_stream_row_ids(c: &mut Criterion) {
             .unwrap(),
         );
         for has_payload in [false, true] {
-            let batch = make_batch(batch_size, has_payload);
-            let parameter = format!("holes_{hole_stride}/payload_{has_payload}");
-            group.bench_with_input(
-                BenchmarkId::new("shape", parameter),
-                &has_payload,
-                |b, _| {
-                    b.iter_batched(
-                        || {
-                            (
-                                make_tasks(batch.clone(), total_rows, batch_size),
-                                make_config(total_rows, sequence.clone()),
-                            )
-                        },
-                        |(tasks, config)| {
-                            let batches = runtime
-                                .block_on(
-                                    wrap_with_row_id_and_delete(tasks, 0, config)
-                                        .buffered(8)
-                                        .try_collect::<Vec<_>>(),
+            for with_all_system_columns in [false, true] {
+                let batch = make_batch(batch_size, has_payload);
+                let system_columns = if with_all_system_columns {
+                    "all"
+                } else {
+                    "row_id"
+                };
+                let parameter =
+                    format!("holes_{hole_stride}/payload_{has_payload}/system_{system_columns}");
+                group.bench_with_input(
+                    BenchmarkId::new("shape", parameter),
+                    &has_payload,
+                    |b, _| {
+                        b.iter_batched(
+                            || {
+                                (
+                                    make_tasks(batch.clone(), total_rows, batch_size),
+                                    make_config(
+                                        total_rows,
+                                        sequence.clone(),
+                                        with_all_system_columns,
+                                    ),
                                 )
-                                .unwrap();
-                            black_box(batches);
-                        },
-                        BatchSize::SmallInput,
-                    );
-                },
-            );
+                            },
+                            |(tasks, config)| {
+                                let batches = runtime
+                                    .block_on(
+                                        wrap_with_row_id_and_delete(tasks, 0, config)
+                                            .buffered(8)
+                                            .try_collect::<Vec<_>>(),
+                                    )
+                                    .unwrap();
+                                black_box(batches);
+                            },
+                            BatchSize::SmallInput,
+                        );
+                    },
+                );
+            }
         }
     }
     group.finish();
