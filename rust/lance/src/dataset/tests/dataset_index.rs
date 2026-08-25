@@ -62,7 +62,7 @@ use lance_index::metrics::{
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedListFormatVersion, MemBM25Scorer, SCORE_COL, Scorer,
+    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -1357,7 +1357,7 @@ async fn compound_fts_results(
         .collect()
 }
 
-async fn compound_fts_results_with_filter(
+async fn compound_fts_results_with_prefilter(
     dataset: &Dataset,
     query: FtsQuery,
     filter: &str,
@@ -1365,6 +1365,7 @@ async fn compound_fts_results_with_filter(
 ) -> Vec<(u64, f32)> {
     let mut scan = dataset.scan();
     scan.with_row_id()
+        .prefilter(true)
         .filter(filter)
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query))
@@ -1983,8 +1984,8 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
             .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC)
             .copied()
             .unwrap_or_default(),
-        1,
-        "only the fully indexed title field should attempt a bounded WAND certificate"
+        2,
+        "the title and body indexed sources should each attempt a bounded WAND certificate"
     );
     assert!(
         partial_stats
@@ -2069,12 +2070,25 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         body_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC) && !body_plan.contains("AggregateExec"),
         "a completed partial-field top-k should bypass outer MAX/top-k:\n{body_plan}"
     );
-    let residual_noise =
-        compound_fts_results_with_filter(&partial_dataset, body_query.clone(), "id = 12", Some(1))
+    let bounded_residual_noise = compound_fts_results_with_prefilter(
+        &partial_dataset,
+        body_query.clone(),
+        "id = 12",
+        Some(1),
+    )
+    .await;
+    let unbounded_residual_noise =
+        compound_fts_results_with_prefilter(&partial_dataset, body_query.clone(), "id = 12", None)
             .await;
-    assert_eq!(residual_noise.len(), 1);
+    assert_eq!(bounded_residual_noise.len(), 1);
+    assert_eq!(unbounded_residual_noise.len(), 1);
+    assert_eq!(
+        bounded_residual_noise,
+        unbounded_residual_noise[..bounded_residual_noise.len()]
+    );
     let mut residual_scan = partial_dataset.scan();
     residual_scan
+        .prefilter(true)
         .filter("id = 12")
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(body_query.clone()))
@@ -2089,13 +2103,6 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         &[12],
         "candidate filtering must select residual business id 12, not a lower row-id tie"
     );
-    let scorer = MemBM25Scorer::new(17, 13, HashMap::from([("noise".to_owned(), 4_usize)]));
-    let expected_score = scorer.query_weight("noise") * scorer.doc_weight(1, 1);
-    assert!(
-        (residual_noise[0].1 - expected_score).abs() <= 1.0e-6,
-        "a residual match must use filter-independent corpus statistics"
-    );
-
     for fuzziness in [Some(1), None] {
         let mut fuzzy =
             MultiMatchQuery::try_new("nois".to_owned(), vec!["body".to_owned()]).unwrap();

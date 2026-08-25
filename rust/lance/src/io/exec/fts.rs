@@ -655,8 +655,6 @@ pub struct CompoundQueryExec {
     /// When set, leaf scorers use this instead of building one from the
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    /// Corpus-wide scorer published by the residual branch of a mixed search.
-    shared_scorer: Option<Arc<SharedFtsScorer>>,
     segment_selection: FtsSegmentSelection,
     /// Rows whose indexed values were superseded by a newer data overlay.
     overlay_block: Option<RowAddrMask>,
@@ -715,7 +713,6 @@ impl CompoundQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            shared_scorer: None,
             segment_selection,
             overlay_block: None,
             external_mask: None,
@@ -741,11 +738,6 @@ impl CompoundQueryExec {
     /// expansions. Execution returns an error when any required token is absent.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
-        self
-    }
-
-    pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
-        self.shared_scorer = Some(scorer);
         self
     }
 
@@ -863,14 +855,6 @@ impl ExecutionPlan for CompoundQueryExec {
             .collect()
     }
 
-    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if let Some(shared_scorer) = &self.shared_scorer {
-            shared_scorer.invalidate();
-        }
-        let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -908,7 +892,6 @@ impl ExecutionPlan for CompoundQueryExec {
             params: self.params.clone(),
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
-            shared_scorer: self.shared_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
             overlay_block: self.overlay_block.clone(),
             external_mask: self.external_mask.clone(),
@@ -928,8 +911,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let preset_base_scorer = self.base_scorer.clone();
-        let shared_scorer = self.shared_scorer.clone();
+        let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
         let overlay_block = self.overlay_block.clone();
         let external_mask = self.external_mask.clone();
@@ -995,11 +977,6 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let base_scorer = match (preset_base_scorer, shared_scorer) {
-                (Some(scorer), _) => Some(scorer),
-                (None, Some(shared_scorer)) => Some(shared_scorer.wait().await?),
-                (None, None) => None,
-            };
             let certificate_limit = match (&query, params.limit) {
                 (FtsQuery::Match(match_query), Some(limit))
                     if limit > 0

@@ -1212,7 +1212,7 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
     let plan = scan.explain_plan(false).await.unwrap();
     assert!(
         plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
-        "zero-token stale rows require the shared current-value corpus scorer:\n{plan}"
+        "zero-token stale rows require bounded targeted current-value scoring:\n{plan}"
     );
     let batch = scan.try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 1);
@@ -1517,7 +1517,13 @@ async fn test_fts_overlay_flat_path_takes_only_stale_rows(
     let mut flat_path_uses_targeted_take = false;
     while let Some(node) = nodes.pop() {
         if node.downcast_ref::<FlatMatchQueryExec>().is_some() {
-            let mut flat_nodes = node.children().into_iter().cloned().collect::<Vec<_>>();
+            let flat_children = node.children();
+            assert_eq!(
+                flat_children.len(),
+                1,
+                "ordinary row-level Match must not scan a second full-corpus statistics input"
+            );
+            let mut flat_nodes = flat_children.into_iter().cloned().collect::<Vec<_>>();
             while let Some(flat_node) = flat_nodes.pop() {
                 if flat_node
                     .downcast_ref::<FilteredReadExec>()
