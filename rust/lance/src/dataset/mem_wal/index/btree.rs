@@ -302,6 +302,9 @@ struct FixedIntBackend {
     writer: Mutex<SkipListWriter<FixedKey>>,
     /// Row positions whose value is null (rare; not on the hot path).
     null_positions: Mutex<Vec<RowPosition>>,
+    /// `null_positions`' heap, kept alongside it so a memory poll never has to
+    /// take that lock. See [`Backend::resident_bytes`].
+    null_bytes: AtomicUsize,
     data_type: DataType,
 }
 
@@ -312,6 +315,7 @@ impl FixedIntBackend {
             reader,
             writer: Mutex::new(writer),
             null_positions: Mutex::new(Vec::new()),
+            null_bytes: AtomicUsize::new(0),
             data_type,
         }
     }
@@ -350,7 +354,15 @@ impl FixedIntBackend {
                 }
                 drop(writer);
                 if !nulls.is_empty() {
-                    self.null_positions.lock().unwrap().extend(nulls);
+                    let mut positions = self.null_positions.lock().unwrap();
+                    // Reserve and charge before the extend, so the counter is
+                    // never behind the positions a concurrent poll can reach.
+                    positions.reserve(nulls.len());
+                    self.null_bytes.store(
+                        positions.capacity() * std::mem::size_of::<RowPosition>(),
+                        Ordering::Relaxed,
+                    );
+                    positions.extend(nulls);
                 }
             }};
         }
@@ -468,6 +480,9 @@ struct BytesBackend {
     reader: SkipListReader<BytesKey>,
     writer: Mutex<SkipListWriter<BytesKey>>,
     null_positions: Mutex<Vec<RowPosition>>,
+    /// `null_positions`' heap, kept alongside it so a memory poll never has to
+    /// take that lock. See [`Backend::resident_bytes`].
+    null_bytes: AtomicUsize,
     data_type: DataType,
     /// Payload of keys too long to live inline in their node. The skiplist's
     /// own counter measures arena chunks only, so without this a column of long
@@ -482,6 +497,7 @@ impl BytesBackend {
             reader,
             writer: Mutex::new(writer),
             null_positions: Mutex::new(Vec::new()),
+            null_bytes: AtomicUsize::new(0),
             data_type,
             key_heap_bytes: AtomicUsize::new(0),
         }
@@ -534,7 +550,15 @@ impl BytesBackend {
                 }
                 drop(writer);
                 if !nulls.is_empty() {
-                    self.null_positions.lock().unwrap().extend(nulls);
+                    let mut positions = self.null_positions.lock().unwrap();
+                    // Reserve and charge before the extend, so the counter is
+                    // never behind the positions a concurrent poll can reach.
+                    positions.reserve(nulls.len());
+                    self.null_bytes.store(
+                        positions.capacity() * std::mem::size_of::<RowPosition>(),
+                        Ordering::Relaxed,
+                    );
+                    positions.extend(nulls);
                 }
             }};
         }
@@ -861,18 +885,16 @@ impl Backend {
         }
     }
 
+    /// Lock-free by construction: admission reads this on every put and on every
+    /// `DRAIN_POLL_INTERVAL` tick while a writer is parked, so taking the
+    /// `null_positions` mutex here would park a memory poll behind an in-flight
+    /// insert.
     fn resident_bytes(&self) -> usize {
-        fn null_bytes(nulls: &Mutex<Vec<RowPosition>>) -> usize {
-            nulls
-                .lock()
-                .map(|n| n.capacity() * std::mem::size_of::<RowPosition>())
-                .unwrap_or(0)
-        }
         match self {
-            Self::FixedInt(b) => b.reader.resident_bytes() + null_bytes(&b.null_positions),
+            Self::FixedInt(b) => b.reader.resident_bytes() + b.null_bytes.load(Ordering::Relaxed),
             Self::Bytes(b) => {
                 b.reader.resident_bytes()
-                    + null_bytes(&b.null_positions)
+                    + b.null_bytes.load(Ordering::Relaxed)
                     + b.key_heap_bytes.load(Ordering::Relaxed)
             }
             Self::Scalar(b) => b.reader.resident_bytes(),
@@ -1087,8 +1109,9 @@ pub struct BTreeIndexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, Int64Array, StringArray, UInt32Array};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1355,6 +1378,37 @@ mod tests {
         assert!(
             index.resident_bytes() >= key_bytes,
             "resident {} must cover the {key_bytes} bytes of spilled key payload",
+            index.resident_bytes()
+        );
+    }
+
+    /// Null positions live behind a mutex the memory poll must never take, so
+    /// their heap is mirrored into an atomic. That mirror has to actually track
+    /// the vector, or a column of nulls goes uncharged against the ceiling.
+    #[rstest]
+    #[case::fixed_int(DataType::Int32)]
+    #[case::bytes(DataType::Utf8)]
+    fn test_resident_bytes_counts_null_positions(#[case] data_type: DataType) {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            data_type.clone(),
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "c".to_string());
+
+        let rows = 1_024;
+        let column: ArrayRef = match data_type {
+            DataType::Int32 => Arc::new(Int32Array::from(vec![None::<i32>; rows])),
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>; rows])),
+            other => unreachable!("unhandled case {other:?}"),
+        };
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let expected = rows * std::mem::size_of::<RowPosition>();
+        assert!(
+            index.resident_bytes() >= expected,
+            "resident {} must cover the {expected} bytes of null positions",
             index.resident_bytes()
         );
     }

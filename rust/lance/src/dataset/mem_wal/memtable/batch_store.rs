@@ -442,10 +442,20 @@ impl BatchStore {
     ///
     /// The unit is the allocation, not the window a batch reads through it: a
     /// one-row zero-copy slice pins its whole parent buffer, so measuring the
-    /// window would let an unbounded footprint in under a small number. Batches
-    /// that slice the *same* parent still pay for it once — the set keys on the
-    /// allocation's address, which is stable and unrecyclable here because the
-    /// store holds every batch it has accepted until it is dropped.
+    /// window would let an unbounded footprint in under a small number.
+    ///
+    /// Charged once per *distinct buffer view*, not strictly once per
+    /// allocation. `ArrayData::slice` advances the offset and leaves the buffer
+    /// pointer alone, so ordinary slices of one parent do dedupe; a buffer that
+    /// came back re-sliced from a kernel (`Buffer::slice_with_length`, concat or
+    /// take output) presents a different `data_ptr` for the same allocation and
+    /// is charged again in full. That over-counts, which is the safe direction
+    /// for a ceiling.
+    ///
+    /// `retained_buffers` is never pruned: it grows with every batch this store
+    /// accepts, bounded only by the store being dropped at flush. The walk plus
+    /// `to_data`, the mutex and a hash insert run per column per append — fine
+    /// at current batch rates, and the thing to look at first if that changes.
     ///
     /// Call under the writer guard, before the batch is moved into its slot.
     fn charge_retained(&self, batch: &RecordBatch) -> usize {

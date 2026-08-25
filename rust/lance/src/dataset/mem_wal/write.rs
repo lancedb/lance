@@ -785,9 +785,15 @@ impl ShardMemory {
         }
     }
 
-    /// Row-data bytes of the active memtable: [`Self::active_bytes`] minus
-    /// [`Self::index_bytes`], but taken off one load so the two terms cannot
-    /// cross. In WAL-only mode, the pending queue's bytes.
+    /// Row-data bytes of the active memtable: the flush unit, summed over the
+    /// windows the batches read through. In WAL-only mode, the pending queue's
+    /// bytes.
+    ///
+    /// Deliberately *not* `active_bytes() - index_bytes()`. That difference is
+    /// what the batches pin — whole parent buffers, unbounded above this figure
+    /// once any batch is a zero-copy slice — and is what the ceiling is built
+    /// on. Use this to reason about when a memtable seals, not about what it
+    /// costs.
     pub fn row_bytes(&self) -> usize {
         match &self.0 {
             ShardMemorySource::MemTables(t) => t
@@ -2029,6 +2035,44 @@ impl ShardWriter {
                 &lance_schema,
                 &pk_columns,
             )?;
+
+            // An HNSW graph reserves its whole capacity before the first insert,
+            // but the seal trigger only measures row bytes. A reservation with no
+            // room left under the ceiling puts the shard over budget at zero rows
+            // — nothing to seal, so nothing to flush, so every put stalls and then
+            // fails as `Error::Backpressure`, which is supposed to mean "retry
+            // later". Reject the config instead; only the built-in valve reads
+            // this ceiling.
+            if config.backpressure.is_none() {
+                // Built the way `make_bound_memtable` builds it below, so this is
+                // the figure the controller will actually read.
+                let mut indexes = IndexStore::from_configs(
+                    &index_configs,
+                    config.max_memtable_rows,
+                    config.max_memtable_batches,
+                )?;
+                if !pk_columns.is_empty() {
+                    indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+                }
+                let reserved = indexes.resident_bytes() + super::memtable::pk_bloom_filter_bytes();
+                // Room for a full memtable of rows on top, or the ceiling is
+                // crossed before `max_memtable_size` can seal.
+                let needed = reserved.saturating_add(config.max_memtable_size);
+                if needed > config.max_unflushed_memtable_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "in-memory indexes reserve {reserved} bytes at \
+                         max_memtable_rows={}, and max_memtable_size={} must fit alongside them, \
+                         needing {needed} bytes; max_unflushed_memtable_bytes={} is below that, \
+                         so the active memtable would cross the backpressure ceiling before \
+                         accruing enough row bytes to seal, stalling every write. Raise \
+                         max_unflushed_memtable_bytes to at least {needed}, or lower \
+                         max_memtable_rows / max_memtable_size",
+                        config.max_memtable_rows,
+                        config.max_memtable_size,
+                        config.max_unflushed_memtable_bytes,
+                    )));
+                }
+            }
 
             // Widen only now that the primary key is known — a tombstone nulls
             // every non-PK column, and PK detection needs the strict schema.
@@ -4271,7 +4315,7 @@ pub fn new_shared_stats() -> SharedWriteStats {
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
     use rstest::rstest;
@@ -8884,6 +8928,163 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    /// Schema for the reservation tests: `vector` is field 1, the id 0 is `id`.
+    fn hnsw_schema(dim: i32) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]))
+    }
+
+    fn hnsw_configs() -> Vec<MemIndexConfig> {
+        vec![MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+            "vec_idx".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )))]
+    }
+
+    /// What the configured indexes owe before a single row arrives — the figure
+    /// `open` validates against, computed the way the memtable will build them.
+    fn reserved_index_bytes(config: &ShardWriterConfig, configs: &[MemIndexConfig]) -> usize {
+        IndexStore::from_configs(
+            configs,
+            config.max_memtable_rows,
+            config.max_memtable_batches,
+        )
+        .unwrap()
+        .resident_bytes()
+            + super::super::memtable::pk_bloom_filter_bytes()
+    }
+
+    /// An HNSW graph is charged from `max_memtable_rows` before the first
+    /// insert, while only row bytes seal a memtable. Sized past the ceiling it
+    /// would put the shard over budget at zero rows with nothing to seal and so
+    /// nothing to flush — every put stalling, then failing as `Backpressure`,
+    /// which means "retry later" and never comes true. That is a config error,
+    /// so it has to land at `open`, not on put #1.
+    #[tokio::test]
+    async fn test_open_rejects_indexes_that_cannot_fit_under_the_ceiling() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            max_memtable_rows: 100_000,
+            max_memtable_size: 1024 * 1024,
+            max_unflushed_memtable_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let reserved = reserved_index_bytes(&config, &hnsw_configs());
+        assert!(
+            reserved > config.max_unflushed_memtable_bytes,
+            "the fixture must actually over-subscribe the ceiling, got {reserved}"
+        );
+
+        let err = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            hnsw_schema(32),
+            hnsw_configs(),
+        )
+        .await
+        .err()
+        .expect("an over-subscribed ceiling must be rejected at open");
+
+        let message = err.to_string();
+        for fragment in [
+            "in-memory indexes reserve",
+            "max_unflushed_memtable_bytes",
+            "stalling every write",
+        ] {
+            assert!(
+                message.contains(fragment),
+                "the error must name {fragment}, got: {message}"
+            );
+        }
+        assert!(
+            !err.is_backpressure(),
+            "a config error must not masquerade as the retryable busy signal"
+        );
+    }
+
+    /// The other side of the gate: a ceiling with room for the reservation *and*
+    /// a full memtable of rows on top opens, and keeps taking writes across a
+    /// seal — the frozen generation gives the valve a flush to park on, so the
+    /// wait ends instead of refusing.
+    #[tokio::test]
+    async fn test_writer_with_indexes_under_the_ceiling_keeps_accepting_writes() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let dim = 8;
+        let sizing = ShardWriterConfig {
+            max_memtable_rows: 2_000,
+            ..Default::default()
+        };
+        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let max_memtable_size = 4 * 1024;
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            max_memtable_rows: sizing.max_memtable_rows,
+            max_memtable_size,
+            // Two generations' worth, so a seal does not immediately re-park the
+            // writer on a ceiling it cannot clear.
+            max_unflushed_memtable_bytes: 2 * (reserved + max_memtable_size),
+            ..Default::default()
+        };
+
+        let schema = hnsw_schema(dim);
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            hnsw_configs(),
+        )
+        .await
+        .expect("a reservation that leaves room under the ceiling must open");
+
+        // Enough rows to carry row bytes past `max_memtable_size` several times
+        // over, so the run spans seals rather than sitting in one memtable.
+        for round in 0..8i32 {
+            let rows = 64;
+            let ids: Vec<i32> = (0..rows).map(|i| round * rows + i).collect();
+            let values: Vec<f32> = (0..rows * dim).map(|i| i as f32).collect();
+            let vectors = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim,
+                Arc::new(Float32Array::from(values)),
+                None,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(vectors)],
+            )
+            .unwrap();
+
+            tokio::time::timeout(STALL_GRACE * 10, writer.put(vec![batch]))
+                .await
+                .expect("a drainable shard must not park the writer indefinitely")
+                .unwrap_or_else(|e| panic!("put in round {round} was refused: {e}"));
+        }
+
+        // Without a seal this would only prove one memtable fits, which is not
+        // the case that stalls.
+        assert!(
+            writer.memtable_stats().await.unwrap().generation > 0,
+            "the run must cross a seal for the drain path to have been exercised"
+        );
+
+        writer.close().await.unwrap();
     }
 }
 
