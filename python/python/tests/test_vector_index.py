@@ -2823,7 +2823,7 @@ def assert_distributed_vector_consistency(
        preprocessed artifacts
     5) For each query, compute ground-truth TopK IDs using exact search
        (use_index=False), then compute TopK using single index and the distributed
-       index with consistent nearest settings (refine_factor=10; IVF probes all
+       index with consistent nearest settings (refine_factor=100; IVF probes all
        fixture partitions)
     6) Compute recall for single and distributed, require each to be >= 0.5,
        and bound their absolute difference with similarity_threshold.
@@ -2947,7 +2947,7 @@ def assert_distributed_vector_consistency(
         gt_ids.append(np.array(gt_tbl["id"].to_pylist(), dtype=np.int64))
 
         # Consistent nearest settings for index-based search
-        nearest = {"column": column, "q": q, "k": topk, "refine_factor": 10}
+        nearest = {"column": column, "q": q, "k": topk, "refine_factor": 100}
         if "IVF" in index_type:
             nearest["nprobes"] = int(index_params.get("num_partitions", 4))
         if "HNSW" in index_type:
