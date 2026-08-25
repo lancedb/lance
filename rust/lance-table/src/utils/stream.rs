@@ -1339,6 +1339,65 @@ mod tests {
         assert_eq!(last_updated_versions, expected_last_updated);
     }
 
+    #[tokio::test]
+    async fn test_version_column_with_unsorted_indices_across_batches() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        let sequence = Arc::new(RowDatasetVersionSequence {
+            runs: (0..10)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position..position + 1),
+                    version: 100 + position,
+                })
+                .collect(),
+        });
+        let indices = UInt32Array::from(vec![8, 2, 9, 1, 6]);
+        let batches = [2, 2, 1].into_iter().map(|num_rows| ReadBatchTask {
+            num_rows,
+            task: std::future::ready(Ok(arrow_array::record_batch!((
+                "x",
+                Int32,
+                vec![0; num_rows as usize]
+            ))
+            .unwrap()))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(indices.clone()),
+            with_row_id: false,
+            with_row_addr: false,
+            with_row_last_updated_at_version: true,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: None,
+            last_updated_at_sequence: Some(sequence),
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 10,
+        };
+
+        let actual = super::wrap_with_row_id_and_delete(stream::iter(batches).boxed(), 0, config)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                batch["_row_last_updated_at_version"]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = indices
+            .values()
+            .iter()
+            .map(|position| 100 + u64::from(*position))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_apply_version_column_direct_call_fallback() {
         use crate::rowids::segment::U64Segment;
