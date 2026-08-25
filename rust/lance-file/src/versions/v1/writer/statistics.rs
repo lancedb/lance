@@ -642,8 +642,10 @@ impl StatisticsCollector {
             let max_value = Arc::new(builder.max_value.finish());
             let struct_fields = vec![
                 ArrowField::new("null_count", DataType::Int64, false),
-                ArrowField::new("min_value", field.data_type(), field.nullable),
-                ArrowField::new("max_value", field.data_type(), field.nullable),
+                // Bounds can be absent for empty pages regardless of the data field's
+                // nullability.
+                ArrowField::new("min_value", field.data_type(), true),
+                ArrowField::new("max_value", field.data_type(), true),
             ];
 
             let stats = StructArray::new(

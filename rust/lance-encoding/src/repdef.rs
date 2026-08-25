@@ -1899,7 +1899,22 @@ impl RepDefUnraveler {
         Ok(())
     }
 
+    /// Removes all but the first definition level of each fixed-size-list slot
+    ///
+    /// The definition levels arrive with one entry per item.  A fixed-size-list
+    /// layer has a single definition level per slot (all `dimension` items in a
+    /// slot share it) so we keep every `dimension`-th level and drop the rest.
+    ///
+    /// `dimension` must be non-zero.  A zero dimension can only come from a
+    /// malformed schema (writers reject it, see
+    /// [`lance_core::datatypes::validate_fixed_size_list_dimensions`]) and is
+    /// rejected here rather than allowed to run off the end of the buffer.
     pub fn decimate(&mut self, dimension: usize) -> Result<()> {
+        if dimension == 0 {
+            return Err(Error::invalid_input(
+                "Cannot decimate repetition/definition levels with a fixed-size-list dimension of 0; dimension must be a positive integer",
+            ));
+        }
         if let Some(sparse) = self.sparse.as_mut() {
             return sparse.decimate(dimension);
         }
@@ -1923,6 +1938,9 @@ impl RepDefUnraveler {
         let mut read_idx = 0;
         let mut write_idx = 0;
         while read_idx < def_levels.len() {
+            // SAFETY: `read_idx` is checked against the length by the loop condition and
+            // `dimension >= 1` (checked above) means `write_idx <= read_idx`, so both
+            // indices are in bounds.
             unsafe {
                 *def_levels.get_unchecked_mut(write_idx) = *def_levels.get_unchecked(read_idx);
             }
@@ -3041,6 +3059,36 @@ mod tests {
         assert_eq!(
             unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_zero_dimension_is_invalid_input() {
+        // A zero dimension can only reach us from a malformed schema.  Decimating with it
+        // used to loop forever, writing past the end of the definition levels buffer.
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_validity_bitmap(validity(&[true, false, true, false]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let def = repdefs.definition_levels.unwrap();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+            4,
+        )]);
+        // Consume the item layer so the fixed-size-list layer is next
+        unraveler.unravel_validity(4).unwrap();
+
+        let err = unraveler.unravel_fsl_validity(2, 0).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
         );
     }
 

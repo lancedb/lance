@@ -69,6 +69,7 @@ from .lance import (
     _MergeInsertBuilder,
     _parse_field_path,
     _Scanner,
+    _serialize_row_addrs,
     _write_dataset,
     indices,
 )
@@ -544,6 +545,49 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The builder instance for method chaining.
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
+
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> "MergeInsertBuilder":
+        """
+        Selects how the merged rows are written to disk.
+
+        For a partial-schema update (the source omits some dataset columns) the
+        two modes have different cost shapes. ``rewrite_columns`` never reads or
+        writes the columns the source omits, but its replacement column file
+        covers every row of each fragment it touches, so the bytes written barely
+        fall as fewer rows match. ``rewrite_rows`` instead scales with the number
+        of matched rows. Patching columns wins once the fraction of rows matched
+        exceeds roughly the fraction of each row's bytes the source columns
+        occupy: for a KB-scale update of a MB-per-row table that is nearly
+        always, and for a table whose columns are all narrow it may never be.
+
+        The per-fragment matched row count that decides this is only known once
+        the join has run, so the caller picks rather than the planner guessing.
+
+        Parameters
+        ----------
+        mode : {'auto', 'rewrite_rows', 'rewrite_columns'}
+            ``auto`` (default) lets the engine choose. It rewrites whole rows,
+            except on the one path that predates this parameter: a
+            partial-schema update whose join key carries a scalar index patches
+            columns. ``rewrite_rows`` deletes the matched rows and writes whole
+            rows into new fragments; for a partial-schema update it gives up
+            that index probe, since the indexed path only ever patches columns.
+            ``rewrite_columns`` attaches new data files holding the source
+            columns to the fragments that already hold the matched rows; it
+            raises if the merge cannot be expressed that way, which requires
+            updating matched rows only (no inserts, no matched deletes, no
+            delete-by-source) with a source that omits at least one dataset
+            column, carries at least one column besides the join key, and
+            carries no blob column.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).write_mode(mode)
 
     def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
         """
@@ -1169,6 +1213,8 @@ class LanceDataset(pa.dataset.Dataset):
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -1266,16 +1312,19 @@ class LanceDataset(pa.dataset.Dataset):
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
         io_buffer_size: int, default None
-            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
-            for more information.
+            The maximum number of bytes to buffer from storage before applying
+            backpressure. See ``ScannerBuilder.io_buffer_size`` for more information.
         batch_readahead: int, optional
-            The number of batches to read ahead.
+            The number of batches to decode concurrently.
         fragment_readahead: int, optional
-            The number of fragments to read ahead.
+            The number of fragments whose reads may be scheduled concurrently.
+            This applies even when ``scan_in_order`` is true. Set this to ``1``
+            to avoid overlapping I/O from multiple fragments.
         scan_in_order: bool, default True
-            Whether to read the fragments and batches in order. If false,
-            throughput may be higher, but batches will be returned out of order
-            and memory use might increase.
+            Whether to return fragments and batches in order. This does not make
+            storage reads sequential; use ``fragment_readahead=1`` for that. If
+            false, throughput may be higher, but batches will be returned out of
+            order and memory use might increase.
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
@@ -1365,6 +1414,14 @@ class LanceDataset(pa.dataset.Dataset):
 
             This parameter allows you to opt-in to the new behavior early, to avoid
             being subject to breaking changes in the future.
+        row_addr_allowlist: bytes, default None
+            Restrict the scan to these row addresses. A serialized roaring treemap
+            over ``_rowid`` (``RowAddrTreeMap::serialize_into`` output). Applied
+            before KNN / BM25 ranking, so top-k is computed over the surviving rows
+            rather than filtered afterwards.
+        row_addr_blocklist: bytes, default None
+            Exclude these row addresses, same encoding as ``row_addr_allowlist``.
+            Combined with it when both are given.
 
 
         .. note::
@@ -1407,6 +1464,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         setopt(builder.filter, filter)
         setopt(builder.prefilter, prefilter)
+        if row_addr_allowlist is not None or row_addr_blocklist is not None:
+            builder.row_addr_prefilter(row_addr_allowlist, row_addr_blocklist)
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
@@ -2983,6 +3042,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -3151,7 +3219,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3210,7 +3278,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -3307,12 +3375,17 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
                         f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not (
@@ -3343,10 +3416,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
@@ -3501,7 +3570,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
@@ -5190,6 +5260,31 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         ignore_not_found: Optional[bool] = None,
     ) -> None:
+        """Delete a dataset and everything under ``base_uri``.
+
+        To limit the damage a mistyped or misconfigured path can do, ``base_uri``
+        must be a dataset root, meaning it holds a manifest that can be read, or a
+        namespace declare/deregister marker. Anything else raises
+        :class:`ValueError`, including a path that holds only data files or only
+        unreadable manifests: such leftovers need an explicit storage-level delete.
+
+        Note that a path which passes this check is deleted in full, including any
+        unmanaged files kept next to the dataset.
+
+        Parameters
+        ----------
+        base_uri : str or Path
+            Root of the dataset to delete.
+        storage_options : optional, dict
+            Extra options for the storage backend.
+        ignore_not_found : optional, bool
+            If True, return successfully when ``base_uri`` does not exist.
+
+        Raises
+        ------
+        ValueError
+            If ``base_uri`` is not a Lance dataset root.
+        """
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
     def get_ivf_model(self, index_name: str):
@@ -5615,6 +5710,26 @@ class SqlQueryBuilder:
         self._builder = self._builder.blob_handling(blob_handling)
         return self
 
+    def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
+        """
+        Set the maximum number of rows produced by each query batch.
+
+        If :meth:`batch_size_bytes` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size(batch_size)
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> "SqlQueryBuilder":
+        """
+        Set the approximate maximum bytes produced by each scan batch.
+
+        If :meth:`batch_size` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size_bytes(batch_size_bytes)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5655,6 +5770,14 @@ class DatasetDelta:
         Return a streaming RecordBatchReader for updated rows.
         """
         return self._delta.get_updated_rows()
+
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
 
 
 class _DatasetDeltaBuilder:
@@ -5721,6 +5844,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -5764,6 +5891,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
@@ -5993,8 +6121,15 @@ class LanceOperation:
             The ids of the fragments that have been removed entirely.
         updated_fragments: list[FragmentMetadata]
             The fragments that have been updated with new deletion vectors.
+            These are used as given, so pass back the metadata read from the
+            dataset rather than a freshly constructed object, or the fragment
+            loses its row id and version metadata.
         new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
+            The fragments that contain the new rows. On a dataset that uses
+            stable row ids, set ``row_id_meta`` on these to carry the ids of
+            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
+            created-at and last-updated-at version metadata are derived during
+            the commit and should be left as None.
         fields_modified: list[int]
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
@@ -6002,6 +6137,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6014,6 +6154,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6381,6 +6522,18 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
+    """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
+
+    Those parameters take a serialized roaring treemap over ``_rowid``; this is
+    the way to produce one from Python.
+
+    >>> blob = serialize_row_addrs([0, 2, 4])                    # doctest: +SKIP
+    >>> ds.scanner(row_addr_allowlist=blob).to_table()           # doctest: +SKIP
+    """
+    return _serialize_row_addrs(list(addrs))
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -6389,6 +6542,8 @@ class ScannerBuilder:
         self._search_filter = None
         self._substrait_filter = None
         self._prefilter = False
+        self._row_addr_allowlist: Optional[bytes] = None
+        self._row_addr_blocklist: Optional[bytes] = None
         self._late_materialization = None
         self._blob_handling = None
         self._offset = None
@@ -6602,6 +6757,25 @@ class ScannerBuilder:
             if search_filter is not None:
                 self.filter(search_filter)
 
+        return self
+
+    def row_addr_prefilter(
+        self,
+        allowlist: Optional[bytes] = None,
+        blocklist: Optional[bytes] = None,
+    ) -> ScannerBuilder:
+        """Restrict the scan to an externally supplied set of row addresses.
+
+        allowlist / blocklist are serialized roaring treemaps over ``_rowid``
+        (``RowAddrTreeMap::serialize_into`` output); passing neither clears the
+        mask. Applied before KNN / BM25 ranking, so top-k is computed over the
+        surviving rows rather than filtered afterwards.
+
+        Bytes rather than an object so the mask can be produced by a different
+        extension module -- nothing Rust-typed crosses the boundary.
+        """
+        self._row_addr_allowlist = allowlist
+        self._row_addr_blocklist = blocklist
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -6896,6 +7070,8 @@ class ScannerBuilder:
             self._orderings,
             self._disable_scoring_autoprojection,
             self._substrait_aggregate,
+            self._row_addr_allowlist,
+            self._row_addr_blocklist,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
@@ -7080,6 +7256,9 @@ class LanceScanner(pa.dataset.Scanner):
     def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
+        Full-text-search nodes include the execution-time ``tokenized_query``
+        text and positions.
+
         Parameters
         ----------
         count_rows : bool, default False
@@ -7115,6 +7294,9 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7146,7 +7328,9 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7205,6 +7389,23 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
+        excluded_fragment_ids: list[int], optional
+            Fragment IDs to exclude from compaction planning. Excluded
+            fragments remain unchanged and act as boundaries, so fragments
+            on opposite sides are not combined into the same compaction task.
+            Duplicate and unknown IDs are ignored.
 
         Returns
         -------
@@ -7229,6 +7430,9 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
+                excluded_fragment_ids=excluded_fragment_ids,
             ).items()
             if v is not None
         }
@@ -7542,6 +7746,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -7801,6 +8006,7 @@ def write_dataset(
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
+        "session": session,
     }
 
     # Add namespace_client and table_id for storage options provider and managed

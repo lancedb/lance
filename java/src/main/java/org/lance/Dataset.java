@@ -484,6 +484,47 @@ public class Dataset implements Closeable {
       boolean namespaceClientManagedVersioning);
 
   /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(String uri) {
+    return listManifestLocations(uri, new HashMap<>());
+  }
+
+  /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @param storageOptions object-store credentials and connection options
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(
+      String uri, Map<String, String> storageOptions) {
+    Preconditions.checkNotNull(uri, "uri must not be null");
+    Preconditions.checkNotNull(storageOptions, "storageOptions must not be null");
+    return listManifestLocationsNative(uri, storageOptions);
+  }
+
+  private static native List<ManifestLocation> listManifestLocationsNative(
+      String uri, Map<String, String> storageOptions);
+
+  /**
    * Creates a builder for opening a dataset.
    *
    * <p>This builder supports opening datasets either directly from a URI or from a LanceNamespace.
@@ -624,10 +665,19 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Drop a Dataset.
+   * Drop a Dataset, deleting everything under {@code path} recursively.
+   *
+   * <p>To limit the damage a mistyped or misconfigured path can do, {@code path} must be a dataset
+   * root, meaning it holds a manifest that can be read, or a namespace declare/deregister marker.
+   * Anything else throws {@link IllegalArgumentException}, including a path that holds only data
+   * files or only unreadable manifests: such leftovers need an explicit storage-level delete.
+   *
+   * <p>Note that a path which passes this check is deleted in full, including any unmanaged files
+   * kept next to the dataset.
    *
    * @param path The file path of the dataset
    * @param storageOptions Storage options
+   * @throws IllegalArgumentException if {@code path} is not a Lance dataset root
    */
   public static native void drop(String path, Map<String, String> storageOptions);
 
@@ -979,6 +1029,23 @@ public class Dataset implements Closeable {
   private native List<Version> nativeListVersions();
 
   /**
+   * Get the number of versions in the current version history.
+   *
+   * <p>Unlike {@link #listVersions()}, this method does not read or deserialize every manifest.
+   * Detached versions are not included.
+   *
+   * @return the number of versions
+   */
+  public long getVersionCount() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionCount();
+    }
+  }
+
+  private native long nativeGetVersionCount();
+
+  /**
    * @return the latest version of the dataset.
    */
   public long latestVersion() {
@@ -1047,13 +1114,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutVersion(version);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutVersion(version));
     }
   }
 
@@ -1070,17 +1131,22 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutTag(tag);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutTag(tag));
     }
   }
 
   private native Dataset nativeCheckoutTag(String tag);
+
+  private Dataset initializeCheckoutDataset(Dataset checkedOutDataset) {
+    if (selfManagedAllocator) {
+      checkedOutDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      checkedOutDataset.allocator = allocator;
+    }
+    checkedOutDataset.session = Session.fromHandle(checkedOutDataset.nativeGetSessionHandle());
+    checkedOutDataset.ownsSession = true;
+    return checkedOutDataset;
+  }
 
   /**
    * Restore the currently checked out version of the dataset as the latest version. This operation
@@ -1568,6 +1634,22 @@ public class Dataset implements Closeable {
   private native boolean nativeHasStableRowIds();
 
   /**
+   * Get the library version that wrote the current manifest.
+   *
+   * <p>Older manifests may not contain writer version metadata.
+   *
+   * @return the current manifest writer version, or empty if unavailable
+   */
+  public Optional<WriterVersion> getWriterVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeGetWriterVersion());
+    }
+  }
+
+  private native WriterVersion nativeGetWriterVersion();
+
+  /**
    * Get the Lance file format version of this dataset.
    *
    * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".
@@ -1660,6 +1742,26 @@ public class Dataset implements Closeable {
 
     // Prevent the new dataset from closing the handle when it gets GC'd
     newDataset.nativeDatasetHandle = 0;
+  }
+
+  /**
+   * Acquires a shared read lock that pins the native dataset handle, blocking a concurrent {@link
+   * #close()} until the lock is released.
+   *
+   * <p>Any code that passes this {@link Dataset} into a native method must hold this lock for the
+   * whole native call; otherwise {@code close()} can release the native dataset mid-call and crash
+   * the JVM. The lock is reentrant and intended for try-with-resources use.
+   *
+   * @return the acquired read lock
+   * @throws IllegalArgumentException if the dataset is already closed
+   */
+  public LockManager.ReadLock acquireReadLock() {
+    LockManager.ReadLock readLock = lockManager.acquireReadLock();
+    if (nativeDatasetHandle == 0) {
+      readLock.close();
+      throw new IllegalArgumentException("Dataset is closed");
+    }
+    return readLock;
   }
 
   /**
@@ -1841,13 +1943,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckout(ref);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckout(ref));
     }
   }
 

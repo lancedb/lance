@@ -15,6 +15,7 @@ use core::panic;
 
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
+    require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
@@ -453,7 +454,15 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 pub struct VariableEncoder {}
 
 impl BlockCompressor for VariableEncoder {
-    fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, mut data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let bits_per_offset = match &data {
+            DataBlock::VariableWidth(data) => data.bits_per_offset,
+            _ => {
+                return Err(Error::invalid_input(
+                    "BinaryBlockEncoder requires a variable-width block",
+                ));
+            }
+        };
         match data {
             DataBlock::VariableWidth(ref mut variable_width_data) => {
                 match variable_width_data.bits_per_offset {
@@ -505,18 +514,23 @@ impl BlockCompressor for VariableEncoder {
                         output.extend_from_slice(&variable_width_data.data);
                         Ok(LanceBuffer::from(output))
                     }
-                    _ => {
-                        panic!(
-                            "BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
-                            variable_width_data.bits_per_offset
-                        );
-                    }
+                    _ => Err(Error::invalid_input(format!(
+                        "BinaryBlockEncoder does not support {}-bit offsets",
+                        variable_width_data.bits_per_offset
+                    ))),
                 }
             }
-            _ => {
-                panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");
-            }
+            _ => unreachable!("variable-width input was validated above"),
         }
+        .map(|payload| {
+            (
+                Some(payload),
+                ProtobufUtils21::variable(
+                    ProtobufUtils21::flat(bits_per_offset as u64, None),
+                    None,
+                ),
+            )
+        })
     }
 }
 
@@ -547,7 +561,8 @@ impl VariablePerValueDecompressor for VariableDecoder {
 pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Binary block")?;
         // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
         // as four bytes.  However, this led to alignment problems and was wasteful since we already store the num_values
         // in higher layers.
@@ -1251,7 +1266,9 @@ mod tests {
         });
         BlockCompressor::compress(&super::VariableEncoder::default(), block)
             .unwrap()
+            .0
             .as_ref()
+            .unwrap()
             .to_vec()
     }
 
@@ -1280,7 +1297,7 @@ mod tests {
             .copy_from_slice(&mutated_offset_value.to_le_bytes()[..bytes_per_offset]);
 
         let block = super::BinaryBlockDecompressor::default()
-            .decompress(LanceBuffer::from(encoded), 3)
+            .decompress(Some(LanceBuffer::from(encoded)), 3)
             .unwrap();
         let data_type = match bits_per_offset {
             32 => DataType::Binary,
@@ -1302,7 +1319,7 @@ mod tests {
         let mut encoded = encoded_binary_block(32);
         encoded[8..12].copy_from_slice(&5_u32.to_le_bytes());
         let err = decompressor
-            .decompress(LanceBuffer::from(encoded), 3)
+            .decompress(Some(LanceBuffer::from(encoded)), 3)
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("first offset"), "{err}");
@@ -1310,14 +1327,14 @@ mod tests {
         // The offsets region must hold exactly num_values + 1 offsets.
         let encoded = encoded_binary_block(32);
         let err = decompressor
-            .decompress(LanceBuffer::from(encoded), 4)
+            .decompress(Some(LanceBuffer::from(encoded)), 4)
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("offset bytes"), "{err}");
 
         // A block too small to hold its header is rejected, not a panic.
         let err = decompressor
-            .decompress(LanceBuffer::from(vec![0_u8; 2]), 1)
+            .decompress(Some(LanceBuffer::from(vec![0_u8; 2])), 1)
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("too small"), "{err}");

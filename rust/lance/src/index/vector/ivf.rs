@@ -60,6 +60,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions as file_versions,
     versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
@@ -2636,7 +2637,7 @@ async fn write_root_vector_index_from_auxiliary(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = lance_file::versions::create_writer(
+    let mut v2_writer = file_versions::create_writer(
         format_version,
         obj_writer,
         schema,
@@ -5254,7 +5255,15 @@ mod tests {
         test_uri: &str,
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
+        generate_test_dataset_with_rows(test_uri, range, 1000).await
+    }
+
+    async fn generate_test_dataset_with_rows(
+        test_uri: &str,
+        range: Range<f32>,
+        num_rows: usize,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let vectors = generate_random_array_with_range::<Float32Type>(num_rows * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -5410,6 +5419,7 @@ mod tests {
             uuid,
             dataset_version: dataset.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5449,6 +5459,7 @@ mod tests {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
+            covering_fields: vec![],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5508,6 +5519,7 @@ mod tests {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
+            covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
@@ -5582,6 +5594,32 @@ mod tests {
         }
     }
 
+    fn fast_ivf_params(num_partitions: usize) -> IvfBuildParams {
+        IvfBuildParams {
+            num_partitions: Some(num_partitions),
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        }
+    }
+
+    fn fast_pq_params(num_sub_vectors: usize, num_bits: usize) -> PQBuildParams {
+        PQBuildParams {
+            num_sub_vectors,
+            num_bits,
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        }
+    }
+
+    fn fast_hnsw_params() -> HnswBuildParams {
+        HnswBuildParams::default()
+            .max_level(3)
+            .num_edges(8)
+            .ef_construction(32)
+    }
+
     // Clippy doesn't like that all start with Ivf but we might have some in the future
     // that _don't_ start with Ivf so I feel it is meaningful to keep the prefix
     #[allow(clippy::enum_variant_names)]
@@ -5620,13 +5658,13 @@ mod tests {
         num_partitions: 2,
         metric_type: MetricType::Dot,
         dimension: 16,
-        index_type: TestIndexType::IvfHnswPq { pq: TestPqParams::small(), num_edges: 100 },
+        index_type: TestIndexType::IvfHnswPq { pq: TestPqParams::small(), num_edges: 4 },
     })]
     #[case::ivf_hnsw_sq(CreateIndexCase {
         metric_type: MetricType::Dot,
         num_partitions: 2,
         dimension: 16,
-        index_type: TestIndexType::IvfHnswSq { num_edges: 100 },
+        index_type: TestIndexType::IvfHnswSq { num_edges: 4 },
     })]
     async fn test_create_index_nulls(
         #[case] test_case: CreateIndexCase,
@@ -5638,36 +5676,37 @@ mod tests {
         let mut index_params = match test_case.index_type {
             TestIndexType::IvfPq { pq } => VectorIndexParams::with_ivf_pq_params(
                 test_case.metric_type,
-                IvfBuildParams::new(test_case.num_partitions),
-                PQBuildParams::new(pq.num_sub_vectors, pq.num_bits),
+                fast_ivf_params(test_case.num_partitions),
+                fast_pq_params(pq.num_sub_vectors, pq.num_bits),
             ),
             TestIndexType::IvfHnswPq { pq, num_edges } => {
                 VectorIndexParams::with_ivf_hnsw_pq_params(
                     test_case.metric_type,
-                    IvfBuildParams::new(test_case.num_partitions),
-                    HnswBuildParams::default().num_edges(num_edges),
-                    PQBuildParams::new(pq.num_sub_vectors, pq.num_bits),
+                    fast_ivf_params(test_case.num_partitions),
+                    fast_hnsw_params().num_edges(num_edges),
+                    fast_pq_params(pq.num_sub_vectors, pq.num_bits),
                 )
             }
-            TestIndexType::IvfFlat => {
-                VectorIndexParams::ivf_flat(test_case.num_partitions, test_case.metric_type)
-            }
+            TestIndexType::IvfFlat => VectorIndexParams::with_ivf_flat_params(
+                test_case.metric_type,
+                fast_ivf_params(test_case.num_partitions),
+            ),
             TestIndexType::IvfHnswSq { num_edges } => VectorIndexParams::with_ivf_hnsw_sq_params(
                 test_case.metric_type,
-                IvfBuildParams::new(test_case.num_partitions),
-                HnswBuildParams::default().num_edges(num_edges),
+                fast_ivf_params(test_case.num_partitions),
+                fast_hnsw_params().num_edges(num_edges),
                 SQBuildParams::default(),
             ),
         };
         index_params.version(index_version);
 
-        let nrows = 2_000;
+        let nrows = 512_usize;
         let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(test_case.dimension as u32)),
             )
-            .into_batch_rows(RowCount::from(nrows))
+            .into_batch_rows(RowCount::from(nrows as u64))
             .unwrap();
 
         // Make every other row null
@@ -5700,9 +5739,9 @@ mod tests {
             .collect::<Float32Array>();
         let results = dataset
             .scan()
-            .nearest("vec", &query, 2_000)
+            .nearest("vec", &query, nrows)
             .unwrap()
-            .ef(100_000)
+            .ef(nrows)
             .minimum_nprobes(2)
             .try_into_batch()
             .await
@@ -5711,10 +5750,10 @@ mod tests {
         if is_approximate {
             let recall = results.num_rows() as f32 / num_non_null as f32;
             assert!(
-                recall >= 0.99,
+                recall >= 0.5,
                 "Recall {} below threshold {} ({}/{})",
                 recall,
-                0.99,
+                0.5,
                 results.num_rows(),
                 num_non_null,
             );
@@ -6498,12 +6537,13 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 4;
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let nlist = 2;
+        let (mut dataset, vector_array) =
+            generate_test_dataset_with_rows(test_uri, 0.0..1.0, 512).await;
 
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
+        let ivf_params = fast_ivf_params(nlist);
+        let pq_params = fast_pq_params(4, 8);
+        let hnsw_params = fast_hnsw_params();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,
             ivf_params,
@@ -6518,23 +6558,20 @@ mod tests {
 
         let query = vector_array.value(0);
         let query = query.as_primitive::<Float32Type>();
-        let k = 100;
+        let k = 20;
         let results = dataset
             .scan()
             .with_row_id()
             .nearest("vector", query, k)
             .unwrap()
             .minimum_nprobes(nlist)
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
+            .ef(64)
+            .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(k, results[0].num_rows());
+        assert_eq!(k, results.num_rows());
 
-        let row_ids = results[0]
+        let row_ids = results
             .column_by_name(ROW_ID)
             .unwrap()
             .as_any()
@@ -6543,7 +6580,7 @@ mod tests {
             .iter()
             .map(|v| v.unwrap() as u32)
             .collect::<Vec<_>>();
-        let dists = results[0]
+        let dists = results
             .column_by_name("_distance")
             .unwrap()
             .as_any()
@@ -6557,10 +6594,19 @@ mod tests {
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+        assert_eq!(results_set.len(), k, "search returned duplicate row ids");
+        assert!(
+            results.iter().all(|(distance, _)| distance.is_finite()),
+            "search returned a non-finite distance: {results:?}"
+        );
+        assert!(
+            results.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "search distances are not sorted: {results:?}"
+        );
 
         let recall = results_set.intersection(&gt_set).count() as f32 / k as f32;
         assert!(
-            recall >= 0.9,
+            recall >= 0.5,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,

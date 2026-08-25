@@ -25,10 +25,13 @@ import org.lance.index.vector.VectorTrainer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -36,6 +39,37 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class VectorIndexTest {
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"IVF_FLAT", "IVF_PQ"})
+  @SuppressWarnings("deprecation")
+  public void testCreateIndexWithConcreteVectorType(IndexType indexType, @TempDir Path tempDir)
+      throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve(indexType.name()))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        VectorIndexParams vectorIndexParams =
+            indexType == IndexType.IVF_FLAT
+                ? VectorIndexParams.ivfFlat(2, DistanceType.L2)
+                : VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2);
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList(TestVectorDataset.vectorColumnName),
+                indexType,
+                Optional.empty(),
+                indexParams,
+                false);
+
+        assertNotNull(index);
+        assertTrue(dataset.listIndexes().contains(index.name()));
+      }
+    }
+  }
 
   @Test
   public void testCreateIvfFlatIndexDistributively(@TempDir Path tempDir) throws Exception {

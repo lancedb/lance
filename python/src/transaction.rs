@@ -8,7 +8,7 @@ use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -93,11 +93,18 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
                 .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
             Err(_) => None,
         };
+        // Tolerate an object predating this attribute, as with `index_details`
+        // above: absent means the index carries no covered columns.
+        let covering_fields: Vec<i32> = match ob.getattr("covering_fields") {
+            Ok(value) => value.extract()?,
+            Err(_) => Vec::new(),
+        };
 
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
+            covering_fields,
             dataset_version,
             fragment_bitmap,
             index_details,
@@ -122,6 +129,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let uuid = self.0.uuid.to_string();
         let name = &self.0.name;
         let fields = &self.0.fields;
+        let covering_fields = &self.0.covering_fields;
         let dataset_version = self.0.dataset_version;
         let index_version = self.0.index_version;
         let fragment_ids = self.0.fragment_bitmap.as_ref().map_or_else(
@@ -162,6 +170,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             base_id,
             files,
             index_details,
+            covering_fields.clone(),
         ))
     }
 }
@@ -413,6 +422,31 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .ok()
                     .map(|py_mode| py_mode.0);
 
+                // Absent on objects predating the field.
+                let updated_fragment_offsets = ob
+                    .getattr("updated_fragment_offsets")
+                    .ok()
+                    .map(|v| v.extract::<Option<HashMap<u64, Vec<u8>>>>())
+                    .transpose()?
+                    .flatten()
+                    .map(|offsets| {
+                        offsets
+                            .into_iter()
+                            .map(|(frag_id, bytes)| {
+                                RoaringBitmap::deserialize_from(&bytes[..])
+                                    .map(|bitmap| (frag_id, bitmap))
+                                    .map_err(|e| {
+                                        PyValueError::new_err(format!(
+                                            "updated_fragment_offsets[{frag_id}]: invalid \
+                                             portable RoaringBitmap bytes: {e}"
+                                        ))
+                                    })
+                            })
+                            .collect::<PyResult<HashMap<_, _>>>()
+                    })
+                    .transpose()?
+                    .map(UpdatedFragmentOffsets);
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
@@ -422,7 +456,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
-                    updated_fragment_offsets: None,
+                    updated_fragment_offsets,
                 };
                 Ok(Self(op))
             }
@@ -601,6 +635,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_modified,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_fragment_offsets,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -618,6 +653,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     },
                     None => "rewrite_rows",
                 };
+                let updated_fragment_offsets =
+                    updated_fragment_offsets
+                        .as_ref()
+                        .map(|UpdatedFragmentOffsets(offsets)| {
+                            offsets
+                                .iter()
+                                .map(|(frag_id, bitmap)| {
+                                    let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                                    bitmap
+                                        .serialize_into(&mut buf)
+                                        .expect("RoaringBitmap serialization cannot fail");
+                                    (*frag_id, buf)
+                                })
+                                .collect::<HashMap<u64, Vec<u8>>>()
+                        });
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -628,6 +678,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_modified,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    updated_fragment_offsets,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -689,6 +740,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } => {
                 let new_indices_py = export_vec(py, new_indices.as_slice())?;
                 let removed_indices_py = export_vec(py, removed_indices.as_slice())?;

@@ -3102,7 +3102,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3494,9 +3494,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4422,7 +4422,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4574,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4593,13 +4593,11 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "blake3",
- "byteorder",
  "bytes",
  "criterion",
  "datafusion-common",
  "datafusion-sql",
  "futures",
- "itertools 0.14.0",
  "lance-arrow",
  "lance-derive",
  "libc",
@@ -4609,7 +4607,6 @@ dependencies = [
  "num_cpus",
  "object_store",
  "pin-project",
- "proptest",
  "prost",
  "quick_cache",
  "rand 0.9.5",
@@ -4628,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4655,13 +4652,14 @@ dependencies = [
  "prost",
  "prost-build",
  "protobuf-src",
+ "rstest",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "lance-datagen"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4680,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4689,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4733,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4759,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4800,7 +4798,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4814,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4893,7 +4891,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4915,7 +4913,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4930,7 +4928,6 @@ dependencies = [
  "futures",
  "http 1.4.2",
  "io-uring",
- "lance-arrow",
  "lance-core",
  "lance-namespace",
  "lance-testing",
@@ -4947,19 +4944,25 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.5",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-google",
  "rstest",
  "serde",
+ "serde_json",
  "tempfile",
  "test-log",
  "tokio",
  "tracing",
  "tracing-mock",
  "url",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
 name = "lance-linalg"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4980,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4992,7 +4995,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5008,10 +5011,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
- "arrow-array",
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
@@ -5026,7 +5028,6 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "lance",
- "lance-arrow",
  "lance-core",
  "lance-index",
  "lance-io",
@@ -5035,7 +5036,6 @@ dependencies = [
  "lance-table",
  "log",
  "object_store",
- "opendal",
  "quick-xml 0.40.1",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -5057,9 +5057,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.8.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3f0a235e3ed5f8805205649ccc7d7d0f3df23ce1294242c9265ad488d7f19d"
+checksum = "0a030196da1c994b63a96a4f0bf5b0cfa459fe6dadc9e962320246ca328da22a"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -5071,25 +5071,23 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
  "byteorder",
- "bytes",
  "criterion",
  "itertools 0.14.0",
  "lance-core",
  "proptest",
  "roaring",
- "rstest",
  "tracing",
 ]
 
 [[package]]
 name = "lance-table"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5136,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5145,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5158,7 +5156,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5171,7 +5169,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "11.0.0-beta.3"
+version = "11.1.0-beta.0"
 dependencies = [
  "clap",
  "lance-core",
@@ -8872,7 +8870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
