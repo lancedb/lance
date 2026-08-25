@@ -102,6 +102,7 @@ use super::{
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
+use crate::index::vector::ivf::{VectorSegmentCompatibility, vector_segment_compatibility};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
@@ -2121,12 +2122,36 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     // repair its coverage.
     let indices = load_all_indices(dataset).await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
+    let mut segments_by_name = HashMap::<&str, Vec<_>>::new();
+    for index in indices.iter().filter(|idx| !is_system_index(idx)) {
+        segments_by_name
+            .entry(index.name.as_str())
+            .or_default()
+            .push(index);
+    }
+
+    let mut visited_names = HashSet::new();
     // System indices (fragment-reuse, mem-wal) don't define data coverage and
     // aren't remapped per rewrite group, so they must not constrain compaction
     // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
     // splits the small-fragment run and they never coalesce.
     for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        index_fragmaps.push(index_fragment_coverage(dataset, index).await?);
+        if !visited_names.insert(index.name.as_str()) {
+            continue;
+        }
+
+        let segments = &segments_by_name[index.name.as_str()];
+        if vector_segments_can_merge_for_compaction(dataset, segments).await {
+            let mut logical_fragment_bitmap = RoaringBitmap::new();
+            for segment in segments {
+                logical_fragment_bitmap |= index_fragment_coverage(dataset, segment).await?;
+            }
+            index_fragmaps.push(logical_fragment_bitmap);
+        } else {
+            for segment in segments {
+                index_fragmaps.push(index_fragment_coverage(dataset, segment).await?);
+            }
+        }
     }
     Ok(index_fragmaps)
 }
@@ -2141,6 +2166,7 @@ async fn index_fragment_coverage(
     if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
         return Ok(fragment_bitmap.clone());
     }
+
     let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
     // max_fragment_id is inclusive (the highest id); +1 for an exclusive
     // upper bound so the last fragment is covered (None => empty range).
@@ -2222,6 +2248,43 @@ async fn reject_unremappable_rewrite(
         }
     }
     Ok(())
+}
+
+async fn vector_segments_can_merge_for_compaction(
+    dataset: &Dataset,
+    segments: &[&lance_table::format::IndexMetadata],
+) -> bool {
+    if segments.len() < 2
+        || segments.iter().any(|segment| {
+            !segment
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+        })
+        || segments
+            .iter()
+            .any(|segment| segment.fields != segments[0].fields)
+        || segments[0].fields.len() != 1
+    {
+        return false;
+    }
+
+    let Ok(column) = dataset.schema().field_path(segments[0].fields[0]) else {
+        return false;
+    };
+    let Ok(logical_index) = dataset
+        .open_logical_vector_index(&column, &segments[0].name)
+        .await
+    else {
+        return false;
+    };
+    let Ok(ivf) = logical_index.as_ivf() else {
+        return false;
+    };
+    matches!(
+        vector_segment_compatibility(&ivf, "compaction"),
+        Ok(VectorSegmentCompatibility::SharedModel)
+    )
 }
 
 pub async fn plan_compaction(
@@ -3062,18 +3125,19 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::index::CreateIndexBuilder;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
-        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        PrimitiveArray, RecordBatch, RecordBatchIterator,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
-    use lance_arrow::BLOB_META_KEY;
+    use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
     use lance_core::Error;
     use lance_core::ROW_ID;
     use lance_core::utils::address::RowAddress;
@@ -7071,6 +7135,79 @@ mod tests {
             "Expected no fragment scan in plan: {}",
             plan
         );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_merges_compatible_vector_segments() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            3
+        );
+
+        let query = vec![0.5; DIM as usize];
+        let before = vector_knn_ids(&dataset, &query, 10).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(plan.tasks()[0].fragments.len(), 3);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let indices = dataset.load_indices_by_name("vec_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([dataset.get_fragments()[0].id() as u32])
+        );
+        dataset.validate().await.unwrap();
+
+        let after = vector_knn_ids(&dataset, &query, 10).await;
+        let overlap = after.iter().filter(|id| before.contains(id)).count();
+        assert!(overlap >= 5, "KNN overlap {overlap} is below 0.5 recall");
     }
 
     #[tokio::test]
