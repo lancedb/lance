@@ -12,7 +12,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
-use crate::index::vector::ivf::{VectorSegmentCompatibility, vector_segment_compatibility};
+use crate::index::vector::ivf::vector_segment_merge_groups;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -67,10 +67,11 @@ struct DatasetIndexRemapper {
     indices: Arc<Vec<IndexMetadata>>,
 }
 
-pub(crate) async fn vector_segments_can_merge_for_compaction(
+pub(crate) async fn vector_segment_merge_groups_for_compaction<'a>(
     dataset: &Dataset,
-    segments: &[&IndexMetadata],
-) -> bool {
+    segments: &[&'a IndexMetadata],
+) -> Vec<Vec<&'a IndexMetadata>> {
+    let singleton_groups = || segments.iter().map(|segment| vec![*segment]).collect();
     if segments.len() < 2
         || segments.iter().any(|segment| {
             !segment
@@ -83,25 +84,42 @@ pub(crate) async fn vector_segments_can_merge_for_compaction(
             .any(|segment| segment.fields != segments[0].fields)
         || segments[0].fields.len() != 1
     {
-        return false;
+        return singleton_groups();
     }
 
     let Ok(column) = dataset.schema().field_path(segments[0].fields[0]) else {
-        return false;
+        return singleton_groups();
     };
     let Ok(logical_index) = dataset
         .open_logical_vector_index(&column, &segments[0].name)
         .await
     else {
-        return false;
+        return singleton_groups();
     };
     let Ok(ivf) = logical_index.as_ivf() else {
-        return false;
+        return singleton_groups();
     };
-    matches!(
-        vector_segment_compatibility(&ivf, "compaction"),
-        Ok(VectorSegmentCompatibility::SharedModel)
-    )
+
+    let mut segments_by_id = segments
+        .iter()
+        .map(|segment| (segment.uuid, *segment))
+        .collect::<HashMap<_, _>>();
+    let groups = vector_segment_merge_groups(&ivf)
+        .into_iter()
+        .filter_map(|group| {
+            let group = group
+                .into_iter()
+                .filter_map(|segment_id| segments_by_id.remove(&segment_id))
+                .collect::<Vec<_>>();
+            (!group.is_empty()).then_some(group)
+        })
+        .collect::<Vec<_>>();
+
+    if segments_by_id.is_empty() {
+        groups
+    } else {
+        singleton_groups()
+    }
 }
 
 impl DatasetIndexRemapper {
@@ -169,7 +187,14 @@ impl DatasetIndexRemapper {
         segments: &[&IndexMetadata],
         mapping: &RowAddrRemap,
     ) -> Result<Option<Vec<RemappedIndex>>> {
-        if !vector_segments_can_merge_for_compaction(&self.dataset, segments).await {
+        if segments.len() < 2
+            || segments.iter().any(|segment| {
+                !segment
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+            })
+        {
             return Ok(None);
         }
 
@@ -294,26 +319,30 @@ impl IndexRemapper for DatasetIndexRemapper {
                 continue;
             }
 
-            if let Some(merged) = self
-                .remap_and_merge_vector_segments(segments, &mapping)
-                .await?
+            for merge_group in
+                vector_segment_merge_groups_for_compaction(&self.dataset, segments).await
             {
-                remapped.extend(merged);
-                continue;
-            }
-
-            for segment in segments {
-                // Box the remap future at the call site: inlining `remap_index` into this
-                // loop's async layout otherwise exceeds rustc's depth limit. It has to be
-                // boxed here, not inside `remap_index` — boxing internally turns the
-                // future's `Send` check into a `Box<Future>: Send` trait obligation that
-                // overflows the solver through the cache types (E0275 downstream).
-                let remap_result = Box::pin(self.remap_index(segment, &mapping)).await?;
-                if let Some(remapped_index) = self
-                    .remapped_index_from_result(segment, remap_result)
+                if let Some(merged) = self
+                    .remap_and_merge_vector_segments(&merge_group, &mapping)
                     .await?
                 {
-                    remapped.push(remapped_index);
+                    remapped.extend(merged);
+                    continue;
+                }
+
+                for segment in merge_group {
+                    // Box the remap future at the call site: inlining `remap_index` into this
+                    // loop's async layout otherwise exceeds rustc's depth limit. It has to be
+                    // boxed here, not inside `remap_index` — boxing internally turns the
+                    // future's `Send` check into a `Box<Future>: Send` trait obligation that
+                    // overflows the solver through the cache types (E0275 downstream).
+                    let remap_result = Box::pin(self.remap_index(segment, &mapping)).await?;
+                    if let Some(remapped_index) = self
+                        .remapped_index_from_result(segment, remap_result)
+                        .await?
+                    {
+                        remapped.push(remapped_index);
+                    }
                 }
             }
         }

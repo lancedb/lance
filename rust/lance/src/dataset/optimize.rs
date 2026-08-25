@@ -90,7 +90,7 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::{
     DatasetIndexRemapperOptions, load_indices_for_remapping,
-    vector_segments_can_merge_for_compaction,
+    vector_segment_merge_groups_for_compaction,
 };
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
@@ -2143,16 +2143,12 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
         }
 
         let segments = &segments_by_name[index.name.as_str()];
-        if vector_segments_can_merge_for_compaction(dataset, segments).await {
-            let mut logical_fragment_bitmap = RoaringBitmap::new();
-            for segment in segments {
-                logical_fragment_bitmap |= index_fragment_coverage(dataset, segment).await?;
+        for merge_group in vector_segment_merge_groups_for_compaction(dataset, segments).await {
+            let mut group_fragment_bitmap = RoaringBitmap::new();
+            for segment in merge_group {
+                group_fragment_bitmap |= index_fragment_coverage(dataset, segment).await?;
             }
-            index_fragmaps.push(logical_fragment_bitmap);
-        } else {
-            for segment in segments {
-                index_fragmaps.push(index_fragment_coverage(dataset, segment).await?);
-            }
+            index_fragmaps.push(group_fragment_bitmap);
         }
     }
     Ok(index_fragmaps)
@@ -7171,6 +7167,72 @@ mod tests {
         );
         dataset.validate().await.unwrap();
 
+        let after = vector_knn_ids(&dataset, &query, 10).await;
+        let overlap = after.iter().filter(|id| before.contains(id)).count();
+        assert!(overlap >= 5, "KNN overlap {overlap} is below 0.5 recall");
+    }
+
+    #[tokio::test]
+    async fn test_compaction_merges_compatible_vector_segment_subset() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for (fragment_id, centroid) in fragment_ids.into_iter().zip([0.0, 0.0, 1.0]) {
+            let centroids = FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(centroid, DIM as usize)),
+                DIM as i32,
+            )
+            .unwrap();
+            let params = VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+            );
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let query = vec![0.5; DIM as usize];
+        let before = vector_knn_ids(&dataset, &query, 10).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(plan.tasks()[0].fragments.len(), 2);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            2
+        );
+        dataset.validate().await.unwrap();
         let after = vector_knn_ids(&dataset, &query, 10).await;
         let overlap = after.iter().filter(|id| before.contains(id)).count();
         assert!(overlap >= 5, "KNN overlap {overlap} is below 0.5 recall");

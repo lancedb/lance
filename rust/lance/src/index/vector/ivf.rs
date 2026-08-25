@@ -558,6 +558,46 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     None
 }
 
+fn vector_segments_share_merge_model(
+    left: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+    right: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+) -> bool {
+    if left.0.index_version != right.0.index_version {
+        return false;
+    }
+
+    let indices = [left.1.clone(), right.1.clone()];
+    validate_vector_query_compatibility(&indices, "merging vector index segments").is_ok()
+        && vector_model_mismatch(&indices).is_none()
+}
+
+/// Partition a logical vector index into the exact groups accepted by the
+/// segment merger. Groups retain the committed segment order.
+pub(crate) fn vector_segment_merge_groups(logical_index: &LogicalIvfView<'_>) -> Vec<Vec<Uuid>> {
+    let segments = logical_index.segments().collect::<Vec<_>>();
+    let mut groups = Vec::<Vec<usize>>::new();
+
+    for segment_idx in 0..segments.len() {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
+        }) {
+            group.push(segment_idx);
+        } else {
+            groups.push(vec![segment_idx]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|segment_idx| segments[segment_idx].0.uuid)
+                .collect()
+        })
+        .collect()
+}
+
 pub(crate) fn vector_segment_compatibility(
     logical_index: &LogicalIvfView<'_>,
     operation: &str,
@@ -565,16 +605,7 @@ pub(crate) fn vector_segment_compatibility(
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
 
-    let mut versions = logical_index
-        .segments()
-        .map(|(metadata, _)| metadata.index_version);
-    if let Some(first_version) = versions.next()
-        && versions.any(|version| version != first_version)
-    {
-        return Ok(VectorSegmentCompatibility::QueryCompatibleModelsDiffer);
-    }
-
-    Ok(if vector_model_mismatch(&indices).is_none() {
+    Ok(if vector_segment_merge_groups(logical_index).len() == 1 {
         VectorSegmentCompatibility::SharedModel
     } else {
         VectorSegmentCompatibility::QueryCompatibleModelsDiffer
