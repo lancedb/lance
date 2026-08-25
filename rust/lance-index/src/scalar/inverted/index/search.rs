@@ -235,6 +235,7 @@ impl InvertedIndex {
     /// equal to their inclusive logical threshold.
     #[doc(hidden)]
     #[instrument(level = "debug", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn bm25_search_documents_with_score_floor(
         &self,
         tokens: Arc<Tokens>,
