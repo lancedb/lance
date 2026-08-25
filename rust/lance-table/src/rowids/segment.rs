@@ -873,6 +873,21 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_range_with_bitmap_data_remains_publicly_mutable() {
+        let mut segment = U64Segment::RangeWithBitmap {
+            range: 0..8,
+            bitmap: Bitmap::new_empty(8),
+        };
+        let U64Segment::RangeWithBitmap { bitmap, .. } = &mut segment else {
+            unreachable!();
+        };
+
+        bitmap.data[0] = 0b1010_0101;
+        assert_eq!(bitmap.len, 8);
+        assert_eq!(bitmap.count_ones(), 4);
+    }
+
+    #[test]
     fn test_extend_range_over_full_and_near_dense_bitmap_bytes() {
         let mut bitmap = Bitmap::new_full(24);
         bitmap.clear(10);
