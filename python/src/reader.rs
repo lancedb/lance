@@ -26,6 +26,11 @@ use crate::rt;
 
 const READER_CHANNEL_CAPACITY: usize = 2;
 
+enum ReaderMessage {
+    Batch(Result<RecordBatch, ArrowError>),
+    Finished,
+}
+
 /// Lance's RecordBatchReader
 ///
 /// The async scan is driven by one background producer for the lifetime of the
@@ -34,7 +39,8 @@ const READER_CHANNEL_CAPACITY: usize = 2;
 /// for every batch while preserving backpressure.
 pub struct LanceReader {
     schema: SchemaRef,
-    receiver: std::sync::Arc<Mutex<mpsc::Receiver<Result<RecordBatch, ArrowError>>>>,
+    receiver: std::sync::Arc<Mutex<mpsc::Receiver<ReaderMessage>>>,
+    finished: bool,
 }
 
 impl LanceReader {
@@ -55,9 +61,14 @@ impl LanceReader {
                     next = stream.next() => next,
                 };
                 let Some(batch) = next else {
+                    let _ = sender.send(ReaderMessage::Finished).await;
                     break;
                 };
-                if sender.send(batch.map_err(ArrowError::from)).await.is_err() {
+                if sender
+                    .send(ReaderMessage::Batch(batch.map_err(ArrowError::from)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -65,6 +76,7 @@ impl LanceReader {
         Self {
             schema,
             receiver: std::sync::Arc::new(Mutex::new(receiver)),
+            finished: false,
         }
     }
 }
@@ -73,6 +85,9 @@ impl Iterator for LanceReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
         let receiver = self.receiver.clone();
         let recv = async move { receiver.lock().await.recv().await };
         let result = if tokio::runtime::Handle::try_current().is_ok() {
@@ -83,7 +98,17 @@ impl Iterator for LanceReader {
             rt().block_on(None, recv)
         };
         match result {
-            Ok(batch) => batch,
+            Ok(Some(ReaderMessage::Batch(batch))) => Some(batch),
+            Ok(Some(ReaderMessage::Finished)) => {
+                self.finished = true;
+                None
+            }
+            Ok(None) => {
+                self.finished = true;
+                Some(Err(ArrowError::ExternalError(Box::new(
+                    std::io::Error::other("Lance reader producer terminated before end of stream"),
+                ))))
+            }
             Err(err) => Some(Err(ArrowError::ExternalError(Box::new(err)))),
         }
     }
@@ -159,6 +184,33 @@ mod tests {
 
         let error = reader.next().unwrap().unwrap_err();
         assert!(error.to_string().contains("expected reader error"));
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn test_reader_reports_producer_panic_after_a_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = stream::iter([Ok(expected.clone())]).chain(stream::poll_fn(|_| {
+            panic!("expected producer panic");
+        }));
+        let mut reader = make_reader(schema, batches);
+
+        assert_eq!(reader.next().unwrap().unwrap(), expected);
+        let error = reader.next().unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("producer terminated before end of stream")
+        );
         assert!(reader.next().is_none());
     }
 
