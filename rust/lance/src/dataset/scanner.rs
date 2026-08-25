@@ -179,6 +179,13 @@ enum BoundedMixedFtsFieldPlan {
     TargetFlatFallback(&'static str),
 }
 
+#[derive(Default)]
+struct FlatMatchScorerInputs {
+    shared_scorer: Option<Arc<SharedFtsScorer>>,
+    corpus_stats_input: Option<Arc<dyn ExecutionPlan>>,
+    base_scorer: Option<Arc<MemBM25Scorer>>,
+}
+
 const BOUNDED_MIXED_FUZZY_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_fuzzy";
 const BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_full_scan";
 const BOUNDED_MIXED_UNKNOWN_COVERAGE_FALLBACK_METRIC: &str =
@@ -4688,8 +4695,7 @@ impl Scanner {
                             &flat_query,
                             &flat_params,
                             filter_plan,
-                            None,
-                            None,
+                            FlatMatchScorerInputs::default(),
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4715,8 +4721,7 @@ impl Scanner {
                                 &flat_query,
                                 &flat_params,
                                 filter_plan,
-                                None,
-                                None,
+                                FlatMatchScorerInputs::default(),
                             )
                             .await?;
                         return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4767,8 +4772,10 @@ impl Scanner {
                             &flat_query,
                             &flat_params,
                             filter_plan,
-                            shared_scorer,
-                            None,
+                            FlatMatchScorerInputs {
+                                shared_scorer,
+                                ..Default::default()
+                            },
                         )
                         .await?,
                     )
@@ -4791,8 +4798,7 @@ impl Scanner {
                         &flat_query,
                         &flat_params,
                         filter_plan,
-                        None,
-                        None,
+                        FlatMatchScorerInputs::default(),
                     )
                     .await?;
                 (None, Some(flat_phrase_plan))
@@ -4858,8 +4864,7 @@ impl Scanner {
                             query,
                             params,
                             filter_plan,
-                            None,
-                            None,
+                            FlatMatchScorerInputs::default(),
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
@@ -4885,28 +4890,41 @@ impl Scanner {
                                 query,
                                 params,
                                 filter_plan,
-                                None,
-                                None,
+                                FlatMatchScorerInputs::default(),
                             )
                             .await?;
                         return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
                     }
                 };
-                if !self.fast_search
-                    && document_granularity == DocumentGranularity::Row
-                    && query.fuzziness == Some(0)
-                    && !stale_rows.is_empty()
-                {
-                    let plan = self
-                        .plan_target_flat_match_query(query, params, filter_plan)
-                        .await?;
-                    return Self::combine_fts_leaf_plans(None, Some(plan), params);
-                }
                 let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
                 let has_flat_path = !self.fast_search
                     && (!unindexed_fragments.is_empty() || !stale_rows.is_empty());
-                let shared_scorer = (has_flat_path && document_granularity.is_list_element())
-                    .then(|| Arc::new(SharedFtsScorer::new()));
+                let uses_current_row_scorer = has_flat_path
+                    && document_granularity == DocumentGranularity::Row
+                    && query.fuzziness == Some(0)
+                    && !stale_rows.is_empty();
+                let can_share_scorer = document_granularity.is_list_element()
+                    || (document_granularity == DocumentGranularity::Row
+                        && query.fuzziness == Some(0));
+                let shared_scorer =
+                    (has_flat_path && can_share_scorer).then(|| Arc::new(SharedFtsScorer::new()));
+                let (corpus_stats_input, flat_base_scorer) = if uses_current_row_scorer {
+                    let corpus_filter_plan = ExprFilterPlan::default();
+                    let (input, _) = self
+                        .plan_flat_match_input(
+                            target_fragments.to_vec(),
+                            HashMap::new(),
+                            query,
+                            &corpus_filter_plan,
+                        )
+                        .await?;
+                    (
+                        Some(input),
+                        Some(Arc::new(MemBM25Scorer::new(0, 0, HashMap::new()))),
+                    )
+                } else {
+                    (None, None)
+                };
                 let mut match_exec = match preset_segments {
                     Some(segments) => MatchQueryExec::new_with_segments_and_document_granularity(
                         self.dataset.clone(),
@@ -4940,8 +4958,11 @@ impl Scanner {
                             query,
                             params,
                             filter_plan,
-                            shared_scorer,
-                            None,
+                            FlatMatchScorerInputs {
+                                shared_scorer,
+                                corpus_stats_input,
+                                base_scorer: flat_base_scorer,
+                            },
                         )
                         .await?,
                     )
@@ -4965,8 +4986,7 @@ impl Scanner {
                         query,
                         params,
                         filter_plan,
-                        None,
-                        None,
+                        FlatMatchScorerInputs::default(),
                     )
                     .await?;
                 (None, Some(flat_match_plan))
@@ -5085,15 +5105,8 @@ impl Scanner {
                     BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
                 ));
             }
-            // Persisted statistics cannot subtract the old value of a stale
-            // row safely (including zero-token documents). Re-score the
-            // target field from current values instead of merging two corpus
-            // domains or losing a newly matching overlay value.
-            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC,
-            ));
         }
-        if unindexed_fragments.is_empty() {
+        if unindexed_fragments.is_empty() && stale_rows.is_empty() {
             return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
         }
         if !is_explicit_exact {
@@ -5123,7 +5136,26 @@ impl Scanner {
         }
 
         let shared_scorer = Arc::new(SharedFtsScorer::new());
-        let indexed_exec = CompoundQueryExec::new_with_segments(
+        let uses_current_corpus = !stale_rows.is_empty();
+        let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+        let (corpus_stats_input, flat_base_scorer) = if uses_current_corpus {
+            let corpus_filter_plan = ExprFilterPlan::default();
+            let (input, _) = self
+                .plan_flat_match_input(
+                    target_fragments.to_vec(),
+                    HashMap::new(),
+                    query,
+                    &corpus_filter_plan,
+                )
+                .await?;
+            (
+                Some(input),
+                Some(Arc::new(MemBM25Scorer::new(0, 0, HashMap::new()))),
+            )
+        } else {
+            (None, None)
+        };
+        let mut indexed_exec = CompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             FtsQuery::Match(query.clone()),
             params.clone(),
@@ -5132,6 +5164,9 @@ impl Scanner {
         )
         .with_shared_scorer(shared_scorer.clone())
         .with_external_mask(self.external_row_mask.clone());
+        if let Some(overlay_block) = overlay_block {
+            indexed_exec = indexed_exec.with_overlay_block(overlay_block);
+        }
         let indexed_plan = Arc::new(indexed_exec) as Arc<dyn ExecutionPlan>;
         let flat_plan = self
             .plan_flat_match_query(
@@ -5140,8 +5175,11 @@ impl Scanner {
                 query,
                 params,
                 filter_plan,
-                Some(shared_scorer),
-                None,
+                FlatMatchScorerInputs {
+                    shared_scorer: Some(shared_scorer),
+                    corpus_stats_input,
+                    base_scorer: flat_base_scorer,
+                },
             )
             .await?;
 
@@ -5294,9 +5332,13 @@ impl Scanner {
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
-        shared_scorer: Option<Arc<SharedFtsScorer>>,
-        corpus_stats_input: Option<Arc<dyn ExecutionPlan>>,
+        scorer_inputs: FlatMatchScorerInputs,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let FlatMatchScorerInputs {
+            shared_scorer,
+            corpus_stats_input,
+            base_scorer,
+        } = scorer_inputs;
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::internal("FTS Match query granularity was not resolved".to_string())
         })?;
@@ -5331,6 +5373,9 @@ impl Scanner {
         );
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        if let Some(base_scorer) = base_scorer {
+            flat_match_plan = flat_match_plan.with_base_scorer(base_scorer);
         }
         if let Some(corpus_stats_input) = corpus_stats_input {
             flat_match_plan = flat_match_plan.with_corpus_stats_input(corpus_stats_input);

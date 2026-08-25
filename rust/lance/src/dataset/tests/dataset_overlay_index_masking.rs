@@ -33,12 +33,13 @@ use lance_file::writer::FileWriterOptions;
 use crate::Dataset;
 use crate::dataset::ROW_ID;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
-use crate::dataset::transaction::{DataOverlayGroup, Operation, Transaction};
+use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::{BOUNDED_MIXED_FIELD_ROWS_METRIC, FlatMatchQueryExec};
+use crate::session::index_caches::IndexMetadataKey;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -800,18 +801,14 @@ async fn make_text_index_coverage_unknown(dataset: &mut Dataset) {
     let committed = dataset.load_indices_by_name("text_idx").await.unwrap();
     let mut replacement = committed.to_vec();
     replacement[0].fragment_bitmap = None;
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        Operation::CreateIndex {
-            new_indices: replacement,
-            removed_indices: committed.to_vec(),
-        },
-        None,
-    );
+    let metadata_key = IndexMetadataKey {
+        version: dataset.version().version,
+        store_identity: &dataset.object_store.store_prefix,
+    };
     dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-        .unwrap();
+        .index_cache
+        .insert_with_key(&metadata_key, Arc::new(replacement))
+        .await;
 }
 
 /// Collect sorted IDs of rows returned by an FTS query on `text`.
@@ -1114,10 +1111,11 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
             .unwrap();
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("fts_bounded_mixed_fallback_full_scan")
-                && plan.contains("AggregateExec")
-                && !plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
-            "overlay MultiMatch should fail closed to current-value flat scoring:\n{plan}"
+            plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC)
+                && plan.contains("CompoundFtsScorer")
+                && plan.contains("FlatMatchQuery")
+                && !plan.contains("AggregateExec"),
+            "known-coverage overlay MultiMatch should use bounded indexed-live plus targeted stale scoring:\n{plan}"
         );
     }
 
@@ -1213,8 +1211,8 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
         .unwrap();
     let plan = scan.explain_plan(false).await.unwrap();
     assert!(
-        plan.contains("fts_bounded_mixed_fallback_full_scan"),
-        "zero-token stale rows require current-value corpus statistics:\n{plan}"
+        plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "zero-token stale rows require the shared current-value corpus scorer:\n{plan}"
     );
     let batch = scan.try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 1);
@@ -1269,8 +1267,7 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
 async fn test_multimatch_unknown_coverage_overlay_full_scan_is_executable() {
     let mut dataset = create_text_dataset(false).await;
     build_text_fts_index(&mut dataset).await;
-    make_text_index_coverage_unknown(&mut dataset).await;
-    let dataset = commit_overlay(
+    let mut dataset = commit_overlay(
         dataset,
         "unknown_coverage_text_overlay",
         0,
@@ -1279,6 +1276,7 @@ async fn test_multimatch_unknown_coverage_overlay_full_scan_is_executable() {
         vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
     )
     .await;
+    make_text_index_coverage_unknown(&mut dataset).await;
 
     let query: FtsQuery = MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
         .unwrap()

@@ -15,6 +15,7 @@ use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
+use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::covering;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
@@ -1306,18 +1307,14 @@ async fn replace_index_segments_for_test(
     let committed = dataset.load_indices_by_name(index_name).await.unwrap();
     let mut replacement = committed.to_vec();
     mutate(&mut replacement);
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        Operation::CreateIndex {
-            new_indices: replacement,
-            removed_indices: committed.to_vec(),
-        },
-        None,
-    );
+    let metadata_key = IndexMetadataKey {
+        version: dataset.version().version,
+        store_identity: &dataset.object_store.store_prefix,
+    };
     dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-        .unwrap();
+        .index_cache
+        .insert_with_key(&metadata_key, Arc::new(replacement))
+        .await;
 }
 
 fn compound_multimatch_query() -> FtsQuery {
@@ -3282,17 +3279,18 @@ async fn test_compound_tie_uses_resolved_row_id() {
     let stats = collected_stats.lock().unwrap().take().unwrap();
     assert_eq!(
         stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
-        Some(&1)
+        Some(&2),
+        "duplicate same-field MultiMatch children execute independent exact collectors"
     );
     assert_eq!(
         stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
-        Some(&384)
+        Some(&768)
     );
     assert_eq!(
         stats
             .all_counts
             .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
-        Some(&1)
+        Some(&2)
     );
 
     let mut analyze_scanner = dataset.scan();
@@ -3302,20 +3300,23 @@ async fn test_compound_tie_uses_resolved_row_id() {
         .unwrap();
     analyze_scanner.limit(Some(1), None).unwrap();
     let analysis = analyze_scanner.analyze_plan().await.unwrap();
-    let compound_line = analysis
+    let compound_lines = analysis
         .lines()
-        .find(|line| line.contains("CompoundFtsScorer"))
-        .unwrap();
-    assert!(
-        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
-        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
-    );
-    assert!(
-        compound_line.contains(&format!(
-            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
-        )),
-        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
-    );
+        .filter(|line| line.contains("CompoundFtsScorer"))
+        .collect::<Vec<_>>();
+    assert_eq!(compound_lines.len(), 2);
+    for compound_line in compound_lines {
+        assert!(
+            compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
+            "compound FTS metrics missing the bounded candidate peak: {compound_line}"
+        );
+        assert!(
+            compound_line.contains(&format!(
+                "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+            )),
+            "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+        );
+    }
 }
 
 fn nested_fts_batch(

@@ -658,6 +658,8 @@ pub struct CompoundQueryExec {
     /// Corpus-wide scorer published by the residual branch of a mixed search.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Rows whose indexed values were superseded by a newer data overlay.
+    overlay_block: Option<RowAddrMask>,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
     /// [`MatchQueryExec::with_external_mask`]).
@@ -715,6 +717,7 @@ impl CompoundQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection,
+            overlay_block: None,
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -743,6 +746,12 @@ impl CompoundQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    /// Exclude rows whose indexed text was superseded by a newer data overlay.
+    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -901,6 +910,7 @@ impl ExecutionPlan for CompoundQueryExec {
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -921,6 +931,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let overlay_block = self.overlay_block.clone();
         let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
@@ -958,7 +969,7 @@ impl ExecutionPlan for CompoundQueryExec {
                 &prefilter_source,
                 dataset,
                 &segments,
-                None,
+                overlay_block,
                 external_mask,
             )?;
             let deleted_fragments =
@@ -1715,10 +1726,7 @@ impl SharedFtsScorer {
     }
 
     fn advance_generation(generation: &mut u64) -> u64 {
-        *generation = match generation.checked_add(1) {
-            Some(next) => next,
-            None => 1,
-        };
+        *generation = generation.checked_add(1).unwrap_or(1);
         *generation
     }
 
