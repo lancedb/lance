@@ -1,44 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::OnceLock;
-
 use lance_core::deepsize::DeepSizeOf;
 
+#[derive(PartialEq, Eq, Clone, DeepSizeOf)]
 pub struct Bitmap {
-    data: Vec<u8>,
-    len: usize,
-    count_ones: OnceLock<usize>,
-}
-
-impl Clone for Bitmap {
-    fn clone(&self) -> Self {
-        let count_ones = OnceLock::new();
-        if let Some(&count) = self.count_ones.get() {
-            count_ones
-                .set(count)
-                .expect("new count cache should be empty");
-        }
-        Self {
-            data: self.data.clone(),
-            len: self.len,
-            count_ones,
-        }
-    }
-}
-
-impl PartialEq for Bitmap {
-    fn eq(&self, other: &Self) -> bool {
-        self.data == other.data && self.len == other.len
-    }
-}
-
-impl Eq for Bitmap {}
-
-impl DeepSizeOf for Bitmap {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.data.deep_size_of_children(context)
-    }
+    pub data: Vec<u8>,
+    pub len: usize,
 }
 
 impl std::fmt::Debug for Bitmap {
@@ -73,11 +41,7 @@ impl Bitmap {
     }
 
     pub(crate) fn from_parts(data: Vec<u8>, len: usize) -> Self {
-        Self {
-            data,
-            len,
-            count_ones: OnceLock::new(),
-        }
+        Self { data, len }
     }
 
     #[inline]
@@ -91,12 +55,10 @@ impl Bitmap {
 
     pub fn set(&mut self, i: usize) {
         self.data[i / 8] |= 1 << (i % 8);
-        self.count_ones.take();
     }
 
     pub fn clear(&mut self, i: usize) {
         self.data[i / 8] &= !(1 << (i % 8));
-        self.count_ones.take();
     }
 
     pub fn get(&self, i: usize) -> bool {
@@ -116,12 +78,10 @@ impl Bitmap {
     }
 
     pub fn count_ones(&self) -> usize {
-        *self.count_ones.get_or_init(|| {
-            self.data
-                .iter()
-                .map(|&byte| byte.count_ones() as usize)
-                .sum()
-        })
+        self.data
+            .iter()
+            .map(|&byte| byte.count_ones() as usize)
+            .sum()
     }
 
     pub fn count_zeros(&self) -> usize {
@@ -248,25 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn test_count_ones_cache_tracks_clone_and_mutation() {
-        let mut bitmap = Bitmap::new_empty(10_000);
-        bitmap.set(3);
-        bitmap.set(9_999);
-        assert_eq!(bitmap.count_ones(), 2);
-        assert_eq!(bitmap.count_ones.get(), Some(&2));
+    fn test_count_ones_tracks_direct_data_mutation() {
+        let mut bitmap = Bitmap::new_empty(16);
+        assert_eq!(bitmap.count_ones(), 0);
 
-        let clone = bitmap.clone();
-        assert_eq!(clone.count_ones.get(), Some(&2));
-        assert_eq!(clone.count_ones(), 2);
+        bitmap.data[0] = 0b1010_0101;
+        assert_eq!(bitmap.count_ones(), 4);
 
-        bitmap.set(8);
-        assert!(bitmap.count_ones.get().is_none());
-        assert_eq!(bitmap.count_ones(), 3);
-
-        bitmap.clear(3);
-        assert!(bitmap.count_ones.get().is_none());
-        assert_eq!(bitmap.count_ones(), 2);
-        assert_eq!(clone.count_ones(), 2);
+        bitmap.data[1] = 0xff;
+        assert_eq!(bitmap.count_ones(), 12);
     }
 
     #[test]

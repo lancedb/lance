@@ -331,7 +331,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_cached_bitmap_popcount_does_not_change_serialization() {
+    fn test_bitmap_serialization_is_byte_exact() {
         let mut bitmap = Bitmap::new_full(10);
         bitmap.clear(2);
         let segment = U64Segment::RangeWithBitmap {
