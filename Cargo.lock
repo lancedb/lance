@@ -5093,6 +5093,7 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-datagen",
+ "lance-encoding",
  "lance-file",
  "lance-io",
  "lance-select",

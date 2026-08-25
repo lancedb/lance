@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+// PROTOTYPE ONLY (discussion lance-format/lance#7499).
+//
+// Full recursive, self-balancing Bε-tree manifest. Not a stable format; exists
+// to benchmark the counter-proposal. Reuses lance.table.{DataFragment,DataFile,
+// DeletionFile} so fragment byte sizes and (de)serialization are authentic.
+//
+// Node kinds:
+//   - Leaf     : a tabular Lance file (frag_id, fragment_pb) — the actual data.
+//   - Internal : this protobuf (ChildRef pivots + a TaggedAction ε-buffer).
+//   - Root     : the manifest — an InternalNode plus table metadata.
+
+syntax = "proto3";
+
+package lance.table;
+
+import "table.proto";
+
+// A pointer from a parent to a child node, with pivot bounds (the child owns the
+// contiguous key range [min_key, max_key]) and enough metadata to route + cost.
+message ChildRef {
+  string node_path = 1;    // path to the child file, relative to the dataset root
+  uint64 min_key = 2;      // smallest fragment id in the subtree
+  uint64 max_key = 3;      // largest fragment id in the subtree
+  uint64 num_keys = 4;     // fragments in the subtree
+  uint64 byte_size = 5;    // logical bytes of the child (leaf split/merge metric)
+  uint32 height = 6;       // 0 = leaf, >0 = internal
+  uint32 num_children = 7;  // direct children of the child (0 for a leaf); internal split/merge metric
+}
+
+// AddDataFile is the backfill / add-column action: attach a new DataFile to an
+// existing fragment. A "data replacement" is RemoveDataFile + AddDataFile.
+message AddDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+}
+
+message RemoveDataFile {
+  uint64 frag_id = 1;
+  string path = 2;
+}
+
+message AddDeletionFile {
+  uint64 frag_id = 1;
+  DeletionFile deletion_file = 2;
+}
+
+// A single ε-buffer message, keyed by the fragment id it targets.
+message FragmentAction {
+  oneof action {
+    DataFragment add_fragment = 1;
+    uint64 remove_fragment = 2;
+    AddDataFile add_data_file = 3;
+    RemoveDataFile remove_data_file = 4;
+    AddDeletionFile add_deletion_file = 5;
+  }
+}
+
+// A buffered message with its message sequence number (msn). Newer msn wins for
+// the same key; buffers are kept sorted by (target_key, msn).
+message TaggedAction {
+  uint64 msn = 1;
+  FragmentAction action = 2;
+}
+
+// An internal node: child pivots + this node's ε-buffer. Stored as a standalone
+// protobuf object `_bt/node/{uuid}.node`.
+message InternalNode {
+  repeated ChildRef children = 1;
+  repeated TaggedAction buffer = 2;
+}
+
+// The root node = the manifest. An internal node plus table-level metadata.
+message BeTreeRoot {
+  uint64 version = 1;
+  repeated ChildRef children = 2;
+  repeated TaggedAction buffer = 3;
+  // Next message sequence number to assign (monotonic).
+  uint64 next_msn = 4;
+  // Opaque serialized table schema.
+  bytes schema_pb = 5;
+  // Config echoed so readers can interpret the tree (node-size + branching-factor limits).
+  uint64 max_node_bytes = 6;
+  uint32 max_children_per_node = 7;
+}

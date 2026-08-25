@@ -21,6 +21,9 @@ fn main() -> Result<()> {
             "./protos/table.proto",
             "./protos/transaction.proto",
             "./protos/rowids.proto",
+            // PROTOTYPE (discussion #7499): Bε-tree manifest messages. Same
+            // `lance.table` package, so these merge into the existing `pb` module.
+            "./protos/betree.proto",
         ],
         &["./protos"],
     )?;
