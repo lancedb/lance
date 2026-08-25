@@ -598,6 +598,21 @@ impl ShardManifestStore {
     /// # Returns
     ///
     /// The successfully written manifest.
+    ///
+    /// # Concurrency
+    ///
+    /// Each losing CAS clears the store's shared position, so commits that
+    /// overlap within one CAS round-trip all fall back to a scan and retry —
+    /// roughly `n^2/2` scans for `n` of them. Commits spaced further apart than
+    /// that window cost nothing: the winner leaves its position warm for the
+    /// next one.
+    ///
+    /// `MAX_RETRIES` therefore bounds how many commits can overlap on one
+    /// handle: the unluckiest loses every round, so past ten concurrent commits
+    /// it exhausts its budget and returns the conflict instead of landing.
+    /// Reaching that needs eleven commit sources inside a single CAS, which no
+    /// current caller comes close to. Worth revisiting if one funnels many
+    /// independent writers through a single [`Self`].
     #[instrument(name = "manifest_commit_update", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn commit_update<F>(&self, local_epoch: u64, prepare_fn: F) -> Result<ShardManifest>
     where
