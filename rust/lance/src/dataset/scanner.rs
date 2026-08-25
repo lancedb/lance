@@ -5099,12 +5099,10 @@ impl Scanner {
             .filter(|fragment| unindexed_fragment_ids.contains(fragment.id as u32))
             .cloned()
             .collect::<Vec<_>>();
-        if !stale_rows.is_empty() {
-            if !is_explicit_exact {
-                return Ok(BoundedMixedFtsFieldPlan::ExhaustiveFallback(
-                    BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
-                ));
-            }
+        if !stale_rows.is_empty() && !is_explicit_exact {
+            return Ok(BoundedMixedFtsFieldPlan::ExhaustiveFallback(
+                BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
+            ));
         }
         if unindexed_fragments.is_empty() && stale_rows.is_empty() {
             return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
