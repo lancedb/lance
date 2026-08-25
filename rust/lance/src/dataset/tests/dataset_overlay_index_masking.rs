@@ -5,7 +5,7 @@
 //! queries stay correct while overlays remain (stale index hits are dropped and new
 //! matches are added by re-evaluating overlay-covered rows on the flat path).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::TryStreamExt;
 
@@ -15,11 +15,12 @@ use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
+use lance_index::metrics::MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery};
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
@@ -38,6 +39,7 @@ use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
+use lance_datafusion::exec::ExecutionSummaryCounts;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -1029,6 +1031,86 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
     assert!(
         mango_ids.contains(&6),
         "id=6 mango sorbet should still be found: {mango_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_field_overlay_masks() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text_a", DataType::Utf8, false),
+        ArrowField::new("text_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2])),
+            Arc::new(StringArray::from(vec!["apple", "apple", "none"])),
+            Arc::new(StringArray::from(vec!["none", "apple", "apple"])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    for column in ["text_a", "text_b"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    // Only text_a is stale for row 1. text_b must retain its indexed match,
+    // while text_a's stale posting is blocked and re-evaluated separately.
+    let dataset = commit_overlay(
+        dataset,
+        "multimatch_text_a_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec!["none"]))],
+    )
+    .await;
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "apple".to_owned(),
+        vec!["text_a".to_owned(), "text_b".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1]);
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&1)
     );
 }
 

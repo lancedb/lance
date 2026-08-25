@@ -50,7 +50,8 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
     CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
-    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
+    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, MULTIMATCH_PREFILTER_MATERIALIZATION_DURATION_METRIC,
+    MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
     WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
     WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
     WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
@@ -1902,6 +1903,16 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     // Index only the title after the append so it can retain a bounded plan
     // while the partially covered body uses the exhaustive leaf fallback.
     create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
+    partial_dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
     assert_compound_matches_independent_oracle(
         &partial_dataset,
         "partial_top_level_cross_column_multimatch",
@@ -1921,7 +1932,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         1,
         "only the fully indexed title field should attempt a bounded WAND certificate"
     );
-    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
         "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
@@ -1934,6 +1945,297 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     assert!(
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
+    );
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut partial_scan = partial_dataset.scan();
+    partial_scan
+        .prefilter(true)
+        .with_row_id()
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    partial_scan.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&1),
+        "bounded and partial field paths must share the base prefilter"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_multimatch_materializes_prefilter_once(
+    #[values(false, true)] use_scalar_index: bool,
+) {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    expected.truncate(LIMIT);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(use_scalar_index)
+        .with_row_id()
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert_eq!(
+        plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should keep their bounded scorer:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        usize::from(use_scalar_index) * 2,
+        "each field should declare the shared prefilter dependency:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    let actual = batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_multimatch_prefilter", &actual, &expected);
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&1)
+    );
+    assert!(
+        stats
+            .all_times
+            .contains_key(MULTIMATCH_PREFILTER_MATERIALIZATION_DURATION_METRIC)
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_prefilter_sharing_controls() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let two_fields: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let (_, stats) = compound_fts_results_with_stats(&dataset, two_fields, 2).await;
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&0),
+        "a MultiMatch without a filter must not install shared materialization"
+    );
+
+    let one_field: FtsQuery =
+        MultiMatchQuery::try_new("noise".to_owned(), vec!["title".to_owned()])
+            .unwrap()
+            .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(one_field))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&0),
+        "a one-field MultiMatch must keep the ordinary prefilter path"
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_deletes() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset.delete("id = 1").await.unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    expected.truncate(3);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .with_row_id()
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_prefilter_deletes", &actual, &expected);
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&1)
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_when_first_field_is_flat_only() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["body".to_owned(), "title".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("FlatMatchQuery") && plan.contains("SharedMultiMatchPrefilter"),
+        "the later indexed field must retain the declared shared source:\n{plan}"
+    );
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats
+            .all_counts
+            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
+        Some(&1)
     );
 }
 
