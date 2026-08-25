@@ -499,7 +499,6 @@ impl BytesBackend {
                 let mut nulls: Vec<RowPosition> = Vec::new();
                 let had_existing_nulls = !self.null_positions.lock().unwrap().is_empty();
                 let mut saw_null = false;
-                let mut spilled_key_bytes = 0;
                 for row_idx in 0..typed.len() {
                     let position = row_offset + row_idx as u64;
                     if typed.is_null(row_idx) {
@@ -515,7 +514,18 @@ impl BytesBackend {
                             bytes: InlineBytes::new(bytes),
                             position,
                         };
-                        spilled_key_bytes += key.bytes.heap_bytes();
+                        // Charge before publishing, the way the arena charges
+                        // a chunk before the node that lives in it: the insert
+                        // below splices the node in with `Release`, so a reader
+                        // that can reach the key can also see its payload. A
+                        // per-batch total added afterwards would leave a whole
+                        // in-flight batch of keys visible but uncharged, and an
+                        // admission sample landing there reads low. Inline keys
+                        // own nothing, so they skip the atomic entirely.
+                        let spilled = key.bytes.heap_bytes();
+                        if spilled > 0 {
+                            self.key_heap_bytes.fetch_add(spilled, Ordering::Relaxed);
+                        }
                         had_existing |= writer.insert_and_check_neighbors(key, |prev, next| {
                             prev.is_some_and(|key| key.bytes.as_slice() == bytes)
                                 || next.is_some_and(|key| key.bytes.as_slice() == bytes)
@@ -523,8 +533,6 @@ impl BytesBackend {
                     }
                 }
                 drop(writer);
-                self.key_heap_bytes
-                    .fetch_add(spilled_key_bytes, Ordering::Relaxed);
                 if !nulls.is_empty() {
                     self.null_positions.lock().unwrap().extend(nulls);
                 }
@@ -1349,6 +1357,59 @@ mod tests {
             "resident {} must cover the {key_bytes} bytes of spilled key payload",
             index.resident_bytes()
         );
+    }
+
+    /// Charging the batch's total after the loop is not enough: each key is
+    /// reachable to lock-free readers the moment it is spliced in, so an
+    /// admission sample landing mid-batch would see a growing index against a
+    /// stale byte total and admit a write it should have refused. The charge
+    /// has to land before the key it pays for.
+    #[test]
+    fn test_resident_bytes_covers_keys_already_published() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
+        let rows = 2_000usize;
+        let width = 8 * 1024usize;
+        let values: Vec<String> = (0..rows)
+            .map(|i| format!("{i:07}{}", "z".repeat(width - 7)))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(values)) as Arc<dyn Array>],
+        )
+        .unwrap();
+
+        let index = Arc::new(BTreeMemIndex::new(0, "s".to_string()));
+        let inserting = Arc::clone(&index);
+        let handle = std::thread::spawn(move || inserting.insert(&batch, 0).unwrap());
+
+        // Sample until the insert is partway through. Every sample that catches
+        // it there must already account for the keys it can see; the loop is
+        // only about *reaching* that state, so the assertion is inside it.
+        let mut sampled_mid_insert = false;
+        while !handle.is_finished() {
+            let published = index.len();
+            if published == 0 || published >= rows {
+                std::hint::spin_loop();
+                continue;
+            }
+            sampled_mid_insert = true;
+            let charged = index.resident_bytes();
+            assert!(
+                charged >= published * width,
+                "{published} keys are visible but only {charged} bytes are charged"
+            );
+        }
+        handle.join().unwrap();
+
+        assert!(
+            sampled_mid_insert,
+            "the insert never became observable partway through, so nothing was proven"
+        );
+        assert!(index.resident_bytes() >= rows * width);
     }
 
     #[test]
