@@ -8934,6 +8934,129 @@ mod tests {
         ).await.unwrap();
     }
 
+    /// #4583 use case 3: which side of the merge_insert hash join gets buffered
+    /// is decided by the source's statistics, not by the order `create_plan`
+    /// writes the join in. `create_plan` always puts the target on the left, so
+    /// without a swap the target is always the build side.
+    ///
+    /// The target here is one row past DataFusion's
+    /// `hash_join_single_partition_threshold_rows`, and `FilteredReadExec`
+    /// reports no `total_byte_size`, so the target can never be the collected
+    /// side. That leaves the source: a materialized one reports exact statistics
+    /// and fits under the threshold, so `JoinSelection` swaps it onto the build
+    /// side and rewrites `Right` into `Left`. A one-shot stream reports `Absent`
+    /// for everything, neither side qualifies, and the plan falls back to a
+    /// partitioned join that still buffers the whole target.
+    ///
+    /// The one-shot provider used below stands in for every non-materialized
+    /// source: `stream_source_to_provider` sends the default path through
+    /// `spilling_table_provider`, which also hands back a `StreamingTable` and so
+    /// reports the same absent statistics.
+    ///
+    /// This is about which side is buffered, not about how much the target reads.
+    /// The target scan projects `other` either way, because the `RewriteRows` fill
+    /// reads it from the target side of the join.
+    #[tokio::test]
+    async fn test_plan_join_build_side_follows_source_statistics() {
+        fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
+            if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+                return Some(join);
+            }
+            for child in plan.children() {
+                if let Some(join) = find_hash_join(child.as_ref()) {
+                    return Some(join);
+                }
+            }
+            None
+        }
+
+        fn sides(join: &HashJoinExec) -> (String, String) {
+            let render = |plan: &Arc<dyn ExecutionPlan>| {
+                format!(
+                    "{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                )
+            };
+            (render(join.left()), render(join.right()))
+        }
+
+        // One row past datafusion.optimizer.hash_join_single_partition_threshold_rows.
+        const TARGET_ROWS: u64 = 128 * 1024 + 1;
+
+        let target = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(TARGET_ROWS), BatchCount::from(1));
+        let ds = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
+
+        // Partial schema: the source omits `other`, so on the RewriteRows path
+        // whichever side is collected carries `other` for every row it holds.
+        let source = record_batch!(
+            ("key", UInt32, [0, 1, 2, 3]),
+            ("value", UInt32, [10, 11, 12, 13])
+        )
+        .unwrap();
+
+        let new_job = || {
+            crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+
+        let materialized: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(source.schema(), vec![vec![source.clone()]])
+                .unwrap(),
+        );
+        let plan = new_job().create_plan(materialized).await.unwrap();
+        let join =
+            find_hash_join(plan.as_ref()).expect("materialized source must plan a hash join");
+        let (build, probe) = sides(join);
+        assert_eq!(
+            (*join.partition_mode(), *join.join_type()),
+            (PartitionMode::CollectLeft, JoinType::Left),
+            "an exact-statistics source fits under the collect threshold, so the inputs are \
+             swapped and Right is rewritten to Left. build side was:\n{build}"
+        );
+        assert!(
+            build.contains("DataSourceExec") && !build.contains("LanceRead"),
+            "the source must be the collected side:\n{build}"
+        );
+        assert!(
+            probe.contains("LanceRead"),
+            "the target must be the probe side, which is the side a hash join offers its \
+             dynamic filter to:\n{probe}"
+        );
+
+        let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
+        let stream_plan = new_job()
+            .create_plan(one_shot_provider(reader_to_stream(Box::new(reader))).unwrap())
+            .await
+            .unwrap();
+        let join =
+            find_hash_join(stream_plan.as_ref()).expect("stream source must plan a hash join");
+        let (build, probe) = sides(join);
+        assert_eq!(
+            (*join.partition_mode(), *join.join_type()),
+            (PartitionMode::Partitioned, JoinType::Right),
+            "with no source statistics neither side qualifies, so nothing is swapped and both \
+             sides are hash-repartitioned instead. build side was:\n{build}"
+        );
+        assert!(
+            build.contains("LanceRead"),
+            "the target stays the collected side, so it buffers `other` for every one of its \
+             rows:\n{build}"
+        );
+        assert!(
+            probe.contains("StreamingTableExec"),
+            "the source stays the probe side:\n{probe}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fast_path_update_only() {
         let data = lance_datagen::gen_batch()
