@@ -434,6 +434,12 @@ impl Transaction {
                 groups,
             )?);
             replacement.uuid = rewritten_index.new_id;
+            if replacements
+                .iter()
+                .any(|replacement| replacement.old_id != replacement.new_id)
+            {
+                replacement.base_id = None;
+            }
             replacement.index_details = Some(Arc::new(rewritten_index.new_index_details.clone()));
             replacement.index_version = rewritten_index.new_index_version as i32;
             replacement.dataset_version = source_indices
@@ -999,20 +1005,22 @@ mod tests {
 
     #[test]
     fn test_handle_rewrite_indices_merges_source_segments() {
-        let first = create_test_index(
+        let mut first = create_test_index(
             "vector_idx",
             1,
             3,
             Some(RoaringBitmap::from_iter([1])),
             true,
         );
-        let second = create_test_index(
+        let mut second = create_test_index(
             "vector_idx",
             1,
             4,
             Some(RoaringBitmap::from_iter([2])),
             true,
         );
+        first.base_id = Some(0);
+        second.base_id = Some(0);
         let first_id = first.uuid;
         let second_id = second.uuid;
         let merged_id = Uuid::new_v4();
@@ -1048,6 +1056,7 @@ mod tests {
         assert_eq!(indices[0].uuid, merged_id);
         assert_eq!(indices[0].dataset_version, 3);
         assert_eq!(indices[0].index_version, 2);
+        assert_eq!(indices[0].base_id, None);
         assert_eq!(indices[0].index_details.as_deref(), Some(&details));
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),

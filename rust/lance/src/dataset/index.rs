@@ -10,9 +10,10 @@ use std::sync::Arc;
 use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
+use crate::index::vector::ivf::{VectorSegmentCompatibility, vector_segment_compatibility};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -64,6 +65,43 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
 struct DatasetIndexRemapper {
     dataset: Arc<Dataset>,
     indices: Arc<Vec<IndexMetadata>>,
+}
+
+pub(crate) async fn vector_segments_can_merge_for_compaction(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> bool {
+    if segments.len() < 2
+        || segments.iter().any(|segment| {
+            !segment
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+        })
+        || segments
+            .iter()
+            .any(|segment| segment.fields != segments[0].fields)
+        || segments[0].fields.len() != 1
+    {
+        return false;
+    }
+
+    let Ok(column) = dataset.schema().field_path(segments[0].fields[0]) else {
+        return false;
+    };
+    let Ok(logical_index) = dataset
+        .open_logical_vector_index(&column, &segments[0].name)
+        .await
+    else {
+        return false;
+    };
+    let Ok(ivf) = logical_index.as_ivf() else {
+        return false;
+    };
+    matches!(
+        vector_segment_compatibility(&ivf, "compaction"),
+        Ok(VectorSegmentCompatibility::SharedModel)
+    )
 }
 
 impl DatasetIndexRemapper {
@@ -131,14 +169,7 @@ impl DatasetIndexRemapper {
         segments: &[&IndexMetadata],
         mapping: &RowAddrRemap,
     ) -> Result<Option<Vec<RemappedIndex>>> {
-        if segments.len() < 2
-            || segments.iter().any(|segment| {
-                !segment
-                    .index_details
-                    .as_ref()
-                    .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
-            })
-        {
+        if !vector_segments_can_merge_for_compaction(&self.dataset, segments).await {
             return Ok(None);
         }
 

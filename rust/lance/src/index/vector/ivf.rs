@@ -454,6 +454,7 @@ enum VectorModelMismatch {
     StorageFormat,
     IvfCentroids,
     QuantizerMetadata,
+    HnswBuildParameters,
 }
 
 fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
@@ -526,6 +527,8 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     let first = indices.first()?;
     let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();
+    let first_hnsw_params = matches!(first.sub_index_type().0, SubIndexType::Hnsw)
+        .then(|| derive_hnsw_params(first.as_ref()));
 
     for index in indices.iter().skip(1) {
         if first.as_any().type_id() != index.as_any().type_id() {
@@ -544,6 +547,12 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
         if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
             return Some(VectorModelMismatch::QuantizerMetadata);
         }
+
+        if let Some(first_hnsw_params) = first_hnsw_params.as_ref()
+            && !hnsw_build_params_eq(first_hnsw_params, &derive_hnsw_params(index.as_ref()))
+        {
+            return Some(VectorModelMismatch::HnswBuildParameters);
+        }
     }
 
     None
@@ -555,6 +564,16 @@ pub(crate) fn vector_segment_compatibility(
 ) -> Result<VectorSegmentCompatibility> {
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
+
+    let mut versions = logical_index
+        .segments()
+        .map(|(metadata, _)| metadata.index_version);
+    if let Some(first_version) = versions.next()
+        && versions.any(|version| version != first_version)
+    {
+        return Ok(VectorSegmentCompatibility::QueryCompatibleModelsDiffer);
+    }
+
     Ok(if vector_model_mismatch(&indices).is_none() {
         VectorSegmentCompatibility::SharedModel
     } else {
@@ -573,6 +592,9 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
         ))),
         Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
             "{operation}: vector index segments do not share quantizer metadata"
+        ))),
+        Some(VectorModelMismatch::HnswBuildParameters) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share HNSW build parameters"
         ))),
         None => Ok(()),
     }
