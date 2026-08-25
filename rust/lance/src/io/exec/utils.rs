@@ -207,6 +207,11 @@ pub(crate) struct SharedPreFilterMetrics {
     pub materialization_duration: Time,
 }
 
+pub(crate) struct PreFilterMasks {
+    pub overlay_block: Option<RowAddrMask>,
+    pub external_mask: Option<Arc<RowAddrMask>>,
+}
+
 impl PreFilterSource {
     /// Return a plan-local shared form for a MultiMatch with multiple fields.
     /// No-filter and already-shared sources retain their existing identity.
@@ -375,8 +380,7 @@ pub(crate) fn build_prefilter(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
-    overlay_block: Option<RowAddrMask>,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
     shared_metrics: SharedPreFilterMetrics,
 ) -> Result<Arc<DatasetPreFilter>> {
     let mut shared_filter = None;
@@ -420,7 +424,7 @@ pub(crate) fn build_prefilter(
     // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
     // applies separately to drop index entries staled by a data overlay.
     let mut prefilter = if let Some(shared_filter) = shared_filter {
-        let shared_filter = match external_mask {
+        let shared_filter = match masks.external_mask {
             Some(mask) => async move {
                 Ok(Arc::new(
                     mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
@@ -431,7 +435,7 @@ pub(crate) fn build_prefilter(
         };
         DatasetPreFilter::new_with_filter_future(ds, index_meta, Some(shared_filter))
     } else {
-        let prefilter_loader = match external_mask {
+        let prefilter_loader = match masks.external_mask {
             Some(mask) => {
                 Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
             }
@@ -439,7 +443,7 @@ pub(crate) fn build_prefilter(
         };
         DatasetPreFilter::new(ds, index_meta, prefilter_loader)
     };
-    if let Some(overlay_block) = overlay_block {
+    if let Some(overlay_block) = masks.overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))

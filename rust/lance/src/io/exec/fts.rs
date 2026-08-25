@@ -37,7 +37,7 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, SharedPreFilterMetrics, build_prefilter};
+use super::utils::{IndexMetrics, PreFilterMasks, SharedPreFilterMetrics, build_prefilter};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -1046,8 +1046,10 @@ impl ExecutionPlan for CompoundQueryExec {
                 &prefilter_source,
                 dataset,
                 &segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
                 metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =
@@ -1631,8 +1633,10 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 &prefilter_source,
                 dataset.clone(),
                 &selected_segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
                 metrics.shared_prefilter_metrics(),
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
@@ -2938,8 +2942,10 @@ impl ExecutionPlan for MatchQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
                 metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =
@@ -4236,8 +4242,10 @@ impl ExecutionPlan for PhraseQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
                 metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =

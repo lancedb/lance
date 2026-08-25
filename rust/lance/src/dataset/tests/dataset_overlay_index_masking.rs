@@ -1041,12 +1041,14 @@ async fn test_multimatch_shared_prefilter_preserves_field_overlay_masks() {
         ArrowField::new("text_a", DataType::Utf8, false),
         ArrowField::new("text_b", DataType::Utf8, false),
     ]));
+    // Row 0 matches text_a, row 1 matches both fields before its overlay,
+    // and row 2 is a negative control.
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(Int32Array::from(vec![0, 1, 2])),
             Arc::new(StringArray::from(vec!["apple", "apple", "none"])),
-            Arc::new(StringArray::from(vec!["none", "apple", "apple"])),
+            Arc::new(StringArray::from(vec!["none", "apple", "none"])),
         ],
     )
     .unwrap();
