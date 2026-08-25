@@ -548,7 +548,9 @@ def test_index_with_nans(tmp_path, index_file_version):
 def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
 
-    tbl = create_table(nvec=256, ndim=32, nans=8)
+    # Torch PQ initialization samples 256 valid residuals. Keep a small margin
+    # after NaN filtering so every platform can produce a complete sample batch.
+    tbl = create_table(nvec=320, ndim=32, nans=8)
 
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
