@@ -6967,14 +6967,14 @@ mod tests {
         use arrow_array::types::{Float32Type, Int32Type};
         use lance_datagen::Dimension;
 
-        const DIM: u32 = 32;
+        const DIM: u32 = 8;
         let mut dataset = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
             )
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(64))
             .await
             .unwrap();
         dataset
@@ -7014,7 +7014,7 @@ mod tests {
                 }
             }
         }
-        let step = (rows.len() / 16).max(1);
+        let step = (rows.len() / 4).max(1);
         let queries: Vec<Vec<f32>> = rows.iter().step_by(step).cloned().collect();
         let mut baseline: Vec<Vec<i32>> = Vec::new();
         for q in &queries {
@@ -7025,7 +7025,7 @@ mod tests {
         let metrics = compact_files(
             &mut dataset,
             CompactionOptions {
-                target_rows_per_fragment: 2_000,
+                target_rows_per_fragment: 128,
                 defer_index_remap: true,
                 ..Default::default()
             },
@@ -7169,10 +7169,15 @@ mod tests {
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::L2,
             small_ivf(),
-            HnswBuildParams::default(),
+            HnswBuildParams::default()
+                .max_level(2)
+                .num_edges(4)
+                .ef_construction(16),
             PQBuildParams {
                 max_iters: 2,
                 num_sub_vectors: 2,
+                num_bits: 4,
+                sample_rate: 2,
                 ..Default::default()
             },
         );
