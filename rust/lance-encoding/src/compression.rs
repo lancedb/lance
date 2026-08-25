@@ -1063,6 +1063,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression_config,
                 )))
             }
+            compression @ (Compression::Range(_) | Compression::Delta(_)) => {
+                Err(Error::not_supported_source(
+                    format!(
+                        "{} compression is only supported in block positions",
+                        compression_name(compression)
+                    )
+                    .into(),
+                ))
+            }
             _ => todo!(),
         }
     }
@@ -1258,32 +1267,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let child = delta.deltas.as_deref().ok_or_else(|| {
                     Error::invalid_input("Delta is missing its deltas child encoding")
                 })?;
-                let child_bits = match child.compression.as_ref() {
-                    Some(Compression::Flat(flat)) => flat.bits_per_value,
-                    Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
-                    Some(Compression::InlineBitpacking(bitpacking)) => {
-                        bitpacking.uncompressed_bits_per_value
-                    }
-                    Some(Compression::OutOfLineBitpacking(bitpacking)) => {
-                        bitpacking.uncompressed_bits_per_value
-                    }
-                    Some(other) => {
-                        return Err(Error::invalid_input(format!(
-                            "Delta does not support a {} child",
-                            compression_name(other)
-                        )));
-                    }
-                    None => {
-                        return Err(Error::invalid_input(
-                            "Delta child is missing its compression variant",
-                        ));
-                    }
-                };
-                if child_bits != bits_per_value {
-                    return Err(Error::invalid_input(format!(
-                        "Delta child declares {child_bits}-bit values, expected {bits_per_value}"
-                    )));
-                }
+                validate_delta_child_encoding(child, bits_per_value)?;
                 let child = self.create_block_decompressor(child)?;
                 Ok(Box::new(DeltaDecompressor::new(
                     bits_per_value,
@@ -1295,6 +1279,38 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         }
     }
 }
+
+pub(crate) fn validate_delta_child_encoding(
+    child: &CompressiveEncoding,
+    expected_bits_per_value: u64,
+) -> Result<()> {
+    let child_bits_per_value = match child.compression.as_ref() {
+        Some(Compression::Flat(flat)) => flat.bits_per_value,
+        Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
+        Some(Compression::InlineBitpacking(bitpacking)) => bitpacking.uncompressed_bits_per_value,
+        Some(Compression::OutOfLineBitpacking(bitpacking)) => {
+            bitpacking.uncompressed_bits_per_value
+        }
+        Some(other) => {
+            return Err(Error::invalid_input(format!(
+                "Delta does not support a {} child",
+                compression_name(other)
+            )));
+        }
+        None => {
+            return Err(Error::invalid_input(
+                "Delta child is missing its compression variant",
+            ));
+        }
+    };
+    if child_bits_per_value != expected_bits_per_value {
+        return Err(Error::invalid_input(format!(
+            "Delta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn create_rle_decompressor(
     rle: &crate::format::pb21::Rle,
     decompression_strategy: &dyn DecompressionStrategy,
