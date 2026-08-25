@@ -245,7 +245,8 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns `Error::AlreadyExists` if another writer already wrote this version.
+    /// Returns [`Error::RetryableCommitConflict`] if another writer already
+    /// holds this version.
     #[instrument(name = "manifest_write", level = "debug", skip_all, fields(shard_id = %self.shard_id, version = manifest.version, epoch = manifest.writer_epoch))]
     pub(crate) async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
         let version = manifest.version;
@@ -290,12 +291,16 @@ impl ShardManifestStore {
     }
 
     /// The error for a version another writer already holds. `commit_update`
-    /// keys its retry on this wording.
+    /// matches on the variant to decide whether to retry.
     fn version_taken(&self, version: u64) -> Error {
-        Error::io(format!(
-            "Manifest version {} already exists for shard {}",
-            version, self.shard_id
-        ))
+        Error::retryable_commit_conflict_source(
+            version,
+            format!(
+                "Manifest version {} already exists for shard {}",
+                version, self.shard_id
+            )
+            .into(),
+        )
     }
 
     /// Find the latest manifest version.
@@ -644,7 +649,7 @@ impl ShardManifestStore {
                 }
                 Err(e) => {
                     // Check if it's a version conflict (can retry) vs other error
-                    let is_version_conflict = e.to_string().contains("already exists");
+                    let is_version_conflict = matches!(e, Error::RetryableCommitConflict { .. });
 
                     if is_version_conflict && attempt < MAX_RETRIES - 1 {
                         continue;
@@ -810,7 +815,7 @@ mod tests {
 
     /// The cached read and the storage read agree after a write.
     #[tokio::test]
-    async fn read_latest_serves_the_written_manifest() {
+    async fn latest_serves_the_written_manifest() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
@@ -829,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_latest_empty() {
+    async fn test_latest_empty() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
@@ -1175,8 +1180,12 @@ mod tests {
 
         let mut replay = claimed.clone();
         replay.current_generation = 42;
-        let error = ours.write(&replay).await.unwrap_err().to_string();
-        assert!(error.contains("already exists"), "{}", error);
+        let error = ours.write(&replay).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "the variant is what commit_update retries on: {:?}",
+            error
+        );
         assert!(
             ours.cached().is_none(),
             "a collision must drop the position so the retry re-reads"
