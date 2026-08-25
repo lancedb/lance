@@ -547,7 +547,16 @@ pub fn wrap_with_row_id_and_delete(
                                 .collect::<Vec<_>>(),
                         ),
                     };
-                    Arc::new(values)
+                    if values.len() != num_rows as usize {
+                        return Err(Error::corrupt_file_named(
+                            "row ID metadata",
+                            format!(
+                                "decoded row IDs at selected offset {this_offset} contain {} rows, but the current batch requires {num_rows} rows",
+                                values.len()
+                            ),
+                        ));
+                    }
+                    Ok(Arc::new(values))
                 })
             });
             batch_task
@@ -558,7 +567,7 @@ pub fn wrap_with_row_id_and_delete(
                         this_offset,
                         fragment_id,
                         config.as_ref(),
-                        row_ids,
+                        row_ids.transpose()?,
                     )
                 })
                 .boxed()
@@ -796,6 +805,40 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(actual, vec![4, 4, 10]);
+    }
+
+    #[tokio::test]
+    async fn test_truncated_stable_row_ids_returns_error() {
+        let task = ReadBatchTask {
+            num_rows: 10,
+            task: std::future::ready(Ok(
+                arrow_array::record_batch!(("x", Int32, vec![0; 10])).unwrap()
+            ))
+            .boxed(),
+        };
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(RowIdSequence::try_from_iter(0_u64..5).unwrap())),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 10,
+        };
+
+        let error = super::wrap_with_row_id_and_delete(stream::iter([task]).boxed(), 0, config)
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(
+            "decoded row IDs at selected offset 0 contain 5 rows, but the current batch requires 10 rows"
+        ));
     }
 
     #[tokio::test]
