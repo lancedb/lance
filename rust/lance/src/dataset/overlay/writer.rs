@@ -54,19 +54,6 @@ use crate::dataset::versions;
 use crate::dataset::write::GenericWriter;
 
 /// Why staging a data overlay failed.
-///
-/// [`FileFragment::write_columns`], the dense sibling of this API, returns the
-/// crate-wide [`Error`], and a caller that only propagates can have that here
-/// too — `WriteOverlayError` converts into it. The difference is that a caller
-/// driving a backfill can usually *do* something about an overlay-shaped
-/// mistake: re-sort a batch that arrived out of order, split one that spans a
-/// range of fragments, drop the deleted rows a scan handed back as null
-/// addresses. Naming those cases lets it branch on them instead of matching on
-/// message text.
-///
-/// Classification is best-effort, not exhaustive: an I/O or encoding failure
-/// from underneath arrives as [`Other`](Self::Other), and so does anything a
-/// future revision adds without a variant of its own.
 #[derive(Debug, Snafu)]
 pub enum WriteOverlayError {
     /// The declared schema names a field the dataset does not define, or defines
