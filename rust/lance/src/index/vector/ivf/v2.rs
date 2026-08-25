@@ -4603,14 +4603,20 @@ mod tests {
         test_pq_matrix_case(nlist, distance_type, IndexFileVersion::V3).await;
     }
 
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
     #[tokio::test]
-    async fn test_ivf_pq_distance_range() {
-        let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
+    async fn test_ivf_pq_distance_range(#[case] version: IndexFileVersion) {
+        let params = pq_matrix_params(1, DistanceType::L2, version);
         test_distance_range(Some(params), 1).await;
     }
 
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
     #[tokio::test]
-    async fn test_ivf_pq_f64_smoke() {
+    async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
         let test_dir = TempStrDir::default();
         let batch = pq_matrix_batch::<Float64Type>();
         let schema = batch.schema();
@@ -4619,12 +4625,18 @@ mod tests {
         let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
             .await
             .unwrap();
-        let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
+        let params = pq_matrix_params(1, DistanceType::L2, version);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
         test_recall::<Float64Type>(params, 1, 0.5, "vector", &dataset, vectors).await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
+        let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+        test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
     }
 
     #[tokio::test]
@@ -5211,6 +5223,8 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
+        assert_eq!(row_ids.len(), k);
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), k);
         let dists = result[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
