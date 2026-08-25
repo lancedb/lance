@@ -6640,6 +6640,254 @@ mod tests {
     }
 
     #[test]
+    fn test_weighted_assignment_ignores_zero_weight_rows() {
+        let data = f32_fsl_from_values(vec![0.0, 10.0], 1).unwrap();
+        let result = assign_weighted_f32_points(
+            &data,
+            &[1.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0, 10.0],
+            &L2_METRIC_POLICY,
+        )
+        .unwrap();
+        assert_eq!(result.cluster_weights, vec![1.0, 0.0]);
+        assert_eq!(result.centroids, vec![0.0, 10.0]);
+        assert_eq!(result.loss, 0.0);
+    }
+
+    #[test]
+    fn test_weighted_hierarchical_rejects_empty_and_mismatched_inputs() {
+        let progress = Arc::new(|_: u32, _: u32| {});
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: 1,
+            target_k: 2,
+            metric_policy: &L2_METRIC_POLICY,
+            max_iters: 1,
+            on_progress: progress,
+        };
+        let empty = f32_fsl_from_values(Vec::new(), 1).unwrap();
+        assert!(train_weighted_hierarchical_f32_kmeans(&empty, &[], &[], &params).is_err());
+        let data = f32_fsl_from_values(vec![0.0, 1.0], 1).unwrap();
+        let error = train_weighted_hierarchical_f32_kmeans(&data, &[1.0], &[0.0, 0.0], &params)
+            .unwrap_err();
+        assert!(error.to_string().contains("input lengths do not match"));
+    }
+
+    #[test]
+    fn test_weighted_hierarchical_splits_until_target_k() {
+        let values = (0..16)
+            .flat_map(|value| [value as f32, value as f32 + 0.1])
+            .collect::<Vec<_>>();
+        let data = f32_fsl_from_values(values, 1).unwrap();
+        let progress = Arc::new(|_: u32, _: u32| {});
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: 1,
+            target_k: 17,
+            metric_policy: &L2_METRIC_POLICY,
+            max_iters: 3,
+            on_progress: progress,
+        };
+        let result = train_weighted_hierarchical_f32_kmeans(
+            &data,
+            &vec![1.0; 32],
+            &vec![0.0; 32],
+            &params,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 17);
+        let values = result.values().as_primitive::<Float32Type>().values();
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|left, right| left.total_cmp(right));
+        assert!(sorted.windows(2).filter(|pair| (pair[0] - pair[1]).abs() > 0.001).count() >= 16);
+    }
+
+    #[test]
+    fn test_weighted_update_all_points_single_cluster_and_duplicates() {
+        let data = f32_fsl_from_values(vec![3.0, 3.0, 3.0], 1).unwrap();
+        let result = assign_weighted_f32_points(
+            &data,
+            &[1.0, 2.0, 3.0],
+            &[0.0, 0.0, 0.0],
+            &[0.0, 10.0],
+            &L2_METRIC_POLICY,
+        )
+        .unwrap();
+        assert_eq!(result.cluster_weights, vec![6.0, 0.0]);
+        assert_eq!(result.centroids, vec![3.0, 10.0]);
+        assert_eq!(result.membership, vec![Some(0), Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn test_weighted_update_tie_breaks_to_first_centroid() {
+        let data = f32_fsl_from_values(vec![0.0], 1).unwrap();
+        let result = assign_weighted_f32_points(
+            &data,
+            &[1.0],
+            &[0.0],
+            &[-1.0, 1.0],
+            &L2_METRIC_POLICY,
+        )
+        .unwrap();
+        assert_eq!(result.membership, vec![Some(0)]);
+        assert_eq!(result.cluster_weights, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_streaming_partition_boundary_and_sample_rate_helpers() {
+        assert_eq!(streaming_local_coreset_k(256, 256, 16, 1, false), 256);
+        assert_eq!(streaming_local_coreset_k(257, 257, 16, 1, false), 257);
+        assert_eq!(streaming_coreset_rate(256, 1, None), 1);
+        assert_eq!(streaming_coreset_rate(256, 256, None), 64);
+        assert_eq!(streaming_coreset_rate(256, 256, Some(16)), 16);
+        assert_eq!(streaming_coreset_rate(1, 256, None), 1);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_coreset_rejects_insufficient_sample() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/insufficient", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<Float32Type>(2.into()))
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 1;
+        params.streaming_sample_rate = Some(1);
+        params.max_iters = 1;
+        let error = build_ivf_model(
+            &dataset,
+            "vector",
+            2,
+            MetricType::L2,
+            &params,
+            None,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot train 257 centroids"), "{error}");
+    }
+
+    #[rstest]
+    #[case::fixed_no_refine(false, 0)]
+    #[case::fixed_refine(false, 1)]
+    #[case::fragments_no_refine(true, 0)]
+    #[case::fragments_refine(true, 1)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_fixed_and_fragment_refinement(
+        #[case] use_fragments: bool,
+        #[case] refine_passes: usize,
+    ) {
+        const DIMENSION: usize = 1;
+        const NUM_PARTITIONS: usize = 257;
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/streaming", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<Float32Type>((DIMENSION as u32).into()))
+            .into_reader_rows(RowCount::from(1024), BatchCount::from(2));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+        let fragment_ids = use_fragments.then(|| {
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>()
+        });
+        let mut params = IvfBuildParams::new(NUM_PARTITIONS);
+        params.sample_rate = 4;
+        params.streaming_sample_rate = Some(2);
+        params.streaming_refine_passes = refine_passes;
+        params.max_iters = 1;
+        let model = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            build_ivf_model(
+                &dataset,
+                "vector",
+                DIMENSION,
+                MetricType::L2,
+                &params,
+                fragment_ids.as_deref(),
+                lance_index::progress::noop_progress(),
+            ),
+        )
+        .await
+        .expect("streaming refinement timed out")
+        .unwrap();
+        assert_eq!(model.num_partitions(), NUM_PARTITIONS);
+        assert_eq!(model.dimension(), DIMENSION);
+        let centroids = model.centroids.unwrap();
+        assert_eq!(centroids.len(), NUM_PARTITIONS);
+        assert!(centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_coreset_dimension_one_and_empty_dataset_errors() {
+        let test_dir = TempStrDir::default();
+        let empty_uri = format!("{}/empty", test_dir.as_str());
+        let empty_reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<Float32Type>(1.into()))
+            .into_reader_rows(RowCount::from(0), BatchCount::from(1));
+        let empty = Dataset::write(empty_reader, &empty_uri, None).await.unwrap();
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 1;
+        params.streaming_sample_rate = Some(1);
+        let error = build_ivf_model(
+            &empty,
+            "vector",
+            1,
+            MetricType::L2,
+            &params,
+            None,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_dot_assignment_accepts_negative_distances() {
+        let data = f32_fsl_from_values(vec![2.0, -2.0], 1).unwrap();
+        let result = assign_weighted_f32_points(
+            &data,
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[1.0, -1.0],
+            &DOT_METRIC_POLICY,
+        )
+        .unwrap();
+        assert_eq!(result.membership, vec![Some(0), Some(1)]);
+        assert!(result.loss < 0.0);
+        assert_eq!(result.centroids, vec![2.0, -2.0]);
+    }
+
+    #[test]
+    fn test_dot_refinement_preserves_empty_centroid() {
+        let data = f32_fsl_from_values(vec![2.0, 2.0], 1).unwrap();
+        let initial = f32_fsl_from_values(vec![10.0, -10.0], 1).unwrap();
+        let result = refine_weighted_f32_kmeans(
+            &data,
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &initial,
+            &DOT_METRIC_POLICY,
+            1,
+            Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        assert_eq!(result.centroids, vec![2.0, -10.0]);
+        assert_eq!(result.cluster_weights, vec![2.0, 0.0]);
+    }
+
+    #[test]
     fn test_weighted_kmeanspp_initialization_selects_distant_centroids() {
         let values = vec![0.0, 0.1, 100.0, 101.0];
         let weights = vec![1.0; 4];
