@@ -2530,6 +2530,60 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn assert_general_block_preserves_compression_level(
+        compression: &str,
+        expected_scheme: crate::format::pb21::CompressionScheme,
+        compression_level: Option<i32>,
+    ) {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some(compression.to_string()),
+                compression_level,
+                ..Default::default()
+            },
+        );
+        let strategy = strategy(TestEncoding::StructuralU32, params);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 1024);
+
+        let compressor = strategy.create_block_compressor(&field, &data).unwrap();
+        let (_, encoding) = compressor.compress(data).unwrap();
+        let Some(Compression::General(general)) = encoding.compression.as_ref() else {
+            panic!("expected general compression");
+        };
+
+        assert_eq!(
+            general.compression.as_ref(),
+            Some(&crate::format::pb21::BufferCompression {
+                scheme: expected_scheme as i32,
+                level: compression_level,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_general_block_preserves_absent_zstd_level() {
+        assert_general_block_preserves_compression_level(
+            "zstd",
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd,
+            None,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn test_general_block_preserves_explicit_lz4_level() {
+        assert_general_block_preserves_compression_level(
+            "lz4",
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4,
+            Some(7),
+        );
+    }
+
     #[test]
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn test_general_compression_not_selected_for_v2_1_even_if_requested() {

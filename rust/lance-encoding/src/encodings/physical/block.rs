@@ -463,6 +463,9 @@ impl BlockDecompressor for GeneralBlockDecompressor {
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
     pub(crate) compressor: Box<dyn BufferCompressor>,
+    // Runtime compressors normalize levels that they default or ignore. Block descriptors must
+    // retain the selected configuration so stable writers preserve those present/absent values.
+    block_compression: CompressionConfig,
 }
 
 impl Default for CompressedBufferEncoder {
@@ -475,25 +478,33 @@ impl Default for CompressedBufferEncoder {
         #[cfg(not(any(feature = "zstd", feature = "lz4")))]
         let (scheme, level) = (CompressionScheme::None, None);
 
-        let compressor =
-            GeneralBufferCompressor::get_compressor(CompressionConfig { scheme, level }).unwrap();
-        Self { compressor }
+        let block_compression = CompressionConfig { scheme, level };
+        let compressor = GeneralBufferCompressor::get_compressor(block_compression).unwrap();
+        Self {
+            compressor,
+            block_compression,
+        }
     }
 }
 
 impl CompressedBufferEncoder {
     pub fn try_new(compression_config: CompressionConfig) -> Result<Self> {
         let compressor = GeneralBufferCompressor::get_compressor(compression_config)?;
-        Ok(Self { compressor })
+        Ok(Self {
+            compressor,
+            block_compression: compression_config,
+        })
     }
 
     pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
+        let block_compression = CompressionConfig {
+            scheme,
+            level: Some(0),
+        };
         Ok(Self {
-            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
-                scheme,
-                level: Some(0),
-            })?,
+            compressor: GeneralBufferCompressor::get_compressor(block_compression)?,
+            block_compression,
         })
     }
 }
@@ -647,7 +658,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         self.compressor.compress(&encoded, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.compressor.config(), inner_encoding)?,
+            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
         ))
     }
 }
