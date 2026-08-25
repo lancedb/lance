@@ -10198,22 +10198,42 @@ mod test {
         #[values(false, true)] stable_row_ids: bool,
         #[values(ApproxMode::Normal, ApproxMode::Fast)] approx_mode: ApproxMode,
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2),
             VectorIndexParams::ivf_hnsw(
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16)
             ),
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 MetricType::L2,
-                IvfBuildParams::new(2),
-                HnswBuildParams::default(),
-                PQBuildParams::new(2, 8)
+                IvfBuildParams {
+                    num_partitions: Some(2),
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                },
+                HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16),
+                PQBuildParams {
+                    num_sub_vectors: 2,
+                    num_bits: 4,
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                }
             ),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
                 IvfBuildParams::new(2),
-                HnswBuildParams::default(),
+                HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16),
                 SQBuildParams::default()
             )
         )]
@@ -10229,13 +10249,13 @@ mod test {
             ArrowField::new("vector", fixed_size_list_type(2, DataType::Float32), true),
         ]));
 
-        let vector_values = Float32Array::from_iter_values((0..600).map(|x| x as f32));
+        let vector_values = Float32Array::from_iter_values((0..64).map(|x| x as f32));
 
         let batches = vec![
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(0..300)),
+                    Arc::new(Int32Array::from_iter_values(0..32)),
                     Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
                 ],
             )
@@ -10244,7 +10264,7 @@ mod test {
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
-            max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
+            max_rows_per_file: 16, // At least two files to make sure stable row ids make a difference
             enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
@@ -10262,8 +10282,8 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
-        scan.minimum_nprobes(100);
-        scan.ef(100);
+        scan.minimum_nprobes(2);
+        scan.ef(16);
         scan.approx_mode(approx_mode);
         scan.with_row_id();
 
