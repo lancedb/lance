@@ -54,10 +54,14 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
+    MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer,
+    collect_flat_bm25_stats, collect_flat_fuzzy_candidates, compound_search,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
     compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
+    final_query_tokens_with_flat_candidates, flat_bm25_search_stream_with_options_and_fixed_scorer,
+    flat_bm25_search_stream_with_options_and_prepared,
     flat_bm25_search_stream_with_options_and_scorer, fts_schema, prepare_bm25_query,
+    prepare_bm25_query_with_flat_stats,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -288,6 +292,23 @@ async fn open_fts_segments(
             .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
     )
     .await
+}
+
+/// Return whether any selected physical FTS segment still carries postings
+/// from fragments that have since been removed from that segment's live row
+/// map. Such postings must not participate in a current-value fuzzy rewrite or
+/// its corpus statistics.
+pub(crate) async fn fts_segments_have_deleted_fragments(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+) -> Result<bool> {
+    let metrics_set = ExecutionPlanMetricsSet::new();
+    let metrics = IndexMetrics::new(&metrics_set, 0);
+    Ok(open_fts_segments(dataset, column, segments, &metrics)
+        .await?
+        .iter()
+        .any(|index| !index.deleted_fragments().is_empty()))
 }
 
 async fn search_prepared_segments(
@@ -667,6 +688,7 @@ pub struct CompoundQueryExec {
     /// the complete corpus before this exec was restricted to a segment
     /// subset.
     prepared_match: Option<Arc<PreparedBm25Query>>,
+    shared_prepared: Option<Arc<SharedPreparedMatch>>,
     segment_selection: FtsSegmentSelection,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
@@ -724,6 +746,7 @@ impl CompoundQueryExec {
             prefilter_source,
             base_scorer: None,
             prepared_match: None,
+            shared_prepared: None,
             segment_selection,
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
@@ -760,6 +783,14 @@ impl CompoundQueryExec {
     #[doc(hidden)]
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
         self.prepared_match = Some(prepared);
+        self.shared_prepared = None;
+        self.base_scorer = None;
+        self
+    }
+
+    pub(crate) fn with_shared_prepared(mut self, prepared: Arc<SharedPreparedMatch>) -> Self {
+        self.shared_prepared = Some(prepared);
+        self.prepared_match = None;
         self.base_scorer = None;
         self
     }
@@ -907,6 +938,14 @@ impl ExecutionPlan for CompoundQueryExec {
             .collect()
     }
 
+    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if let Some(shared_prepared) = &self.shared_prepared {
+            shared_prepared.invalidate();
+        }
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -935,6 +974,7 @@ impl ExecutionPlan for CompoundQueryExec {
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
             prepared_match: self.prepared_match.clone(),
+            shared_prepared: self.shared_prepared.clone(),
             segment_selection: self.segment_selection.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
@@ -955,6 +995,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_prepared_match = self.prepared_match.clone();
+        let shared_prepared = self.shared_prepared.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -980,12 +1021,15 @@ impl ExecutionPlan for CompoundQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            if preset_prepared_match.is_some() && !matches!(&query, FtsQuery::Match(_)) {
+            if (preset_prepared_match.is_some() || shared_prepared.is_some())
+                && !matches!(&query, FtsQuery::Match(_))
+            {
                 return Err(DataFusionError::Execution(
                     "CompoundQueryExec prepared vocabulary requires a root Match query".to_string(),
                 ));
             }
             let scorer_only_fuzzy = preset_prepared_match.is_none()
+                && shared_prepared.is_none()
                 && compound_query_uses_fuzzy_expansion(&query)
                 && preset_base_scorer.is_some();
             let scorer_override_covers_all = if scorer_only_fuzzy {
@@ -998,6 +1042,11 @@ impl ExecutionPlan for CompoundQueryExec {
             let _details = load_segment_details(&dataset, column, &segments).await?;
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            let preset_prepared_match = match (preset_prepared_match, shared_prepared) {
+                (Some(prepared), _) => Some(prepared),
+                (None, Some(shared)) => Some(shared.wait().await?),
+                (None, None) => None,
+            };
             if let Some(first_index) = indices.first() {
                 tokenized_query
                     .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
@@ -1843,6 +1892,134 @@ struct SharedFtsScorerProducer {
     completed: bool,
 }
 
+#[derive(Clone, Debug)]
+enum SharedPreparedState {
+    Pending,
+    Ready(Arc<PreparedBm25Query>),
+    Failed(Arc<str>),
+    Cancelled,
+    Invalidated,
+}
+
+/// Coordinates one canonical fuzzy rewrite and its exact corpus statistics
+/// between the current-value producer and posting-backed consumers.
+#[derive(Debug)]
+pub(crate) struct SharedPreparedMatch {
+    generation: Mutex<u64>,
+    sender: tokio::sync::watch::Sender<SharedPreparedState>,
+}
+
+impl SharedPreparedMatch {
+    pub(crate) fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(SharedPreparedState::Pending);
+        Self {
+            generation: Mutex::new(0),
+            sender,
+        }
+    }
+
+    fn generation(&self) -> MutexGuard<'_, u64> {
+        match self.generation.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn begin_generation(&self) -> u64 {
+        let mut current = self.generation();
+        *current = current.checked_add(1).unwrap_or(1);
+        self.sender.send_replace(SharedPreparedState::Pending);
+        *current
+    }
+
+    fn invalidate(&self) {
+        let mut current = self.generation();
+        *current = current.checked_add(1).unwrap_or(1);
+        self.sender.send_replace(SharedPreparedState::Invalidated);
+    }
+
+    fn publish(&self, generation: u64, prepared: Arc<PreparedBm25Query>) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender
+                .send_replace(SharedPreparedState::Ready(prepared));
+        }
+    }
+
+    fn publish_error(&self, generation: u64, error: &DataFusionError) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender
+                .send_replace(SharedPreparedState::Failed(Arc::from(error.to_string())));
+        }
+    }
+
+    fn cancel(&self, generation: u64) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender.send_replace(SharedPreparedState::Cancelled);
+        }
+    }
+
+    async fn wait(&self) -> DataFusionResult<Arc<PreparedBm25Query>> {
+        let mut receiver = self.sender.subscribe();
+        loop {
+            match receiver.borrow_and_update().clone() {
+                SharedPreparedState::Ready(prepared) => return Ok(prepared),
+                SharedPreparedState::Failed(message) => {
+                    return Err(DataFusionError::Execution(message.to_string()));
+                }
+                SharedPreparedState::Cancelled => {
+                    return Err(DataFusionError::Execution(
+                        "mixed fuzzy FTS preparation was cancelled before publication".to_string(),
+                    ));
+                }
+                SharedPreparedState::Pending | SharedPreparedState::Invalidated => {}
+            }
+            receiver.changed().await.map_err(|_| {
+                DataFusionError::Execution(
+                    "mixed fuzzy FTS producer stopped before publishing preparation".to_string(),
+                )
+            })?;
+        }
+    }
+}
+
+struct SharedPreparedMatchProducer {
+    shared: Arc<SharedPreparedMatch>,
+    generation: u64,
+    completed: bool,
+}
+
+impl SharedPreparedMatchProducer {
+    fn new(shared: Arc<SharedPreparedMatch>) -> Self {
+        let generation = shared.begin_generation();
+        Self {
+            shared,
+            generation,
+            completed: false,
+        }
+    }
+
+    fn publish(mut self, prepared: Arc<PreparedBm25Query>) {
+        self.shared.publish(self.generation, prepared);
+        self.completed = true;
+    }
+
+    fn publish_error(mut self, error: &DataFusionError) {
+        self.shared.publish_error(self.generation, error);
+        self.completed = true;
+    }
+}
+
+impl Drop for SharedPreparedMatchProducer {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.shared.cancel(self.generation);
+        }
+    }
+}
+
 impl SharedFtsScorerProducer {
     fn new(scorer: Arc<SharedFtsScorer>) -> Self {
         Self {
@@ -2078,6 +2255,9 @@ pub struct MatchQueryExec {
     prepared_query: Option<Arc<PreparedBm25Query>>,
     /// Corpus-wide scorer published by the flat branch of a mixed search.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
+    /// Canonical fuzzy vocabulary and scorer published by the current-value
+    /// branch of a mixed search.
+    shared_prepared: Option<Arc<SharedPreparedMatch>>,
     segment_selection: FtsSegmentSelection,
     /// Rows whose indexed values were superseded by newer data overlays.
     overlay_block: Option<RowAddrMask>,
@@ -2168,6 +2348,7 @@ impl MatchQueryExec {
             base_scorer: None,
             prepared_query: None,
             shared_scorer: None,
+            shared_prepared: None,
             segment_selection: FtsSegmentSelection::AllCommitted,
             overlay_block: None,
             document_granularity,
@@ -2232,6 +2413,7 @@ impl MatchQueryExec {
             base_scorer: None,
             prepared_query: None,
             shared_scorer: None,
+            shared_prepared: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
             overlay_block: None,
             document_granularity,
@@ -2276,6 +2458,7 @@ impl MatchQueryExec {
             base_scorer: None,
             prepared_query: None,
             shared_scorer: None,
+            shared_prepared: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             overlay_block: None,
             external_mask: None,
@@ -2321,6 +2504,11 @@ impl MatchQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_shared_prepared(mut self, prepared: Arc<SharedPreparedMatch>) -> Self {
+        self.shared_prepared = Some(prepared);
         self
     }
 
@@ -2390,6 +2578,17 @@ impl ExecutionPlan for MatchQueryExec {
             .collect()
     }
 
+    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if let Some(shared_scorer) = &self.shared_scorer {
+            shared_scorer.invalidate();
+        }
+        if let Some(shared_prepared) = &self.shared_prepared {
+            shared_prepared.invalidate();
+        }
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2411,6 +2610,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     prepared_query: self.prepared_query.clone(),
                     shared_scorer: self.shared_scorer.clone(),
+                    shared_prepared: self.shared_prepared.clone(),
                     segment_selection: self.segment_selection.clone(),
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
@@ -2433,6 +2633,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     prepared_query: self.prepared_query.clone(),
                     shared_scorer: self.shared_scorer.clone(),
+                    shared_prepared: self.shared_prepared.clone(),
                     segment_selection: self.segment_selection.clone(),
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
@@ -2466,6 +2667,7 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let preset_prepared_query = self.prepared_query.clone();
         let shared_scorer = self.shared_scorer.clone();
+        let shared_prepared = self.shared_prepared.clone();
         let segment_selection = self.segment_selection.clone();
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
@@ -2486,6 +2688,7 @@ impl ExecutionPlan for MatchQueryExec {
                 )
                 .await?;
             let scorer_only_fuzzy = preset_prepared_query.is_none()
+                && shared_prepared.is_none()
                 && uses_fuzzy_expansion(params.fuzziness)
                 && (preset_base_scorer.is_some() || shared_scorer.is_some());
             let scorer_override_covers_all = if scorer_only_fuzzy {
@@ -2534,6 +2737,12 @@ impl ExecutionPlan for MatchQueryExec {
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
                     query: prepared_query,
+                    params: Arc::new(params),
+                    operator: query.operator,
+                })
+            } else if let Some(shared_prepared) = shared_prepared {
+                Arc::new(PreparedMatch {
+                    query: shared_prepared.wait().await?,
                     params: Arc::new(params),
                     operator: query.operator,
                 })
@@ -3058,6 +3267,11 @@ pub struct FlatMatchQueryExec {
     base_scorer: Option<Arc<MemBM25Scorer>>,
     /// Publishes the scorer extended with this flat branch's documents.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
+    /// Publishes one canonical fuzzy vocabulary/scorer to indexed consumers.
+    shared_prepared: Option<Arc<SharedPreparedMatch>>,
+    /// Retain the index tokenizer but derive vocabulary/statistics exclusively
+    /// from current values (stale, unknown-coverage, and legacy fallback).
+    current_values_only: bool,
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
@@ -3138,6 +3352,8 @@ impl FlatMatchQueryExec {
             unindexed_input,
             base_scorer: None,
             shared_scorer: None,
+            shared_prepared: None,
+            current_values_only: false,
             preset_segments: None,
             document_granularity,
             document_column,
@@ -3194,6 +3410,8 @@ impl FlatMatchQueryExec {
             unindexed_input,
             base_scorer: None,
             shared_scorer: None,
+            shared_prepared: None,
+            current_values_only: false,
             preset_segments: Some(segments),
             document_granularity,
             document_column,
@@ -3211,6 +3429,21 @@ impl FlatMatchQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_shared_prepared(mut self, prepared: Arc<SharedPreparedMatch>) -> Self {
+        self.shared_prepared = Some(prepared);
+        self
+    }
+
+    pub(crate) fn with_current_values_only(mut self) -> Self {
+        self.current_values_only = true;
+        self
+    }
+
+    pub(crate) fn with_corpus_stats_input(mut self, input: Arc<dyn ExecutionPlan>) -> Self {
+        self.corpus_stats_input = Some(input);
         self
     }
 
@@ -3249,7 +3482,21 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // output partition, so the input must be coalesced to one partition. Without
         // this, EnforceDistribution may round-robin the scan across `target_partitions`
         // and only partition 0 is consumed, silently dropping the other fragments.
-        vec![Distribution::SinglePartition]
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if let Some(shared_scorer) = &self.shared_scorer {
+            shared_scorer.invalidate();
+        }
+        if let Some(shared_prepared) = &self.shared_prepared {
+            shared_prepared.invalidate();
+        }
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
     }
 
     fn with_new_children(
@@ -3270,6 +3517,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
             unindexed_input,
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
+            shared_prepared: self.shared_prepared.clone(),
+            current_values_only: self.current_values_only,
             preset_segments: self.preset_segments.clone(),
             document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
@@ -3290,6 +3539,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
+        let shared_prepared_producer = self
+            .shared_prepared
+            .clone()
+            .map(SharedPreparedMatchProducer::new);
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
@@ -3297,6 +3550,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let document_granularity = self.document_granularity;
         let document_column = self.document_column.clone();
         let phrase_slop = self.params.phrase_slop;
+        let params = MatchQueryExec::effective_params(&query, self.params.clone());
+        let corpus_stats_input = self.corpus_stats_input.clone();
+        let unindexed_plan = self.unindexed_input.clone();
+        let current_values_only = self.current_values_only;
 
         // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
         // so it can attribute the spawn_cpu tokenize work and synchronous
@@ -3309,19 +3566,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        let unindexed_input = document_input(
-            self.unindexed_input.execute(partition, context)?,
-            &document_column,
-        )?;
-
         let stream = stream::once(async move {
             let shared_scorer_producer = shared_scorer_producer;
+            let shared_prepared_producer = shared_prepared_producer;
             let result = async {
                 let segments = match preset_segments {
                     Some(segments) => Some(segments),
                     None => load_segments(&ds, &column, document_granularity).await?,
                 };
-                let (tokenizer, base_scorer) = match segments {
+                let (indices, mut query_tokenizer, document_tokenizer, base_scorer) = match segments
+                {
                     Some(segments) => {
                         let _details = load_segment_details(&ds, &column, &segments).await?;
                         let indices =
@@ -3333,63 +3587,217 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         let first_index = indices.first().ok_or(DataFusionError::Execution(
                             format!("FTS index for column {} has no segments", column),
                         ))?;
-                        let mut tokenizer = first_index.tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                        record_tokenized_query(&tokenized_query, &query_tokens);
-                        let base_scorer = match preset_base_scorer {
-                            Some(scorer) => (*scorer).clone(),
-                            None => {
-                                let scorer_start = std::time::Instant::now();
-                                let scorer = build_global_bm25_scorer(
-                                    &indices,
-                                    &query_tokens,
-                                    &FtsSearchParams::new(),
-                                    Some(metrics.as_ref()),
-                                )
-                                .boxed()
-                                .await?;
-                                metrics.record_scorer_build(scorer_start.elapsed());
-                                scorer
+                        let base_scorer = if uses_fuzzy_expansion(query.fuzziness) {
+                            None
+                        } else {
+                            match preset_base_scorer {
+                                Some(scorer) => Some((*scorer).clone()),
+                                None => {
+                                    let mut tokenizer = first_index.tokenizer();
+                                    let query_tokens =
+                                        collect_query_tokens(&query.terms, &mut tokenizer);
+                                    let scorer_start = std::time::Instant::now();
+                                    let scorer = build_global_bm25_scorer(
+                                        &indices,
+                                        &query_tokens,
+                                        &params,
+                                        Some(metrics.as_ref()),
+                                    )
+                                    .boxed()
+                                    .await?;
+                                    metrics.record_scorer_build(scorer_start.elapsed());
+                                    Some(scorer)
+                                }
                             }
                         };
-                        (tokenizer, Some(base_scorer))
+                        let query_tokenizer =
+                            tokenizer_for_match_query(first_index, query.fuzziness);
+                        let document_tokenizer = first_index.tokenizer();
+                        (indices, query_tokenizer, document_tokenizer, base_scorer)
                     }
-                    None => {
-                        let mut tokenizer = default_text_tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                        record_tokenized_query(&tokenized_query, &query_tokens);
-                        (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
-                    }
+                    None => (
+                        Vec::new(),
+                        default_text_tokenizer(),
+                        default_text_tokenizer(),
+                        preset_base_scorer.map(|s| (*s).clone()),
+                    ),
                 };
+                let query_tokens =
+                    Arc::new(collect_query_tokens(&query.terms, &mut query_tokenizer));
+                record_tokenized_query(&tokenized_query, query_tokens.as_ref());
 
-                flat_bm25_search_stream_with_options_and_scorer(
-                    unindexed_input,
-                    document_column,
-                    query.terms,
-                    tokenizer,
-                    base_scorer,
-                    FlatBm25SearchOptions {
-                        target_batch_size,
-                        elapsed_compute: Some(elapsed_compute),
-                        operator: query.operator,
-                        boost: query.boost,
-                        document_granularity,
-                        phrase_slop,
-                    },
-                )
-                .await
+                let candidate_stream = || {
+                    document_input(
+                        unindexed_plan.execute(partition, context.clone())?,
+                        &document_column,
+                    )
+                };
+                if uses_fuzzy_expansion(query.fuzziness) {
+                    if query_tokens.is_empty() || params.max_expansions == 0 {
+                        let final_tokens = final_query_tokens_with_flat_candidates(
+                            &[],
+                            query_tokens.as_ref(),
+                            &params,
+                            &Default::default(),
+                        )?;
+                        let prepared = Arc::new(
+                            prepare_bm25_query_with_flat_stats(
+                                &[],
+                                query_tokens.as_ref(),
+                                final_tokens,
+                                Some(metrics.as_ref()),
+                                MemBM25Scorer::new(0, 0, HashMap::new()),
+                            )
+                            .await?,
+                        );
+                        let stream: SendableRecordBatchStream =
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                fts_schema(document_granularity),
+                                stream::empty::<DataFusionResult<RecordBatch>>(),
+                            ));
+                        return Ok((stream, prepared.scorer().as_ref().clone(), Some(prepared)));
+                    }
+                    let stats_plan = corpus_stats_input
+                        .clone()
+                        .unwrap_or_else(|| unindexed_plan.clone());
+                    let stats_stream = || {
+                        document_input(
+                            stats_plan.execute(partition, context.clone())?,
+                            &document_column,
+                        )
+                    };
+                    let candidates = collect_flat_fuzzy_candidates(
+                        stats_stream()?,
+                        &document_column,
+                        document_tokenizer.box_clone(),
+                        query_tokens.clone(),
+                        Arc::new(params.clone()),
+                        Some(elapsed_compute.clone()),
+                    )
+                    .await?;
+                    let preparation_indices = if current_values_only {
+                        &[][..]
+                    } else {
+                        indices.as_slice()
+                    };
+                    let final_tokens = final_query_tokens_with_flat_candidates(
+                        preparation_indices,
+                        query_tokens.as_ref(),
+                        &params,
+                        &candidates,
+                    )?;
+                    let final_tokens = Arc::new(final_tokens);
+                    let flat_stats = collect_flat_bm25_stats(
+                        stats_stream()?,
+                        &document_column,
+                        document_tokenizer.box_clone(),
+                        final_tokens.clone(),
+                        Some(elapsed_compute.clone()),
+                    )
+                    .await?;
+                    let scorer_start = std::time::Instant::now();
+                    let prepared = Arc::new(
+                        prepare_bm25_query_with_flat_stats(
+                            preparation_indices,
+                            query_tokens.as_ref(),
+                            final_tokens.as_ref().clone(),
+                            Some(metrics.as_ref()),
+                            flat_stats,
+                        )
+                        .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    let stream = flat_bm25_search_stream_with_options_and_prepared(
+                        candidate_stream()?,
+                        document_column,
+                        document_tokenizer,
+                        prepared.clone(),
+                        FlatBm25SearchOptions {
+                            target_batch_size,
+                            elapsed_compute: Some(elapsed_compute),
+                            operator: query.operator,
+                            boost: query.boost,
+                            document_granularity,
+                            phrase_slop,
+                        },
+                    )
+                    .await?;
+                    Ok((stream, prepared.scorer().as_ref().clone(), Some(prepared)))
+                } else if let Some(corpus_stats_plan) = corpus_stats_input {
+                    let corpus_stats_stream = document_input(
+                        corpus_stats_plan.execute(partition, context.clone())?,
+                        &document_column,
+                    )?;
+                    let (_, scorer) = flat_bm25_search_stream_with_options_and_scorer(
+                        corpus_stats_stream,
+                        document_column.clone(),
+                        query.terms.clone(),
+                        document_tokenizer.box_clone(),
+                        base_scorer,
+                        FlatBm25SearchOptions {
+                            target_batch_size,
+                            elapsed_compute: Some(elapsed_compute.clone()),
+                            operator: query.operator,
+                            boost: query.boost,
+                            document_granularity,
+                            phrase_slop,
+                        },
+                    )
+                    .await?;
+                    let stream = flat_bm25_search_stream_with_options_and_fixed_scorer(
+                        candidate_stream()?,
+                        document_column,
+                        query.terms,
+                        document_tokenizer,
+                        scorer.clone(),
+                        FlatBm25SearchOptions {
+                            target_batch_size,
+                            elapsed_compute: Some(elapsed_compute),
+                            operator: query.operator,
+                            boost: query.boost,
+                            document_granularity,
+                            phrase_slop,
+                        },
+                    )
+                    .await?;
+                    Ok((stream, scorer, None))
+                } else {
+                    let (stream, scorer) = flat_bm25_search_stream_with_options_and_scorer(
+                        candidate_stream()?,
+                        document_column,
+                        query.terms,
+                        document_tokenizer,
+                        base_scorer,
+                        FlatBm25SearchOptions {
+                            target_batch_size,
+                            elapsed_compute: Some(elapsed_compute),
+                            operator: query.operator,
+                            boost: query.boost,
+                            document_granularity,
+                            phrase_slop,
+                        },
+                    )
+                    .await?;
+                    Ok((stream, scorer, None))
+                }
             }
             .await;
 
             match result {
-                Ok((stream, scorer)) => {
+                Ok((stream, scorer, prepared)) => {
                     if let Some(producer) = shared_scorer_producer {
                         producer.publish(scorer);
+                    }
+                    if let (Some(producer), Some(prepared)) = (shared_prepared_producer, prepared) {
+                        producer.publish(prepared);
                     }
                     Ok(stream)
                 }
                 Err(error) => {
                     if let Some(producer) = shared_scorer_producer {
+                        producer.publish_error(&error);
+                    }
+                    if let Some(producer) = shared_prepared_producer {
                         producer.publish_error(&error);
                     }
                     Err(error)
@@ -4422,13 +4830,14 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::inverted::builder::ScoredDoc;
+    use lance_index::scalar::inverted::document_tokenizer::DocType;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
-        PhraseQuery, collect_query_tokens, has_query_token,
+        PhraseQuery, Tokens, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::inverted::{
-        DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
-        build_global_bm25_scorer, prepare_bm25_query,
+        DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, MemBM25Scorer, PreparedBm25Query,
+        SCORE_COL, build_global_bm25_scorer, prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -4447,13 +4856,159 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
-        build_boolean_query_children, classify_wand_exactness_certificate, default_text_tokenizer,
-        open_fts_segments, tokenizer_for_match_query,
+        PhraseQueryExec, SharedFtsScorer, SharedFtsScorerProducer, SharedPreparedMatch,
+        SharedPreparedMatchProducer, SharedPreparedState,
+        WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
+        tokenizer_for_match_query,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
+
+    #[tokio::test]
+    async fn shared_scorer_ignores_cancelled_stale_generation_after_reset() {
+        let scorer = Arc::new(SharedFtsScorer::new());
+        let stale_producer = SharedFtsScorerProducer::new(scorer.clone());
+        scorer.invalidate();
+        let current_producer = SharedFtsScorerProducer::new(scorer.clone());
+        drop(stale_producer);
+
+        current_producer.publish(MemBM25Scorer::new(
+            3,
+            2,
+            HashMap::from([("needle".to_string(), 1)]),
+        ));
+        let published = scorer.wait().await.unwrap();
+        assert_eq!(published.num_docs, 2);
+        assert_eq!(published.total_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn shared_scorer_serializes_publish_against_reset() {
+        let scorer = Arc::new(SharedFtsScorer::new());
+        let stale_producer = SharedFtsScorerProducer::new(scorer.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        let publish_barrier = barrier.clone();
+        let publish = std::thread::spawn(move || {
+            publish_barrier.wait();
+            stale_producer.publish(MemBM25Scorer::new(
+                1,
+                1,
+                HashMap::from([("stale".to_string(), 1)]),
+            ));
+        });
+        barrier.wait();
+        scorer.invalidate();
+        publish.join().unwrap();
+
+        let current = SharedFtsScorerProducer::new(scorer.clone());
+        current.publish(MemBM25Scorer::new(
+            7,
+            3,
+            HashMap::from([("current".to_string(), 2)]),
+        ));
+        let published = scorer.wait().await.unwrap();
+        assert_eq!(published.num_docs, 3);
+        assert_eq!(published.total_tokens, 7);
+        assert_eq!(published.num_docs_containing_token("current"), 2);
+    }
+
+    fn prepared_for_test(term: &str) -> Arc<PreparedBm25Query> {
+        let tokens = Arc::new(Tokens::new(vec![term.to_string()], DocType::Text));
+        Arc::new(PreparedBm25Query::from_parts(
+            tokens,
+            Arc::new(MemBM25Scorer::new(
+                1,
+                1,
+                HashMap::from([(term.to_string(), 1)]),
+            )),
+            true,
+        ))
+    }
+
+    #[tokio::test]
+    async fn shared_prepared_ignores_stale_cancel_after_reset() {
+        let shared = Arc::new(SharedPreparedMatch::new());
+        let stale = SharedPreparedMatchProducer::new(shared.clone());
+        shared.invalidate();
+        let current = SharedPreparedMatchProducer::new(shared.clone());
+        drop(stale);
+        current.publish(prepared_for_test("current"));
+
+        let prepared = shared.wait().await.unwrap();
+        assert_eq!(prepared.tokens().get_token(0), "current");
+    }
+
+    #[tokio::test]
+    async fn shared_prepared_error_wakes_waiter() {
+        let shared = Arc::new(SharedPreparedMatch::new());
+        let producer = SharedPreparedMatchProducer::new(shared.clone());
+        producer.publish_error(&DataFusionError::Execution("prepare failed".to_string()));
+
+        let error = shared.wait().await.unwrap_err();
+        assert!(error.to_string().contains("prepare failed"));
+    }
+
+    #[tokio::test]
+    async fn shared_prepared_cancel_wakes_waiter() {
+        let shared = Arc::new(SharedPreparedMatch::new());
+        let producer = SharedPreparedMatchProducer::new(shared.clone());
+        drop(producer);
+
+        let error = shared.wait().await.unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn shared_prepared_serializes_publish_against_reset() {
+        let shared = Arc::new(SharedPreparedMatch::new());
+        let stale = SharedPreparedMatchProducer::new(shared.clone());
+        shared.invalidate();
+        let current = SharedPreparedMatchProducer::new(shared.clone());
+        stale.publish(prepared_for_test("stale"));
+        assert!(matches!(
+            *shared.sender.borrow(),
+            SharedPreparedState::Pending
+        ));
+        current.publish(prepared_for_test("current"));
+        assert_eq!(
+            shared.wait().await.unwrap().tokens().get_token(0),
+            "current"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_match_with_new_children_preserves_prepared_producer() {
+        let fixture = NoContextTestFixture::new();
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            lance_core::ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new("text", DataType::Utf8, true),
+        ]));
+        let input = Arc::new(EmptyExec::new(input_schema)) as Arc<dyn ExecutionPlan>;
+        let shared = Arc::new(SharedPreparedMatch::new());
+        let exec = Arc::new(
+            FlatMatchQueryExec::new(
+                Arc::new(fixture.dataset.clone()),
+                MatchQuery::new("needle".to_string())
+                    .with_column(Some("text".to_string()))
+                    .with_fuzziness(Some(1))
+                    .with_document_granularity(DocumentGranularity::Row),
+                FtsSearchParams::default().with_fuzziness(Some(1)),
+                input.clone(),
+            )
+            .unwrap()
+            .with_shared_prepared(shared.clone()),
+        );
+        let rewritten_plan = exec.with_new_children(vec![input]).unwrap();
+        let rewritten = rewritten_plan.downcast_ref::<FlatMatchQueryExec>().unwrap();
+        let rewritten_shared = rewritten.shared_prepared.as_ref().unwrap();
+        assert!(Arc::ptr_eq(rewritten_shared, &shared));
+
+        let producer = SharedPreparedMatchProducer::new(rewritten_shared.clone());
+        producer.publish(prepared_for_test("needle"));
+        assert_eq!(shared.wait().await.unwrap().tokens().get_token(0), "needle");
+    }
     use datafusion::physical_plan::union::UnionExec;
     use datafusion_physical_plan::joins::HashJoinExec;
 

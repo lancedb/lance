@@ -64,7 +64,8 @@ impl std::fmt::Debug for PreparedBm25Query {
 }
 
 impl PreparedBm25Query {
-    pub(crate) fn from_parts(
+    #[doc(hidden)]
+    pub fn from_parts(
         tokens: Arc<Tokens>,
         scorer: Arc<MemBM25Scorer>,
         has_all_query_positions: bool,
@@ -91,10 +92,11 @@ impl PreparedBm25Query {
     }
 }
 
-pub(crate) fn final_query_tokens(
+fn final_query_tokens_with_extra_candidates(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
+    extra_candidates: Option<&BTreeMap<u32, BTreeSet<String>>>,
 ) -> Result<Tokens> {
     if !uses_fuzzy_expansion(params.fuzziness) {
         return Ok(query_tokens.clone());
@@ -134,6 +136,9 @@ pub(crate) fn final_query_tokens(
                 )?;
             }
         }
+        if let Some(extra_candidates) = extra_candidates.and_then(|all| all.get(&position)) {
+            candidates.extend(extra_candidates.iter().take(remaining).cloned());
+        }
         for candidate in candidates {
             if expanded_tokens.len() >= params.max_expansions {
                 break;
@@ -149,6 +154,26 @@ pub(crate) fn final_query_tokens(
         expanded_positions,
         query_tokens.token_type().clone(),
     ))
+}
+
+pub(crate) fn final_query_tokens(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+) -> Result<Tokens> {
+    final_query_tokens_with_extra_candidates(indices, query_tokens, params, None)
+}
+
+/// Resolve one fuzzy vocabulary across immutable index dictionaries and a
+/// bounded summary collected from current-value rows.
+#[doc(hidden)]
+pub fn final_query_tokens_with_flat_candidates(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+    flat_candidates: &BTreeMap<u32, BTreeSet<String>>,
+) -> Result<Tokens> {
+    final_query_tokens_with_extra_candidates(indices, query_tokens, params, Some(flat_candidates))
 }
 
 fn unique_terms(tokens: &Tokens) -> Vec<String> {
@@ -245,6 +270,59 @@ pub async fn prepare_bm25_query(
         tokens,
         scorer,
         has_all_query_positions,
+    })
+}
+
+/// Build a canonical query for a vocabulary that has already been resolved,
+/// extending immutable-index statistics with exact current-value statistics.
+///
+/// `flat_stats` must contain document frequencies for every unique term in
+/// `final_tokens`. It is deliberately separate from fuzzy vocabulary discovery
+/// so callers can run an unfiltered second pass after the global expansion cap
+/// has been applied.
+#[doc(hidden)]
+pub async fn prepare_bm25_query_with_flat_stats(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: &Tokens,
+    final_tokens: Tokens,
+    metrics: Option<&dyn crate::scalar::MetricsCollector>,
+    flat_stats: MemBM25Scorer,
+) -> Result<PreparedBm25Query> {
+    let terms = unique_terms(&final_tokens);
+    let mut total_tokens = flat_stats.total_tokens;
+    let mut num_docs = flat_stats.num_docs;
+    let mut token_docs = HashMap::with_capacity(terms.len());
+    for term in &terms {
+        token_docs.insert(term.clone(), flat_stats.num_docs_containing_token(term));
+    }
+
+    for index in indices {
+        let (segment_total_tokens, segment_num_docs, segment_token_docs) =
+            index.bm25_stats_for_terms(&terms, metrics).await?;
+        total_tokens = total_tokens
+            .checked_add(segment_total_tokens)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus token count overflows u64"))?;
+        num_docs = num_docs
+            .checked_add(segment_num_docs)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus document count overflows usize"))?;
+        for (term, count) in terms.iter().zip(segment_token_docs) {
+            let total = token_docs.get_mut(term).ok_or_else(|| {
+                lance_core::Error::internal(format!(
+                    "global scorer term '{term}' was not initialized"
+                ))
+            })?;
+            *total = total.checked_add(count).ok_or_else(|| {
+                lance_core::Error::index(format!(
+                    "FTS document frequency for term '{term}' overflows usize"
+                ))
+            })?;
+        }
+    }
+
+    Ok(PreparedBm25Query {
+        has_all_query_positions: has_all_query_positions(query_tokens, &final_tokens),
+        tokens: Arc::new(final_tokens),
+        scorer: Arc::new(MemBM25Scorer::new(total_tokens, num_docs, token_docs)),
     })
 }
 

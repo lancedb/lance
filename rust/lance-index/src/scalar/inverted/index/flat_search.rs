@@ -368,6 +368,9 @@ pub(super) async fn tokenize_and_count(
 
                             let (all_tokens, phrase_match) = match doc {
                                 Some(doc) => count_text(doc, &mut temp_query_token_counts)?,
+                                None if coordinate_rank > 0 => {
+                                    count_text("", &mut temp_query_token_counts)?
+                                }
                                 None => (0, false),
                             };
                             if coordinate_rank > 0 || all_tokens > 0 {
@@ -472,7 +475,7 @@ pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     append_counts: &mut impl FnMut(usize, u64, u64, &[u64], bool) -> DataFusionResult<()>,
     temp_query_token_counts: &mut Vec<u64>,
     query_tokens_len: usize,
-    match_phrase: bool,
+    _match_phrase: bool,
 ) -> DataFusionResult<()> {
     let doc_array = doc_col.as_list::<ListOffset>();
     match doc_array.value_type() {
@@ -492,20 +495,19 @@ pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
         let mut phrase_match = false;
         if !doc_array.is_null(i) {
             let elements = doc_array.value(i);
-            if match_phrase {
-                let mut document = String::new();
-                for element in iter_str_array(elements.as_ref()).flatten() {
-                    if !document.is_empty() {
-                        document.push(' ');
-                    }
-                    document.push_str(element);
+            // Row-level list documents use the same materialization boundary
+            // as the index builder: non-null elements are joined with one
+            // ASCII space and tokenized once. This matters for raw/ngram
+            // analyzers whose tokens can span an element boundary. ListElement
+            // input is expanded upstream and never reaches this branch.
+            let mut document = String::new();
+            for element in iter_str_array(elements.as_ref()).flatten() {
+                if !document.is_empty() {
+                    document.push(' ');
                 }
-                (all_tokens, phrase_match) = count_text(&document, temp_query_token_counts)?;
-            } else {
-                for element in iter_str_array(elements.as_ref()).flatten() {
-                    all_tokens += count_text(element, temp_query_token_counts)?.0;
-                }
+                document.push_str(element);
             }
+            (all_tokens, phrase_match) = count_text(&document, temp_query_token_counts)?;
         }
         if all_tokens > 0 {
             append_counts(
@@ -852,6 +854,432 @@ pub struct FlatBm25SearchOptions {
     pub phrase_slop: Option<u32>,
 }
 
+fn collect_fuzzy_candidates_from_terms(
+    terms: &BTreeSet<String>,
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+) -> Result<BTreeMap<u32, BTreeSet<String>>> {
+    fn merge_stream<S>(
+        stream: &mut S,
+        candidates: &mut BTreeSet<String>,
+        limit: usize,
+    ) -> Result<()>
+    where
+        for<'a> S: fst::Streamer<'a, Item = &'a [u8]>,
+    {
+        while let Some(term) = stream.next() {
+            let term = std::str::from_utf8(term).map_err(|error| {
+                Error::index(format!(
+                    "flat FTS vocabulary contains invalid UTF-8: {error}"
+                ))
+            })?;
+            candidates.insert(term.to_string());
+            while candidates.len() > limit {
+                candidates.pop_last();
+            }
+            if candidates.len() == limit
+                && candidates
+                    .last()
+                    .is_some_and(|largest| term >= largest.as_str())
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    if terms.is_empty() || params.max_expansions == 0 {
+        return Ok(BTreeMap::new());
+    }
+    let mut builder = fst::SetBuilder::memory();
+    for term in terms {
+        builder.insert(term).map_err(|error| {
+            Error::index(format!("failed to build flat FTS vocabulary: {error}"))
+        })?;
+    }
+    let set =
+        fst::Set::new(builder.into_inner().map_err(|error| {
+            Error::index(format!("failed to finish flat FTS vocabulary: {error}"))
+        })?)
+        .map_err(|error| Error::index(format!("failed to open flat FTS vocabulary: {error}")))?;
+
+    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    for token_index in 0..query_tokens.len() {
+        source_terms_by_position
+            .entry(query_tokens.position(token_index))
+            .or_default()
+            .push(query_tokens.get_token(token_index));
+    }
+    let mut result = BTreeMap::new();
+    for (position, source_terms) in source_terms_by_position {
+        let candidates = result.entry(position).or_insert_with(BTreeSet::new);
+        for source_term in source_terms {
+            let fuzzy = fuzzy_term_options(
+                source_term,
+                query_tokens.token_type(),
+                params.fuzziness,
+                params.prefix_length,
+            );
+            let levenshtein = fst::automaton::Levenshtein::new(source_term, fuzzy.edit_distance)
+                .map_err(|error| {
+                    Error::index(format!("failed to construct the fuzzy query: {error}"))
+                })?;
+            match fuzzy.exact_prefix {
+                "" => {
+                    let mut stream = set.search(levenshtein).into_stream();
+                    merge_stream(&mut stream, candidates, params.max_expansions)?;
+                }
+                exact_prefix => {
+                    let prefix = fst::automaton::Str::new(exact_prefix).starts_with();
+                    let mut stream = set.search(levenshtein.intersection(prefix)).into_stream();
+                    merge_stream(&mut stream, candidates, params.max_expansions)?;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn collect_batch_terms(
+    batch: &RecordBatch,
+    doc_col_idx: usize,
+    coordinate_rank: usize,
+    mut tokenizer: Box<dyn LanceTokenizer>,
+) -> DataFusionResult<BTreeSet<String>> {
+    let mut terms = BTreeSet::new();
+    let mut collect_text = |document: &str| {
+        let mut stream = tokenizer.token_stream_for_doc(document);
+        while let Some(token) = stream.next() {
+            terms.insert(token.text.to_string());
+        }
+    };
+    match batch.column(doc_col_idx).data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            for document in iter_str_array(batch.column(doc_col_idx)) {
+                match document {
+                    Some(document) => collect_text(document),
+                    None if coordinate_rank > 0 => collect_text(""),
+                    None => {}
+                }
+            }
+        }
+        DataType::List(_) => {
+            let documents = batch.column(doc_col_idx).as_list::<i32>();
+            for row in 0..documents.len() {
+                if documents.is_null(row) {
+                    continue;
+                }
+                let elements = documents.value(row);
+                let document = materialize_flat_string_list(elements.as_ref());
+                collect_text(&document);
+            }
+        }
+        DataType::LargeList(_) => {
+            let documents = batch.column(doc_col_idx).as_list::<i64>();
+            for row in 0..documents.len() {
+                if documents.is_null(row) {
+                    continue;
+                }
+                let elements = documents.value(row);
+                let document = materialize_flat_string_list(elements.as_ref());
+                collect_text(&document);
+            }
+        }
+        data_type => {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "unsupported data type {data_type} for flat full text search"
+            )));
+        }
+    }
+    Ok(terms)
+}
+
+fn materialize_flat_string_list(elements: &dyn Array) -> String {
+    let mut document = String::new();
+    for element in iter_str_array(elements).flatten() {
+        if !document.is_empty() {
+            document.push(' ');
+        }
+        document.push_str(element);
+    }
+    document
+}
+
+/// Collect a bounded fuzzy-vocabulary summary from current-value rows.
+///
+/// Each rechunked input block builds a transient ordered FST over its deduped
+/// vocabulary. Each query-source automaton traverses that FST once, avoiding
+/// per-occurrence edit-distance work, and only the lexicographically smallest
+/// `max_expansions` candidates per query position survive the merge. Memory is
+/// bounded by one input chunk plus `query_positions * max_expansions`.
+#[doc(hidden)]
+pub async fn collect_flat_fuzzy_candidates(
+    input: SendableRecordBatchStream,
+    doc_col: &str,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<BTreeMap<u32, BTreeSet<String>>> {
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let input_schema = input.schema();
+    let doc_col_idx = input_schema.index_of(doc_col)?;
+    let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
+    let chunked = lance_arrow::stream::rechunk_stream_by_size(
+        input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    );
+    let max_expansions = params.max_expansions;
+    let summaries = chunked
+        .map(move |batch| {
+            let tokenizer = tokenizer.box_clone();
+            let query_tokens = query_tokens.clone();
+            let params = params.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let started = std::time::Instant::now();
+                let terms = collect_batch_terms(&batch?, doc_col_idx, coordinate_rank, tokenizer)?;
+                let candidates = collect_fuzzy_candidates_from_terms(
+                    &terms,
+                    query_tokens.as_ref(),
+                    params.as_ref(),
+                )?;
+                if let Some(time) = elapsed_compute {
+                    time.add_duration(started.elapsed());
+                }
+                DataFusionResult::Ok(candidates)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus());
+
+    let mut merged = BTreeMap::<u32, BTreeSet<String>>::new();
+    futures::pin_mut!(summaries);
+    while let Some(summary) = summaries.try_next().await? {
+        for (position, candidates) in summary {
+            let output = merged.entry(position).or_default();
+            output.extend(candidates);
+            while output.len() > max_expansions {
+                output.pop_last();
+            }
+        }
+    }
+    Ok(merged)
+}
+
+#[derive(Default)]
+struct FlatBm25Stats {
+    total_tokens: u64,
+    num_docs: usize,
+    token_docs: Vec<usize>,
+}
+
+fn collect_batch_bm25_stats(
+    batch: &RecordBatch,
+    doc_col_idx: usize,
+    coordinate_rank: usize,
+    mut tokenizer: Box<dyn LanceTokenizer>,
+    term_indices: &HashMap<String, usize>,
+) -> DataFusionResult<FlatBm25Stats> {
+    fn count_text(
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        document: &str,
+        term_indices: &HashMap<String, usize>,
+        seen: &mut [bool],
+        touched: &mut Vec<usize>,
+    ) -> u64 {
+        let mut token_count = 0_u64;
+        let mut stream = tokenizer.token_stream_for_doc(document);
+        while let Some(token) = stream.next() {
+            token_count += 1;
+            if let Some(index) = term_indices.get(&token.text)
+                && !seen[*index]
+            {
+                seen[*index] = true;
+                touched.push(*index);
+            }
+        }
+        token_count
+    }
+
+    fn finish_document(
+        stats: &mut FlatBm25Stats,
+        seen: &mut [bool],
+        touched: &mut Vec<usize>,
+        token_count: u64,
+        retain_empty: bool,
+    ) {
+        if token_count == 0 && !retain_empty {
+            for index in touched.drain(..) {
+                seen[index] = false;
+            }
+            return;
+        }
+        stats.total_tokens += token_count;
+        stats.num_docs += 1;
+        for index in touched.drain(..) {
+            stats.token_docs[index] += 1;
+            seen[index] = false;
+        }
+    }
+
+    let mut stats = FlatBm25Stats {
+        token_docs: vec![0; term_indices.len()],
+        ..Default::default()
+    };
+    let mut seen = vec![false; term_indices.len()];
+    let mut touched = Vec::with_capacity(term_indices.len().min(16));
+    match batch.column(doc_col_idx).data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            for document in iter_str_array(batch.column(doc_col_idx)) {
+                let count = match document {
+                    Some(document) => count_text(
+                        &mut tokenizer,
+                        document,
+                        term_indices,
+                        &mut seen,
+                        &mut touched,
+                    ),
+                    None if coordinate_rank > 0 => {
+                        count_text(&mut tokenizer, "", term_indices, &mut seen, &mut touched)
+                    }
+                    None => 0,
+                };
+                finish_document(
+                    &mut stats,
+                    &mut seen,
+                    &mut touched,
+                    count,
+                    coordinate_rank > 0,
+                );
+            }
+        }
+        DataType::List(_) => {
+            let documents = batch.column(doc_col_idx).as_list::<i32>();
+            for row in 0..documents.len() {
+                let mut count = 0;
+                if !documents.is_null(row) {
+                    let elements = documents.value(row);
+                    let document = materialize_flat_string_list(elements.as_ref());
+                    count = count_text(
+                        &mut tokenizer,
+                        &document,
+                        term_indices,
+                        &mut seen,
+                        &mut touched,
+                    );
+                }
+                finish_document(&mut stats, &mut seen, &mut touched, count, false);
+            }
+        }
+        DataType::LargeList(_) => {
+            let documents = batch.column(doc_col_idx).as_list::<i64>();
+            for row in 0..documents.len() {
+                let mut count = 0;
+                if !documents.is_null(row) {
+                    let elements = documents.value(row);
+                    let document = materialize_flat_string_list(elements.as_ref());
+                    count = count_text(
+                        &mut tokenizer,
+                        &document,
+                        term_indices,
+                        &mut seen,
+                        &mut touched,
+                    );
+                }
+                finish_document(&mut stats, &mut seen, &mut touched, count, false);
+            }
+        }
+        data_type => {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "unsupported data type {data_type} for flat full text search"
+            )));
+        }
+    }
+    Ok(stats)
+}
+
+/// Collect exact BM25 corpus statistics for an already-resolved vocabulary.
+/// Input is reduced chunk-by-chunk to counters; document text and per-row token
+/// vectors are never retained across chunks.
+#[doc(hidden)]
+pub async fn collect_flat_bm25_stats(
+    input: SendableRecordBatchStream,
+    doc_col: &str,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<MemBM25Scorer> {
+    let input_schema = input.schema();
+    let doc_col_idx = input_schema.index_of(doc_col)?;
+    let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
+    let mut terms = Vec::new();
+    let mut term_indices = HashMap::new();
+    for token in query_tokens.as_ref() {
+        if !term_indices.contains_key(token) {
+            let index = terms.len();
+            terms.push(token.clone());
+            term_indices.insert(token.clone(), index);
+        }
+    }
+    let term_indices = Arc::new(term_indices);
+    let summaries = input
+        .map(move |batch| {
+            let tokenizer = tokenizer.box_clone();
+            let term_indices = term_indices.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let started = std::time::Instant::now();
+                let stats = collect_batch_bm25_stats(
+                    &batch?,
+                    doc_col_idx,
+                    coordinate_rank,
+                    tokenizer,
+                    term_indices.as_ref(),
+                )?;
+                if let Some(time) = elapsed_compute {
+                    time.add_duration(started.elapsed());
+                }
+                DataFusionResult::Ok(stats)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus());
+    let mut merged = FlatBm25Stats {
+        token_docs: vec![0; terms.len()],
+        ..Default::default()
+    };
+    futures::pin_mut!(summaries);
+    while let Some(stats) = summaries.try_next().await? {
+        merged.total_tokens = merged
+            .total_tokens
+            .checked_add(stats.total_tokens)
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(
+                    "flat FTS corpus token count overflows u64".to_string(),
+                )
+            })?;
+        merged.num_docs = merged.num_docs.checked_add(stats.num_docs).ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution(
+                "flat FTS corpus document count overflows usize".to_string(),
+            )
+        })?;
+        for (total, count) in merged.token_docs.iter_mut().zip(stats.token_docs) {
+            *total = total.checked_add(count).ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(
+                    "flat FTS document frequency overflows usize".to_string(),
+                )
+            })?;
+        }
+    }
+    Ok(MemBM25Scorer::new(
+        merged.total_tokens,
+        merged.num_docs,
+        terms.into_iter().zip(merged.token_docs).collect(),
+    ))
+}
+
 /// Run a flat BM25 search and return the scorer initialized from both the
 /// optional indexed corpus and the flat input corpus.
 pub async fn flat_bm25_search_stream_with_options_and_scorer(
@@ -860,6 +1288,89 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     query: String,
     tokenizer: Box<dyn LanceTokenizer>,
     base_scorer: Option<MemBM25Scorer>,
+    options: FlatBm25SearchOptions,
+) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
+    flat_bm25_search_stream_with_scorer_mode(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        FlatScorerMode::Extend(base_scorer),
+        None,
+        options,
+    )
+    .await
+}
+
+/// Run a flat BM25 search with fixed corpus-wide statistics.
+///
+/// Unlike [`flat_bm25_search_stream_with_options_and_scorer`], documents in
+/// `input` are scored but are not added to the supplied scorer. This is used
+/// when corpus statistics were collected from an unfiltered stream while the
+/// candidate stream has already applied a query filter.
+#[doc(hidden)]
+pub async fn flat_bm25_search_stream_with_options_and_fixed_scorer(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    scorer: MemBM25Scorer,
+    options: FlatBm25SearchOptions,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    Ok(flat_bm25_search_stream_with_scorer_mode(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        FlatScorerMode::Fixed(scorer),
+        None,
+        options,
+    )
+    .await?
+    .0)
+}
+
+/// Score current-value rows with exactly the vocabulary and corpus statistics
+/// selected by canonical mixed fuzzy preparation.
+#[doc(hidden)]
+pub async fn flat_bm25_search_stream_with_options_and_prepared(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+    options: FlatBm25SearchOptions,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    if options.operator == Operator::And && !prepared.has_all_query_positions() {
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            fts_schema(options.document_granularity),
+            stream::empty::<DataFusionResult<RecordBatch>>(),
+        )));
+    }
+    Ok(flat_bm25_search_stream_with_scorer_mode(
+        input,
+        doc_col,
+        String::new(),
+        tokenizer,
+        FlatScorerMode::Fixed(prepared.scorer().as_ref().clone()),
+        Some(prepared.tokens().clone()),
+        options,
+    )
+    .await?
+    .0)
+}
+
+enum FlatScorerMode {
+    Extend(Option<MemBM25Scorer>),
+    Fixed(MemBM25Scorer),
+}
+
+async fn flat_bm25_search_stream_with_scorer_mode(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    scorer_mode: FlatScorerMode,
+    prepared_tokens: Option<Arc<Tokens>>,
     options: FlatBm25SearchOptions,
 ) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
     let FlatBm25SearchOptions {
@@ -875,7 +1386,8 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
     let pre_await_start = std::time::Instant::now();
-    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
+    let query_tokens =
+        prepared_tokens.unwrap_or_else(|| Arc::new(collect_query_tokens(&query, &mut tokenizer)));
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
     // searchable content and matches nothing. Return early rather than
@@ -917,6 +1429,69 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     if let Some(t) = &elapsed_compute {
         t.add_duration(pre_await_start.elapsed());
     }
+
+    // A fixed scorer already contains corpus-wide statistics, so every input
+    // chunk can be tokenized and scored independently. Keep only the bounded
+    // in-flight chunks owned by `buffered`; never concatenate O(rows * terms)
+    // token-count state for the whole current-value corpus.
+    let base_scorer = match scorer_mode {
+        FlatScorerMode::Fixed(scorer) => {
+            let returned_scorer = scorer.clone();
+            let scorer = Arc::new(scorer);
+            let scored_chunks = chunked
+                .map(move |batch| {
+                    let tokenizer = tokenizer.box_clone();
+                    let query_tokens = query_tokens.clone();
+                    let scorer = scorer.clone();
+                    let elapsed_compute = elapsed_compute.clone();
+                    async move {
+                        let counted_input = tokenize_and_count(
+                            stream::iter([batch]),
+                            tokenizer,
+                            query_tokens.clone(),
+                            doc_col_idx,
+                            elapsed_compute.clone(),
+                            coordinate_rank,
+                            phrase_slop,
+                        )
+                        .await?;
+                        let scores = spawn_cpu(move || {
+                            let started = std::time::Instant::now();
+                            let scores = flat_bm25_score(
+                                query_tokens.as_ref(),
+                                &counted_input,
+                                scorer.as_ref(),
+                                document_granularity,
+                                operator,
+                                boost,
+                                phrase_slop,
+                            )?;
+                            if let Some(time) = elapsed_compute {
+                                time.add_duration(started.elapsed());
+                            }
+                            DataFusionResult::Ok(scores)
+                        })
+                        .await?;
+                        let batches = (0..scores.num_rows().div_ceil(target_batch_size))
+                            .map(|index| {
+                                let start = index * target_batch_size;
+                                let len = (scores.num_rows() - start).min(target_batch_size);
+                                Ok(scores.slice(start, len))
+                            })
+                            .collect::<Vec<DataFusionResult<RecordBatch>>>();
+                        DataFusionResult::Ok(stream::iter(batches))
+                    }
+                })
+                .buffered(get_num_compute_intensive_cpus())
+                .try_flatten()
+                .boxed();
+            return Ok((
+                Box::pin(RecordBatchStreamAdapter::new(output_schema, scored_chunks)),
+                returned_scorer,
+            ));
+        }
+        FlatScorerMode::Extend(base_scorer) => base_scorer,
+    };
 
     // Phase 2 - For each row we need to know the total number of tokens and the count of each
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"

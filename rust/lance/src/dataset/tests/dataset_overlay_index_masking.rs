@@ -1030,6 +1030,287 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
         mango_ids.contains(&6),
         "id=6 mango sorbet should still be found: {mango_ids:?}"
     );
+
+    for term in ["apple", "mango"] {
+        let exhaustive = bounded_multimatch_ids(&dataset, term, None).await;
+        let limited = bounded_multimatch_ids(&dataset, term, Some(2)).await;
+        assert_eq!(limited, exhaustive[..exhaustive.len().min(2)]);
+        if term == "apple" {
+            assert_eq!(
+                limited,
+                vec![0],
+                "limit=2 must not resurrect id=1's stale indexed apple posting"
+            );
+        }
+
+        let query: FtsQuery = MultiMatchQuery::try_new(term.to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC)
+                && plan.contains("CompoundFtsScorer")
+                && plan.contains("FlatMatchQuery")
+                && !plan.contains("AggregateExec"),
+            "known-coverage overlay MultiMatch should use bounded indexed-live plus targeted stale scoring:\n{plan}"
+        );
+    }
+
+    let multi_match_query: FtsQuery =
+        MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let unbounded = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(multi_match_query.clone()),
+        None,
+    )
+    .await;
+    let bounded = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(multi_match_query),
+        Some(2),
+    )
+    .await;
+    assert_eq!(bounded, unbounded[..bounded.len()]);
+
+    let plain_query = FullTextSearchQuery::new("mango".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut plain = scored_fts_rows(&dataset, plain_query, None).await;
+    let mut multi_match = unbounded;
+    plain.sort_unstable_by_key(|(row_id, _)| *row_id);
+    multi_match.sort_unstable_by_key(|(row_id, _)| *row_id);
+    assert_eq!(
+        plain, multi_match,
+        "plain Match and unbounded one-field MultiMatch must share current-value scores"
+    );
+
+    let mut fuzzy = MultiMatchQuery::try_new("applf".to_owned(), vec!["text".to_owned()]).unwrap();
+    fuzzy.match_queries[0].fuzziness = Some(1);
+    let mut fuzzy_scan = dataset.scan();
+    fuzzy_scan
+        .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
+    assert!(
+        fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy")
+            && fuzzy_plan.contains("FlatMatchQuery")
+            && !fuzzy_plan.contains("CompoundFtsScorer"),
+        "stale fuzzy queries must prepare and score from all current values:\n{fuzzy_plan}"
+    );
+    let fuzzy_batch = fuzzy_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        fuzzy_batch["id"].as_primitive::<Int32Type>().values(),
+        &[0],
+        "the unaffected indexed fuzzy hit must survive while stale id=1 remains blocked"
+    );
+
+    let plain_fuzzy = FtsQuery::Match(
+        MatchQuery::new("applf".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(1)),
+    );
+    let unbounded_plain = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(plain_fuzzy.clone()),
+        None,
+    )
+    .await;
+    let bounded_plain = scored_fts_rows(
+        &dataset,
+        FullTextSearchQuery::new_query(plain_fuzzy.clone()),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        bounded_plain,
+        unbounded_plain[..1],
+        "plain Match all-current fallback must apply final score/row-id top-k"
+    );
+
+    let mut fast_multimatch =
+        MultiMatchQuery::try_new("applf".to_owned(), vec!["text".to_owned()]).unwrap();
+    fast_multimatch.match_queries[0].fuzziness = Some(1);
+    for (name, query) in [
+        ("plain", plain_fuzzy),
+        ("multimatch", FtsQuery::MultiMatch(fast_multimatch)),
+    ] {
+        let mut fast = dataset.scan();
+        fast.fast_search();
+        fast.full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let plan = fast.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("FlatMatchQuery"),
+            "{name} fuzzy fast_search must remain index-only: {plan}"
+        );
+        let batch = fast.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            &[0],
+            "{name} fuzzy fast_search must mask the stale posting"
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_multimatch_overlay_zero_token_row_becomes_match(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [0]), ("text", Utf8, [""])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_text_fts_index(&mut dataset).await;
+    let dataset = commit_overlay(
+        dataset,
+        "zero_token_to_needle",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+        vec![Arc::new(StringArray::from(vec![Some("needle")]))],
+    )
+    .await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new("needle".to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        "zero-token stale rows require bounded targeted current-value scoring:\n{plan}"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(
+        batch[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+
+    let mut fuzzy = MultiMatchQuery::try_new("needlf".to_owned(), vec!["text".to_owned()]).unwrap();
+    fuzzy.match_queries[0].fuzziness = Some(1);
+    let fuzzy_query: FtsQuery = fuzzy.into();
+    let mut fuzzy_scan = dataset.scan();
+    fuzzy_scan
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(fuzzy_query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
+    assert!(
+        fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy")
+            && fuzzy_plan.contains("FlatMatchQuery"),
+        "zero-token stale fuzzy rows require all-current preparation: {fuzzy_plan}"
+    );
+    let fuzzy_batch = fuzzy_scan.try_into_batch().await.unwrap();
+    assert_eq!(fuzzy_batch.num_rows(), 1);
+
+    let plain_query = FullTextSearchQuery::new("needle".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let plain = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(plain_query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(plain.num_rows(), 1);
+    assert!(
+        plain[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+
+    let unbounded_query: FtsQuery =
+        MultiMatchQuery::try_new("needle".to_owned(), vec!["text".to_owned()])
+            .unwrap()
+            .into();
+    let unbounded = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(unbounded_query))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(unbounded.num_rows(), 1);
+    assert!(
+        unbounded[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0)
+            .is_finite()
+    );
+}
+
+#[tokio::test]
+async fn test_multimatch_unknown_coverage_overlay_full_scan_is_executable() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+    let mut dataset = commit_overlay(
+        dataset,
+        "unknown_coverage_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+    make_text_index_coverage_unknown(&mut dataset).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
+        .unwrap()
+        .into();
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("fts_bounded_mixed_fallback_full_scan") && plan.contains("FlatMatchQuery"),
+        "unknown overlay ownership must produce an executable FullScan fallback:\n{plan}"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 6]);
 }
 
 #[tokio::test]
