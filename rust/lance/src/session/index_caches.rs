@@ -15,10 +15,6 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::CompactFragReuseIndex;
-use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{ApproxMode, Query};
-use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
