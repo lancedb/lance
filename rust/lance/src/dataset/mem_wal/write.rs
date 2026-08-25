@@ -2078,6 +2078,21 @@ impl ShardWriter {
             // later". Reject the config instead; only the built-in valve reads
             // this ceiling.
             if config.backpressure.is_none() {
+                // The headroom the check below reserves for rows. At zero it
+                // reserves nothing, so a fresh memtable's index reservation may
+                // *equal* the ceiling — over budget before its first row, with an
+                // empty memtable there is nothing to seal, and the writer refuses
+                // its first write forever. A zero threshold is degenerate anyway:
+                // it seals every memtable at every insert.
+                if config.max_memtable_size == 0 {
+                    return Err(Error::invalid_input(
+                        "max_memtable_size must be greater than zero: it is both the \
+                         seal threshold for row data and the headroom reserved for rows \
+                         under max_unflushed_memtable_bytes, and at zero a writer with \
+                         in-memory indexes can be at its ceiling before its first row",
+                    ));
+                }
+
                 // Built the way `make_bound_memtable` builds it below, so this is
                 // the figure the controller will actually read.
                 let mut indexes = IndexStore::from_configs(
@@ -9160,6 +9175,47 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// `max_memtable_size` is the headroom the reservation check reserves for
+    /// rows. At zero it reserves none, so a fresh memtable's index reservation
+    /// could equal the ceiling exactly — admissible by the check, yet over budget
+    /// before its first row, with an empty memtable offering nothing to seal. The
+    /// writer refused its first write and never recovered.
+    #[tokio::test]
+    async fn test_open_rejects_a_zero_row_headroom() {
+        let sizing = ShardWriterConfig {
+            max_memtable_rows: 2_000,
+            ..Default::default()
+        };
+        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let (store, base_path, base_uri, _t) = create_local_store().await;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            max_memtable_rows: sizing.max_memtable_rows,
+            max_memtable_size: 0,
+            // Exactly the fresh reservation: the boundary the old `>` admitted.
+            max_unflushed_memtable_bytes: reserved,
+            ..Default::default()
+        };
+
+        let err = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            hnsw_schema(8),
+            hnsw_configs(),
+        )
+        .await
+        .err()
+        .expect("a zero row headroom must be rejected at open");
+
+        assert!(
+            err.to_string()
+                .contains("max_memtable_size must be greater than zero"),
+            "the error must name the knob, got: {err}"
+        );
     }
 
     /// Schema for the reservation tests: `vector` is field 1, the id 0 is `id`.
