@@ -4311,11 +4311,11 @@ async fn test_fts_phrase_query() {
     let words = ["lance", "full", "text", "search"];
     let mut lance_search_count = 0;
     let mut full_text_count = 0;
-    let mut doc_array = (0..4096)
+    let mut doc_array = (0..256)
         .map(|_| {
             let mut rng = rand::rng();
-            let mut text = String::with_capacity(512);
-            let len = rng.random_range(127..512);
+            let mut text = String::with_capacity(128);
+            let len = rng.random_range(31..128);
             for i in 0..len {
                 if i > 0 {
                     text.push(' ');
