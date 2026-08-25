@@ -6115,6 +6115,7 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
