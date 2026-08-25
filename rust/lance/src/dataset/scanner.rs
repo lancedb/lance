@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
@@ -66,6 +67,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
@@ -74,13 +76,17 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{
-    DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL, SCORE_FIELD, fts_schema,
+    DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
+    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
+use lance_select::IndexExprResult;
+// Re-exported so callers of `Scanner::with_row_addr_prefilter` can name the mask
+// type without depending on `lance-select` directly.
+pub use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -94,9 +100,10 @@ use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
-    fts_index_fragment_bitmap, load_segment_details, load_segments, resolve_fts_field,
-    resolve_query_document_granularity,
+    fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
+    resolve_fts_field, resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
@@ -106,14 +113,14 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, FtsDocumentExec,
-    MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
+    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
-    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    LanceScanExec, Planner, PreFilterSource, RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
         KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec, query_index_field,
     },
@@ -137,6 +144,22 @@ use lance_datafusion::substrait::parse_substrait;
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
 
+pub(crate) fn validate_batch_size(batch_size: usize) -> Result<u32> {
+    let validated = u32::try_from(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        ))
+    })?;
+    if validated == 0 {
+        return Err(Error::invalid_input(format!(
+            "batch_size must be between 1 and {}, got {batch_size}",
+            u32::MAX
+        )));
+    }
+    Ok(validated)
+}
+
 enum FtsOverlayPlan {
     Unchanged(Option<Vec<IndexMetadata>>),
     RowLevel {
@@ -146,28 +169,65 @@ enum FtsOverlayPlan {
     FullScan,
 }
 
-fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
-    match query {
-        FtsQuery::Match(query) => {
-            if let Some(column) = &query.column {
-                columns.insert(column.clone());
+fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
+    fn visit(query: &FtsQuery, columns: &mut Vec<String>, seen: &mut HashSet<String>) {
+        match query {
+            FtsQuery::Match(query) => {
+                if let Some(column) = &query.column
+                    && seen.insert(column.clone())
+                {
+                    columns.push(column.clone());
+                }
+            }
+            FtsQuery::Phrase(query) => {
+                if let Some(column) = &query.column
+                    && seen.insert(column.clone())
+                {
+                    columns.push(column.clone());
+                }
+            }
+            FtsQuery::Boost(query) => {
+                visit(&query.positive, columns, seen);
+                visit(&query.negative, columns, seen);
+            }
+            FtsQuery::MultiMatch(query) => {
+                for match_query in &query.match_queries {
+                    if let Some(column) = &match_query.column
+                        && seen.insert(column.clone())
+                    {
+                        columns.push(column.clone());
+                    }
+                }
+            }
+            FtsQuery::Boolean(query) => {
+                for child in query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                {
+                    visit(child, columns, seen);
+                }
             }
         }
+    }
+
+    let mut columns = Vec::new();
+    let mut seen = HashSet::new();
+    visit(query, &mut columns, &mut seen);
+    columns
+}
+
+fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
+    match query {
         FtsQuery::Phrase(query) => {
             if let Some(column) = &query.column {
                 columns.insert(column.clone());
             }
         }
         FtsQuery::Boost(query) => {
-            collect_all_fts_columns(&query.positive, columns);
-            collect_all_fts_columns(&query.negative, columns);
-        }
-        FtsQuery::MultiMatch(query) => {
-            for match_query in &query.match_queries {
-                if let Some(column) = &match_query.column {
-                    columns.insert(column.clone());
-                }
-            }
+            collect_phrase_columns(&query.positive, columns);
+            collect_phrase_columns(&query.negative, columns);
         }
         FtsQuery::Boolean(query) => {
             for child in query
@@ -176,10 +236,25 @@ fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
                 .chain(&query.must)
                 .chain(&query.must_not)
             {
-                collect_all_fts_columns(child, columns);
+                collect_phrase_columns(child, columns);
             }
         }
+        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => {}
     }
+}
+
+async fn load_physical_fts_details(
+    dataset: &Dataset,
+    column: &str,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexDetails> {
+    let details = fetch_index_details(dataset, column, segment).await?;
+    let details = InvertedIndexDetails::decode(details.value.as_slice()).map_err(|err| {
+        Error::io(format!(
+            "failed to decode InvertedIndexDetails payload: {err}"
+        ))
+    })?;
+    normalize_inverted_details(segment, details)
 }
 
 fn supports_compound_scorer(query: &FtsQuery) -> bool {
@@ -204,25 +279,8 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     if matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) || !supports_shape(query) {
         return false;
     }
-    let mut columns = HashSet::new();
-    collect_all_fts_columns(query, &mut columns);
-    columns.len() == 1
-}
-
-fn contains_phrase_query(query: &FtsQuery) -> bool {
-    match query {
-        FtsQuery::Phrase(_) => true,
-        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => false,
-        FtsQuery::Boost(query) => {
-            contains_phrase_query(&query.positive) || contains_phrase_query(&query.negative)
-        }
-        FtsQuery::Boolean(query) => query
-            .should
-            .iter()
-            .chain(&query.must)
-            .chain(&query.must_not)
-            .any(contains_phrase_query),
-    }
+    let columns = collect_fts_columns_in_order(query);
+    !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -265,6 +323,39 @@ fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
                 validate_fts_query_contract(child)?;
             }
             Ok(())
+        }
+    }
+}
+
+fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
+    fn normalize_zero(value: &mut f32) {
+        if *value == 0.0 {
+            *value = 0.0;
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => normalize_zero(&mut query.boost),
+        FtsQuery::Phrase(_) => {}
+        FtsQuery::Boost(query) => {
+            normalize_zero(&mut query.negative_boost);
+            normalize_fts_zero_boosts(&mut query.positive);
+            normalize_fts_zero_boosts(&mut query.negative);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &mut query.match_queries {
+                normalize_zero(&mut match_query.boost);
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter_mut()
+                .chain(&mut query.must)
+                .chain(&mut query.must_not)
+            {
+                normalize_fts_zero_boosts(child);
+            }
         }
     }
 }
@@ -495,7 +586,7 @@ impl FilterPlan {
         if self.refine_query_filter {
             match &self.query_filter {
                 Some(QueryFilter::Fts(fts_query)) => {
-                    let cols = if fts_query.columns().is_empty() {
+                    let cols = if fts_query.query.is_missing_column() {
                         let indexed_columns = fts_indexed_columns(dataset.clone()).await?;
                         let q = fill_fts_query_column(&fts_query.query, &indexed_columns, false)?;
                         q.columns()
@@ -523,6 +614,7 @@ impl FilterPlan {
         &self,
         input: Arc<dyn ExecutionPlan>,
         scanner: &Scanner,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plan = input;
 
@@ -539,9 +631,12 @@ impl FilterPlan {
         }
 
         if let Some(refine_expr) = &self.expr_filter_plan.refine_expr {
-            // We create a new planner specific to the node's schema, since
-            // physical expressions reference column by index rather than by name.
-            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            plan = Arc::new(match session {
+                Some(session) => {
+                    LanceFilterExec::try_new_with_session(refine_expr.clone(), plan, session)?
+                }
+                None => LanceFilterExec::try_new(refine_expr.clone(), plan)?,
+            });
         }
 
         Ok(plan)
@@ -882,6 +977,14 @@ pub struct Scanner {
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
 
+    /// Optional external allow/block mask keyed in `_rowid` space. On a vector
+    /// search it is combined with the index-side prefilter and applied to the
+    /// flat branch for fragments not covered by the index; on a plain scan it is
+    /// the row source (see `use_external_mask`). Held behind an Arc so cloning it
+    /// into the ANN sub-plans and the flat-branch filter is cheap regardless of
+    /// mask size.
+    external_row_mask: Option<Arc<RowAddrMask>>,
+
     /// Materialization style controls when columns are fetched
     materialization_style: MaterializationStyle,
 
@@ -1181,6 +1284,7 @@ impl Scanner {
             projection_plan,
             blob_handling: BlobHandling::default(),
             prefilter: false,
+            external_row_mask: None,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
@@ -1345,6 +1449,47 @@ impl Scanner {
         self
     }
 
+    /// Set an external [`RowAddrMask`] allow/block prefilter.
+    ///
+    /// Build the mask with [`RowAddrMask::from_allowed`] to keep only the listed
+    /// rows or [`RowAddrMask::from_block`] to drop them. On a vector
+    /// ([`nearest`](Self::nearest)) search the mask is combined with any
+    /// filter-derived prefilter on the index branch and applied to the flat
+    /// branch for fragments not covered by the vector index. On a
+    /// [`full_text_search`](Self::full_text_search) (match or phrase query) the
+    /// mask is combined into the FTS prefilter so BM25 top-k is computed over
+    /// masked rows, and the flat branch that scores unindexed fragments
+    /// (plan_flat_match_query) is masked with RowAddrMaskFilterExec. On a plain
+    /// scan the mask is used directly as the row source, with any
+    /// [`filter`](Self::filter) applied as a refine on top.
+    ///
+    /// The mask is keyed in the dataset's `_rowid` space, so build it from the
+    /// same dataset you query. That space is the row address when stable row ids
+    /// are disabled and the stable row id when they are enabled; both are handled
+    /// (index prefilter and filtered read branch on `uses_stable_row_ids`), so no
+    /// caller-side translation is needed either way.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::dataset::Dataset;
+    /// # async fn example(dataset: &Dataset) -> lance::Result<()> {
+    /// use lance::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
+    ///
+    /// // Restrict the scan to rows whose _rowid is 0, 2, or 4.
+    /// let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([0u64, 2, 4]));
+    /// let mut scanner = dataset.scan();
+    /// scanner.with_row_addr_prefilter(mask);
+    /// let batch = scanner.try_into_batch().await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_row_addr_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
+        self.external_row_mask = Some(Arc::new(mask));
+        self
+    }
+
     /// Set the callback to be called after the scan with summary statistics
     pub fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
         self.scan_stats_callback = Some(callback);
@@ -1454,6 +1599,8 @@ impl Scanner {
     }
 
     /// Set the maximum number of rows per batch.
+    ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive.
     ///
     /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
@@ -1993,9 +2140,7 @@ impl Scanner {
             .or_else(|| self.dataset.file_reader_options.clone());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
-                if opts.batch_size_bytes.is_none() {
-                    opts.batch_size_bytes = Some(bsb);
-                }
+                opts.batch_size_bytes = Some(bsb);
                 Some(opts)
             }
             (Some(opts), None) => Some(opts),
@@ -2595,6 +2740,10 @@ impl Scanner {
             ));
         }
 
+        if let Some(batch_size) = self.batch_size {
+            validate_batch_size(batch_size)?;
+        }
+
         if self.strict_batch_size
             && let Some(batch_size_bytes) = self
                 .resolved_file_reader_options()
@@ -2791,8 +2940,22 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    pub fn create_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(None))
+    }
+
+    pub(crate) fn create_plan_with_session<'a>(
+        &'a self,
+        session: &'a dyn Session,
+    ) -> BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.create_plan_impl(Some(session)))
+    }
+
     #[instrument(level = "debug", skip_all)]
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan_impl(
+        &self,
+        session: Option<&dyn Session>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
@@ -2855,7 +3018,7 @@ impl Scanner {
                     self.take_source(take_op).await?
                 } else {
                     let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                        .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
                         .await?;
                     if planned_read.limit_pushed_down {
                         use_limit_node = false;
@@ -2900,7 +3063,7 @@ impl Scanner {
         plan = self.take(plan, pre_filter_projection)?;
 
         // Filter
-        plan = filter_plan.refine_filter(plan, self).await?;
+        plan = filter_plan.refine_filter(plan, self, session).await?;
 
         // Aggregate (if set, applies aggregate and returns early)
         if let Some(agg) = &self.aggregate {
@@ -3117,6 +3280,32 @@ impl Scanner {
         }
     }
 
+    // A plain-scan external row mask is fed as the FilteredReadExec row source so
+    // only masked rows are read, with any SQL filter applied as a refine on top.
+    // Vector and full-text searches apply the mask via their own prefilter paths
+    // (KNN external_mask / FTS build_prefilter), so this plain-scan source is
+    // scoped to scans that are neither. FTS in particular has nearest.is_none(),
+    // so excluding it here keeps the FTS prefilter's own filtered read unmasked.
+    fn use_external_mask(&self) -> bool {
+        self.nearest.is_none() && self.full_text_query.is_none() && self.external_row_mask.is_some()
+    }
+
+    // The filter plan actually handed to the filtered read. With an external mask
+    // active the mask is the row source, so any SQL filter is demoted to a refine
+    // on top of it; otherwise the plan is used as-is. Projection and scan-range
+    // planning must be done against this, not the raw filter_plan, so refine
+    // columns are retained and limit/offset is not pushed down before masking.
+    fn effective_filter_plan(&self, filter_plan: &ExprFilterPlan) -> ExprFilterPlan {
+        if self.use_external_mask() {
+            match filter_plan.full_expr.clone() {
+                Some(expr) => ExprFilterPlan::new_refine_only(expr),
+                None => ExprFilterPlan::default(),
+            }
+        } else {
+            filter_plan.clone()
+        }
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -3127,11 +3316,15 @@ impl Scanner {
         make_deletions_null: bool,
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
+        session: Option<&dyn Session>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Kept for the overlay stale-Take path below, which re-evaluates blocked stale rows.
         let user_projection = projection.clone();
+        let use_external_mask = self.use_external_mask();
+        let effective_filter = self.effective_filter_plan(filter_plan);
+
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(filter_plan.clone())
+            .with_filter_plan(effective_filter)
             .with_projection(projection);
 
         if let Some(fragments) = fragments {
@@ -3143,7 +3336,7 @@ impl Scanner {
         }
 
         if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(batch_size as u32);
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
         }
 
         // Bound the decode fan-out by `batch_readahead`.
@@ -3171,6 +3364,10 @@ impl Scanner {
             read_options = read_options.with_only_indexed_fragments();
         }
 
+        if let Some(session) = session {
+            read_options = read_options.with_physical_filters(session)?;
+        }
+
         // Mask data overlay files: a row with an overlay committed after an index it relies on
         // touched an indexed field can no longer be trusted to that index. Block just those rows
         // from the index result (their fragments stay indexed, so non-stale rows keep the index)
@@ -3190,13 +3387,16 @@ impl Scanner {
         }
 
         let result_format = self.index_expr_result_format();
-        let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                result_format,
-            )) as Arc<dyn ExecutionPlan>
-        });
+        let index_input = match self.external_row_mask.as_deref() {
+            Some(mask) if use_external_mask => Some(self.mask_as_take_input(mask.clone())?),
+            _ => filter_plan.index_query.clone().map(|index_query| {
+                Arc::new(ScalarIndexExec::new(
+                    self.dataset.clone(),
+                    index_query,
+                    result_format,
+                )) as Arc<dyn ExecutionPlan>
+            }),
+        };
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
@@ -3220,7 +3420,12 @@ impl Scanner {
             .await?;
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
-        let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
+        let filtered = Arc::new(match session {
+            Some(session) => {
+                LanceFilterExec::try_new_with_session(optimized_filter, stale_node, session)?
+            }
+            None => LanceFilterExec::try_new(optimized_filter, stale_node)?,
+        });
         let stale_path: Arc<dyn ExecutionPlan> =
             Arc::new(project(filtered, plan.schema().as_ref())?);
 
@@ -3234,6 +3439,7 @@ impl Scanner {
     // Helper function for filtered read
     //
     // Delegates to legacy or new filtered read based on dataset storage version
+    #[allow(clippy::too_many_arguments)]
     fn filtered_read<'a>(
         &'a self,
         filter_plan: &'a ExprFilterPlan,
@@ -3242,7 +3448,27 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
+        session: Option<&'a dyn Session>,
     ) -> BoxFuture<'a, Result<PlannedFilteredScan>> {
+        // The plain-scan mask path lives in new_filtered_read; legacy_filtered_read
+        // has no equivalent, so a masked plain scan there would silently drop the
+        // mask and return every row. Fail loudly instead. Vector and full-text
+        // searches apply the mask via their own prefilter paths (ANN prefilter /
+        // FTS build_prefilter) plus the RowAddrMaskFilterExec flat wrap, so they
+        // are unaffected -- use_external_mask() is false for them.
+        let is_legacy = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
+            == lance_file::version::ConcreteFileVersion::V1;
+        if is_legacy && self.use_external_mask() {
+            return std::future::ready(Err(Error::not_supported(
+                "with_row_addr_prefilter is not supported for plain scans on \
+                 legacy-storage datasets",
+            )))
+            .boxed();
+        }
         versions::filtered_read(
             self.dataset
                 .manifest()
@@ -3255,13 +3481,30 @@ impl Scanner {
             fragments,
             scan_range,
             is_prefilter,
+            session,
         )
         .boxed()
     }
 
     fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_id_mask = RowAddrMask::from_allowed(row_ids);
-        let index_result = IndexExprResult::exact(row_id_mask);
+        self.mask_as_take_input(RowAddrMask::from_allowed(row_ids))
+    }
+
+    // Wrap a row-address mask as a one-shot index input for FilteredReadExec, so a
+    // plain scan reads only the rows the mask selects.
+    //
+    // Every take-shaped row source funnels through here: plain takes, the
+    // _rowid/_rowaddr predicate shortcut, and the overlay stale-row replay under
+    // both scan and ANN. Intersecting the caller's mask once at this boundary is
+    // what keeps the invariant on all of them; applying it per branch is how
+    // branches get missed. Idempotent, so the branch that passes the external
+    // mask itself is unaffected.
+    fn mask_as_take_input(&self, mask: RowAddrMask) -> Result<Arc<dyn ExecutionPlan>> {
+        let mask = match self.external_row_mask.as_deref() {
+            Some(external) => mask.intersect(external.clone()),
+            None => mask,
+        };
+        let index_result = IndexExprResult::exact(mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let format = self.index_expr_result_format();
         let batch = index_result.serialize(&fragments_covered, format)?;
@@ -3311,6 +3554,7 @@ impl Scanner {
     async fn filtered_read_source(
         &self,
         filter_plan: &mut ExprFilterPlan,
+        session: Option<&dyn Session>,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
@@ -3332,11 +3576,15 @@ impl Scanner {
             self.projection_plan.physical_projection.clone()
         };
 
-        let mut projection = if filter_plan.has_refine() {
+        // Plan against the effective filter: with an external mask the SQL filter
+        // becomes a refine, so its columns must be retained even when the original
+        // plan resolved to an exact scalar-index query (has_refine() == false).
+        let effective_filter = self.effective_filter_plan(filter_plan);
+        let mut projection = if effective_filter.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
-            self.calc_eager_projection(filter_plan, &effective_projection)?
+            self.calc_eager_projection(&effective_filter, &effective_projection)?
                 .with_row_id()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
@@ -3350,7 +3598,11 @@ impl Scanner {
             projection.with_row_addr = true;
         }
 
-        let scan_range = if filter_plan.is_empty() {
+        // An external mask is applied as the row source inside new_filtered_read, so
+        // limit/offset must not be pushed down as a pre-mask range (that would limit
+        // rows before masking). Leaving scan_range None keeps limit_pushed_down false
+        // so the limit is applied by a node above the masked source instead.
+        let scan_range = if filter_plan.is_empty() && !self.use_external_mask() {
             log::trace!("pushing scan_range into filtered_read");
             self.get_scan_range(filter_plan).await?
         } else {
@@ -3364,6 +3616,7 @@ impl Scanner {
             self.fragments.clone().map(Arc::new),
             scan_range,
             /*is_prefilter= */ false,
+            session,
         )
         .await
     }
@@ -3553,15 +3806,12 @@ impl Scanner {
                 .await
             }
             FtsQuery::Boolean(bool_query) => {
-                for query in bool_query.must.iter() {
-                    if !self
-                        .fragments_covered_by_fts_query_helper(query, accum)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
-                }
-                for query in &bool_query.should {
+                for query in bool_query
+                    .must
+                    .iter()
+                    .chain(&bool_query.should)
+                    .chain(&bool_query.must_not)
+                {
                     if !self
                         .fragments_covered_by_fts_query_helper(query, accum)
                         .await?
@@ -3852,7 +4102,8 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {
         let mut resolved = query.clone();
-        if resolved.columns().is_empty() {
+        normalize_fts_zero_boosts(&mut resolved.query);
+        if resolved.query.is_missing_column() {
             if Self::query_requests_list_element(&resolved.query) {
                 return Err(Error::invalid_input(
                     "ListElement FTS queries must explicitly specify a field path".to_string(),
@@ -3912,24 +4163,18 @@ impl Scanner {
         prefilter_source: &PreFilterSource,
         document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let mut columns = HashSet::new();
-        collect_all_fts_columns(query, &mut columns);
-        let Some(column) = columns.into_iter().next() else {
+        let columns = collect_fts_columns_in_order(query);
+        if columns.is_empty() {
             return Ok(None);
-        };
+        }
+        let cross_column = columns.len() > 1;
+        if cross_column && params.limit.is_none() {
+            // Candidate-driven cross-column execution requires a bounded top-k
+            // collector. The existing DataFusion plan remains the exact path
+            // for callers that request the full result set.
+            return Ok(None);
+        }
 
-        let index = self
-            .dataset
-            .load_scalar_index(
-                IndexCriteria::default()
-                    .for_column(&column)
-                    .supports_fts()
-                    .with_fts_document_granularity(document_granularity),
-            )
-            .await?;
-        let Some(index) = index else {
-            return Ok(None);
-        };
         let target_fragments: &[Fragment] = self
             .fragments
             .as_deref()
@@ -3937,45 +4182,117 @@ impl Scanner {
         if target_fragments.is_empty() {
             return Ok(None);
         }
-        if !self
-            .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?)
-            .is_empty()
-        {
-            // Flat and posting-backed leaves do not share a document domain.
-            // Preserve the exact DataFusion fallback until flat leaves expose
-            // the same candidate protocol.
+        let mut phrase_columns = HashSet::new();
+        collect_phrase_columns(query, &mut phrase_columns);
+
+        let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
+            let phrase_columns = &phrase_columns;
+            async move {
+                let index = self
+                    .dataset
+                    .load_scalar_index(
+                        IndexCriteria::default()
+                            .for_column(&column)
+                            .supports_fts()
+                            .with_fts_document_granularity(document_granularity),
+                    )
+                    .await?;
+                let Some(index) = index else {
+                    return Ok(None);
+                };
+
+                let (unindexed_fragments, overlay_plan) = futures::future::try_join(
+                    self.dataset.unindexed_fragments(&index.name),
+                    self.fts_overlay_plan(&column, document_granularity, target_fragments),
+                )
+                .await?;
+                if !self.retain_target_fragments(unindexed_fragments).is_empty() {
+                    // Flat and posting-backed leaves do not share a document
+                    // domain, so preserve the exact fallback for partial index
+                    // coverage.
+                    return Ok(None);
+                }
+                let segments = match overlay_plan {
+                    FtsOverlayPlan::Unchanged(Some(segments)) => segments,
+                    FtsOverlayPlan::Unchanged(None) => {
+                        load_segments(&self.dataset, &column, document_granularity)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "No Inverted index found for column {column}"
+                                ))
+                            })?
+                    }
+                    FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
+                };
+
+                if cross_column {
+                    let details = futures::future::try_join_all(
+                        segments.iter().map(|segment| {
+                            load_physical_fts_details(&self.dataset, &column, segment)
+                        }),
+                    )
+                    .await?;
+                    if phrase_columns.contains(&column)
+                        && details.iter().any(|details| !details.with_position)
+                    {
+                        return Err(Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position"
+                                .to_string(),
+                        ));
+                    }
+                    let all_modern = details.iter().all(|details| {
+                        matches!(
+                            details.posting_format_version,
+                            Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
+                        )
+                    });
+                    if !all_modern {
+                        return Ok(None);
+                    }
+                } else if phrase_columns.contains(&column) {
+                    let details = load_segment_details(&self.dataset, &column, &segments).await?;
+                    if !details.with_position {
+                        return Err(Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                Ok(Some((column, segments)))
+            }
+        }))
+        .await?;
+        let Some(segment_groups) = segment_groups.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(None);
-        }
-        let segments = match self
-            .fts_overlay_plan(&column, document_granularity, target_fragments)
-            .await?
-        {
-            FtsOverlayPlan::Unchanged(Some(segments)) => segments,
-            FtsOverlayPlan::Unchanged(None) => {
-                load_segments(&self.dataset, &column, document_granularity)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!("No Inverted index found for column {column}"))
-                    })?
-            }
-            FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
         };
-        if contains_phrase_query(query) {
-            let details = load_segment_details(&self.dataset, &column, &segments).await?;
-            if !details.with_position {
-                return Err(Error::invalid_input(
-                    "position is not found but required for phrase queries, try recreating the index with position"
-                        .to_string(),
-                ));
-            }
+
+        if !cross_column {
+            let (_, segments) = segment_groups.into_iter().next().ok_or_else(|| {
+                Error::internal("compound scorer requires one column".to_string())
+            })?;
+            return Ok(Some(Arc::new(
+                CompoundQueryExec::new_with_segments(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                    segments,
+                )
+                .with_external_mask(self.external_row_mask.clone()),
+            )));
         }
-        Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
+
+        let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             prefilter_source.clone(),
-            segments,
-        ))))
+            segment_groups,
+        )?
+        .with_external_mask(self.external_row_mask.clone());
+        Ok(Some(Arc::new(exec)))
     }
 
     async fn plan_fts(
@@ -3995,9 +4312,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Cross-column, flat, and overlay-backed compound queries retain the
-        // exact DataFusion fallback because their leaves do not share one
-        // posting document domain.
+        // Unsupported, unbounded, partial-index, and overlay-backed cross-column
+        // shapes retain the exact DataFusion fallback.
         let plan: Arc<dyn ExecutionPlan> = match query {
             FtsQuery::Match(query) => {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
@@ -4036,13 +4352,43 @@ impl Scanner {
             }
 
             FtsQuery::MultiMatch(query) => {
-                let mut children = Vec::with_capacity(query.match_queries.len());
-                for match_query in &query.match_queries {
-                    let child =
-                        self.plan_match_query(match_query, params, filter_plan, prefilter_source);
-                    children.push(child);
-                }
-                let children = futures::future::try_join_all(children).await?;
+                // A top-level cross-column MultiMatch scores each field independently and takes
+                // the maximum score for each row. A field's bounded compound top-k is therefore
+                // sufficient to determine the global top-k independently of the other fields.
+                // Preserve that bounded plan for every eligible field, while planning only
+                // partial-index and overlay-backed fields through the exhaustive leaf fallback.
+                let unlimited_params = params.clone().with_limit(None);
+                let can_use_bounded_compound =
+                    !document_granularity.is_list_element() && params.limit.is_some();
+                let children =
+                    futures::future::try_join_all(query.match_queries.iter().map(|match_query| {
+                        let unlimited_params = &unlimited_params;
+                        async move {
+                            if can_use_bounded_compound {
+                                let child_query = FtsQuery::Match(match_query.clone());
+                                if let Some(plan) = self
+                                    .plan_compound_scorer(
+                                        &child_query,
+                                        params,
+                                        prefilter_source,
+                                        document_granularity,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(plan);
+                                }
+                            }
+
+                            self.plan_match_query(
+                                match_query,
+                                unlimited_params,
+                                filter_plan,
+                                prefilter_source,
+                            )
+                            .await
+                        }
+                    }))
+                    .await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
@@ -4304,6 +4650,7 @@ impl Scanner {
                 if let Some(shared_scorer) = &shared_scorer {
                     phrase_exec = phrase_exec.with_shared_scorer(shared_scorer.clone());
                 }
+                phrase_exec = phrase_exec.with_external_mask(self.external_row_mask.clone());
                 let phrase_plan = Some(Arc::new(phrase_exec) as Arc<dyn ExecutionPlan>);
                 let flat_phrase_plan = if has_flat_path {
                     Some(
@@ -4462,6 +4809,7 @@ impl Scanner {
                 if let Some(shared_scorer) = &shared_scorer {
                     match_exec = match_exec.with_shared_scorer(shared_scorer.clone());
                 }
+                match_exec = match_exec.with_external_mask(self.external_row_mask.clone());
                 let match_plan = Some(Arc::new(match_exec) as Arc<dyn ExecutionPlan>);
                 let flat_match_plan = if has_flat_path {
                     Some(
@@ -4595,6 +4943,7 @@ impl Scanner {
                     Some(Arc::new(fragments)),
                     None,
                     /*is_prefilter=*/ true,
+                    None,
                 )
                 .await?;
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -4638,7 +4987,15 @@ impl Scanner {
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
         }
-        Ok(Arc::new(flat_match_plan))
+        let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(flat_match_plan);
+        // Unindexed fragments and stale rows never reach the index-side prefilter,
+        // so apply the external row-address mask to the flat FTS results here
+        // (mirrors the ANN flat branch). Applied before the caller's top-k so
+        // masked-out rows do not consume result slots.
+        if let Some(mask) = self.external_row_mask.clone() {
+            return Ok(Arc::new(RowAddrMaskFilterExec::new(flat_match_plan, mask)));
+        }
+        Ok(flat_match_plan)
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -4686,7 +5043,7 @@ impl Scanner {
 
                 if requested_index_segments
                     .iter()
-                    .any(|idx| !idx.fields.contains(&column_id))
+                    .any(|idx| idx.fields.first() != Some(&column_id))
                 {
                     return Err(Error::invalid_input(format!(
                         "with_index_segments contained a segment that does not belong to vector column '{}'",
@@ -4738,7 +5095,17 @@ impl Scanner {
                         None
                     }
                 }
-            } else if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+            }
+            // An index can only answer a query on the column it is keyed on, which is
+            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
+            // merely carries values for, which it cannot search. Not a boundary derived
+            // from `covering_fields` either -- that is computed from a field older
+            // writers drop, so it would widen to the carried columns exactly when the
+            // declaration is lost.
+            else if let Some(index) = indices
+                .iter()
+                .find(|i| i.fields.first() == Some(&column_id))
+            {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
@@ -4885,11 +5252,17 @@ impl Scanner {
                     self.fragments.clone().map(Arc::new),
                     None,
                     /*is_prefilter= */ true,
+                    None,
                 )
                 .await?;
 
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            }
+            // The flat branch never reaches the index-side prefilter, so apply
+            // the external row-address mask here against the scanned _rowid.
+            if let Some(mask) = self.external_row_mask.clone() {
+                plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
             Ok(self.flat_knn(plan, &q)?)
         }
@@ -5049,6 +5422,12 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
+            // Appended fragments are not covered by the index, so the external
+            // row-address mask must be applied to them here.
+            let scan_node = match self.external_row_mask.clone() {
+                Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
+                None => scan_node,
+            };
             let topk_fallback = self.flat_knn(scan_node, &q)?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
@@ -5157,7 +5536,8 @@ impl Scanner {
     ///
     /// The check is field-aware (an overlay touching only unindexed fields excludes nothing) and
     /// version-gated (an overlay with `committed_version <= index.dataset_version` is already
-    /// incorporated by the index), via [`overlay_exclusion_offsets`].
+    /// incorporated by the index), via
+    /// [`lance_table::format::overlay::staleness::overlay_exclusion_offsets`].
     async fn overlay_stale_index_rows(
         &self,
         index_expr: &ScalarIndexExpr,
@@ -6003,6 +6383,7 @@ impl Scanner {
             q,
             prefilter_source,
             overlay_block,
+            self.external_row_mask.clone(),
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -6064,6 +6445,7 @@ impl Scanner {
                 &query,
                 prefilter_source.clone(),
                 overlay_block.clone(),
+                self.external_row_mask.clone(),
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -6180,6 +6562,7 @@ impl Scanner {
                 Some(fragments),
                 None,
                 /*is_prefilter= */ true,
+                None,
             )
             .await?;
         Ok(PreFilterSource::FilteredRowIds(plan))
@@ -6240,7 +6623,7 @@ impl Scanner {
                 read_options = read_options.with_deleted_rows()?;
             }
             if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(batch_size as u32);
+                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
             }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -6724,7 +7107,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{
-        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -6769,6 +7152,130 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_normalize_fts_zero_boosts_recurses_and_preserves_nonzero_values() {
+        fn boost_bits(query: &FtsQuery) -> Vec<u32> {
+            match query {
+                FtsQuery::Match(query) => vec![query.boost.to_bits()],
+                FtsQuery::Phrase(_) => Vec::new(),
+                FtsQuery::Boost(query) => std::iter::once(query.negative_boost.to_bits())
+                    .chain(boost_bits(&query.positive))
+                    .chain(boost_bits(&query.negative))
+                    .collect(),
+                FtsQuery::MultiMatch(query) => query
+                    .match_queries
+                    .iter()
+                    .map(|query| query.boost.to_bits())
+                    .collect(),
+                FtsQuery::Boolean(query) => query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                    .flat_map(boost_bits)
+                    .collect(),
+            }
+        }
+
+        let match_query =
+            |terms: &str, boost| MatchQuery::new(terms.to_string()).with_boost(boost).into();
+        let multi_match = MultiMatchQuery::try_new(
+            "needle".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![-0.0, 2.5])
+        .unwrap();
+        let negative = BooleanQuery::new([
+            (Occur::Should, multi_match.into()),
+            (Occur::Must, match_query("required", 3.5)),
+            (Occur::MustNot, match_query("blocked", -0.0)),
+        ]);
+        let boost = BoostQuery::new(match_query("positive", -0.0), negative.into(), Some(-0.0));
+        let mut query: FtsQuery = BooleanQuery::new([
+            (Occur::Should, match_query("outer", -0.0)),
+            (Occur::Must, boost.into()),
+            (Occur::MustNot, match_query("unchanged", 4.5)),
+        ])
+        .into();
+
+        let nz = (-0.0_f32).to_bits();
+        let pz = 0.0_f32.to_bits();
+        let b2 = 2.5_f32.to_bits();
+        let b3 = 3.5_f32.to_bits();
+        let b4 = 4.5_f32.to_bits();
+        assert_eq!(boost_bits(&query), vec![nz, nz, nz, nz, b2, b3, nz, b4]);
+        normalize_fts_zero_boosts(&mut query);
+        assert_eq!(boost_bits(&query), vec![pz, pz, pz, pz, b2, b3, pz, b4]);
+    }
+
+    #[test]
+    fn test_compound_scorer_shape_supports_cross_column_boolean_queries() {
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("alpha".to_string())
+                    .with_column(Some("title".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("beta".to_string())
+                    .with_column(Some("body".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::MustNot,
+                MatchQuery::new("gamma".to_string())
+                    .with_column(Some("summary".to_string()))
+                    .into(),
+            ),
+        ]));
+
+        assert!(supports_compound_scorer(&query));
+        assert_eq!(
+            collect_fts_columns_in_order(&query),
+            ["title", "body", "summary"]
+        );
+    }
+
+    #[test]
+    fn test_compound_scorer_leaves_top_level_cross_column_multi_match_on_existing_path() {
+        let single_column = FtsQuery::MultiMatch(
+            MultiMatchQuery::try_new("alpha".to_string(), vec!["title".to_string()]).unwrap(),
+        );
+        let cross_column = FtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "alpha".to_string(),
+                vec!["title".to_string(), "body".to_string()],
+            )
+            .unwrap(),
+        );
+
+        assert!(supports_compound_scorer(&single_column));
+        assert!(!supports_compound_scorer(&cross_column));
+    }
+
+    #[test]
+    fn test_collect_phrase_columns_traverses_prohibited_subtrees() {
+        let phrase =
+            PhraseQuery::new("exact phrase".to_string()).with_column(Some("body".to_string()));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("alpha".to_string())
+                    .with_column(Some("title".to_string()))
+                    .into(),
+            ),
+            (Occur::MustNot, phrase.into()),
+        ]));
+        let mut columns = HashSet::new();
+
+        collect_phrase_columns(&query, &mut columns);
+
+        assert_eq!(columns, HashSet::from(["body".to_string()]));
     }
 
     #[test]
@@ -6954,6 +7461,440 @@ mod test {
                 rows_read += next.num_rows();
             }
         }
+    }
+
+    fn batch_row_ids(batch: &RecordBatch) -> Vec<u64> {
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_allow_block_refine(#[case] stable_row_ids: bool) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let all_set: BTreeSet<u64> = all_ids.iter().copied().collect();
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        // Allow-mask plain scan returns exactly the allowed rows.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        assert_eq!(got, allow_set);
+
+        // Block-mask plain scan returns every row except the blocked ones, which
+        // also exercises FilteredReadExec index-input serialization of a BlockList.
+        let block: Vec<u64> = all_ids.iter().copied().step_by(3).collect();
+        let block_set: BTreeSet<u64> = block.iter().copied().collect();
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter(
+            block.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        let expected: BTreeSet<u64> = all_set.difference(&block_set).copied().collect();
+        assert_eq!(got, expected);
+
+        // With a SQL refine, the result is the allowed rows that also match the filter.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["i"]).unwrap();
+        scan.with_row_id();
+        let refined = scan.try_into_batch().await.unwrap();
+        let refined_ids: BTreeSet<u64> = batch_row_ids(&refined).into_iter().collect();
+        assert!(refined_ids.is_subset(&allow_set) && !refined_ids.is_empty());
+        let is = refined
+            .column_by_name("i")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert!(is.values().iter().all(|v| *v >= 200));
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_rejected_on_legacy() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([0u64])));
+        let Err(err) = scan.try_into_stream().await else {
+            panic!("expected legacy-storage masked plain scan to be rejected");
+        };
+        assert!(
+            err.to_string().contains("legacy-storage"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn row_addr_mask_ann_search_only_allowed(#[case] stable_row_ids: bool) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        // Append after indexing so the appended fragment is unindexed (flat branch).
+        test_ds.append_new_data().await.unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(3).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        let key: Float32Array = (0..32).map(|v| v as f32).collect();
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, 15).unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(!got.is_empty());
+        for id in got {
+            assert!(
+                allow_set.contains(&id),
+                "returned _rowid {id} not in allowlist"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_with_limit() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        // limit must apply AFTER masking: 5 rows, all from the allowlist.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.limit(Some(5), None).unwrap();
+        scan.with_row_id();
+        let got = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert_eq!(got.len(), 5, "masked limit should yield 5 masked rows");
+        for id in &got {
+            assert!(allow_set.contains(id), "returned {id} not allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_filter_unprojected_column() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+
+        // Allow everything; filter on `i` but project only `s` (unrelated column).
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            all_ids.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["s"]).unwrap();
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 200, "expected 200 rows with i>=200");
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_exact_index_filter_unprojected_column() {
+        // A scalar index on `i` turns `i >= 200` into an exact index query with no
+        // refine. Under an external mask that predicate is demoted to a refine over
+        // the masked rows, so `i` must still be projected for the read even though
+        // the user only asked for `s`.
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_scalar_index().await.unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            all_ids.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["s"]).unwrap();
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 200, "expected 200 rows with i>=200");
+    }
+
+    /// A `_rowid` predicate is recognized as a TakeOperation and short-circuits
+    /// straight to `take_source`, which used to skip the mask entirely.
+    #[tokio::test]
+    async fn row_addr_mask_take_shortcut_respects_mask() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let target = all_ids[0];
+
+        // Sanity: unmasked, the shortcut returns the row.
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("_rowid = {target}")).unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+
+        // Masked to nothing, it must return nothing.
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("_rowid = {target}")).unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::allow_nothing());
+        assert_eq!(
+            scan.try_into_batch().await.unwrap().num_rows(),
+            0,
+            "the take shortcut must not return rows the mask excludes"
+        );
+
+        // And an allow-list restricts it rather than being ignored.
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("_rowid = {target}")).unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            target,
+        ])));
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+    }
+
+    /// A same-column compound query (Boost here) is optimized into
+    /// CompoundFtsScorer, a scorer that built its prefilter without the mask.
+    #[tokio::test]
+    async fn row_addr_mask_compound_fts_respects_mask() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        let ds = &test_ds.dataset;
+
+        let compound = || {
+            let positive = MatchQuery::new("4".to_owned()).with_column(Some("s".to_owned()));
+            let negative = MatchQuery::new("9".to_owned()).with_column(Some("s".to_owned()));
+            FullTextSearchQuery::new_query(
+                BoostQuery::new(positive.into(), negative.into(), Some(1.0)).into(),
+            )
+        };
+
+        let mut scan = ds.scan();
+        scan.full_text_search(compound()).unwrap();
+        scan.with_row_id();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("CompoundFtsScorer"),
+            "expected the compound scorer path, got:\n{plan}"
+        );
+        let base = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(!base.is_empty(), "compound query matched nothing");
+
+        let mut scan = ds.scan();
+        scan.full_text_search(compound()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::allow_nothing());
+        assert_eq!(
+            scan.try_into_batch().await.unwrap().num_rows(),
+            0,
+            "the compound scorer must not return rows the mask excludes"
+        );
+
+        // Allow exactly one baseline hit; only that one may come back.
+        let keep = base[0];
+        let mut scan = ds.scan();
+        scan.full_text_search(compound()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([keep])));
+        assert_eq!(
+            batch_row_ids(&scan.try_into_batch().await.unwrap()),
+            vec![keep]
+        );
+    }
+
+    /// A cross-column boolean query plans into CrossColumnCompoundFtsScorer,
+    /// which is a different exec from the same-column CompoundFtsScorer and
+    /// builds its own prefilter, so it needs the mask threaded separately.
+    #[tokio::test]
+    async fn row_addr_mask_cross_column_fts_respects_mask() {
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("title", DataType::Utf8, true),
+            ArrowField::new("body", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..64).map(|v| format!("alpha title {v}")),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..64).map(|v| format!("alpha body {v}")),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let path = TempStrDir::default();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &path, None).await.unwrap();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false);
+        for column in ["title", "body"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &params, true)
+                .await
+                .unwrap();
+        }
+
+        // Two leaves on different columns is what selects the cross-column
+        // scorer; a bounded limit is required by that exec.
+        let cross_column = || {
+            FullTextSearchQuery::new_query(FtsQuery::Boolean(BooleanQuery::new([
+                (
+                    Occur::Should,
+                    MatchQuery::new("title".to_string())
+                        .with_column(Some("title".to_string()))
+                        .into(),
+                ),
+                (
+                    Occur::Should,
+                    MatchQuery::new("body".to_string())
+                        .with_column(Some("body".to_string()))
+                        .into(),
+                ),
+            ])))
+            .limit(Some(10))
+        };
+
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("CrossColumnCompoundFtsScorer"),
+            "expected the cross-column compound scorer path, got:\n{plan}"
+        );
+        let base = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(!base.is_empty(), "cross-column query matched nothing");
+
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::allow_nothing());
+        assert_eq!(
+            scan.try_into_batch().await.unwrap().num_rows(),
+            0,
+            "the cross-column scorer must not return rows the mask excludes"
+        );
+
+        let keep = base[0];
+        let mut scan = dataset.scan();
+        scan.full_text_search(cross_column()).unwrap();
+        scan.with_row_id();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([keep])));
+        assert_eq!(
+            batch_row_ids(&scan.try_into_batch().await.unwrap()),
+            vec![keep]
+        );
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_fts_search_only_allowed() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Re-append the low-i rows AFTER indexing so token "4" matches both an
+        // indexed row (index prefilter path) and an unindexed one (flat FTS branch).
+        test_ds.append_data_with_range(0, 10).await.unwrap();
+        let ds = &test_ds.dataset;
+
+        // Baseline: the row ids an unmasked FTS query matches.
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_id();
+        let base_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let base_set: BTreeSet<u64> = base_ids.iter().copied().collect();
+        assert!(
+            base_ids.len() >= 2,
+            "expected indexed + unindexed matches for token 4, got {base_ids:?}"
+        );
+
+        // Allow only every other matching row; the mask must prefilter BM25 so the
+        // result is exactly the allowed subset of the baseline matches.
+        let allow: Vec<u64> = base_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        let expected: BTreeSet<u64> = base_set.intersection(&allow_set).copied().collect();
+        assert_eq!(got, expected, "masked FTS must return allowed matches only");
+        assert!(!got.is_empty());
+
+        // Block every match -> empty, proving the mask actually filters FTS results
+        // on both the indexed and flat branches.
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter(
+            base_ids.iter().copied(),
+        )));
+        scan.with_row_id();
+        let blocked = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(blocked.is_empty(), "block-mask must drop all FTS matches");
     }
 
     #[tokio::test]

@@ -9,9 +9,10 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
-use lance_index::{IndexType, scalar::ScalarIndexParams};
+use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::rowids::read_row_ids;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
@@ -447,6 +448,27 @@ async fn test_index_without_file_sizes() {
         index.files.is_none() || index.files.as_ref().unwrap().is_empty(),
         "Index should not have file size info (created with old version)"
     );
+    // A manifest predating `covering_fields` decodes it as empty, so the keyed
+    // prefix is the whole of `fields` -- exactly what selection assumed before
+    // covering existed.
+    assert!(
+        index.covering_fields.is_empty(),
+        "Index from old version should declare no covered columns"
+    );
+
+    // Selection derives the keyed count as `fields.len() - covering_fields.len()`.
+    // On this old metadata it must still resolve to the one indexed column;
+    // otherwise the filter below would quietly fall back to a full scan and
+    // still return the right row.
+    let selected = dataset
+        .load_scalar_index(IndexCriteria::default().for_column("values"))
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.map(|idx| idx.name),
+        Some("values_idx".to_string()),
+        "an old single-field index must still be selected for its column"
+    );
 
     // Verify the index still works - scan with a filter that uses the index
     let batch = dataset
@@ -854,4 +876,39 @@ async fn test_migrate_to_stable_row_ids_blocked_by_index() {
     assert_eq!(results.num_rows(), 1);
     let id_col = results["id"].as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(id_col.value(0), 15);
+}
+
+/// The migration numbers from the mark it is handed, so any manifest carrying a
+/// non-zero one cannot reissue ids the earlier versions still hold.
+#[rstest]
+#[case::fresh(0, vec![0..4, 4..10])]
+#[case::carried_mark(30, vec![30..34, 34..40])]
+fn test_migration_allocates_from_the_given_mark(
+    #[case] start: u64,
+    #[case] expected: Vec<std::ops::Range<u64>>,
+) {
+    let mut fragments: Vec<Fragment> = [4usize, 6]
+        .iter()
+        .enumerate()
+        .map(|(i, rows)| {
+            let mut f = Fragment::new(i as u64);
+            f.physical_rows = Some(*rows);
+            f
+        })
+        .collect();
+
+    let next = Dataset::assign_stable_row_ids_for_migration(&mut fragments, start).unwrap();
+    assert_eq!(next, expected.last().unwrap().end);
+
+    let sequences: Vec<Vec<u64>> = fragments
+        .iter()
+        .map(|f| {
+            let RowIdMeta::Inline(data) = f.row_id_meta.as_ref().unwrap() else {
+                panic!("migration writes inline row id meta");
+            };
+            read_row_ids(data).unwrap().iter().collect()
+        })
+        .collect();
+    let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
+    assert_eq!(sequences, expected);
 }

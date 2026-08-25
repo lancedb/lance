@@ -13,11 +13,11 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+use crate::dataset::{ManifestWriteConfig, validate_dataset_root_for_drop, write_manifest_file};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
-use lance_table::format::DataStorageFormat;
+use lance_table::format::{DataStorageFormat, Fragment};
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
@@ -2859,4 +2859,292 @@ async fn test_open_dataset_non_not_found_error_is_not_masked() {
         "Expected IO error but got: {:?}",
         err,
     );
+}
+
+#[tokio::test]
+async fn test_get_fragment_by_id() {
+    // 4 fragments of 10 rows each, ids 0..=3.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 4);
+
+    for id in 0..4 {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+    assert!(dataset.get_fragment(4).is_none());
+    assert!(dataset.get_fragment(usize::MAX).is_none());
+
+    // Deleting all rows of fragment 1 leaves a hole in the id space.
+    dataset.delete("i >= 10 AND i < 20").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    assert!(dataset.get_fragment(1).is_none());
+    for id in [0, 2, 3] {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+}
+
+/// Replace the manifest fragments, rebuilding the derived state exactly as
+/// opening a dataset does, so the lookups see a manifest Lance would read off
+/// disk rather than one it just built.
+fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    dataset.fragment_bitmap = Arc::new(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+    );
+}
+
+/// Manifests written before fragments were forced into id order (Lance 0.10 and
+/// earlier) and manifests with duplicate fragment ids (Lance 0.16 and earlier)
+/// are still readable -- neither is rejected on open. A lookup that trusted the
+/// sorted-by-id invariant would hand back a different fragment's data.
+#[rstest]
+#[case::unsorted(vec![3, 1, 2, 0])]
+#[case::duplicate_ids(vec![0, 0, 2, 3])]
+#[tokio::test]
+async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let by_id: HashMap<u64, Fragment> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.clone()))
+        .collect();
+    let fragments: Vec<Fragment> = ids.iter().map(|id| by_id[id].clone()).collect();
+    install_fragments(&mut dataset, fragments);
+
+    for id in ids.iter().map(|id| *id as usize) {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(
+            fragment.id(),
+            id,
+            "get_fragment({id}) returned the wrong fragment"
+        );
+        assert_eq!(
+            fragment.count_rows(None).await.unwrap(),
+            10,
+            "get_fragment({id}) returned unreadable metadata"
+        );
+    }
+    assert!(dataset.get_fragment(4).is_none());
+}
+
+async fn write_tiny_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+    Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap()
+}
+
+/// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
+/// even when the user keeps unmanaged files beside it.
+#[rstest]
+#[case::committed_dataset(&[], true)]
+// `cleanup_preserves_unmanaged_dirs_and_files` establishes that a dataset may sit
+// alongside unmanaged files, so those must not block a drop either.
+#[case::dataset_with_unmanaged_files(&["images/clip.mp4", "misc/notes.txt"], true)]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_committed_dataset(
+    #[case] extra_entries: &[&str],
+    #[case] expected_ok: bool,
+) {
+    let test_dir = TempStdDir::default();
+    let dataset_dir = test_dir.as_ref().join("t.lance");
+    write_tiny_dataset(dataset_dir.to_str().unwrap()).await;
+    for entry in extra_entries {
+        let path = dataset_dir.join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"unmanaged").unwrap();
+    }
+
+    let (object_store, base) = ObjectStore::from_uri(dataset_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let result = validate_dataset_root_for_drop(&object_store, &base).await;
+
+    assert_eq!(
+        result.is_ok(),
+        expected_ok,
+        "unexpected outcome: {result:?}"
+    );
+}
+
+/// A manifest under a detached version name is still a manifest, so a root holding only
+/// one is a dataset root.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_detached_manifest() {
+    let source_dir = TempStdDir::default();
+    let source = source_dir.as_ref().join("t.lance");
+    let dataset = write_tiny_dataset(source.to_str().unwrap()).await;
+    let manifest_name = dataset
+        .manifest_location()
+        .path
+        .filename()
+        .unwrap()
+        .to_string();
+    let manifest_bytes = std::fs::read(source.join("_versions").join(manifest_name)).unwrap();
+
+    let test_dir = TempStdDir::default();
+    let detached_dir = test_dir.as_ref().join("_versions");
+    std::fs::create_dir_all(&detached_dir).unwrap();
+    std::fs::write(
+        detached_dir.join("d9223372036854775808.manifest"),
+        &manifest_bytes,
+    )
+    .unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
+}
+
+/// A namespace may reserve a table name without ever writing a manifest, and dropping
+/// that reservation has to keep working.
+#[rstest]
+#[case::declared(".lance-reserved")]
+#[case::deregistered(".lance-deregistered")]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_namespace_marker(#[case] marker: &str) {
+    let test_dir = TempStdDir::default();
+    std::fs::write(test_dir.as_ref().join(marker), b"table t").unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
+}
+
+/// Anything short of a readable manifest must fail closed, because the delete this
+/// guards is recursive and unrecoverable. A file merely sitting under `_versions/`, or
+/// merely named like a manifest, is not evidence: either is trivial to end up with in a
+/// storage root that holds irreplaceable data.
+#[rstest]
+#[case::unrelated_file_under_versions(&["_versions/README", "reports/q1.csv"])]
+#[case::unreadable_manifest(&["_versions/1.manifest", "reports/q1.csv"])]
+#[case::unreadable_v2_manifest(&["_versions/00000000000000000001.manifest", "reports/q1.csv"])]
+#[case::unreadable_detached_manifest(&["_versions/d9223372036854775808.manifest"])]
+#[case::staged_manifest(&["_versions/1.manifest-2e1f0c3a", "data/0.lance"])]
+#[case::data_files_only(&["data/0.lance"])]
+#[case::layout_dirs_only(&["data/0.lance", "tree/branch/data/0.lance"])]
+#[case::home_directory(&["data/0.lance", "notes.txt"])]
+#[case::unrelated_directory(&["reports/q1.csv"])]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_paths_without_a_readable_manifest(
+    #[case] entries: &[&str],
+) {
+    let test_dir = TempStdDir::default();
+    for entry in entries {
+        let path = test_dir.as_ref().join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a manifest").unwrap();
+    }
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("must not authorize a recursive delete without a readable manifest");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("no readable Lance manifest"),
+        "{err}"
+    );
+}
+
+/// A zero-length manifest reads as corrupt rather than as I/O failure, so it must be
+/// reported as "not a dataset root" like any other unreadable manifest.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_empty_manifest() {
+    let test_dir = TempStdDir::default();
+    let versions = test_dir.as_ref().join("_versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    std::fs::write(versions.join("1.manifest"), b"").unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("an empty manifest is not evidence of a dataset");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+}
+
+/// The parent of a dataset is not a dataset, however Lance-looking its children are.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_warehouse_root() {
+    let test_dir = TempStdDir::default();
+    let warehouse = test_dir.as_ref().join("warehouse");
+    write_tiny_dataset(warehouse.join("t.lance").to_str().unwrap()).await;
+
+    let (object_store, base) = ObjectStore::from_uri(warehouse.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("a warehouse root must not be droppable");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+}
+
+/// A path that does not exist must stay a not-found error from the delete itself
+/// rather than becoming a validation error, so callers keep the error kind they
+/// already handle.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_allows_missing_path() {
+    let test_dir = TempStdDir::default();
+    let missing = test_dir.as_ref().join("does_not_exist");
+
+    let (object_store, base) = ObjectStore::from_uri(missing.to_str().unwrap())
+        .await
+        .unwrap();
+
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
 }

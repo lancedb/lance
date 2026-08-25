@@ -33,6 +33,8 @@
 //!   removed, so the overlay's other fields — and its coverage positions — stay
 //!   intact (see [`tombstone_overlay_fields`]).
 
+pub mod staleness;
+
 use std::sync::Arc;
 
 use lance_core::Error;

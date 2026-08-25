@@ -544,7 +544,10 @@ pub(crate) async fn indexed_fts_document_granularities(
     let mut by_name = BTreeMap::new();
 
     for index in dataset.load_indices().await?.iter() {
-        if index.fields.as_slice() != [resolved.final_field_id] {
+        // A covered FTS index still answers for its keyed column; only the
+        // keyed prefix decides whether this index matches, not the full
+        // `fields` vector including carried columns.
+        if index.keyed_field() != Some(resolved.final_field_id) {
             continue;
         }
         let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
@@ -854,7 +857,6 @@ pub(crate) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
@@ -1015,6 +1017,74 @@ pub async fn load_segment_params(
 mod tests {
     use super::*;
 
+    /// A covered FTS index (`fields=[tags, id]`, `id` carried) must still be
+    /// recognized by `indexed_fts_document_granularities`: matching on
+    /// `idx.fields` as a whole (rather than its keyed prefix) would leave
+    /// `available` empty and silently fall back to the `Row` default even
+    /// though a `ListElement` index exists.
+    #[tokio::test]
+    async fn test_resolve_query_document_granularity_recognizes_covered_index() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{Int32Array, RecordBatchIterator};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::IndexType;
+
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for tag in ["alpha", "beta", "gamma", "delta"] {
+            tags_builder.values().append_value(tag);
+            tags_builder.append(true);
+        }
+        let tags: ArrayRef = Arc::new(tags_builder.finish());
+        let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..4));
+        let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+        let schema = batch.schema();
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tags_field_id = dataset.schema().field("tags").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+
+        let params =
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
+        let segment = dataset
+            .create_index_builder(&["tags"], IndexType::Inverted, &params)
+            .name("tags_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        // Nothing writes a covering declaration yet, and read plumbing never
+        // touches covered-column storage, so declaring the uninvolved `id`
+        // column as carried is a faithful stand-in for a genuinely covered
+        // FTS segment.
+        let covered = IndexMetadata {
+            fields: vec![tags_field_id, id_field_id],
+            covering_fields: vec![id_field_id],
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("tags_idx", "tags", vec![covered])
+            .await
+            .unwrap();
+
+        let resolved = resolve_query_document_granularity(&dataset, "tags", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            DocumentGranularity::ListElement,
+            "a covered ListElement FTS index must still be recognized, not silently \
+             skipped in favor of the Row default"
+        );
+    }
+
     fn fts_test_schema() -> Schema {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("text", DataType::Utf8, true),
@@ -1060,6 +1130,7 @@ mod tests {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![1],
+            covering_fields: vec![],
             name: "tags_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1083,6 +1154,7 @@ mod tests {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![1],
+            covering_fields: vec![],
             name: "tags_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
