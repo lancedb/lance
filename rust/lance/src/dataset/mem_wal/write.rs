@@ -1142,9 +1142,9 @@ impl BackpressureController for LocalBackpressureController {
                     return Err(Error::backpressure(format!(
                         "shard is at its memtable ceiling with no flush outstanding, so waiting \
                          cannot drain it: unflushed_bytes={}, max={}, active_bytes={} (of which \
-                         index_bytes={}), frozen_bytes={}. Either a flush failed and left its \
-                         generation resident, or index memory carries the active memtable past \
-                         the ceiling before max_memtable_size seals it",
+                         index_bytes={}), frozen_bytes={}. The active memtable seals on resident \
+                         bytes, so reaching here means a flush failed and left its generation \
+                         charged with nothing queued to retry it",
                         unflushed_memtable_bytes,
                         self.max_unflushed_memtable_bytes,
                         shard.active_bytes(),
@@ -1354,6 +1354,7 @@ async fn replay_memtable_from_wal(
     wal_flusher: &WalFlusher,
     index_configs: &[MemIndexConfig],
     max_memtable_size: usize,
+    max_resident_bytes: usize,
 ) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
     // cursor of 0 means "no flush has ever stamped this shard" and replay
@@ -1413,6 +1414,7 @@ async fn replay_memtable_from_wal(
                         && memtable_reached_flush_threshold(
                             &active,
                             max_memtable_size,
+                            max_resident_bytes,
                             batches.len(),
                         )
                     {
@@ -1478,8 +1480,7 @@ async fn replay_memtable_from_wal(
 }
 
 /// Whether a memtable has reached the threshold at which it should be sealed and
-/// flushed: at or over `max_memtable_size` bytes, or without room in its batch
-/// store for `incoming_batches` more.
+/// flushed.
 ///
 /// The single source of truth for the flush trigger, shared by the live put path
 /// (`maybe_trigger_memtable_flush`, checking post-insert with `incoming_batches =
@@ -1487,13 +1488,42 @@ async fn replay_memtable_from_wal(
 /// with the next WAL entry's batch count). Keeping one predicate is what stops the
 /// two from drifting — e.g. someone adding a third criterion to one and not the
 /// other, which is the exact class of bug this whole change set is about.
+///
+/// Three arms, each answering a different question:
+///
+/// - **Row window** against `max_memtable_size`. The knob an operator sizes: it
+///   measures what a flush actually writes, so a generation stays a predictable
+///   fragment in the base dataset. Deliberately the *only* thing charged to this
+///   threshold — index memory and buffer padding are not, or fragment size would
+///   start depending on index configuration and Arrow's allocator.
+/// - **Resident total** against `max_resident_bytes`, the backpressure ceiling.
+///   The row window bounds neither what the batches *pin* (a one-row slice holds
+///   its whole parent) nor what the indexes hold, so without this arm a memtable
+///   can carry a shard past its ceiling with no seal reachable — and the valve,
+///   finding nothing outstanding to wait on, would refuse writes that can never
+///   succeed. This is the drain path that makes the ceiling live rather than a
+///   trap.
+/// - **Batch-store capacity**, room for `incoming_batches` more.
 fn memtable_reached_flush_threshold(
     memtable: &MemTable,
     max_memtable_size: usize,
+    max_resident_bytes: usize,
     incoming_batches: usize,
 ) -> bool {
-    memtable.batch_store().row_bytes() >= max_memtable_size
-        || memtable.batch_store().remaining_capacity() < incoming_batches
+    let store = memtable.batch_store();
+    store.row_bytes() >= max_memtable_size
+        || memtable_resident_bytes(memtable) >= max_resident_bytes
+        || store.remaining_capacity() < incoming_batches
+}
+
+/// What this memtable holds in memory: the heap its batches pin plus its
+/// in-memory indexes. The same quantity [`ShardMemory`] reports for the active
+/// memtable, so the seal trigger and the ceiling that gates writes measure the
+/// same thing.
+fn memtable_resident_bytes(memtable: &MemTable) -> usize {
+    memtable.batch_store().retained_bytes()
+        + memtable.indexes().map_or(0, IndexStore::resident_bytes)
+        + super::memtable::pk_bloom_filter_bytes()
 }
 
 /// Flush a sealed replay memtable to a Lance generation, choosing the indexed
@@ -1820,8 +1850,12 @@ impl SharedWriterState {
 
         // Checked post-insert: flush if there is no longer room for even one more
         // batch (or the byte threshold is crossed). Same predicate replay uses.
-        let should_flush =
-            memtable_reached_flush_threshold(&state.memtable, self.config.max_memtable_size, 1);
+        let should_flush = memtable_reached_flush_threshold(
+            &state.memtable,
+            self.config.max_memtable_size,
+            self.config.max_unflushed_memtable_bytes,
+            1,
+        );
 
         if should_flush {
             state.flush_requested = true;
@@ -2271,6 +2305,7 @@ impl ShardWriter {
             &wal_flusher,
             index_configs,
             config.max_memtable_size,
+            config.max_unflushed_memtable_bytes,
         )
         .await?;
 
@@ -6314,9 +6349,13 @@ mod tests {
     }
 
     /// Two seal predicates exist — `MemTable::should_flush` and
-    /// `memtable_reached_flush_threshold` — and their byte arms must trip at the
-    /// same byte. They did not: one counted the PK bloom filter and the other
-    /// did not, so they disagreed by a fixed offset on every memtable.
+    /// `memtable_reached_flush_threshold` — and their *row-window* arms must trip
+    /// at the same byte. They did not: one counted the PK bloom filter and the
+    /// other did not, so they disagreed by a fixed offset on every memtable.
+    ///
+    /// Only that arm is shared. `memtable_reached_flush_threshold` also seals on
+    /// resident bytes, which `should_flush` knows nothing about, so the ceiling
+    /// below is held out of range to compare like with like.
     #[tokio::test]
     async fn test_both_seal_predicates_share_one_byte_arm() {
         let schema = create_test_schema();
@@ -6329,8 +6368,14 @@ mod tests {
 
         let at = memtable.batch_store().row_bytes();
         assert!(at > 0, "the memtable must hold something to be a test");
+        // Owned batches, so the pinned footprint sits just under the window sum
+        // (no per-batch header in the allocation walk). Asserted rather than
+        // assumed: if it ever exceeded `at`, the retained arm would fire and this
+        // would be comparing something other than the row arm.
+
         // `incoming_batches` of 1 against a capacity of 64 keeps the batch-count
-        // arm out of it, so only the byte arms are being compared.
+        // arm out of it, and `usize::MAX` keeps the resident arm out, so only the
+        // row-window arms are being compared.
         for (bytes, expected) in [(at, true), (at + 1, false)] {
             assert_eq!(
                 memtable.should_flush(bytes),
@@ -6338,7 +6383,7 @@ mod tests {
                 "should_flush at {bytes}"
             );
             assert_eq!(
-                memtable_reached_flush_threshold(&memtable, bytes, 1),
+                memtable_reached_flush_threshold(&memtable, bytes, usize::MAX, 1),
                 expected,
                 "the two seal predicates disagree at {bytes}; a bloom-sized offset \
                  between them makes every memtable seal early on one path"
@@ -8928,6 +8973,98 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    /// A one-row slice pins its whole parent, so a memtable can hold megabytes
+    /// while its row window reads a few dozen bytes. With only the row arm the
+    /// shard crossed its ceiling with nothing sealed and no seal reachable — the
+    /// valve then found `Drain::Stalled` and refused every put, permanently.
+    /// The resident arm is what makes that shard drain instead.
+    #[tokio::test]
+    async fn test_pinned_parents_seal_before_the_ceiling_traps_the_writer() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let chunk = 1_000_000; // ~4MB parent per put
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            // Far above anything the one-row windows will ever sum to, so the row
+            // arm cannot be what seals here.
+            max_memtable_size: 1024 * 1024,
+            // Never filled, so the capacity arm cannot be it either.
+            max_memtable_batches: 1024,
+            max_unflushed_memtable_bytes: 8 * 1024 * 1024,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        for i in 0..6i32 {
+            let parent = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(
+                    (0..chunk).map(|v| v + i).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap();
+            tokio::time::timeout(STALL_GRACE * 10, writer.put(vec![parent.slice(0, 1)]))
+                .await
+                .expect("a shard the resident arm can seal must not park forever")
+                .unwrap_or_else(|e| {
+                    panic!("put {i} was refused, so the ceiling is still a trap: {e}")
+                });
+        }
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.generation > 0,
+            "the pinned parents must have sealed a generation; row bytes never \
+             came close to max_memtable_size"
+        );
+        assert!(
+            writer.memory().row_bytes() < 1024,
+            "the row window must still be tiny — otherwise the row arm did the \
+             sealing and this proves nothing"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Index memory is not charged to `max_memtable_size`, so it is the resident
+    /// arm that has to notice a memtable whose indexes rather than its rows are
+    /// filling the ceiling.
+    #[tokio::test]
+    async fn test_resident_arm_seals_on_index_memory() {
+        let schema = create_test_schema();
+        let mut memtable =
+            MemTable::with_capacity(schema.clone(), 1, vec![], CacheConfig::default(), 64).unwrap();
+        memtable
+            .insert(create_test_batch(&schema, 0, 50))
+            .await
+            .unwrap();
+
+        let resident = memtable_resident_bytes(&memtable);
+        let rows = memtable.batch_store().row_bytes();
+        assert!(
+            resident > rows,
+            "the fixture needs non-row memory to be measuring anything: \
+             resident {resident} vs rows {rows}"
+        );
+
+        // Row arm way out of range; only the resident arm can fire.
+        assert!(
+            memtable_reached_flush_threshold(&memtable, usize::MAX, resident, 1),
+            "resident bytes at the ceiling must seal"
+        );
+        assert!(
+            !memtable_reached_flush_threshold(&memtable, usize::MAX, resident + 1, 1),
+            "and must not seal below it"
+        );
     }
 
     /// Schema for the reservation tests: `vector` is field 1, the id 0 is `id`.
