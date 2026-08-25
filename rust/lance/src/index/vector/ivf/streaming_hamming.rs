@@ -988,6 +988,65 @@ mod tests {
     }
 
     #[test]
+    fn summary_cost_matches_bruteforce_for_multiple_candidates() {
+        let vectors = [[0b0000_0000], [0b0000_0011], [0b0000_1111], [0b1111_1111]];
+        let mut ones = vec![0_u64; 8];
+        for vector in vectors {
+            add_vector_bits(&mut ones, &vector).unwrap();
+        }
+        for centroid in [[0_u8], [0b0000_0011], [0b1111_1111]] {
+            let expected = vectors
+                .iter()
+                .map(|vector| (vector[0] ^ centroid[0]).count_ones() as u64)
+                .sum::<u64>();
+            assert_eq!(summary_cost(4, &ones, &centroid, 1).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn hamming_summary_rejects_invalid_dimensions_and_counts() {
+        let mut coreset = HammingCoreset::new(2, 2);
+        assert!(coreset.push(1, &[1; 8]).is_err());
+        assert!(coreset.push(1, &[2; 16]).is_err());
+        let mut accumulator = HammingAccumulator::try_new(1, 2).unwrap();
+        assert!(accumulator.add_vector(0, &[1]).is_err());
+        assert!(accumulator.add_vector(1, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn hamming_reduction_is_deterministic_for_equal_bit_fractions() {
+        let mut first = HammingCoreset::new(1, 6);
+        let mut second = HammingCoreset::new(1, 6);
+        for coreset in [&mut first, &mut second] {
+            coreset.push(1, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            coreset.push(1, &[0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            coreset.push(1, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            coreset.push(1, &[0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            coreset.push(1, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            coreset.push(1, &[1, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        }
+        first.reduce_to_budget(2).unwrap();
+        second.reduce_to_budget(2).unwrap();
+        assert_eq!(first.counts, second.counts);
+        assert_eq!(first.ones, second.ones);
+        assert_eq!(first.counts, vec![3, 3]);
+        assert_eq!(
+            first.ones.to_u64_vec(),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn hamming_empty_and_duplicate_summaries_are_safe() {
+        let mut coreset = HammingCoreset::new(1, 3);
+        coreset.push(3, &[3, 3, 0, 0, 0, 0, 0, 0]).unwrap();
+        coreset.push(3, &[3, 3, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(coreset.reduce_to_budget(0).is_err());
+        assert_eq!(coreset.mode(0), vec![3]);
+        assert_eq!(coreset.cost(0, &[3]).unwrap(), 0);
+    }
+
+    #[test]
     fn majority_ties_resolve_to_zero() {
         let mut ones = vec![0_u64; 8];
         add_vector_bits(&mut ones, &[0b1010_1010]).unwrap();
