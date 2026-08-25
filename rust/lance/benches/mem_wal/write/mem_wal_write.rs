@@ -607,6 +607,10 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     wal_persist_retry_base_delay: std::time::Duration::from_millis(
                                         50,
                                     ),
+                                    l0_flush_retry_base_delay: default_config
+                                        .l0_flush_retry_base_delay,
+                                    l0_flush_retry_max_delay: default_config
+                                        .l0_flush_retry_max_delay,
                                     durable_write: durable,
                                     max_wal_buffer_size: max_wal_buffer_size
                                         .unwrap_or(default_config.max_wal_buffer_size),

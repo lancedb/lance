@@ -30,6 +30,9 @@ pub struct FailControls {
     /// Remaining WAL-entry `put_opts` calls to fail; saturates at 0. Set high to
     /// "always fail", set to 0 to "recover".
     wal_put_failures: AtomicUsize,
+    /// Remaining SSTable (generation directory) writes to fail; saturates at 0.
+    /// Drives the L0-flush failure path, as `wal_put_failures` does the WAL.
+    sstable_put_failures: AtomicUsize,
     /// When failing, write to the inner store anyway before reporting the error,
     /// simulating a lost acknowledgement (the PUT actually landed).
     simulate_lost_ack: AtomicBool,
@@ -45,8 +48,13 @@ impl FailControls {
     pub fn fail_wal_puts(&self, n: usize) {
         self.wal_put_failures.store(n, Ordering::SeqCst);
     }
+    pub fn fail_sstable_puts(&self, n: usize) {
+        self.sstable_put_failures.store(n, Ordering::SeqCst);
+    }
+    /// Storage heals: every injected failure mode stops firing.
     pub fn recover(&self) {
         self.wal_put_failures.store(0, Ordering::SeqCst);
+        self.sstable_put_failures.store(0, Ordering::SeqCst);
     }
     pub fn set_lost_ack(&self, v: bool) {
         self.simulate_lost_ack.store(v, Ordering::SeqCst);
@@ -64,6 +72,20 @@ impl FailControls {
             .unwrap()
             .iter()
             .any(|p| p.contains(needle))
+    }
+
+    /// Distinct `{hash}_gen_{n}` directory segments written through this store.
+    /// A generation whose flush retries must reuse one: a fresh directory per
+    /// attempt strands everything the previous attempt wrote.
+    pub fn generation_dirs(&self) -> std::collections::BTreeSet<String> {
+        self.put_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p.split('/'))
+            .filter(|segment| segment.contains("_gen_"))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Did any read land on a path containing `needle`? See [`Self::wrote_under`].
@@ -91,7 +113,8 @@ impl WrappingObjectStore for FailingWrapper {
     }
 }
 
-/// Delegates everything to `inner`, failing WAL-entry PUTs per [`FailControls`].
+/// Delegates everything to `inner`, failing WAL-entry and SSTable writes per
+/// [`FailControls`].
 #[derive(Debug)]
 struct FailingObjectStore {
     inner: Arc<dyn OSObjectStore>,
@@ -105,11 +128,33 @@ impl FailingObjectStore {
         location.as_ref().contains("/wal/")
     }
 
-    fn injected_error() -> object_store::Error {
+    /// An L0 flush writes everything for a generation under its
+    /// `{hash}_gen_{n}` directory (see `sstable_path`): data file, dataset
+    /// manifest, bloom filter, indexes.
+    fn is_sstable_write(location: &Path) -> bool {
+        location.as_ref().contains("_gen_")
+    }
+
+    fn injected_error(what: &'static str) -> object_store::Error {
         object_store::Error::Generic {
             store: "failing-test-store",
-            source: "injected transient WAL put failure".to_string().into(),
+            source: format!("injected transient {what} put failure").into(),
         }
+    }
+
+    /// Consume one armed SSTable failure, if this write is one and any remain.
+    /// Both entry points call it: the data file goes out multipart, the
+    /// manifest and bloom filter as plain PUTs.
+    fn take_sstable_failure(&self, location: &Path) -> Option<object_store::Error> {
+        if !Self::is_sstable_write(location)
+            || self.controls.sstable_put_failures.load(Ordering::SeqCst) == 0
+        {
+            return None;
+        }
+        self.controls
+            .sstable_put_failures
+            .fetch_sub(1, Ordering::SeqCst);
+        Some(Self::injected_error("SSTable"))
     }
 }
 
@@ -144,8 +189,11 @@ impl OSObjectStore for FailingObjectStore {
                     // The write lands but we still report failure (lost ack).
                     let _ = self.inner.put_opts(location, payload, opts).await;
                 }
-                return Err(Self::injected_error());
+                return Err(Self::injected_error("WAL"));
             }
+        }
+        if let Some(e) = self.take_sstable_failure(location) {
+            return Err(e);
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -161,6 +209,9 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        if let Some(e) = self.take_sstable_failure(location) {
+            return Err(e);
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 

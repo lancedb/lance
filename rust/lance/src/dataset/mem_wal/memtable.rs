@@ -20,7 +20,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use super::index::IndexStore;
-use super::util::{WatchableOnceCell, WatchableOnceCellReader};
+use super::util::{WatchableOnceCell, WatchableOnceCellReader, generate_random_hash};
 use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
@@ -106,6 +106,12 @@ pub struct MemTable {
     /// Created when the memtable is frozen and set with a value when the flush completes.
     /// Used by backpressure to wait for oldest memtable flush completion.
     memtable_flush_completion: std::sync::Mutex<Option<WatchableOnceCell<DurabilityResult>>>,
+
+    /// The directory hash this generation flushes to, generated once on first
+    /// use. Retries must land on the same path: a fresh hash per attempt strands
+    /// the previous attempt's SSTable and index files with nothing referencing
+    /// them, so a long outage leaks one directory per attempt.
+    sstable_hash: std::sync::OnceLock<String>,
 }
 
 /// Cached Dataset with timestamp for eventual consistency.
@@ -248,6 +254,7 @@ impl MemTable {
             frozen_at_wal_entry_position: None,
             wal_flush_completion: std::sync::Mutex::new(None),
             memtable_flush_completion: std::sync::Mutex::new(Some(memtable_flush_cell)),
+            sstable_hash: std::sync::OnceLock::new(),
         })
     }
 
@@ -317,6 +324,17 @@ impl MemTable {
             .as_ref()
             .expect("memtable_flush_completion cell should exist (created at construction)")
             .reader()
+    }
+
+    /// The directory hash for this generation's SSTable, stable for the life of
+    /// the memtable so every flush attempt writes to the same path and a retry
+    /// overwrites its predecessor instead of orphaning it.
+    ///
+    /// Only in-process stability is needed: a writer that never commits this
+    /// generation is recovered by reopening and replaying the WAL, which builds
+    /// a fresh memtable with a fresh hash.
+    pub fn sstable_hash(&self) -> &str {
+        self.sstable_hash.get_or_init(generate_random_hash)
     }
 
     /// Get a reader for the memtable flush completion.

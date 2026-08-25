@@ -32,7 +32,7 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::mem_wal::util::{derived_store_params, sstable_path};
 use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
@@ -102,6 +102,11 @@ impl MemTableFlusher {
             store_params: None,
             session: None,
         }
+    }
+
+    /// The shard these generations belong to.
+    pub(crate) fn shard_id(&self) -> Uuid {
+        self.shard_id
     }
 
     /// Attach the warmer fired pre-commit for each new generation.
@@ -210,6 +215,11 @@ impl MemTableFlusher {
     /// WAL entries this generation captures. Pass 0 only for shards that
     /// have not yet appended any WAL entry — non-zero positions are
     /// 1-based (see `FIRST_WAL_ENTRY_POSITION`).
+    ///
+    /// Generations must reach L0 in order, or the cursor advances past WAL
+    /// entries no SSTable holds. `MemTableFlushHandler` enforces that by
+    /// retrying a failed generation and holding later ones behind it, so one
+    /// arriving here out of order is refused rather than committed over.
     #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub async fn flush(
         &self,
@@ -230,10 +240,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
+        let random_hash = memtable.sstable_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -306,7 +316,7 @@ impl MemTableFlusher {
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
-        use crate::dataset::WriteParams;
+        use crate::dataset::{WriteMode, WriteParams};
 
         if memtable.row_count() == 0 {
             return Ok((0, RoaringBitmap::new()));
@@ -358,6 +368,11 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?.to_selector()),
+            // Retries reuse the generation's path, so a previous attempt may have
+            // left a dataset here. Overwrite creates when absent and supersedes a
+            // partial attempt otherwise; `Create` would turn every retry into an
+            // already-exists error that no amount of retrying clears.
+            mode: WriteMode::Overwrite,
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -440,8 +455,8 @@ impl MemTableFlusher {
 
     /// Flush the MemTable to storage with indexes.
     ///
-    /// See [`MemTableFlusher::flush`] for `covered_wal_entry_position`
-    /// semantics.
+    /// See [`MemTableFlusher::flush`] for `covered_wal_entry_position` and
+    /// generation-ordering semantics.
     #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
     pub async fn flush_with_indexes(
         &self,
@@ -463,10 +478,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
+        let random_hash = memtable.sstable_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",
@@ -1134,13 +1149,22 @@ impl MemTableFlusher {
 
         self.manifest_store
             .commit_update(epoch, |current| {
+                // The fail-fast check at the top of the flush does not stand in
+                // for this: the cursor advances here, so the guard must run
+                // against the manifest actually being written.
+                ShardManifestStore::check_generation_contiguous(
+                    current,
+                    generation,
+                    self.shard_id,
+                )?;
+
                 let mut sstables = current.sstables.clone();
                 sstables.push(SsTable {
                     generation,
                     path: gen_path.clone(),
                 });
 
-                ShardManifest {
+                Ok(ShardManifest {
                     version: current.version + 1,
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
@@ -1149,7 +1173,7 @@ impl MemTableFlusher {
                     current_generation: generation + 1,
                     sstables,
                     ..current.clone()
-                }
+                })
             })
             .await
     }
@@ -1338,6 +1362,58 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    /// The manifest's backstop against out-of-order generations. One that skips
+    /// ahead is refused at the commit, leaving cursor and frontier where they
+    /// were, so its WAL entries stay replayable.
+    #[tokio::test]
+    async fn test_flusher_refuses_generation_gap() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = create_test_schema();
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri,
+            shard_id,
+            manifest_store.clone(),
+        );
+
+        // Generation 1 commits normally, moving the frontier to 2.
+        let mut gen1 = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let frag_id = gen1.insert(create_test_batch(&schema, 10)).await.unwrap();
+        flusher.flush(&gen1, epoch, 1, frag_id + 1).await.unwrap();
+
+        // Generation 2's flush failed, so generation 3 must not commit over it.
+        let mut gen3 = MemTable::new(schema.clone(), 3, vec![]).unwrap();
+        let frag_id = gen3.insert(create_test_batch(&schema, 10)).await.unwrap();
+        let err = flusher
+            .flush(&gen3, epoch, 7, frag_id + 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PrerequisiteFailed { .. }),
+            "expected a prerequisite failure, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("next expected generation is 2"),
+            "error should name the frontier: {err}"
+        );
+
+        // Cursor and frontier unmoved: WAL entries past position 1 still replay.
+        let manifest = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(manifest.replay_after_wal_entry_position, 1);
+        assert_eq!(manifest.current_generation, 2);
+        assert_eq!(manifest.sstables.len(), 1);
     }
 
     /// A `SsTableWarmer` that counts calls and optionally fails.

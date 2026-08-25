@@ -111,6 +111,16 @@ pub struct ShardWriterConfig {
     /// back off exponentially (capped). Default: 50ms.
     pub wal_persist_retry_base_delay: Duration,
 
+    /// Base backoff before the first L0 flush retry; subsequent retries back
+    /// off exponentially up to `l0_flush_retry_max_delay`. Default: 50ms.
+    pub l0_flush_retry_base_delay: Duration,
+
+    /// Ceiling on the exponential backoff between L0 flush retries, so a long
+    /// outage settles into a slow poll rather than a hot loop. A
+    /// `l0_flush_retry_base_delay` above this is simply clamped to it.
+    /// Default: 30s.
+    pub l0_flush_retry_max_delay: Duration,
+
     /// Maximum MemTable size in bytes before triggering a flush to storage.
     ///
     /// MemTable size is checked every `max_wal_flush_interval` (during WAL flush ticks).
@@ -252,6 +262,8 @@ impl Default for ShardWriterConfig {
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
             max_wal_persist_retries: 3,
             wal_persist_retry_base_delay: Duration::from_millis(50),
+            l0_flush_retry_base_delay: Duration::from_millis(50),
+            l0_flush_retry_max_delay: Duration::from_secs(30),
             max_memtable_size: 256 * 1024 * 1024, // 256MB
             max_memtable_rows: 100_000,           // 100k rows
             max_memtable_batches: 8_000,          // 8k batches
@@ -314,6 +326,20 @@ impl ShardWriterConfig {
     /// See [`ShardWriterConfig::wal_persist_retry_base_delay`].
     pub fn with_wal_persist_retry_base_delay(mut self, delay: Duration) -> Self {
         self.wal_persist_retry_base_delay = delay;
+        self
+    }
+
+    /// Set the base backoff before the first L0 flush retry.
+    /// See [`ShardWriterConfig::l0_flush_retry_base_delay`].
+    pub fn with_l0_flush_retry_base_delay(mut self, delay: Duration) -> Self {
+        self.l0_flush_retry_base_delay = delay;
+        self
+    }
+
+    /// Set the ceiling on the backoff between L0 flush retries.
+    /// See [`ShardWriterConfig::l0_flush_retry_max_delay`].
+    pub fn with_l0_flush_retry_max_delay(mut self, delay: Duration) -> Self {
+        self.l0_flush_retry_max_delay = delay;
         self
     }
 
@@ -441,8 +467,10 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
         // the WAL flusher and MemTable flusher both run on this loop,
         // and dropping their channels deadlocks all subsequent puts
         // (and panics any task waiting on the corresponding watch).
-        // Log and keep draining; the worst case for a transient flush
-        // failure is replay from the WAL on next open.
+        // Log and keep draining. Handlers absorb their own transient failures
+        // (see `MemTableFlushHandler::flush_generation_with_retry`), so an error
+        // reaching here is terminal for that message; its data is still in the
+        // WAL for the next open to replay.
         let result = loop {
             if ticker_intervals.is_empty() {
                 tokio::select! {
@@ -526,6 +554,13 @@ impl TaskExecutor {
         }
     }
 
+    /// Token every dispatcher watches. Cancellation is only polled between
+    /// messages, so a handler that blocks inside `handle()` takes a clone to
+    /// bail out rather than stall shutdown.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
     pub fn add_handler<T: Send + Debug + 'static>(
         &self,
         name: String,
@@ -597,8 +632,10 @@ impl Default for TaskExecutor {
 pub enum DurabilityResult {
     /// Write is now durable.
     Durable,
-    /// Write failed with an error message.
-    Failed(String),
+    /// Write failed. Carries the fence reason as well as the message: a waiter
+    /// decides between retrying and reopening on the reason, and a peer takeover
+    /// calls for the opposite response to our own persistence failure.
+    Failed(WalFlushFailure),
 }
 
 impl DurabilityResult {
@@ -607,9 +644,9 @@ impl DurabilityResult {
         Self::Durable
     }
 
-    /// Create a failed durability result.
-    pub fn err(msg: impl Into<String>) -> Self {
-        Self::Failed(msg.into())
+    /// Create a failed durability result, preserving the error's fence reason.
+    pub fn err(error: &Error) -> Self {
+        Self::Failed(WalFlushFailure::from_error(error))
     }
 
     /// Check if the result is durable.
@@ -617,11 +654,11 @@ impl DurabilityResult {
         matches!(self, Self::Durable)
     }
 
-    /// Convert to a Result.
+    /// Convert to a Result, rebuilding the typed error the flush reported.
     pub fn into_result(self) -> Result<()> {
         match self {
             Self::Durable => Ok(()),
-            Self::Failed(msg) => Err(Error::io(msg)),
+            Self::Failed(failure) => Err(failure.into_error()),
         }
     }
 }
@@ -1539,6 +1576,12 @@ pub struct ShardWriter {
     manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     mode: WriterMode,
+    /// Stops L0 flushes from retrying, without stopping the flush task itself.
+    /// [`Self::close`] cancels it so each queued generation makes one final
+    /// attempt and reports an outcome, instead of retrying past the caller's
+    /// shutdown. Distinct from the task executor's token, which would abandon
+    /// the queue and leave those generations with no outcome at all.
+    l0_retry_stop: CancellationToken,
     /// The base table's schema as the caller passed it — no `_tombstone`,
     /// nullability untouched. Caller input is held to it (see
     /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
@@ -1683,6 +1726,7 @@ impl ShardWriter {
 
         let stats = new_shared_stats();
         let task_executor = Arc::new(TaskExecutor::new());
+        let l0_retry_stop = CancellationToken::new();
 
         let mode = if config.enable_memtable {
             let (pk_field_ids, pk_columns, storage_schema) = memtable_validation
@@ -1705,6 +1749,7 @@ impl ShardWriter {
                 manifest_store.clone(),
                 stats.clone(),
                 &task_executor,
+                l0_retry_stop.clone(),
             )
             .await?
         } else {
@@ -1726,6 +1771,7 @@ impl ShardWriter {
             manifest_store,
             stats,
             mode,
+            l0_retry_stop,
             logical_schema,
         })
     }
@@ -1749,6 +1795,7 @@ impl ShardWriter {
         manifest_store: Arc<ShardManifestStore>,
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
+        l0_retry_stop: CancellationToken,
     ) -> Result<WriterMode> {
         // PK metadata and index/interval validation were resolved in `open`
         // before the epoch was claimed (a doomed open must not fence the
@@ -1895,6 +1942,12 @@ impl ShardWriter {
             stats.clone(),
             config.observer.clone(),
             config.frozen_memtable_grace,
+            task_executor.cancellation_token(),
+            l0_retry_stop,
+            L0RetryConfig {
+                base_delay: config.l0_flush_retry_base_delay,
+                max_delay: config.l0_flush_retry_max_delay,
+            },
         );
         task_executor.add_handler(
             "memtable_flusher".to_string(),
@@ -2807,7 +2860,8 @@ impl ShardWriter {
     ///
     /// Returns an error if pending WAL data cannot be persisted, an active or
     /// frozen MemTable cannot be flushed, a flush handler exits before reporting
-    /// completion, or background tasks cannot be shut down.
+    /// completion, the writer is poisoned, or background tasks cannot be shut
+    /// down.
     #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn close(self) -> Result<()> {
         info!("Closing ShardWriter for shard {}", self.config.shard_id);
@@ -2893,6 +2947,15 @@ impl ShardWriter {
                         .map(|(_, w)| w.clone())
                         .collect()
                 };
+                // Make the next failure terminal before waiting on any of these.
+                // A flush retries until it lands, so draining first would hold
+                // close open for the length of an outage; cancelling the *task*
+                // instead would abandon the queue and leave those generations
+                // with no outcome to report. This stops the retrying without
+                // stopping the work, so the wait is bounded by one attempt each
+                // and a flush that succeeds still commits.
+                self.l0_retry_stop.cancel();
+
                 for mut watcher in watchers {
                     let stage_result = match watcher.await_value().await {
                         Some(durability) => durability.into_result(),
@@ -2930,6 +2993,17 @@ impl ShardWriter {
                 }
             }
         }
+
+        // A poisoned writer never got its generations to L0. `close()` is the
+        // caller's "everything is durable now" fence, so it has to say so even
+        // when no watcher is left to carry the failure: the handler that
+        // poisoned drains the watcher on its way out, so a caller that already
+        // observed the error is the common case, not a missed one.
+        close_result = Self::merge_close_stage(
+            close_result,
+            "writer poison",
+            self.wal_flusher.check_poisoned(),
+        );
 
         // Shutdown background tasks
         let shutdown_result = self.task_executor.shutdown_all().await;
@@ -3351,6 +3425,17 @@ struct MemTableFlushHandler {
     /// How long a frozen memtable lingers in memory after its flush commits
     /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
+    /// Aborts an in-flight retry loop at shutdown. Without it a generation
+    /// retrying against a down store holds the dispatcher inside `handle()`,
+    /// and `abort()` — which joins it — never returns.
+    cancellation: CancellationToken,
+    /// Set by [`ShardWriter::close`] to make the next failure terminal. Unlike
+    /// `cancellation` this leaves the task running, so generations queued behind
+    /// the current one still get an attempt and still report an outcome.
+    retry_stop: CancellationToken,
+    /// Backoff between L0 flush attempts. See
+    /// [`ShardWriterConfig::l0_flush_retry_base_delay`].
+    retry: L0RetryConfig,
 }
 
 impl MemTableFlushHandler {
@@ -3364,6 +3449,9 @@ impl MemTableFlushHandler {
         stats: SharedWriteStats,
         observer: Option<Arc<dyn WalObserver>>,
         grace: Duration,
+        cancellation: CancellationToken,
+        retry_stop: CancellationToken,
+        retry: L0RetryConfig,
     ) -> Self {
         Self {
             state,
@@ -3374,6 +3462,9 @@ impl MemTableFlushHandler {
             stats,
             observer,
             grace,
+            cancellation,
+            retry_stop,
+            retry,
         }
     }
 
@@ -3434,6 +3525,9 @@ impl MemTableFlushHandler {
     /// watcher is always signaled and the backpressure queue is always drained
     /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
     /// dropped watch channel and return `Err` instead of the actual outcome.
+    /// Both fire once per generation, on the terminal outcome: the completion
+    /// cell is a `WatchableOnceCell`, so signaling per attempt would publish a
+    /// failure the retry later recovered from.
     #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
@@ -3476,31 +3570,14 @@ impl MemTableFlushHandler {
             let covered_wal_entry_position = wal_flushed_position
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
-            // Rebuild secondary indexes on the SSTable so later
-            // queries hit an index instead of scanning. Skip the extra
-            // dataset open when there are no indexes to build. The indexed
-            // path's future is boxed to keep this async block's nesting
-            // under the type-layout recursion limit.
             // Read the durability cursor *after* the WAL-append completion above,
             // not before: the append that makes this memtable durable is the very
             // thing we just waited on, so a cursor sampled earlier would still be
             // short of it and trip the flush precondition.
             let durable = self.wal_flusher.durable();
 
-            if self.index_configs.is_empty() {
-                self.flusher
-                    .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
-                    .await
-            } else {
-                Box::pin(self.flusher.flush_with_indexes(
-                    &memtable,
-                    self.epoch,
-                    &self.index_configs,
-                    covered_wal_entry_position,
-                    durable,
-                ))
+            self.flush_generation_with_retry(&memtable, covered_wal_entry_position, durable)
                 .await
-            }
         }
         .await;
 
@@ -3508,7 +3585,7 @@ impl MemTableFlushHandler {
         // backpressure state for this memtable, even on failure.
         let durability = match &flush_result {
             Ok(_) => DurabilityResult::ok(),
-            Err(e) => DurabilityResult::err(e.to_string()),
+            Err(e) => DurabilityResult::err(e),
         };
         memtable.signal_memtable_flush_complete(durability);
 
@@ -3561,6 +3638,175 @@ impl MemTableFlushHandler {
 
         Ok(result)
     }
+
+    /// Write one generation to L0 and commit it, retrying a failure until the
+    /// budget runs out.
+    ///
+    /// Retrying at all is what keeps generations ordered. The manifest commit
+    /// that records the SSTable and advances `replay_after_wal_entry_position`
+    /// is the shard's atomic "this reached L0" agreement, so a later generation
+    /// committing ahead of a failed one would move that cursor past WAL entries
+    /// no SSTable holds. The dispatcher awaits `handle()` inline on a channel of
+    /// its own, so this loop head-of-line blocks the flush queue: N+1 cannot
+    /// start, let alone commit, while N is failing. Ordering becomes structural.
+    ///
+    /// While retrying, the cost is memory and never data. Frozen memtables queue
+    /// up behind the loop until backpressure stalls writes, and every row stays
+    /// WAL-durable and readable meanwhile.
+    ///
+    /// A retryable failure is treated as unavailability, not as a fault: the
+    /// loop retries it indefinitely, logging at `warn` and counting
+    /// `l0_flush_failures`. That keeps the queue and the resident set the same
+    /// fact — a generation is outstanding exactly while its memtable is
+    /// resident — so no separate terminal state has to be published and
+    /// consulted for callers to tell "still owed" from "lost". A store that
+    /// comes back therefore heals the writer with no operator action.
+    ///
+    /// Only two things end the loop early. [`is_terminal_flush_error`] poisons,
+    /// because no amount of retrying clears a fence or a rejected precondition.
+    /// Cancellation returns the error, which is how [`ShardWriter::close`] stops
+    /// a retry that would otherwise outlive the writer.
+    async fn flush_generation_with_retry(
+        &self,
+        memtable: &MemTable,
+        covered_wal_entry_position: u64,
+        durable: usize,
+    ) -> Result<super::memtable::flush::FlushResult> {
+        let mut retries: usize = 0;
+        loop {
+            // A generation queued behind one that already poisoned the writer
+            // must not attempt: committing it would advance the replay cursor
+            // past the failed generation's WAL entries, which is the very hole
+            // the ordering rule exists to prevent. Cheaper than letting each
+            // queued generation burn its own budget against a dead store.
+            self.wal_flusher.check_poisoned()?;
+
+            // Rebuild secondary indexes on the SSTable so later queries hit an
+            // index instead of scanning. Skip the extra dataset open when there
+            // are no indexes to build. The indexed path's future is boxed to
+            // keep this future's nesting under the type-layout recursion limit.
+            let result = if self.index_configs.is_empty() {
+                self.flusher
+                    .flush(memtable, self.epoch, covered_wal_entry_position, durable)
+                    .await
+            } else {
+                Box::pin(self.flusher.flush_with_indexes(
+                    memtable,
+                    self.epoch,
+                    &self.index_configs,
+                    covered_wal_entry_position,
+                    durable,
+                ))
+                .await
+            };
+
+            let error = match result {
+                Ok(flushed) => return Ok(flushed),
+                Err(e) if is_terminal_flush_error(&e) => {
+                    return Err(self.poison_unflushable(memtable, &e));
+                }
+                Err(e) => e,
+            };
+
+            retries += 1;
+            self.stats.record_l0_flush_failure();
+            // The writer is closing: report this attempt instead of starting
+            // another. Waiting out an outage past the caller's shutdown is what
+            // an unbounded retry must not do, and the rows are WAL-durable, so
+            // the next open replays what this generation never committed.
+            if self.retry_stop.is_cancelled() {
+                let abandoned = Error::io(format!(
+                    "L0 flush of generation {} abandoned at close after {} attempt(s): {}. \
+                     Its rows are still WAL-durable, so reopening replays them",
+                    memtable.generation(),
+                    retries,
+                    error
+                ));
+                warn!("{abandoned}");
+                return Err(abandoned);
+            }
+
+            let delay = self.retry.backoff(retries);
+            warn!(
+                "L0 flush of generation {} failed (attempt {}), retrying in {:?}; \
+                 later generations are held behind it: {}",
+                memtable.generation(),
+                retries,
+                delay,
+                error
+            );
+
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(error),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// Fail-stop a generation that retrying cannot rescue. Unavailability is
+    /// waited out instead (see [`Self::flush_generation_with_retry`]); this is
+    /// for the errors where the next attempt is guaranteed to fail the same way,
+    /// so the loop would spin without ever letting the queue drain.
+    ///
+    /// Staying live is what would do the damage: the next generation's commit
+    /// advances the replay cursor past this one's WAL entries, which is the hole
+    /// the ordering rule exists to prevent. It also strands this memtable in
+    /// memory unmetered, since the backpressure drain runs on the way out.
+    fn poison_unflushable(&self, memtable: &MemTable, error: &Error) -> Error {
+        let poisoned = Error::writer_poisoned(format!(
+            "L0 flush of generation {} for shard {} failed without retrying, which cannot \
+             clear this error: {}. \
+             Generations past the replay cursor never reached L0, so this writer \
+             cannot flush again without leaving a hole; reopen to replay the WAL",
+            memtable.generation(),
+            self.flusher.shard_id(),
+            error
+        ));
+        error!("{poisoned}");
+        self.wal_flusher.poison(&poisoned);
+        poisoned
+    }
+}
+
+/// Backoff policy for a retrying L0 flush, built from the `l0_flush_retry_*`
+/// fields of [`ShardWriterConfig`]. Unlike [`WalRetryConfig`] on the WAL-append
+/// path there is no attempt budget: an L0 flush retries until it lands or the
+/// writer is cancelled.
+#[derive(Debug, Clone, Copy)]
+struct L0RetryConfig {
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl L0RetryConfig {
+    /// Backoff before retry `attempt` (1-based). Doubles from `base_delay`,
+    /// clamped to `max_delay` so a long outage settles into a slow poll rather
+    /// than a hot loop.
+    fn backoff(&self, attempt: usize) -> Duration {
+        let shift = attempt.saturating_sub(1).min(16) as u32;
+        self.base_delay
+            .checked_mul(1u32 << shift)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay)
+    }
+}
+
+/// Whether an L0 flush error is one that retrying cannot clear.
+///
+/// A fence means the shard is no longer ours (peer claimed the epoch, or our
+/// WAL persistence poisoned us). `InvalidInput` is the flush's preconditions
+/// (empty memtable, rows not yet WAL-durable) and `PrerequisiteFailed` the
+/// ordering guard. All deterministic: retrying would spin on a condition
+/// waiting cannot change, hiding a real bug behind an endless log.
+///
+/// The list is an optimization, not a safety property: naming an error here
+/// only skips the waiting. Either way the writer poisons, so a deterministic
+/// error not named here reaches the same fail-stop a budget later.
+fn is_terminal_flush_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Fenced { .. } | Error::InvalidInput { .. } | Error::PrerequisiteFailed { .. }
+    )
 }
 
 // ============================================================================
@@ -3593,6 +3839,7 @@ pub struct WriteStats {
     memtable_flush_count: AtomicU64,
     memtable_flush_time_nanos: AtomicU64,
     memtable_flush_rows: AtomicU64,
+    l0_flush_failures: AtomicU64,
 }
 
 /// Snapshot of write statistics at a point in time.
@@ -3615,6 +3862,11 @@ pub struct WriteStatsSnapshot {
     pub memtable_flush_count: u64,
     pub memtable_flush_time: Duration,
     pub memtable_flush_rows: u64,
+
+    /// L0 flush attempts that failed and were retried. A generation retries
+    /// until it lands, so a climbing count with a flat `memtable_flush_count`
+    /// is the signal that L0 is unavailable and memtables are piling up.
+    pub l0_flush_failures: u64,
 }
 
 impl WriteStats {
@@ -3656,6 +3908,12 @@ impl WriteStats {
     }
 
     /// Record a MemTable flush operation.
+    /// Count one failed L0 flush attempt. Every occurrence is also logged at
+    /// `warn`; this is the aggregate an operator alerts on.
+    pub fn record_l0_flush_failure(&self) {
+        self.l0_flush_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_memtable_flush(&self, duration: Duration, rows: usize) {
         self.memtable_flush_count.fetch_add(1, Ordering::Relaxed);
         self.memtable_flush_time_nanos
@@ -3687,6 +3945,7 @@ impl WriteStats {
                 self.memtable_flush_time_nanos.load(Ordering::Relaxed),
             ),
             memtable_flush_rows: self.memtable_flush_rows.load(Ordering::Relaxed),
+            l0_flush_failures: self.l0_flush_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -3849,6 +4108,7 @@ mod tests {
     use lance_core::FenceReason;
     use rstest::rstest;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -6300,6 +6560,302 @@ mod tests {
             .unwrap();
     }
 
+    /// A failed L0 flush is retried until it commits, and later generations
+    /// wait behind it. Letting N+1 commit while N is failing would stamp
+    /// `replay_after_wal_entry_position` past WAL entries no SSTable holds, so
+    /// N's rows would live only in memory and die with the process.
+    #[tokio::test]
+    async fn test_flush_retries_until_it_commits_holding_later_generations() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        let config = memtable_config_with_pk(shard_id);
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Generation 1 flushes cleanly and stamps the manifest.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let manifest_store = ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            config.manifest_scan_batch_size,
+        );
+        let after_gen1 = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(after_gen1.current_generation, 2);
+        assert_eq!(after_gen1.sstables.len(), 1);
+
+        // Storage breaks. Generation 2 starts retrying; 3 seals behind it.
+        controls.fail_sstable_puts(usize::MAX);
+        writer
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 2, 1)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+
+        // Past the first retry's backoff. Generation 3 must not have slipped
+        // past the generation 2 that keeps failing.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let wedged = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(
+            wedged.current_generation, 2,
+            "no generation may commit while generation 2 is still failing"
+        );
+        assert_eq!(wedged.sstables, after_gen1.sstables);
+        assert_eq!(
+            wedged.replay_after_wal_entry_position, after_gen1.replay_after_wal_entry_position,
+            "the replay cursor must not advance past a generation that never landed"
+        );
+
+        // Storage heals. Both land in order with no further nudging, which
+        // only happens if generation 2 was still being retried.
+        controls.recover();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let healed = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(healed.current_generation, 4);
+        let generations: Vec<u64> = healed.sstables.iter().map(|s| s.generation).collect();
+        assert_eq!(generations, vec![1, 2, 3]);
+        assert!(
+            healed.replay_after_wal_entry_position > after_gen1.replay_after_wal_entry_position
+        );
+
+        // Everything reached L0, so reopening has nothing left to replay.
+        drop(writer);
+        let reopened = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .unwrap();
+        let stats = reopened.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats.row_count, 0,
+            "every generation committed, so the WAL cursor should cover all entries"
+        );
+    }
+
+    /// An L0 store that is merely unavailable must not cost the writer its
+    /// life. The flush keeps retrying, counting each failure, and the writer
+    /// stays readable and writable throughout — so when storage comes back the
+    /// generation lands with no operator action and no reopen.
+    ///
+    /// This is what keeps the flush queue and the resident set the same fact:
+    /// a generation is outstanding exactly while its memtable is resident, so
+    /// nothing has to publish a separate "it failed" state for callers to
+    /// consult.
+    #[tokio::test]
+    async fn test_unavailable_l0_retries_without_poisoning_then_heals() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        let config = ShardWriterConfig {
+            l0_flush_retry_base_delay: Duration::from_millis(1),
+            l0_flush_retry_max_delay: Duration::from_millis(5),
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        // The row is WAL-durable; only its trip to L0 is broken.
+        controls.fail_sstable_puts(usize::MAX);
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+
+        // Let the loop burn several attempts against the dead store.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            writer.stats().l0_flush_failures > 1,
+            "each failed attempt must be counted, got {}",
+            writer.stats().l0_flush_failures
+        );
+
+        // Not poisoned: the writer still reads, still writes, still reports.
+        writer
+            .scan()
+            .await
+            .expect("an unavailable L0 must not fail reads");
+        writer
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .expect("an unavailable L0 must not fail writes");
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.frozen_count, 1, "the generation is still owed");
+
+        // Storage comes back and the queued generation lands on its own.
+        controls.recover();
+        writer
+            .wait_for_flush_drain()
+            .await
+            .expect("a healed store must let the retrying generation commit");
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats.frozen_count, 0,
+            "nothing is owed once the generation commits"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression: a failure must reach a fence waiter with its reason intact.
+    /// `SealFence` is detached — it holds watchers and no writer handle — so it
+    /// cannot consult the poison latch to re-type an error after the fact. The
+    /// reason has to survive the watcher cell itself, or callers are left
+    /// string-matching to tell a peer takeover from our own failure.
+    #[tokio::test]
+    async fn test_seal_fence_wait_reports_the_typed_fence_reason() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        let config = memtable_config_with_pk(shard_id);
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        controls.fail_sstable_puts(usize::MAX);
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        let fence = writer_a.force_seal_active().await.unwrap();
+
+        // A successor claims the shard while A is mid-retry, ending A's flush
+        // with a terminal error. The fence is a detached value holding only
+        // watchers, so this is the path that used to flatten the reason.
+        let (fence_result, writer_b) = tokio::join!(
+            fence.wait(),
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri,
+                config,
+                schema.clone(),
+                vec![],
+            )
+        );
+        let writer_b = writer_b.unwrap();
+
+        let err = fence_result.expect_err("a generation that never reached L0 must fail the fence");
+        assert_eq!(
+            err.fence_reason(),
+            Some(FenceReason::PersistenceFailure),
+            "the fence must carry the reason, not just a message: {err}"
+        );
+
+        // B replayed the row A never got to L0, so it needs a working store to
+        // close: the flush it owes would otherwise retry past the drain bound.
+        controls.recover();
+        writer_b.close().await.unwrap();
+    }
+
+    /// Retry is for transient failures. A fence is not one — a successor owns
+    /// the shard — so the loop gives up instead of spinning forever.
+    #[tokio::test]
+    async fn test_flush_retry_gives_up_when_fenced_by_successor() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        let config = memtable_config_with_pk(shard_id);
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        controls.fail_sstable_puts(usize::MAX);
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer_a.force_seal_active().await.unwrap();
+
+        // Writer B claims the shard while A is mid-retry, so A's next attempt
+        // reads the bumped epoch and stops. Run concurrently: A's flush ends
+        // the moment B claims, so the drain must already be watching.
+        let (drain_result, writer_b) = tokio::join!(
+            writer_a.wait_for_flush_drain(),
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri,
+                config,
+                schema.clone(),
+                vec![],
+            )
+        );
+        let writer_b = writer_b.unwrap();
+
+        let err = drain_result.unwrap_err();
+        assert!(
+            err.to_string().contains("fenced"),
+            "expected the retry to stop on a fence, got: {err}"
+        );
+
+        // Giving up poisons, exactly as exhausting the budget does. A writer
+        // left live here would serve reads B has already moved past, and would
+        // strand every later generation in memory once the backpressure drain
+        // stopped metering them.
+        assert_eq!(
+            writer_a
+                .put(vec![create_test_batch(&schema, 1, 1)])
+                .await
+                .err()
+                .and_then(|e| e.fence_reason()),
+            Some(FenceReason::PersistenceFailure),
+            "a writer that gave up on a generation must reject later writes"
+        );
+        assert_eq!(
+            writer_a.scan().await.err().and_then(|e| e.fence_reason()),
+            Some(FenceReason::PersistenceFailure),
+            "and must not serve a snapshot the successor has moved past"
+        );
+
+        writer_b.abort().await.unwrap();
+    }
+
     /// A doomed open must fail on local validation *before* it claims the epoch,
     /// so it cannot fence the healthy writer already serving the shard. The
     /// index-config check used to run *after* `claim_epoch` (and, for a successor,
@@ -7089,10 +7645,12 @@ mod tests {
         // hold its own writer claim.
         let (compactor_epoch, _) = manifest_store.claim_epoch(pre.shard_spec_id).await.unwrap();
         manifest_store
-            .commit_update(compactor_epoch, |current| ShardManifest {
-                version: current.version + 1,
-                sstables: vec![],
-                ..current.clone()
+            .commit_update(compactor_epoch, |current| {
+                Ok(ShardManifest {
+                    version: current.version + 1,
+                    sstables: vec![],
+                    ..current.clone()
+                })
             })
             .await
             .unwrap();
@@ -7720,10 +8278,12 @@ mod tests {
         // generation's successful flush would.
         writer
             .manifest_store
-            .commit_update(writer.epoch(), |current| ShardManifest {
-                version: current.version + 1,
-                current_generation: sealed + 2,
-                ..current.clone()
+            .commit_update(writer.epoch(), |current| {
+                Ok(ShardManifest {
+                    version: current.version + 1,
+                    current_generation: sealed + 2,
+                    ..current.clone()
+                })
             })
             .await
             .unwrap();
@@ -7938,48 +8498,75 @@ mod tests {
             .close()
             .await
             .expect_err("close must propagate the fenced MemTable flush");
+        // The flush poisons on the fence, so close surfaces it typed rather than
+        // as the bare IO error the raw flush failure used to produce.
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
         assert!(
-            matches!(error, Error::IO { .. }),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains("Writer fenced"),
-            "unexpected error: {error}"
+            error.to_string().contains("peer claimed epoch"),
+            "the poison must name the fence that caused it: {error}"
         );
 
         writer_b.close().await.unwrap();
     }
 
-    /// Regression: a transient flush failure must NOT reopen the
-    /// concurrent-read-vs-flush hole. The sealed generation stays in the
-    /// queryable set (rows intact) until a later flush or WAL replay.
-    /// Failure is induced deterministically by fencing the writer with a
-    /// successor before the seal, so the flush's `check_fenced` rejects it.
+    /// Regression: `close()` must return promptly while an L0 flush is still
+    /// failing. A flush retries until it lands, so a drain that ran before
+    /// cancellation would wait out the whole outage on a task whose only exit is
+    /// that cancellation. Close cancels first and reports what never landed.
     #[tokio::test]
-    async fn test_frozen_retained_after_failed_flush() {
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+    async fn test_close_stops_retrying_instead_of_waiting_out_the_outage() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
         let schema = create_test_schema();
         let shard_id = Uuid::new_v4();
 
-        let writer_a = ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            base_uri.clone(),
-            memtable_config_with_pk(shard_id),
-            schema.clone(),
-            vec![],
-        )
-        .await
-        .unwrap();
+        // Back off far longer than the assertion below allows, so a close that
+        // waited for the retry loop could not possibly come back in time.
+        let config = ShardWriterConfig {
+            l0_flush_retry_base_delay: Duration::from_secs(60),
+            l0_flush_retry_max_delay: Duration::from_secs(60),
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
 
-        let initial_gen = writer_a.memtable_stats().await.unwrap().generation;
-        writer_a
+        writer
             .put(vec![create_test_batch(&schema, 0, 10)])
             .await
             .unwrap();
 
-        // Successor claims a higher epoch, fencing A.
-        let writer_b = ShardWriter::open(
+        controls.fail_sstable_puts(usize::MAX);
+        writer.force_seal_active().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let error = timeout(Duration::from_secs(10), writer.close())
+            .await
+            .expect("close must not wait on a retry loop")
+            .expect_err("close cannot report success when a generation never reached L0");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "close waited on the backoff instead of abandoning it: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("WAL-durable"),
+            "close must say the rows survive in the WAL, got: {error}"
+        );
+    }
+
+    /// Regression: every attempt at one generation must write to the same
+    /// directory. A fresh `{hash}_gen_N` per attempt leaves the previous
+    /// attempt's data file, bloom filter and indexes behind with nothing
+    /// referencing them, so an outage leaks a directory per retry.
+    #[tokio::test]
+    async fn test_flush_retries_reuse_one_generation_directory() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer = ShardWriter::open(
             store,
             base_path,
             base_uri,
@@ -7989,32 +8576,63 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(writer_b.epoch() > writer_a.epoch());
 
-        // `force_seal_active` would reject up-front on a fenced writer;
-        // freeze directly so the failure surfaces at flush-commit time —
-        // exactly the freeze/flush race the fix guards.
-        match &writer_a.mode {
-            WriterMode::MemTable {
-                state,
-                writer_state,
-                ..
-            } => {
-                let mut st = state.write().await;
-                writer_state.freeze_memtable(&mut st).unwrap();
-            }
-            WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
-        }
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
 
-        // The fenced flush fails; the drain surfaces that error.
-        assert!(
-            writer_a.wait_for_flush_drain().await.is_err(),
-            "fenced flush should fail the drain"
+        // Fail the first attempt's SSTable write, then let the retry through.
+        controls.fail_sstable_puts(1);
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let dirs = controls.generation_dirs();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "a retried generation must reuse its directory, wrote to {dirs:?}"
         );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression: a flush failure must NOT reopen the concurrent-read-vs-flush
+    /// hole. For as long as the retry loop is still working a generation, it
+    /// stays in the queryable set with its rows — and healing inside the budget
+    /// commits it, so a transient failure costs the writer nothing.
+    #[tokio::test]
+    async fn test_frozen_retained_while_flush_retries() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // The rows are WAL-durable; only their trip to L0 is broken. The default
+        // budget backs off for seconds, so the reads below land mid-retry.
+        controls.fail_sstable_puts(usize::MAX);
+        writer.force_seal_active().await.unwrap();
 
         // The hole did not reopen: the sealed generation is still queryable
         // with its rows, alongside the new (empty) active generation.
-        let refs = writer_a.in_memory_memtable_refs().await.unwrap();
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
         assert_eq!(refs.frozen.len(), 1, "sealed generation must be retained");
         assert_eq!(refs.frozen[0].generation, initial_gen);
         assert!(
@@ -8023,19 +8641,27 @@ mod tests {
         );
         assert_eq!(refs.active.generation, initial_gen + 1);
 
-        // Nor did it vanish from the stats. Backpressure released these bytes on
-        // flush completion so the failure cannot wedge writes, but the memtable
-        // is still resident, and this snapshot is what an operator reads to
+        // Nor did it vanish from the stats. The memtable is still resident while
+        // the retry works it, and this snapshot is what an operator reads to
         // decide whether to evict the shard.
-        let stats = writer_a.memtable_stats().await.unwrap();
+        let stats = writer.memtable_stats().await.unwrap();
         assert_eq!(stats.frozen_count, 1);
         assert!(
             stats.frozen_bytes >= refs.frozen[0].batch_store.estimated_bytes(),
-            "a failed flush must keep owing its resident bytes, got {}",
+            "a retrying flush must keep owing its resident bytes, got {}",
             stats.frozen_bytes
         );
 
-        writer_b.close().await.unwrap();
+        // Storage heals inside the budget, so the generation lands and the
+        // writer is left healthy rather than poisoned.
+        controls.recover();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 10, 1)])
+            .await
+            .unwrap();
+
+        writer.close().await.unwrap();
     }
 }
 
