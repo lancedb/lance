@@ -1643,12 +1643,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         metrics: &dyn MetricsCollector,
         candidate_limit: usize,
     ) -> Result<PartitionSearchResult> {
-        if S::name() != "FLAT"
-            || !matches!(
-                Q::quantization_type(),
-                QuantizationType::Rabit | QuantizationType::Scalar
-            )
-        {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
             return Err(Error::not_supported(format!(
                 "candidate-producing search is not supported for IVF_{}_{}",
                 S::name(),
@@ -1723,12 +1718,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         offsets_in_partition: &[u32],
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if S::name() != "FLAT"
-            || !matches!(
-                Q::quantization_type(),
-                QuantizationType::Rabit | QuantizationType::Scalar
-            )
-        {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
             return Err(Error::not_supported(format!(
                 "selected-candidate scoring is not supported for IVF_{}_{}",
                 S::name(),
@@ -5311,65 +5301,37 @@ mod tests {
     }
 
     #[rstest]
-    #[case::rq4_l2(DistanceType::L2, Some(4), false, DIM)]
-    #[case::rq4_cosine(DistanceType::Cosine, Some(4), false, DIM)]
-    #[case::rq4_dot(DistanceType::Dot, Some(4), false, DIM)]
-    #[case::rq8_l2(DistanceType::L2, Some(8), false, DIM)]
-    #[case::rq8_cosine(DistanceType::Cosine, Some(8), false, DIM)]
-    #[case::rq8_dot(DistanceType::Dot, Some(8), false, DIM)]
-    #[case::sq8_l2(DistanceType::L2, None, true, DIM)]
-    #[case::sq8_cosine(DistanceType::Cosine, None, true, DIM)]
-    #[case::sq8_dot(DistanceType::Dot, None, true, DIM)]
-    #[case::rq4_dot_768(DistanceType::Dot, Some(4), false, 768)]
-    #[case::sq8_l2_3072(DistanceType::L2, None, true, 3072)]
-    #[case::rq8_cosine_4096(DistanceType::Cosine, Some(8), false, 4096)]
+    #[case::rq4_l2(DistanceType::L2, 4, DIM)]
+    #[case::rq4_cosine(DistanceType::Cosine, 4, DIM)]
+    #[case::rq4_dot(DistanceType::Dot, 4, DIM)]
+    #[case::rq8_l2(DistanceType::L2, 8, DIM)]
+    #[case::rq8_cosine(DistanceType::Cosine, 8, DIM)]
+    #[case::rq8_dot(DistanceType::Dot, 8, DIM)]
+    #[case::rq4_dot_768(DistanceType::Dot, 4, 768)]
+    #[case::rq8_cosine_4096(DistanceType::Cosine, 8, 4096)]
     #[tokio::test]
     async fn test_score_partition_candidates_matches_accurate_native_search(
         #[case] distance_type: DistanceType,
-        #[case] rq_num_bits: Option<u8>,
-        #[case] has_negative_values: bool,
+        #[case] num_bits: u8,
         #[case] dimension: usize,
     ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let range = if has_negative_values {
-            -1.0..1.0
-        } else {
-            0.0..1.0
-        };
         let num_rows = if dimension == DIM { NUM_ROWS } else { 128 };
         let (mut dataset, vectors) =
-            generate_f32_test_dataset_with_shape(test_uri, num_rows, dimension, range).await;
+            generate_f32_test_dataset_with_shape(test_uri, num_rows, dimension, 0.0..1.0).await;
         let ivf_params = IvfBuildParams::new(4);
-        let params = if let Some(num_bits) = rq_num_bits {
-            VectorIndexParams::with_ivf_rq_params(
-                distance_type,
-                ivf_params,
-                RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
-            )
-        } else {
-            VectorIndexParams::with_ivf_sq_params(
-                distance_type,
-                ivf_params,
-                SQBuildParams::default(),
-            )
-        };
+        let params = VectorIndexParams::with_ivf_rq_params(
+            distance_type,
+            ivf_params,
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
-        if rq_num_bits.is_none() {
-            let obj_store = Arc::new(ObjectStore::local());
-            let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
-            let metadata = get_sq_metadata(&dataset, scheduler, &indices[0].uuid.to_string()).await;
-            assert!(
-                metadata.bounds.start < 0.0 && metadata.bounds.end > 0.0,
-                "SQ bounds should be learned from both negative and positive values, got {:?}",
-                metadata.bounds
-            );
-        }
         let index = dataset
             .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
             .await
@@ -5511,12 +5473,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::sq8(None)]
-    #[case::rq4(Some(4))]
-    #[case::rq8(Some(8))]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
     #[tokio::test]
     async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(
-        #[case] rq_num_bits: Option<u8>,
+        #[case] num_bits: u8,
     ) {
         const EDGE_DIM: usize = 8;
         let test_dir = TempStrDir::default();
@@ -5567,19 +5528,11 @@ mod tests {
             .unwrap(),
         );
         let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
-        let params = if let Some(num_bits) = rq_num_bits {
-            VectorIndexParams::with_ivf_rq_params(
-                DistanceType::L2,
-                ivf_params,
-                RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
-            )
-        } else {
-            VectorIndexParams::with_ivf_sq_params(
-                DistanceType::L2,
-                ivf_params,
-                SQBuildParams::default(),
-            )
-        };
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await

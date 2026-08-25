@@ -15,7 +15,6 @@ pub mod filtered_read;
 pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
-mod knn_results_cache;
 mod optimizer;
 mod projection;
 mod pushdown_scan;
