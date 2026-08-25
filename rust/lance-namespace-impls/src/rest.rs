@@ -748,6 +748,81 @@ impl RestNamespace {
             metrics.increment(operation);
         }
     }
+
+    /// Merge `extra` scalar entries into `request`'s JSON serialization,
+    /// without clobbering any field the typed request already sets. Returns
+    /// the plain typed request when `extra` is empty, so the common case
+    /// pays no serialization cost.
+    fn merge_extra_options<T: Serialize>(
+        request: &T,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::to_value(request).map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to serialize request: {:?}", e),
+            })
+        })?;
+        if let serde_json::Value::Object(map) = &mut body {
+            for (key, value) in extra {
+                map.entry(key).or_insert(value);
+            }
+        }
+        Ok(body)
+    }
+
+    /// Like [`LanceNamespace::alter_table_backfill_columns`], but also
+    /// forwards `extra` -- opaque scalar options the generated
+    /// `AlterTableBackfillColumnsRequest` doesn't declare a field for.
+    ///
+    /// The generated request model only knows the fields that existed in
+    /// the `lance-namespace` spec when it was last regenerated, so a caller
+    /// building a request from a dynamically-typed source (e.g. a language
+    /// binding depythonizing a caller-supplied object) can hold a knob the
+    /// model has no slot for. Merging it into the JSON body here forwards it
+    /// anyway, the same way Phalanx's REST handler already accepts an
+    /// opaque `options` bag on the receiving end -- so a knob doesn't need a
+    /// schema bump on both sides just to reach the server.
+    pub async fn alter_table_backfill_columns_with_extra(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        if extra.is_empty() {
+            return self
+                .post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+                .await;
+        }
+        let body = Self::merge_extra_options(&request, extra)?;
+        self.post_json(&path, &query, &body, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    /// See [`Self::alter_table_backfill_columns_with_extra`] -- same idea,
+    /// for `refresh_materialized_view`.
+    pub async fn refresh_materialized_view_with_extra(
+        &self,
+        request: RefreshMaterializedViewRequest,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        if extra.is_empty() {
+            return self
+                .post_json(&path, &query, &request, "refresh_materialized_view", &id)
+                .await;
+        }
+        let body = Self::merge_extra_options(&request, extra)?;
+        self.post_json(&path, &query, &body, "refresh_materialized_view", &id)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1454,12 +1529,7 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: AlterTableBackfillColumnsRequest,
     ) -> Result<AlterTableBackfillColumnsResponse> {
-        self.record_op("alter_table_backfill_columns");
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/backfill_column", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+        self.alter_table_backfill_columns_with_extra(request, serde_json::Map::new())
             .await
     }
 
@@ -1467,12 +1537,7 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: RefreshMaterializedViewRequest,
     ) -> Result<RefreshMaterializedViewResponse> {
-        self.record_op("refresh_materialized_view");
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+        self.refresh_materialized_view_with_extra(request, serde_json::Map::new())
             .await
     }
 

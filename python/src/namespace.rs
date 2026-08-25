@@ -33,6 +33,7 @@ use lance_namespace_impls::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
+use serde::Serialize;
 
 use crate::error::PythonErrorExt;
 use crate::session::Session;
@@ -818,6 +819,35 @@ impl PyDirectoryNamespace {
     }
 }
 
+/// Keys the caller's Python object set that `typed` (the generated request
+/// model `request` was `depythonize`d into) has no field for.
+///
+/// `depythonize` silently drops anything the target struct doesn't declare
+/// -- there's no `deny_unknown_fields` and no flatten catch-all on the
+/// generated namespace request models, so a knob the model hasn't caught up
+/// to yet (e.g. a newer Geneva tuning kwarg) just disappears before the
+/// request is even built. Recovering it here, from the original object
+/// rather than from `typed`, is what lets a caller forward it anyway --
+/// see `alter_table_backfill_columns` / `refresh_materialized_view` below,
+/// which merge this into the JSON body instead of relying solely on the
+/// generated struct's own serialization.
+fn extra_options<T: Serialize>(
+    py_request: &Bound<'_, PyAny>,
+    typed: &T,
+) -> PyResult<serde_json::Map<String, serde_json::Value>> {
+    let raw: serde_json::Value = depythonize(py_request)?;
+    let typed_value = serde_json::to_value(typed)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let (Some(raw_obj), Some(typed_obj)) = (raw.as_object(), typed_value.as_object()) else {
+        return Ok(serde_json::Map::new());
+    };
+    Ok(raw_obj
+        .iter()
+        .filter(|(key, _)| !typed_obj.contains_key(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
+}
+
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
@@ -1405,9 +1435,14 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let typed: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let extra = extra_options(request, &typed)?;
         let response = crate::rt()
-            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .block_on(
+                Some(py),
+                self.inner
+                    .alter_table_backfill_columns_with_extra(typed, extra),
+            )?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -1417,9 +1452,14 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let typed: RefreshMaterializedViewRequest = depythonize(request)?;
+        let extra = extra_options(request, &typed)?;
         let response = crate::rt()
-            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .block_on(
+                Some(py),
+                self.inner
+                    .refresh_materialized_view_with_extra(typed, extra),
+            )?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
