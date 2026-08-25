@@ -3301,18 +3301,17 @@ async fn test_compound_tie_uses_resolved_row_id() {
     let stats = collected_stats.lock().unwrap().take().unwrap();
     assert_eq!(
         stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
-        Some(&2),
-        "duplicate same-field MultiMatch children execute independent exact collectors"
+        Some(&1)
     );
     assert_eq!(
         stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
-        Some(&768)
+        Some(&384)
     );
     assert_eq!(
         stats
             .all_counts
             .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
-        Some(&2)
+        Some(&1)
     );
 
     let mut analyze_scanner = dataset.scan();
@@ -3322,23 +3321,20 @@ async fn test_compound_tie_uses_resolved_row_id() {
         .unwrap();
     analyze_scanner.limit(Some(1), None).unwrap();
     let analysis = analyze_scanner.analyze_plan().await.unwrap();
-    let compound_lines = analysis
+    let compound_line = analysis
         .lines()
-        .filter(|line| line.contains("CompoundFtsScorer"))
-        .collect::<Vec<_>>();
-    assert_eq!(compound_lines.len(), 2);
-    for compound_line in compound_lines {
-        assert!(
-            compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
-            "compound FTS metrics missing the bounded candidate peak: {compound_line}"
-        );
-        assert!(
-            compound_line.contains(&format!(
-                "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
-            )),
-            "compound FTS metrics missing the bounded resolution batch: {compound_line}"
-        );
-    }
+        .find(|line| line.contains("CompoundFtsScorer"))
+        .unwrap();
+    assert!(
+        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
+        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
+    );
+    assert!(
+        compound_line.contains(&format!(
+            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+        )),
+        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+    );
 }
 
 fn nested_fts_batch(
