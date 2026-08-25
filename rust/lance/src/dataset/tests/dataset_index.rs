@@ -3299,13 +3299,16 @@ async fn test_compound_tie_uses_resolved_row_id() {
     assert_eq!(exhaustive.len(), 384);
 
     let stats = collected_stats.lock().unwrap().take().unwrap();
+    // Both duplicate-field children project 384 addresses, but only the first
+    // cold collector overflows and performs a resolution batch. The second
+    // child reuses the resident row-address projection.
     assert_eq!(
         stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
         Some(&1)
     );
     assert_eq!(
         stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
-        Some(&384)
+        Some(&768)
     );
     assert_eq!(
         stats
@@ -3321,19 +3324,19 @@ async fn test_compound_tie_uses_resolved_row_id() {
         .unwrap();
     analyze_scanner.limit(Some(1), None).unwrap();
     let analysis = analyze_scanner.analyze_plan().await.unwrap();
-    let compound_line = analysis
+    let compound_lines = analysis
         .lines()
-        .find(|line| line.contains("CompoundFtsScorer"))
-        .unwrap();
+        .filter(|line| line.contains("CompoundFtsScorer"))
+        .collect::<Vec<_>>();
+    assert_eq!(compound_lines.len(), 2);
     assert!(
-        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
-        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
-    );
-    assert!(
-        compound_line.contains(&format!(
-            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
-        )),
-        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+        compound_lines.iter().any(|compound_line| {
+            compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128"))
+                && compound_line.contains(&format!(
+                    "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+                ))
+        }),
+        "compound FTS metrics missing the cold collector peaks: {compound_lines:?}"
     );
 }
 
