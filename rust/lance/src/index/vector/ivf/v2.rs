@@ -2075,6 +2075,7 @@ mod tests {
     use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, Result};
+    use lance_datagen::{RowCount, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
@@ -5226,12 +5227,46 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 500;
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let num_rows = 32;
+        let num_partitions = num_rows + 2;
+        let mut vector_values = vec![0.0; num_rows * DIM];
+        for row in 0..num_rows {
+            vector_values[row * DIM + row] = 1.0;
+        }
+        let one_hot_vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vector_values.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let batch = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::jitter_centroids(one_hot_vectors, 0.0))
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let ivf_params = IvfBuildParams::new(nlist);
+        // Keep partition 0 empty: stats previously failed when the first partition was empty.
+        let mut centroid_values = Vec::with_capacity(num_partitions * DIM);
+        centroid_values.extend(std::iter::repeat_n(2.0, DIM));
+        centroid_values.extend(vector_values);
+        centroid_values.extend(std::iter::repeat_n(-2.0, DIM));
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(centroid_values),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(num_partitions, centroids).unwrap();
         let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(4)
+            .ef_construction(4);
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             ivf_params,
@@ -5254,14 +5289,25 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
 
         assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-        for index in stats["indices"].as_array().unwrap() {
-            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-            assert_eq!(
-                index["num_partitions"].as_number().unwrap(),
-                &serde_json::Number::from(nlist)
-            );
-            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
-        }
+        let indices = stats["indices"].as_array().unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        assert_eq!(
+            index["num_partitions"].as_number().unwrap(),
+            &serde_json::Number::from(num_partitions)
+        );
+        assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        let partition_sizes = index["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|partition| partition["size"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(partition_sizes.len(), num_partitions);
+        assert_eq!(partition_sizes.iter().sum::<u64>(), num_rows as u64);
+        assert_eq!(partition_sizes[0], 0);
+        assert!(partition_sizes.contains(&0));
     }
 
     async fn test_distance_range(params: Option<VectorIndexParams>, nlist: usize) {
