@@ -688,11 +688,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         <BLANKLINE>
 
         This is always the streaming shape. `explain_plan` receives a schema rather
-        than data, so it cannot know how `execute` would wrap the source, and a
-        source that reports statistics, such as a `pa.Table`, can change which side
-        of the join is collected. Use `analyze_plan`, which receives the real source,
-        when that side matters. Note that `analyze_plan` runs the merge to collect
-        metrics and may write data files, whereas `explain_plan` writes nothing.
+        than data, so it cannot know how `execute` would wrap the source, and the
+        wrapping affects the plan. Use `analyze_plan`, which receives the real
+        source, when that matters. Note that `analyze_plan` runs the merge to
+        collect metrics and may write data files, whereas `explain_plan` writes
+        nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([

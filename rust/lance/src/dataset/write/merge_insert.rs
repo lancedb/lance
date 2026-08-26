@@ -2933,13 +2933,9 @@ impl MergeInsertJob {
     ///
     /// A schema says nothing about how the source would be wrapped, so this always
     /// reports the streaming shape: the source is stood in for by an empty one-shot
-    /// stream, which reports no statistics. A source that does report them, such as
-    /// an in-memory table or a file-backed provider, can move the collected side of
-    /// the join, so use [`Self::analyze_plan_batches`] or
-    /// [`Self::analyze_plan_provider`] when that side matters. Those execute the
-    /// merge to collect metrics and may write data files; this method writes
-    /// nothing. Note that a one-shot stream buffered for retries still reports no
-    /// statistics, so it plans like the stream it is.
+    /// stream. The wrapping affects the plan, so use [`Self::analyze_plan_batches`]
+    /// or [`Self::analyze_plan_provider`] when that matters. Those execute the merge
+    /// to collect metrics and may write data files; this method writes nothing.
     ///
     /// # Errors
     ///
@@ -3036,10 +3032,9 @@ impl MergeInsertJob {
     ///
     /// # Errors
     ///
-    /// * `Error::NotSupported` when the configuration cannot use the plan path
-    ///   (a source carrying a field the dataset does not have, or a scalar-index
-    ///   execution path). A source that merely omits dataset columns is supported;
-    ///   those columns are filled from the target side of the join.
+    /// * `Error::NotSupported` when the configuration cannot use the plan path.
+    ///   `can_use_create_plan` decides that, and its own doc comment lists the
+    ///   source shapes it accepts.
     /// * `Error::invalid_input` from the support check, e.g. a non-nullable dataset
     ///   column the source does not supply.
     /// * Any error from building or executing the plan. This method runs the merge
@@ -3047,7 +3042,7 @@ impl MergeInsertJob {
     pub async fn analyze_plan_provider(&self, provider: Arc<dyn TableProvider>) -> Result<String> {
         // Check if we can use create_plan
         if !self.can_use_create_plan(provider.schema().as_ref()).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support plan reporting. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support plan reporting: either the source schema is not one the plan path accepts, or the join takes the scalar-index execution path.".into()));
         }
 
         // Clone self since create_plan consumes the job
@@ -9059,10 +9054,10 @@ mod tests {
             .into_reader_rows(RowCount::from(TARGET_ROWS), BatchCount::from(1));
         let ds = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
 
-        // Partial schema: the source omits `other`, so the row-rewrite fill has the
-        // target scan has to read it, and the build side holds it for every row it
-        // buffers. This test asserts which side is the build side, not the
-        // projection, so the reading itself is background rather than a claim.
+        // Partial schema: the source omits `other`, so the row-rewrite fill makes
+        // the target scan read it. In the streaming half below, where the target is
+        // the build side, that means it is held for every buffered row. This test
+        // asserts which side is the build side, not the projection.
         let source = record_batch!(
             ("key", UInt32, [0, 1, 2, 3]),
             ("value", UInt32, [10, 11, 12, 13])
@@ -9129,8 +9124,10 @@ mod tests {
 
     /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
     /// was handed would actually run. The batches entry point must therefore not
-    /// fall back to the streaming plan: materialized batches are collected as the
-    /// join's build side and the join type is rewritten, while a stream is not.
+    /// fall back to the streaming plan: with the row counts used below the join
+    /// collects the materialized source and rewrites the join type, and a stream
+    /// gets neither. Which side wins is a size comparison, not a property of the
+    /// entry point; see the fixture comment.
     #[tokio::test]
     async fn test_analyze_plan_reports_the_given_source_shape() {
         let data = lance_datagen::gen_batch()
