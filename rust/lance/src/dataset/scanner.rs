@@ -77,7 +77,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
+    INVERTED_INDEX_VERSION_V3, MemBM25Scorer, SCORE_COL, SCORE_FIELD, fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -113,12 +113,9 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BOUNDED_MIXED_FIELD_ROWS_METRIC, BOUNDED_MIXED_INDEXED_CANDIDATES_METRIC,
-    BOUNDED_MIXED_INDEXED_ROWS_METRIC, BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC,
-    BOUNDED_MIXED_RESIDUAL_ROWS_METRIC, BoostQueryExec, BoundedMixedFtsMetricsExec,
-    CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec,
-    FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer, SharedPreparedMatch,
-    fts_segments_have_deleted_fragments,
+    BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
+    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    SharedPreparedMatch, fts_segments_have_deleted_fragments,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -173,26 +170,11 @@ enum FtsOverlayPlan {
     FullScan,
 }
 
-enum BoundedMixedFtsFieldPlan {
-    NotApplicable,
-    Bounded(Arc<dyn ExecutionPlan>),
-    ExhaustiveFallback(&'static str),
-    TargetFlatFallback(&'static str),
-}
-
 struct FlatFuzzyPreparationScope {
     fragments: Vec<Fragment>,
     stale_rows: HashMap<u32, RoaringBitmap>,
     current_values_only: bool,
 }
-
-const BOUNDED_MIXED_FUZZY_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_fuzzy";
-const BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_full_scan";
-const BOUNDED_MIXED_UNKNOWN_COVERAGE_FALLBACK_METRIC: &str =
-    "fts_bounded_mixed_fallback_unknown_coverage";
-const BOUNDED_MIXED_OVERLAP_FALLBACK_METRIC: &str =
-    "fts_bounded_mixed_fallback_overlapping_coverage";
-const BOUNDED_MIXED_LEGACY_FALLBACK_METRIC: &str = "fts_bounded_mixed_fallback_legacy";
 
 fn fts_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
     match query {
@@ -287,28 +269,6 @@ fn has_unknown_fts_coverage(segments: &[IndexMetadata]) -> bool {
 
 fn has_retired_or_unknown_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
     has_retired_fts_coverage(dataset, segments) || has_unknown_fts_coverage(segments)
-}
-
-fn bounded_mixed_overlay_fallback(plan: &FtsOverlayPlan) -> Option<&'static str> {
-    matches!(plan, FtsOverlayPlan::FullScan).then_some(BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC)
-}
-
-fn bounded_mixed_indexed_coverage<'a>(
-    segment_coverages: impl IntoIterator<Item = Option<&'a RoaringBitmap>>,
-    target_fragment_ids: &RoaringBitmap,
-) -> std::result::Result<RoaringBitmap, &'static str> {
-    let mut indexed_fragment_ids = RoaringBitmap::new();
-    for segment_fragment_ids in segment_coverages {
-        let Some(segment_fragment_ids) = segment_fragment_ids else {
-            return Err(BOUNDED_MIXED_UNKNOWN_COVERAGE_FALLBACK_METRIC);
-        };
-        let covered_target_ids = segment_fragment_ids & target_fragment_ids;
-        if !(&indexed_fragment_ids & &covered_target_ids).is_empty() {
-            return Err(BOUNDED_MIXED_OVERLAP_FALLBACK_METRIC);
-        }
-        indexed_fragment_ids |= covered_target_ids;
-    }
-    Ok(indexed_fragment_ids)
 }
 
 fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
@@ -5152,267 +5112,6 @@ impl Scanner {
         Self::combine_fts_leaf_plans(match_plan, flat_match_plan, params)
     }
 
-    /// Bound one top-level MultiMatch field whose live rows are split between
-    /// a modern posting index and exact residual evaluation.
-    ///
-    /// The optimization is deliberately narrower than the ordinary Match
-    /// fallback. Known fragment coverage proves that indexed and unindexed
-    /// sources do not overlap, while the overlay block removes stale rows from
-    /// the indexed source before their current values are evaluated by the
-    /// residual source. Unknown or overlapping coverage and legacy postings
-    /// retain the exhaustive plan.
-    async fn plan_bounded_mixed_multimatch_field(
-        &self,
-        query: &MatchQuery,
-        params: &FtsSearchParams,
-        filter_plan: &ExprFilterPlan,
-        prefilter_source: &PreFilterSource,
-    ) -> Result<BoundedMixedFtsFieldPlan> {
-        let Some(limit) = params.limit else {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        };
-        if limit == 0 || query.document_granularity != Some(DocumentGranularity::Row) {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        }
-        if self.fast_search {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        }
-        let column = query.column.as_ref().ok_or_else(|| {
-            Error::invalid_input("the column must be specified in the query".to_string())
-        })?;
-        resolve_fts_field(self.dataset.schema(), column, DocumentGranularity::Row)?;
-
-        let Some(index) = self
-            .dataset
-            .load_scalar_index(
-                IndexCriteria::default()
-                    .for_column(column)
-                    .supports_fts()
-                    .with_fts_document_granularity(DocumentGranularity::Row),
-            )
-            .await?
-        else {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        };
-        let target_fragments: &[Fragment] = self
-            .fragments
-            .as_deref()
-            .unwrap_or_else(|| self.dataset.fragments());
-        if target_fragments.is_empty() {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        }
-        let is_explicit_exact = query.fuzziness == Some(0);
-        let Some(loaded_segments) =
-            load_segments(&self.dataset, column, DocumentGranularity::Row).await?
-        else {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        };
-        let target_fragment_ids =
-            RoaringBitmap::from_iter(target_fragments.iter().map(|fragment| fragment.id as u32));
-        if !is_explicit_exact && self.fragments.is_some() {
-            let all_fragment_ids = RoaringBitmap::from_iter(
-                self.dataset
-                    .fragments()
-                    .iter()
-                    .map(|fragment| fragment.id as u32),
-            );
-            if let Err(metric) = bounded_mixed_indexed_coverage(
-                loaded_segments
-                    .iter()
-                    .map(|segment| segment.fragment_bitmap.as_ref()),
-                &all_fragment_ids,
-            ) {
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
-            }
-            let global_unindexed = self.dataset.unindexed_fragments(&index.name).await?;
-            let global_overlay = self
-                .fts_overlay_plan(column, DocumentGranularity::Row, self.dataset.fragments())
-                .await?;
-            if !global_unindexed.is_empty()
-                || !matches!(global_overlay, FtsOverlayPlan::Unchanged(_))
-            {
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                    BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
-                ));
-            }
-        }
-        let overlay_plan = self
-            .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
-            .await?;
-        if let Some(metric) = bounded_mixed_overlay_fallback(&overlay_plan) {
-            if !is_explicit_exact {
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
-            }
-            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
-        }
-        let (stale_rows, segments) = match overlay_plan {
-            FtsOverlayPlan::Unchanged(Some(segments)) => (HashMap::new(), segments),
-            FtsOverlayPlan::Unchanged(None) => (HashMap::new(), loaded_segments),
-            FtsOverlayPlan::RowLevel {
-                stale_rows,
-                segments,
-            } => (stale_rows, segments),
-            FtsOverlayPlan::FullScan => {
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                    BOUNDED_MIXED_FULL_SCAN_FALLBACK_METRIC,
-                ));
-            }
-        };
-        if !is_explicit_exact && has_retired_fts_coverage(&self.dataset, &segments) {
-            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
-            ));
-        }
-        let indexed_fragment_ids = match bounded_mixed_indexed_coverage(
-            segments
-                .iter()
-                .map(|segment| segment.fragment_bitmap.as_ref()),
-            &target_fragment_ids,
-        ) {
-            Ok(indexed_fragment_ids) => indexed_fragment_ids,
-            Err(metric) => {
-                if !is_explicit_exact {
-                    return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
-                }
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(metric));
-            }
-        };
-        let unindexed_fragment_ids = &target_fragment_ids - &indexed_fragment_ids;
-        let unindexed_fragments = target_fragments
-            .iter()
-            .filter(|fragment| unindexed_fragment_ids.contains(fragment.id as u32))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !is_explicit_exact
-            && fts_segments_have_deleted_fragments(&self.dataset, column, &segments).await?
-        {
-            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
-            ));
-        }
-        if (!stale_rows.is_empty() || has_post_index_deletions(&self.dataset, &segments).await?)
-            && !is_explicit_exact
-        {
-            return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                BOUNDED_MIXED_FUZZY_FALLBACK_METRIC,
-            ));
-        }
-        if unindexed_fragments.is_empty() && stale_rows.is_empty() {
-            return Ok(BoundedMixedFtsFieldPlan::NotApplicable);
-        }
-        let details = futures::future::try_join_all(
-            segments
-                .iter()
-                .map(|segment| load_physical_fts_details(&self.dataset, column, segment)),
-        )
-        .await?;
-        if details.iter().any(|details| {
-            !matches!(
-                details.posting_format_version,
-                Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
-            )
-        }) {
-            if !is_explicit_exact {
-                return Ok(BoundedMixedFtsFieldPlan::TargetFlatFallback(
-                    BOUNDED_MIXED_LEGACY_FALLBACK_METRIC,
-                ));
-            }
-            return Ok(BoundedMixedFtsFieldPlan::ExhaustiveFallback(
-                BOUNDED_MIXED_LEGACY_FALLBACK_METRIC,
-            ));
-        }
-
-        let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
-        let shared_prepared = (!is_explicit_exact).then(|| Arc::new(SharedPreparedMatch::new()));
-        let mut indexed_exec = CompoundQueryExec::new_with_segments(
-            self.dataset.clone(),
-            FtsQuery::Match(query.clone()),
-            params.clone(),
-            prefilter_source.clone(),
-            segments,
-        )
-        .with_external_mask(self.external_row_mask.clone());
-        if let Some(overlay_block) = overlay_block {
-            indexed_exec = indexed_exec.with_overlay_block(overlay_block);
-        }
-        if let Some(shared_prepared) = &shared_prepared {
-            indexed_exec = indexed_exec.with_shared_prepared(shared_prepared.clone());
-        }
-        let indexed_plan = Arc::new(indexed_exec) as Arc<dyn ExecutionPlan>;
-        let flat_plan = self
-            .plan_flat_match_query(
-                unindexed_fragments,
-                stale_rows,
-                query,
-                params,
-                filter_plan,
-                None,
-                shared_prepared,
-            )
-            .await?;
-
-        Ok(BoundedMixedFtsFieldPlan::Bounded(
-            Self::combine_bounded_fts_sources(indexed_plan, flat_plan, limit)?,
-        ))
-    }
-
-    fn fts_top_k(plan: Arc<dyn ExecutionPlan>, limit: usize) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = Arc::new(RepartitionExec::try_new(
-            plan,
-            Partitioning::RoundRobinBatch(1),
-        )?);
-        let sort_exprs = [
-            PhysicalSortExpr {
-                expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: true,
-                    nulls_first: false,
-                },
-            },
-            PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            },
-        ];
-        Ok(Arc::new(
-            SortExec::new(sort_exprs.into(), plan).with_fetch(Some(limit)),
-        ))
-    }
-
-    fn combine_bounded_fts_sources(
-        indexed_plan: Arc<dyn ExecutionPlan>,
-        flat_plan: Arc<dyn ExecutionPlan>,
-        limit: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let indexed_plan = Arc::new(BoundedMixedFtsMetricsExec::new(
-            indexed_plan,
-            BOUNDED_MIXED_INDEXED_CANDIDATES_METRIC,
-        ));
-        let indexed_plan = Self::fts_top_k(indexed_plan, limit)?;
-        let indexed_plan = Arc::new(BoundedMixedFtsMetricsExec::new(
-            indexed_plan,
-            BOUNDED_MIXED_INDEXED_ROWS_METRIC,
-        ));
-        let flat_plan = Arc::new(BoundedMixedFtsMetricsExec::new(
-            flat_plan,
-            BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC,
-        ));
-        let flat_plan = Self::fts_top_k(flat_plan, limit)?;
-        let flat_plan = Arc::new(BoundedMixedFtsMetricsExec::new(
-            flat_plan,
-            BOUNDED_MIXED_RESIDUAL_ROWS_METRIC,
-        ));
-        let sources = UnionExec::try_new(vec![indexed_plan, flat_plan])?;
-        let field = Self::fts_top_k(sources, limit)?;
-        Ok(Arc::new(BoundedMixedFtsMetricsExec::new(
-            field,
-            BOUNDED_MIXED_FIELD_ROWS_METRIC,
-        )))
-    }
-
     fn combine_fts_leaf_plans(
         indexed_plan: Option<Arc<dyn ExecutionPlan>>,
         flat_plan: Option<Arc<dyn ExecutionPlan>>,
@@ -5594,13 +5293,6 @@ impl Scanner {
         shared_scorer: Option<Arc<SharedFtsScorer>>,
         shared_prepared: Option<Arc<SharedPreparedMatch>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let column = query
-            .column
-            .as_ref()
-            .ok_or(Error::invalid_input(
-                "the column must be specified in the query".to_string(),
-            ))?
-            .clone();
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::internal("FTS Match query granularity was not resolved".to_string())
         })?;
@@ -5792,26 +5484,7 @@ impl Scanner {
         } else {
             plan = self.ensure_column_alias(plan, &document_column)?;
         }
-        let mut flat_match_plan = FlatMatchQueryExec::new_with_document_granularity(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            plan,
-            document_granularity,
-            document_column,
-        );
-        if let Some(shared_scorer) = shared_scorer {
-            flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
-        }
-        let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(flat_match_plan);
-        // Unindexed fragments and stale rows never reach the index-side prefilter,
-        // so apply the external row-address mask to the flat FTS results here
-        // (mirrors the ANN flat branch). Applied before the caller's top-k so
-        // masked-out rows do not consume result slots.
-        if let Some(mask) = self.external_row_mask.clone() {
-            return Ok(Arc::new(RowAddrMaskFilterExec::new(flat_match_plan, mask)));
-        }
-        Ok(flat_match_plan)
+        Ok((plan, document_column))
     }
 
     // ANN/KNN search execution node with optional prefilter

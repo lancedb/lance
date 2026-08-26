@@ -1394,7 +1394,12 @@ async fn flat_bm25_search_stream_with_scorer_mode(
     // proceeding. This mirrors the indexed search path, which already
     // short-circuits on empty query tokens.
     if query_tokens.is_empty() {
-        let scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        let scorer = match scorer_mode {
+            FlatScorerMode::Extend(base_scorer) => {
+                base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()))
+            }
+            FlatScorerMode::Fixed(scorer) => scorer,
+        };
         return Ok((
             Box::pin(RecordBatchStreamAdapter::new(
                 output_schema,

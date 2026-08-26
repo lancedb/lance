@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
@@ -688,7 +688,6 @@ pub struct CompoundQueryExec {
     /// the complete corpus before this exec was restricted to a segment
     /// subset.
     prepared_match: Option<Arc<PreparedBm25Query>>,
-    shared_prepared: Option<Arc<SharedPreparedMatch>>,
     segment_selection: FtsSegmentSelection,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
@@ -746,7 +745,6 @@ impl CompoundQueryExec {
             prefilter_source,
             base_scorer: None,
             prepared_match: None,
-            shared_prepared: None,
             segment_selection,
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
@@ -783,14 +781,6 @@ impl CompoundQueryExec {
     #[doc(hidden)]
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
         self.prepared_match = Some(prepared);
-        self.shared_prepared = None;
-        self.base_scorer = None;
-        self
-    }
-
-    pub(crate) fn with_shared_prepared(mut self, prepared: Arc<SharedPreparedMatch>) -> Self {
-        self.shared_prepared = Some(prepared);
-        self.prepared_match = None;
         self.base_scorer = None;
         self
     }
@@ -938,14 +928,6 @@ impl ExecutionPlan for CompoundQueryExec {
             .collect()
     }
 
-    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if let Some(shared_prepared) = &self.shared_prepared {
-            shared_prepared.invalidate();
-        }
-        let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -974,7 +956,6 @@ impl ExecutionPlan for CompoundQueryExec {
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
             prepared_match: self.prepared_match.clone(),
-            shared_prepared: self.shared_prepared.clone(),
             segment_selection: self.segment_selection.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
@@ -995,7 +976,6 @@ impl ExecutionPlan for CompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_prepared_match = self.prepared_match.clone();
-        let shared_prepared = self.shared_prepared.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -1021,15 +1001,12 @@ impl ExecutionPlan for CompoundQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            if (preset_prepared_match.is_some() || shared_prepared.is_some())
-                && !matches!(&query, FtsQuery::Match(_))
-            {
+            if preset_prepared_match.is_some() && !matches!(&query, FtsQuery::Match(_)) {
                 return Err(DataFusionError::Execution(
                     "CompoundQueryExec prepared vocabulary requires a root Match query".to_string(),
                 ));
             }
             let scorer_only_fuzzy = preset_prepared_match.is_none()
-                && shared_prepared.is_none()
                 && compound_query_uses_fuzzy_expansion(&query)
                 && preset_base_scorer.is_some();
             let scorer_override_covers_all = if scorer_only_fuzzy {
@@ -1042,11 +1019,6 @@ impl ExecutionPlan for CompoundQueryExec {
             let _details = load_segment_details(&dataset, column, &segments).await?;
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
-            let preset_prepared_match = match (preset_prepared_match, shared_prepared) {
-                (Some(prepared), _) => Some(prepared),
-                (None, Some(shared)) => Some(shared.wait().await?),
-                (None, None) => None,
-            };
             if let Some(first_index) = indices.first() {
                 tokenized_query
                     .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
@@ -1845,37 +1817,96 @@ fn tokenize_cross_column_compound_query(
     Ok(TokenizedCompoundQuery(leaves))
 }
 
-type SharedScorerResult = std::result::Result<Arc<MemBM25Scorer>, Arc<str>>;
+#[derive(Clone, Debug)]
+enum SharedScorerState {
+    Pending,
+    Ready(Arc<MemBM25Scorer>),
+    Failed(Arc<str>),
+    Cancelled,
+    Invalidated,
+}
 
 /// Coordinates BM25 corpus statistics between the indexed and flat branches
 /// of a mixed search. The flat branch extends the indexed statistics with the
 /// unindexed documents, then publishes the resulting corpus-wide scorer.
 #[derive(Debug)]
 pub(crate) struct SharedFtsScorer {
-    sender: tokio::sync::watch::Sender<Option<SharedScorerResult>>,
+    generation: Mutex<u64>,
+    sender: tokio::sync::watch::Sender<SharedScorerState>,
 }
 
 impl SharedFtsScorer {
     pub(crate) fn new() -> Self {
-        let (sender, _) = tokio::sync::watch::channel(None);
-        Self { sender }
+        let (sender, _) = tokio::sync::watch::channel(SharedScorerState::Pending);
+        Self {
+            generation: Mutex::new(0),
+            sender,
+        }
     }
 
-    fn publish(&self, scorer: MemBM25Scorer) {
-        self.sender.send_replace(Some(Ok(Arc::new(scorer))));
+    fn generation(&self) -> MutexGuard<'_, u64> {
+        match self.generation.lock() {
+            Ok(generation) => generation,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
-    fn publish_error(&self, error: &DataFusionError) {
-        self.sender
-            .send_replace(Some(Err(Arc::from(error.to_string()))));
+    fn advance_generation(generation: &mut u64) -> u64 {
+        *generation = generation.checked_add(1).unwrap_or(1);
+        *generation
+    }
+
+    fn begin_generation(&self) -> u64 {
+        let mut current = self.generation();
+        let generation = Self::advance_generation(&mut current);
+        self.sender.send_replace(SharedScorerState::Pending);
+        generation
+    }
+
+    fn invalidate(&self) {
+        let mut current = self.generation();
+        Self::advance_generation(&mut current);
+        self.sender.send_replace(SharedScorerState::Invalidated);
+    }
+
+    fn publish(&self, generation: u64, scorer: MemBM25Scorer) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender
+                .send_replace(SharedScorerState::Ready(Arc::new(scorer)));
+        }
+    }
+
+    fn publish_error(&self, generation: u64, error: &DataFusionError) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender
+                .send_replace(SharedScorerState::Failed(Arc::from(error.to_string())));
+        }
+    }
+
+    fn cancel(&self, generation: u64) {
+        let current = self.generation();
+        if *current == generation {
+            self.sender.send_replace(SharedScorerState::Cancelled);
+        }
     }
 
     async fn wait(&self) -> DataFusionResult<Arc<MemBM25Scorer>> {
         let mut receiver = self.sender.subscribe();
         loop {
-            let result = receiver.borrow_and_update().clone();
-            if let Some(result) = result {
-                return result.map_err(|message| DataFusionError::Execution(message.to_string()));
+            match receiver.borrow_and_update().clone() {
+                SharedScorerState::Ready(scorer) => return Ok(scorer),
+                SharedScorerState::Failed(message) => {
+                    return Err(DataFusionError::Execution(message.to_string()));
+                }
+                SharedScorerState::Cancelled => {
+                    return Err(DataFusionError::Execution(
+                        "mixed FTS corpus scorer producer was cancelled before publishing statistics"
+                            .to_string(),
+                    ));
+                }
+                SharedScorerState::Pending | SharedScorerState::Invalidated => {}
             }
             receiver.changed().await.map_err(|_| {
                 DataFusionError::Execution(
@@ -1889,6 +1920,7 @@ impl SharedFtsScorer {
 
 struct SharedFtsScorerProducer {
     scorer: Arc<SharedFtsScorer>,
+    generation: u64,
     completed: bool,
 }
 
@@ -2022,19 +2054,21 @@ impl Drop for SharedPreparedMatchProducer {
 
 impl SharedFtsScorerProducer {
     fn new(scorer: Arc<SharedFtsScorer>) -> Self {
+        let generation = scorer.begin_generation();
         Self {
             scorer,
+            generation,
             completed: false,
         }
     }
 
     fn publish(mut self, scorer: MemBM25Scorer) {
-        self.scorer.publish(scorer);
+        self.scorer.publish(self.generation, scorer);
         self.completed = true;
     }
 
     fn publish_error(mut self, error: &DataFusionError) {
-        self.scorer.publish_error(error);
+        self.scorer.publish_error(self.generation, error);
         self.completed = true;
     }
 }
@@ -2042,9 +2076,7 @@ impl SharedFtsScorerProducer {
 impl Drop for SharedFtsScorerProducer {
     fn drop(&mut self) {
         if !self.completed {
-            self.scorer.sender.send_replace(Some(Err(Arc::from(
-                "mixed FTS corpus scorer producer was cancelled before publishing statistics",
-            ))));
+            self.scorer.cancel(self.generation);
         }
     }
 }
@@ -4885,7 +4917,8 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use crate::index::DatasetIndexExt;
     use arrow_array::{

@@ -11,9 +11,10 @@ use futures::TryStreamExt;
 
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::ROW_ID;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
@@ -820,6 +821,32 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
 }
 
+async fn scored_fts_rows(
+    dataset: &Dataset,
+    query: FullTextSearchQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, u32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id().full_text_search(query).unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .map(|score| score.to_bits()),
+        )
+        .collect()
+}
+
 #[tokio::test]
 async fn test_ngram_optimize_preserves_overlay_staleness() {
     let mut dataset = create_text_dataset(false).await;
@@ -1033,36 +1060,6 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
         "id=6 mango sorbet should still be found: {mango_ids:?}"
     );
 
-    for term in ["apple", "mango"] {
-        let exhaustive = bounded_multimatch_ids(&dataset, term, None).await;
-        let limited = bounded_multimatch_ids(&dataset, term, Some(2)).await;
-        assert_eq!(limited, exhaustive[..exhaustive.len().min(2)]);
-        if term == "apple" {
-            assert_eq!(
-                limited,
-                vec![0],
-                "limit=2 must not resurrect id=1's stale indexed apple posting"
-            );
-        }
-
-        let query: FtsQuery = MultiMatchQuery::try_new(term.to_owned(), vec!["text".to_owned()])
-            .unwrap()
-            .into();
-        let mut scan = dataset.scan();
-        scan.full_text_search(FullTextSearchQuery::new_query(query))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap();
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC)
-                && plan.contains("CompoundFtsScorer")
-                && plan.contains("FlatMatchQuery")
-                && !plan.contains("AggregateExec"),
-            "known-coverage overlay MultiMatch should use bounded indexed-live plus targeted stale scoring:\n{plan}"
-        );
-    }
-
     let multi_match_query: FtsQuery =
         MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
             .unwrap()
@@ -1105,9 +1102,7 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
         .unwrap();
     let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
     assert!(
-        fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy")
-            && fuzzy_plan.contains("FlatMatchQuery")
-            && !fuzzy_plan.contains("CompoundFtsScorer"),
+        fuzzy_plan.contains("FlatMatchQuery") && !fuzzy_plan.contains("CompoundFtsScorer"),
         "stale fuzzy queries must prepare and score from all current values:\n{fuzzy_plan}"
     );
     let fuzzy_batch = fuzzy_scan.try_into_batch().await.unwrap();
@@ -1235,11 +1230,6 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
         .unwrap()
         .limit(Some(1), None)
         .unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(
-        plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
-        "zero-token stale rows require bounded targeted current-value scoring:\n{plan}"
-    );
     let batch = scan.try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 1);
     assert!(
@@ -1261,8 +1251,7 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
         .unwrap();
     let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
     assert!(
-        fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy")
-            && fuzzy_plan.contains("FlatMatchQuery"),
+        fuzzy_plan.contains("FlatMatchQuery"),
         "zero-token stale fuzzy rows require all-current preparation: {fuzzy_plan}"
     );
     let fuzzy_batch = fuzzy_scan.try_into_batch().await.unwrap();
@@ -1306,42 +1295,6 @@ async fn test_multimatch_overlay_zero_token_row_becomes_match(
             .value(0)
             .is_finite()
     );
-}
-
-#[tokio::test]
-async fn test_multimatch_unknown_coverage_overlay_full_scan_is_executable() {
-    let mut dataset = create_text_dataset(false).await;
-    build_text_fts_index(&mut dataset).await;
-    let mut dataset = commit_overlay(
-        dataset,
-        "unknown_coverage_text_overlay",
-        0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
-    )
-    .await;
-    make_text_index_coverage_unknown(&mut dataset).await;
-
-    let query: FtsQuery = MultiMatchQuery::try_new("mango".to_owned(), vec!["text".to_owned()])
-        .unwrap()
-        .into();
-    let mut scan = dataset.scan();
-    scan.full_text_search(FullTextSearchQuery::new_query(query))
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .limit(Some(2), None)
-        .unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(
-        plan.contains("fts_bounded_mixed_fallback_full_scan") && plan.contains("FlatMatchQuery"),
-        "unknown overlay ownership must produce an executable FullScan fallback:\n{plan}"
-    );
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 6]);
 }
 
 #[tokio::test]

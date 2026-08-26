@@ -21,11 +21,7 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
-use crate::io::exec::fts::{
-    BOUNDED_MIXED_FIELD_ROWS_METRIC, BOUNDED_MIXED_INDEXED_CANDIDATES_METRIC,
-    BOUNDED_MIXED_INDEXED_ROWS_METRIC, BOUNDED_MIXED_RESIDUAL_CANDIDATES_METRIC,
-    BOUNDED_MIXED_RESIDUAL_ROWS_METRIC, fts_segments_have_deleted_fragments,
-};
+use crate::io::exec::fts::fts_segments_have_deleted_fragments;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -43,8 +39,6 @@ use lance_core::cache::{
     CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, LanceCache, QuickCacheBackend,
 };
 use lance_core::utils::tempfile::TempStrDir;
-use lance_datafusion::exec::ExecutionSummaryCounts;
-use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -1327,6 +1321,32 @@ async fn compound_fts_results(
         .collect()
 }
 
+async fn compound_fts_results_with_prefilter(
+    dataset: &Dataset,
+    query: FtsQuery,
+    filter: &str,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .prefilter(true)
+        .filter(filter)
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
 fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
@@ -1851,54 +1871,6 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         1,
         "the fully indexed title should retain its bounded compound scorer:\n{partial_plan}"
     );
-    let mut residual_scan = partial_dataset.scan();
-    residual_scan
-        .prefilter(true)
-        .filter("id = 12")
-        .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(body_query.clone()))
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .limit(Some(1), None)
-        .unwrap();
-    let residual_batch = residual_scan.try_into_batch().await.unwrap();
-    assert_eq!(
-        residual_batch["id"].as_primitive::<Int32Type>().values(),
-        &[12],
-        "candidate filtering must select residual business id 12, not a lower row-id tie"
-    );
-    for fuzziness in [Some(1), None] {
-        let mut fuzzy =
-            MultiMatchQuery::try_new("nois".to_owned(), vec!["body".to_owned()]).unwrap();
-        fuzzy.match_queries[0].fuzziness = fuzziness;
-        let fuzzy_query: FtsQuery = fuzzy.into();
-        let fuzzy_exhaustive =
-            compound_fts_results(&partial_dataset, fuzzy_query.clone(), None).await;
-        let fuzzy_limited =
-            compound_fts_results(&partial_dataset, fuzzy_query.clone(), Some(1)).await;
-        assert_eq!(
-            fuzzy_limited,
-            fuzzy_exhaustive.into_iter().take(1).collect::<Vec<_>>()
-        );
-        let fuzzy_plan = compound_fts_plan(&partial_dataset, fuzzy_query, 1).await;
-        assert!(
-            fuzzy_plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC)
-                && !fuzzy_plan.contains("fts_bounded_mixed_fallback_fuzzy"),
-            "fuzziness={fuzziness:?} must use canonical bounded mixed scoring:\n{fuzzy_plan}"
-        );
-    }
-
-    let mut fast_scan = partial_dataset.scan();
-    fast_scan.fast_search();
-    fast_scan
-        .full_text_search(FullTextSearchQuery::new_query(body_query))
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .limit(Some(10), None)
-        .unwrap();
-    let fast_plan = fast_scan.explain_plan(false).await.unwrap();
     assert!(
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
@@ -2258,13 +2230,6 @@ async fn test_partial_fuzzy_multimatch_matches_rebuilt_current_value_oracle() {
             &actual,
             &expected,
         );
-        let plan = compound_fts_plan(&partial, query.clone(), 10).await;
-        assert!(
-            plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC)
-                && !plan.contains("fts_bounded_mixed_fallback_fuzzy"),
-            "known-disjoint partial fuzzy field should stay bounded: {plan}"
-        );
-
         let filtered_actual =
             compound_fts_results_with_prefilter(&partial, query.clone(), "id = 10", Some(10)).await;
         let filtered_expected =
@@ -2756,178 +2721,6 @@ async fn test_plain_fuzzy_target_flat_applies_score_and_row_id_topk() {
     let actual = search_ids(&target_flat, query).await;
     assert_eq!(actual, expected);
     assert_eq!(actual, vec![3, 2]);
-}
-
-#[tokio::test]
-async fn test_bounded_partial_multimatch_stable_row_ids_and_deletes() {
-    let mut dataset = write_cross_column_compound_dataset_with_stable_row_ids(true).await;
-    create_fragmented_fts_index(&mut dataset, "body", true).await;
-    let appended = arrow_array::record_batch!(
-        ("title", Utf8, ["residual", "residual", "residual"]),
-        ("body", Utf8, ["noise", "noise", "noise"]),
-        ("id", Int32, [10, 11, 12])
-    )
-    .unwrap();
-    let schema = appended.schema();
-    dataset
-        .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
-        .await
-        .unwrap();
-    dataset.delete("id = 6").await.unwrap();
-
-    let query: FtsQuery = MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
-        .unwrap()
-        .into();
-    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
-    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
-    assert_eq!(limited, exhaustive[..2]);
-    let plan = compound_fts_plan(&dataset, query.clone(), 2).await;
-    assert!(
-        plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
-        "stable row ids should retain the bounded partial-field path:\n{plan}"
-    );
-
-    let mut limited_scan = dataset.scan();
-    limited_scan
-        .full_text_search(FullTextSearchQuery::new_query(query))
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .limit(Some(2), None)
-        .unwrap();
-    let ids = limited_scan.try_into_batch().await.unwrap();
-    assert_eq!(
-        ids["id"].as_primitive::<Int32Type>().values(),
-        &[10, 11],
-        "deleting indexed winner id=6 must promote residual ids 10 and 11"
-    );
-}
-
-#[tokio::test]
-async fn test_mixed_multimatch_metadata_fallbacks_execute_target_flat_scan() {
-    for (case_name, expected_metric, append_residual) in [
-        (
-            "unknown",
-            "fts_bounded_mixed_fallback_unknown_coverage",
-            true,
-        ),
-        (
-            "overlap",
-            "fts_bounded_mixed_fallback_overlapping_coverage",
-            true,
-        ),
-        (
-            "overlap_full",
-            "fts_bounded_mixed_fallback_overlapping_coverage",
-            false,
-        ),
-    ] {
-        let mut dataset = write_cross_column_compound_dataset().await;
-        create_fragmented_fts_index(&mut dataset, "body", true).await;
-        if append_residual {
-            let appended = arrow_array::record_batch!(
-                ("title", Utf8, ["residual"]),
-                ("body", Utf8, ["noise"]),
-                ("id", Int32, [10])
-            )
-            .unwrap();
-            let schema = appended.schema();
-            dataset
-                .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
-                .await
-                .unwrap();
-        }
-        replace_index_segments_for_test(&mut dataset, "body_idx", |segments| match case_name {
-            "unknown" => segments[0].fragment_bitmap = None,
-            "overlap" | "overlap_full" => {
-                let overlapping_fragment =
-                    segments[0].fragment_bitmap.as_ref().unwrap().min().unwrap();
-                segments[1]
-                    .fragment_bitmap
-                    .as_mut()
-                    .unwrap()
-                    .insert(overlapping_fragment);
-            }
-            _ => unreachable!(),
-        })
-        .await;
-
-        let query: FtsQuery = MultiMatchQuery::try_new("noise".to_owned(), vec!["body".to_owned()])
-            .unwrap()
-            .into();
-        let plan = compound_fts_plan(&dataset, query.clone(), 2).await;
-        assert!(
-            plan.contains(expected_metric)
-                && plan.contains("FlatMatchQuery")
-                && plan.contains("AggregateExec"),
-            "{case_name} coverage must produce an executable target-flat fallback:\n{plan}"
-        );
-        let mut scan = dataset.scan();
-        scan.full_text_search(FullTextSearchQuery::new_query(query))
-            .unwrap()
-            .project(&["id"])
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap();
-        let batch = scan.try_into_batch().await.unwrap();
-        let expected_ids: &[i32] = if append_residual { &[6, 10] } else { &[6] };
-        assert_eq!(
-            batch["id"].as_primitive::<Int32Type>().values(),
-            expected_ids,
-            "{case_name} coverage fallback returned the wrong current rows"
-        );
-
-        if case_name == "unknown" {
-            let mut fuzzy =
-                MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
-            fuzzy.match_queries[0].fuzziness = Some(1);
-            let fuzzy_query: FtsQuery = fuzzy.into();
-            let mut fuzzy_scan = dataset.scan();
-            fuzzy_scan
-                .full_text_search(FullTextSearchQuery::new_query(fuzzy_query.clone()))
-                .unwrap()
-                .limit(Some(1), None)
-                .unwrap();
-            let fuzzy_plan = fuzzy_scan.explain_plan(false).await.unwrap();
-            assert!(
-                fuzzy_plan.contains("fts_bounded_mixed_fallback_unknown_coverage")
-                    && fuzzy_plan.contains("FlatMatchQuery"),
-                "unknown-coverage fuzzy query must use all-current prepared fallback: {fuzzy_plan}"
-            );
-
-            let target_fragment = dataset.fragments()[0].clone();
-            let mut scoped_scan = dataset.scan();
-            scoped_scan.with_fragments(vec![target_fragment]);
-            scoped_scan
-                .full_text_search(FullTextSearchQuery::new_query(fuzzy_query))
-                .unwrap()
-                .limit(Some(1), None)
-                .unwrap();
-            let scoped_plan = scoped_scan.explain_plan(false).await.unwrap();
-            assert!(
-                scoped_plan.contains("fts_bounded_mixed_fallback_unknown_coverage"),
-                "fragment-scoped unknown coverage must preserve its metric: {scoped_plan}"
-            );
-        }
-        if case_name == "overlap" {
-            let mut fuzzy =
-                MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
-            fuzzy.match_queries[0].fuzziness = Some(1);
-            let target_fragment = dataset.fragments().last().unwrap().clone();
-            let mut scoped_scan = dataset.scan();
-            scoped_scan.with_fragments(vec![target_fragment]);
-            scoped_scan
-                .full_text_search(FullTextSearchQuery::new_query(fuzzy.into()))
-                .unwrap()
-                .limit(Some(1), None)
-                .unwrap();
-            let scoped_plan = scoped_scan.explain_plan(false).await.unwrap();
-            assert!(
-                scoped_plan.contains("fts_bounded_mixed_fallback_overlapping_coverage"),
-                "non-target overlap must preserve its fallback metric: {scoped_plan}"
-            );
-        }
-    }
 }
 
 #[tokio::test]
@@ -3739,25 +3532,6 @@ async fn test_pure_should_maxscore_is_exact_across_fragments() {
     let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
     assert_eq!(limited, exhaustive[..2]);
 
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
-    let mut scanner = dataset.scan();
-    scanner
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
-        .with_row_id()
-        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
-        .unwrap();
-    scanner.limit(Some(2), None).unwrap();
-    scanner.try_into_batch().await.unwrap();
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
-        Some(&(4 * 5)),
-        "four index partitions should be searched once for each of five query leaves"
-    );
-
     let mut scanner = dataset.scan();
     scanner
         .with_row_id()
@@ -4121,23 +3895,15 @@ async fn test_fts_v1_remains_queryable_after_append_optimize() {
     assert_eq!(limited, exhaustive[..1]);
     let plan = compound_fts_plan(&dataset, legacy_partial_query, 1).await;
     assert!(
-        plan.contains("FlatMatchQuery")
-            && plan.contains("fts_bounded_mixed_fallback_legacy")
-            && plan.contains("AggregateExec")
-            && !plan.contains(BOUNDED_MIXED_FIELD_ROWS_METRIC),
+        plan.contains("FlatMatchQuery"),
         "V1 postings must retain the exhaustive mixed-field fallback:\n{plan}"
     );
     let missing_query: FtsQuery =
         MultiMatchQuery::try_new("missing".to_owned(), vec!["text".to_owned()])
             .unwrap()
             .into();
-    let (missing, stats) = compound_fts_results_with_stats(&dataset, missing_query, 1).await;
+    let missing = compound_fts_results(&dataset, missing_query, Some(1)).await;
     assert!(missing.is_empty());
-    assert_eq!(
-        stats.all_counts.get("fts_bounded_mixed_fallback_legacy"),
-        Some(&1),
-        "fallback metrics count planner invocations even when no rows are returned"
-    );
 
     let mut fuzzy = MultiMatchQuery::try_new("alphx".to_owned(), vec!["text".to_owned()]).unwrap();
     fuzzy.match_queries[0].fuzziness = Some(1);
@@ -4146,9 +3912,7 @@ async fn test_fts_v1_remains_queryable_after_append_optimize() {
     assert_eq!(fuzzy_results.len(), 2);
     let fuzzy_plan = compound_fts_plan(&dataset, fuzzy_query, 10).await;
     assert!(
-        fuzzy_plan.contains("fts_bounded_mixed_fallback_legacy")
-            && fuzzy_plan.contains("FlatMatchQuery")
-            && !fuzzy_plan.contains("CompoundFtsScorer"),
+        fuzzy_plan.contains("FlatMatchQuery") && !fuzzy_plan.contains("CompoundFtsScorer"),
         "V1 fuzzy queries must prepare from all current values: {fuzzy_plan}"
     );
 
