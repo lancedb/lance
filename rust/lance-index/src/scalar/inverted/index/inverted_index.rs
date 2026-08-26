@@ -272,6 +272,20 @@ impl InvertedIndex {
         self.partitions.len() == 1 && self.partitions[0].docs.legacy().is_some()
     }
 
+    /// Returns whether bounded WAND results can certify exact global top-k membership.
+    ///
+    /// The certificate requires a modern index whose every physical partition
+    /// contains impact metadata. Modern postings without impacts can prune with
+    /// partition-local scores before applying a corpus-wide scorer, so their
+    /// bounded candidate set cannot establish global exactness.
+    pub fn supports_wand_exactness_certificate(&self) -> bool {
+        !self.is_legacy()
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.has_impacts)
+    }
+
     /// Read only the index's [`InvertedIndexParams`],
     /// Contains more complete info than manifest's lossy `InvertedIndexDetails`.
     pub async fn load_params(store: &dyn IndexStore) -> Result<InvertedIndexParams> {

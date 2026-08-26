@@ -33,6 +33,7 @@ use lance_core::{
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -51,6 +52,9 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
     CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
     CROSS_COLUMN_STAGED_SUCCESSES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -62,12 +66,11 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
+    MemBM25Scorer, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
     compound_search_with_base_scorer, cross_column_compound_search,
     flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -541,6 +544,10 @@ pub struct CompoundQueryExec {
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Caller-supplied row-address mask, intersected into the prefilter so the
+    /// compound scorer ranks only surviving rows (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -593,6 +600,7 @@ impl CompoundQueryExec {
             prefilter_source,
             base_scorer: None,
             segment_selection,
+            external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -601,6 +609,12 @@ impl CompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
     }
 
     /// Override locally computed BM25 statistics with a corpus-wide scorer.
@@ -635,6 +649,52 @@ impl CompoundQueryExec {
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WandExactnessCertificate {
+    Exhaustive,
+    Strict,
+    Ambiguous,
+}
+
+/// Classify a globally merged k+1 Match WAND result.
+///
+/// Sorting before classification is essential: per-segment WAND output is not
+/// a final cross-segment ordering. A strict score gap after result k proves
+/// that score-only pruning could not have discarded a row-id tie at the final
+/// boundary. Ties wholly inside top-k remain safe because all members of their
+/// score group are present before the strict boundary.
+fn classify_wand_exactness_certificate(
+    documents: &mut [ScoredDoc],
+    limit: usize,
+) -> WandExactnessCertificate {
+    if limit == 0
+        || documents
+            .iter()
+            .any(|document| !document.score.0.is_finite())
+    {
+        return WandExactnessCertificate::Ambiguous;
+    }
+    documents.sort_unstable_by(|left, right| {
+        right
+            .score
+            .0
+            .total_cmp(&left.score.0)
+            .then_with(|| left.row_id.cmp(&right.row_id))
+    });
+    if documents.len() <= limit {
+        WandExactnessCertificate::Exhaustive
+    } else if documents[limit - 1]
+        .score
+        .0
+        .total_cmp(&documents[limit].score.0)
+        == Ordering::Greater
+    {
+        WandExactnessCertificate::Strict
+    } else {
+        WandExactnessCertificate::Ambiguous
     }
 }
 
@@ -712,6 +772,7 @@ impl ExecutionPlan for CompoundQueryExec {
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -730,6 +791,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -767,6 +829,7 @@ impl ExecutionPlan for CompoundQueryExec {
                 dataset,
                 &segments,
                 None,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -791,8 +854,57 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let (row_ids, scores) = match base_scorer {
-                Some(base_scorer) => {
+            let certificate_limit = match (&query, params.limit) {
+                (FtsQuery::Match(match_query), Some(limit))
+                    if limit > 0
+                        && params.wand_factor == 1.0
+                        && match_query.boost.is_finite()
+                        && match_query.boost > 0.0
+                        && base_scorer.is_none()
+                        && indices
+                            .iter()
+                            .all(|index| index.supports_wand_exactness_certificate()) =>
+                {
+                    limit
+                        .checked_add(1)
+                        .map(|wand_limit| (match_query.clone(), limit, wand_limit))
+                }
+                _ => None,
+            };
+            let (row_ids, scores) = if let Some((match_query, limit, wand_limit)) =
+                certificate_limit
+            {
+                let first_index = indices.first().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "FTS index for column {column} has no segments"
+                    ))
+                })?;
+                let mut tokenizer =
+                    tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
+                let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+                let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
+                    .with_phrase_slop(None)
+                    .with_limit(Some(wand_limit));
+                let scorer_start = std::time::Instant::now();
+                let base_scorer = Arc::new(
+                    build_global_bm25_scorer(
+                        &indices,
+                        &tokens,
+                        &wand_params,
+                        Some(metrics.as_ref()),
+                    )
+                    .await?,
+                );
+                metrics.record_scorer_build(scorer_start.elapsed());
+
+                // Zero-weight terms can match documents without contributing a
+                // positive score. A short score-only WAND result therefore does
+                // not prove exhaustion. Preserve exact membership semantics for
+                // those rare corpora without recording a certificate attempt.
+                if base_scorer.token_docs.keys().any(|token| {
+                    let weight = base_scorer.query_weight(token);
+                    !weight.is_finite() || weight <= 0.0
+                }) {
                     compound_search_with_base_scorer(
                         &indices,
                         &query,
@@ -802,9 +914,71 @@ impl ExecutionPlan for CompoundQueryExec {
                         base_scorer,
                     )
                     .await?
+                } else {
+                    metrics.record_wand_exactness_certificate_attempts(1);
+                    prefilter.wait_for_ready().await?;
+                    let mut documents = search_segments(
+                        &indices,
+                        Arc::new(tokens),
+                        Arc::new(wand_params),
+                        match_query.operator,
+                        prefilter.clone(),
+                        metrics.clone(),
+                        base_scorer.clone(),
+                    )
+                    .await?;
+                    documents.iter_mut().for_each(|document| {
+                        document.score.0 *= match_query.boost;
+                    });
+                    metrics.record_wand_exactness_certificate_candidates(documents.len());
+                    match classify_wand_exactness_certificate(&mut documents, limit) {
+                        WandExactnessCertificate::Exhaustive => {
+                            metrics.record_wand_exactness_certificate_exhaustive(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Strict => {
+                            metrics.record_wand_exactness_certificate_strict(1);
+                            documents.truncate(limit);
+                            documents
+                                .into_iter()
+                                .map(|document| (document.row_id, document.score.0))
+                                .unzip()
+                        }
+                        WandExactnessCertificate::Ambiguous => {
+                            metrics.record_wand_exactness_certificate_fallbacks(1);
+                            compound_search_with_base_scorer(
+                                &indices,
+                                &query,
+                                &params,
+                                prefilter,
+                                metrics.clone(),
+                                base_scorer,
+                            )
+                            .await?
+                        }
+                    }
                 }
-                None => {
-                    compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?
+            } else {
+                match base_scorer {
+                    Some(base_scorer) => {
+                        compound_search_with_base_scorer(
+                            &indices,
+                            &query,
+                            &params,
+                            prefilter,
+                            metrics.clone(),
+                            base_scorer,
+                        )
+                        .await?
+                    }
+                    None => {
+                        compound_search(&indices, &query, &params, prefilter, metrics.clone())
+                            .await?
+                    }
                 }
             };
             metrics.baseline_metrics.record_output(row_ids.len());
@@ -854,6 +1028,9 @@ pub struct CrossColumnCompoundQueryExec {
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
     columns: Arc<[CompoundColumnSelection]>,
+    /// Combined into the prefilter so only masked rows are scored (see
+    /// [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -930,6 +1107,7 @@ impl CrossColumnCompoundQueryExec {
             params,
             prefilter_source,
             columns: Arc::from(columns),
+            external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -938,6 +1116,12 @@ impl CrossColumnCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -1032,6 +1216,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             params: self.params.clone(),
             prefilter_source,
             columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -1053,6 +1238,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
+        let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1083,6 +1269,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 dataset.clone(),
                 &selected_segments,
                 None,
+                external_mask,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -1564,6 +1751,11 @@ pub struct FtsIndexMetrics {
     cross_column_staged_successes: Count,
     cross_column_staged_fallbacks: Count,
     cross_column_staged_candidates: Count,
+    wand_exactness_certificate_attempts: Count,
+    wand_exactness_certificate_strict: Count,
+    wand_exactness_certificate_exhaustive: Count,
+    wand_exactness_certificate_fallbacks: Count,
+    wand_exactness_certificate_candidates: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1609,6 +1801,16 @@ impl FtsIndexMetrics {
                 .new_count(CROSS_COLUMN_STAGED_FALLBACKS_METRIC, partition),
             cross_column_staged_candidates: metrics
                 .new_count(CROSS_COLUMN_STAGED_CANDIDATES_METRIC, partition),
+            wand_exactness_certificate_attempts: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, partition),
+            wand_exactness_certificate_strict: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, partition),
+            wand_exactness_certificate_exhaustive: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, partition),
+            wand_exactness_certificate_fallbacks: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, partition),
+            wand_exactness_certificate_candidates: metrics
+                .new_count(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1717,6 +1919,28 @@ impl MetricsCollector for FtsIndexMetrics {
     fn record_cross_column_staged_candidates(&self, num_candidates: usize) {
         self.cross_column_staged_candidates.add(num_candidates);
     }
+
+    fn record_wand_exactness_certificate_attempts(&self, num_attempts: usize) {
+        self.wand_exactness_certificate_attempts.add(num_attempts);
+    }
+
+    fn record_wand_exactness_certificate_strict(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_strict.add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_exhaustive(&self, num_certificates: usize) {
+        self.wand_exactness_certificate_exhaustive
+            .add(num_certificates);
+    }
+
+    fn record_wand_exactness_certificate_fallbacks(&self, num_fallbacks: usize) {
+        self.wand_exactness_certificate_fallbacks.add(num_fallbacks);
+    }
+
+    fn record_wand_exactness_certificate_candidates(&self, num_candidates: usize) {
+        self.wand_exactness_certificate_candidates
+            .add(num_candidates);
+    }
 }
 
 #[derive(Debug)]
@@ -1736,6 +1960,9 @@ pub struct MatchQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`Self::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -1821,6 +2048,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1883,6 +2111,7 @@ impl MatchQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1923,6 +2152,7 @@ impl MatchQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -1955,6 +2185,15 @@ impl MatchQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// Restrict BM25 scoring to rows selected by an external row-address mask.
+    /// The mask is combined (logical AND) with the prefilter built by
+    /// `build_prefilter`, so top-k is computed over masked rows only. No-op when
+    /// `mask` is `None`.
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -2037,6 +2276,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -2069,6 +2309,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -2093,6 +2334,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -2124,6 +2366,7 @@ impl ExecutionPlan for MatchQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -3053,6 +3296,9 @@ pub struct PhraseQueryExec {
     overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
+    /// Optional external row-address mask combined (logical AND) with the BM25
+    /// prefilter so only masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -3129,6 +3375,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3182,6 +3429,7 @@ impl PhraseQueryExec {
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
             overlay_block: None,
+            external_mask: None,
             document_granularity,
             schema,
             properties,
@@ -3227,6 +3475,7 @@ impl PhraseQueryExec {
             overlay_block: None,
             document_granularity,
             schema,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3246,6 +3495,12 @@ impl PhraseQueryExec {
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
     pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -3321,6 +3576,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 overlay_block: self.overlay_block.clone(),
                 document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -3351,6 +3607,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -3375,6 +3632,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
@@ -3406,6 +3664,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 ds,
                 &segments,
                 overlay_block,
+                external_mask,
             )?;
             let deleted_fragments =
                 indices
@@ -4019,6 +4278,7 @@ mod tests {
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+    use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery, collect_query_tokens, has_query_token,
@@ -4044,7 +4304,8 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, build_boolean_query_children, default_text_tokenizer, open_fts_segments,
+        PhraseQueryExec, WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -4100,6 +4361,74 @@ mod tests {
         assert_eq!(metrics.cross_column_staged_successes.value(), 1);
         assert_eq!(metrics.cross_column_staged_fallbacks.value(), 1);
         assert_eq!(metrics.cross_column_staged_candidates.value(), 17);
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_classification() {
+        let documents = |scores: &[f32]| {
+            scores
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(row_id, score)| ScoredDoc::new(row_id as u64, *score))
+                .collect::<Vec<_>>()
+        };
+
+        let mut exhaustive = documents(&[3.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut exhaustive, 3),
+            WandExactnessCertificate::Exhaustive
+        );
+
+        let mut strict = documents(&[4.0, 3.0, 3.0, 1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut strict, 3),
+            WandExactnessCertificate::Strict
+        );
+        assert_eq!(
+            strict
+                .iter()
+                .map(|document| document.row_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "ties wholly inside top-k must use row-id ordering without forcing fallback"
+        );
+
+        let mut ambiguous = documents(&[4.0, 3.0, 2.0, 2.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut ambiguous, 3),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut non_finite = documents(&[4.0, f32::INFINITY]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut non_finite, 1),
+            WandExactnessCertificate::Ambiguous
+        );
+
+        let mut zero_limit = documents(&[1.0]);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut zero_limit, 0),
+            WandExactnessCertificate::Ambiguous
+        );
+    }
+
+    #[test]
+    fn test_wand_exactness_certificate_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_wand_exactness_certificate_attempts(2);
+        metrics.record_wand_exactness_certificate_strict(3);
+        metrics.record_wand_exactness_certificate_exhaustive(5);
+        metrics.record_wand_exactness_certificate_fallbacks(7);
+        metrics.record_wand_exactness_certificate_candidates(11);
+
+        assert_eq!(metrics.wand_exactness_certificate_attempts.value(), 2);
+        assert_eq!(metrics.wand_exactness_certificate_strict.value(), 3);
+        assert_eq!(metrics.wand_exactness_certificate_exhaustive.value(), 5);
+        assert_eq!(metrics.wand_exactness_certificate_fallbacks.value(), 7);
+        assert_eq!(metrics.wand_exactness_certificate_candidates.value(), 11);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {
