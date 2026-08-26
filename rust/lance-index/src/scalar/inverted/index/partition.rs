@@ -2,6 +2,172 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use smallvec::SmallVec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PositionMatchSummary {
+    exact_scoring_required: bool,
+    every_position_matched: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) struct PostingLoadOptions {
+    force_global_scorer: bool,
+    read_policy: PostingReadPolicy,
+}
+
+impl PostingLoadOptions {
+    const fn read_ahead(force_global_scorer: bool) -> Self {
+        Self {
+            force_global_scorer,
+            read_policy: PostingReadPolicy::ReadAhead,
+        }
+    }
+
+    pub(in super::super) const fn cache_aware_exact(force_global_scorer: bool) -> Self {
+        Self {
+            force_global_scorer,
+            read_policy: PostingReadPolicy::CacheAwareExact,
+        }
+    }
+}
+
+fn summarize_position_matches(mut positions: SmallVec<[(u32, bool); 8]>) -> PositionMatchSummary {
+    positions.sort_unstable_by_key(|(position, _)| *position);
+
+    let mut exact_scoring_required = false;
+    let mut every_position_matched = true;
+    let mut group_start = 0;
+    while group_start < positions.len() {
+        let position = positions[group_start].0;
+        let mut group_end = group_start + 1;
+        let mut group_matched = positions[group_start].1;
+        while group_end < positions.len() && positions[group_end].0 == position {
+            exact_scoring_required = true;
+            group_matched |= positions[group_end].1;
+            group_end += 1;
+        }
+        every_position_matched &= group_matched;
+        group_start = group_end;
+    }
+
+    PositionMatchSummary {
+        exact_scoring_required,
+        every_position_matched,
+    }
+}
+
+fn token_dictionary_may_match(
+    dictionary: &TokenSet,
+    tokens: &Tokens,
+    operator: Operator,
+    is_phrase_query: bool,
+) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    if operator != Operator::And && !is_phrase_query {
+        return (0..tokens.len()).any(|index| dictionary.get(tokens.get_token(index)).is_some());
+    }
+
+    // Query positions are normally adjacent, but `Tokens::with_positions` is
+    // public and does not require that ordering. Keep the exact behavior
+    // without allocating two hash tables for every leaf in every partition.
+    let mut positions = SmallVec::<[(u32, bool); 8]>::new();
+    for index in 0..tokens.len() {
+        positions.push((
+            tokens.position(index),
+            dictionary.get(tokens.get_token(index)).is_some(),
+        ));
+    }
+    summarize_position_matches(positions).every_position_matched
+}
+
+fn posting_group_demand_counts(
+    inverted_list: &PostingListReader,
+    token_ids: &[(u32, String, u32)],
+) -> HashMap<(u32, u32), usize> {
+    let mut demanded_token_ids = token_ids
+        .iter()
+        .map(|(token_id, _, _)| *token_id)
+        .collect::<Vec<_>>();
+    demanded_token_ids.sort_unstable();
+    demanded_token_ids.dedup();
+
+    let mut counts = HashMap::new();
+    for token_id in demanded_token_ids {
+        if let Some(group) = inverted_list.group_range_for_token(token_id) {
+            *counts.entry(group).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn effective_posting_read_policy(
+    inverted_list: &PostingListReader,
+    requested_policy: PostingReadPolicy,
+    group_demand_counts: &HashMap<(u32, u32), usize>,
+    token_id: u32,
+) -> PostingReadPolicy {
+    if requested_policy == PostingReadPolicy::ReadAhead {
+        return PostingReadPolicy::ReadAhead;
+    }
+    let Some(group) = inverted_list.group_range_for_token(token_id) else {
+        return PostingReadPolicy::CacheAwareExact;
+    };
+    let demand_count = group_demand_counts.get(&group).copied();
+    debug_assert!(
+        demand_count.is_some(),
+        "posting group {group:?} must have a demand count for token {token_id}"
+    );
+    if demand_count == Some(1) {
+        PostingReadPolicy::CacheAwareExact
+    } else {
+        PostingReadPolicy::ReadAhead
+    }
+}
+
+/// Query-level inputs for a grouped-term score upper bound.
+///
+/// The exact grouped score multiplies and then sums every expansion term in a
+/// stable order. Computing the bound from the `f32` sum of query weights can
+/// round below that score, so retain the `f64` sum and widen once for the term
+/// multiplications plus the final `f32` additions.
+#[derive(Debug, Clone, Copy)]
+struct GroupedScoreUpperBound {
+    query_weight: f32,
+    exact_query_weight_sum: f64,
+    rounding_factor: f64,
+}
+
+impl GroupedScoreUpperBound {
+    fn new(query_weights: impl Iterator<Item = f32>) -> Self {
+        let mut query_weight = 0.0_f32;
+        let mut exact_query_weight_sum = 0.0_f64;
+        let mut num_terms = 0usize;
+        for weight in query_weights {
+            query_weight += weight;
+            exact_query_weight_sum += f64::from(weight);
+            num_terms += 1;
+        }
+        Self {
+            query_weight,
+            exact_query_weight_sum,
+            // Two extra stages cover each term's rounded BM25 evaluation and
+            // multiplication before the grouped f32 sum.
+            rounding_factor: score_sum_upper_bound_factor(num_terms.saturating_add(2)),
+        }
+    }
+
+    #[inline]
+    fn score(self, union_freq: u32, doc_length: u32, scorer: &MemBM25Scorer) -> f32 {
+        outward_f32_upper_bound(
+            self.exact_query_weight_sum
+                * f64::from(scorer.doc_weight(union_freq, doc_length))
+                * self.rounding_factor,
+        )
+    }
+}
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
@@ -80,6 +246,23 @@ impl InvertedPartition {
 
     fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
+    }
+
+    /// Return whether this partition's token dictionary can satisfy a query
+    /// leaf without reading any posting data.
+    ///
+    /// Fuzzy expansions and identifier subwords that belong to the same
+    /// original query position are alternatives. AND and phrase leaves need
+    /// at least one dictionary term for every original position; OR leaves
+    /// need any term. A `false` result is therefore an exact empty-source
+    /// proof, while `true` remains conservative until postings are loaded.
+    pub(in super::super) fn may_match_tokens(
+        &self,
+        tokens: &Tokens,
+        operator: Operator,
+        is_phrase_query: bool,
+    ) -> bool {
+        token_dictionary_may_match(&self.tokens, tokens, operator, is_phrase_query)
     }
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
@@ -162,7 +345,7 @@ impl InvertedPartition {
 
     #[inline]
     fn grouped_score_upper_bound(
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         union_freq: u32,
         doc_length: u32,
         scorer: &MemBM25Scorer,
@@ -170,7 +353,7 @@ impl InvertedPartition {
         // BM25's document weight is monotonic in frequency and every IDF is
         // non-negative. Scoring the summed frequency with the summed IDF is
         // therefore an upper bound on the sum of the individual term scores.
-        query_weight * scorer.doc_weight(union_freq, doc_length)
+        score_upper_bound.score(union_freq, doc_length, scorer)
     }
 
     fn grouped_block_max_scores(
@@ -178,7 +361,7 @@ impl InvertedPartition {
         frequencies: &[u32],
         block_size: usize,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Vec<f32> {
         doc_ids
@@ -190,7 +373,7 @@ impl InvertedPartition {
                     .zip(frequencies)
                     .map(|(doc_id, freq)| {
                         Self::grouped_score_upper_bound(
-                            query_weight,
+                            score_upper_bound,
                             *freq,
                             docs.scoring_num_tokens(*doc_id),
                             scorer,
@@ -204,7 +387,7 @@ impl InvertedPartition {
     fn union_plain_posting_lists(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let mut freqs_by_row_id = BTreeMap::new();
@@ -221,7 +404,7 @@ impl InvertedPartition {
         let mut max_score = 0.0_f32;
         for (row_id, freq) in freqs_by_row_id {
             max_score = max_score.max(Self::grouped_score_upper_bound(
-                query_weight,
+                score_upper_bound,
                 freq,
                 docs.num_tokens_by_row_id(row_id),
                 scorer,
@@ -240,7 +423,7 @@ impl InvertedPartition {
     fn union_plain_posting_lists_with_positions(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let mut positions_by_row_id = BTreeMap::<u64, Vec<u32>>::new();
@@ -272,7 +455,7 @@ impl InvertedPartition {
             positions.sort_unstable();
             let frequency = positions.len() as u32;
             max_score = max_score.max(Self::grouped_score_upper_bound(
-                query_weight,
+                score_upper_bound,
                 frequency,
                 docs.num_tokens_by_row_id(row_id),
                 scorer,
@@ -296,7 +479,7 @@ impl InvertedPartition {
     fn union_compressed_posting_lists(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let block_size = postings
@@ -343,7 +526,7 @@ impl InvertedPartition {
             &frequencies,
             block_size,
             docs,
-            query_weight,
+            score_upper_bound,
             scorer,
         );
         let batch = builder.to_batch(block_max_scores)?;
@@ -355,7 +538,7 @@ impl InvertedPartition {
     fn union_compressed_posting_lists_with_positions(
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let block_size = postings
@@ -407,7 +590,7 @@ impl InvertedPartition {
             &frequencies,
             block_size,
             docs,
-            query_weight,
+            score_upper_bound,
             scorer,
         );
         let batch = builder.to_batch(block_max_scores)?;
@@ -420,7 +603,7 @@ impl InvertedPartition {
         postings: Vec<PostingList>,
         docs: &LoadedDocLengths,
         with_positions: bool,
-        query_weight: f32,
+        score_upper_bound: GroupedScoreUpperBound,
         scorer: &MemBM25Scorer,
     ) -> Result<PostingList> {
         let has_plain = postings
@@ -433,18 +616,23 @@ impl InvertedPartition {
             (true, true) => Err(Error::index(
                 "cannot union mixed plain and compressed posting lists".to_owned(),
             )),
-            (true, false) if with_positions => {
-                Self::union_plain_posting_lists_with_positions(postings, docs, query_weight, scorer)
+            (true, false) if with_positions => Self::union_plain_posting_lists_with_positions(
+                postings,
+                docs,
+                score_upper_bound,
+                scorer,
+            ),
+            (true, false) => {
+                Self::union_plain_posting_lists(postings, docs, score_upper_bound, scorer)
             }
-            (true, false) => Self::union_plain_posting_lists(postings, docs, query_weight, scorer),
             (false, true) if with_positions => Self::union_compressed_posting_lists_with_positions(
                 postings,
                 docs,
-                query_weight,
+                score_upper_bound,
                 scorer,
             ),
             (false, true) => {
-                Self::union_compressed_posting_lists(postings, docs, query_weight, scorer)
+                Self::union_compressed_posting_lists(postings, docs, score_upper_bound, scorer)
             }
             (false, false) => Ok(PostingList::Plain(PlainPostingList::new(
                 ScalarBuffer::from(Vec::<u64>::new()),
@@ -463,7 +651,6 @@ impl InvertedPartition {
     // bounds must share corpus-level statistics before the global collector
     // can safely propagate its threshold. Old posting formats without impacts
     // fall back to a scorer-derived global upper bound in that mode.
-    #[instrument(level = "debug", skip_all)]
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -473,59 +660,96 @@ impl InvertedPartition {
         metrics: &dyn MetricsCollector,
         force_global_scorer: bool,
     ) -> Result<LoadedPostings> {
+        self.load_posting_lists_with_policy(
+            tokens,
+            params,
+            operator,
+            impact_scorer,
+            metrics,
+            PostingLoadOptions::read_ahead(force_global_scorer),
+        )
+        .await
+    }
+
+    #[instrument(name = "load_posting_lists", level = "debug", skip_all)]
+    pub(in super::super) async fn load_posting_lists_with_policy(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        impact_scorer: &MemBM25Scorer,
+        metrics: &dyn MetricsCollector,
+        options: PostingLoadOptions,
+    ) -> Result<LoadedPostings> {
+        let PostingLoadOptions {
+            force_global_scorer,
+            read_policy: requested_read_policy,
+        } = options;
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
-        let required_positions = (is_and_query || is_phrase_query).then(|| {
-            (0..tokens.len())
-                .map(|index| tokens.position(index))
-                .collect::<HashSet<_>>()
-        });
         // Fuzzy expansion already ran once at the index level (see
         // `InvertedIndex::bm25_search`) under the global `max_expansions`
         // budget. Positions identify alternatives that must share one posting
         // iterator, including code identifier subwords and fuzzy expansions.
-        let tokens = tokens.clone();
-        let token_positions = (0..tokens.len())
-            .map(|index| tokens.position(index))
-            .collect::<Vec<_>>();
-        let mut seen_positions = HashSet::with_capacity(token_positions.len());
-        let exact_scoring_required = token_positions
-            .iter()
-            .any(|position| !seen_positions.insert(*position));
         let mut token_ids = Vec::with_capacity(tokens.len());
-        let mut matched_positions = required_positions.as_ref().map(|_| HashSet::new());
-        for (index, token) in tokens.into_iter().enumerate() {
-            let token_id = self.map(&token);
+        let mut position_matches = SmallVec::<[(u32, bool); 8]>::new();
+        for index in 0..tokens.len() {
+            let token = tokens.get_token(index);
+            let position = tokens.position(index);
+            let token_id = self.map(token);
+            position_matches.push((position, token_id.is_some()));
             if let Some(token_id) = token_id {
-                let position = token_positions[index];
-                if let Some(matched_positions) = matched_positions.as_mut() {
-                    matched_positions.insert(position);
-                }
-                token_ids.push((token_id, token, position));
+                token_ids.push((token_id, token.to_owned(), position));
             }
         }
+        let position_summary = summarize_position_matches(position_matches);
+        let exact_scoring_required = position_summary.exact_scoring_required;
         if token_ids.is_empty() {
             return Ok(LoadedPostings::empty());
         }
-        if let Some(required_positions) = required_positions.as_ref()
-            && let Some(matched_positions) = matched_positions.as_ref()
-            && !required_positions.is_subset(matched_positions)
-        {
+        if (is_and_query || is_phrase_query) && !position_summary.every_position_matched {
             return Ok(LoadedPostings::empty());
         }
 
         token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
         token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
 
+        let group_demand_counts = if requested_read_policy == PostingReadPolicy::CacheAwareExact {
+            posting_group_demand_counts(self.inverted_list.as_ref(), &token_ids)
+        } else {
+            HashMap::new()
+        };
+
         let num_docs = self.docs.len();
         let loaded_postings = stream::iter(token_ids)
-            .map(|(token_id, token, position)| async move {
-                let posting = self
-                    .inverted_list
-                    .posting_list(token_id, is_phrase_query, metrics)
-                    .await?;
+            .map(|(token_id, token, position)| {
+                let read_policy = effective_posting_read_policy(
+                    self.inverted_list.as_ref(),
+                    requested_read_policy,
+                    &group_demand_counts,
+                    token_id,
+                );
+                async move {
+                    let posting = match read_policy {
+                        PostingReadPolicy::ReadAhead => {
+                            self.inverted_list
+                                .posting_list(token_id, is_phrase_query, metrics)
+                                .await?
+                        }
+                        PostingReadPolicy::CacheAwareExact => {
+                            self.inverted_list
+                                .posting_list_with_policy(
+                                    token_id,
+                                    is_phrase_query,
+                                    metrics,
+                                    read_policy,
+                                )
+                                .await?
+                        }
+                    };
 
-                Result::Ok((token_id, token, position, posting))
+                    Result::Ok((token_id, token, position, posting))
+                }
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
@@ -617,7 +841,9 @@ impl InvertedPartition {
                     })
                     .collect::<Vec<_>>();
                 let terms = Arc::<[GroupedTermScorer]>::from(terms);
-                let query_weight = terms.iter().map(GroupedTermScorer::query_weight).sum();
+                let score_upper_bound =
+                    GroupedScoreUpperBound::new(terms.iter().map(GroupedTermScorer::query_weight));
+                let query_weight = score_upper_bound.query_weight;
                 grouped_expansions.push(GroupedExpansionTerms {
                     position,
                     terms: terms.clone(),
@@ -633,7 +859,7 @@ impl InvertedPartition {
                     postings,
                     docs,
                     is_phrase_query,
-                    query_weight,
+                    score_upper_bound,
                     impact_scorer,
                 )?;
                 if posting.is_empty() && (is_and_query || is_phrase_query) {
@@ -775,6 +1001,14 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
+        Ok(self.into_builder_chunked(None, None).await?.0)
+    }
+
+    async fn into_builder_chunked(
+        self,
+        chunk_tokens_override: Option<usize>,
+        max_list_children_override: Option<u64>,
+    ) -> Result<(InnerBuilder, usize)> {
         let mut builder = InnerBuilder::new_with_posting_tail_codec_and_block_size(
             self.id,
             self.inverted_list.has_positions(),
@@ -788,16 +1022,256 @@ impl InvertedPartition {
         builder
             .posting_lists
             .reserve_exact(self.inverted_list.len());
-        for posting_list in self
+        let chunk_count = self
             .inverted_list
-            .read_all(self.inverted_list.has_positions())
-            .await?
-        {
-            let posting_list = posting_list?;
-            builder
-                .posting_lists
-                .push(posting_list.into_builder(&builder.docs));
+            .for_each_posting_list_chunked(
+                self.inverted_list.has_positions(),
+                chunk_tokens_override,
+                max_list_children_override,
+                |posting_list| {
+                    builder
+                        .posting_lists
+                        .push(posting_list.into_builder(&builder.docs));
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok((builder, chunk_count))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn into_builder_with_chunk_limits(
+        self,
+        chunk_tokens: usize,
+        max_list_children: u64,
+    ) -> Result<(InnerBuilder, usize)> {
+        self.into_builder_chunked(Some(chunk_tokens), Some(max_list_children))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::scalar::inverted::document_tokenizer::DocType;
+
+    fn dictionary(terms: &[&str]) -> TokenSet {
+        let mut dictionary = TokenSet::default();
+        for term in terms {
+            dictionary.add((*term).to_owned());
         }
-        Ok(builder)
+        dictionary
+    }
+
+    fn position_summary(entries: &[(u32, bool)]) -> PositionMatchSummary {
+        summarize_position_matches(entries.iter().copied().collect())
+    }
+
+    #[test]
+    fn position_summary_marks_or_duplicates_for_exact_scoring() {
+        let summary = position_summary(&[(0, true), (0, false), (1, false)]);
+
+        assert!(summary.exact_scoring_required);
+        assert!(!summary.every_position_matched);
+    }
+
+    #[test]
+    fn position_summary_requires_a_match_in_every_and_group() {
+        let complete = position_summary(&[(0, false), (0, true), (1, true)]);
+        let incomplete = position_summary(&[(0, true), (1, false), (1, false)]);
+
+        assert!(complete.exact_scoring_required);
+        assert!(complete.every_position_matched);
+        assert!(incomplete.exact_scoring_required);
+        assert!(!incomplete.every_position_matched);
+    }
+
+    #[test]
+    fn position_summary_groups_nonadjacent_positions() {
+        let summary = position_summary(&[(9, false), (1, true), (4, true), (9, true)]);
+
+        assert!(summary.exact_scoring_required);
+        assert!(summary.every_position_matched);
+    }
+
+    #[test]
+    fn position_summary_spills_past_eight_tokens_without_losing_exactness() {
+        let mut positions = SmallVec::<[(u32, bool); 8]>::new();
+        positions.extend((0..10).map(|position| (position, true)));
+        positions.push((3, false));
+        assert!(positions.spilled());
+
+        let summary = summarize_position_matches(positions);
+        assert!(summary.exact_scoring_required);
+        assert!(summary.every_position_matched);
+    }
+
+    #[test]
+    fn token_dictionary_or_needs_any_expansion() {
+        let tokens = Tokens::with_positions(
+            vec!["missing".to_owned(), "alpha".to_owned()],
+            vec![0, 1],
+            DocType::Text,
+        );
+
+        assert!(token_dictionary_may_match(
+            &dictionary(&["alpha"]),
+            &tokens,
+            Operator::Or,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &dictionary(&["other"]),
+            &tokens,
+            Operator::Or,
+            false,
+        ));
+    }
+
+    #[test]
+    fn token_dictionary_and_and_phrase_need_every_original_position() {
+        let expanded = Tokens::with_positions(
+            vec!["alpha".to_owned(), "alphi".to_owned(), "beta".to_owned()],
+            vec![0, 0, 1],
+            DocType::Text,
+        );
+        let complete = dictionary(&["alphi", "beta"]);
+        let missing_position = dictionary(&["alpha", "alphi"]);
+
+        assert!(token_dictionary_may_match(
+            &complete,
+            &expanded,
+            Operator::And,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &missing_position,
+            &expanded,
+            Operator::And,
+            false,
+        ));
+        assert!(!token_dictionary_may_match(
+            &missing_position,
+            &expanded,
+            Operator::Or,
+            true,
+        ));
+
+        let non_adjacent_positions = Tokens::with_positions(
+            vec!["beta".to_owned(), "alpha".to_owned(), "alphi".to_owned()],
+            vec![1, 0, 1],
+            DocType::Text,
+        );
+        assert!(token_dictionary_may_match(
+            &dictionary(&["alpha", "alphi"]),
+            &non_adjacent_positions,
+            Operator::And,
+            false,
+        ));
+    }
+
+    #[rstest]
+    #[case::plain(false)]
+    #[case::v3_compressed(true)]
+    fn grouped_union_bound_covers_exact_grouped_score(#[case] compressed: bool) {
+        let num_docs = 1_975_725usize;
+        let total_tokens = num_docs as u64 * u64::from(u32::MAX);
+        let token_names = ["t0", "t1"];
+        let token_docs = [1_970_713usize, 334_819];
+        let frequencies = [138_872u32, 794_767];
+        let doc_length = frequencies.into_iter().sum::<u32>();
+        let scorer = Arc::new(MemBM25Scorer::new(
+            total_tokens,
+            num_docs,
+            token_names
+                .into_iter()
+                .zip(token_docs)
+                .map(|(token, docs)| (token.to_owned(), docs))
+                .collect(),
+        ));
+        let query_weights = token_names.map(|token| scorer.query_weight(token));
+        let exact_score = query_weights.into_iter().zip(frequencies).fold(
+            0.0_f32,
+            |score, (query_weight, frequency)| {
+                score + query_weight * scorer.doc_weight(frequency, doc_length)
+            },
+        );
+        let query_weight = query_weights.into_iter().sum::<f32>();
+        let score_upper_bound = GroupedScoreUpperBound::new(query_weights.into_iter());
+        let union_frequency = frequencies.into_iter().sum::<u32>();
+        let naive_proxy_bound = query_weight * scorer.doc_weight(union_frequency, doc_length);
+        let term_postings = query_weights
+            .into_iter()
+            .zip(frequencies)
+            .map(|(query_weight, frequency)| {
+                let max_score = query_weight * scorer.doc_weight(frequency, doc_length);
+                if compressed {
+                    let mut builder =
+                        PostingListBuilder::new_with_block_size(false, MAX_POSTING_BLOCK_SIZE);
+                    builder.add(0, PositionRecorder::Count(frequency));
+                    let batch = builder.to_batch(vec![max_score]).unwrap();
+                    let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+                    let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+                    PostingList::from_batch(&batch, Some(max_score), Some(length)).unwrap()
+                } else {
+                    PostingList::Plain(PlainPostingList::new(
+                        ScalarBuffer::from(vec![0u64]),
+                        ScalarBuffer::from(vec![frequency as f32]),
+                        Some(max_score),
+                        None,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        let grouped_terms = term_postings
+            .iter()
+            .zip(query_weights)
+            .map(|(posting, query_weight)| GroupedTermScorer::new(query_weight, posting))
+            .collect::<Arc<[GroupedTermScorer]>>();
+        let mut documents = DocSet::default();
+        documents.append(0, doc_length);
+        let loaded_documents = LoadedDocLengths::Legacy(Arc::new(documents.clone()));
+        let union_posting = InvertedPartition::union_posting_lists(
+            term_postings,
+            &loaded_documents,
+            false,
+            score_upper_bound,
+            &scorer,
+        )
+        .unwrap();
+        let grouped_bound = union_posting.max_score().unwrap();
+
+        assert_eq!(exact_score.to_bits(), 0x407a_4aa8);
+        assert_eq!(naive_proxy_bound.to_bits(), 0x407a_4aa7);
+        assert!(grouped_bound >= exact_score);
+
+        let posting = PostingIterator::with_query_weight(
+            "group".to_owned(),
+            0,
+            0,
+            query_weight,
+            union_posting,
+            1,
+        )
+        .with_grouped_terms(grouped_terms);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![posting],
+            &documents,
+            scorer,
+            &params,
+            &metrics,
+        );
+        cursor.set_min_competitive_score(exact_score).unwrap();
+
+        assert_eq!(cursor.next().unwrap(), Some(0));
+        assert_eq!(
+            cursor.current_score().unwrap().to_bits(),
+            exact_score.to_bits()
+        );
     }
 }

@@ -375,27 +375,17 @@ impl U64Segment {
                 }
                 Some(range.start + i as u64 + lo as u64)
             }
-            Self::RangeWithBitmap { range, bitmap } => {
-                // Find the i-th set bit (a "select1") via byte-wise popcount.
-                // Bytes past `bitmap.len()` are zero-padded by construction
-                // (Bitmap::new_full), so popcount counts only valid positions.
-                let mut remaining = i;
-                for (byte_idx, &byte) in bitmap.data.iter().enumerate() {
-                    let ones = byte.count_ones() as usize;
-                    if remaining < ones {
-                        let mut b = byte;
-                        for _ in 0..remaining {
-                            b &= b - 1; // clear lowest set bit
-                        }
-                        let bit = b.trailing_zeros() as usize;
-                        return Some(range.start + (byte_idx * 8 + bit) as u64);
-                    }
-                    remaining -= ones;
-                }
-                None
-            }
+            Self::RangeWithBitmap { .. } => self.cursor().get(i),
             Self::SortedArray(array) => array.get(i),
             Self::Array(array) => array.get(i),
+        }
+    }
+
+    /// Reads values at non-decreasing indices in one pass.
+    pub fn cursor(&self) -> SegmentCursor<'_> {
+        SegmentCursor {
+            segment: self,
+            state: SegmentCursorState::default(),
         }
     }
 
@@ -653,6 +643,117 @@ impl U64Segment {
             Some(val)
         });
         *self = Self::from_stats_and_sequence(stats, sequence)
+    }
+}
+
+/// Segment reader that keeps its scan position across calls.
+pub struct SegmentCursor<'a> {
+    segment: &'a U64Segment,
+    state: SegmentCursorState,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SegmentCursorState {
+    /// Byte the next select1 scan resumes at.
+    byte_idx: usize,
+    /// Set bits in `bitmap.data[..byte_idx]`.
+    ones_before: usize,
+}
+
+impl SegmentCursor<'_> {
+    /// The value at index `i`. A decreasing index rewinds the scan.
+    pub fn get(&mut self, i: usize) -> Option<u64> {
+        self.state.get(self.segment, i)
+    }
+}
+
+impl SegmentCursorState {
+    /// Append a contiguous range of values while preserving the bitmap scan
+    /// position for the next call.
+    pub(crate) fn extend_range(
+        &mut self,
+        segment: &U64Segment,
+        selection: Range<usize>,
+        values: &mut Vec<u64>,
+    ) {
+        let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+            match segment {
+                U64Segment::Range(range) => {
+                    let segment_len = (range.end - range.start) as usize;
+                    let end = selection.end.min(segment_len);
+                    if selection.start < end {
+                        values.extend(
+                            (range.start + selection.start as u64)..(range.start + end as u64),
+                        );
+                    }
+                }
+                _ => values.extend(selection.filter_map(|index| segment.get(index))),
+            }
+            return;
+        };
+
+        if selection.start < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+        while let Some(&byte) = bitmap.data.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            let ones_after_byte = self.ones_before + ones;
+            if selection.start >= ones_after_byte {
+                self.ones_before = ones_after_byte;
+                self.byte_idx += 1;
+                continue;
+            }
+
+            let mut remaining_bits = byte;
+            let mut rank = self.ones_before;
+            while remaining_bits != 0 {
+                if rank >= selection.end {
+                    return;
+                }
+                let bit = remaining_bits.trailing_zeros() as usize;
+                if rank >= selection.start {
+                    values.push(range.start + (self.byte_idx * 8 + bit) as u64);
+                }
+                remaining_bits &= remaining_bits - 1;
+                rank += 1;
+            }
+
+            self.ones_before = ones_after_byte;
+            self.byte_idx += 1;
+            if self.ones_before >= selection.end {
+                return;
+            }
+        }
+    }
+
+    /// The value at index `i`. A decreasing index rewinds the scan.
+    pub(crate) fn get(&mut self, segment: &U64Segment, i: usize) -> Option<u64> {
+        let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+            return segment.get(i);
+        };
+        if i < self.ones_before {
+            self.byte_idx = 0;
+            self.ones_before = 0;
+        }
+        // Deserialization rejects a bitmap whose padding bits are set, so
+        // popcount counts only valid positions.
+        let mut remaining = i - self.ones_before;
+        while let Some(&byte) = bitmap.data.get(self.byte_idx) {
+            let ones = byte.count_ones() as usize;
+            if remaining < ones {
+                let mut b = byte;
+                for _ in 0..remaining {
+                    b &= b - 1; // clear lowest set bit
+                }
+                let bit = b.trailing_zeros() as usize;
+                return Some(range.start + (self.byte_idx * 8 + bit) as u64);
+            }
+            remaining -= ones;
+            self.ones_before += ones;
+            self.byte_idx += 1;
+        }
+        None
     }
 }
 

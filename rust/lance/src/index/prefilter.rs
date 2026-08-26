@@ -561,6 +561,7 @@ mod test {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: Vec::new(),
+            covering_fields: vec![],
             name: "legacy".to_string(),
             dataset_version: dataset.manifest.version,
             fragment_bitmap: None,

@@ -5,13 +5,13 @@
 //! the corresponding IVF partitions.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::{
@@ -336,6 +336,15 @@ pub fn create_ivf_shuffler(
     }
 }
 
+/// Schema of the partition-offsets sidecar written alongside shuffled data.
+static OFFSETS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        "offset",
+        DataType::UInt64,
+        false,
+    )]))
+});
+
 const DEFAULT_SHUFFLE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 
 /// Number of rows per output batch when streaming sorted data via interleave.
@@ -463,11 +472,7 @@ impl Shuffler for TwoFileShuffler {
         let num_partitions = self.num_partitions;
         // No need to write partition ids since we can infer this from offsets
         let schema = data.schema().without_column(PART_ID_COLUMN);
-        let offsets_schema = Arc::new(Schema::new(vec![Field::new(
-            "offset",
-            DataType::UInt64,
-            false,
-        )]));
+        let offsets_schema = OFFSETS_SCHEMA.clone();
         let batch_size_bytes = self.batch_size_bytes;
 
         // Create data file writer
@@ -907,6 +912,32 @@ mod tests {
 
         // Out of range partition returns None
         assert!(reader.read_partition(3).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_empty_first_batch() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let empty_batch = make_batch(&[], &[], None);
+        let data_batch = make_batch(&[1, 0, 1], &[10, 20, 30], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 2);
+        let stream = batches_to_stream(vec![empty_batch, data_batch]);
+        let reader = shuffler.shuffle(stream).await.unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 1);
+        assert_eq!(reader.partition_size(1).unwrap(), 2);
+
+        let expected_schema = ArrowSchema::new(vec![Field::new("val", DataType::Int32, false)]);
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        assert_eq!(p0.schema().as_ref(), &expected_schema);
+        let p0_values: &Int32Array = p0["val"].as_primitive();
+        assert_eq!(p0_values.values(), &[20]);
+
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        assert_eq!(p1.schema().as_ref(), &expected_schema);
+        let p1_values: &Int32Array = p1["val"].as_primitive();
+        assert_eq!(p1_values.values(), &[10, 30]);
     }
 
     #[tokio::test]
