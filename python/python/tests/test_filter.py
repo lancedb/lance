@@ -17,12 +17,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance.dataset import (
-    _SQL_OPERATORS,
-    _SQL_RENAMES,
+    _FILTER_DOCS,
+    _SQL_EQUIVALENT,
     _sql_equivalent,
     _substrait_serialization_error,
 )
-from lance.lance import sql_scalar_function_names
 from lance.vector import vec_to_table
 
 
@@ -377,51 +376,104 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
     assert result["id"].to_pylist() == [1]
 
 
+# Multibyte, mixed case and padded rows, so a mapping that only looks
+# equivalent (ascii_* against non-ASCII, byte length against character length)
+# selects a different set here rather than passing unnoticed.
+_EQUIVALENCE_ROWS = ["Abc", "abc", "É", "é", "ab", "  ab  "]
+
+# One case per _SQL_EQUIVALENT entry: the pyarrow expression, and the Lance SQL
+# the hint points at written against column "str".
+_EQUIVALENCE_CASES = {
+    "starts_with": (pc.starts_with(pc.field("str"), "ab"), "starts_with(str, 'ab')"),
+    "ends_with": (pc.ends_with(pc.field("str"), "bc"), "ends_with(str, 'bc')"),
+    "match_substring": (pc.match_substring(pc.field("str"), "b"), "contains(str, 'b')"),
+    "match_substring_regex": (
+        pc.match_substring_regex(pc.field("str"), "a.c"),
+        "regexp_like(str, 'a.c')",
+    ),
+    "match_like": (pc.match_like(pc.field("str"), "ab%"), "str LIKE 'ab%'"),
+    "replace_substring": (
+        pc.replace_substring(pc.field("str"), "b", "X") == "aX",
+        "replace(str, 'b', 'X') = 'aX'",
+    ),
+    "replace_substring_regex": (
+        pc.replace_substring_regex(pc.field("str"), "b+", "X") == "aX",
+        "regexp_replace(str, 'b+', 'X') = 'aX'",
+    ),
+    "utf8_lower": (pc.utf8_lower(pc.field("str")) == "é", "lower(str) = 'é'"),
+    "utf8_upper": (pc.utf8_upper(pc.field("str")) == "É", "upper(str) = 'É'"),
+    "utf8_length": (pc.utf8_length(pc.field("str")) == 1, "length(str) = 1"),
+    "utf8_reverse": (pc.utf8_reverse(pc.field("str")) == "cba", "reverse(str) = 'cba'"),
+    "binary_length": (
+        pc.binary_length(pc.field("str")) == 2,
+        "octet_length(str) = 2",
+    ),
+}
+
+
+@pytest.mark.parametrize("function", sorted(_EQUIVALENCE_CASES))
+def test_sql_equivalent_selects_the_same_rows(tmp_path, function):
+    """The hinted SQL must select what the pyarrow expression would.
+
+    A hint that quietly selects different rows is worse than no hint, and the
+    names alone do not establish that: Arrow's binary_length counts bytes where
+    SQL length counts characters, and its ascii_* kernels leave non-ASCII
+    untouched where SQL lower and upper fold it.
+    """
+    assert _SQL_EQUIVALENT.keys() == _EQUIVALENCE_CASES.keys(), (
+        "every mapping offered to users needs a case proving it equivalent"
+    )
+
+    expression, sql = _EQUIVALENCE_CASES[function]
+    table = pa.table({"str": _EQUIVALENCE_ROWS})
+    ds = lance.write_dataset(table, tmp_path)
+
+    expected = table.filter(expression)["str"].to_pylist()
+    assert ds.to_table(filter=sql)["str"].to_pylist() == expected
+    # A case that cannot tell the mapping apart from a wrong one proves nothing.
+    assert 0 < len(expected) < len(_EQUIVALENCE_ROWS)
+
+
 @pytest.mark.parametrize(
-    ("expression", "function", "hint", "sql"),
+    ("expression", "function", "hint"),
     [
-        # One case per rule _sql_equivalent resolves by, rather than per
-        # function: the mapping is derived, so the rules are what can break.
         pytest.param(
             pc.starts_with(pc.field("str"), "ab"),
             "starts_with",
-            "starts_with(...)",
-            "starts_with(str, 'ab')",
-            id="same_name",
+            "starts_with(column, 'prefix')",
+            id="mapped",
         ),
         pytest.param(
-            pc.utf8_lower(pc.field("str")) == "abc",
-            "utf8_lower",
-            "lower(...)",
-            "lower(str) = 'abc'",
-            id="kernel_prefix",
-        ),
-        pytest.param(
-            pc.match_substring(pc.field("str"), "b"),
-            "match_substring",
-            "contains(...)",
-            "contains(str, 'b')",
-            id="renamed",
-        ),
-        pytest.param(
-            pc.match_like(pc.field("str"), "ab%"),
+            pc.match_like(pc.field("str"), "ab%", ignore_case=True),
             "match_like",
-            "column LIKE 'pattern'",
-            "str LIKE 'ab%'",
-            id="operator",
+            "column ILIKE 'pattern'",
+            id="ignore_case_mapped",
+        ),
+        pytest.param(
+            pc.starts_with(pc.field("str"), "ab", ignore_case=True),
+            "starts_with",
+            _FILTER_DOCS,
+            id="ignore_case_unmapped",
+        ),
+        pytest.param(
+            pc.utf8_split_whitespace(pc.field("str")).is_valid(),
+            "utf8_split_whitespace",
+            _FILTER_DOCS,
+            id="unmapped",
         ),
     ],
 )
 def test_filter_expression_without_substrait_mapping(
-    tmp_path, expression, function, hint, sql
+    tmp_path, expression, function, hint
 ):
     """PyArrow has no Substrait mapping for these string functions.
 
     Lance consumes pyarrow expressions through Substrait, so such a filter
     cannot be applied; the error should name the function and how Lance SQL
-    writes it rather than surface Arrow's internal failure.
+    writes it, falling back to the documentation when Lance SQL has no form
+    that selects the same rows.
     """
-    ds = lance.write_dataset(pa.table({"str": ["abc", "xyz"]}), tmp_path)
+    ds = lance.write_dataset(pa.table({"str": _EQUIVALENCE_ROWS}), tmp_path)
 
     # ArrowNotImplementedError (a NotImplementedError subclass) is what the
     # unimproved path already raised; only the message changes.
@@ -431,31 +483,24 @@ def test_filter_expression_without_substrait_mapping(
     assert function in message
     assert hint in message
 
-    # The SQL form the error points at expresses the same predicate.
-    assert ds.to_table(filter=sql)["str"].to_pylist() == ["abc"]
 
+def test_ignore_case_withholds_a_case_sensitive_hint():
+    """ignore_case is not attributable to one call in a compound expression.
 
-def test_sql_renames_are_registered_functions():
-    """The rename table holds names Lance SQL is expected to still have.
-
-    Everything else _sql_equivalent suggests is read from the registry, so a
-    rename here is the only way it can suggest a function that does not exist.
+    Arrow reports the unsupported function by name only, so an option seen
+    anywhere withholds every mapping lacking a case-insensitive form.
     """
-    missing = sorted(set(_SQL_RENAMES.values()) - set(sql_scalar_function_names()))
-    assert missing == []
+    sensitive = str(pc.starts_with(pc.field("str"), "ab"))
+    assert _sql_equivalent("starts_with", sensitive) == _SQL_EQUIVALENT["starts_with"]
 
-
-def test_sql_operators_are_valid_filters(tmp_path):
-    """The operator table gives syntax in full, so it needs a syntax check."""
-    ds = lance.write_dataset(pa.table({"str": ["abc", "xyz"]}), tmp_path)
-    for syntax in _SQL_OPERATORS.values():
-        filter = syntax.replace("column", "str").replace("pattern", "ab%")
-        assert ds.to_table(filter=filter)["str"].to_pylist() == ["abc"]
+    insensitive = str(pc.starts_with(pc.field("str"), "ab", ignore_case=True))
+    assert _sql_equivalent("starts_with", insensitive) is None
+    assert _sql_equivalent("match_like", insensitive) == "column ILIKE 'pattern'"
 
 
 def test_filter_expression_with_no_sql_equivalent():
     """A function Lance SQL cannot express falls back to pointing at the docs."""
-    assert _sql_equivalent("no_such_arrow_function") is None
+    assert _sql_equivalent("no_such_arrow_function", "") is None
 
     err = pa.ArrowNotImplementedError(
         "No conversion function exists to convert the Arrow function"
@@ -463,7 +508,7 @@ def test_filter_expression_with_no_sql_equivalent():
     )
     message = str(_substrait_serialization_error(pc.field("str").is_valid(), err))
     assert "no_such_arrow_function" in message
-    assert "https://lance.org/guide/read_and_write/#filter-push-down" in message
+    assert _FILTER_DOCS in message
 
 
 @pytest.mark.skip(

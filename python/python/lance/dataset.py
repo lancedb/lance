@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import functools
 import json
 import operator
 import os
@@ -73,7 +72,6 @@ from .lance import (
     _serialize_row_addrs,
     _write_dataset,
     indices,
-    sql_scalar_function_names,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
@@ -6503,57 +6501,51 @@ _SUBSTRAIT_UNSUPPORTED_FUNCTION = re.compile(
 
 _FILTER_DOCS = "https://lance.org/guide/read_and_write/#filter-push-down"
 
-# Arrow names a kernel after the type it operates on where Lance SQL, which
-# dispatches on the argument, does not: ``utf8_lower`` is ``lower``,
-# ``binary_length`` is ``length``.
-_ARROW_KERNEL_PREFIXES = ("utf8_", "ascii_", "binary_")
+# PyArrow renders an expression's options inline, e.g.
+# ``match_like(s, {pattern="ab%", ignore_case=true})``.
+_IGNORE_CASE = re.compile(r"ignore_case=true")
 
-# Arrow compute functions Lance SQL spells under an unrelated name.  Only such
-# genuine renames belong here: a function Lance SQL names as Arrow does, or one
-# that differs only by a kernel prefix, resolves against the registry below.
-_SQL_RENAMES = {
-    "match_substring": "contains",
-    "match_substring_regex": "regexp_like",
-    "replace_substring": "replace",
-    "replace_substring_regex": "regexp_replace",
-}
-
-# Arrow compute functions Lance SQL writes as an operator rather than a call,
-# so there is no registry entry to resolve and the syntax is given in full.
-_SQL_OPERATORS = {
+# Arrow compute function -> Lance SQL that selects the same rows.  Proven by
+# test_sql_equivalent_selects_the_same_rows, which every entry must have a case
+# in: a name that merely looks equivalent is not enough, since Arrow's ascii_*
+# kernels leave non-ASCII untouched where SQL lower/upper fold it, and
+# binary_length counts bytes where SQL length counts characters.
+_SQL_EQUIVALENT = {
+    "starts_with": "starts_with(column, 'prefix')",
+    "ends_with": "ends_with(column, 'suffix')",
+    "match_substring": "contains(column, 'substring')",
+    "match_substring_regex": "regexp_like(column, 'pattern')",
     "match_like": "column LIKE 'pattern'",
+    "replace_substring": "replace(column, 'from', 'to')",
+    "replace_substring_regex": "regexp_replace(column, 'pattern', 'to')",
+    "utf8_lower": "lower(column)",
+    "utf8_upper": "upper(column)",
+    "utf8_length": "length(column)",
+    "utf8_reverse": "reverse(column)",
+    "binary_length": "octet_length(column)",
+}
+
+# The same, for an expression that sets Arrow's ignore_case option.  Most of
+# the kernels above have no case-insensitive Lance SQL counterpart, so their
+# absence here is what withholds a hint that would select different rows.
+_SQL_EQUIVALENT_IGNORE_CASE = {
+    "match_like": "column ILIKE 'pattern'",
 }
 
 
-@functools.lru_cache(maxsize=1)
-def _sql_scalar_functions() -> frozenset:
-    """The scalar functions a Lance SQL filter can call, from the Rust registry."""
-    return frozenset(sql_scalar_function_names())
+def _sql_equivalent(function: str, expression: str) -> Optional[str]:
+    """Return Lance SQL selecting the same rows as *function*, or None.
 
-
-def _sql_equivalent(function: str) -> Optional[str]:
-    """Return how Lance SQL writes an Arrow compute function, or None.
-
-    Resolved against the function registry rather than a table of known pairs,
-    so a function Lance gains, or one PyArrow adds a Substrait mapping for, does
-    not leave a hardcoded list to fall out of date.
+    Only a mapping whose full semantics follow from the expression is offered;
+    a hint that quietly selects different rows is worse than no hint.  Arrow
+    renders options per call but the failing function is reported by name
+    alone, so ``ignore_case`` anywhere in a compound expression withholds every
+    mapping that has no case-insensitive form, rather than risk attributing the
+    option to the wrong call.
     """
-    operator = _SQL_OPERATORS.get(function)
-    if operator is not None:
-        return operator
-
-    candidates = [_SQL_RENAMES.get(function, function)]
-    candidates.extend(
-        function[len(prefix) :]
-        for prefix in _ARROW_KERNEL_PREFIXES
-        if function.startswith(prefix)
-    )
-
-    registered = _sql_scalar_functions()
-    for candidate in candidates:
-        if candidate in registered:
-            return f"{candidate}(...)"
-    return None
+    if _IGNORE_CASE.search(expression):
+        return _SQL_EQUIVALENT_IGNORE_CASE.get(function)
+    return _SQL_EQUIVALENT.get(function)
 
 
 def _substrait_serialization_error(
@@ -6567,6 +6559,7 @@ def _substrait_serialization_error(
     string form instead of surfacing the Arrow internals error.  The exception
     type is preserved so existing handlers keep working.
     """
+    expression = str(filter)
     match = _SUBSTRAIT_UNSUPPORTED_FUNCTION.search(str(err))
     function = match.group(1) if match else None
     if function is None:
@@ -6576,7 +6569,7 @@ def _substrait_serialization_error(
         detail = (
             f"PyArrow cannot serialize the compute function '{function}' to Substrait"
         )
-        equivalent = _sql_equivalent(function)
+        equivalent = _sql_equivalent(function, expression)
     hint = "Pass the filter as a Lance SQL string instead"
     hint += (
         f", where this is written `{equivalent}`."
@@ -6584,7 +6577,7 @@ def _substrait_serialization_error(
         else f"; see {_FILTER_DOCS} for the supported syntax."
     )
     return pa.ArrowNotImplementedError(
-        f"Cannot apply the filter expression `{filter}`: {detail}, which is"
+        f"Cannot apply the filter expression `{expression}`: {detail}, which is"
         f" how Lance consumes PyArrow expressions. {hint}"
     )
 
