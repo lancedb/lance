@@ -315,6 +315,7 @@ mod tests {
 
     fn assert_split_miniblock_layout(
         pages: &[crate::encoder::EncodedPage],
+        min_miniblock_pages: usize,
         expect_structural_only_page: bool,
     ) {
         let mut miniblock_pages = 0;
@@ -345,19 +346,18 @@ mod tests {
         }
 
         assert!(
-            miniblock_pages > 0,
-            "expected leaf values to remain on mini-block pages"
+            miniblock_pages >= min_miniblock_pages,
+            "expected at least {min_miniblock_pages} mini-block pages, got {miniblock_pages}"
         );
         assert_eq!(
             fullzip_pages, 0,
             "split list pages should not fall back to full-zip"
         );
-        if expect_structural_only_page {
-            assert!(
-                structural_only_pages > 0,
-                "expected at least one structural-only page"
-            );
-        }
+        assert_eq!(
+            structural_only_pages > 0,
+            expect_structural_only_page,
+            "structural-only page presence did not match expectation; got {structural_only_pages}"
+        );
     }
 
     fn assert_has_fullzip_layout(pages: &[crate::encoder::EncodedPage]) {
@@ -1156,20 +1156,20 @@ mod tests {
         // Redacted reproduction from a production schema shape containing ARRAY(BOOLEAN).
         // The field names are not relevant; the failure requires sparse list structure
         // with a 1-bit Boolean leaf value.
-        let num_rows = 200_000usize;
-        let num_non_empty = 10usize;
+        let levels_per_chunk =
+            crate::encodings::logical::primitive::miniblock::max_repdef_levels_per_chunk(2);
+        // One row past the chunk limit forces a split. Keeping values at both ends ensures
+        // both sides of that split remain mini-block pages instead of structural-only pages.
+        let num_rows = (levels_per_chunk + 1) as usize;
         let booleans_per_list = 8usize;
-        let step = num_rows / num_non_empty;
 
         let mut offsets = Vec::with_capacity(num_rows + 1);
-        let mut values = Vec::with_capacity(num_non_empty * booleans_per_list);
+        let mut values = Vec::with_capacity(2 * booleans_per_list);
         offsets.push(0i32);
 
-        let mut next_non_empty = step / 2;
         for row in 0..num_rows {
-            if row == next_non_empty {
+            if row == 0 || row == num_rows - 1 {
                 values.extend((0..booleans_per_list).map(|idx| idx % 2 == 0));
-                next_non_empty += step;
             }
             offsets.push(values.len() as i32);
         }
@@ -1184,12 +1184,13 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_range(0..1000)
-            .with_range(0..num_rows as u64)
-            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
-            .with_dense_encodings();
+            .with_indices(vec![0, levels_per_chunk / 2, num_rows as u64 - 1])
+            .with_batch_size(64 * 1024)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, false);
+        assert_split_miniblock_layout(&pages, 2, false);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1225,7 +1226,7 @@ mod tests {
             .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1262,7 +1263,7 @@ mod tests {
             .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1293,7 +1294,7 @@ mod tests {
             .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1414,7 +1415,7 @@ mod tests {
             .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1441,7 +1442,7 @@ mod tests {
         let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
             .await
             .unwrap();
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
     }
 }

@@ -121,6 +121,9 @@ impl BlockingDataset {
                 ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
                     .await
                     .map_err(|e| Error::io_error(e.to_string()))?;
+            lance::dataset::validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| Error::input_error(e.to_string()))?;
             object_store
                 .remove_dir_all(path)
                 .await
@@ -3332,6 +3335,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let excluded_fragment_ids = env
+        .call_method(
+            &java_options,
+            "getExcludedFragmentIds",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3348,6 +3359,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         config,
     )
 }
