@@ -5833,6 +5833,89 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
     dataset
 }
 
+/// Regression test for https://github.com/lance-format/lance/issues/8806.
+#[tokio::test]
+async fn test_json_btree_declines_untyped_json_extract() {
+    let initial = json_batch(vec![
+        r#"{"kind": "click", "n": 3}"#,
+        r#"{"kind": "view", "n": 7}"#,
+        r#"{"kind": "click", "n": 9}"#,
+    ]);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let appended = json_batch(vec![
+        r#"{"kind": "scroll", "n": 12}"#,
+        r#"{"kind": "click", "n": 100}"#,
+    ]);
+    let appended_schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], appended_schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for (path, name) in [("$.kind", "json_kind_idx"), ("$.n", "json_n_idx")] {
+        let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+            "target_index_type": "btree",
+            "path": path,
+        }));
+        dataset
+            .create_index(
+                &["json"],
+                IndexType::Scalar,
+                Some(name.to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    for (predicate, expected_rows) in [
+        (r#"json_extract(json, '$.kind') = '"click"'"#, 3),
+        (r#"json_extract(json, '$.kind') >= '"s"'"#, 2),
+        ("json_extract(json, '$.n') = '9'", 1),
+        ("json_extract(json, '$.n') > '5'", 2),
+    ] {
+        let indexed = dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let mut indexed_values = indexed["json"]
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        indexed_values.sort_unstable();
+        let mut baseline_values = baseline["json"]
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        baseline_values.sort_unstable();
+
+        assert_eq!(baseline.num_rows(), expected_rows, "predicate={predicate}");
+        assert_eq!(indexed.num_rows(), expected_rows, "predicate={predicate}");
+        assert_eq!(indexed_values, baseline_values, "predicate={predicate}");
+    }
+}
+
 #[tokio::test]
 async fn test_json_btree_index_statistics() {
     let dataset = json_btree_dataset(vec![

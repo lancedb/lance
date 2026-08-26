@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, 'name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -2093,7 +2093,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, 'name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
@@ -2986,7 +2986,7 @@ mod tests {
                 ColInfo::new(
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
-                        "$.name".to_string(),
+                        "name".to_string(),
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -2999,13 +2999,13 @@ mod tests {
 
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, 'name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.name".to_string(),
+                "name".to_string(),
             ),
         );
 
@@ -4156,15 +4156,15 @@ mod tests {
         assert_eq!(round_tripped_frags, fragments_covered);
     }
 
-    /// Regression test: when two JSON indices target different paths on the same
-    /// column, a query against one path must be routed to its own index instead
+    /// Regression test: when two JSON indices target different keys on the same
+    /// column, a query against one key must be routed to its own index instead
     /// of being intercepted by whichever parser was registered first.
     #[test]
-    fn test_multi_json_indices_route_by_path() {
+    fn test_multi_json_indices_route_by_key() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // key "a" and one for key "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
-            "$.a".to_string(),
+            "a".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4172,7 +4172,7 @@ mod tests {
             )),
         )));
         multi.add(Box::new(JsonQueryParser::new(
-            "$.b".to_string(),
+            "b".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
                 "Json".to_string(),
@@ -4194,12 +4194,12 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.b".to_string(),
+                "b".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, 'b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4213,18 +4213,18 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.a".to_string(),
+                "a".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, 'a') = 'foo'",
             Some(expected_a),
             false,
         );
 
-        // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        // Query against an unindexed key must not bind to either index.
+        check_no_index(&index_info, "json_get_string(json, 'c') = 'foo'");
     }
 
     #[test]

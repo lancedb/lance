@@ -401,9 +401,10 @@ impl ScalarQueryParser for JsonQueryParser {
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                // Support multiple JSON extraction functions
+                // `json_extract` returns serialized JSON text while the index stores
+                // decoded native values. In particular, text and native numeric range
+                // comparisons have different ordering, so it cannot safely use this index.
                 let json_functions = [
-                    "json_extract",
                     "json_get",
                     "json_get_int",
                     "json_get_float",
@@ -426,7 +427,7 @@ impl ScalarQueryParser for JsonQueryParser {
                                 "json_get_int" => Some(DataType::Int64),
                                 "json_get_float" => Some(DataType::Float64),
                                 "json_get_bool" => Some(DataType::Boolean),
-                                "json_get_string" | "json_extract" => Some(DataType::Utf8),
+                                "json_get_string" => Some(DataType::Utf8),
                                 _ => None,
                             }
                         } else {
