@@ -78,7 +78,7 @@ fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value
     let error = parse_deep_clone_stream_concurrency(value).unwrap_err();
     let message = error.to_string();
     assert!(message.contains("LANCE_DEEP_CLONE_STREAM_CONCURRENCY"));
-    assert!(message.contains(value));
+    assert!(message.contains(&format!("{value:?}")));
 }
 
 #[test]

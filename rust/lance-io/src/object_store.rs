@@ -1128,6 +1128,11 @@ impl ObjectStore {
         if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
                 .map_err(|source| {
+                    let source = if source.kind() == std::io::ErrorKind::NotFound {
+                        Error::not_found(source_path.to_string())
+                    } else {
+                        Error::from(source)
+                    };
                     stream_copy_error("source metadata", source_path, destination_path, source)
                 })?
                 .len();
@@ -2719,6 +2724,26 @@ mod tests {
         assert_eq!(
             store.read_one_all(&destination).await.unwrap().as_ref(),
             contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_via_stream_preserves_local_not_found() {
+        let directory = TempStdDir::default();
+        let (store, base_path) = ObjectStore::from_uri(directory.to_str().unwrap())
+            .await
+            .unwrap();
+        let source = base_path.clone().join("missing.bin");
+        let destination = base_path.join("destination.bin");
+
+        let error = store
+            .copy_via_stream(&source, &store, &destination)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.is_not_found(),
+            "expected not-found error, got: {error}"
         );
     }
 
