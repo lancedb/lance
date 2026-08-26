@@ -156,6 +156,29 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
+    /// Upper bound on heap bytes held — or already committed — by this index.
+    ///
+    /// Sized by `capacity` (the writer's `max_memtable_rows`) rather than by
+    /// rows inserted: the graph and lookup slabs are pre-allocated in full on
+    /// the first insert, so an idle vector memtable costs the same as a full
+    /// one.
+    ///
+    /// Non-zero *before* that first insert too. The allocation is settled the
+    /// moment the index exists — only `dim` is still unknown, and no term
+    /// depends on it — so reporting zero until the row that triggers it would
+    /// hide the largest allocation in a vector memtable from the admission
+    /// controller that runs just ahead of it. Until then this is the reserved
+    /// estimate; from the first insert on it is the graph's own measurement.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match self.state.get() {
+            Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),
+            None => {
+                HnswGraph::reserved_bytes(self.capacity, &build_params_of(&self.build_params))
+                    + ArrowFixedSizeListVectorStore::reserved_bytes(self.capacity, self.max_batches)
+            }
+        }
+    }
+
     fn ensure_state(&self, dim: usize) -> Result<&HnswState> {
         if let Some(state) = self.state.get() {
             if state.storage.dim() != dim {
@@ -417,17 +440,23 @@ impl HnswMemIndex {
 }
 
 fn to_lance_hnsw_params(params: &HnswBuildParams) -> Result<BuildParams> {
-    let params = BuildParams {
+    let params = build_params_of(params);
+    // Validate by constructing a tiny graph with these params. This keeps
+    // invalid builder options as boundary errors instead of delayed panics.
+    HnswGraph::try_new(1, params.clone())?;
+    Ok(params)
+}
+
+/// The same field-for-field translation without the validating build, so sizing
+/// questions can be answered off a config that has not been accepted yet.
+fn build_params_of(params: &HnswBuildParams) -> BuildParams {
+    BuildParams {
         max_level: params.max_level,
         m: params.m,
         ef_construction: params.ef_construction,
         prefetch_distance: params.prefetch_distance,
         ..BuildParams::default()
-    };
-    // Validate by constructing a tiny graph with these params. This keeps
-    // invalid builder options as boundary errors instead of delayed panics.
-    HnswGraph::try_new(1, params.clone())?;
-    Ok(params)
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +489,56 @@ mod tests {
             ),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
+    }
+
+    /// The graph is pre-allocated from `capacity`, so its footprint is settled
+    /// before any row arrives and barely moves as rows do. A memory budget that
+    /// samples only row bytes would miss all of it, and one that waited for the
+    /// first insert would miss the allocation that insert triggers.
+    #[test]
+    fn test_resident_bytes_is_preallocated_not_proportional_to_rows() {
+        let dim = 8;
+        let capacity = 4_000;
+        let index = || {
+            HnswMemIndex::with_capacity(
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                HnswBuildParams::default().num_edges(16).ef_construction(64),
+                capacity,
+                64,
+            )
+        };
+
+        let untouched = index().resident_bytes();
+
+        let sparse = index();
+        sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
+        let one_row = sparse.resident_bytes();
+
+        let full = index();
+        full.insert(&make_batch(0, capacity, dim), 0).unwrap();
+        let all_rows = full.resident_bytes();
+
+        // One row already pays for the whole graph: well over a KB per slot of
+        // capacity, and within a small factor of the fully-populated index.
+        assert!(
+            one_row > capacity * 128,
+            "one row should commit the pre-allocated graph, got {one_row} for capacity {capacity}"
+        );
+        assert!(
+            all_rows < one_row * 2,
+            "a full index ({all_rows}) should not dwarf a one-row index ({one_row})"
+        );
+
+        // The charge is visible before the row that commits it, and close
+        // enough to the real thing to admit against. The reservation walks the
+        // level ladder in expectation where the graph samples it, so allow a
+        // 25% band either way rather than demanding equality.
+        assert!(
+            untouched.abs_diff(one_row) * 4 < one_row,
+            "reserved {untouched} should track the built graph {one_row} before the first insert"
+        );
     }
 
     #[test]

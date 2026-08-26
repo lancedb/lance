@@ -1947,6 +1947,7 @@ pub async fn initialize_vector_index(
         uuid: new_uuid,
         name: source_index.name.clone(),
         fields: vec![field.id],
+        covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
         index_details: source_index.index_details.clone(),
@@ -2263,25 +2264,27 @@ mod tests {
         let uri = format!("{}/ds", test_dir.as_str());
 
         let reader = lance_datagen::gen_batch()
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,
             IvfBuildParams {
-                num_partitions: Some(8),
+                num_partitions: Some(2),
+                max_iters: 2,
+                sample_rate: 2,
                 ..Default::default()
             },
-            HnswBuildParams {
-                max_level: 6,
-                m: 24,
-                ef_construction: 120,
-                prefetch_distance: None,
-            },
+            HnswBuildParams::default()
+                .max_level(2)
+                .num_edges(4)
+                .ef_construction(16),
             PQBuildParams {
-                num_sub_vectors: 8,
-                num_bits: 8,
+                num_sub_vectors: 2,
+                num_bits: 4,
+                max_iters: 2,
+                sample_rate: 2,
                 ..Default::default()
             },
         );
@@ -3405,29 +3408,33 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // A 4-bit PQ codebook needs at least 16 training rows.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();
 
         // Create IVF_HNSW_PQ index on source with custom HNSW parameters
         let ivf_params = IvfBuildParams {
-            num_partitions: Some(8),
+            num_partitions: Some(2),
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let hnsw_params = HnswBuildParams {
-            max_level: 6,
-            m: 24,
-            ef_construction: 120,
+            max_level: 2,
+            m: 4,
+            ef_construction: 16,
             prefetch_distance: None,
         };
         let pq_params = PQBuildParams {
-            num_sub_vectors: 8,
-            num_bits: 8,
+            num_sub_vectors: 2,
+            num_bits: 4,
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -3459,8 +3466,8 @@ mod tests {
         // Create target dataset with same schema
         let target_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1));
         let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
             .await
             .unwrap();
@@ -3507,8 +3514,8 @@ mod tests {
         // Check number of partitions
         assert_eq!(
             stats.get("num_partitions").and_then(|v| v.as_u64()),
-            Some(8),
-            "Should have 8 partitions"
+            Some(2),
+            "Should have 2 partitions"
         );
 
         // Verify centroids are shared between source and target indices
@@ -3569,13 +3576,13 @@ mod tests {
         // Verify PQ parameters
         assert_eq!(
             sub_index.get("nbits").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should use 8 bits"
+            Some(4),
+            "PQ should use 4 bits"
         );
         assert_eq!(
             sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should have 8 sub vectors"
+            Some(2),
+            "PQ should have 2 sub vectors"
         );
 
         // Verify IVF parameters are correctly derived
@@ -3587,8 +3594,8 @@ mod tests {
         );
         assert_eq!(
             target_ivf_params.num_partitions,
-            Some(8),
-            "Should have 8 partitions as configured"
+            Some(2),
+            "Should have 2 partitions as configured"
         );
 
         // Verify PQ parameters are correctly derived
@@ -3609,29 +3616,29 @@ mod tests {
             "PQ num_bits should match"
         );
         assert_eq!(
-            target_pq_params.num_sub_vectors, 8,
-            "PQ should have 8 sub vectors"
+            target_pq_params.num_sub_vectors, 2,
+            "PQ should have 2 sub vectors"
         );
-        assert_eq!(target_pq_params.num_bits, 8, "PQ should use 8 bits");
+        assert_eq!(target_pq_params.num_bits, 4, "PQ should use 4 bits");
 
         // Verify HNSW parameters are extracted and used correctly
         let derived_hnsw_params = derive_hnsw_params(target_vector_index.as_ref());
         assert_eq!(
-            derived_hnsw_params.max_level, 6,
-            "HNSW max_level should be extracted as 6 from source index"
+            derived_hnsw_params.max_level, 2,
+            "HNSW max_level should be extracted as 2 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.m, 24,
-            "HNSW m should be extracted as 24 from source index"
+            derived_hnsw_params.m, 4,
+            "HNSW m should be extracted as 4 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.ef_construction, 120,
-            "HNSW ef_construction should be extracted as 120 from source index"
+            derived_hnsw_params.ef_construction, 16,
+            "HNSW ef_construction should be extracted as 16 from source index"
         );
 
         // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
-            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .anon_col(array::rand_vec::<Float32Type>(8.into()))
             .into_batch_rows(RowCount::from(1))
             .unwrap()
             .column(0)
