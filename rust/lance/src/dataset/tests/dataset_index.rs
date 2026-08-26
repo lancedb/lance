@@ -2373,6 +2373,139 @@ async fn test_partial_fuzzy_multimatch_matches_rebuilt_current_value_oracle() {
     assert_scored_rows_close("partial_plain_match_topk", &actual, &exhaustive[..1]);
 }
 
+#[tokio::test]
+async fn test_mixed_unicode_fuzzy_matches_partition_layout_oracles() {
+    async fn create_unicode_index(dataset: &mut Dataset, fragment_groups: Vec<Vec<u32>>) {
+        let params = InvertedIndexParams::default().ascii_folding(false);
+        let mut segments = Vec::with_capacity(fragment_groups.len());
+        for fragment_ids in fragment_groups {
+            let mut builder = dataset
+                .create_index_builder(&["text"], IndexType::Inverted, &params)
+                .name("text_idx".to_string())
+                .fragments(fragment_ids);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        dataset
+            .commit_existing_index_segments("text_idx", "text", segments)
+            .await
+            .unwrap();
+    }
+
+    async fn write_unicode_rows(include_residual: bool) -> Dataset {
+        let batch = if include_residual {
+            arrow_array::record_batch!(
+                ("text", Utf8, ["بسرعة", "café", "بسرعة", "café"]),
+                ("id", Int32, [0, 1, 2, 3])
+            )
+            .unwrap()
+        } else {
+            arrow_array::record_batch!(("text", Utf8, ["بسرعة", "café"]), ("id", Int32, [0, 1]))
+                .unwrap()
+        };
+        let schema = batch.schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn scored_business_rows(dataset: &Dataset, query: FtsQuery) -> Vec<(i32, f32)> {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                batch[SCORE_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect()
+    }
+
+    fn assert_business_scores_close(
+        case_name: &str,
+        actual: &[(i32, f32)],
+        expected: &[(i32, f32)],
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{case_name}");
+        for ((actual_id, actual_score), (expected_id, expected_score)) in
+            actual.iter().zip(expected)
+        {
+            assert_eq!(actual_id, expected_id, "{case_name}");
+            let tolerance = 1.0e-5 * expected_score.abs().max(1.0);
+            assert!(
+                (actual_score - expected_score).abs() <= tolerance,
+                "{case_name}: score for id {actual_id} was {actual_score}, expected {expected_score}"
+            );
+        }
+    }
+
+    let mut partial = write_unicode_rows(false).await;
+    create_unicode_index(&mut partial, vec![vec![0], vec![1]]).await;
+    let residual =
+        arrow_array::record_batch!(("text", Utf8, ["بسرعة", "café"]), ("id", Int32, [2, 3]))
+            .unwrap();
+    let schema = residual.schema();
+    partial
+        .append(RecordBatchIterator::new(vec![Ok(residual)], schema), None)
+        .await
+        .unwrap();
+
+    let mut interleaved = write_unicode_rows(true).await;
+    create_unicode_index(&mut interleaved, vec![vec![0, 2], vec![1, 3]]).await;
+    let mut split = write_unicode_rows(true).await;
+    create_unicode_index(&mut split, vec![vec![0, 1], vec![2, 3]]).await;
+
+    for (case_name, source_term, expected_ids) in [
+        ("arabic_insertion", "بسرع", &[0, 2][..]),
+        ("ascii_to_accent", "cafe", &[1, 3][..]),
+    ] {
+        let query = FtsQuery::Match(
+            MatchQuery::new(source_term.to_owned())
+                .with_column(Some("text".to_owned()))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(4)
+                .with_document_granularity(DocumentGranularity::Row),
+        );
+        let plan = compound_fts_plan(&partial, query.clone(), 10).await;
+        assert!(
+            plan.contains("FlatMatchQuery") && plan.matches("MatchQuery:").count() >= 2,
+            "{case_name} must exercise indexed and residual vocabularies: {plan}"
+        );
+        let actual = scored_business_rows(&partial, query.clone()).await;
+        assert_eq!(
+            actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected_ids
+        );
+        let interleaved = scored_business_rows(&interleaved, query.clone()).await;
+        let split = scored_business_rows(&split, query).await;
+        assert_business_scores_close(
+            &format!("mixed_vs_interleaved_{case_name}"),
+            &actual,
+            &interleaved,
+        );
+        assert_business_scores_close(&format!("mixed_vs_split_{case_name}"), &actual, &split);
+    }
+}
+
 fn fuzzy_body_coverage_queries() -> Vec<(&'static str, FtsQuery)> {
     let plain = FtsQuery::Match(
         MatchQuery::new("noisf".to_owned())

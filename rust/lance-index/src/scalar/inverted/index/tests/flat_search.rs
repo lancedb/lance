@@ -70,6 +70,101 @@ async fn flat_fuzzy_candidates_are_bounded_across_chunks_not_occurrences() {
     );
 }
 
+async fn assert_residual_fuzzy_candidate(source_term: &str, residual_term: &str) {
+    let query_tokens = Arc::new(Tokens::new(vec![source_term.to_string()], DocType::Text));
+    let params = Arc::new(
+        FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(4),
+    );
+    let tokenizer = InvertedIndexParams::default()
+        .ascii_folding(false)
+        .build()
+        .unwrap();
+    let candidates = collect_flat_fuzzy_candidates(
+        text_stream(vec![
+            vec!["unrelated".to_string()],
+            vec![residual_term.to_string()],
+        ]),
+        "text",
+        tokenizer,
+        query_tokens,
+        params,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        candidates
+            .get(&0)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![residual_term.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn residual_fuzzy_candidates_support_arabic_insertion() {
+    assert_residual_fuzzy_candidate("بسرع", "بسرعة").await;
+}
+
+#[tokio::test]
+async fn residual_fuzzy_candidates_support_ascii_to_accent_edit() {
+    assert_residual_fuzzy_candidate("cafe", "café").await;
+}
+
+#[tokio::test]
+async fn residual_fuzzy_candidates_bound_cache_and_search_unicode_overflow() {
+    let query_tokens = Arc::new(Tokens::with_positions(
+        vec![
+            "oneq".to_string(),
+            "twoq".to_string(),
+            "threeq".to_string(),
+            "fourq".to_string(),
+            "بسرع".to_string(),
+        ],
+        vec![0, 1, 2, 3, 4],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(8),
+    );
+    let prepared = prepare_flat_fuzzy_automata(query_tokens.as_ref(), params.as_ref()).unwrap();
+    assert_eq!(prepared.cached.len(), MAX_CACHED_FUZZY_AUTOMATA);
+    assert_eq!(prepared.uncached, vec![(4, "بسرع".to_string())]);
+
+    let tokenizer = InvertedIndexParams::default()
+        .ascii_folding(false)
+        .build()
+        .unwrap();
+    let candidates = collect_flat_fuzzy_candidates(
+        text_stream(vec![
+            vec!["unrelated".to_string()],
+            vec!["بسرعة".to_string()],
+        ]),
+        "text",
+        tokenizer,
+        query_tokens,
+        params,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        candidates
+            .get(&4)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["بسرعة".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn flat_fuzzy_stats_are_exact_for_the_final_vocabulary() {
     let final_tokens = Arc::new(Tokens::with_positions(

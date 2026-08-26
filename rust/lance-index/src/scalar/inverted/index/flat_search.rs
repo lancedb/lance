@@ -854,9 +854,60 @@ pub struct FlatBm25SearchOptions {
     pub phrase_slop: Option<u32>,
 }
 
+struct PreparedFlatFuzzyAutomaton {
+    position: u32,
+    automaton: FuzzyAutomaton,
+}
+
+/// Keeps common short queries compile-once without reviving unbounded DFA
+/// retention for pathological query strings.
+const MAX_CACHED_FUZZY_AUTOMATA: usize = 4;
+
+struct PreparedFlatFuzzyAutomata {
+    cached: Vec<PreparedFlatFuzzyAutomaton>,
+    uncached: Vec<(u32, String)>,
+    token_type: DocType,
+}
+
+fn prepare_flat_fuzzy_automata(
+    query_tokens: &Tokens,
+    params: &FtsSearchParams,
+) -> Result<PreparedFlatFuzzyAutomata> {
+    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    for token_index in 0..query_tokens.len() {
+        source_terms_by_position
+            .entry(query_tokens.position(token_index))
+            .or_default()
+            .push(query_tokens.get_token(token_index));
+    }
+    let mut cached = Vec::with_capacity(query_tokens.len().min(MAX_CACHED_FUZZY_AUTOMATA));
+    let mut uncached = Vec::new();
+    for (position, source_terms) in source_terms_by_position {
+        let mut seen_source_terms = HashSet::new();
+        for source_term in source_terms {
+            if !seen_source_terms.insert(source_term) {
+                continue;
+            }
+            if cached.len() < MAX_CACHED_FUZZY_AUTOMATA {
+                cached.push(PreparedFlatFuzzyAutomaton {
+                    position,
+                    automaton: FuzzyAutomaton::new(source_term, query_tokens.token_type(), params)?,
+                });
+            } else {
+                uncached.push((position, source_term.to_string()));
+            }
+        }
+    }
+    Ok(PreparedFlatFuzzyAutomata {
+        cached,
+        uncached,
+        token_type: query_tokens.token_type().clone(),
+    })
+}
+
 fn collect_fuzzy_candidates_from_terms(
     terms: &BTreeSet<String>,
-    query_tokens: &Tokens,
+    prepared: &PreparedFlatFuzzyAutomata,
     params: &FtsSearchParams,
 ) -> Result<BTreeMap<u32, BTreeSet<String>>> {
     fn merge_stream<S>(
@@ -888,7 +939,10 @@ fn collect_fuzzy_candidates_from_terms(
         Ok(())
     }
 
-    if terms.is_empty() || params.max_expansions == 0 {
+    if terms.is_empty()
+        || (prepared.cached.is_empty() && prepared.uncached.is_empty())
+        || params.max_expansions == 0
+    {
         return Ok(BTreeMap::new());
     }
     let mut builder = fst::SetBuilder::memory();
@@ -897,45 +951,28 @@ fn collect_fuzzy_candidates_from_terms(
             Error::index(format!("failed to build flat FTS vocabulary: {error}"))
         })?;
     }
-    let set =
+    let vocabulary =
         fst::Set::new(builder.into_inner().map_err(|error| {
             Error::index(format!("failed to finish flat FTS vocabulary: {error}"))
         })?)
         .map_err(|error| Error::index(format!("failed to open flat FTS vocabulary: {error}")))?;
 
-    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
-    for token_index in 0..query_tokens.len() {
-        source_terms_by_position
-            .entry(query_tokens.position(token_index))
-            .or_default()
-            .push(query_tokens.get_token(token_index));
-    }
     let mut result = BTreeMap::new();
-    for (position, source_terms) in source_terms_by_position {
-        let candidates = result.entry(position).or_insert_with(BTreeSet::new);
-        for source_term in source_terms {
-            let fuzzy = fuzzy_term_options(
-                source_term,
-                query_tokens.token_type(),
-                params.fuzziness,
-                params.prefix_length,
-            );
-            let levenshtein = fst::automaton::Levenshtein::new(source_term, fuzzy.edit_distance)
-                .map_err(|error| {
-                    Error::index(format!("failed to construct the fuzzy query: {error}"))
-                })?;
-            match fuzzy.exact_prefix {
-                "" => {
-                    let mut stream = set.search(levenshtein).into_stream();
-                    merge_stream(&mut stream, candidates, params.max_expansions)?;
-                }
-                exact_prefix => {
-                    let prefix = fst::automaton::Str::new(exact_prefix).starts_with();
-                    let mut stream = set.search(levenshtein.intersection(prefix)).into_stream();
-                    merge_stream(&mut stream, candidates, params.max_expansions)?;
-                }
-            }
-        }
+    for prepared in &prepared.cached {
+        let candidates = result
+            .entry(prepared.position)
+            .or_insert_with(BTreeSet::new);
+        let mut stream = vocabulary.search(&prepared.automaton).into_stream();
+        merge_stream(&mut stream, candidates, params.max_expansions)?;
+    }
+    for (position, source_term) in &prepared.uncached {
+        let candidates = result.entry(*position).or_insert_with(BTreeSet::new);
+        // Long/pathological queries stay memory bounded: construct one
+        // overflow automaton inside the serialized chunk task and drop it
+        // immediately after searching this transient FST.
+        let automaton = FuzzyAutomaton::new(source_term, &prepared.token_type, params)?;
+        let mut stream = vocabulary.search(&automaton).into_stream();
+        merge_stream(&mut stream, candidates, params.max_expansions)?;
     }
     Ok(result)
 }
@@ -1007,11 +1044,13 @@ fn materialize_flat_string_list(elements: &dyn Array) -> String {
 
 /// Collect a bounded fuzzy-vocabulary summary from current-value rows.
 ///
-/// Each rechunked input block builds a transient ordered FST over its deduped
-/// vocabulary. Each query-source automaton traverses that FST once, avoiding
-/// per-occurrence edit-distance work, and only the lexicographically smallest
-/// `max_expansions` candidates per query position survive the merge. Memory is
-/// bounded by one input chunk plus `query_positions * max_expansions`.
+/// The first [`MAX_CACHED_FUZZY_AUTOMATA`] unique query terms compile one
+/// Unicode-aware automaton each and share them across all rechunked input
+/// tasks. Any overflow terms are constructed and dropped one at a time inside
+/// serialized chunk tasks. Each task builds, searches, and drops one transient
+/// ordered FST over its deduped chunk vocabulary. Memory is therefore bounded
+/// by the small automaton cache, one overflow DFA, bounded in-flight chunks,
+/// and `query_positions * max_expansions`, never the full residual vocabulary.
 #[doc(hidden)]
 pub async fn collect_flat_fuzzy_candidates(
     input: SendableRecordBatchStream,
@@ -1023,6 +1062,9 @@ pub async fn collect_flat_fuzzy_candidates(
 ) -> DataFusionResult<BTreeMap<u32, BTreeSet<String>>> {
     const ACCUMULATE_BYTES: usize = 256 * 1024;
     const SLICE_BYTES: usize = 512 * 1024;
+    if query_tokens.is_empty() || params.max_expansions == 0 {
+        return Ok(BTreeMap::new());
+    }
     let input_schema = input.schema();
     let doc_col_idx = input_schema.index_of(doc_col)?;
     let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
@@ -1033,10 +1075,30 @@ pub async fn collect_flat_fuzzy_candidates(
         SLICE_BYTES,
     );
     let max_expansions = params.max_expansions;
+    let preparation_elapsed_compute = elapsed_compute.clone();
+    let preparation_params = params.clone();
+    let prepared = Arc::new(
+        spawn_cpu(move || {
+            let started = std::time::Instant::now();
+            let prepared =
+                prepare_flat_fuzzy_automata(query_tokens.as_ref(), preparation_params.as_ref())
+                    .map_err(DataFusionError::from);
+            if let Some(time) = preparation_elapsed_compute {
+                time.add_duration(started.elapsed());
+            }
+            prepared
+        })
+        .await?,
+    );
+    let chunk_concurrency = if prepared.uncached.is_empty() {
+        get_num_compute_intensive_cpus()
+    } else {
+        1
+    };
     let summaries = chunked
         .map(move |batch| {
             let tokenizer = tokenizer.box_clone();
-            let query_tokens = query_tokens.clone();
+            let prepared = prepared.clone();
             let params = params.clone();
             let elapsed_compute = elapsed_compute.clone();
             spawn_cpu(move || {
@@ -1044,7 +1106,7 @@ pub async fn collect_flat_fuzzy_candidates(
                 let terms = collect_batch_terms(&batch?, doc_col_idx, coordinate_rank, tokenizer)?;
                 let candidates = collect_fuzzy_candidates_from_terms(
                     &terms,
-                    query_tokens.as_ref(),
+                    prepared.as_ref(),
                     params.as_ref(),
                 )?;
                 if let Some(time) = elapsed_compute {
@@ -1053,7 +1115,7 @@ pub async fn collect_flat_fuzzy_candidates(
                 DataFusionResult::Ok(candidates)
             })
         })
-        .buffered(get_num_compute_intensive_cpus());
+        .buffered(chunk_concurrency);
 
     let mut merged = BTreeMap::<u32, BTreeSet<String>>::new();
     futures::pin_mut!(summaries);
