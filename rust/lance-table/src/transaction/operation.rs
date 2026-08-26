@@ -88,6 +88,8 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
+        /// Dataset configuration values to atomically upsert with the rewrite.
+        config_upsert_values: Option<HashMap<String, String>>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a

@@ -99,16 +99,19 @@ impl PartialEq for Operation {
                     groups: a_groups,
                     rewritten_indices: a_indices,
                     frag_reuse_index: a_frag_reuse_index,
+                    config_upsert_values: a_config,
                 },
                 Self::Rewrite {
                     groups: b_groups,
                     rewritten_indices: b_indices,
                     frag_reuse_index: b_frag_reuse_index,
+                    config_upsert_values: b_config,
                 },
             ) => {
                 compare_vec(a_groups, b_groups)
                     && compare_vec(a_indices, b_indices)
                     && a_frag_reuse_index == b_frag_reuse_index
+                    && a_config == b_config
             }
             (
                 Self::Merge {
@@ -873,6 +876,10 @@ impl Operation {
             Self::Overwrite {
                 config_upsert_values: Some(upsert_values),
                 ..
+            }
+            | Self::Rewrite {
+                config_upsert_values: Some(upsert_values),
+                ..
             } => {
                 let vec: Vec<String> = upsert_values.keys().cloned().collect();
                 vec
@@ -1036,6 +1043,7 @@ mod tests {
             groups: vec![],
             rewritten_indices: vec![],
             frag_reuse_index: None,
+            config_upsert_values: None,
         };
         assert_ne!(overlay(1), rewrite);
     }

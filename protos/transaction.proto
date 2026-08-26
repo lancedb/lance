@@ -132,6 +132,8 @@ message Transaction {
     repeated RewriteGroup groups = 3;
     // Indices that have been rewritten
     repeated RewrittenIndex rewritten_indices = 4;
+    // Dataset configuration values to atomically upsert with the rewrite.
+    map<string, string> config_upsert_values = 5;
   }
 
   // An operation that merges in a new column, altering the schema.

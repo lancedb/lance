@@ -736,11 +736,12 @@ impl DefaultCompactionPlanner {
             excluded_fragment_ids,
         })
     }
-}
 
-#[async_trait::async_trait]
-impl CompactionPlanner for DefaultCompactionPlanner {
-    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+    async fn plan_fragment_groups(
+        &self,
+        dataset: &Dataset,
+        fragment_groups: Vec<Vec<FileFragment>>,
+    ) -> Result<CompactionPlan> {
         if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
             return Err(Error::invalid_input(
                 "defer_index_remap=true is not supported on datasets with stable row IDs: \
@@ -750,16 +751,15 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             ));
         }
 
-        // get_fragments should be returning fragments in sorted order (by id)
-        // and fragment ids should be unique
-        let fragments = dataset.get_fragments();
-
-        debug_assert!(
-            fragments.windows(2).all(|w| w[0].id() < w[1].id()),
-            "fragments in manifest are not sorted"
-        );
+        // None is a hard boundary between independently compactable groups.
+        let fragments = fragment_groups
+            .into_iter()
+            .flat_map(|group| group.into_iter().map(Some).chain(std::iter::once(None)));
         let mut fragment_metrics = futures::stream::iter(fragments)
             .map(|fragment| async {
+                let Some(fragment) = fragment else {
+                    return Ok(None);
+                };
                 if u32::try_from(fragment.id())
                     .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id))
                 {
@@ -891,6 +891,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for DefaultCompactionPlanner {
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        self.plan_fragment_groups(dataset, vec![dataset.get_fragments()])
+            .await
     }
 }
 
@@ -2101,6 +2109,44 @@ pub async fn plan_compaction(
     planner.plan(dataset).await
 }
 
+/// Plan compaction over explicit fragment groups.
+///
+/// Fragments are adjacent only within the same group. The planner will never
+/// create a task containing fragments from two different groups.
+pub async fn plan_compaction_fragment_groups(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragment_groups: &[Vec<u64>],
+) -> Result<CompactionPlan> {
+    let mut fragments_by_id = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| (fragment.id() as u64, fragment))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut groups = Vec::with_capacity(fragment_groups.len());
+    for group in fragment_groups {
+        let mut fragments = Vec::with_capacity(group.len());
+        for fragment_id in group {
+            if !seen.insert(*fragment_id) {
+                return Err(Error::invalid_input(format!(
+                    "fragment {fragment_id} occurs in multiple compaction groups"
+                )));
+            }
+            let fragment = fragments_by_id.remove(fragment_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "compaction group references missing fragment {fragment_id}"
+                ))
+            })?;
+            fragments.push(fragment);
+        }
+        groups.push(fragments);
+    }
+    DefaultCompactionPlanner::new(options.clone())?
+        .plan_fragment_groups(dataset, groups)
+        .await
+}
+
 /// The result of a single compaction task.
 ///
 /// This should be passed to [commit_compaction()] to commit the operation.
@@ -2899,6 +2945,53 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
+    commit_compaction_with_options(
+        dataset,
+        completed_tasks,
+        remap_options,
+        options,
+        &CompactionCommitOptions::default(),
+    )
+    .await
+}
+
+/// Additional controls for committing completed compaction tasks.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionCommitOptions {
+    /// The caller already reserved and assigned every output fragment ID.
+    pub fragment_ids_reserved: bool,
+    /// Dataset configuration values to atomically upsert with the rewrite.
+    pub config_upsert_values: Option<HashMap<String, String>>,
+}
+
+/// Reserve and assign final IDs to every output fragment in a set of rewrite results.
+///
+/// This is useful when metadata written before the rewrite commit must refer to
+/// the final fragment IDs. Pass `fragment_ids_reserved = true` to
+/// [`commit_compaction_with_options`] when committing these results.
+pub async fn reserve_fragment_ids_for_compaction(
+    dataset: &Dataset,
+    completed_tasks: &mut [RewriteResult],
+) -> Result<()> {
+    let fragments = completed_tasks
+        .iter_mut()
+        .flat_map(|task| task.new_fragments.iter_mut())
+        .collect::<Vec<_>>();
+    if fragments.is_empty() {
+        return Ok(());
+    }
+    reserve_fragment_ids(dataset, fragments.into_iter()).await
+}
+
+/// Commit compaction results with optional pre-reserved fragment IDs and
+/// atomic dataset configuration updates.
+pub async fn commit_compaction_with_options(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    commit_options: &CompactionCommitOptions,
+) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
@@ -2965,7 +3058,7 @@ pub async fn commit_compaction(
         .collect();
 
     // Single reserve_fragment_ids for all address-style tasks
-    if has_address_style {
+    if has_address_style && !commit_options.fragment_ids_reserved {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
             .filter(|task| task.row_addrs.is_some() || task.row_addr_order.is_some())
@@ -3112,7 +3205,10 @@ pub async fn commit_compaction(
                 new_index_files: rewritten.files,
             })
             .collect()
-    } else if !options.defer_index_remap && !has_address_style {
+    } else if !options.defer_index_remap
+        && !has_address_style
+        && !commit_options.fragment_ids_reserved
+    {
         // We need to reserve fragment ids here so that the fragment bitmap
         // can be updated for each index. Only needed for stable row IDs
         // since address-style IDs were already reserved above.
@@ -3154,6 +3250,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
+            config_upsert_values: commit_options.config_upsert_values.clone(),
         },
     )
     .transaction_properties(options.transaction_properties.clone())
@@ -3518,6 +3615,111 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_fragment_groups_are_hard_compaction_boundaries() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 2_500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragment_ids = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.id() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids.len(), 4);
+
+        let groups = vec![
+            vec![fragment_ids[0], fragment_ids[2]],
+            vec![fragment_ids[1], fragment_ids[3]],
+        ];
+        let plan = plan_compaction_fragment_groups(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 10_000,
+                ..Default::default()
+            },
+            &groups,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        for task in &plan.tasks {
+            let ids = task
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<HashSet<_>>();
+            assert!(
+                groups
+                    .iter()
+                    .any(|group| group.iter().copied().collect::<HashSet<_>>() == ids)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_can_atomically_upsert_dataset_config() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 2_500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let dataset_ref = &dataset;
+        let mut results = futures::future::try_join_all(
+            plan.compaction_tasks()
+                .map(|task| async move { task.execute(dataset_ref).await }),
+        )
+        .await
+        .unwrap();
+        reserve_fragment_ids_for_compaction(&dataset, &mut results)
+            .await
+            .unwrap();
+        commit_compaction_with_options(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+            &CompactionCommitOptions {
+                fragment_ids_reserved: true,
+                config_upsert_values: Some(HashMap::from([(
+                    "test.rewrite.pointer".to_string(),
+                    "2".to_string(),
+                )])),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset
+                .config()
+                .get("test.rewrite.pointer")
+                .map(String::as_str),
+            Some("2")
+        );
     }
 
     fn list_data_files(uri: &str) -> std::collections::BTreeSet<String> {
