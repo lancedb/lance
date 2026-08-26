@@ -1502,20 +1502,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case::above_u64(r#"{"v": 18446744073709551616}"#, 18446744073709551616.0)]
-    #[case::fraction(
-        r#"{"v": 1.2345678901234567890123456789012345678}"#,
-        1.2345678901234567
-    )]
+    #[case::above_u64(r#"{"v": 18446744073709551616}"#)]
+    #[case::fraction(r#"{"v": 1.2345678901234567890123456789012345678}"#)]
     #[tokio::test]
-    async fn test_json_decimal_index_uses_float_accessor_semantics(
-        #[case] json: &str,
-        #[case] expected: f64,
-    ) {
+    async fn test_json_decimal_index_uses_float_accessor_semantics(#[case] json: &str) {
         use arrow_array::Float64Array;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::{TryStreamExt, stream};
 
+        let jsonb = json.parse::<jsonb::OwnedJsonb>().unwrap();
+        let expected = jsonb
+            .as_raw()
+            .get_by_name("v", false)
+            .unwrap()
+            .unwrap()
+            .as_raw()
+            .to_f64()
+            .unwrap();
         let batch = json_update_batch(&[json], vec![0]);
         let schema = batch.schema();
         let source = Box::pin(RecordBatchStreamAdapter::new(
