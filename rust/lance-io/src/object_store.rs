@@ -1193,34 +1193,61 @@ impl ObjectStore {
             .max(1);
         Span::current().record("read_chunk_size", read_chunk_size as u64);
         let mut bytes_transferred = 0usize;
-        while bytes_transferred < source_size {
-            let range_end = bytes_transferred
-                .checked_add(read_chunk_size)
-                .unwrap_or(source_size)
-                .min(source_size);
-            let range = bytes_transferred..range_end;
-            let expected_bytes = range.len();
-            let bytes = reader.get_range(range.clone()).await.map_err(|source| {
+        if source_size > 0 {
+            let first_range = 0..read_chunk_size.min(source_size);
+            let mut current_range = first_range.clone();
+            let mut current_bytes = reader.get_range(first_range).await.map_err(|source| {
                 stream_copy_error("source read", source_path, destination_path, source)
             })?;
-            if bytes.len() != expected_bytes {
-                Span::current().record("validation", "failed");
-                return Err(Error::io(format!(
-                    "multipart_stream_copy source range size mismatch from {source_path} to \
-                     {destination_path}: range={range:?}, expected_bytes={expected_bytes}, \
-                     actual_bytes={}",
-                    bytes.len()
-                )));
+
+            loop {
+                let expected_bytes = current_range.len();
+                if current_bytes.len() != expected_bytes {
+                    Span::current().record("validation", "failed");
+                    return Err(Error::io(format!(
+                        "multipart_stream_copy source range size mismatch from {source_path} to \
+                         {destination_path}: range={current_range:?}, \
+                         expected_bytes={expected_bytes}, actual_bytes={}",
+                        current_bytes.len()
+                    )));
+                }
+                bytes_transferred = bytes_transferred
+                    .checked_add(current_bytes.len())
+                    .ok_or_else(|| {
+                        Error::io(format!(
+                            "multipart_stream_copy byte count overflow from {source_path} to \
+                             {destination_path}"
+                        ))
+                    })?;
+
+                if bytes_transferred == source_size {
+                    writer.write_all(&current_bytes).await.map_err(|source| {
+                        stream_copy_error(
+                            "destination write",
+                            source_path,
+                            destination_path,
+                            source,
+                        )
+                    })?;
+                    break;
+                }
+
+                let range_end = bytes_transferred
+                    .checked_add(read_chunk_size)
+                    .unwrap_or(source_size)
+                    .min(source_size);
+                let next_range = bytes_transferred..range_end;
+                let next_read = reader.get_range(next_range.clone());
+                let (write_result, next_bytes) =
+                    tokio::join!(writer.write_all(&current_bytes), next_read);
+                write_result.map_err(|source| {
+                    stream_copy_error("destination write", source_path, destination_path, source)
+                })?;
+                current_bytes = next_bytes.map_err(|source| {
+                    stream_copy_error("source read", source_path, destination_path, source)
+                })?;
+                current_range = next_range;
             }
-            bytes_transferred = bytes_transferred.checked_add(bytes.len()).ok_or_else(|| {
-                Error::io(format!(
-                    "multipart_stream_copy byte count overflow from {source_path} to \
-                     {destination_path}"
-                ))
-            })?;
-            writer.write_all(&bytes).await.map_err(|source| {
-                stream_copy_error("destination write", source_path, destination_path, source)
-            })?;
         }
         Span::current().record("bytes_transferred", bytes_transferred as u64);
 

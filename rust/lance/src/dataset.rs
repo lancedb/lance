@@ -3267,6 +3267,8 @@ impl Dataset {
     /// Note: external `base_paths` referenced by the source manifest are read through
     /// this dataset's object store; per-base distinct source credentials are not yet
     /// supported (see <https://github.com/lance-format/lance/issues/6093>).
+    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3312,15 +3314,20 @@ impl Dataset {
         let configured_io_parallelism = src_ds.object_store.io_parallelism();
         let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
             && target_store.has_direct_local_paths());
-        // A streaming copy may hold one source range plus several upload parts.
-        // Bound the default aggregate footprint while preserving efficient local
-        // copies and an operator's explicit LANCE_IO_THREADS override.
-        let io_parallelism =
-            if uses_streaming_copy && std::env::var_os("LANCE_IO_THREADS").is_none() {
-                configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
-            } else {
-                configured_io_parallelism
-            };
+        // Limit the number of concurrently buffered transfers by default while
+        // preserving efficient local copies and explicit operator settings.
+        let io_parallelism = if !uses_streaming_copy {
+            configured_io_parallelism
+        } else if let Ok(value) = std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            value
+                .parse::<NonZero<usize>>()
+                .expect("LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer")
+                .get()
+        } else if std::env::var_os("LANCE_IO_THREADS").is_some() {
+            configured_io_parallelism
+        } else {
+            configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+        };
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
