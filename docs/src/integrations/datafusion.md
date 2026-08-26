@@ -96,7 +96,7 @@ Lance provides comprehensive JSON support through a set of built-in UDFs that ar
 
 For a complete guide to JSON functions including:
 - `json_extract` - Extract values using JSONPath
-- `json_get`, `json_get_string`, `json_get_int`, `json_get_float`, `json_get_bool` - Type-safe value extraction
+- `json_get`, `json_get_string`, `json_get_int`, `json_get_uint`, `json_get_float`, `json_get_bool` - Type-safe value extraction
 - `json_exists` - Check if a path exists
 - `json_array_contains`, `json_array_length` - Array operations
 

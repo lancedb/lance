@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
+    BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder, UInt64Builder,
 };
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
@@ -23,6 +23,7 @@ pub enum JsonbType {
     String = 4,
     Array = 5,
     Object = 6,
+    UInt64 = 7,
 }
 
 impl JsonbType {
@@ -36,6 +37,7 @@ impl JsonbType {
             4 => Some(Self::String),
             5 => Some(Self::Array),
             6 => Some(Self::Object),
+            7 => Some(Self::UInt64),
             _ => None,
         }
     }
@@ -180,6 +182,22 @@ fn json_value_to_int(value: jsonb::OwnedJsonb) -> Result<Option<i64>> {
         .map_err(|e| common::execution_error(format!("Failed to convert to integer: {}", e)))
 }
 
+/// Convert JSONB value to an unsigned integer using jsonb's built-in serde (strict mode)
+fn json_value_to_uint(value: jsonb::OwnedJsonb) -> Result<Option<u64>> {
+    let raw_jsonb = value.as_raw();
+
+    if raw_jsonb
+        .is_null()
+        .map_err(|e| common::execution_error(format!("Failed to check null: {}", e)))?
+    {
+        return Ok(None);
+    }
+
+    raw_jsonb.to_u64().map(Some).map_err(|e| {
+        common::execution_error(format!("Failed to convert to unsigned integer: {}", e))
+    })
+}
+
 /// Convert JSONB value to float using jsonb's built-in serde (strict mode)
 fn json_value_to_float(value: jsonb::OwnedJsonb) -> Result<Option<f64>> {
     let raw_jsonb = value.as_raw();
@@ -245,7 +263,7 @@ pub fn json_extract_udf() -> ScalarUDF {
 /// # Returns
 /// A struct with two fields:
 /// - value: LargeBinary (the extracted JSONB value)
-/// - type_tag: UInt8 (type information: 0=null, 1=bool, 2=int64, 3=float64, 4=string, 5=array, 6=object)
+/// - type_tag: UInt8 (type information: 0=null, 1=bool, 2=int64, 3=float64, 4=string, 5=array, 6=object, 7=uint64)
 pub fn json_extract_with_type_udf() -> ScalarUDF {
     use arrow_schema::Fields;
 
@@ -378,8 +396,12 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
             } else if raw.is_number().unwrap_or(false) {
                 let is_float_storage =
                     matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
+                let is_uint64_storage =
+                    matches!(raw.as_number(), Ok(Some(jsonb::Number::UInt64(_))));
                 if !is_float_storage && raw.is_i64().unwrap_or(false) {
                     JsonbType::Int64
+                } else if is_uint64_storage {
+                    JsonbType::UInt64
                 } else {
                     JsonbType::Float64
                 }
@@ -639,6 +661,62 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => match json_value_to_int(value)? {
                     Some(int_val) => builder.append_value(int_val),
+                    None => builder.append_null(),
+                },
+                None => builder.append_null(),
+            }
+        } else {
+            builder.append_null();
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Create the json_get_uint UDF for getting an unsigned integer value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// Unsigned integer value with type coercion (strings/floats/booleans converted to uint)
+pub fn json_get_uint_udf() -> ScalarUDF {
+    create_udf(
+        "json_get_uint",
+        vec![DataType::LargeBinary, DataType::Utf8],
+        DataType::UInt64,
+        Volatility::Immutable,
+        Arc::new(json_get_uint_columnar_impl),
+    )
+}
+
+/// Implementation of json_get_uint function with ColumnarValue
+fn json_get_uint_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    let arrays = common::columnar_to_arrays(args);
+    let result = json_get_uint_impl(&arrays)?;
+    Ok(ColumnarValue::Array(result))
+}
+
+/// Implementation of json_get_uint function
+fn json_get_uint_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    common::validate_arg_count(args, 2, "json_get_uint")?;
+
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
+
+    let mut builder = UInt64Builder::with_capacity(jsonb_array.len());
+
+    for i in 0..jsonb_array.len() {
+        if jsonb_array.is_null(i) {
+            builder.append_null();
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
+            let jsonb_bytes = jsonb_array.value(i);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
+
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
+                Some(value) => match json_value_to_uint(value)? {
+                    Some(uint_val) => builder.append_value(uint_val),
                     None => builder.append_null(),
                 },
                 None => builder.append_null(),
@@ -953,7 +1031,7 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use arrow_array::builder::LargeBinaryBuilder;
-    use arrow_array::{BooleanArray, Float64Array, Int64Array};
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, UInt64Array};
 
     fn create_test_jsonb(json_str: &str) -> Vec<u8> {
         jsonb::parse_value(json_str.as_bytes()).unwrap().to_vec()
@@ -969,6 +1047,7 @@ mod tests {
         assert_eq!(JsonbType::String.as_u8(), 4);
         assert_eq!(JsonbType::Array.as_u8(), 5);
         assert_eq!(JsonbType::Object.as_u8(), 6);
+        assert_eq!(JsonbType::UInt64.as_u8(), 7);
 
         // Test from_u8 conversion
         assert_eq!(JsonbType::from_u8(0), Some(JsonbType::Null));
@@ -978,7 +1057,8 @@ mod tests {
         assert_eq!(JsonbType::from_u8(4), Some(JsonbType::String));
         assert_eq!(JsonbType::from_u8(5), Some(JsonbType::Array));
         assert_eq!(JsonbType::from_u8(6), Some(JsonbType::Object));
-        assert_eq!(JsonbType::from_u8(7), None); // Invalid value
+        assert_eq!(JsonbType::from_u8(7), Some(JsonbType::UInt64));
+        assert_eq!(JsonbType::from_u8(8), None); // Invalid value
     }
 
     #[tokio::test]
@@ -1101,6 +1181,35 @@ mod tests {
         assert_eq!(int_array.value(1), 99);
         assert_eq!(int_array.value(2), 1); // jsonb converts true to 1
         assert_eq!(int_array.value(3), 7);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_get_uint_udf() -> Result<()> {
+        let json = r#"{"small": 42, "large": 18446744073709551615, "null": null}"#;
+        let jsonb_bytes = create_test_jsonb(json);
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        for _ in 0..4 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
+
+        let jsonb_array = Arc::new(binary_builder.finish());
+        let key_array = Arc::new(StringArray::from(vec![
+            Some("small"),
+            Some("large"),
+            Some("null"),
+            Some("missing"),
+        ]));
+
+        let result = json_get_uint_impl(&[jsonb_array, key_array])?;
+        let uint_array = result.as_any().downcast_ref::<UInt64Array>().unwrap();
+
+        assert_eq!(uint_array.value(0), 42);
+        assert_eq!(uint_array.value(1), u64::MAX);
+        assert!(uint_array.is_null(2));
+        assert!(uint_array.is_null(3));
 
         Ok(())
     }
@@ -1270,7 +1379,8 @@ mod tests {
             (r#"{"v": 0}"#, JsonbType::Int64),
             (r#"{"v": -42}"#, JsonbType::Int64),
             (r#"{"v": 9223372036854775807}"#, JsonbType::Int64), // i64::MAX
-            (r#"{"v": 9223372036854775808}"#, JsonbType::Float64), // i64::MAX + 1
+            (r#"{"v": 9223372036854775808}"#, JsonbType::UInt64), // i64::MAX + 1
+            (r#"{"v": 18446744073709551615}"#, JsonbType::UInt64), // u64::MAX
             (r#"{"v": 1.0}"#, JsonbType::Float64),
             (r#"{"v": 2.7}"#, JsonbType::Float64),
             (r#"{"v": 1.5}"#, JsonbType::Float64),

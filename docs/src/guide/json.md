@@ -132,6 +132,25 @@ result = dataset.to_table(
 )
 ```
 
+#### json_get_uint
+
+Extracts an unsigned integer value with strict type conversion. Use this for JSON
+integers above `i64::MAX`.
+
+**Syntax:** `json_get_uint(json_column, key_or_index)`
+
+**Returns:** Unsigned 64-bit integer, null if the JSON value is null or missing
+
+**Type Conversion:** Uses JSONB's strict `to_u64()` conversion. Negative values
+cannot be converted.
+
+**Example:**
+```python
+result = dataset.to_table(
+    filter="json_get_uint(data, 'sequence') = 9223372036854775808"
+)
+```
+
 #### json_get_float
 
 Extracts a floating-point value with strict type conversion.

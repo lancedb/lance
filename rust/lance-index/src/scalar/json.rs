@@ -24,8 +24,9 @@ use datafusion_physical_expr::{
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
+    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context, provider_to_stream,
 };
+use lance_datafusion::spill::spilling_table_provider;
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -49,6 +50,8 @@ use crate::{
 };
 
 const JSON_INDEX_VERSION: u32 = 0;
+/// Maximum extracted JSON data kept in memory while inferring an index type.
+const JSON_TYPE_INFERENCE_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
 
 /// A JSON index that indexes a field in a JSON column
 ///
@@ -227,6 +230,7 @@ pub struct JsonIndexParameters {
 enum JsonIndexTargetType {
     Boolean,
     Int64,
+    UInt64,
     Float64,
     Utf8,
     LargeBinary,
@@ -239,6 +243,7 @@ impl TryFrom<&DataType> for JsonIndexTargetType {
         match data_type {
             DataType::Boolean => Ok(Self::Boolean),
             DataType::Int64 => Ok(Self::Int64),
+            DataType::UInt64 => Ok(Self::UInt64),
             DataType::Float64 => Ok(Self::Float64),
             DataType::Utf8 => Ok(Self::Utf8),
             DataType::LargeBinary => Ok(Self::LargeBinary),
@@ -254,6 +259,7 @@ impl From<JsonIndexTargetType> for DataType {
         match data_type {
             JsonIndexTargetType::Boolean => Self::Boolean,
             JsonIndexTargetType::Int64 => Self::Int64,
+            JsonIndexTargetType::UInt64 => Self::UInt64,
             JsonIndexTargetType::Float64 => Self::Float64,
             JsonIndexTargetType::Utf8 => Self::Utf8,
             JsonIndexTargetType::LargeBinary => Self::LargeBinary,
@@ -406,6 +412,7 @@ impl ScalarQueryParser for JsonQueryParser {
                     "json_extract",
                     "json_get",
                     "json_get_int",
+                    "json_get_uint",
                     "json_get_float",
                     "json_get_bool",
                     "json_get_string",
@@ -424,6 +431,7 @@ impl ScalarQueryParser for JsonQueryParser {
                             // Return the appropriate type based on the function
                             match udf.name() {
                                 "json_get_int" => Some(DataType::Int64),
+                                "json_get_uint" => Some(DataType::UInt64),
                                 "json_get_float" => Some(DataType::Float64),
                                 "json_get_bool" => Some(DataType::Boolean),
                                 "json_get_string" | "json_extract" => Some(DataType::Utf8),
@@ -475,6 +483,94 @@ impl TrainingRequest for JsonTrainingRequest {
 
     fn criteria(&self) -> &TrainingCriteria {
         &self.criteria
+    }
+}
+
+struct JsonTypeInference {
+    observed_types: Vec<JsonbType>,
+    has_negative_int64: bool,
+}
+
+impl JsonTypeInference {
+    fn new() -> Self {
+        Self {
+            observed_types: Vec::with_capacity(7),
+            has_negative_int64: false,
+        }
+    }
+
+    fn observe(&mut self, jsonb_type: JsonbType) {
+        if jsonb_type != JsonbType::Null && !self.observed_types.contains(&jsonb_type) {
+            self.observed_types.push(jsonb_type);
+        }
+    }
+
+    fn finish(mut self, path: &str) -> Result<DataType> {
+        self.observed_types.sort_by_key(|value| value.as_u8());
+        if self.observed_types.is_empty() {
+            return Ok(DataType::Utf8);
+        }
+
+        let has_type = |jsonb_type| self.observed_types.contains(&jsonb_type);
+        let is_numeric = self.observed_types.iter().all(|jsonb_type| {
+            matches!(
+                jsonb_type,
+                JsonbType::Int64 | JsonbType::UInt64 | JsonbType::Float64
+            )
+        });
+        if is_numeric {
+            if has_type(JsonbType::UInt64) && has_type(JsonbType::Float64) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "JSON path '{path}' contains both UInt64 and Float64 values, which cannot share a lossless JSON index type"
+                    )
+                    .into(),
+                ));
+            }
+            if has_type(JsonbType::UInt64) {
+                if self.has_negative_int64 {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "JSON path '{path}' contains negative Int64 and UInt64 values, which cannot share a lossless JSON index type"
+                        )
+                        .into(),
+                    ));
+                }
+                return Ok(DataType::UInt64);
+            }
+            if has_type(JsonbType::Float64) {
+                return Ok(DataType::Float64);
+            }
+            return Ok(DataType::Int64);
+        }
+
+        if self
+            .observed_types
+            .iter()
+            .all(|jsonb_type| matches!(jsonb_type, JsonbType::Array | JsonbType::Object))
+        {
+            return Ok(DataType::LargeBinary);
+        }
+
+        if self.observed_types.len() == 1 {
+            return Ok(match self.observed_types[0] {
+                JsonbType::Boolean => DataType::Boolean,
+                JsonbType::Int64 => DataType::Int64,
+                JsonbType::UInt64 => DataType::UInt64,
+                JsonbType::Float64 => DataType::Float64,
+                JsonbType::String => DataType::Utf8,
+                JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
+                JsonbType::Null => DataType::Utf8,
+            });
+        }
+
+        Err(Error::invalid_input_source(
+            format!(
+                "JSON path '{path}' contains incompatible JSON types {:?}",
+                self.observed_types
+            )
+            .into(),
+        ))
     }
 }
 
@@ -536,7 +632,11 @@ impl JsonIndexPlugin {
         project.execute(0, ctx.task_ctx()).map_err(Into::into)
     }
 
-    fn infer_type_from_batch(batch: &RecordBatch, path: &str) -> Result<Option<DataType>> {
+    fn infer_type_from_batch(
+        batch: &RecordBatch,
+        path: &str,
+        inference: &mut JsonTypeInference,
+    ) -> Result<()> {
         let json_result_column = batch
             .column_by_name("json_result")
             .ok_or_else(|| Error::invalid_input_source("Missing json_result column".into()))?;
@@ -544,6 +644,12 @@ impl JsonIndexPlugin {
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| Error::invalid_input_source("json_result is not a struct".into()))?;
+        let value_array = struct_array
+            .column_by_name("value")
+            .ok_or_else(|| Error::invalid_input_source("Missing value column in struct".into()))?
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::invalid_input_source("value is not LargeBinary".into()))?;
         let type_array = struct_array
             .column_by_name("type_tag")
             .ok_or_else(|| Error::invalid_input_source("Missing type_tag column in struct".into()))?
@@ -551,55 +657,62 @@ impl JsonIndexPlugin {
             .downcast_ref::<UInt8Array>()
             .ok_or_else(|| Error::invalid_input_source("type_tag is not UInt8".into()))?;
 
-        for type_tag in type_array.iter().flatten() {
+        for index in 0..type_array.len() {
+            if value_array.is_null(index) {
+                continue;
+            }
+            if type_array.is_null(index) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "JSON path '{path}' has a value at batch row {index} without a type tag"
+                    )
+                    .into(),
+                ));
+            }
+            let type_tag = type_array.value(index);
             let jsonb_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
                 Error::invalid_input_source(
                     format!("JSON path '{path}' produced invalid type tag {type_tag}").into(),
                 )
             })?;
-            let data_type = match jsonb_type {
-                JsonbType::Null => continue,
-                JsonbType::Boolean => DataType::Boolean,
-                JsonbType::Int64 => DataType::Int64,
-                JsonbType::Float64 => DataType::Float64,
-                JsonbType::String => DataType::Utf8,
-                JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
-            };
-            return Ok(Some(data_type));
+            if jsonb_type == JsonbType::Int64 {
+                let raw_jsonb = jsonb::RawJsonb::new(value_array.value(index));
+                let value = jsonb::from_raw_jsonb::<i64>(&raw_jsonb).map_err(|error| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Failed to inspect Int64 at JSON path '{path}', batch row {index}: {error}"
+                        )
+                        .into(),
+                    )
+                })?;
+                inference.has_negative_int64 |= value < 0;
+            }
+            inference.observe(jsonb_type);
         }
-        Ok(None)
+        Ok(())
     }
 
-    /// Extract JSON and infer the target type from the first non-null value.
+    /// Extract JSON and infer one lossless target type from the complete stream.
     ///
-    /// Only the prefix needed for inference is buffered. Once a type is found,
-    /// the remainder of the input stays streaming.
+    /// The extracted stream is replayable and memory-bounded. Larger inputs spill
+    /// to disk, so complete type inference does not collect every batch in memory.
     async fn extract_json_with_type_info(
         data: SendableRecordBatchStream,
         path: String,
     ) -> Result<(SendableRecordBatchStream, DataType)> {
-        let mut stream = Self::extract_json(data, path.clone())?;
-        let schema = stream.schema();
-        let mut buffered_batches = Vec::new();
-        let mut inferred_type = None;
+        let extracted = Self::extract_json(data, path.clone())?;
+        let provider = spilling_table_provider(extracted, JSON_TYPE_INFERENCE_MEMORY_LIMIT).await?;
+        let mut inference_stream = provider_to_stream(provider.clone()).await?;
+        let mut inference = JsonTypeInference::new();
 
-        while let Some(batch_result) = stream.next().await {
+        while let Some(batch_result) = inference_stream.next().await {
             let batch = batch_result?;
-            inferred_type = Self::infer_type_from_batch(&batch, &path)?;
-            buffered_batches.push(batch);
-            if inferred_type.is_some() {
-                break;
-            }
+            Self::infer_type_from_batch(&batch, &path, &mut inference)?;
         }
 
-        let inferred_type = inferred_type.unwrap_or(DataType::Utf8);
-        let buffered = futures::stream::iter(buffered_batches.into_iter().map(Ok));
-        let recreated_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            buffered.chain(stream),
-        )) as SendableRecordBatchStream;
-
-        Ok((recreated_stream, inferred_type))
+        let inferred_type = inference.finish(&path)?;
+        let replay = provider_to_stream(provider).await?;
+        Ok((replay, inferred_type))
     }
 
     fn validate_json_types(
@@ -635,6 +748,9 @@ impl JsonIndexPlugin {
             let is_compatible = match target_type {
                 DataType::Boolean => actual_type == JsonbType::Boolean,
                 DataType::Int64 => actual_type == JsonbType::Int64,
+                DataType::UInt64 => {
+                    matches!(actual_type, JsonbType::Int64 | JsonbType::UInt64)
+                }
                 DataType::Float64 => {
                     matches!(actual_type, JsonbType::Int64 | JsonbType::Float64)
                 }
@@ -728,6 +844,27 @@ impl JsonIndexPlugin {
                             Error::invalid_input_source(
                                 format!(
                                     "Failed to convert JSON path '{path}' at batch row {i} to Int64: {error}"
+                                )
+                                .into(),
+                            )
+                        })?;
+                        builder.append_value(value);
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::UInt64 => {
+                let mut builder =
+                    arrow_array::builder::UInt64Builder::with_capacity(binary_array.len());
+                for i in 0..binary_array.len() {
+                    if is_null(i) {
+                        builder.append_null();
+                    } else {
+                        let raw_jsonb = jsonb::RawJsonb::new(binary_array.value(i));
+                        let value = raw_jsonb.to_u64().map_err(|error| {
+                            Error::invalid_input_source(
+                                format!(
+                                    "Failed to convert JSON path '{path}' at batch row {i} to UInt64: {error}"
                                 )
                                 .into(),
                             )
@@ -1207,6 +1344,52 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+    }
+
+    #[rstest]
+    #[case::small_first(r#"{"v": 1}"#, r#"{"v": 9223372036854775808}"#, [1, 9223372036854775808])]
+    #[case::large_first(r#"{"v": 9223372036854775808}"#, r#"{"v": 1}"#, [9223372036854775808, 1])]
+    #[tokio::test]
+    async fn test_json_uint64_inference_uses_complete_stream(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] expected: [u64; 2],
+    ) {
+        use arrow_array::UInt64Array;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::{TryStreamExt, stream};
+
+        let first_batch = json_update_batch(&[first], vec![0]);
+        let second_batch = json_update_batch(&[second], vec![1]);
+        let schema = first_batch.schema();
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter([Ok(first_batch), Ok(second_batch)]),
+        )) as SendableRecordBatchStream;
+
+        let (extracted, inferred_type) =
+            JsonIndexPlugin::extract_json_with_type_info(source, "$.v".to_string())
+                .await
+                .unwrap();
+        assert_eq!(inferred_type, DataType::UInt64);
+
+        let converted =
+            JsonIndexPlugin::convert_stream_by_type(extracted, inferred_type, "$.v".to_string())
+                .unwrap();
+        let batches: Vec<RecordBatch> = converted.try_collect().await.unwrap();
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[VALUE_COLUMN_NAME]
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
     }
 
     /// Trains a JSON-path index of `target_index_type` over `json_docs` (fed to the

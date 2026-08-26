@@ -5854,6 +5854,76 @@ async fn test_json_btree_index_statistics() {
 }
 
 #[rstest]
+#[case::small_first(
+    &[r#"{"val": 1}"#],
+    &[r#"{"val": 9223372036854775808}"#, r#"{"val": 9223372036854775809}"#]
+)]
+#[case::large_first(
+    &[r#"{"val": 9223372036854775808}"#, r#"{"val": 9223372036854775809}"#],
+    &[r#"{"val": 1}"#]
+)]
+#[tokio::test]
+async fn test_json_btree_uint64_is_lossless_and_order_independent(
+    #[case] first_fragment: &[&str],
+    #[case] second_fragment: &[&str],
+) {
+    let first = json_batch(first_fragment.to_vec());
+    let schema = first.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let second = json_batch(second_fragment.to_vec());
+    let schema = second.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(second)], schema), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let predicate = "json_get_uint(json, 'val') = 9223372036854775809";
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(predicate).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+        "Expected UInt64 JSON BTree query:\n{plan}"
+    );
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(indexed.num_rows(), 1);
+    assert_eq!(indexed, baseline);
+}
+
+#[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
 #[tokio::test]

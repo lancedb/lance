@@ -22,6 +22,7 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_udf());
     ctx.register_udf(json::json_get_string_udf());
     ctx.register_udf(json::json_get_int_udf());
+    ctx.register_udf(json::json_get_uint_udf());
     ctx.register_udf(json::json_get_float_udf());
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
