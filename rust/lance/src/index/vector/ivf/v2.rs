@@ -2088,7 +2088,7 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
-    use lance_index::vector::quantizer::QuantizerMetadata;
+    use lance_index::vector::quantizer::{Quantizer, QuantizerMetadata};
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
@@ -2659,6 +2659,8 @@ mod tests {
 
         let test_dir = TempStrDir::default();
         let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS);
+        let repeated_batch = batch.clone();
+        let repeated_schema = schema.clone();
         let vectors = batch["vector"].as_fixed_size_list().clone();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
@@ -2667,7 +2669,9 @@ mod tests {
 
         let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
         ivf_params.max_iters = 2;
-        ivf_params.sample_rate = 16;
+        // Scan the entire fixture so IVF training does not enter the
+        // OS-seeded sampling path before seeded k-means starts.
+        ivf_params.sample_rate = LIGHTWEIGHT_PQ_ROWS / LIGHTWEIGHT_PQ_PARTITIONS;
         ivf_params.kmeans_seed = Some(42);
         let pq_params = lightweight_pq_params_with_bits(num_bits);
         let params = if use_hnsw {
@@ -2741,6 +2745,46 @@ mod tests {
             .count() as f32
             / K as f32;
         assert_ge!(recall, 0.5, "recall: {recall}");
+
+        let repeated_test_dir = TempStrDir::default();
+        let repeated_batches = RecordBatchIterator::new(vec![Ok(repeated_batch)], repeated_schema);
+        let mut repeated_dataset =
+            Dataset::write(repeated_batches, repeated_test_dir.as_str(), None)
+                .await
+                .unwrap();
+        repeated_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let first_index = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        let repeated_index =
+            load_vector_index_context(&repeated_dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            first_index.index.ivf_model().centroids,
+            repeated_index.index.ivf_model().centroids
+        );
+        assert_eq!(
+            first_index.index.ivf_model().loss,
+            repeated_index.index.ivf_model().loss
+        );
+        assert_eq!(
+            first_index.index.ivf_model().lengths,
+            repeated_index.index.ivf_model().lengths
+        );
+        let Quantizer::Product(first_pq) = first_index.index.quantizer() else {
+            panic!("expected product quantizer");
+        };
+        let Quantizer::Product(repeated_pq) = repeated_index.index.quantizer() else {
+            panic!("expected product quantizer");
+        };
+        assert_eq!(first_pq.codebook, repeated_pq.codebook);
 
         drop(dataset);
         let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
