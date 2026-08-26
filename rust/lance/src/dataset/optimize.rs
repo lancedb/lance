@@ -2960,8 +2960,6 @@ pub async fn commit_compaction(
 pub struct CompactionCommitOptions {
     /// The caller already reserved and assigned every output fragment ID.
     pub fragment_ids_reserved: bool,
-    /// Dataset configuration values to atomically upsert with the rewrite.
-    pub config_upsert_values: Option<HashMap<String, String>>,
 }
 
 /// Reserve and assign final IDs to every output fragment in a set of rewrite results.
@@ -2983,8 +2981,7 @@ pub async fn reserve_fragment_ids_for_compaction(
     reserve_fragment_ids(dataset, fragments.into_iter()).await
 }
 
-/// Commit compaction results with optional pre-reserved fragment IDs and
-/// atomic dataset configuration updates.
+/// Commit compaction results with optional pre-reserved fragment IDs.
 pub async fn commit_compaction_with_options(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
@@ -3250,7 +3247,6 @@ pub async fn commit_compaction_with_options(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
-            config_upsert_values: commit_options.config_upsert_values.clone(),
         },
     )
     .transaction_properties(options.transaction_properties.clone())
@@ -3666,60 +3662,6 @@ mod tests {
                     .any(|group| group.iter().copied().collect::<HashSet<_>>() == ids)
             );
         }
-    }
-
-    #[tokio::test]
-    async fn compaction_can_atomically_upsert_dataset_config() {
-        let test_dir = TempStrDir::default();
-        let data = sample_data();
-        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-        let mut dataset = Dataset::write(
-            reader,
-            &test_dir,
-            Some(WriteParams {
-                max_rows_per_file: 2_500,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let options = CompactionOptions {
-            target_rows_per_fragment: 10_000,
-            ..Default::default()
-        };
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        let dataset_ref = &dataset;
-        let mut results = futures::future::try_join_all(
-            plan.compaction_tasks()
-                .map(|task| async move { task.execute(dataset_ref).await }),
-        )
-        .await
-        .unwrap();
-        reserve_fragment_ids_for_compaction(&dataset, &mut results)
-            .await
-            .unwrap();
-        commit_compaction_with_options(
-            &mut dataset,
-            results,
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
-            &CompactionCommitOptions {
-                fragment_ids_reserved: true,
-                config_upsert_values: Some(HashMap::from([(
-                    "test.rewrite.pointer".to_string(),
-                    "2".to_string(),
-                )])),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            dataset
-                .config()
-                .get("test.rewrite.pointer")
-                .map(String::as_str),
-            Some("2")
-        );
     }
 
     fn list_data_files(uri: &str) -> std::collections::BTreeSet<String> {

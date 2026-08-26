@@ -292,25 +292,8 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
-        // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
-        let rewrite_updates_config = matches!(
-            ours,
-            Operation::Rewrite {
-                config_upsert_values: Some(_),
-                ..
-            }
-        ) || matches!(
-            theirs,
-            Operation::Rewrite {
-                config_upsert_values: Some(_),
-                ..
-            }
-        );
-        if rewrite_updates_config && ours.upsert_key_conflict(theirs) {
-            return Err(self.retryable_conflict_err(other_transaction, other_version));
-        }
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
         {
@@ -2986,7 +2969,6 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                config_upsert_values: None,
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -3126,7 +3108,6 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
-                    config_upsert_values: None,
                 },
                 [
                     Compatible,    // append
@@ -3149,7 +3130,6 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
-                    config_upsert_values: None,
                 },
                 [
                     Compatible,    // append
@@ -3507,7 +3487,6 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
-            config_upsert_values: None,
         };
 
         let fragment0 = Fragment::new(0);
@@ -3653,7 +3632,6 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
-            config_upsert_values: None,
         };
 
         for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
@@ -4288,7 +4266,6 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(frag_reuse_index),
-                config_upsert_values: None,
             },
             None,
         );
@@ -4774,7 +4751,6 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
-                    config_upsert_values: None,
                 },
                 Retryable,
             ),
@@ -4790,7 +4766,6 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
-                    config_upsert_values: None,
                 },
                 Compatible,
             ),

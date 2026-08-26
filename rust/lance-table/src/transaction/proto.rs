@@ -153,7 +153,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 groups,
                 rewritten_indices,
-                config_upsert_values,
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
@@ -181,11 +180,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                     groups,
                     rewritten_indices,
                     frag_reuse_index: None,
-                    config_upsert_values: if config_upsert_values.is_empty() {
-                        None
-                    } else {
-                        Some(config_upsert_values)
-                    },
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -562,7 +556,6 @@ impl From<&Transaction> for pb::Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index: _,
-                config_upsert_values,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -572,7 +565,6 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(|rewritten| rewritten.into())
                     .collect(),
-                config_upsert_values: config_upsert_values.clone().unwrap_or_default(),
                 ..Default::default()
             }),
             Operation::CreateIndex {

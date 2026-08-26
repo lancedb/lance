@@ -495,7 +495,6 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     rewritten_indices,
                     // TODO: pass frag_reuse_index when available
                     frag_reuse_index: None,
-                    config_upsert_values: None,
                 };
                 Ok(Self(op))
             }

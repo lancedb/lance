@@ -791,7 +791,6 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
-                ..
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -1326,10 +1325,6 @@ impl Transaction {
 
         match &self.operation {
             Operation::Overwrite {
-                config_upsert_values: Some(tm),
-                ..
-            }
-            | Operation::Rewrite {
                 config_upsert_values: Some(tm),
                 ..
             } => {
