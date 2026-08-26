@@ -15,6 +15,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+import pytest
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -301,17 +302,32 @@ class JsonIndex(UpgradeDowngradeTest):
 
     def check_read(self):
         """Verify JSON index can be queried."""
+        if os.environ.get("LANCE_COMPAT_JSON_EXPECT_REJECTION") == "1":
+            with pytest.raises(
+                ValueError, match="cannot be read by this version of Lance"
+            ):
+                lance.dataset(self.path)
+            return
+
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="json_get_int(json, 'val') == 7")
         assert table.num_rows == 1
         assert table.column("idx").to_pylist() == [7]
 
-        # Verify index is used
+        # Legacy JSON index details do not record their trained target type.
+        # Current readers must scan rather than risk an incompatible exact lookup.
         explain = ds.scanner(filter="json_get_int(json, 'val') == 7").explain_plan()
-        assert "ScalarIndexQuery" in explain
+        assert "ScalarIndexQuery" not in explain
 
     def check_write(self):
         """Verify can insert data with JSON index."""
+        if os.environ.get("LANCE_COMPAT_JSON_EXPECT_REJECTION") == "1":
+            with pytest.raises(
+                ValueError, match="cannot be read by this version of Lance"
+            ):
+                lance.dataset(self.path)
+            return
+
         ds = lance.dataset(self.path)
         data = pa.table(
             {
@@ -321,6 +337,11 @@ class JsonIndex(UpgradeDowngradeTest):
         )
         ds.insert(data)
         ds.optimize.compact_files()
+
+    def compat_env(self, version: str, method_name: str) -> dict[str, str]:
+        if method_name in {"check_read", "check_write"}:
+            return {"LANCE_COMPAT_JSON_EXPECT_REJECTION": "1"}
+        return {}
 
 
 @compat_test(min_version="0.36.0")
