@@ -687,6 +687,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                     StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
 
+        This is always the streaming shape. `explain_plan` receives a schema rather
+        than data, so it cannot know how `execute` would wrap the source, and a
+        materialized source such as a `pa.Table` reports statistics that can put the
+        source on the collected side of the join instead of the target. Use
+        `analyze_plan`, which receives the real source, when the collected side
+        matters. Note that `analyze_plan` runs the merge to collect metrics and may
+        write data files, whereas `explain_plan` writes nothing.
+
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
         ...     pa.field("id", pa.int64()),
@@ -767,11 +775,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                         DataSourceExec: ..., metrics=[]
                       LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
 
-        `new_data` above is a `pa.Table`, so it is wrapped in an in-memory table
-        whose exact row count lets the join collect the source rather than the
-        target. Passing a `pa.RecordBatchReader` instead reports no statistics, and
-        the plan collects the target and reads `StreamingTableExec` on the source
-        side. The plan reported here is always the one that source would run.
+        The reported plan follows how the source was passed. `new_data` above is a
+        `pa.Table`, so it is wrapped in an in-memory table that reports exact
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
+        which side of the join to collect from those statistics and from the two
+        sides' sizes, so the same merge can plan differently depending on which one
+        you hand it. Use `explain_plan` only for the streaming shape: it takes a
+        schema rather than data, so it cannot know how the source would be wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes

@@ -3617,6 +3617,9 @@ def test_merge_insert_analyze_plan_matches_execute_routing():
             .when_not_matched_insert_all()
         )
 
+    # Two source rows against the target's 64 keeps the source the smaller side,
+    # which is what lets the join collect it. Raise it above 64 and the join
+    # collects the target instead and the join type stays Right.
     source = pa.table({"id": [1, 100], "value": [999, 999]})
 
     materialized = builder().analyze_plan(source)

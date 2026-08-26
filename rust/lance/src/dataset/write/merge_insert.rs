@@ -2931,6 +2931,14 @@ impl MergeInsertJob {
     /// * `schema` - Optional schema of the source data. If None, uses the dataset's schema
     /// * `verbose` - If true, provides more detailed information in the plan output
     ///
+    /// A schema says nothing about how the source would be wrapped, so this always
+    /// reports the streaming shape: the source is stood in for by an empty one-shot
+    /// stream, which reports no statistics. A materialized or re-scannable source
+    /// reports statistics that can move the collected side of the join, so use
+    /// [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`] when that
+    /// side matters. Those execute the merge to collect metrics and may write data
+    /// files; this method writes nothing.
+    ///
     /// # Errors
     ///
     /// Returns Error::NotSupported if the merge insert configuration doesn't support
@@ -2997,7 +3005,13 @@ impl MergeInsertJob {
     /// Mirrors [`Self::execute_batches`]: the batches are wrapped in a
     /// [`MemTable`], so the reported plan is the one an in-memory source actually
     /// runs. That plan can differ from the streaming one, because the join picks
-    /// its build side from the statistics the source reports.
+    /// its collected side from the statistics each source reports.
+    ///
+    /// Two cases where the plan reported here is the streaming one anyway:
+    /// [`SourceDedupeBehavior::FirstSeen`] deduplicates the source ahead of the
+    /// join and re-wraps it in a stream, hiding the in-memory node; and an empty
+    /// `batches` carries no schema, so the provider falls back to the dataset's
+    /// (see [`Self::analyze_plan_provider`]).
     ///
     /// [`MemTable`]: datafusion::datasource::MemTable
     pub async fn analyze_plan_batches(&self, batches: Vec<RecordBatch>) -> Result<String> {
@@ -3007,11 +3021,28 @@ impl MergeInsertJob {
 
     /// [`Self::analyze_plan`] from a re-scannable [`TableProvider`].
     ///
-    /// Mirrors [`Self::execute_provider`].
+    /// Mirrors [`Self::execute_provider`]. Under
+    /// [`SourceDedupeBehavior::FirstSeen`] the provider is re-wrapped in a stream
+    /// before the join, so its own node does not appear in the reported plan.
+    ///
+    /// The support check runs against `provider.schema()`, which is the source
+    /// schema the caller supplied. For a provider built from an empty batch list
+    /// that schema is the dataset's, so a source whose declared schema the dataset
+    /// does not have is reported rather than rejected. `execute_batches` builds its
+    /// provider the same way, so the two agree.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotSupported` when the configuration cannot use the plan path
+    ///   (a partial-schema source, or a scalar-index execution path).
+    /// * `Error::invalid_input` from the support check, e.g. a non-nullable dataset
+    ///   column the source does not supply.
+    /// * Any error from building or executing the plan. This method runs the merge
+    ///   to collect metrics, so I/O and source-deduplication failures surface here.
     pub async fn analyze_plan_provider(&self, provider: Arc<dyn TableProvider>) -> Result<String> {
         // Check if we can use create_plan
         if !self.can_use_create_plan(provider.schema().as_ref()).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support plan reporting. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
         // Clone self since create_plan consumes the job
@@ -8981,6 +9012,13 @@ mod tests {
     /// This is about which side is buffered, not about how much the target reads.
     /// The target scan projects `other` either way, because the `RewriteRows` fill
     /// reads it from the target side of the join.
+    ///
+    /// Both expectations characterise DataFusion's choice rather than any Lance
+    /// logic, and Lance sets no `hash_join_single_partition_threshold*` of its own,
+    /// so this rides on DataFusion's defaults (1 MiB / 128 Ki rows). A DataFusion
+    /// upgrade that changes them fails this test without anything in Lance
+    /// regressing, which is the point: the plan shape is what merge_insert's memory
+    /// use depends on, so a silent change to it should not go unnoticed.
     #[tokio::test]
     async fn test_plan_join_build_side_follows_source_statistics() {
         fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
@@ -9095,7 +9133,11 @@ mod tests {
             .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let ds = Arc::new(Dataset::write(data, "memory://", None).await.unwrap());
 
-        // Full schema: `analyze_plan` only supports sources that cover it.
+        // Full schema: `analyze_plan` only supports sources that cover it. Two rows
+        // against the target's 64 keeps the source the smaller side, which is what
+        // makes the join collect it here; both sides are under DataFusion's collect
+        // threshold, so the choice comes from comparing row counts. Raise the source
+        // above 64 and the join collects the target instead.
         let source =
             record_batch!(("key", UInt32, [1, 100]), ("value", UInt32, [999, 999])).unwrap();
 
@@ -9118,7 +9160,19 @@ mod tests {
         );
         assert!(
             materialized.contains("join_type=Left"),
-            "collecting the source rewrites the join type:\n{materialized}"
+            "collecting the source, which is the smaller side here, rewrites the join type:\n{materialized}"
+        );
+
+        // The provider entry is public too, and the batches entry is a thin wrapper
+        // over it, so pin it directly rather than only through that wrapper.
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(source.schema(), vec![vec![source.clone()]])
+                .unwrap(),
+        );
+        let from_provider = new_job().analyze_plan_provider(provider).await.unwrap();
+        assert!(
+            from_provider.contains("DataSourceExec") && from_provider.contains("join_type=Left"),
+            "a provider with exact statistics reports the same shape as its batches:\n{from_provider}"
         );
 
         let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
