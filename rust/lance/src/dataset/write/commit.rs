@@ -315,8 +315,13 @@ impl<'a> CommitBuilder<'a> {
                 {
                     commit_handler.clone()
                 } else {
-                    resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
-                        .await?
+                    resolve_commit_handler(
+                        uri,
+                        self.commit_handler.clone(),
+                        &self.store_params,
+                        Some(session.store_registry().as_ref()),
+                    )
+                    .await?
                 };
                 let (object_store, base_path) = if let Some(passed_store) = self.object_store {
                     (

@@ -2358,7 +2358,7 @@ mod tests {
         let uri = tmp.as_str();
         let schema = simple_schema();
         let batch = simple_batch(&schema, vec![1, 2, 3]);
-        let commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+        let commit_handler = commit_handler_from_url("cos://bucket/dataset", &None, None)
             .await
             .unwrap();
         let params = WriteParams {

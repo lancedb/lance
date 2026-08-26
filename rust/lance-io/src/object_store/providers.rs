@@ -38,9 +38,39 @@ pub mod tencent;
 #[cfg(feature = "tos")]
 pub mod tos;
 
+/// Which built-in commit handler a provider's stores should use.
+///
+/// Commit-handler selection is otherwise inferred from the URL scheme. A
+/// registered out-of-tree provider serves a scheme that the built-in resolver
+/// does not recognize, so this lets the provider declare the guarantee its
+/// store actually offers instead of falling back to a scheme-string guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitHandlerType {
+    /// Atomic put-if-not-exists. Safe for concurrent writers: a second writer
+    /// racing on the same manifest version gets a conflict instead of silently
+    /// overwriting. This is the default; it fits any store whose backend
+    /// supports create-if-not-exists (most object stores).
+    #[default]
+    ConditionalPut,
+    /// Blind overwrite with no concurrency protection. A store that cannot
+    /// offer atomic create-if-not-exists should return this so callers get the
+    /// documented "concurrent writes may lose data" behavior rather than an
+    /// error at commit time.
+    Unsafe,
+}
+
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+
+    /// The commit handler this provider's stores should use.
+    ///
+    /// Defaults to the conflict-safe [`CommitHandlerType::ConditionalPut`].
+    /// Override it to return [`CommitHandlerType::Unsafe`] for a store that
+    /// cannot support atomic create-if-not-exists.
+    fn commit_handler(&self) -> CommitHandlerType {
+        CommitHandlerType::ConditionalPut
+    }
 
     /// Extract the path relative to the base of the store.
     ///

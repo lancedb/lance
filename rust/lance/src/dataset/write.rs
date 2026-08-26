@@ -1840,6 +1840,7 @@ async fn resolve_commit_handler(
     uri: &str,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_options: &Option<ObjectStoreParams>,
+    registry: Option<&ObjectStoreRegistry>,
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => {
@@ -1853,7 +1854,7 @@ async fn resolve_commit_handler(
                     "when creating a dataset with a custom object store the commit_handler must also be specified",
                 ));
             }
-            commit_handler_from_url(uri, store_options).await
+            commit_handler_from_url(uri, store_options, registry).await
         }
         Some(commit_handler) => {
             if uri.starts_with("s3+ddb") {

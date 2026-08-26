@@ -141,7 +141,7 @@ fn stream_copy_error(
     }))
 }
 
-pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use providers::{CommitHandlerType, ObjectStoreProvider, ObjectStoreRegistry};
 pub use read_dir::ReadDirOptions;
 pub use storage_options::{
     BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,

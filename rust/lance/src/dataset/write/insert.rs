@@ -376,7 +376,7 @@ impl<'a> InsertBuilder<'a> {
                     .map(|s| s.store_registry())
                     .unwrap_or_else(|| Arc::new(Default::default()));
                 let (object_store, base_path) = ObjectStore::from_uri_and_params(
-                    registry,
+                    registry.clone(),
                     uri,
                     &params.store_params.clone().unwrap_or_default(),
                 )
@@ -385,6 +385,7 @@ impl<'a> InsertBuilder<'a> {
                     uri,
                     params.commit_handler.clone(),
                     &params.store_params,
+                    Some(&registry),
                 )
                 .await?;
                 (object_store, base_path, commit_handler)
@@ -522,7 +523,7 @@ mod test {
             ))
             .await
             .unwrap();
-        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None, None)
             .await
             .unwrap();
 
