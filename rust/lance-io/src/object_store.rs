@@ -1126,9 +1126,11 @@ impl ObjectStore {
     ) -> Result<WriteResult> {
         let started_at = Instant::now();
         if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
-            let source_size = self.size(source_path).await.map_err(|source| {
-                stream_copy_error("source metadata", source_path, destination_path, source)
-            })?;
+            let source_size = std::fs::metadata(super::local::to_local_path(source_path))
+                .map_err(|source| {
+                    stream_copy_error("source metadata", source_path, destination_path, source)
+                })?
+                .len();
             let source_size = usize::try_from(source_size).map_err(|source| {
                 stream_copy_error(
                     "source size conversion",
