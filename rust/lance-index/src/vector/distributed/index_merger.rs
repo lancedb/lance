@@ -69,6 +69,11 @@ static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
 
+/// Rows per decoded batch when scanning a segment's row id column. This bounds
+/// the transient decode buffer, while the accumulated id set still grows with
+/// the segment's distinct row ids.
+const ROW_ID_READ_BATCH_SIZE: u32 = 64 * 1024;
+
 /// Strict bitwise equality check for FixedSizeListArray values.
 /// Returns true only if length, value_length and all underlying primitive values are equal.
 fn fixed_size_list_equal(a: &FixedSizeListArray, b: &FixedSizeListArray) -> bool {
@@ -292,7 +297,7 @@ pub async fn read_segment_row_ids(
     let mut stream = reader
         .read_stream_projected(
             lance_io::ReadBatchParams::RangeFull,
-            u32::MAX,
+            ROW_ID_READ_BATCH_SIZE,
             4,
             projection,
             lance_encoding::decoder::FilterExpression::no_filter(),
@@ -1970,6 +1975,37 @@ mod tests {
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
         Ok(total_rows)
+    }
+
+    /// Row identity must accumulate correctly across the bounded read batches
+    /// that keep admission memory independent of segment size.
+    #[tokio::test]
+    async fn test_read_segment_row_ids_spans_multiple_bounded_batches() {
+        let object_store = ObjectStore::memory();
+        let segment_dir = Path::from("index/uuid");
+        let aux_path = segment_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let total_rows = 3 * ROW_ID_READ_BATCH_SIZE + 17;
+        let base_row_id = 5u64;
+        write_flat_partial_aux(
+            &object_store,
+            &aux_path,
+            1,
+            &[total_rows],
+            base_row_id,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+
+        let identity = read_segment_row_ids(&object_store, &segment_dir)
+            .await
+            .unwrap();
+        assert_eq!(identity.num_rows, total_rows as u64);
+        let expected =
+            (base_row_id..base_row_id + total_rows as u64).collect::<roaring::RoaringTreemap>();
+        assert_eq!(identity.row_ids, expected);
     }
 
     #[tokio::test]
