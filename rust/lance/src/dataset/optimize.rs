@@ -99,7 +99,9 @@ use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_inte
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{DatasetIndexExt, load_all_indices, unsupported_index_version};
+use crate::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, unsupported_index_version,
+};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -125,6 +127,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
@@ -2130,7 +2133,19 @@ async fn index_fragment_coverage(
         .manifest
         .max_fragment_id
         .map_or(0, |m| m + 1);
-    Ok(RoaringBitmap::from_sorted_iter(frags).unwrap())
+    let mut coverage = RoaringBitmap::from_sorted_iter(frags).unwrap();
+    // Reconstructed in the id space of the version the index was written
+    // against, which a later compaction has already moved on from.
+    // `load_all_indices` puts a stored bitmap into the current space by running
+    // it through the fragment-reuse index and leaves a `None` one alone, so a
+    // reconstruction has to take that step itself. Skipping it names the
+    // fragments a deferred compaction moved these rows out of, which is a set
+    // no rewrite can intersect - the guards below then wave through the rewrite
+    // of the fragment the rows actually live in.
+    if let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? {
+        frag_reuse_index.remap_fragment_bitmap(&mut coverage)?;
+    }
+    Ok(coverage)
 }
 
 /// Each index this build has no reader for, by name, and the fragments it covers.

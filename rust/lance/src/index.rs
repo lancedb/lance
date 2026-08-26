@@ -11757,6 +11757,141 @@ mod tests {
         assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
     }
 
+    /// An index old enough to predate the fragment bitmap has its coverage
+    /// reconstructed from the version it was written against, so it arrives in
+    /// that version's fragment-id space. `load_all_indices` moves a *stored*
+    /// bitmap into the current space through the fragment-reuse index and leaves
+    /// a `None` one alone, so the reconstruction has to make that move itself.
+    ///
+    /// Without it, a deferred compaction is enough to defeat both guards: the
+    /// coverage still names the fragments the rows moved out of, which no later
+    /// rewrite can intersect, so the planner stops holding anything back and the
+    /// commit boundary waves the rewrite through.
+    #[tokio::test]
+    async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{CompactionPlan, TaskData, commit_compaction};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: false,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, "id_idx").await;
+
+        // Drop the bitmap, which is what an index written before it existed
+        // looks like: coverage has to be reconstructed from `dataset_version`.
+        let hidden = manifest_index(&dataset, "id_idx").await;
+        let legacy = IndexMetadata {
+            fragment_bitmap: None,
+            ..hidden.clone()
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![legacy],
+                removed_indices: vec![hidden],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        // Deferred remap is the one compaction a build that cannot read the
+        // index may run: it hands the repair on through a fragment-reuse index.
+        // Fragments 0 and 1 become fragment 2, and the index still covers those
+        // rows - now under a different id.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let after_defer = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(after_defer, vec![2]);
+
+        // The commit-boundary half, taken first: the planner half below rewrites
+        // fragment 2 when the remap is missing, which would leave this nothing
+        // to ask about and hide whether the guard is sensitive on its own.
+        let plan = CompactionPlan {
+            tasks: vec![TaskData {
+                fragments: dataset.fragments().as_ref().clone(),
+            }],
+            read_version: dataset.version().version,
+            options: CompactionOptions::default(),
+        };
+        let mut rewrites = Vec::new();
+        for task in plan.compaction_tasks() {
+            rewrites.push(task.execute(&dataset).await.unwrap());
+        }
+        let err = commit_compaction(
+            &mut dataset,
+            rewrites,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan.options,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("id_idx") && message.contains("[2]"),
+            "the refusal has to name the index and the fragment in current ids: {message}"
+        );
+
+        // Two fragments the index never covered, so the planner half has
+        // something to compact and cannot pass by finding nothing to do.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        // The planner half: the appended pair coalesces, fragment 2 is held back.
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+        assert!(
+            dataset
+                .get_fragments()
+                .iter()
+                .any(|fragment| fragment.id() == 2),
+            "the fragment the reconstructed coverage maps to was rewritten"
+        );
+    }
+
     /// Optimizing a name whose segments this build cannot all read would commit
     /// a merged segment overlapping the one it left behind - a state
     /// `Dataset::validate` reports as corruption and no later commit can heal.
