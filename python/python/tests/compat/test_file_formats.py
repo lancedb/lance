@@ -11,6 +11,7 @@ covering various data types and file format versions.
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -19,6 +20,45 @@ from .compat_decorator import (
     compat_test,
 )
 from .util import build_basic_types, build_large
+
+PRECISE_JSON_UNSUPPORTED_READER = "12.0.0b2"
+
+
+class ExactJsonNumbersFence:
+    """Exercise the manifest fence with the last reader predating exact JSON."""
+
+    values = [
+        '{"value":18446744073709551616}',
+        '{"value":1.2345678901234567890123456789012345678}',
+    ]
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        data = pa.table({"json": pa.array(self.values, type=pa.json_())})
+        dataset = lance.write_dataset(data, self.path)
+        assert dataset.to_table().column("json").to_pylist() == self.values
+
+    def check_predecessor_rejects(self):
+        try:
+            lance.dataset(self.path).to_table()
+        except Exception as error:
+            assert "cannot be read by this version of Lance" in str(error)
+        else:
+            raise AssertionError(
+                "the predecessor read exact decimal JSONB without recognizing "
+                "its format"
+            )
+
+
+@pytest.mark.compat
+def test_exact_json_numbers_reject_predecessor_reader(venv_factory, tmp_path):
+    fence = ExactJsonNumbersFence(tmp_path / "exact_json.lance")
+    fence.create()
+
+    predecessor = venv_factory.get_venv(PRECISE_JSON_UNSUPPORTED_READER)
+    predecessor.execute_method(fence, "check_predecessor_rejects")
 
 
 # We start testing against the first release where 2.1 was stable. Before that
