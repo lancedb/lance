@@ -1158,7 +1158,7 @@ pub async fn collect_flat_fuzzy_candidates(
             async move {
                 let vocabulary = vocabulary?;
                 let Some(vocabulary) = vocabulary else {
-                    return Ok(BTreeMap::new());
+                    return Ok::<BTreeMap<u32, BTreeSet<String>>, DataFusionError>(BTreeMap::new());
                 };
                 let cached_vocabulary = Arc::new(vocabulary);
                 let overflow_vocabulary = cached_vocabulary.clone();
@@ -1179,7 +1179,9 @@ pub async fn collect_flat_fuzzy_candidates(
                 let has_overflow = !prepared.uncached.is_empty();
                 let overflow_search = async move {
                     if !has_overflow {
-                        return Ok(BTreeMap::new());
+                        return Ok::<BTreeMap<u32, BTreeSet<String>>, DataFusionError>(
+                            BTreeMap::new(),
+                        );
                     }
                     let _permit = overflow_search.acquire_owned().await.map_err(|_| {
                         DataFusionError::Execution(
@@ -1203,7 +1205,7 @@ pub async fn collect_flat_fuzzy_candidates(
                 };
                 let (mut cached, overflow) = futures::try_join!(cached_search, overflow_search)?;
                 merge_fuzzy_candidate_maps(&mut cached, overflow, max_expansions);
-                Ok(cached)
+                Ok::<BTreeMap<u32, BTreeSet<String>>, DataFusionError>(cached)
             }
         })
         .buffered(compute_concurrency);
