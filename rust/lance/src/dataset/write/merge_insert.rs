@@ -2950,7 +2950,7 @@ impl MergeInsertJob {
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan: either the source schema is not one the plan path accepts, or the join takes the scalar-index execution path.".into()));
         }
 
         // Create an empty batch with the provided schema to pass to create_plan
