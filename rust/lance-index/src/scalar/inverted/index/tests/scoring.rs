@@ -844,7 +844,12 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
     let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
     let mut results = Vec::new();
     let mut published_floors = Vec::new();
-    for partition in &index.partitions {
+    for partition_id in [0, 1] {
+        let partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == partition_id)
+            .unwrap();
         let LoadedPostings {
             postings,
             grouped_expansions,
