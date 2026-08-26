@@ -24,6 +24,7 @@ use object_store::DynObjectStore;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
+use object_store::list::PaginatedListStore;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
 use object_store::{
@@ -45,7 +46,19 @@ pub(crate) mod dynamic_opendal;
 mod list_retry;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+    feature = "goosefs",
+))]
+pub(crate) mod opendal_store;
 pub mod providers;
+pub(crate) mod read_dir;
 pub mod storage_options;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -88,6 +101,7 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use read_dir::ReadDirOptions;
 pub use storage_options::{
     BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
     LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY, StorageOptionsAccessor,
@@ -108,6 +122,11 @@ pub trait ObjectStoreExt {
         dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> BoxStream<'a, Result<ObjectMeta>>;
+}
+
+#[async_trait]
+pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
 }
 
 #[async_trait]
@@ -137,10 +156,12 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 }
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // Provider-owned native directory operations for rooted local stores.
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -159,6 +180,31 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// The backend's paginated listing API, when it has one. `None` means
+    /// [`Self::read_dir_page`] has to list a directory in full to page through it.
+    pub(crate) paginated_lister: Option<Arc<dyn PaginatedListStore>>,
+}
+
+// Hand-written because `PaginatedListStore` is not `Debug`.
+impl std::fmt::Debug for ObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStore")
+            .field("inner", &self.inner)
+            .field("scheme", &self.scheme)
+            .field("block_size", &self.block_size)
+            .field("max_iop_size", &self.max_iop_size)
+            .field(
+                "use_constant_size_upload_parts",
+                &self.use_constant_size_upload_parts,
+            )
+            .field("list_is_lexically_ordered", &self.list_is_lexically_ordered)
+            .field("io_parallelism", &self.io_parallelism)
+            .field("download_retry_count", &self.download_retry_count)
+            .field("io_tracker", &self.io_tracker)
+            .field("store_prefix", &self.store_prefix)
+            .field("paginated_lister", &self.paginated_lister.is_some())
+            .finish()
+    }
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -183,6 +229,34 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Wrap the paginated listing API that goes with the store, if it has one.
+    ///
+    /// [`ObjectStore::read_dir_page`] pushes the page size and the resume position into
+    /// [`PaginatedListStore`], which is a separate trait from [`OSObjectStore`] and so cannot
+    /// be reached through the store [`Self::wrap`] returns. A listing that is pushed down
+    /// therefore does not pass through [`Self::wrap`], and this is where a wrapper says what
+    /// should happen instead:
+    ///
+    /// - `Some(lister)` keeps the pushdown, wrapping the lister or handing back the one
+    ///   given. Right for a wrapper that observes rather than intercepts — metering, caching,
+    ///   mirroring writes.
+    /// - `None` gives up the pushdown, so listings go through [`Self::wrap`] as a full
+    ///   directory read. Right for a wrapper that hides, rewrites or fails paths, which a
+    ///   pushed-down listing would otherwise walk straight past.
+    ///
+    /// A wrapper that keeps the pushdown must leave the listing itself alone: setting
+    /// [`offset`](object_store::list::PaginatedListOptions::offset) or changing the delimiter
+    /// breaks paging, since `read_dir_page` reads one directory level and resumes by the token
+    /// it got back.
+    ///
+    /// There is deliberately no default: getting this wrong is either a silent loss of speed
+    /// or a silent loss of the wrapper, and neither announces itself.
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>>;
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +279,18 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    // One wrapper giving up the pushdown gives it up for the chain: the listing has to go
+    // through `wrap`, which is every wrapper in the chain at once.
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        self.wrappers.iter().try_fold(original, |acc, wrapper| {
+            wrapper.wrap_paginated(store_prefix, acc)
+        })
     }
 }
 
@@ -538,6 +624,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
+                local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -547,6 +634,8 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                // Type-erased on the way in, so there is no telling if it can paginate.
+                paginated_lister: None,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -622,6 +711,14 @@ impl ObjectStore {
         self.scheme == "file" || self.scheme == "file+uring"
     }
 
+    /// Returns true when object paths directly encode absolute local filesystem paths.
+    ///
+    /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
+    /// their inner object-store implementation instead of direct filesystem access.
+    pub fn has_direct_local_paths(&self) -> bool {
+        self.is_local() && self.store_prefix == self.scheme
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -687,13 +784,26 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
+    /// Apply a [`WrappingObjectStore`] to both `inner` and `paginated_lister` together.
+    ///
+    /// Keeps both halves in sync: a wrapper returning `None` from
+    /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
+    /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
+    pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
+        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        self.paginated_lister = self
+            .paginated_lister
+            .take()
+            .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -755,7 +865,7 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -818,7 +928,7 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 if let Some(parent) = local_path.parent() {
@@ -940,7 +1050,7 @@ impl ObjectStore {
         multipart_copy_fallback: bool,
         max_single_copy: u64,
     ) -> Result<()> {
-        if self.is_local() {
+        if self.has_direct_local_paths() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -962,6 +1072,9 @@ impl ObjectStore {
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
+    ///
+    /// This enumerates the whole prefix before it returns, however many children it holds.
+    /// Use [`Self::read_dir_page`] to page through a directory instead.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
@@ -1007,7 +1120,13 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = local_dir_operations.remove_dir_all(&path).await;
+            metrics.record(&result, 0);
+            return result;
+        }
+        if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -1065,7 +1184,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.is_local() && self.scheme != "file-object-store" {
+        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
             return Ok(());
         }
 
@@ -1297,6 +1416,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1306,6 +1426,8 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            // Type-erased on the way in, so there is no telling if it can paginate.
+            paginated_lister: None,
         }
     }
 }
@@ -1744,12 +1866,138 @@ mod tests {
             // return a mocked value so we can check if the final store is the one we expect
             self.return_value.clone()
         }
+
+        // This one swaps the store out entirely, so a listing that went around it would be
+        // listing something else.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            None
+        }
     }
 
     impl TestWrapper {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    /// A lister that exists only to be wrapped.
+    #[derive(Debug)]
+    struct StubLister;
+
+    #[async_trait]
+    impl PaginatedListStore for StubLister {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _opts: object_store::list::PaginatedListOptions,
+        ) -> object_store::Result<object_store::list::PaginatedListResult> {
+            unimplemented!("this lister exists to be wrapped, not to list")
+        }
+    }
+
+    /// Records the listers it was handed, and leaves the store alone.
+    #[derive(Debug)]
+    struct PaginatedTestWrapper {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WrappingObjectStore for PaginatedTestWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            original
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}@{store_prefix}", self.name));
+            Some(original)
+        }
+    }
+
+    /// A chain hands the lister to each of its wrappers in turn. One wrapper giving up the
+    /// pushdown gives it up for the chain, and the wrappers after it are never asked: the
+    /// listing is going through `wrap` either way, which is every wrapper at once.
+    #[rstest]
+    #[case::every_wrapper_keeps_it(false, vec!["first@memory", "second@memory"])]
+    #[case::one_wrapper_gives_it_up(true, vec!["first@memory"])]
+    fn test_a_chain_wraps_the_lister_until_one_gives_it_up(
+        #[case] gives_up: bool,
+        #[case] expected_log: Vec<&str>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> =
+            vec![Arc::new(PaginatedTestWrapper {
+                name: "first",
+                log: log.clone(),
+            })];
+        if gives_up {
+            wrappers.push(Arc::new(TestWrapper {
+                called: AtomicBool::new(false),
+                return_value: Arc::new(InMemory::new()),
+            }));
+        }
+        wrappers.push(Arc::new(PaginatedTestWrapper {
+            name: "second",
+            log: log.clone(),
+        }));
+
+        let wrapped = ChainedWrappingObjectStore::new(wrappers)
+            .wrap_paginated("memory", Arc::new(StubLister));
+
+        assert_eq!(wrapped.is_none(), gives_up);
+        assert_eq!(*log.lock().unwrap(), expected_log);
+    }
+
+    /// `apply_wrapper` keeps both halves of the store in sync. A wrapper that gives up the
+    /// pushdown has to clear the lister too, or `read_dir_page` would keep talking to the
+    /// backend behind the wrapper's back.
+    #[rstest]
+    #[case::gives_up_the_pushdown(true)]
+    #[case::keeps_the_pushdown(false)]
+    fn test_apply_wrapper_keeps_inner_and_the_lister_in_sync(#[case] gives_up: bool) {
+        let replacement = Arc::new(InMemory::new());
+        let giving_up = TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        };
+        let keeping = PaginatedTestWrapper {
+            name: "passthrough",
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let wrapper: &dyn WrappingObjectStore = match gives_up {
+            true => &giving_up,
+            false => &keeping,
+        };
+
+        let mut store = ObjectStore::memory();
+        store.paginated_lister = Some(Arc::new(StubLister) as Arc<dyn PaginatedListStore>);
+        store.apply_wrapper(wrapper);
+
+        assert_eq!(
+            store.paginated_lister.is_some(),
+            !gives_up,
+            "the lister has to follow what the wrapper said"
+        );
+        // The wrapper that gives up the pushdown is also the one that swaps the store out, so
+        // whether `inner` was replaced says that `wrap` ran on the same wrapper.
+        assert_eq!(
+            Arc::ptr_eq(&store.inner, &(replacement as Arc<dyn OSObjectStore>)),
+            gives_up
+        );
     }
 
     #[tokio::test]

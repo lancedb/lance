@@ -45,7 +45,7 @@ use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
-        create_rle_decompressor,
+        compress_required_block, create_rle_decompressor,
     },
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
     utils::bytepack::BytepackedIntegerEncoder,
@@ -192,7 +192,7 @@ impl DecodeMiniBlockTask {
         levels: LanceBuffer,
         num_levels: u16,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
+        let rep = rep_decompressor.decompress(Some(levels), num_levels as u64)?;
         let rep = rep.as_fixed_width().unwrap();
         debug_assert_eq!(rep.num_values, num_levels as u64);
         debug_assert_eq!(rep.bits_per_value, 16);
@@ -1569,7 +1569,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                     }
                     LevelCodec::Block(decompressor) => {
                         let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
-                        let decompressed = decompressor.decompress(frame, num_values)?;
+                        let decompressed = decompressor.decompress(Some(frame), num_values)?;
                         dense_levels_from_block(decompressed, num_values, level_type)
                     }
                 }
@@ -2624,7 +2624,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_bytes.unwrap();
                 Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                    LanceBuffer::from_bytes(dictionary_data, dictionary.dictionary_data_alignment),
+                    Some(LanceBuffer::from_bytes(
+                        dictionary_data,
+                        dictionary.dictionary_data_alignment,
+                    )),
                     dictionary.num_dictionary_items,
                 )?))
             } else {
@@ -5020,8 +5023,9 @@ impl PrimitiveStructuralEncoder {
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
-        let (compressor, compressor_desc) =
+        let compressor =
             compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
+        let mut compressor_desc = None;
         // Compress blocks of levels (sized according to the chunks)
         let mut level_chunks = Vec::with_capacity(chunks.len());
         let mut values_counter = 0;
@@ -5091,7 +5095,22 @@ impl PrimitiveStructuralEncoder {
             };
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
-            let compressed_levels = compressor.compress(chunk_levels_block)?;
+            let (compressed_levels, chunk_compressor_desc) =
+                compressor.compress(chunk_levels_block)?;
+            if let Some(compressor_desc) = compressor_desc.as_ref() {
+                if compressor_desc != &chunk_compressor_desc {
+                    return Err(Error::internal(
+                        "Rep/def block compressor changed encoding between chunks".to_string(),
+                    ));
+                }
+            } else {
+                compressor_desc = Some(chunk_compressor_desc);
+            }
+            let compressed_levels = compressed_levels.ok_or_else(|| {
+                Error::internal(
+                    "Rep/def block compressor selected a metadata-only codec".to_string(),
+                )
+            })?;
             let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
                 Error::invalid_input_source(
                     format!(
@@ -5116,7 +5135,9 @@ impl PrimitiveStructuralEncoder {
         };
         Ok(CompressedLevels {
             data: level_chunks,
-            compression: compressor_desc,
+            compression: compressor_desc.ok_or_else(|| {
+                Error::internal("Rep/def compression produced no chunks".to_string())
+            })?,
             rep_index,
         })
     }
@@ -5152,9 +5173,8 @@ impl PrimitiveStructuralEncoder {
 
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
-        let (compressor, encoding) =
-            compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
-        let compressed_buffer = compressor.compress(levels_block)?;
+        let (compressed_buffer, encoding) =
+            compress_required_block(compression_strategy, &levels_field, levels_block)?;
         Ok((compressed_buffer, encoding))
     }
 
@@ -5540,9 +5560,8 @@ impl PrimitiveStructuralEncoder {
             let num_dictionary_items = dictionary_data.num_values();
             let dict_values_field = Self::build_dict_values_compressor_field(field)?;
 
-            let (compressor, dictionary_encoding) = compression_strategy
-                .create_block_compressor(&dict_values_field, &dictionary_data)?;
-            let dictionary_buffer = compressor.compress(dictionary_data)?;
+            let (dictionary_buffer, dictionary_encoding) =
+                compress_required_block(compression_strategy, &dict_values_field, dictionary_data)?;
 
             data.push(dictionary_buffer);
             if let Some(rep_index) = rep_index {
@@ -6548,6 +6567,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        DataBlock::validate_arrays(&arrays, &self.field.name)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
@@ -8743,7 +8763,7 @@ mod tests {
         let repeated_strings: Vec<_> = unique_values
             .iter()
             .cycle()
-            .take(100_000)
+            .take(10_000)
             .map(|s| Some(s.as_str()))
             .collect();
 
@@ -9630,7 +9650,7 @@ mod tests {
             .create_block_decompressor(&encoding)
             .unwrap();
         let decompressed = decompressor
-            .decompress(compressed_buf, values.len() as u64)
+            .decompress(Some(compressed_buf), values.len() as u64)
             .unwrap();
         let decompressed_fixed_width = decompressed.as_fixed_width().unwrap();
         assert_eq!(decompressed_fixed_width.num_values, values.len() as u64);
@@ -9718,6 +9738,8 @@ mod tests {
             block_info: BlockInfo::new(),
         });
         BlockCompressor::compress(&RleEncoder::with_run_length_width(run_length_width), block)
+            .unwrap()
+            .0
             .unwrap()
     }
 

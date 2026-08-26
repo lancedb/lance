@@ -121,6 +121,9 @@ impl BlockingDataset {
                 ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
                     .await
                     .map_err(|e| Error::io_error(e.to_string()))?;
+            lance::dataset::validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| Error::input_error(e.to_string()))?;
             object_store
                 .remove_dir_all(path)
                 .await

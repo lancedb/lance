@@ -107,6 +107,51 @@ impl RowAddrMask {
         }
     }
 
+    /// Build a mask from serialized [`RowAddrTreeMap`] payloads.
+    ///
+    /// `allow` selects rows, `block` excludes them; each is the output of
+    /// [`RowAddrTreeMap::serialize_into`]. Returns `None` when neither is given,
+    /// which callers read as "no mask" rather than "select nothing".
+    ///
+    /// Bytes rather than treemaps on purpose: a caller living in a different
+    /// dynamically-linked extension module has its own copy of these Rust types
+    /// and cannot hand one over, but both sides agree on this encoding.
+    pub fn from_serialized_parts(
+        allow: Option<&[u8]>,
+        block: Option<&[u8]>,
+    ) -> Result<Option<Self>> {
+        // Name the offending side: the underlying failure is a bare "failed to
+        // fill whole buffer", which tells a caller holding two blobs nothing.
+        fn decode(bytes: &[u8], which: &str) -> Result<RowAddrTreeMap> {
+            RowAddrTreeMap::deserialize_from(bytes).map_err(|e| {
+                Error::invalid_input(format!(
+                    "row address {which} is not a serialized RowAddrTreeMap: {e}"
+                ))
+            })
+        }
+        let allow = allow.map(|b| decode(b, "allowlist")).transpose()?;
+        let block = block.map(|b| decode(b, "blocklist")).transpose()?;
+        Ok(match (allow, block) {
+            (Some(allow), Some(block)) => Some(Self::from_allowed(allow).also_block(block)),
+            (Some(allow), None) => Some(Self::from_allowed(allow)),
+            (None, Some(block)) => Some(Self::from_block(block)),
+            (None, None) => None,
+        })
+    }
+
+    /// Intersect two masks: a row survives only if both select it.
+    ///
+    /// Lets a planner apply a caller-supplied mask at one boundary rather than
+    /// at every branch that produces rows, which is how branches get missed.
+    pub fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
+            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a).also_block(b),
+            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b).also_block(a),
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
+        }
+    }
+
     /// Also allow the given addrs
     pub fn also_allow(self, allow_list: RowAddrTreeMap) -> Self {
         match self {
@@ -623,8 +668,21 @@ impl RowAddrTreeMap {
             if bitmap_size == 0 {
                 inner.insert(fragment, RowAddrSelection::Full);
             } else {
-                let mut buffer = vec![0; bitmap_size as usize];
-                reader.read_exact(&mut buffer)?;
+                // Grow with the bytes that actually arrive instead of trusting the
+                // declared size. This is reachable from a public byte boundary, so
+                // a 12-byte payload could otherwise declare 4 GiB and abort the
+                // process on the allocation before any read fails.
+                let mut buffer = Vec::new();
+                let read = reader
+                    .by_ref()
+                    .take(u64::from(bitmap_size))
+                    .read_to_end(&mut buffer)?;
+                if read != bitmap_size as usize {
+                    return Err(Error::invalid_input(format!(
+                        "row addr treemap declares a {bitmap_size} byte bitmap for \
+                         fragment {fragment} but only {read} bytes remain"
+                    )));
+                }
                 let set = RoaringBitmap::deserialize_from(&buffer[..])?;
                 inner.insert(fragment, RowAddrSelection::Partial(set));
             }
@@ -1292,6 +1350,102 @@ mod tests {
         // Block list
         let mask = RowAddrMask::from_block(rows(&[10, 20, 30]));
         assert!(mask.iter_addrs().is_none());
+    }
+
+    #[test]
+    fn test_row_addr_mask_intersect() {
+        let a = rows(&[1, 2, 3]);
+        let b = rows(&[3, 4]);
+
+        // allow & allow -> only rows in both
+        assert_mask_selects(
+            &RowAddrMask::from_allowed(a.clone()).intersect(RowAddrMask::from_allowed(b.clone())),
+            &[3],
+            &[1, 2, 4, 100],
+        );
+        // allow & block -> allowed minus blocked
+        assert_mask_selects(
+            &RowAddrMask::from_allowed(a.clone()).intersect(RowAddrMask::from_block(b.clone())),
+            &[1, 2],
+            &[3, 4, 100],
+        );
+        // block & allow -> same, order independent
+        assert_mask_selects(
+            &RowAddrMask::from_block(b.clone()).intersect(RowAddrMask::from_allowed(a.clone())),
+            &[1, 2],
+            &[3, 4, 100],
+        );
+        // block & block -> both exclusions apply
+        assert_mask_selects(
+            &RowAddrMask::from_block(a.clone()).intersect(RowAddrMask::from_block(b)),
+            &[100],
+            &[1, 2, 3, 4],
+        );
+        // all_rows is the identity, and intersecting with itself changes nothing
+        let allow_a = RowAddrMask::from_allowed(a.clone());
+        assert_eq!(allow_a.clone().intersect(RowAddrMask::all_rows()), allow_a);
+        assert_eq!(allow_a.clone().intersect(allow_a.clone()), allow_a);
+        // allow_nothing absorbs
+        assert_mask_selects(
+            &RowAddrMask::allow_nothing().intersect(RowAddrMask::from_allowed(a)),
+            &[],
+            &[1, 2, 3, 100],
+        );
+    }
+
+    #[test]
+    fn test_row_addr_mask_from_serialized_parts() {
+        fn ser(tm: &RowAddrTreeMap) -> Vec<u8> {
+            let mut buf = Vec::new();
+            tm.serialize_into(&mut buf).unwrap();
+            buf
+        }
+        let allow = ser(&rows(&[1, 2, 3]));
+        let block = ser(&rows(&[3, 4]));
+
+        // Neither part means "no mask", which is not the same as "select nothing".
+        assert!(
+            RowAddrMask::from_serialized_parts(None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let m = RowAddrMask::from_serialized_parts(Some(&allow), None)
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2, 3], &[4, 100]);
+
+        let m = RowAddrMask::from_serialized_parts(None, Some(&block))
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2, 100], &[3, 4]);
+
+        // Block wins on the overlap.
+        let m = RowAddrMask::from_serialized_parts(Some(&allow), Some(&block))
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2], &[3, 4, 100]);
+
+        // Round trips through the same encoding the caller used.
+        let again = RowAddrMask::from_serialized_parts(Some(&ser(m.allow_list().unwrap())), None)
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&again, &[1, 2], &[3, 4]);
+
+        assert!(RowAddrMask::from_serialized_parts(Some(b"not a treemap"), None).is_err());
+
+        // A declared bitmap size must not be allocated before the bytes are
+        // known to exist: this 12-byte payload claims ~4 GiB.
+        let bomb = [
+            1u8, 0, 0, 0, // one entry
+            0, 0, 0, 0, // fragment zero
+            0xff, 0xff, 0xff, 0xff, // declared bitmap size
+        ];
+        let err = RowAddrMask::from_serialized_parts(Some(&bomb), None).unwrap_err();
+        assert!(
+            err.to_string().contains("only 0 bytes remain"),
+            "expected a length complaint, got: {err}"
+        );
     }
 
     #[test]
