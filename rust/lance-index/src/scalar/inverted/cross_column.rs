@@ -540,7 +540,7 @@ async fn prepare_column_leaves(
 
     for (leaf_ordinal, leaf) in leaf_queries {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, leaf, &effective_params);
+        let tokens = tokenize_leaf(first_index, leaf, &effective_params)?;
         let tokens_by_segment = indices
             .iter()
             .map(|index| {

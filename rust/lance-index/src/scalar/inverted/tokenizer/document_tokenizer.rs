@@ -4,6 +4,7 @@
 use arrow_schema::{DataType, Field};
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_arrow::json::JSON_EXT_NAME;
+use lance_core::Result;
 use lance_tokenizer::{BoxTokenStream, TextAnalyzer, Token, TokenStream};
 use serde_json::Value;
 
@@ -26,7 +27,7 @@ impl AsRef<str> for DocType {
 impl TryFrom<&Field> for DocType {
     type Error = lance_core::Error;
 
-    fn try_from(field: &Field) -> Result<Self, Self::Error> {
+    fn try_from(field: &Field) -> std::result::Result<Self, Self::Error> {
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
             DataType::List(field) | DataType::LargeList(field)
@@ -76,6 +77,13 @@ impl DocType {
 pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     /// Tokenize query text for search.
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a>;
+    /// Tokenize query text for search, returning invalid query syntax to the caller.
+    fn try_token_stream_for_search<'a>(
+        &'a mut self,
+        query_text: &'a str,
+    ) -> Result<BoxTokenStream<'a>> {
+        Ok(self.token_stream_for_search(query_text))
+    }
     /// Tokenize document text for index.
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a>;
     /// Clone the tokenizer.
@@ -144,8 +152,19 @@ impl std::fmt::Debug for JsonTokenizer {
 
 impl LanceTokenizer for JsonTokenizer {
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
-        let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap();
+        // This method predates fallible query tokenization. Keep it panic-free for
+        // compatibility; search execution uses `try_token_stream_for_search` so it can
+        // return the specific malformed-triple error.
+        let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap_or_default();
         BoxTokenStream::new(TTStream { tokens, index: 0 })
+    }
+
+    fn try_token_stream_for_search<'a>(
+        &'a mut self,
+        query_text: &'a str,
+    ) -> Result<BoxTokenStream<'a>> {
+        let tokens = flatten_triplet(query_text, &mut self.tokenizer)?;
+        Ok(BoxTokenStream::new(TTStream { tokens, index: 0 }))
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
@@ -306,7 +325,9 @@ mod tests {
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
         JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use lance_core::Error;
     use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use rstest::rstest;
     use serde_json::Value;
 
     #[test]
@@ -377,6 +398,21 @@ mod tests {
         assert_token(&tokens[3], 3, "d,str,hello");
         assert_token(&tokens[4], 4, "d,str,world");
         assert_token(&tokens[5], 5, "e,number,1.0");
+    }
+
+    #[rstest]
+    #[case::missing_type("brown", "Invalid triple format: brown")]
+    #[case::invalid_type("title,string,brown", "Invalid triple type: string")]
+    fn test_invalid_json_search_query(#[case] query: &str, #[case] expected_message: &str) {
+        let mut tokenizer =
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build());
+        let error = tokenizer
+            .try_token_stream_for_search(query)
+            .err()
+            .expect("invalid JSON search query should fail");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message), "{error}");
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {

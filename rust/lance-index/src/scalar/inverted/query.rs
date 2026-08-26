@@ -834,7 +834,21 @@ impl<'a> IntoIterator for &'a Tokens {
 
 pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
-    let mut stream = tokenizer.token_stream_for_search(text);
+    let stream = tokenizer.token_stream_for_search(text);
+    collect_tokens(stream, token_type)
+}
+
+/// Tokenize search text, returning tokenizer-specific query syntax errors.
+pub fn try_collect_query_tokens(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+) -> Result<Tokens> {
+    let token_type = tokenizer.doc_type();
+    let stream = tokenizer.try_token_stream_for_search(text)?;
+    Ok(collect_tokens(stream, token_type))
+}
+
+fn collect_tokens(mut stream: lance_tokenizer::BoxTokenStream<'_>, token_type: DocType) -> Tokens {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     while let Some(token) = stream.next() {

@@ -24,7 +24,8 @@ use super::{
     },
     index::{DocSet, InvertedPartition},
     query::{
-        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
+        try_collect_query_tokens,
     },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
@@ -3480,7 +3481,7 @@ pub(super) fn tokenize_leaf(
     index: &InvertedIndex,
     leaf: &LeafQuery,
     params: &FtsSearchParams,
-) -> Tokens {
+) -> Result<Tokens> {
     let is_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
         && matches!(params.fuzziness, Some(distance) if distance != 0);
     let mut tokenizer = if is_fuzzy_match {
@@ -3492,7 +3493,7 @@ pub(super) fn tokenize_leaf(
     } else {
         index.tokenizer()
     };
-    collect_query_tokens(leaf.terms(), &mut tokenizer)
+    try_collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
 pub(super) fn expanded_leaf_tokens(
@@ -3555,7 +3556,7 @@ async fn prepare_compound_query(
     let mut leaves = Vec::with_capacity(leaf_queries.len());
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
         let scorer = match &base_scorer {
             Some(scorer) => scorer.clone(),
             None => Arc::new(
