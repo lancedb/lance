@@ -113,7 +113,9 @@ public class Fragment {
    *     returns a new fragment with the updated deletion vector.
    */
   public FragmentMetadata deleteRows(List<Integer> rowIndexes) {
-    return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    }
   }
 
   private static native FragmentMetadata nativeDeleteRows(
@@ -129,7 +131,9 @@ public class Fragment {
    * @return row counts in this Fragment
    */
   public int countRows() {
-    return countRowsNative(dataset, fragmentMetadata.getId());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return countRowsNative(dataset, fragmentMetadata.getId());
+    }
   }
 
   /**
@@ -153,8 +157,10 @@ public class Fragment {
    * @return the fragment metadata and new schema.
    */
   public FragmentMergeResult mergeColumns(ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeMergeColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeMergeColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   private native FragmentMergeResult nativeMergeColumns(
@@ -186,8 +192,10 @@ public class Fragment {
    */
   public FragmentUpdateResult updateColumns(
       ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeUpdateColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeUpdateColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   public FragmentUpdateResult updateColumns(ArrowArrayStream stream) {

@@ -195,7 +195,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         &self,
         field: &LanceField,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
         let rle = match self.encoding {
             TestEncoding::Array | TestEncoding::StructuralU16 => None,

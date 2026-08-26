@@ -475,6 +475,20 @@ pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> 
     }
 }
 
+pub fn iter_binary_array(
+    arr: &dyn Array,
+) -> Result<Box<dyn Iterator<Item = Option<&[u8]>> + Send + '_>> {
+    match arr.data_type() {
+        DataType::Binary => Ok(Box::new(arr.as_binary::<i32>().iter())),
+        DataType::LargeBinary => Ok(Box::new(arr.as_binary::<i64>().iter())),
+        DataType::BinaryView => Ok(Box::new(arr.as_binary_view().iter())),
+        DataType::FixedSizeBinary(_) => Ok(Box::new(arr.as_fixed_size_binary().iter())),
+        data_type => Err(ArrowError::InvalidArgumentError(format!(
+            "Expecting a binary type, found {data_type}"
+        ))),
+    }
+}
+
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
@@ -1584,8 +1598,11 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
-    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
+    use arrow_array::{
+        BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Int32Array,
+        LargeBinaryArray, ListArray, NullArray, StringArray, StructArray, new_empty_array,
+        new_null_array,
+    };
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -2838,5 +2855,43 @@ mod tests {
             innermost_struct.column(1).as_ref(),
             &Int32Array::from(vec![1, 2]) as &dyn Array
         );
+    }
+
+    #[test]
+    fn test_iter_binary_array_accepts_binary_variants() {
+        let binary = BinaryArray::from(vec![b"a".as_slice(), b"bc"]);
+        assert_eq!(
+            iter_binary_array(&binary).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"a".as_slice()), Some(b"bc".as_slice())]
+        );
+
+        let large_binary = LargeBinaryArray::from(vec![b"x".as_slice(), b"yz"]);
+        assert_eq!(
+            iter_binary_array(&large_binary)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![Some(b"x".as_slice()), Some(b"yz".as_slice())]
+        );
+
+        let binary_view = BinaryViewArray::from(vec![b"1".as_slice(), b"23"]);
+        assert_eq!(
+            iter_binary_array(&binary_view).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"1".as_slice()), Some(b"23".as_slice())]
+        );
+
+        let fixed_size = FixedSizeBinaryArray::from(vec![b"abcd", b"efgh"]);
+        assert_eq!(
+            iter_binary_array(&fixed_size).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"abcd".as_slice()), Some(b"efgh".as_slice())]
+        );
+    }
+
+    #[test]
+    fn test_iter_binary_array_rejects_non_binary() {
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let Err(error) = iter_binary_array(&int_array) else {
+            panic!("expected an error for non-binary array");
+        };
+        assert!(error.to_string().contains("Expecting a binary type"));
     }
 }
