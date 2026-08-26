@@ -385,7 +385,7 @@ impl<'a> InsertBuilder<'a> {
                     uri,
                     params.commit_handler.clone(),
                     &params.store_params,
-                    Some(&registry),
+                    object_store.commit_handler_type(),
                 )
                 .await?;
                 (object_store, base_path, commit_handler)
@@ -523,9 +523,13 @@ mod test {
             ))
             .await
             .unwrap();
-        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None, None)
-            .await
-            .unwrap();
+        dataset.commit_handler = commit_handler_from_url(
+            "cos://bucket/dataset",
+            &None,
+            lance_io::object_store::CommitHandlerType::ConditionalPut,
+        )
+        .await
+        .unwrap();
 
         let append_batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])

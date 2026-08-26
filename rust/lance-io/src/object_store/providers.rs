@@ -244,6 +244,11 @@ impl ObjectStoreRegistry {
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
 
+        // Capture the provider's declared commit-handler capability on the
+        // exact store it built, so commit-handler resolution is bound to this
+        // store rather than a later registry lookup.
+        store.commit_handler_type = provider.commit_handler();
+
         store.inner = store.inner.traced();
 
         // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
@@ -723,5 +728,69 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         let stats = registry.stats();
         assert_eq!((stats.hits, stats.misses, stats.active_stores), (0, 0, 0));
+    }
+
+    /// A provider that builds a working in-memory store yet declares it can
+    /// only offer unsafe commits, used to prove the declared capability is
+    /// stamped onto the store the registry builds even for a known scheme.
+    #[derive(Debug)]
+    struct UnsafeMemoryProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for UnsafeMemoryProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            MemoryStoreProvider.new_store(base_path, params).await
+        }
+
+        fn commit_handler(&self) -> CommitHandlerType {
+            CommitHandlerType::Unsafe
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("memory".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_commit_handler_travels_with_store() {
+        let url = Url::parse("memory://bucket/ds").unwrap();
+
+        // A built-in provider declares the conflict-safe default, and the
+        // registry stamps that capability onto the store it builds.
+        let registry = ObjectStoreRegistry::default();
+        let store = registry
+            .new_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.commit_handler_type(),
+            CommitHandlerType::ConditionalPut
+        );
+
+        // Overriding a known scheme with a provider that declares Unsafe makes
+        // the store it builds carry Unsafe: the capability is bound to the
+        // exact store, not inferred from the scheme name.
+        let registry = ObjectStoreRegistry::default();
+        registry.insert("memory", Arc::new(UnsafeMemoryProvider));
+        let store = registry
+            .new_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(store.commit_handler_type(), CommitHandlerType::Unsafe);
+
+        // A cached store keeps the capability it was built with.
+        let cached = registry
+            .get_store(url, &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(cached.commit_handler_type(), CommitHandlerType::Unsafe);
     }
 }

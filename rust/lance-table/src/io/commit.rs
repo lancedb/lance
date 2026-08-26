@@ -50,9 +50,7 @@ pub mod dynamodb;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
-use lance_io::object_store::{
-    CommitHandlerType, ObjectStore, ObjectStoreExt, ObjectStoreParams, ObjectStoreRegistry,
-};
+use lance_io::object_store::{CommitHandlerType, ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
@@ -1106,9 +1104,11 @@ pub async fn commit_handler_from_url(
     url_or_path: &str,
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
-    // Registry consulted for schemes the built-in resolver does not recognize,
-    // so a registered provider can declare its own commit handler.
-    registry: Option<&ObjectStoreRegistry>,
+    // Commit-handler capability captured from the constructed object store.
+    // The store carries the capability its provider declared, so the default
+    // handler is bound to that exact store rather than re-queried from a
+    // registry whose providers may have changed since the store was built.
+    capability: CommitHandlerType,
 ) -> Result<Arc<dyn CommitHandler>> {
     let local_handler: Arc<dyn CommitHandler> = if cfg!(windows) {
         Arc::new(RenameCommitHandler)
@@ -1129,9 +1129,6 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "tos" | "shared-memory" | "goosefs" => {
-            Ok(Arc::new(ConditionalPutCommitHandler))
-        }
         "cos" => Ok(Arc::new(TencentCosCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
@@ -1195,22 +1192,16 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        // Unrecognized scheme. If a provider is registered for it, let the
-        // provider declare its commit handler; otherwise default to the
-        // conflict-safe put-if-not-exists handler rather than the unsafe
-        // blind-overwrite handler. A store that genuinely lacks atomic
-        // create-if-not-exists can register a provider that returns
-        // `CommitHandlerType::Unsafe`.
-        scheme => {
-            let declared = registry
-                .and_then(|r| r.get_provider(scheme))
-                .map(|p| p.commit_handler())
-                .unwrap_or_default();
-            match declared {
-                CommitHandlerType::ConditionalPut => Ok(Arc::new(ConditionalPutCommitHandler)),
-                CommitHandlerType::Unsafe => Ok(Arc::new(UnsafeCommitHandler)),
-            }
-        }
+        // Every other scheme derives its default handler from the capability
+        // captured on the constructed object store. Built-in providers declare
+        // `ConditionalPut`; a registered provider, even one overriding a known
+        // scheme such as `memory`, can declare `Unsafe`, and that declaration
+        // travels with the store it built. Explicit caller-supplied handlers
+        // are honored before this function is called and never reach here.
+        _ => match capability {
+            CommitHandlerType::ConditionalPut => Ok(Arc::new(ConditionalPutCommitHandler)),
+            CommitHandlerType::Unsafe => Ok(Arc::new(UnsafeCommitHandler)),
+        },
     }
 }
 
@@ -2115,7 +2106,9 @@ mod tests {
         // fall through to UnsafeCommitHandler and silently clobber each
         // other's manifests. Unrecognized schemes (e.g. runtime-registered
         // out-of-tree providers) default to the same conflict-safe handler.
-        let handler = commit_handler_from_url(url, &None, None).await.unwrap();
+        let handler = commit_handler_from_url(url, &None, CommitHandlerType::ConditionalPut)
+            .await
+            .unwrap();
         assert_eq!(
             format!("{:?}", handler),
             "ConditionalPutCommitHandler",
@@ -2123,44 +2116,39 @@ mod tests {
         );
     }
 
-    /// A provider that declares it can only offer unsafe commits, used to check
-    /// that a registered provider's `commit_handler()` overrides the default.
-    #[derive(Debug)]
-    struct UnsafeDeclaringProvider;
-
-    #[async_trait::async_trait]
-    impl lance_io::object_store::ObjectStoreProvider for UnsafeDeclaringProvider {
-        async fn new_store(
-            &self,
-            _base_path: url::Url,
-            _params: &lance_io::object_store::ObjectStoreParams,
-        ) -> Result<lance_io::object_store::ObjectStore> {
-            unimplemented!("test provider is only used for commit_handler()")
-        }
-
-        fn commit_handler(&self) -> CommitHandlerType {
-            CommitHandlerType::Unsafe
-        }
-    }
-
     #[tokio::test]
-    async fn test_registered_provider_declares_commit_handler() {
-        let registry = ObjectStoreRegistry::default();
-        registry.insert("custom-unsafe", Arc::new(UnsafeDeclaringProvider));
-
-        // A registered provider that declares Unsafe routes to UnsafeCommitHandler,
-        // overriding the conflict-safe default for unrecognized schemes.
-        let handler = commit_handler_from_url("custom-unsafe://bucket/ds", &None, Some(&registry))
-            .await
-            .unwrap();
+    async fn test_commit_handler_from_url_honors_store_capability() {
+        // A general object-store scheme takes its default handler from the
+        // capability captured on the constructed store: an Unsafe-declaring
+        // provider's store routes to UnsafeCommitHandler, a ConditionalPut one
+        // to ConditionalPutCommitHandler.
+        let handler =
+            commit_handler_from_url("memory://bucket/ds", &None, CommitHandlerType::Unsafe)
+                .await
+                .unwrap();
         assert_eq!(format!("{:?}", handler), "UnsafeCommitHandler");
 
-        // A scheme with no registered provider still defaults to the conflict-safe
-        // handler even when a registry is supplied.
-        let handler = commit_handler_from_url("other-scheme://bucket/ds", &None, Some(&registry))
+        let handler = commit_handler_from_url(
+            "memory://bucket/ds",
+            &None,
+            CommitHandlerType::ConditionalPut,
+        )
+        .await
+        .unwrap();
+        assert_eq!(format!("{:?}", handler), "ConditionalPutCommitHandler");
+
+        // A scheme with dedicated handling ignores the store capability: file
+        // keeps its local handler and cos keeps the Tencent handler even when
+        // the capability says Unsafe.
+        let handler = commit_handler_from_url("file:///tmp/ds", &None, CommitHandlerType::Unsafe)
             .await
             .unwrap();
-        assert_eq!(format!("{:?}", handler), "ConditionalPutCommitHandler");
+        assert_ne!(format!("{:?}", handler), "UnsafeCommitHandler");
+
+        let handler = commit_handler_from_url("cos://bucket/ds", &None, CommitHandlerType::Unsafe)
+            .await
+            .unwrap();
+        assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can
@@ -2271,9 +2259,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cos_commit_requires_custom_handler() {
-        let handler = commit_handler_from_url("cos://bucket-a/ds", &None, None)
-            .await
-            .unwrap();
+        let handler =
+            commit_handler_from_url("cos://bucket-a/ds", &None, CommitHandlerType::Unsafe)
+                .await
+                .unwrap();
         assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
 
         let mut manifest = test_manifest();

@@ -1820,7 +1820,7 @@ impl ManifestNamespace {
 
     /// Resolve the commit handler for the `__manifest` dataset's storage backend.
     async fn manifest_commit_handler(&self) -> Result<Arc<dyn CommitHandler>> {
-        commit_handler_from_url(&self.root, &None, None)
+        commit_handler_from_url(&self.root, &None, self.object_store.commit_handler_type())
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {

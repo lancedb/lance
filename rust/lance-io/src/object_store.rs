@@ -224,6 +224,11 @@ pub struct ObjectStore {
     /// The backend's paginated listing API, when it has one. `None` means
     /// [`Self::read_dir_page`] has to list a directory in full to page through it.
     pub(crate) paginated_lister: Option<Arc<dyn PaginatedListStore>>,
+    /// The commit-handler capability declared by the provider that built this
+    /// store. It is captured at construction time so the default commit handler
+    /// is bound to the exact store, not re-derived from a registry that may
+    /// have changed.
+    commit_handler_type: CommitHandlerType,
 }
 
 // Hand-written because `PaginatedListStore` is not `Debug`.
@@ -244,6 +249,7 @@ impl std::fmt::Debug for ObjectStore {
             .field("io_tracker", &self.io_tracker)
             .field("store_prefix", &self.store_prefix)
             .field("paginated_lister", &self.paginated_lister.is_some())
+            .field("commit_handler_type", &self.commit_handler_type)
             .finish()
     }
 }
@@ -677,6 +683,9 @@ impl ObjectStore {
                 store_prefix,
                 // Type-erased on the way in, so there is no telling if it can paginate.
                 paginated_lister: None,
+                // A caller-supplied store has no provider to declare a
+                // capability, so fall back to the conflict-safe default.
+                commit_handler_type: CommitHandlerType::ConditionalPut,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -777,6 +786,13 @@ impl ObjectStore {
 
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// The commit-handler capability declared by the provider that built this
+    /// store. Commit-handler resolution uses this to pick the default handler,
+    /// so the choice stays bound to the store the provider actually produced.
+    pub fn commit_handler_type(&self) -> CommitHandlerType {
+        self.commit_handler_type
     }
 
     pub fn block_size(&self) -> usize {
@@ -1797,6 +1813,13 @@ impl ObjectStore {
             store_prefix,
             // Type-erased on the way in, so there is no telling if it can paginate.
             paginated_lister: None,
+            // Derive the capability from the registered provider for this
+            // scheme when one exists; otherwise fall back to the conflict-safe
+            // default.
+            commit_handler_type: DEFAULT_OBJECT_STORE_REGISTRY
+                .get_provider(scheme)
+                .map(|provider| provider.commit_handler())
+                .unwrap_or_default(),
         }
     }
 }
