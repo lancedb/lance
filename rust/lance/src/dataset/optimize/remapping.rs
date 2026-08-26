@@ -18,7 +18,7 @@ use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -166,6 +166,117 @@ pub fn transpose_row_addrs(
     let old_frag_digests: Vec<FragDigest> = old_fragments.iter().map(|frag| frag.into()).collect();
     let new_frag_digests: Vec<FragDigest> = new_fragments.iter().map(|frag| frag.into()).collect();
     transpose_row_ids_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
+}
+
+/// Build a direct remap when rows were written in a different order.
+///
+/// `old_row_addrs` is ordered by the new physical row position. Unlike normal
+/// compaction, it must not be converted to a sorted bitmap before pairing it
+/// with the new fragment addresses.
+pub fn transpose_reordered_row_addrs(
+    old_row_addrs: &[u64],
+    old_fragments: &[Fragment],
+    new_fragments: &[Fragment],
+) -> Result<HashMap<u64, Option<u64>>> {
+    let old_fragment_ids = old_fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<HashSet<_>>();
+    let mut rewritten = RoaringTreemap::new();
+    for &old_row_addr in old_row_addrs {
+        let old_fragment_id = old_row_addr / RowAddress::FRAGMENT_SIZE;
+        if !old_fragment_ids.contains(&old_fragment_id) {
+            return Err(Error::invalid_input(format!(
+                "reordered row address {old_row_addr} belongs to fragment {old_fragment_id}, which is not in the rewrite group"
+            )));
+        }
+        if !rewritten.insert(old_row_addr) {
+            return Err(Error::invalid_input(format!(
+                "reordered rewrite captured duplicate row address {old_row_addr}"
+            )));
+        }
+    }
+
+    let new_row_count = new_fragments.iter().try_fold(0usize, |total, fragment| {
+        let rows = fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "reordered fragment {} is missing physical_rows",
+                fragment.id
+            ))
+        })?;
+        total
+            .checked_add(rows)
+            .ok_or_else(|| Error::internal("reordered fragment row count overflow"))
+    })?;
+    if old_row_addrs.len() != new_row_count {
+        return Err(Error::invalid_input(format!(
+            "reordered rewrite captured {} old row addresses but wrote {new_row_count} new rows",
+            old_row_addrs.len()
+        )));
+    }
+
+    let mut new_addrs = Vec::with_capacity(new_row_count);
+    for fragment in new_fragments {
+        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+            Error::invalid_input(format!(
+                "reordered fragment ID {} cannot be represented as u32",
+                fragment.id
+            ))
+        })?;
+        let rows = u32::try_from(fragment.physical_rows.unwrap_or(0)).map_err(|_| {
+            Error::invalid_input(format!(
+                "reordered fragment {} has too many physical rows",
+                fragment.id
+            ))
+        })?;
+        new_addrs.extend(
+            (0..rows).map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset))),
+        );
+    }
+
+    let old_row_count = old_fragments.iter().try_fold(0usize, |total, fragment| {
+        let rows = fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "original fragment {} is missing physical_rows",
+                fragment.id
+            ))
+        })?;
+        total
+            .checked_add(rows)
+            .ok_or_else(|| Error::internal("original fragment row count overflow"))
+    })?;
+    let mut mapping = HashMap::with_capacity(old_row_count);
+    mapping.extend(
+        old_row_addrs
+            .iter()
+            .copied()
+            .zip(new_addrs.into_iter().map(Some)),
+    );
+
+    // Reordered rewrites already require an O(rows) direct map. Walking all
+    // old offsets keeps deletion handling correct even if the rewrite group's
+    // fragment order is not sorted by fragment ID.
+    for fragment in old_fragments {
+        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+            Error::invalid_input(format!(
+                "original fragment ID {} cannot be represented as u32",
+                fragment.id
+            ))
+        })?;
+        let rows = u32::try_from(fragment.physical_rows.unwrap_or(0)).map_err(|_| {
+            Error::invalid_input(format!(
+                "original fragment {} has too many physical rows",
+                fragment.id
+            ))
+        })?;
+        for offset in 0..rows {
+            let addr = u64::from(RowAddress::new_from_parts(fragment_id, offset));
+            if !rewritten.contains(addr) {
+                mapping.insert(addr, None);
+            }
+        }
+    }
+    Ok(mapping)
 }
 
 pub fn transpose_row_ids_from_digest(
@@ -541,6 +652,29 @@ mod tests {
         // A fragment outside the group is unaffected by both.
         let outside = u64::from(RowAddress::new_from_parts(99, 0));
         assert_eq!(compact.get(outside), expected.get(&outside).copied());
+    }
+
+    #[test]
+    fn test_reordered_row_addrs_preserve_permutation() {
+        let mut old_zero = Fragment::new(0);
+        old_zero.physical_rows = Some(2);
+        let mut old_one = Fragment::new(1);
+        old_one.physical_rows = Some(2);
+        let mut new = Fragment::new(10);
+        new.physical_rows = Some(3);
+
+        let old_addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let reordered = [old_addr(1, 1), old_addr(0, 0), old_addr(1, 0)];
+        let remap =
+            transpose_reordered_row_addrs(&reordered, &[old_one, old_zero], &[new]).unwrap();
+
+        for (new_offset, old) in reordered.into_iter().enumerate() {
+            assert_eq!(
+                remap.get(&old),
+                Some(&Some(old_addr(10, new_offset as u32)))
+            );
+        }
+        assert_eq!(remap.get(&old_addr(0, 1)), Some(&None));
     }
 
     #[test]

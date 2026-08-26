@@ -81,6 +81,7 @@
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
+use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -106,6 +107,7 @@ use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::{
     Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
@@ -125,7 +127,11 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{
+    Fragment, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+};
+use lance_table::rowids::RowIdSequence;
+use lance_table::rowids::segment::U64Segment;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -2115,6 +2121,327 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// Old physical row addresses in new physical row order.
+    ///
+    /// Reordered rewrites cannot use `row_addrs`: its `RoaringTreemap`
+    /// encoding sorts addresses and loses the permutation. This field keeps
+    /// that permutation for immediate direct index remapping. Deferred remap
+    /// is intentionally unsupported for reordered address-style rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_addr_order: Option<Vec<u64>>,
+}
+
+#[derive(Debug)]
+struct StableReorderedRowMetadata {
+    row_ids: RowIdSequence,
+    last_updated_versions: RowDatasetVersionSequence,
+    created_at_versions: RowDatasetVersionSequence,
+    row_count: u64,
+}
+
+impl StableReorderedRowMetadata {
+    fn new() -> Self {
+        Self {
+            row_ids: RowIdSequence::new(),
+            last_updated_versions: RowDatasetVersionSequence::new(),
+            created_at_versions: RowDatasetVersionSequence::new(),
+            row_count: 0,
+        }
+    }
+
+    fn capture(&mut self, batch: &RecordBatch) -> Result<()> {
+        let row_ids = required_u64_column(batch, ROW_ID)?;
+        let last_updated = required_u64_column(batch, ROW_LAST_UPDATED_AT_VERSION)?;
+        let created_at = required_u64_column(batch, ROW_CREATED_AT_VERSION)?;
+        self.row_ids.extend(row_ids.values().as_ref().into());
+        append_version_runs(
+            &mut self.last_updated_versions,
+            self.row_count,
+            last_updated.values(),
+        )?;
+        append_version_runs(
+            &mut self.created_at_versions,
+            self.row_count,
+            created_at.values(),
+        )?;
+        let batch_rows = u64::try_from(batch.num_rows())
+            .map_err(|_| Error::internal("batch row count cannot be represented as u64"))?;
+        self.row_count = self.row_count.checked_add(batch_rows).ok_or_else(|| {
+            Error::internal("row count overflow while capturing rewrite metadata")
+        })?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum ReorderedRowMetadata {
+    Stable(StableReorderedRowMetadata),
+    /// Old physical row addresses in the exact order rows were written.
+    AddressStyle(Vec<u64>),
+}
+
+impl ReorderedRowMetadata {
+    fn new(stable_row_ids: bool) -> Self {
+        if stable_row_ids {
+            Self::Stable(StableReorderedRowMetadata::new())
+        } else {
+            Self::AddressStyle(Vec::new())
+        }
+    }
+
+    fn capture(&mut self, batch: &RecordBatch) -> Result<()> {
+        match self {
+            Self::Stable(metadata) => metadata.capture(batch),
+            Self::AddressStyle(row_addrs) => {
+                let batch_row_addrs = required_u64_column(batch, ROW_ID)?;
+                row_addrs.extend_from_slice(batch_row_addrs.values());
+                Ok(())
+            }
+        }
+    }
+
+    fn row_count(&self) -> Result<u64> {
+        match self {
+            Self::Stable(metadata) => Ok(metadata.row_count),
+            Self::AddressStyle(row_addrs) => u64::try_from(row_addrs.len()).map_err(|_| {
+                Error::internal("reordered row address count cannot be represented as u64")
+            }),
+        }
+    }
+}
+
+fn required_u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
+    let column = batch.column_by_name(name).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "reordered rewrite stream is missing required system column '{name}'"
+        ))
+    })?;
+    let column = column
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "reordered rewrite system column '{name}' must be UInt64, got {}",
+                column.data_type()
+            ))
+        })?;
+    if column.null_count() != 0 {
+        return Err(Error::invalid_input(format!(
+            "reordered rewrite system column '{name}' contains {} null value(s)",
+            column.null_count()
+        )));
+    }
+    Ok(column)
+}
+
+fn append_version_runs(
+    sequence: &mut RowDatasetVersionSequence,
+    start: u64,
+    versions: &[u64],
+) -> Result<()> {
+    let mut run_start = 0usize;
+    while run_start < versions.len() {
+        let version = versions[run_start];
+        let run_end_index = versions[run_start + 1..]
+            .iter()
+            .position(|candidate| *candidate != version)
+            .map_or(versions.len(), |offset| run_start + 1 + offset);
+        let run_start_offset = u64::try_from(run_start)
+            .map_err(|_| Error::internal("version run start cannot be represented as u64"))?;
+        let run_end_offset = u64::try_from(run_end_index)
+            .map_err(|_| Error::internal("version run end cannot be represented as u64"))?;
+        sequence.runs.push(RowDatasetVersionRun {
+            span: U64Segment::Range(
+                start
+                    .checked_add(run_start_offset)
+                    .ok_or_else(|| Error::internal("version run start overflow"))?
+                    ..start
+                        .checked_add(run_end_offset)
+                        .ok_or_else(|| Error::internal("version run end overflow"))?,
+            ),
+            version,
+        });
+        run_start = run_end_index;
+    }
+    Ok(())
+}
+
+fn capture_reordered_row_metadata(
+    mut stream: SendableRecordBatchStream,
+    stable_row_ids: bool,
+) -> Result<(
+    SendableRecordBatchStream,
+    std::sync::mpsc::Receiver<ReorderedRowMetadata>,
+)> {
+    let schema = stream.schema();
+    let system_columns = if stable_row_ids {
+        vec![ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_CREATED_AT_VERSION]
+    } else {
+        vec![ROW_ID]
+    };
+    for name in &system_columns {
+        let (_, field) = schema.column_with_name(name).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "reordered rewrite stream is missing required system column '{name}'"
+            ))
+        })?;
+        if field.data_type() != &ArrowDataType::UInt64 {
+            return Err(Error::invalid_input(format!(
+                "reordered rewrite system column '{name}' must be UInt64, got {}",
+                field.data_type()
+            )));
+        }
+    }
+
+    let user_projection = (0..schema.fields().len())
+        .filter(|index| !system_columns.contains(&schema.field(*index).name().as_str()))
+        .collect::<Vec<_>>();
+    let output_schema = Arc::new(schema.project(&user_projection)?);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut metadata = ReorderedRowMetadata::new(stable_row_ids);
+    let output = futures::stream::poll_fn(move |context| match stream.poll_next_unpin(context) {
+        std::task::Poll::Ready(Some(Ok(batch))) => {
+            let result = metadata
+                .capture(&batch)
+                .and_then(|_| batch.project(&user_projection).map_err(Error::from))
+                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)));
+            std::task::Poll::Ready(Some(result))
+        }
+        std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Some(Err(error))),
+        std::task::Poll::Ready(None) => {
+            let completed =
+                std::mem::replace(&mut metadata, ReorderedRowMetadata::new(stable_row_ids));
+            let _ = sender.send(completed);
+            std::task::Poll::Ready(None)
+        }
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    });
+    Ok((
+        Box::pin(RecordBatchStreamAdapter::new(output_schema, output)),
+        receiver,
+    ))
+}
+
+/// Uncommitted output of a reordered rewrite.
+#[derive(Debug)]
+pub struct ReorderedFragmentWriteResult {
+    pub fragments: Vec<Fragment>,
+    /// Present for address-style datasets. The addresses are deliberately not
+    /// encoded as a `RoaringTreemap`: its sorted iteration would destroy the
+    /// shuffle permutation needed to remap indices correctly.
+    pub old_row_addrs: Option<Vec<u64>>,
+}
+
+/// Write an already-reordered stream as uncommitted fragments while preserving
+/// the dataset's row identity in the new physical order.
+///
+/// The input must contain all user columns plus `_rowid`. Stable-row-ID
+/// datasets must also include `_row_last_updated_at_version` and
+/// `_row_created_at_version`. The system columns are captured and removed
+/// before writing. Callers may invoke this once per logical output partition
+/// to guarantee that no fragment crosses a partition boundary, then commit the
+/// returned fragments with [`commit_compaction`].
+pub async fn write_reordered_fragments(
+    dataset: &Dataset,
+    stream: SendableRecordBatchStream,
+    mut params: WriteParams,
+) -> Result<ReorderedFragmentWriteResult> {
+    let stable_row_ids = dataset.manifest.uses_stable_row_ids();
+    params.mode = WriteMode::Append;
+    params.enable_stable_row_ids = stable_row_ids;
+    let (stream, metadata_receiver) = capture_reordered_row_metadata(stream, stable_row_ids)?;
+    let (mut fragments, _) = write_fragments_internal(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        Some(dataset),
+        dataset.object_store.clone(),
+        &dataset.base,
+        dataset.schema().clone(),
+        stream,
+        params,
+        None,
+    )
+    .await?;
+
+    let attach_result: Result<Option<Vec<u64>>> = (|| {
+        let metadata = metadata_receiver.try_recv().map_err(|error| {
+            Error::internal(format!(
+                "failed to receive reordered row metadata after writing fragments: {error}"
+            ))
+        })?;
+        let fragment_sizes = fragments
+            .iter()
+            .map(|fragment| {
+                let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                    Error::internal(format!(
+                        "reordered fragment {} is missing its physical row count",
+                        fragment.id
+                    ))
+                })?;
+                u64::try_from(physical_rows).map_err(|_| {
+                    Error::internal(format!(
+                        "fragment {} row count cannot be represented as u64",
+                        fragment.id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let written_rows = fragment_sizes.iter().try_fold(0u64, |total, rows| {
+            total
+                .checked_add(*rows)
+                .ok_or_else(|| Error::internal("reordered fragment row count overflow"))
+        })?;
+        if written_rows != metadata.row_count()? {
+            return Err(Error::internal(format!(
+                "reordered writer produced {written_rows} rows after capturing {} rows",
+                metadata.row_count()?
+            )));
+        }
+        let metadata = match metadata {
+            ReorderedRowMetadata::Stable(metadata) => metadata,
+            ReorderedRowMetadata::AddressStyle(row_addrs) => return Ok(Some(row_addrs)),
+        };
+        let row_id_sequences = lance_table::rowids::rechunk_sequences(
+            [metadata.row_ids],
+            fragment_sizes.iter().copied(),
+            false,
+        )?;
+        let last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
+            [metadata.last_updated_versions],
+            fragment_sizes.iter().copied(),
+            false,
+        )?;
+        let created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
+            [metadata.created_at_versions],
+            fragment_sizes,
+            false,
+        )?;
+        for (((fragment, row_ids), last_updated), created_at) in fragments
+            .iter_mut()
+            .zip(row_id_sequences)
+            .zip(last_updated_sequences)
+            .zip(created_at_sequences)
+        {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(
+                lance_table::rowids::write_row_ids(&row_ids).into(),
+            ));
+            fragment.last_updated_at_version_meta =
+                Some(RowDatasetVersionMeta::from_sequence(&last_updated)?);
+            fragment.created_at_version_meta =
+                Some(RowDatasetVersionMeta::from_sequence(&created_at)?);
+        }
+        Ok(None)
+    })();
+    let old_row_addrs = match attach_result {
+        Ok(old_row_addrs) => old_row_addrs,
+        Err(error) => {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &fragments).await;
+            return Err(error);
+        }
+    };
+    Ok(ReorderedFragmentWriteResult {
+        fragments,
+        old_row_addrs,
+    })
 }
 
 async fn reserve_fragment_ids(
@@ -2170,6 +2497,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            row_addr_order: None,
         });
     }
 
@@ -2394,6 +2722,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        row_addr_order: None,
     })
 }
 
@@ -2574,7 +2903,26 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    if completed_tasks
+        .iter()
+        .any(|task| task.row_addrs.is_some() && task.row_addr_order.is_some())
+    {
+        return Err(Error::invalid_input(
+            "a rewrite result cannot contain both sorted and reordered row addresses".to_string(),
+        ));
+    }
+
+    let has_reordered_address_style = completed_tasks
+        .iter()
+        .any(|task| task.row_addr_order.is_some());
+    if has_reordered_address_style && options.defer_index_remap {
+        return Err(Error::invalid_input(
+            "reordered address-style rewrites require immediate index remapping".to_string(),
+        ));
+    }
+    let has_address_style = completed_tasks
+        .iter()
+        .any(|task| task.row_addrs.is_some() || task.row_addr_order.is_some());
     // Address-style results require immediate index remapping unless it is deferred.
     let needs_remapping =
         !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
@@ -2620,7 +2968,7 @@ pub async fn commit_compaction(
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
-            .filter(|t| t.row_addrs.is_some())
+            .filter(|task| task.row_addrs.is_some() || task.row_addr_order.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
         if let Err(e) = reserve_fragment_ids(dataset, frags.into_iter()).await {
@@ -2661,6 +3009,8 @@ pub async fn commit_compaction(
         RoaringBitmap::new()
     };
     let mut any_group_indexed = false;
+    let use_direct_remap =
+        has_reordered_address_style || options.index_remap_mode == IndexRemapMode::Direct;
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -2670,43 +3020,47 @@ pub async fn commit_compaction(
         };
 
         if index_remapper.is_some() {
-            if let Some(row_addrs_bytes) = task.row_addrs {
+            if let Some(row_addr_order) = task.row_addr_order {
+                let transposed = remapping::transpose_reordered_row_addrs(
+                    &row_addr_order,
+                    &task.original_fragments,
+                    &task.new_fragments,
+                )?;
+                direct_row_id_map.extend(transposed);
+            } else if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
-                match options.index_remap_mode {
-                    IndexRemapMode::Direct => {
-                        let transposed = remapping::transpose_row_addrs(
-                            row_addrs,
-                            &task.original_fragments,
-                            &task.new_fragments,
-                        );
-                        direct_row_id_map.extend(transposed);
-                    }
-                    IndexRemapMode::Compact => {
-                        let new_frags = task
-                            .new_fragments
-                            .iter()
-                            .map(|f| {
-                                let physical_rows = f.physical_rows.ok_or_else(|| {
-                                    Error::invalid_input(format!(
-                                        "compacted fragment {} is missing physical_rows",
-                                        f.id
-                                    ))
-                                })?;
-                                Ok((f.id as u32, physical_rows as u32))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                if use_direct_remap {
+                    let transposed = remapping::transpose_row_addrs(
+                        row_addrs,
+                        &task.original_fragments,
+                        &task.new_fragments,
+                    );
+                    direct_row_id_map.extend(transposed);
+                } else {
+                    let new_frags = task
+                        .new_fragments
+                        .iter()
+                        .map(|f| {
+                            let physical_rows = f.physical_rows.ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "compacted fragment {} is missing physical_rows",
+                                    f.id
+                                ))
+                            })?;
+                            Ok((f.id as u32, physical_rows as u32))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
 
-                        remap_group_inputs.push(GroupInput {
-                            rewritten_old_row_addrs: row_addrs,
-                            old_frag_ids: task
-                                .original_fragments
-                                .iter()
-                                .map(|f| f.id as u32)
-                                .collect(),
-                            new_frags,
-                        });
-                    }
+                    remap_group_inputs.push(GroupInput {
+                        rewritten_old_row_addrs: row_addrs,
+                        old_frag_ids: task
+                            .original_fragments
+                            .iter()
+                            .map(|f| f.id as u32)
+                            .collect(),
+                        new_frags,
+                    });
                 }
             }
         } else if options.defer_index_remap {
@@ -2742,9 +3096,10 @@ pub async fn commit_compaction(
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
             .collect::<Vec<_>>();
 
-        let remap = match options.index_remap_mode {
-            IndexRemapMode::Direct => RowAddrRemap::direct(direct_row_id_map),
-            IndexRemapMode::Compact => RowAddrRemap::compact(remap_group_inputs)?,
+        let remap = if use_direct_remap {
+            RowAddrRemap::direct(direct_row_id_map)
+        } else {
+            RowAddrRemap::compact(remap_group_inputs)?
         };
         let remapped_indices = index_remapper.remap_indices(remap, &affected_ids).await?;
         remapped_indices
@@ -4016,6 +4371,100 @@ mod tests {
 
         let after_scalar_result = scalar_query(&dataset).await;
         assert_eq!(before_scalar_result, after_scalar_result);
+    }
+
+    #[tokio::test]
+    async fn test_write_reordered_fragments_preserves_stable_row_metadata() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..12))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://test/reordered-fragments",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("a = 5").await.unwrap();
+
+        let original_fragments = dataset.fragments().as_ref().clone();
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[
+                "a",
+                ROW_ID,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ])
+            .unwrap();
+        let original = scanner.try_into_batch().await.unwrap();
+        let reverse = UInt32Array::from_iter_values((0..original.num_rows() as u32).rev());
+        let columns = original
+            .columns()
+            .iter()
+            .map(|column| arrow_select::take::take(column.as_ref(), &reverse, None).unwrap())
+            .collect();
+        let reordered = RecordBatch::try_new(original.schema(), columns).unwrap();
+        let reordered_schema = reordered.schema();
+        let stream = futures::stream::iter([Ok(reordered)]);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(reordered_schema, stream));
+        let write_result = write_reordered_fragments(
+            &dataset,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(write_result.old_row_addrs.is_none());
+        assert!(write_result.fragments.iter().all(|fragment| {
+            fragment.row_id_meta.is_some()
+                && fragment.last_updated_at_version_meta.is_some()
+                && fragment.created_at_version_meta.is_some()
+        }));
+
+        let result = RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: write_result.fragments,
+            read_version: dataset.version().version,
+            original_fragments,
+            row_addrs: None,
+            row_addr_order: None,
+        };
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner
+            .scan_in_order(true)
+            .project(&[
+                "a",
+                ROW_ID,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ])
+            .unwrap();
+        let after = scanner.try_into_batch().await.unwrap();
+        for (after, before) in after.columns().iter().zip(original.columns()) {
+            let expected = arrow_select::take::take(before.as_ref(), &reverse, None).unwrap();
+            assert_eq!(after.as_ref(), expected.as_ref());
+        }
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076
