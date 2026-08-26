@@ -570,7 +570,7 @@ impl WalOnlyState {
     }
 
     /// Pending bytes (for size-based flush trigger).
-    pub fn estimated_size(&self) -> usize {
+    pub fn queue_bytes(&self) -> usize {
         self.pending
             .lock()
             .ok()
