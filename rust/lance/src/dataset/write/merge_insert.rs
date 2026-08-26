@@ -3037,7 +3037,9 @@ impl MergeInsertJob {
     /// # Errors
     ///
     /// * `Error::NotSupported` when the configuration cannot use the plan path
-    ///   (a partial-schema source, or a scalar-index execution path).
+    ///   (a source carrying a field the dataset does not have, or a scalar-index
+    ///   execution path). A source that merely omits dataset columns is supported;
+    ///   those columns are filled from the target side of the join.
     /// * `Error::invalid_input` from the support check, e.g. a non-nullable dataset
     ///   column the source does not supply.
     /// * Any error from building or executing the plan. This method runs the merge
@@ -9013,7 +9015,7 @@ mod tests {
     /// reports the same absent statistics.
     ///
     /// This is about which side is buffered, not about how much the target reads.
-    /// The target scan projects `other` either way, because the `RewriteRows` fill
+    /// The target scan projects `other` either way, because the row-rewrite fill
     /// reads it from the target side of the join.
     ///
     /// Both expectations characterise DataFusion's choice rather than any Lance
@@ -9057,7 +9059,7 @@ mod tests {
             .into_reader_rows(RowCount::from(TARGET_ROWS), BatchCount::from(1));
         let ds = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
 
-        // Partial schema: the source omits `other`, so on the RewriteRows path the
+        // Partial schema: the source omits `other`, so the row-rewrite fill has the
         // target scan has to read it, and the build side holds it for every row it
         // buffers. This test asserts which side is the build side, not the
         // projection, so the reading itself is background rather than a claim.
@@ -9087,8 +9089,8 @@ mod tests {
         assert_eq!(
             (*join.partition_mode(), *join.join_type()),
             (PartitionMode::CollectLeft, JoinType::Left),
-            "an exact-statistics source fits under the collect threshold, so the inputs are \
-             swapped and Right is rewritten to Left. build side was:\n{build}"
+            "the target is past the collect threshold and the source is not, so the inputs \
+             are swapped and Right is rewritten to Left. build side was:\n{build}"
         );
         assert!(
             build.contains("DataSourceExec") && !build.contains("LanceRead"),
@@ -9111,8 +9113,8 @@ mod tests {
         assert_eq!(
             (*join.partition_mode(), *join.join_type()),
             (PartitionMode::Partitioned, JoinType::Right),
-            "with no source statistics neither side qualifies, so nothing is swapped and both \
-             sides are hash-repartitioned instead. build side was:\n{build}"
+            "the target is past the collect threshold and the source reports no statistics, \
+             so neither side qualifies and both are hash-repartitioned. build side was:\n{build}"
         );
         assert!(
             build.contains("LanceRead"),
@@ -9138,7 +9140,8 @@ mod tests {
             .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let ds = Arc::new(Dataset::write(data, "memory://", None).await.unwrap());
 
-        // Full schema: `analyze_plan` only supports sources that cover it. Two rows
+        // The source covers the dataset's schema, so nothing is filled from the
+        // target side. Two rows
         // against the target's 64 keeps the source the smaller side, which is what
         // makes the join collect it here; both sides are under DataFusion's collect
         // threshold, so the choice comes from comparing row counts. Raise the source

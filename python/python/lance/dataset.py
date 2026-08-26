@@ -803,8 +803,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
 
         # Route exactly as execute() does, so the reported plan is the one that
-        # would run. A materialized source reports exact statistics and gets a
-        # different join shape than a stream, which reports none.
+        # would run. A materialized source reports exact statistics where a stream
+        # reports none, which can change which side of the join is collected.
         if _is_materialized(data_obj):
             return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
 
