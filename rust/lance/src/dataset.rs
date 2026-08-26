@@ -793,6 +793,7 @@ impl Dataset {
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
                 store_identity: &object_store.store_prefix,
+                identity: manifest_location.identity.as_deref(),
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -814,6 +815,7 @@ impl Dataset {
             let metadata_cache = session.metadata_cache.for_dataset(uri);
             let metadata_key = TransactionKey {
                 version: manifest_location.version,
+                identity: manifest_location.identity.as_deref(),
             };
             metadata_cache
                 .insert_with_key(&metadata_key, Arc::new(transaction))
@@ -842,6 +844,8 @@ impl Dataset {
         let manifest_key = ManifestKey {
             version: manifest_location.version,
             e_tag: manifest_location.e_tag.as_deref(),
+
+            identity: manifest_location.identity.as_deref(),
         };
         if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
             return Ok(cached);
@@ -1207,6 +1211,8 @@ impl Dataset {
         let manifest_key = ManifestKey {
             version: location.version,
             e_tag: location.e_tag.as_deref(),
+
+            identity: location.identity.as_deref(),
         };
         let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
@@ -1241,6 +1247,7 @@ impl Dataset {
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
         let transaction_key = TransactionKey {
             version: self.manifest.version,
+            identity: self.manifest_location.identity.as_deref(),
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
@@ -3547,8 +3554,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
+            let identity = location.identity.clone();
             let tx_key = TransactionKey {
                 version: manifest.version,
+                identity: identity.as_deref(),
             };
             let transaction =
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
@@ -4093,9 +4102,10 @@ impl ManifestWriteConfig {
     }
 }
 
-/// Commit a manifest file and create a copy at the latest manifest path.
+/// [`write_manifest_file`], published only if `predecessor` still holds;
+/// see `CommitHandler::commit_after`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_manifest_file(
+pub(crate) async fn write_manifest_file_after(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
@@ -4104,7 +4114,40 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    predecessor: Option<&lance_table::io::commit::PredecessorIdentity>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    let Some(predecessor) = predecessor else {
+        return write_manifest_file(
+            object_store,
+            commit_handler,
+            base_path,
+            manifest,
+            indices,
+            config,
+            naming_scheme,
+            transaction,
+        )
+        .await;
+    };
+    prepare_manifest_for_write(manifest, config)?;
+    commit_handler
+        .commit_after(
+            manifest,
+            indices,
+            base_path,
+            object_store,
+            write_manifest_file_to_path,
+            naming_scheme,
+            transaction,
+            predecessor,
+        )
+        .await
+}
+
+fn prepare_manifest_for_write(
+    manifest: &mut Manifest,
+    config: &ManifestWriteConfig,
+) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
@@ -4120,6 +4163,22 @@ pub(crate) async fn write_manifest_file(
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
     manifest.update_max_fragment_id();
+    Ok(())
+}
+
+/// Commit a manifest file and create a copy at the latest manifest path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_manifest_file(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    manifest: &mut Manifest,
+    indices: Option<Vec<IndexMetadata>>,
+    config: &ManifestWriteConfig,
+    naming_scheme: ManifestNamingScheme,
+    transaction: Option<lance_table::format::Transaction>,
+) -> std::result::Result<ManifestLocation, CommitError> {
+    prepare_manifest_for_write(manifest, config)?;
 
     commit_handler
         .commit(
