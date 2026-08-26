@@ -324,6 +324,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
+    m.add_wrapped(wrap_pyfunction!(sql_scalar_function_names))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(schema::parse_field_path))?;
@@ -395,6 +396,11 @@ pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pyfunction(name = "bytes_read_counter")]
 fn bytes_read_counter() -> PyResult<u64> {
     Ok(::lance::io::bytes_read_counter())
+}
+
+#[pyfunction(name = "sql_scalar_function_names")]
+fn sql_scalar_function_names() -> PyResult<Vec<String>> {
+    Ok(lance_datafusion::planner::scalar_function_names())
 }
 
 #[pyfunction(name = "_schema_to_json")]

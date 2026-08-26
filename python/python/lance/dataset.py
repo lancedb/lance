@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import json
 import operator
 import os
@@ -72,6 +73,7 @@ from .lance import (
     _serialize_row_addrs,
     _write_dataset,
     indices,
+    sql_scalar_function_names,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
@@ -6499,13 +6501,59 @@ _SUBSTRAIT_UNSUPPORTED_FUNCTION = re.compile(
     r"convert the Arrow function (\w+) to a Substrait call"
 )
 
-# PyArrow compute functions with no Substrait mapping whose predicate has a
-# direct equivalent in Lance's SQL dialect.
-_SQL_EQUIVALENT = {
-    "starts_with": "starts_with(column, 'prefix')",
-    "ends_with": "ends_with(column, 'suffix')",
-    "match_substring": "contains(column, 'substring')",
+_FILTER_DOCS = "https://lance.org/guide/read_and_write/#filter-push-down"
+
+# Arrow names a kernel after the type it operates on where Lance SQL, which
+# dispatches on the argument, does not: ``utf8_lower`` is ``lower``,
+# ``binary_length`` is ``length``.
+_ARROW_KERNEL_PREFIXES = ("utf8_", "ascii_", "binary_")
+
+# Arrow compute functions Lance SQL spells under an unrelated name.  Only such
+# genuine renames belong here: a function Lance SQL names as Arrow does, or one
+# that differs only by a kernel prefix, resolves against the registry below.
+_SQL_RENAMES = {
+    "match_substring": "contains",
+    "match_substring_regex": "regexp_like",
+    "replace_substring": "replace",
+    "replace_substring_regex": "regexp_replace",
 }
+
+# Arrow compute functions Lance SQL writes as an operator rather than a call,
+# so there is no registry entry to resolve and the syntax is given in full.
+_SQL_OPERATORS = {
+    "match_like": "column LIKE 'pattern'",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _sql_scalar_functions() -> frozenset:
+    """The scalar functions a Lance SQL filter can call, from the Rust registry."""
+    return frozenset(sql_scalar_function_names())
+
+
+def _sql_equivalent(function: str) -> Optional[str]:
+    """Return how Lance SQL writes an Arrow compute function, or None.
+
+    Resolved against the function registry rather than a table of known pairs,
+    so a function Lance gains, or one PyArrow adds a Substrait mapping for, does
+    not leave a hardcoded list to fall out of date.
+    """
+    operator = _SQL_OPERATORS.get(function)
+    if operator is not None:
+        return operator
+
+    candidates = [_SQL_RENAMES.get(function, function)]
+    candidates.extend(
+        function[len(prefix) :]
+        for prefix in _ARROW_KERNEL_PREFIXES
+        if function.startswith(prefix)
+    )
+
+    registered = _sql_scalar_functions()
+    for candidate in candidates:
+        if candidate in registered:
+            return f"{candidate}(...)"
+    return None
 
 
 def _substrait_serialization_error(
@@ -6523,16 +6571,20 @@ def _substrait_serialization_error(
     function = match.group(1) if match else None
     if function is None:
         detail = f"PyArrow cannot serialize this expression to Substrait ({err})"
-        hint = "Pass the filter as a Lance SQL string instead."
+        equivalent = None
     else:
         detail = (
             f"PyArrow cannot serialize the compute function '{function}' to Substrait"
         )
-        equivalent = _SQL_EQUIVALENT.get(function)
-        hint = "Pass the filter as a Lance SQL string instead"
-        hint += f', e.g. filter="{equivalent}".' if equivalent else "."
+        equivalent = _sql_equivalent(function)
+    hint = "Pass the filter as a Lance SQL string instead"
+    hint += (
+        f", where this is written `{equivalent}`."
+        if equivalent
+        else f"; see {_FILTER_DOCS} for the supported syntax."
+    )
     return pa.ArrowNotImplementedError(
-        f"Cannot push down the filter expression `{filter}`: {detail}, which is"
+        f"Cannot apply the filter expression `{filter}`: {detail}, which is"
         f" how Lance consumes PyArrow expressions. {hint}"
     )
 
@@ -6741,10 +6793,11 @@ class ScannerBuilder:
 
         :param filter: The filter to apply.  This can be a string, a pyarrow compute
             expression, a FullTextQuery, a VectorSearchQuery, or a dictionary.
-            A pyarrow expression is passed to Lance as Substrait; functions
-            PyArrow cannot serialize to Substrait (``starts_with``,
-            ``ends_with``, ``match_substring``) must be given as a Lance SQL
-            string instead.
+            A pyarrow expression is passed to Lance as Substrait, which PyArrow
+            implements for only a subset of its compute functions; a filter
+            using one of the rest (``starts_with`` and the other string
+            matchers, for instance) must be given as a Lance SQL string. The
+            error raised for such an expression names the Lance SQL equivalent.
 
         :return: The scanner builder.
         """

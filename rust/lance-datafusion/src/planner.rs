@@ -269,6 +269,16 @@ impl ContextProvider for LanceContextProvider {
     }
 }
 
+/// Names of the scalar functions callable from a Lance SQL filter.
+///
+/// Read from the same registry the planner resolves against, so callers that
+/// surface the SQL dialect to users (such as the Python bindings, which suggest
+/// a SQL equivalent for a filter they cannot express another way) stay in step
+/// with the functions actually registered.
+pub fn scalar_function_names() -> Vec<String> {
+    LanceContextProvider::default().udf_names()
+}
+
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
@@ -2140,5 +2150,20 @@ mod tests {
                 .contains("CAST to JSONB only supports string literals"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_scalar_function_names_match_the_planner() {
+        let names = scalar_function_names();
+
+        // Every listed name must actually plan, or a caller suggesting one to a
+        // user would be pointing at a function the planner cannot resolve.
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+        for name in ["starts_with", "lower", "contains"] {
+            assert!(names.contains(&name.to_string()), "{name} is not listed");
+        }
+        let ast = parse_sql_expr("starts_with(s, 'a')").unwrap();
+        planner.parse_sql_expr(&ast).unwrap();
     }
 }

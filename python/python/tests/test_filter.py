@@ -16,6 +16,13 @@ import pandas.testing as tm
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.dataset import (
+    _SQL_OPERATORS,
+    _SQL_RENAMES,
+    _sql_equivalent,
+    _substrait_serialization_error,
+)
+from lance.lance import sql_scalar_function_names
 from lance.vector import vec_to_table
 
 
@@ -373,26 +380,35 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
 @pytest.mark.parametrize(
     ("expression", "function", "hint", "sql"),
     [
+        # One case per rule _sql_equivalent resolves by, rather than per
+        # function: the mapping is derived, so the rules are what can break.
         pytest.param(
             pc.starts_with(pc.field("str"), "ab"),
             "starts_with",
-            "starts_with(column, 'prefix')",
+            "starts_with(...)",
             "starts_with(str, 'ab')",
-            id="starts_with",
+            id="same_name",
         ),
         pytest.param(
-            pc.ends_with(pc.field("str"), "bc"),
-            "ends_with",
-            "ends_with(column, 'suffix')",
-            "ends_with(str, 'bc')",
-            id="ends_with",
+            pc.utf8_lower(pc.field("str")) == "abc",
+            "utf8_lower",
+            "lower(...)",
+            "lower(str) = 'abc'",
+            id="kernel_prefix",
         ),
         pytest.param(
             pc.match_substring(pc.field("str"), "b"),
             "match_substring",
-            "contains(column, 'substring')",
+            "contains(...)",
             "contains(str, 'b')",
-            id="match_substring",
+            id="renamed",
+        ),
+        pytest.param(
+            pc.match_like(pc.field("str"), "ab%"),
+            "match_like",
+            "column LIKE 'pattern'",
+            "str LIKE 'ab%'",
+            id="operator",
         ),
     ],
 )
@@ -402,8 +418,8 @@ def test_filter_expression_without_substrait_mapping(
     """PyArrow has no Substrait mapping for these string functions.
 
     Lance consumes pyarrow expressions through Substrait, so such a filter
-    cannot be pushed down; the error should name the function and the
-    equivalent Lance SQL filter rather than surface Arrow's internal failure.
+    cannot be applied; the error should name the function and how Lance SQL
+    writes it rather than surface Arrow's internal failure.
     """
     ds = lance.write_dataset(pa.table({"str": ["abc", "xyz"]}), tmp_path)
 
@@ -417,6 +433,37 @@ def test_filter_expression_without_substrait_mapping(
 
     # The SQL form the error points at expresses the same predicate.
     assert ds.to_table(filter=sql)["str"].to_pylist() == ["abc"]
+
+
+def test_sql_renames_are_registered_functions():
+    """The rename table holds names Lance SQL is expected to still have.
+
+    Everything else _sql_equivalent suggests is read from the registry, so a
+    rename here is the only way it can suggest a function that does not exist.
+    """
+    missing = sorted(set(_SQL_RENAMES.values()) - set(sql_scalar_function_names()))
+    assert missing == []
+
+
+def test_sql_operators_are_valid_filters(tmp_path):
+    """The operator table gives syntax in full, so it needs a syntax check."""
+    ds = lance.write_dataset(pa.table({"str": ["abc", "xyz"]}), tmp_path)
+    for syntax in _SQL_OPERATORS.values():
+        filter = syntax.replace("column", "str").replace("pattern", "ab%")
+        assert ds.to_table(filter=filter)["str"].to_pylist() == ["abc"]
+
+
+def test_filter_expression_with_no_sql_equivalent():
+    """A function Lance SQL cannot express falls back to pointing at the docs."""
+    assert _sql_equivalent("no_such_arrow_function") is None
+
+    err = pa.ArrowNotImplementedError(
+        "No conversion function exists to convert the Arrow function"
+        " no_such_arrow_function to a Substrait call"
+    )
+    message = str(_substrait_serialization_error(pc.field("str").is_valid(), err))
+    assert "no_such_arrow_function" in message
+    assert "https://lance.org/guide/read_and_write/#filter-push-down" in message
 
 
 @pytest.mark.skip(
