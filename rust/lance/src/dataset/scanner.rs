@@ -463,41 +463,6 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
     }
 }
 
-/// Keep AUTO fuzziness exact at the public dataset-planning boundary.
-///
-/// Low-level index preparation already understands `fuzziness=None`, but a
-/// partial dataset plan must prepare one vocabulary across indexed and current
-/// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
-/// current-row preparation atomically. Until then, recursively rewrite AUTO to
-/// exact while preserving explicit positive fuzziness.
-fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
-    match query {
-        FtsQuery::Match(query) => {
-            query.fuzziness.get_or_insert(0);
-        }
-        FtsQuery::Phrase(_) => {}
-        FtsQuery::Boost(query) => {
-            apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.positive);
-            apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.negative);
-        }
-        FtsQuery::MultiMatch(query) => {
-            for match_query in &mut query.match_queries {
-                match_query.fuzziness.get_or_insert(0);
-            }
-        }
-        FtsQuery::Boolean(query) => {
-            for child in query
-                .should
-                .iter_mut()
-                .chain(&mut query.must)
-                .chain(&mut query.must_not)
-            {
-                apply_dataset_planner_auto_fuzziness_compatibility_gate(child);
-            }
-        }
-    }
-}
-
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
 where
@@ -4251,7 +4216,6 @@ impl Scanner {
             resolved.query = fill_fts_query_column(&resolved.query, &indexed_columns, false)?;
             Self::set_missing_query_granularity(&mut resolved.query, DocumentGranularity::Row);
         }
-        apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut resolved.query);
         resolved.query = self
             .resolve_fts_query_document_granularity(resolved.query)
             .await?;
@@ -7736,69 +7700,6 @@ mod test {
         assert_eq!(boost_bits(&query), vec![nz, nz, nz, nz, b2, b3, nz, b4]);
         normalize_fts_zero_boosts(&mut query);
         assert_eq!(boost_bits(&query), vec![pz, pz, pz, pz, b2, b3, pz, b4]);
-    }
-
-    #[test]
-    fn test_dataset_planner_defers_auto_fuzziness_recursively() {
-        fn collect_fuzziness(query: &FtsQuery, values: &mut Vec<Option<u32>>) {
-            match query {
-                FtsQuery::Match(query) => values.push(query.fuzziness),
-                FtsQuery::Phrase(_) => {}
-                FtsQuery::Boost(query) => {
-                    collect_fuzziness(&query.positive, values);
-                    collect_fuzziness(&query.negative, values);
-                }
-                FtsQuery::MultiMatch(query) => {
-                    values.extend(query.match_queries.iter().map(|query| query.fuzziness));
-                }
-                FtsQuery::Boolean(query) => {
-                    for child in query
-                        .should
-                        .iter()
-                        .chain(&query.must)
-                        .chain(&query.must_not)
-                    {
-                        collect_fuzziness(child, values);
-                    }
-                }
-            }
-        }
-
-        let auto_match = |terms: &str| {
-            MatchQuery::new(terms.to_owned())
-                .with_fuzziness(None)
-                .into()
-        };
-        let mut multi_match = MultiMatchQuery::try_new(
-            "multi".to_owned(),
-            vec!["title".to_owned(), "body".to_owned()],
-        )
-        .unwrap();
-        multi_match.match_queries[0].fuzziness = None;
-        multi_match.match_queries[1].fuzziness = Some(1);
-        let boost = BoostQuery::new(
-            auto_match("positive"),
-            MatchQuery::new("negative".to_owned())
-                .with_fuzziness(Some(0))
-                .into(),
-            None,
-        );
-        let mut query: FtsQuery = BooleanQuery::new([
-            (Occur::Should, auto_match("root")),
-            (Occur::Must, FtsQuery::MultiMatch(multi_match)),
-            (Occur::MustNot, boost.into()),
-        ])
-        .into();
-
-        apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query);
-
-        let mut fuzziness = Vec::new();
-        collect_fuzziness(&query, &mut fuzziness);
-        assert_eq!(
-            fuzziness,
-            [Some(0), Some(0), Some(1), Some(0), Some(0)],
-            "AUTO must become exact without changing explicit fuzzy or exact leaves"
-        );
     }
 
     #[test]

@@ -2151,7 +2151,7 @@ async fn test_multimatch_fields_have_independent_fuzzy_expansion_budgets() {
 }
 
 #[tokio::test]
-async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
+async fn test_dataset_planner_auto_fuzziness_for_partial_indices() {
     let indexed = arrow_array::record_batch!(
         ("title", Utf8, ["alpha"]),
         ("body", Utf8, ["alpha"]),
@@ -2204,7 +2204,8 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
 
     for (case_name, query, expected_ids) in [
         ("match_exact", auto_match("ALPHA"), &[0, 1][..]),
-        ("match_typo", auto_match("alphx"), &[][..]),
+        ("match_typo", auto_match("alphx"), &[0, 1][..]),
+        ("match_uppercase_typo", auto_match("ALPHX"), &[0, 1][..]),
         (
             "multimatch_exact",
             FtsQuery::MultiMatch(auto_multimatch("ALPHA")),
@@ -2213,7 +2214,12 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
         (
             "multimatch_typo",
             FtsQuery::MultiMatch(auto_multimatch("alphx")),
-            &[][..],
+            &[0, 1][..],
+        ),
+        (
+            "multimatch_uppercase_typo",
+            FtsQuery::MultiMatch(auto_multimatch("ALPHX")),
+            &[0, 1][..],
         ),
         (
             "nested_multimatch_exact",
@@ -2225,7 +2231,13 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
             "nested_multimatch_typo",
             BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
                 .into(),
-            &[][..],
+            &[0, 1][..],
+        ),
+        (
+            "nested_multimatch_uppercase_typo",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHX")))])
+                .into(),
+            &[0, 1][..],
         ),
     ] {
         let batch = dataset
@@ -2241,6 +2253,35 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
             batch["id"].as_primitive::<Int32Type>().values(),
             expected_ids,
             "indexed and unindexed rows diverged for {case_name}"
+        );
+    }
+
+    for (case_name, lowercase, uppercase) in [
+        ("field", auto_match("alphx"), auto_match("ALPHX")),
+        (
+            "field_local_multimatch",
+            FtsQuery::MultiMatch(auto_multimatch("alphx")),
+            FtsQuery::MultiMatch(auto_multimatch("ALPHX")),
+        ),
+        (
+            "nested_multimatch",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
+                .into(),
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHX")))])
+                .into(),
+        ),
+    ] {
+        let lowercase = compound_fts_results(&dataset, lowercase, Some(10)).await;
+        let uppercase = compound_fts_results(&dataset, uppercase, Some(10)).await;
+        assert_eq!(
+            lowercase.len(),
+            2,
+            "{case_name} must match both corpus halves"
+        );
+        assert_scored_rows_close(
+            &format!("partial_auto_analyzer_normalization_{case_name}"),
+            &uppercase,
+            &lowercase,
         );
     }
 }
