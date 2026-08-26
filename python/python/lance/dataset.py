@@ -3646,6 +3646,7 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
@@ -3657,10 +3658,10 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default True
+        stem: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default True
+        remove_stop_words: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
         custom_stop_words: Optional[List[str]], default None
