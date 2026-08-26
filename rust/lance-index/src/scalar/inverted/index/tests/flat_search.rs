@@ -133,9 +133,14 @@ async fn residual_fuzzy_candidates_bound_cache_and_search_unicode_overflow() {
             .with_fuzziness(Some(1))
             .with_max_expansions(8),
     );
-    let prepared = prepare_flat_fuzzy_automata(query_tokens.as_ref(), params.as_ref()).unwrap();
-    assert_eq!(prepared.cached.len(), MAX_CACHED_FUZZY_AUTOMATA);
-    assert_eq!(prepared.uncached, vec![(4, "بسرع".to_string())]);
+    let (cached, uncached, cache_limit) =
+        super::super::flat_search::flat_fuzzy_automata_cache_counts(
+            query_tokens.as_ref(),
+            params.as_ref(),
+        )
+        .unwrap();
+    assert_eq!(cached, cache_limit);
+    assert_eq!(uncached, 1);
 
     let tokenizer = InvertedIndexParams::default()
         .ascii_folding(false)

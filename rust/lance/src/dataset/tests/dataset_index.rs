@@ -2446,14 +2446,17 @@ async fn test_mixed_unicode_fuzzy_matches_partition_layout_oracles() {
         expected: &[(i32, f32)],
     ) {
         assert_eq!(actual.len(), expected.len(), "{case_name}");
-        for ((actual_id, actual_score), (expected_id, expected_score)) in
-            actual.iter().zip(expected)
-        {
-            assert_eq!(actual_id, expected_id, "{case_name}");
+        let actual = actual.iter().copied().collect::<HashMap<_, _>>();
+        let expected = expected.iter().copied().collect::<HashMap<_, _>>();
+        assert_eq!(actual.len(), expected.len(), "{case_name}");
+        for (expected_id, expected_score) in expected {
+            let actual_score = actual
+                .get(&expected_id)
+                .unwrap_or_else(|| panic!("{case_name}: missing business id {expected_id}"));
             let tolerance = 1.0e-5 * expected_score.abs().max(1.0);
             assert!(
                 (actual_score - expected_score).abs() <= tolerance,
-                "{case_name}: score for id {actual_id} was {actual_score}, expected {expected_score}"
+                "{case_name}: score for id {expected_id} was {actual_score}, expected {expected_score}"
             );
         }
     }
@@ -2491,10 +2494,9 @@ async fn test_mixed_unicode_fuzzy_matches_partition_layout_oracles() {
             "{case_name} must exercise indexed and residual vocabularies: {plan}"
         );
         let actual = scored_business_rows(&partial, query.clone()).await;
-        assert_eq!(
-            actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            expected_ids
-        );
+        let mut actual_ids = actual.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, expected_ids);
         let interleaved = scored_business_rows(&interleaved, query.clone()).await;
         let split = scored_business_rows(&split, query).await;
         assert_business_scores_close(

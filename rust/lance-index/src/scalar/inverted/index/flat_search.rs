@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::inverted::document_tokenizer::DocType;
+use datafusion::error::DataFusionError;
 
 pub fn doc_index_storage_column(rank: usize) -> String {
     format!("{DOC_INDEX_STORAGE_PREFIX}{rank}")
@@ -905,66 +907,89 @@ fn prepare_flat_fuzzy_automata(
     })
 }
 
-fn collect_fuzzy_candidates_from_terms(
-    terms: &BTreeSet<String>,
-    prepared: &PreparedFlatFuzzyAutomata,
+#[cfg(test)]
+pub(super) fn flat_fuzzy_automata_cache_counts(
+    query_tokens: &Tokens,
     params: &FtsSearchParams,
-) -> Result<BTreeMap<u32, BTreeSet<String>>> {
-    fn merge_stream<S>(
-        stream: &mut S,
-        candidates: &mut BTreeSet<String>,
-        limit: usize,
-    ) -> Result<()>
-    where
-        for<'a> S: fst::Streamer<'a, Item = &'a [u8]>,
-    {
-        while let Some(term) = stream.next() {
-            let term = std::str::from_utf8(term).map_err(|error| {
-                Error::index(format!(
-                    "flat FTS vocabulary contains invalid UTF-8: {error}"
-                ))
-            })?;
-            candidates.insert(term.to_string());
-            while candidates.len() > limit {
-                candidates.pop_last();
-            }
-            if candidates.len() == limit
-                && candidates
-                    .last()
-                    .is_some_and(|largest| term >= largest.as_str())
-            {
-                break;
-            }
-        }
-        Ok(())
-    }
+) -> Result<(usize, usize, usize)> {
+    let prepared = prepare_flat_fuzzy_automata(query_tokens, params)?;
+    Ok((
+        prepared.cached.len(),
+        prepared.uncached.len(),
+        MAX_CACHED_FUZZY_AUTOMATA,
+    ))
+}
 
-    if terms.is_empty()
-        || (prepared.cached.is_empty() && prepared.uncached.is_empty())
-        || params.max_expansions == 0
-    {
-        return Ok(BTreeMap::new());
+fn build_transient_fuzzy_vocabulary(terms: BTreeSet<String>) -> Result<Option<fst::Set<Vec<u8>>>> {
+    if terms.is_empty() {
+        return Ok(None);
     }
     let mut builder = fst::SetBuilder::memory();
-    for term in terms {
+    for term in &terms {
         builder.insert(term).map_err(|error| {
             Error::index(format!("failed to build flat FTS vocabulary: {error}"))
         })?;
     }
-    let vocabulary =
-        fst::Set::new(builder.into_inner().map_err(|error| {
+    fst::Set::new(
+        builder.into_inner().map_err(|error| {
             Error::index(format!("failed to finish flat FTS vocabulary: {error}"))
-        })?)
-        .map_err(|error| Error::index(format!("failed to open flat FTS vocabulary: {error}")))?;
+        })?,
+    )
+    .map(Some)
+    .map_err(|error| Error::index(format!("failed to open flat FTS vocabulary: {error}")))
+}
 
+fn merge_fuzzy_stream<S>(
+    stream: &mut S,
+    candidates: &mut BTreeSet<String>,
+    limit: usize,
+) -> Result<()>
+where
+    for<'a> S: fst::Streamer<'a, Item = &'a [u8]>,
+{
+    while let Some(term) = stream.next() {
+        let term = std::str::from_utf8(term).map_err(|error| {
+            Error::index(format!(
+                "flat FTS vocabulary contains invalid UTF-8: {error}"
+            ))
+        })?;
+        candidates.insert(term.to_string());
+        while candidates.len() > limit {
+            candidates.pop_last();
+        }
+        if candidates.len() == limit
+            && candidates
+                .last()
+                .is_some_and(|largest| term >= largest.as_str())
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn search_cached_flat_fuzzy_automata(
+    vocabulary: &fst::Set<Vec<u8>>,
+    prepared: &PreparedFlatFuzzyAutomata,
+    limit: usize,
+) -> Result<BTreeMap<u32, BTreeSet<String>>> {
     let mut result = BTreeMap::new();
     for prepared in &prepared.cached {
         let candidates = result
             .entry(prepared.position)
             .or_insert_with(BTreeSet::new);
         let mut stream = vocabulary.search(&prepared.automaton).into_stream();
-        merge_stream(&mut stream, candidates, params.max_expansions)?;
+        merge_fuzzy_stream(&mut stream, candidates, limit)?;
     }
+    Ok(result)
+}
+
+fn search_uncached_flat_fuzzy_automata(
+    vocabulary: &fst::Set<Vec<u8>>,
+    prepared: &PreparedFlatFuzzyAutomata,
+    params: &FtsSearchParams,
+) -> Result<BTreeMap<u32, BTreeSet<String>>> {
+    let mut result = BTreeMap::new();
     for (position, source_term) in &prepared.uncached {
         let candidates = result.entry(*position).or_insert_with(BTreeSet::new);
         // Long/pathological queries stay memory bounded: construct one
@@ -972,9 +997,23 @@ fn collect_fuzzy_candidates_from_terms(
         // immediately after searching this transient FST.
         let automaton = FuzzyAutomaton::new(source_term, &prepared.token_type, params)?;
         let mut stream = vocabulary.search(&automaton).into_stream();
-        merge_stream(&mut stream, candidates, params.max_expansions)?;
+        merge_fuzzy_stream(&mut stream, candidates, params.max_expansions)?;
     }
     Ok(result)
+}
+
+fn merge_fuzzy_candidate_maps(
+    output: &mut BTreeMap<u32, BTreeSet<String>>,
+    input: BTreeMap<u32, BTreeSet<String>>,
+    limit: usize,
+) {
+    for (position, candidates) in input {
+        let merged = output.entry(position).or_default();
+        merged.extend(candidates);
+        while merged.len() > limit {
+            merged.pop_last();
+        }
+    }
 }
 
 fn collect_batch_terms(
@@ -1047,9 +1086,9 @@ fn materialize_flat_string_list(elements: &dyn Array) -> String {
 /// The first [`MAX_CACHED_FUZZY_AUTOMATA`] unique query terms compile one
 /// Unicode-aware automaton each and share them across all rechunked input
 /// tasks. Any overflow terms are constructed and dropped one at a time inside
-/// serialized chunk tasks. Each task builds, searches, and drops one transient
-/// ordered FST over its deduped chunk vocabulary. Memory is therefore bounded
-/// by the small automaton cache, one overflow DFA, bounded in-flight chunks,
+/// a separately serialized overflow-search stage. Chunk tokenization and
+/// transient FST construction remain parallel. Memory is therefore bounded by
+/// the small automaton cache, one overflow DFA, bounded in-flight chunk FSTs,
 /// and `query_positions * max_expansions`, never the full residual vocabulary.
 #[doc(hidden)]
 pub async fn collect_flat_fuzzy_candidates(
@@ -1090,43 +1129,89 @@ pub async fn collect_flat_fuzzy_candidates(
         })
         .await?,
     );
-    let chunk_concurrency = if prepared.uncached.is_empty() {
-        get_num_compute_intensive_cpus()
-    } else {
-        1
-    };
-    let summaries = chunked
+    let compute_concurrency = get_num_compute_intensive_cpus();
+    let vocabulary_elapsed_compute = elapsed_compute.clone();
+    let vocabularies = chunked
         .map(move |batch| {
             let tokenizer = tokenizer.box_clone();
-            let prepared = prepared.clone();
-            let params = params.clone();
-            let elapsed_compute = elapsed_compute.clone();
+            let elapsed_compute = vocabulary_elapsed_compute.clone();
             spawn_cpu(move || {
                 let started = std::time::Instant::now();
                 let terms = collect_batch_terms(&batch?, doc_col_idx, coordinate_rank, tokenizer)?;
-                let candidates = collect_fuzzy_candidates_from_terms(
-                    &terms,
-                    prepared.as_ref(),
-                    params.as_ref(),
-                )?;
+                let vocabulary = build_transient_fuzzy_vocabulary(terms)?;
                 if let Some(time) = elapsed_compute {
                     time.add_duration(started.elapsed());
                 }
-                DataFusionResult::Ok(candidates)
+                DataFusionResult::Ok(vocabulary)
             })
         })
-        .buffered(chunk_concurrency);
+        .buffered(compute_concurrency);
+
+    let overflow_search = Arc::new(tokio::sync::Semaphore::new(1));
+    let summaries = vocabularies
+        .map(move |vocabulary| {
+            let prepared = prepared.clone();
+            let cached_elapsed_compute = elapsed_compute.clone();
+            let overflow_elapsed_compute = elapsed_compute.clone();
+            let overflow_search = overflow_search.clone();
+            let params = params.clone();
+            async move {
+                let vocabulary = vocabulary?;
+                let Some(vocabulary) = vocabulary else {
+                    return Ok(BTreeMap::new());
+                };
+                let cached_vocabulary = Arc::new(vocabulary);
+                let overflow_vocabulary = cached_vocabulary.clone();
+                let cached_prepared = prepared.clone();
+                let cached_search = spawn_cpu(move || {
+                    let started = std::time::Instant::now();
+                    let candidates = search_cached_flat_fuzzy_automata(
+                        cached_vocabulary.as_ref(),
+                        cached_prepared.as_ref(),
+                        max_expansions,
+                    )
+                    .map_err(DataFusionError::from);
+                    if let Some(time) = cached_elapsed_compute {
+                        time.add_duration(started.elapsed());
+                    }
+                    candidates
+                });
+                let has_overflow = !prepared.uncached.is_empty();
+                let overflow_search = async move {
+                    if !has_overflow {
+                        return Ok(BTreeMap::new());
+                    }
+                    let _permit = overflow_search.acquire_owned().await.map_err(|_| {
+                        DataFusionError::Execution(
+                            "flat fuzzy overflow search gate was closed".to_string(),
+                        )
+                    })?;
+                    spawn_cpu(move || {
+                        let started = std::time::Instant::now();
+                        let candidates = search_uncached_flat_fuzzy_automata(
+                            overflow_vocabulary.as_ref(),
+                            prepared.as_ref(),
+                            params.as_ref(),
+                        )
+                        .map_err(DataFusionError::from);
+                        if let Some(time) = overflow_elapsed_compute {
+                            time.add_duration(started.elapsed());
+                        }
+                        candidates
+                    })
+                    .await
+                };
+                let (mut cached, overflow) = futures::try_join!(cached_search, overflow_search)?;
+                merge_fuzzy_candidate_maps(&mut cached, overflow, max_expansions);
+                Ok(cached)
+            }
+        })
+        .buffered(compute_concurrency);
 
     let mut merged = BTreeMap::<u32, BTreeSet<String>>::new();
     futures::pin_mut!(summaries);
     while let Some(summary) = summaries.try_next().await? {
-        for (position, candidates) in summary {
-            let output = merged.entry(position).or_default();
-            output.extend(candidates);
-            while output.len() > max_expansions {
-                output.pop_last();
-            }
-        }
+        merge_fuzzy_candidate_maps(&mut merged, summary, max_expansions);
     }
     Ok(merged)
 }
