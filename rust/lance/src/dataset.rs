@@ -3336,13 +3336,11 @@ impl Dataset {
             }
         };
         // Limit the number of concurrently buffered transfers by default while
-        // preserving efficient local copies and explicit operator settings.
+        // preserving efficient local copies and the operation-specific override.
         let io_parallelism = if !uses_streaming_copy {
             configured_io_parallelism
         } else if let Some(value) = stream_copy_parallelism {
             value
-        } else if std::env::var_os("LANCE_IO_THREADS").is_some() {
-            configured_io_parallelism
         } else {
             configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
         };
