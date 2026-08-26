@@ -47,7 +47,7 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
@@ -64,6 +64,7 @@ use uuid::Uuid;
 
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexInternalExt;
+use crate::index::covering::{effective_covering, effective_covering_with_ids};
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
@@ -1102,11 +1103,150 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+fn covering_fields_match(expected: &Field, physical: &Field) -> bool {
+    expected.name() == physical.name()
+        && expected.data_type() == physical.data_type()
+        && expected.is_nullable() == physical.is_nullable()
+        && expected.metadata() == physical.metadata()
+}
+
+/// Intersect a requested manifest declaration with the capabilities proven by every
+/// selected physical segment.
+///
+/// The output remains in declaration order because that is the schema the ANN exec
+/// exposes. If a segment stores the surviving columns in a different relative order then
+/// none are served: storage emits in physical order, and pairing those values with a
+/// declaration-ordered schema would be incorrect.
+fn common_physical_covering(
+    mut requested: Vec<(i32, Field)>,
+    physical_by_segment: &[Vec<(i32, Field)>],
+) -> Vec<(i32, Field)> {
+    if physical_by_segment.is_empty() {
+        return Vec::new();
+    }
+
+    for physical in physical_by_segment {
+        let before = requested.len();
+        requested.retain(|(expected_id, expected_field)| {
+            let kept = physical.iter().any(|(physical_id, physical_field)| {
+                expected_id == physical_id && covering_fields_match(expected_field, physical_field)
+            });
+            if !kept {
+                // Withdrawal is silent by design -- results stay correct, the plan just
+                // grows a base-table read -- which makes a covered index that quietly
+                // stopped eliding takes indistinguishable from one that never worked.
+                // `covering_fields_match` compares name, data type, nullability AND
+                // metadata, so the cause is usually a drift too small to guess at.
+                log::debug!(
+                    "Covering column '{}' (field id {}) is declared but not servable by a \
+                     segment: no physical column matches it on name, type, nullability and \
+                     metadata. Its values will come from a base-table read.",
+                    expected_field.name(),
+                    expected_id
+                );
+            }
+            kept
+        });
+        if requested.is_empty() {
+            if before > 0 {
+                log::debug!(
+                    "No declared covering column is servable by every selected segment; \
+                     this query reads all of them from the base table."
+                );
+            }
+            return requested;
+        }
+    }
+
+    let requested_ids = requested.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    for physical in physical_by_segment {
+        let physical_ids = physical
+            .iter()
+            .filter(|(physical_id, physical_field)| {
+                requested.iter().any(|(expected_id, expected_field)| {
+                    expected_id == physical_id
+                        && covering_fields_match(expected_field, physical_field)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        if requested_ids != physical_ids {
+            // Segments disagree on the order or set they can serve. Storage emits in
+            // physical order while the schema is declaration-ordered, so pairing them
+            // would be wrong -- none are served rather than some.
+            log::debug!(
+                "Selected segments do not agree on the covering columns they can serve \
+                 ({requested_ids:?} vs {physical_ids:?}); this query reads all of them from \
+                 the base table."
+            );
+            return Vec::new();
+        }
+    }
+    requested
+}
+
+/// Resolve the query's manifest-requested covering columns against every selected
+/// segment's physical storage capability.
+///
+/// The returned query always has an explicit covering projection. A missing physical
+/// column is omitted from it, causing the normal scanner take to fetch that value from
+/// the base table instead.
+pub async fn resolve_physical_covering_query(
+    dataset: Arc<Dataset>,
+    indices: &[IndexMetadata],
+    query: &Query,
+) -> Result<Query> {
+    let mut resolved_query = query.clone();
+    let declared_ids = indices
+        .first()
+        .map(|index| index.covering_fields.as_slice())
+        .unwrap_or_default();
+    if let Some(mismatch) = indices
+        .iter()
+        .find(|index| index.covering_fields != declared_ids)
+    {
+        return Err(Error::index(format!(
+            "ANN index delta segments of index '{}' disagree on covering fields ({:?} vs {:?}); \
+             the index metadata is inconsistent -- rebuild the index",
+            mismatch.name, declared_ids, mismatch.covering_fields
+        )));
+    }
+
+    let requested = effective_covering_with_ids(
+        declared_ids,
+        query.covering_projection.as_deref(),
+        dataset.schema(),
+    )?;
+    if requested.is_empty() {
+        resolved_query.covering_projection = Some(Arc::from(Vec::<String>::new()));
+        return Ok(resolved_query);
+    }
+
+    let physical_by_segment = future::try_join_all(indices.iter().map(|index| {
+        let dataset = dataset.clone();
+        let column = query.column.clone();
+        let uuid = index.uuid;
+        async move {
+            dataset
+                .open_vector_index(&column, &uuid, &NoOpMetricsCollector)
+                .await?
+                .physical_covering_fields()
+        }
+    }))
+    .await?;
+    let names = common_physical_covering(requested, &physical_by_segment)
+        .into_iter()
+        .map(|(_, field)| field.name().clone())
+        .collect::<Vec<_>>();
+    resolved_query.covering_projection = Some(Arc::from(names));
+    Ok(resolved_query)
+}
+
 /// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
 /// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
 /// `external_mask`, when `Some`, additionally restricts the scan to a caller-supplied
 /// allow/block set (see [`ANNIvfSubIndexExec::with_external_mask`]).
-pub fn new_knn_exec(
+pub async fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[IndexMetadata],
     query: &Query,
@@ -1114,17 +1254,18 @@ pub fn new_knn_exec(
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let query = resolve_physical_covering_query(dataset.clone(), indices, query).await?;
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
         indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
     )?;
 
-    let mut sub_index = ANNIvfSubIndexExec::try_new(
+    let mut sub_index = ANNIvfSubIndexExec::try_new_with_resolved_covering(
         Arc::new(ivf_node),
         dataset,
         indices.to_vec(),
-        query.clone(),
+        query,
         prefilter_source,
     )?;
     if let Some(overlay_block) = overlay_block {
@@ -1420,7 +1561,24 @@ pub struct ANNIvfSubIndexExec {
 }
 
 impl ANNIvfSubIndexExec {
+    /// Construct an ANN sub-index exec without a verified physical covering capability.
+    ///
+    /// This synchronous entry point cannot open segment storage, so it conservatively
+    /// disables covering and leaves declared values to the base-table take. Dataset
+    /// planning and protobuf reconstruction use the storage-aware async resolution path
+    /// before calling `Self::try_new_with_resolved_covering` (private, so not linked).
     pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+        mut query: Query,
+        prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        query.covering_projection = Some(Arc::from(Vec::<String>::new()));
+        Self::try_new_with_resolved_covering(input, dataset, indices, query, prefilter_source)
+    }
+
+    pub(crate) fn try_new_with_resolved_covering(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         indices: Vec<IndexMetadata>,
@@ -1433,11 +1591,9 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
-        // Declare any included/covering columns recorded in the index manifest
-        // (`IndexMetadata.covering_fields`, by field id); the per-partition search
-        // emits them so a covered projection lets TakeExec skip the base-table
-        // fetch. Empty for ordinary indexes. Resolve id -> name -> arrow field so
-        // the declared schema matches the columns stored at build time exactly.
+        // Start from the logical declaration, narrowed to the explicit projection already
+        // proven against every selected segment's physical storage. The per-partition
+        // search emits only this subset, so TakeExec may skip the matching base-table fields.
         let mut fields = KNN_INDEX_SCHEMA.fields().to_vec();
         let included_ids = indices
             .first()
@@ -1458,33 +1614,21 @@ impl ANNIvfSubIndexExec {
                 mismatch.name, included_ids, mismatch.covering_fields
             )));
         }
-        if !included_ids.is_empty() {
-            let lance_schema = dataset.schema();
-            for id in &included_ids {
-                // The manifest is authoritative: a declared covering field that cannot
-                // be resolved means the index metadata and schema disagree. Silently
-                // dropping it would leave the declared output schema missing a column a
-                // covered projection expects -- TakeExec would then wrongly elide the
-                // base-table fetch for a column that is never emitted. Fail loudly
-                // instead (a covered column cannot be dropped while its index exists).
-                let lance_field = lance_schema
-                    .fields
-                    .iter()
-                    .find(|field| field.id == *id)
-                    .ok_or_else(|| {
-                        Error::index(format!(
-                            "ANNIvfSubIndexExec: index declares covering field id {id}, which is \
-                             not present as a top-level field in the current dataset schema; \
-                             index metadata and schema are inconsistent"
-                        ))
-                    })?;
-                // Convert just this field. `ArrowSchema::from(&lance_schema)` would give the
-                // same result -- it is exactly this conversion mapped over every field -- but
-                // it walks the whole table (including nested structs) on every covered plan.
-                fields.push(Arc::new(arrow_schema::Field::from(lance_field)));
-            }
-        }
-        let has_covered = !included_ids.is_empty();
+        // Narrow only AFTER the agreement check above: narrowing first could reduce
+        // segments that genuinely disagree into a subset on which they happen to agree,
+        // masking metadata corruption as a working query. The manifest remains
+        // authoritative for logical identity and schema dependencies; the projection is
+        // authoritative for physical availability.
+        let covering = effective_covering(
+            &included_ids,
+            query.covering_projection.as_deref(),
+            dataset.schema(),
+        )?;
+        // Resolved-at-construction covered flag (see the `has_covered` field): from
+        // the NARROWED set, not the declaration -- a projection that needs none of
+        // the declared columns (`Some(&[])`) makes this plan non-covered.
+        let has_covered = !covering.is_empty();
+        fields.extend(covering.into_iter().map(Arc::new));
         let output_schema = Arc::new(arrow_schema::Schema::new(fields));
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -3001,13 +3145,71 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            covering_projection: None,
         }
     }
 
-    /// The read path is manifest-authoritative: if an index declares a covering field id
-    /// the current schema cannot resolve, `ANNIvfSubIndexExec::try_new` must fail loudly
-    /// rather than silently produce an output schema missing that column -- which would
-    /// let `TakeExec` wrongly elide the base-table fetch for a column never emitted.
+    fn covering_field(id: i32, name: &str, data_type: DataType) -> (i32, Field) {
+        (id, Field::new(name, data_type, true))
+    }
+
+    #[test]
+    fn test_common_physical_covering_requires_every_segment_to_prove_the_field() {
+        let price = covering_field(17, "price", DataType::Int64);
+        let payload = covering_field(23, "payload", DataType::Utf8);
+
+        let common = common_physical_covering(
+            vec![price.clone(), payload.clone()],
+            &[vec![price.clone(), payload.clone()], vec![price.clone()]],
+        );
+
+        assert_eq!(common, vec![price.clone()]);
+
+        let common = common_physical_covering(
+            vec![price.clone(), payload.clone()],
+            &[vec![payload, price.clone()], vec![price.clone()]],
+        );
+        assert_eq!(
+            common,
+            vec![price],
+            "order is checked after finding the plan-wide subset"
+        );
+    }
+
+    #[test]
+    fn test_common_physical_covering_rejects_wrong_identity_shape_and_order() {
+        let price = covering_field(17, "price", DataType::Int64);
+        let payload = covering_field(23, "payload", DataType::Utf8);
+
+        assert!(
+            common_physical_covering(
+                vec![price.clone()],
+                &[vec![covering_field(99, "price", DataType::Int64)]],
+            )
+            .is_empty(),
+            "a matching name and type cannot substitute for the source field id"
+        );
+        assert!(
+            common_physical_covering(
+                vec![price.clone()],
+                &[vec![covering_field(17, "price", DataType::UInt64)]],
+            )
+            .is_empty(),
+            "a matching source field id cannot substitute for the physical Arrow type"
+        );
+        assert!(
+            common_physical_covering(
+                vec![price.clone(), payload.clone()],
+                &[vec![payload, price]],
+            )
+            .is_empty(),
+            "a physical order that disagrees with the declared output schema is not servable"
+        );
+    }
+
+    /// The manifest remains authoritative for logical dependencies: if an index declares
+    /// a covering field id the current schema cannot resolve, construction must fail loudly
+    /// rather than hiding schema/metadata corruption behind physical fallback.
     #[tokio::test]
     async fn test_ann_sub_index_rejects_unresolvable_covering_field() {
         use lance_datafusion::exec::OneShotExec;
@@ -3071,6 +3273,132 @@ mod tests {
         assert!(
             err.to_string().contains("covering field id 9999"),
             "expected a manifest/schema inconsistency error, got: {err}"
+        );
+    }
+
+    /// The exec's declared output schema is the seam through which a query's covering
+    /// projection reaches the rest of the plan: `knn_combined` unions the flat paths
+    /// against this schema, so whatever is declared here is what every unindexed
+    /// fragment pays to read.
+    ///
+    /// All three states of [`Query::covering_projection`] must be visible in the
+    /// declaration, and the `Some(&[])` case must NOT collapse into the `None` case.
+    /// The two are indistinguishable in query results -- a covering column is
+    /// semantically transparent, so the values simply arrive via a take instead -- which
+    /// is why this is asserted on the declared schema rather than on any result.
+    #[tokio::test]
+    async fn test_ann_sub_index_declares_only_the_projected_covering_columns() {
+        use lance_datafusion::exec::OneShotExec;
+
+        let input = Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(
+            KNN_PARTITION_SCHEMA.clone(),
+        )));
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new("price", DataType::Int32, true),
+            ArrowField::new("payload", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                "memory://d2-projected-covering",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let vec_id = dataset.schema().field("vec").unwrap().id;
+        let price_id = dataset.schema().field("price").unwrap().id;
+        let payload_id = dataset.schema().field("payload").unwrap().id;
+
+        // Declared in the reverse of field-id order, so the assertions below distinguish
+        // declaration order from schema order.
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![vec_id, payload_id, price_id],
+            name: "vector_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            covering_fields: vec![payload_id, price_id],
+        };
+        index
+            .validate_covering_fields()
+            .expect("the fixture must be a legal covering declaration");
+
+        let declared_for = |projection: Option<Vec<String>>| {
+            let mut query = base_query();
+            query.covering_projection = projection.map(Arc::from);
+            let exec = ANNIvfSubIndexExec::try_new_with_resolved_covering(
+                input.clone(),
+                dataset.clone(),
+                vec![index.clone()],
+                query,
+                PreFilterSource::None,
+            )
+            .unwrap();
+            exec.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            declared_for(None),
+            vec![DIST_COL, ROW_ID, "payload", "price"],
+            "no projection means no narrowing: every declared covering column"
+        );
+        assert_eq!(
+            declared_for(Some(vec!["price".to_string()])),
+            vec![DIST_COL, ROW_ID, "price"],
+            "only the covering column this query reads is declared"
+        );
+        assert_eq!(
+            declared_for(Some(vec!["price".to_string(), "payload".to_string()])),
+            vec![DIST_COL, ROW_ID, "payload", "price"],
+            "covering columns are declared in the index's order, not the request's"
+        );
+        assert_eq!(
+            declared_for(Some(vec![])),
+            vec![DIST_COL, ROW_ID],
+            "a query needing no covering column must declare a plain-index schema, which \
+             is what lets the flat paths skip the covering read entirely"
+        );
+
+        let mut unverified_query = base_query();
+        unverified_query.covering_projection = Some(Arc::from(["price".to_string()]));
+        let unverified = ANNIvfSubIndexExec::try_new(
+            input,
+            dataset,
+            vec![index],
+            unverified_query,
+            PreFilterSource::None,
+        )
+        .unwrap();
+        assert_eq!(
+            unverified
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![DIST_COL, ROW_ID],
+            "the synchronous constructor cannot verify storage and must disable covering"
         );
     }
 
@@ -4911,6 +5239,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            covering_projection: None,
         };
 
         async fn multivector_scoring(
@@ -4989,6 +5318,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            covering_projection: None,
         };
 
         let mut fields = KNN_INDEX_SCHEMA.fields().to_vec();

@@ -38,6 +38,30 @@ pub(super) fn gather_covering_columns_by_row_id(
     source: &RecordBatch,
     target_rowids: &arrow_array::UInt64Array,
 ) -> Result<Vec<(arrow_schema::FieldRef, ArrayRef)>> {
+    let take_idx = row_id_take_indices(source, target_rowids)?;
+    let mut out = Vec::with_capacity(source.num_columns().saturating_sub(1));
+    for (i, field) in source.schema().fields().iter().enumerate() {
+        if field.name() == ROW_ID {
+            continue;
+        }
+        let taken = arrow::compute::take(source.column(i), &take_idx, None)?;
+        out.push((field.clone(), taken));
+    }
+    Ok(out)
+}
+
+/// Where each of `target_rowids` sits in `source` (a batch carrying `_rowid`), as take
+/// indices. Every target row id must be present; a miss is an error for the same reason
+/// [`gather_covering_columns_by_row_id`] errors on one -- taking an unrelated row's
+/// values would corrupt the covered result silently.
+///
+/// Split out so a caller that must keep `_rowid` on the result (the survivor gather
+/// narrows each partition's covering batch before reading the next one) can take the
+/// whole batch instead of its non-`_rowid` columns.
+pub(super) fn row_id_take_indices(
+    source: &RecordBatch,
+    target_rowids: &arrow_array::UInt64Array,
+) -> Result<arrow_array::UInt32Array> {
     let src_rowids = source
         .column_by_name(ROW_ID)
         .ok_or_else(|| Error::internal("covering source missing row id".to_string()))?
@@ -47,7 +71,7 @@ pub(super) fn gather_covering_columns_by_row_id(
     for (i, rid) in src_rowids.values().iter().enumerate() {
         pos.insert(*rid, i as u32);
     }
-    let take_idx: arrow_array::UInt32Array = target_rowids
+    Ok(target_rowids
         .values()
         .iter()
         .map(|rid| {
@@ -58,16 +82,7 @@ pub(super) fn gather_covering_columns_by_row_id(
             })
         })
         .collect::<Result<Vec<u32>>>()?
-        .into();
-    let mut out = Vec::with_capacity(source.num_columns().saturating_sub(1));
-    for (i, field) in source.schema().fields().iter().enumerate() {
-        if field.name() == ROW_ID {
-            continue;
-        }
-        let taken = arrow::compute::take(source.column(i), &take_idx, None)?;
-        out.push((field.clone(), taken));
-    }
-    Ok(out)
+        .into())
 }
 
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.

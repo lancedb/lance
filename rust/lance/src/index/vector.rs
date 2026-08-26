@@ -642,6 +642,42 @@ async fn prepare_vector_segment_build(
     Ok((element_type, index_type, ivf_params, shuffler))
 }
 
+/// Warn when covering is declared on an index type whose search is a pessimisation for it.
+///
+/// Covering pays for itself only where the search settles into ONE global top-k heap: there
+/// the covering read is bounded by the survivors (see `gather_survivor_covering`). Every HNSW
+/// index, and any query with `query_parallelism > 1`, emits per partition instead, so the
+/// covering read scales with partitions probed rather than `k` and is issued serially --
+/// measured at 2.8x a plain index's latency warm at nprobe 32 (1.18x cold). That is slower
+/// than the base-table take covering exists to elide, so warn at build time rather than let
+/// the regression be found in production. Batching the per-partition reads globally would
+/// remove this; until then the combination is legal but not recommended.
+///
+/// Called after `validate_covering_columns` at every build entry point: warning first would
+/// emit this for configurations that are about to be rejected outright, and warning on only
+/// one entry point would let a distributed build silently take the shape this exists to flag.
+fn warn_if_covering_is_pessimised(index_type: IndexType, column: &str, params: &VectorIndexParams) {
+    if params.covering_columns.is_empty()
+        || !matches!(
+            index_type,
+            IndexType::IvfHnswFlat | IndexType::IvfHnswPq | IndexType::IvfHnswSq
+        )
+    {
+        return;
+    }
+    log::warn!(
+        "Index on column '{}' declares covering columns {:?} on a {:?} index. HNSW \
+         search emits per partition rather than through one global top-k heap, so \
+         covering reads scale with partitions probed rather than k and are issued \
+         serially -- about 2.8x a plain index's latency warm at nprobe 32. Prefer \
+         IVF_PQ or IVF_FLAT for covering, or expect covered queries on this index to \
+         be slower than uncovered ones.",
+        column,
+        params.covering_columns,
+        index_type
+    );
+}
+
 /// Validate `covering_columns` (covering columns) at the API boundary, before any build.
 /// Rejects non-V3 format, nested/dotted names, the indexed vector column itself, names that
 /// collide with a build pipeline's internal storage/transform columns, duplicates, missing
@@ -747,6 +783,7 @@ pub(crate) async fn build_distributed_vector_index(
         Some(fragment_ids),
     )
     .await?;
+    warn_if_covering_is_pessimised(index_type, column, params);
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -1160,6 +1197,7 @@ async fn build_vector_index_impl(
     let stages = &params.stages;
 
     validate_covering_columns(params, dataset, column)?;
+    warn_if_covering_is_pessimised(index_type, column, params);
 
     match index_type {
         IndexType::IvfFlat => match element_type {
@@ -2081,28 +2119,37 @@ pub async fn initialize_vector_index(
     // Carry the source index's covering ("included") columns so the rebuilt
     // target storage keeps them. covering_fields are field ids in the source;
     // resolve to names (the same columns must exist in the target dataset).
-    let covering_columns: Vec<String> = source_index
-        .covering_fields
-        .iter()
-        .map(|id| {
-            source_dataset
-                .schema()
-                .field_by_id(*id)
-                .map(|f| f.name.clone())
-                .ok_or_else(|| {
-                    Error::index(format!(
-                        "covering field id {id} (from index '{}') not found in source dataset schema",
-                        source_index.name
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Through `effective_covering` -- the single authority for covering resolution -- and
+    // not `Schema::field_by_id`: that recurses into struct children while `Field::name` is
+    // unqualified, so a (corrupt or foreign) nested id would resolve to a bare leaf name,
+    // and an unrelated top-level column of that name in the target would then be covered
+    // silently in its place. `append.rs` routes its own rebuild the same way.
+    let covering_columns: Vec<String> = crate::index::covering::effective_covering(
+        &source_index.covering_fields,
+        None,
+        source_dataset.schema(),
+    )
+    .map_err(|e| {
+        Error::index(format!(
+            "covering declaration of index '{}' cannot be resolved against the source \
+             dataset schema: {e}",
+            source_index.name
+        ))
+    })?
+    .into_iter()
+    .map(|field| field.name().clone())
+    .collect();
     params.covering_columns(covering_columns);
     // Validate against the TARGET dataset, not the source: the names resolve there, but
     // the column they resolve to may be a different kind (a blob, a reserved storage name,
     // a non-V3 build). Without this, the two ordinary build entry points would reject a
     // covering set that this cross-dataset path silently accepts.
     validate_covering_columns(&params, target_dataset, column_name)?;
+    warn_if_covering_is_pessimised(
+        vector_index_type(source_vector_index.as_ref()),
+        column_name,
+        &params,
+    );
 
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
@@ -2892,6 +2939,124 @@ mod tests {
     /// resolve to something that is not coverable in the target. It must run the same
     /// validation the two ordinary build entry points do, or it silently materializes
     /// (here) blob descriptor structs as the covered payload.
+    /// A covering id naming a *nested* field must not resolve to its bare leaf name.
+    ///
+    /// `Schema::field_by_id` recurses into struct children and `Field::name` is
+    /// unqualified, so a nested id resolves to e.g. `price` -- which can collide with an
+    /// unrelated top-level column in the target and silently build an index covering the
+    /// wrong column. `effective_covering` is top-level only for exactly this reason, and
+    /// the optimize path routes through it (`append.rs`); this path must too.
+    ///
+    /// Reachable because `validate_covering_columns` rejects dotted paths only at *create*
+    /// time -- a manifest written by another build is not covered by it.
+    #[tokio::test]
+    async fn test_initialize_vector_index_rejects_a_nested_covering_id() {
+        use arrow_schema::Fields;
+
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
+
+        // Source has a struct whose child is named `price`, plus a top-level `price`.
+        let rows = 300usize;
+        let nested_price: arrow_array::ArrayRef =
+            Arc::new(arrow_array::Int64Array::from(vec![1i64; rows]));
+        let nested: arrow_array::ArrayRef = Arc::new(arrow_array::StructArray::from(vec![(
+            Arc::new(Field::new("price", ArrowDataType::Int64, true)),
+            nested_price,
+        )]));
+        let top_price: arrow_array::ArrayRef =
+            Arc::new(arrow_array::Int64Array::from(vec![999i64; rows]));
+        let vectors: arrow_array::ArrayRef = Arc::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(
+                arrow_array::Float32Array::from(vec![0.5f32; rows * 32]),
+                32,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "meta",
+                ArrowDataType::Struct(Fields::from(vec![Field::new(
+                    "price",
+                    ArrowDataType::Int64,
+                    true,
+                )])),
+                true,
+            ),
+            Field::new("price", ArrowDataType::Int64, true),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![nested, top_price, vectors]).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut source_dataset = Dataset::write(reader, &source_uri, None).await.unwrap();
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 20);
+        params.covering_columns(vec!["price".to_string()]);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vidx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Forge what another writer could commit: the declaration rebound to the NESTED
+        // `meta.price` id. Create-time validation never sees this.
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let nested_id = source_dataset
+            .schema()
+            .field("meta.price")
+            .expect("nested field must exist")
+            .id;
+        let mut source_index = source_dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == "vidx")
+            .unwrap()
+            .clone();
+        let top_id = source_dataset.schema().field("price").unwrap().id;
+        assert_ne!(nested_id, top_id, "the two `price` fields must differ");
+        for id in source_index.fields.iter_mut() {
+            if *id == top_id {
+                *id = nested_id;
+            }
+        }
+        for id in source_index.covering_fields.iter_mut() {
+            if *id == top_id {
+                *id = nested_id;
+            }
+        }
+
+        let target_reader = arrow_array::RecordBatchIterator::new(
+            Vec::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+            schema.clone(),
+        );
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        let err = initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            &source_index,
+            &["vector"],
+        )
+        .await
+        .expect_err("a nested covering id must not resolve to a bare leaf name");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&nested_id.to_string()),
+            "the error must name the unresolvable id rather than silently covering the \
+             unrelated top-level `price`; was: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_initialize_vector_index_validates_covering_against_target() {
         let test_dir = TempStrDir::default();

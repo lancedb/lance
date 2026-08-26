@@ -43,7 +43,9 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
-use lance_index::vector::storage::{COVERING_FIELD_IDS_KEY, STORAGE_METADATA_KEY};
+use lance_index::vector::storage::{
+    COVERING_FIELD_IDS_KEY, PartitionColumns, STORAGE_METADATA_KEY,
+};
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{
     DEFAULT_PARTITION_WINDOW_BYTES, EmptyReader, IvfShufflerReader, create_ivf_shuffler,
@@ -597,8 +599,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .as_any()
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                // Every column, not just the internal ones: the remapped storage is
+                // written straight into the new index file, so a covering column
+                // that is not read here is a covering column the remapped index
+                // does not have.
                 let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .load_partition_entry_with_covering(part_id)
                     .await?;
 
                 let storage = part.storage.remap(&mapping)?;
@@ -1582,7 +1588,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             // decoded partition per in-flight task while the rest wait on it.
             let old_data_filter = source.old_data_filter().await?;
 
-            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
+            // Every column, not just the internal ones: these batches are re-written into
+            // the index being built, so a covering column that is not read here is a
+            // covering column the new index does not have.
+            let part_storage = existing_index
+                .load_partition_storage(part_id, PartitionColumns::All, None)
+                .await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             match Q::quantization_type() {
@@ -1739,6 +1750,60 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 })
             })
             .collect()
+    }
+
+    /// Refuse to re-stamp a covering payload onto a different logical field.
+    ///
+    /// A rebuild (compaction remap, or `optimize_indices` merging existing sources) copies
+    /// the covering payload out of existing storage **by name**, while the stamp written
+    /// here is resolved from the **current** dataset schema. If a covered column was
+    /// rebound between the two -- dropped and re-added under the same name, so the name
+    /// resolves to a fresh id -- those disagree, and writing the current id over payload
+    /// built from the old one silently converts a detectable mismatch into an undetectable
+    /// one.
+    ///
+    /// That matters because the read path's protection *is* this stamp: planning compares
+    /// the stamped source ids against the index's declared `covering_fields`
+    /// (`common_physical_covering`) and falls back to a base-table take when they differ.
+    /// Re-stamping makes the comparison succeed, so the stale payload starts being served
+    /// and the base-table read is elided. Refusing keeps the index in the state the read
+    /// path already handles correctly.
+    ///
+    /// Sources with no covering payload, or whose stamp is absent/malformed (which already
+    /// makes their payload unservable), are not the case this guards and are skipped.
+    ///
+    /// Nor does it fire when this rebuild writes no stamp at all (`about_to_stamp` empty).
+    /// That is the degraded state -- a declaration cleared by a pre-covering writer while
+    /// the storage still physically carries the payload -- and it converges to an ordinary
+    /// index: with no stamp, `physical_covering_fields` yields nothing, the payload is
+    /// unservable, and reads use the base table. There is no mismatch to launder, and
+    /// refusing here would make a degraded index permanently un-optimizable
+    /// (see `test_degraded_covered_index_can_still_be_optimized`).
+    fn validate_covering_stamp_is_inherited(&self, about_to_stamp: &[i32]) -> Result<()> {
+        if about_to_stamp.is_empty() {
+            return Ok(());
+        }
+        for source in &self.existing_indices {
+            let stamped: Vec<i32> = source
+                .index
+                .physical_covering_fields()?
+                .into_iter()
+                .map(|(source_id, _)| source_id)
+                .collect();
+            if stamped.is_empty() || stamped == about_to_stamp {
+                continue;
+            }
+            return Err(Error::index(format!(
+                "cannot rebuild this covered index: its existing storage carries covering \
+                 values stamped with source field ids {stamped:?}, but the covering columns \
+                 {:?} now resolve to {about_to_stamp:?} in the dataset schema. A covered \
+                 column was replaced by a different field of the same name, so the stored \
+                 payload belongs to the old field. Drop and recreate the index rather than \
+                 rebuilding it.",
+                self.covering_columns
+            )));
+        }
+        Ok(())
     }
 
     /// The *source dataset* field ids of the covering columns, in declaration order.
@@ -2066,6 +2131,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&storage_partition_metadata)?,
         );
         let covering_field_ids = self.covering_field_ids()?;
+        self.validate_covering_stamp_is_inherited(&covering_field_ids)?;
         if !covering_field_ids.is_empty() {
             storage_writer.add_schema_metadata(
                 COVERING_FIELD_IDS_KEY,

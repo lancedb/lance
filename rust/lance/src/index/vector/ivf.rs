@@ -4895,6 +4895,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::OldIndexDataFilter;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::storage::PartitionColumns;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
@@ -5350,6 +5351,7 @@ mod tests {
                     query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
+                    covering_projection: None,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
@@ -6878,7 +6880,10 @@ mod tests {
         );
 
         // PQ code is on residual space
-        let pq_store = ivf_idx.load_partition_storage(0, None).await.unwrap();
+        let pq_store = ivf_idx
+            .load_partition_storage(0, PartitionColumns::Internal, None)
+            .await
+            .unwrap();
         pq_store
             .codebook()
             .values()

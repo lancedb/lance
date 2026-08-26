@@ -78,6 +78,7 @@ use vector::utils::get_vector_type;
 
 mod api;
 pub(crate) mod append;
+pub(crate) mod covering;
 mod create;
 pub mod frag_reuse;
 pub mod mem_wal;

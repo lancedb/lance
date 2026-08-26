@@ -346,6 +346,918 @@ async fn test_covered_ann_query_elides_base_table_take() {
     assert!(batch.column_by_name("extra").is_some());
 }
 
+/// A dataset with a covered IVF_PQ index over two covering columns, for the
+/// projection-pushdown tests below.
+///
+/// Deliberate properties, each load-bearing for at least one assertion:
+///   - `covering_columns(["payload", "price"])` is the *reverse* of schema order, so an
+///     implementation that walks the schema and filters by membership produces
+///     `["price", "payload"]` and fails.
+///   - `price` and `payload` have different types and values that are neither the row id
+///     nor each other (`price` is negative, `payload` is a string), so a positional read
+///     of the storage batch cannot pass for a by-name one.
+///   - `extra` is a real column the index does not carry, so "narrowed away" and
+///     "never declared" stay distinguishable.
+///   - Four well-separated clusters and four partitions, so the runtime probe path is
+///     genuinely reached rather than short-circuited (see the module doc above).
+async fn covered_two_column_dataset(uri: &str) -> Dataset {
+    const DIMS: usize = 16;
+    const NUM_CLUSTERS: usize = 4;
+    const ROWS_PER_CLUSTER: usize = 64;
+    const TOTAL: usize = NUM_CLUSTERS * ROWS_PER_CLUSTER;
+
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut price = Vec::with_capacity(TOTAL);
+    let mut payload = Vec::with_capacity(TOTAL);
+    let mut extra = Vec::with_capacity(TOTAL);
+    let mut values = Vec::with_capacity(TOTAL * DIMS);
+    for cluster in 0..NUM_CLUSTERS {
+        let center = (cluster * 1000) as f32;
+        for row in 0..ROWS_PER_CLUSTER {
+            let index = (cluster * ROWS_PER_CLUSTER + row) as i32;
+            price.push(-index - 7);
+            payload.push(format!("p{}", index * 3 + 11));
+            extra.push(index * 2);
+            for dim in 0..DIMS {
+                let base = if dim == 0 { center } else { 0.0 };
+                values.push(base + (rng.random::<f32>() - 0.5) * 0.02);
+            }
+        }
+    }
+
+    let vectors: ArrayRef = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(values),
+            DIMS as i32,
+        )
+        .unwrap(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("vector", vectors.data_type().clone(), false),
+        ArrowField::new("price", DataType::Int32, false),
+        ArrowField::new("payload", DataType::Utf8, false),
+        ArrowField::new("extra", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            vectors,
+            Arc::new(Int32Array::from(price)),
+            Arc::new(StringArray::from(payload)),
+            Arc::new(Int32Array::from(extra)),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    let mut params = VectorIndexParams::ivf_pq(NUM_CLUSTERS, 8, 4, MetricType::L2, 2);
+    params.covering_columns(vec!["payload".to_string(), "price".to_string()]);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+}
+
+/// A query vector near the last cluster's centre of [`covered_two_column_dataset`].
+fn covered_query_vector() -> Float32Array {
+    let mut values = vec![0.0f32; 16];
+    values[0] = 3000.0;
+    Float32Array::from(values)
+}
+
+/// The ANN search node's declared output schema: `[_distance, _rowid]` plus exactly the
+/// covering columns this scan asks the index to materialize.
+fn ann_declared_schema(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Vec<String> {
+    fn find(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        if plan.name() == "ANNSubIndexExec" {
+            return Some(plan.clone());
+        }
+        plan.children().into_iter().find_map(find)
+    }
+    let ann = find(plan).expect("the scan must plan an ANN sub-index search");
+    ann.schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+/// The `projection=[...]` list of the (single) flat `LanceScan` in an explained plan.
+fn flat_scan_projection(plan: &str) -> Vec<String> {
+    let line = plan
+        .lines()
+        .find(|line| line.contains("LanceScan:"))
+        .unwrap_or_else(|| panic!("plan has no flat LanceScan node:\n{plan}"));
+    let start = line
+        .find("projection=[")
+        .expect("LanceScan prints a projection")
+        + "projection=[".len();
+    let rest = &line[start..];
+    let end = rest.find(']').expect("projection list is bracketed");
+    rest[..end]
+        .split(", ")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The covering set is per query, not per index: an index carrying `payload` and `price`
+/// must be asked for exactly the subset a given scan would otherwise take from the base
+/// table, and for *nothing* when the scan reads no dataset column at all.
+///
+/// Asserted on the ANN node's declared schema rather than on results, because a covering
+/// column is semantically transparent: with the narrowing disabled every case below
+/// still returns identical, correct values -- they just arrive via a base-table read.
+/// The `Some(vec![])` case (no covering column projected) is the one the whole pushdown
+/// exists for, and the one that silently disappears if it is folded into "not computed".
+///
+/// This is a plan-shape assertion, decided by a static schema comparison at plan
+/// construction, so it needs no clustering and no minimum partition count.
+#[tokio::test]
+async fn test_covered_ann_declares_only_the_covering_columns_the_query_projects() {
+    let test_uri = TempStrDir::default();
+    let dataset = covered_two_column_dataset(&test_uri).await;
+    let query = covered_query_vector();
+
+    let declared_with =
+        |columns: Vec<&'static str>, filter: Option<&'static str>, prefilter: bool| {
+            let dataset = dataset.clone();
+            let query = query.clone();
+            async move {
+                let mut scan = dataset.scan();
+                scan.nearest("vector", &query, 10).unwrap();
+                scan.project(&columns).unwrap();
+                if let Some(filter) = filter {
+                    scan.prefilter(prefilter);
+                    scan.filter(filter).unwrap();
+                }
+                ann_declared_schema(&scan.create_plan().await.unwrap())
+            }
+        };
+    // Postfiltering is the scanner default; the prefilter cases say so explicitly.
+    let declared = |columns: Vec<&'static str>, filter: Option<&'static str>| {
+        declared_with(columns, filter, false)
+    };
+
+    // Nothing but the search's own output columns: the index declares covering columns,
+    // but this query needs none of them, so it must ask for none. Collapsing this into
+    // "no narrowing computed" restores full materialization invisibly.
+    assert_eq!(
+        declared(vec![ROW_ID], None).await,
+        vec![DIST_COL, ROW_ID],
+        "a query reading no dataset column must ask the index for no covering column"
+    );
+
+    // One of two.
+    assert_eq!(
+        declared(vec!["price"], None).await,
+        vec![DIST_COL, ROW_ID, "price"],
+        "only the covering column this query reads may be materialized"
+    );
+    assert_eq!(
+        declared(vec!["payload"], None).await,
+        vec![DIST_COL, ROW_ID, "payload"],
+    );
+
+    // Both, in the index's declaration order -- which is the reverse of schema order, so
+    // this also pins that the emitted order follows the index and not the projection.
+    assert_eq!(
+        declared(vec!["price", "payload"], None).await,
+        vec![DIST_COL, ROW_ID, "payload", "price"],
+        "covering columns are emitted in the index's declared order"
+    );
+
+    // A column the index does not carry narrows to nothing, and is not confused with a
+    // covering column that was narrowed away.
+    assert_eq!(
+        declared(vec!["extra"], None).await,
+        vec![DIST_COL, ROW_ID],
+        "an uncovered projection cannot be served by the index"
+    );
+
+    // A filter column is read by the refine pass, so it counts even though it is not in
+    // the output projection. Postfiltering is the default, so this also pins that the
+    // resolution happens where the whole filter is still visible.
+    assert_eq!(
+        declared(vec!["extra"], Some("price < 0")).await,
+        vec![DIST_COL, ROW_ID, "price"],
+        "a covering column used only by the filter still saves a base-table read"
+    );
+
+    // ...but only when the filter is rechecked above the search. A *prefiltered* scan
+    // consumes the filter below it and then calls `disable_refine`, so nothing above the
+    // search reads `price` and materializing it would be pure waste -- free today, a real
+    // read once storage honours the declaration. The paired invariant test
+    // (`..._refetches_a_covering_column`, `prefilter_on_covering`) is what proves this
+    // narrowing does not cost a base-table take; this assertion is what proves it happens.
+    assert_eq!(
+        declared_with(vec!["extra"], Some("price < 0"), true).await,
+        vec![DIST_COL, ROW_ID],
+        "a prefiltered scan's filter columns are consumed below the search, so the index \
+         must not be asked to materialize them"
+    );
+}
+
+/// An FTS scorer sitting on top of a vector search reads one more column than the scan
+/// options describe: it scores from whatever the search emitted, so the FTS document
+/// column is consumed *between* the search and the final projection. Narrowing that is
+/// blind to it makes the scorer take the column from the base table -- correct, but
+/// exactly the read a covered index exists to avoid.
+///
+/// Both directions of the pairing are covered, because they are separate code paths:
+///
+/// * FTS is the search and the vector query is the filter -- `Scanner::fts_rerank`;
+/// * the vector query is the search and FTS is the (postfiltered) query filter --
+///   the refine pass, via `FilterPlan::refine_columns`.
+///
+/// Each is paired with a non-`Match` shape that discriminates rather than merely
+/// differing: only `Match` scores from its input, every other shape builds its own plan
+/// and joins on `_rowid`. So the `Match` cases must keep `payload` and the others must
+/// still narrow it away -- a "fix" that simply stopped narrowing on FTS plans passes the
+/// first of each pair and fails the second.
+#[tokio::test]
+async fn test_covered_ann_keeps_the_column_an_fts_scorer_reads() {
+    use crate::dataset::scanner::QueryFilter;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = covered_two_column_dataset(&test_uri).await;
+    dataset
+        .create_index(
+            &["payload"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let vector_query = lance_index::vector::Query {
+        column: "vector".to_string(),
+        key: Arc::new(covered_query_vector()),
+        // Every row passes the vector filter, so the rerank below is exercised on a
+        // populated input regardless of where the jitter puts any single row.
+        k: 256,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 4,
+        maximum_nprobes: None,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(MetricType::L2),
+        use_index: true,
+        query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: 0.0,
+        approx_mode: Default::default(),
+        covering_projection: None,
+    };
+
+    // Neither scan projects a dataset column, so `payload` can only ever be declared
+    // because an FTS scorer is known to read it.
+
+    // FTS is the search, the vector query is the filter: `Scanner::fts_rerank`.
+    let reranked = |fts: FullTextSearchQuery| {
+        let dataset = dataset.clone();
+        let vector_query = vector_query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(fts)
+                .unwrap()
+                .prefilter(true)
+                .filter_query(QueryFilter::Vector(vector_query))
+                .unwrap();
+            scan.project::<&str>(&[]).unwrap();
+            scan
+        }
+    };
+
+    // The vector query is the search, FTS is the query filter. Postfiltering is the
+    // default, and it is the postfilter path whose refine pass scores from the search.
+    let postfiltered = |fts: FullTextSearchQuery| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &covered_query_vector(), 256)
+                .unwrap();
+            scan.minimum_nprobes(4);
+            scan.filter_query(QueryFilter::Fts(fts)).unwrap();
+            scan.project::<&str>(&[]).unwrap();
+            scan
+        }
+    };
+
+    // `p11` is the `payload` value of row 0 (see `covered_two_column_dataset`).
+    let match_query = || {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new("p11".to_string()).with_column(Some("payload".to_string())),
+        ))
+    };
+    // Same terms, but a shape that joins on `_rowid` instead of scoring from the input.
+    let joined_query = || {
+        FullTextSearchQuery::new_query(FtsQuery::Boolean(BooleanQuery::new(vec![(
+            Occur::Should,
+            FtsQuery::Match(
+                MatchQuery::new("p11".to_string()).with_column(Some("payload".to_string())),
+            ),
+        )])))
+    };
+
+    let scan = reranked(match_query()).await;
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "payload"],
+        "the covered document column the FTS rerank scores from must survive the narrowing"
+    );
+    // The plan is not merely well-shaped: it runs and scores.
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(
+        batch.num_rows() > 0,
+        "the reranked search must return the matching row"
+    );
+    assert!(
+        batch.column_by_name(SCORE_COL).is_some(),
+        "an FTS rerank emits a score column"
+    );
+
+    let scan = reranked(joined_query()).await;
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID],
+        "a non-Match rerank joins on _rowid and reads nothing from the search, so the \
+         covering column must still be narrowed away"
+    );
+
+    let scan = postfiltered(match_query()).await;
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "payload"],
+        "the refine pass over an FTS query filter scores from the search too"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(
+        batch.num_rows() > 0,
+        "the postfiltered search must return the matching row"
+    );
+
+    // No non-Match counterpart for this direction: `Scanner::flat_fts_filter` rejects
+    // every other shape outright, so there is no plan to assert a schema on. The
+    // Match-only rule is pinned by the rerank pair above, which shares the same resolver
+    // (`fts_scores_from_input`).
+    //
+    // Asserted on the error's *content*, not merely on `is_err()`: this case exists to
+    // fire when the restriction is lifted, and any unrelated planning failure -- a fixture
+    // that stopped building the inverted index, a change to `filter_query` validation --
+    // would otherwise keep it green while the claim it protects went untested.
+    let err = postfiltered(joined_query())
+        .await
+        .create_plan()
+        .await
+        .expect_err("a non-Match FTS post-filter is not plannable today");
+    assert!(
+        err.to_string().contains("Only Match queries are supported"),
+        "if a non-Match FTS post-filter ever becomes plannable it needs its own \
+         declared-schema case here; got a different error instead: {err}"
+    );
+
+    // The DEFAULT shape: a Match that names no column at all. `create_plan` resolves
+    // both the FTS search query and the FTS query filter through
+    // `resolve_full_text_search_query`, which fills the column from the FTS-indexed
+    // columns BEFORE any covering resolution sees the query -- so the filled column
+    // must reach the covering declaration on both directions. If that resolution were
+    // ever skipped (or `fts_scored_columns` handed an unresolved query), the most
+    // common query shape would silently stop engaging covering, taking `payload` from
+    // the base table on every query with byte-identical results.
+    let unnamed_match_query =
+        || FullTextSearchQuery::new_query(FtsQuery::Match(MatchQuery::new("p11".to_string())));
+
+    let scan = reranked(unnamed_match_query()).await;
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "payload"],
+        "an unnamed Match resolves to the FTS-indexed column, which the covering \
+         declaration must include"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(
+        batch.num_rows() > 0,
+        "the unnamed-Match rerank must return the matching row"
+    );
+
+    let scan = postfiltered(unnamed_match_query()).await;
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "payload"],
+        "the refine pass fills the unnamed Match's column, so the covering must too"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(
+        batch.num_rows() > 0,
+        "the unnamed-Match postfilter must return the matching row"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The covering-elision invariant
+//
+// `Scanner::columns_read_after_vector_search` is a hand-written enumeration of the columns
+// something above the vector search reads. Nothing ties it to the nodes `create_plan`
+// actually builds, and under-declaration is silent: results stay byte-identical because
+// `Scanner::take` simply fetches the column from the base table instead. Phase 7 shipped
+// two readers missing from that enumeration (`FlatMatchQueryExec` and `FlatMatchFilter`),
+// both found by reading plan text, not by a failing test.
+//
+// The oracle is that plan text. For an index that covers a column, a take above the search
+// fetching that column *is* the lost elision -- there is nothing else to look for. So the
+// tests below plan a matrix of scan shapes over an index covering **every** non-vector
+// column and assert, structurally, that no take above the search fetches any of them.
+// Any newly inserted reader trips this in whatever shapes the matrix exercises.
+//
+// This is a test-level guard, not a self-maintaining derivation; a genuinely new plan shape
+// still needs its own case. See the task report for the two-pass planning alternative that
+// would remove the enumeration outright.
+// ---------------------------------------------------------------------------------------
+
+/// The covering columns that some take *above* the vector search fetches from the base
+/// table -- i.e. the elisions this scan shape lost.
+///
+/// Returns `None` when the plan contains no ANN search at all, so a caller can tell
+/// "nothing was taken" apart from "there was nothing to take above".
+///
+/// Only the ancestors of the ANN node are inspected. The prefilter hangs *below* the
+/// search (it is a child of `ANNSubIndexExec`) and the flat/unindexed fallback is a
+/// sibling branch of the union; both legitimately read from the base table, and neither is
+/// on the path this walks. Of the ancestors, only the two nodes that can fetch from the
+/// dataset are counted -- a `ProjectionExec` can rename or extract a struct child, which
+/// would otherwise look like a newly appeared column.
+fn covering_taken_above_search(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    covering: &HashSet<String>,
+) -> Option<Vec<String>> {
+    if plan.name() == "ANNSubIndexExec" {
+        return Some(Vec::new());
+    }
+    for child in plan.children() {
+        let Some(mut taken) = covering_taken_above_search(child, covering) else {
+            continue;
+        };
+        if matches!(plan.name(), "FilteredReadExec" | "TakeExec") {
+            let child_schema = child.schema();
+            let below: HashSet<&str> = child_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect();
+            for field in plan.schema().fields() {
+                if covering.contains(field.name()) && !below.contains(field.name().as_str()) {
+                    taken.push(field.name().clone());
+                }
+            }
+        }
+        return Some(taken);
+    }
+    None
+}
+
+/// The scan shapes the invariant is checked against. Each is a distinct route through
+/// `create_plan`'s post-source pipeline, which is where a reader can hide.
+#[derive(Debug, Clone, Copy)]
+enum CoveredShape {
+    /// The state the pushdown exists for: nothing read from the dataset at all.
+    ProjectNothing,
+    ProjectOneCovering,
+    ProjectEveryCovering,
+    /// Postfiltering is the default; the filter is rechecked above the search.
+    PostfilterOnCovering,
+    /// Prefiltering consumes the filter below the search, so nothing above reads it.
+    PrefilterOnCovering,
+    /// `create_plan` takes the sort keys above the search, twice.
+    OrderByCovering,
+    /// Aggregate inputs are taken above the search on their own path.
+    AggregateOverCovering,
+    /// Inserts a `take` of the vector column above the ANN node before the flat re-score.
+    RefineFactor,
+    LimitOffset,
+    WithRowAddress,
+    /// Skips `knn_combined` entirely.
+    FastSearch,
+    /// FTS is the search, the vector query is the filter: `FlatMatchQueryExec` scores from
+    /// the search's own columns.
+    FtsRerank,
+    /// The vector query is the search, FTS is the query filter: the refine pass scores
+    /// from the search's own columns via `FlatMatchFilter`.
+    FtsPostfilterRefine,
+}
+
+/// A dataset whose covered index carries **every** non-vector column, so that any column
+/// any scan shape reads above the search is a covering column and therefore a detectable
+/// elision loss. `payload` also carries an inverted index, for the two FTS shapes.
+///
+/// Four well-separated clusters and four partitions, so the runtime probe path is genuinely
+/// reached rather than short-circuited by a single partition.
+async fn fully_covered_dataset(uri: &str, append_unindexed: bool) -> Dataset {
+    const DIMS: usize = 16;
+    const NUM_CLUSTERS: usize = 4;
+    const ROWS_PER_CLUSTER: usize = 64;
+    const TOTAL: usize = NUM_CLUSTERS * ROWS_PER_CLUSTER;
+
+    let mut rng = StdRng::seed_from_u64(11);
+    let mut make_batch = |tag: &str| {
+        let mut price = Vec::with_capacity(TOTAL);
+        let mut payload = Vec::with_capacity(TOTAL);
+        let mut extra = Vec::with_capacity(TOTAL);
+        let mut values = Vec::with_capacity(TOTAL * DIMS);
+        for cluster in 0..NUM_CLUSTERS {
+            let center = (cluster * 1000) as f32;
+            for row in 0..ROWS_PER_CLUSTER {
+                let index = (cluster * ROWS_PER_CLUSTER + row) as i32;
+                price.push(-index - 7);
+                payload.push(format!("{tag}{}", index * 3 + 11));
+                extra.push(index * 2);
+                for dim in 0..DIMS {
+                    let base = if dim == 0 { center } else { 0.0 };
+                    values.push(base + (rng.random::<f32>() - 0.5) * 0.02);
+                }
+            }
+        }
+        let vectors: ArrayRef = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from(values),
+                DIMS as i32,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("vector", vectors.data_type().clone(), false),
+            ArrowField::new("price", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Utf8, false),
+            ArrowField::new("extra", DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                vectors,
+                Arc::new(Int32Array::from(price)),
+                Arc::new(StringArray::from(payload)),
+                Arc::new(Int32Array::from(extra)),
+            ],
+        )
+        .unwrap()
+    };
+
+    let batch = make_batch("p");
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    let mut params = VectorIndexParams::ivf_pq(NUM_CLUSTERS, 8, 4, MetricType::L2, 2);
+    // Every non-vector column. `covering_columns` rejects the indexed vector column itself,
+    // so this is the widest legal declaration for this schema.
+    params.covering_columns(vec![
+        "payload".to_string(),
+        "price".to_string(),
+        "extra".to_string(),
+    ]);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["payload"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    if append_unindexed {
+        // After the build, so `knn_combined` plans its flat fallback branch and the extra
+        // `take` of the vector column that sits above the ANN node.
+        let more = make_batch("q");
+        let reader = RecordBatchIterator::new(vec![more].into_iter().map(Ok), schema);
+        dataset.append(reader, None).await.unwrap();
+    }
+    dataset
+}
+
+/// Build the scan for one shape. Kept in one place so the matrix stays a list of names.
+async fn plan_covered_shape(
+    dataset: &Dataset,
+    shape: CoveredShape,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    use crate::dataset::scanner::{AggregateExpr, ColumnOrdering, QueryFilter};
+
+    let query = covered_query_vector();
+    let vector_filter = lance_index::vector::Query {
+        column: "vector".to_string(),
+        key: Arc::new(query.clone()),
+        k: 32,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 4,
+        maximum_nprobes: None,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(MetricType::L2),
+        use_index: true,
+        query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: 0.0,
+        approx_mode: Default::default(),
+        covering_projection: None,
+    };
+    // `p11` is row 0's payload; any term would do, the shape is what is under test.
+    let match_query = || {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new("p11".to_string()).with_column(Some("payload".to_string())),
+        ))
+    };
+
+    let mut scan = dataset.scan();
+    // Every shape except the two FTS ones is a plain vector search.
+    if !matches!(
+        shape,
+        CoveredShape::FtsRerank | CoveredShape::FtsPostfilterRefine
+    ) {
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.minimum_nprobes(4);
+    }
+    scan.with_row_id();
+
+    match shape {
+        CoveredShape::ProjectNothing => {
+            scan.project::<&str>(&[]).unwrap();
+        }
+        CoveredShape::ProjectOneCovering => {
+            scan.project(&["payload"]).unwrap();
+        }
+        CoveredShape::ProjectEveryCovering => {
+            scan.project(&["payload", "price", "extra"]).unwrap();
+        }
+        CoveredShape::PostfilterOnCovering => {
+            scan.prefilter(false);
+            scan.filter("price < 0 AND extra >= 0").unwrap();
+            scan.project::<&str>(&[]).unwrap();
+        }
+        CoveredShape::PrefilterOnCovering => {
+            scan.prefilter(true);
+            scan.filter("price < 0 AND extra >= 0").unwrap();
+            scan.project::<&str>(&[]).unwrap();
+        }
+        CoveredShape::OrderByCovering => {
+            scan.project::<&str>(&[]).unwrap();
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "price".to_string(),
+            )]))
+            .unwrap();
+        }
+        CoveredShape::AggregateOverCovering => {
+            scan.project::<&str>(&[]).unwrap();
+            scan.aggregate(AggregateExpr::builder().sum("extra").build())
+                .unwrap();
+        }
+        CoveredShape::RefineFactor => {
+            scan.refine(2);
+            scan.project(&["payload"]).unwrap();
+        }
+        CoveredShape::LimitOffset => {
+            scan.limit(Some(5), Some(2)).unwrap();
+            scan.project(&["payload"]).unwrap();
+        }
+        CoveredShape::WithRowAddress => {
+            scan.with_row_address();
+            scan.project(&["price"]).unwrap();
+        }
+        CoveredShape::FastSearch => {
+            scan.fast_search();
+            scan.project(&["payload"]).unwrap();
+        }
+        CoveredShape::FtsRerank => {
+            scan.full_text_search(match_query())
+                .unwrap()
+                .prefilter(true)
+                .filter_query(QueryFilter::Vector(vector_filter))
+                .unwrap();
+            scan.project::<&str>(&[]).unwrap();
+        }
+        CoveredShape::FtsPostfilterRefine => {
+            scan.nearest("vector", &query, 32).unwrap();
+            scan.minimum_nprobes(4);
+            scan.prefilter(false);
+            scan.filter_query(QueryFilter::Fts(match_query())).unwrap();
+            scan.project::<&str>(&[]).unwrap();
+        }
+    }
+    scan.create_plan().await.unwrap()
+}
+
+/// No take above a covered vector search may fetch a column the index already carries.
+///
+/// This is the structural counterpart to
+/// `test_covered_ann_declares_only_the_covering_columns_the_query_projects`: that test
+/// pins what the *declaration* says for a handful of shapes, this one pins the
+/// *consequence* -- that the declaration was complete enough that nothing had to be
+/// re-fetched -- across every shape in the matrix, without naming a single column.
+///
+/// The assertion is paired, not bare: each case first asserts the shape really planned an
+/// ANN search (otherwise "no take above it" is vacuous), then that the set of covering
+/// columns taken above it is empty.
+///
+/// Run with and without an unindexed fragment, because the fallback rewrites the whole
+/// region above the search into a union with an extra take of the vector column.
+#[rstest]
+#[case::project_nothing(CoveredShape::ProjectNothing)]
+#[case::project_one_covering(CoveredShape::ProjectOneCovering)]
+#[case::project_every_covering(CoveredShape::ProjectEveryCovering)]
+#[case::postfilter_on_covering(CoveredShape::PostfilterOnCovering)]
+#[case::prefilter_on_covering(CoveredShape::PrefilterOnCovering)]
+#[case::order_by_covering(CoveredShape::OrderByCovering)]
+#[case::aggregate_over_covering(CoveredShape::AggregateOverCovering)]
+#[case::refine_factor(CoveredShape::RefineFactor)]
+#[case::limit_offset(CoveredShape::LimitOffset)]
+#[case::with_row_address(CoveredShape::WithRowAddress)]
+#[case::fast_search(CoveredShape::FastSearch)]
+#[case::fts_rerank(CoveredShape::FtsRerank)]
+#[case::fts_postfilter_refine(CoveredShape::FtsPostfilterRefine)]
+#[tokio::test]
+async fn test_no_take_above_a_covered_search_refetches_a_covering_column(
+    #[case] shape: CoveredShape,
+    #[values(false, true)] unindexed_fragment: bool,
+) {
+    let test_uri = TempStrDir::default();
+    let dataset = fully_covered_dataset(&test_uri, unindexed_fragment).await;
+    let covering: HashSet<String> = ["payload", "price", "extra"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let plan = plan_covered_shape(&dataset, shape).await;
+    let taken = covering_taken_above_search(&plan, &covering).unwrap_or_else(|| {
+        panic!(
+            "{shape:?} (unindexed_fragment={unindexed_fragment}) planned no ANN search, so \
+             the invariant below would hold vacuously; either the shape stopped using the \
+             index or it does not belong in this matrix. Plan:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        )
+    });
+    assert!(
+        taken.is_empty(),
+        "{shape:?} (unindexed_fragment={unindexed_fragment}) re-fetches covering column(s) \
+         {taken:?} from the base table above the search. The index already carries them, so \
+         some node above the search reads a column \
+         `Scanner::columns_read_after_vector_search` does not name. Plan:\n{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+}
+
+/// The ANN node and the flat fallback are unioned against a single schema, so they must
+/// narrow together. A flat path that emits *fewer* covering columns than the ANN node
+/// declares is not a slow plan, it is a failed one -- which is why the pre-pushdown code
+/// simply emitted every declared covering column on both sides.
+///
+/// Asserts the flat scan's projection positively (exact list), so it fails both when the
+/// flat path keeps reading a narrowed-away column and when it stops reading a needed one.
+#[tokio::test]
+async fn test_covered_ann_flat_fallback_narrows_with_the_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covered_two_column_dataset(&test_uri).await;
+
+    // Append after indexing so `knn_combined` has an unindexed fragment to scan flat.
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let appended: ArrayRef = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from(vec![3000.0f32; 16]),
+            16,
+        )
+        .unwrap(),
+    );
+    let append = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            appended,
+            Arc::new(Int32Array::from(vec![-9999])),
+            Arc::new(StringArray::from(vec!["appended"])),
+            Arc::new(Int32Array::from(vec![12345])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(append)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query = covered_query_vector();
+    let mut scan = dataset.scan();
+    scan.nearest("vector", &query, 10).unwrap();
+    scan.project(&["price"]).unwrap();
+
+    // The index really is used -- without this the assertions below would hold just as
+    // well for a plan that fell back to brute force entirely.
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "the scan must use the covered index:\n{plan}"
+    );
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "price"],
+    );
+    assert_eq!(
+        flat_scan_projection(&plan),
+        vec!["vector", "price"],
+        "the flat fallback must read the vector it scores plus exactly the covering \
+         columns the ANN node declares -- no more (wasted IO) and no fewer (broken \
+         union):\n{plan}"
+    );
+
+    // And the plan actually runs, with the narrowed covering values arriving by name out
+    // of a storage batch that still physically carries both covering columns.
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(
+        batch.num_rows() > 0,
+        "the covered search must return the appended row's cluster"
+    );
+    let prices = batch
+        .column_by_name("price")
+        .expect("price is projected")
+        .as_primitive::<Int32Type>();
+    assert!(
+        prices.iter().all(|price| price.unwrap() < 0),
+        "price values must be the negative fixture values, not row ids or payload \
+         positions: {prices:?}"
+    );
+}
+
+/// Every covering value must survive a narrowed declaration, by name. The storage batch
+/// still carries both covering columns at this point (narrowing storage is a later
+/// phase), so a positional read would hand back `payload` where `price` was asked for --
+/// which the fixture's disjoint types and values make impossible to miss.
+///
+/// Uses the four-cluster fixture and asserts against `take_rows` ground truth rather
+/// than recall: recall cannot discriminate an index read from a brute-force fallback,
+/// since a covering column is semantically transparent and a fallback scores 1.0.
+#[tokio::test]
+async fn test_covered_ann_narrowed_values_match_the_base_table() {
+    let test_uri = TempStrDir::default();
+    let dataset = covered_two_column_dataset(&test_uri).await;
+    let query = covered_query_vector();
+
+    let mut scan = dataset.scan();
+    scan.nearest("vector", &query, 10).unwrap();
+    scan.project(&["payload"]).unwrap();
+    scan.with_row_id();
+
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "the values below must come from the index, not a fallback scan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("LanceRead"),
+        "a covered projection must not take from the base table:\n{plan}"
+    );
+    assert_eq!(
+        ann_declared_schema(&scan.create_plan().await.unwrap()),
+        vec![DIST_COL, ROW_ID, "payload"],
+    );
+
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 10);
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .expect("row ids requested by name")
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    let from_index = batch
+        .column_by_name("payload")
+        .expect("payload is projected")
+        .as_string::<i32>()
+        .clone();
+
+    let ground_truth = dataset
+        .take_rows(&row_ids, dataset.schema().project(&["payload"]).unwrap())
+        .await
+        .unwrap();
+    let expected = ground_truth
+        .column_by_name("payload")
+        .expect("take returns the requested column")
+        .as_string::<i32>()
+        .clone();
+    assert_eq!(
+        from_index, expected,
+        "the narrowed covering column must carry the same values the base table would"
+    );
+}
+
 /// A filtered `describe_indices` must still find a covered index by its keyed
 /// column. The matcher compares the caller's resolved field slice against the one
 /// column named by `for_column`, so a caller that passes all of `index.fields` --

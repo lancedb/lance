@@ -404,9 +404,17 @@ impl Transaction {
         match new_schema.field_by_id(covered_id) {
             None => true,
             Some(new) => {
+                // Metadata is compared for the same reason name, type and nullability are:
+                // this guard exists to turn a covering desync into an explicit error, and
+                // the read path's acceptance test (`covering_fields_match` in
+                // `io::exec::knn`) compares metadata too. A difference this guard ignores
+                // but that one does not is not a caught error -- it is a covered index
+                // that silently stops serving its columns and falls back to a base-table
+                // read, with no way for the user to learn why.
                 old.name != new.name
                     || old.nullable != new.nullable
                     || old.data_type() != new.data_type()
+                    || old.metadata != new.metadata
             }
         }
     }
@@ -1122,6 +1130,60 @@ mod tests {
         let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
         assert!(result.is_ok());
         assert!(indices.is_empty());
+    }
+
+    /// A covered column whose *only* change is field metadata must be rejected here.
+    ///
+    /// The read path intersects a declaration against each segment's physical columns with
+    /// `covering_fields_match`, which compares name, type, nullability AND metadata. If
+    /// this guard compared any less, a metadata-only edit would commit cleanly and then
+    /// silently withdraw covering at query time -- exactly the silent degradation the
+    /// guard is here to convert into an error.
+    #[test]
+    fn test_covered_field_subtree_change_notices_metadata_only_edit() {
+        let with_metadata = |value: Option<&str>| {
+            let mut field = ArrowField::new("carried", DataType::Int32, false);
+            if let Some(value) = value {
+                field = field.with_metadata(
+                    [("unit".to_string(), value.to_string())]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            LanceSchema::try_from(&ArrowSchema::new(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                field,
+            ]))
+            .unwrap()
+        };
+
+        let old_schema = with_metadata(Some("metres"));
+        let carried_id = old_schema.field("carried").unwrap().id;
+
+        assert!(
+            Transaction::covered_field_subtree_changed(
+                &old_schema,
+                &with_metadata(Some("feet")),
+                carried_id
+            ),
+            "a changed metadata value must count as a covering change"
+        );
+        assert!(
+            Transaction::covered_field_subtree_changed(
+                &old_schema,
+                &with_metadata(None),
+                carried_id
+            ),
+            "dropping metadata entirely must count as a covering change"
+        );
+        assert!(
+            !Transaction::covered_field_subtree_changed(
+                &old_schema,
+                &with_metadata(Some("metres")),
+                carried_id
+            ),
+            "an unchanged field must not be reported as changed"
+        );
     }
 
     #[test]

@@ -801,36 +801,27 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         .unwrap_or(raw_field_path);
     // Covering ("included") columns recorded on the index, resolved to names.
     // Threaded into the merge builder and projected into the new-data scan so
-    // they survive optimize/merge and partition split/join. Resolution is
-    // TOP-LEVEL ONLY, matching every other covering resolution site (creation
-    // rejects dotted paths, so `covering_fields` can only hold top-level ids):
-    // the recursive `Schema::field_by_id` would resolve a nested id -- possible
-    // only in corrupt or foreign metadata -- to a leaf name and rebuild storage
-    // under a name the read path errors on, making commit-time and query-time
-    // disagree about the same index. An unresolvable id must fail loudly: the
-    // merged delta is committed with the original `covering_fields`, so silently
-    // rebuilding without the column would leave metadata advertising a column
-    // the storage cannot emit.
-    let covering_columns: Vec<String> = old_indices[0]
-        .covering_fields
-        .iter()
-        .map(|id| {
-            dataset
-                .schema()
-                .fields
-                .iter()
-                .find(|f| f.id == *id)
-                .map(|f| f.name.clone())
-                .ok_or_else(|| {
-                    Error::index(format!(
-                        "Append index: covering field id {} recorded on index '{}' does not \
-                         exist as a top-level field in the dataset schema; index metadata and \
-                         schema are inconsistent",
-                        id, old_indices[0].name
-                    ))
-                })
-        })
-        .collect::<Result<_>>()?;
+    // they survive optimize/merge and partition split/join. Resolution goes
+    // through `effective_covering` -- the single authority for covering
+    // resolution -- so it is top-level only and fails loudly on an unresolvable
+    // id, exactly like the read path: silently rebuilding without the column
+    // would leave the committed metadata advertising a column the storage
+    // cannot emit, and a recursive lookup would resolve a (corrupt or foreign)
+    // nested id to a leaf name the read path errors on.
+    let covering_columns: Vec<String> = crate::index::covering::effective_covering(
+        &old_indices[0].covering_fields,
+        None,
+        dataset.schema(),
+    )
+    .map_err(|e| {
+        Error::index(format!(
+            "Append index: covering declaration of index '{}' cannot be resolved: {e}",
+            old_indices[0].name
+        ))
+    })?
+    .into_iter()
+    .map(|field| field.name().clone())
+    .collect();
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
