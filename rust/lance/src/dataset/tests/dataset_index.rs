@@ -15,7 +15,7 @@ use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
-use crate::utils::test::covering;
+use crate::utils::test::{copy_test_data_to_tmp, covering};
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -5851,6 +5851,52 @@ async fn test_json_btree_index_statistics() {
     assert_eq!(stats["num_unindexed_rows"], 0);
     assert_eq!(stats["indices"][0]["min"], "1000");
     assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
+#[tokio::test]
+async fn test_legacy_json_btree_can_be_read_and_rebuilt() {
+    async fn assert_indexed_float_query(dataset: &Dataset) {
+        let mut scan = dataset.scan();
+        scan.filter("json_get_float(json, 'val') = 7.0").unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "expected the legacy Float64 JSON BTree to be used:\n{plan}"
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch["id"].as_primitive::<Int32Type>().value(0), 1);
+    }
+
+    let test_dir = copy_test_data_to_tmp("v10.0.0/legacy_json_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].name, "json_idx");
+    assert_eq!(indices[0].index_version, 0);
+    assert_indexed_float_query(&dataset).await;
+
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].index_version, 1);
+    assert_indexed_float_query(&dataset).await;
 }
 
 #[rstest]

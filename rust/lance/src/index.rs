@@ -3279,7 +3279,19 @@ impl DatasetIndexInternalExt for Dataset {
                     continue;
                 }
             };
-            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
+            let loaded_index = if plugin.requires_loaded_index_for_query_parser() {
+                Some(
+                    self.open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let query_parser = plugin.new_query_parser_with_index(
+                index.name.clone(),
+                &index_details.0,
+                loaded_index.as_deref(),
+            );
 
             if let Some(query_parser) = query_parser {
                 // Union the per-segment fragment bitmap into this

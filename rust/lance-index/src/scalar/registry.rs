@@ -151,6 +151,27 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
 
+    /// Whether query planning needs the loaded index in addition to its manifest details.
+    ///
+    /// Plugins should request this only when information required for safe query admission
+    /// lives in the index files rather than in [`CreatedIndex::index_details`].
+    fn requires_loaded_index_for_query_parser(&self) -> bool {
+        false
+    }
+
+    /// Returns a query parser with access to the loaded index when requested.
+    ///
+    /// The default implementation ignores `index` and delegates to
+    /// [`Self::new_query_parser`].
+    fn new_query_parser_with_index(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _index: Option<&dyn ScalarIndex>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.new_query_parser(index_name, index_details)
+    }
+
     /// Load an index from storage
     ///
     /// The index details should match the details that were returned when the index was

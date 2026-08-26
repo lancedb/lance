@@ -136,16 +136,9 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let target_type = self
-            .target_index
-            .training_data_type()
-            .as_ref()
-            .and_then(JsonIndexTargetType::from_data_type)
-            .map(JsonIndexTargetType::to_proto);
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
-            target_type,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -169,8 +162,6 @@ impl ScalarIndex for JsonIndex {
                 self.target_index.index_type()
             ))
         })?;
-        let persisted_target_type =
-            JsonIndexTargetType::from_data_type(&target_type).map(JsonIndexTargetType::to_proto);
         let new_data = JsonIndexPlugin::extract_json(new_data, self.path.clone())?;
         let new_data =
             JsonIndexPlugin::convert_stream_by_type(new_data, target_type, self.path.clone())?;
@@ -186,7 +177,6 @@ impl ScalarIndex for JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
-            target_type: persisted_target_type,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -257,33 +247,6 @@ impl JsonIndexTargetType {
             DataType::LargeBinary => Some(Self::LargeBinary),
             _ => None,
         }
-    }
-
-    fn from_proto(value: i32) -> Option<Self> {
-        use crate::pb::json_index_details::TargetType;
-
-        match TargetType::try_from(value).ok()? {
-            TargetType::Boolean => Some(Self::Boolean),
-            TargetType::Int64 => Some(Self::Int64),
-            TargetType::Uint64 => Some(Self::UInt64),
-            TargetType::Float64 => Some(Self::Float64),
-            TargetType::Utf8 => Some(Self::Utf8),
-            TargetType::LargeBinary => Some(Self::LargeBinary),
-            TargetType::Unspecified => None,
-        }
-    }
-
-    fn to_proto(self) -> i32 {
-        use crate::pb::json_index_details::TargetType;
-
-        (match self {
-            Self::Boolean => TargetType::Boolean,
-            Self::Int64 => TargetType::Int64,
-            Self::UInt64 => TargetType::Uint64,
-            Self::Float64 => TargetType::Float64,
-            Self::Utf8 => TargetType::Utf8,
-            Self::LargeBinary => TargetType::LargeBinary,
-        }) as i32
     }
 }
 
@@ -1191,8 +1154,6 @@ impl BasicTrainer for JsonIndexPlugin {
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
-            target_type: JsonIndexTargetType::from_data_type(&target_type)
-                .map(JsonIndexTargetType::to_proto),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1228,15 +1189,29 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 
     fn new_query_parser(
         &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        None
+    }
+
+    fn requires_loaded_index_for_query_parser(&self) -> bool {
+        true
+    }
+
+    fn new_query_parser_with_index(
+        &self,
         index_name: String,
         index_details: &prost_types::Any,
+        index: Option<&dyn ScalarIndex>,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         // TODO: Allow return Result here
         let registry = self.registry().unwrap();
         let json_details =
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
-        let target_type = JsonIndexTargetType::from_proto(json_details.target_type?)?.into();
+        let target_type = index?.training_data_type()?;
+        JsonIndexTargetType::from_data_type(&target_type)?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
         let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
@@ -1300,13 +1275,12 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_json_details_do_not_create_typed_query_parser() {
+    fn test_json_query_parser_requires_loaded_index() {
         let registry = IndexPluginRegistry::with_default_plugins();
         let plugin = registry.get_plugin_by_name("json").unwrap();
         let details = crate::pb::JsonIndexDetails {
             path: "value".to_string(),
             target_details: Some(prost_types::Any::default()),
-            target_type: None,
         };
         let details = prost_types::Any::from_msg(&details).unwrap();
 

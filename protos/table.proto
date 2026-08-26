@@ -125,9 +125,6 @@ message Manifest {
   //   merely-carried column with an index keyed on a different column. Writers must
   //   refuse it too: one that treats every entry of fields as keyed would maintain
   //   the index against the wrong dependency set.
-  // * 1 << 8: JSON columns may contain exact Decimal64, Decimal128, or Decimal256
-  //   JSONB encodings. Readers without arbitrary-precision JSONB support must refuse
-  //   the dataset instead of silently converting those values through float64.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.

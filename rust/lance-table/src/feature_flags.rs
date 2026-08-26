@@ -4,7 +4,6 @@
 //! Feature flags
 
 use crate::format::Manifest;
-use lance_core::datatypes::LogicalType;
 use lance_core::{Error, Result};
 
 /// Fragments may contain deletion files, which record the tombstones of
@@ -51,26 +50,16 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// that exposure comes with the reclamation and is inherited by whichever flag
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
-/// JSON columns may contain the exact Decimal64, Decimal128, or Decimal256
-/// encodings enabled by jsonb's arbitrary-precision parser.
-///
-/// Readers built without arbitrary-precision jsonb support decode those values
-/// through `f64` and silently change them. Readers and writers that do not
-/// understand this representation must therefore refuse the table.
-pub const FLAG_JSON_EXACT_NUMBERS: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 512;
+pub const FLAG_UNKNOWN: u64 = 256;
 
 // The highest flag allocated must stay below the unknown boundary, or
 // `supported_flags` would refuse a bit this code claims to understand. The next
 // flag takes 256, so it has to move the boundary to 512 with it.
-const _: () = assert!(FLAG_JSON_EXACT_NUMBERS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (128).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
-// The previous build's unknown boundary was 256, so it refuses exact-number
-// JSON datasets before decoding their decimal JSONB values.
-const _: () = assert!(FLAG_JSON_EXACT_NUMBERS >= 256);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -142,19 +131,6 @@ pub fn apply_feature_flags(
     if has_overlays {
         manifest.reader_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
-    }
-
-    // Any write to a JSON dataset can introduce one of jsonb's exact decimal
-    // encodings. Fence the whole committed version so older readers cannot
-    // silently round such values through f64.
-    let json_logical_type = LogicalType::from("json");
-    let has_json_fields = manifest
-        .schema
-        .fields_pre_order()
-        .any(|field| field.logical_type == json_logical_type);
-    if has_json_fields {
-        manifest.reader_feature_flags |= FLAG_JSON_EXACT_NUMBERS;
-        manifest.writer_feature_flags |= FLAG_JSON_EXACT_NUMBERS;
     }
 
     if disable_transaction_file {
@@ -236,24 +212,6 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
-    /// The predecessor's supported mask ended immediately below bit 256. Keep
-    /// the precise-JSON flag on that boundary so the predecessor fails closed,
-    /// while this build accepts the representation it writes.
-    #[test]
-    fn test_exact_json_numbers_fence_predecessor_reader() {
-        const PREDECESSOR_UNKNOWN_BOUNDARY: u64 = 256;
-        const PREDECESSOR_SUPPORTED_FLAGS: u64 = PREDECESSOR_UNKNOWN_BOUNDARY - 1;
-
-        assert_eq!(FLAG_JSON_EXACT_NUMBERS, PREDECESSOR_UNKNOWN_BOUNDARY);
-        assert!(can_read_dataset(FLAG_JSON_EXACT_NUMBERS));
-        assert!(can_write_dataset(FLAG_JSON_EXACT_NUMBERS));
-        assert_ne!(
-            FLAG_JSON_EXACT_NUMBERS & !PREDECESSOR_SUPPORTED_FLAGS,
-            0,
-            "the predecessor must reject precise JSON before decoding it"
-        );
-    }
-
     #[test]
     fn test_read_check() {
         assert!(can_read_dataset(0));
@@ -263,7 +221,6 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_read_dataset(super::FLAG_JSON_EXACT_NUMBERS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -332,30 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_feature_flags_sets_exact_json_numbers_flag() {
-        use crate::format::{DataStorageFormat, Manifest};
-        use arrow_schema::Schema as ArrowSchema;
-        use lance_arrow::json::json_field;
-        use lance_core::datatypes::Schema;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        let arrow_schema = ArrowSchema::new(vec![json_field("data", true)]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(
-            schema,
-            Arc::new(vec![]),
-            DataStorageFormat::default(),
-            HashMap::new(),
-        );
-
-        apply_feature_flags(&mut manifest, false, false).unwrap();
-
-        assert_ne!(manifest.reader_feature_flags & FLAG_JSON_EXACT_NUMBERS, 0);
-        assert_ne!(manifest.writer_feature_flags & FLAG_JSON_EXACT_NUMBERS, 0);
-    }
-
-    #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
@@ -364,7 +297,6 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_write_dataset(super::FLAG_JSON_EXACT_NUMBERS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
