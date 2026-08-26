@@ -292,6 +292,7 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
         if (may_alter_nullability(ours) && supplies_values(theirs))
