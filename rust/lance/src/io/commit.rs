@@ -359,18 +359,9 @@ async fn do_commit_new_dataset(
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
-    let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &pb_transaction).await?
-    } else {
-        String::new()
-    };
-
-    let (mut manifest, indices) = if let Operation::Clone {
-        is_shallow,
-        ref_name,
+    let clone_source = if let Operation::Clone {
         ref_version,
         ref_path,
-        branch_name,
         ..
     } = &transaction.operation
     {
@@ -391,7 +382,28 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
+        Some((source_store, source_manifest_location, source_manifest))
+    } else {
+        None
+    };
 
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, base_path, &pb_transaction).await?
+    } else {
+        String::new()
+    };
+
+    let (mut manifest, indices) = if let (
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_path,
+            branch_name,
+            ..
+        },
+        Some((source_store, source_manifest_location, source_manifest)),
+    ) = (&transaction.operation, clone_source)
+    {
         if *is_shallow {
             let new_base_id = source_manifest
                 .base_paths

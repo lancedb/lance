@@ -3495,6 +3495,8 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
+        self.ensure_manifest_writable().await?;
+
         // Atomically create the .lance-reserved file to mark the table as declared.
         // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
         // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
@@ -3858,8 +3860,8 @@ mod tests {
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
-        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
-        ListTablesRequest, TableExistsRequest,
+        CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
+        DropTableRequest, ListTablesRequest, TableExistsRequest,
     };
     use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
@@ -4395,7 +4397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manifest_rewrite_rejects_unknown_writer_flag_before_staging() {
+    async fn test_manifest_writes_reject_unknown_writer_flag_before_staging() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
         let manifest_ns = create_manifest_namespace(temp_path, false).await;
@@ -4410,6 +4412,18 @@ mod tests {
         };
 
         let entries_before = dir_entry_names(temp_path);
+        let mut declare_request = DeclareTableRequest::new();
+        declare_request.id = Some(vec!["declared_table".to_string()]);
+        let error = manifest_ns
+            .declare_table(declare_request)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {error}"
+        );
+        assert_eq!(dir_entry_names(temp_path), entries_before);
+
         let mut create_request = CreateTableRequest::new();
         create_request.id = Some(vec!["new_table".to_string()]);
         let error = manifest_ns
