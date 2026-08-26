@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-const JSON_INDEX_VERSION: u32 = 0;
+const JSON_INDEX_VERSION: u32 = 1;
 /// Maximum extracted JSON data kept in memory while inferring an index type.
 const JSON_TYPE_INFERENCE_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
 
@@ -368,6 +368,26 @@ pub struct JsonQueryParser {
     target_parser: Box<dyn ScalarQueryParser>,
 }
 
+/// Returns the direct object key selected by a JSONPath, when direct-key access
+/// has identical semantics for every possible root value.
+fn direct_key_for_json_path(path: &str) -> Option<String> {
+    use jsonb::jsonpath::Path;
+
+    let parsed = jsonb::jsonpath::parse_json_path(path.as_bytes()).ok()?;
+    let ([Path::DotField(key) | Path::ColonField(key) | Path::ObjectField(key)]
+    | [
+        Path::Root,
+        Path::DotField(key) | Path::ColonField(key) | Path::ObjectField(key),
+    ]) = parsed.paths.as_slice()
+    else {
+        return None;
+    };
+
+    // json_get_* interprets a numeric key as an array index as well as an object
+    // key, while a JSONPath object-field selector does not.
+    key.parse::<usize>().err().map(|_| key.to_string())
+}
+
 impl JsonQueryParser {
     pub fn new(
         path: String,
@@ -467,11 +487,12 @@ impl ScalarQueryParser for JsonQueryParser {
                 if udf.args.len() != 2 {
                     return None;
                 }
-                // We already know index 0 is a column reference to the column so we just need to
-                // ensure that index 1 matches our path
+                // We already know index 0 is a column reference to the column. The json_get_*
+                // family uses direct-key semantics, so only admit it when the training JSONPath
+                // selects exactly one equivalent object key.
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
-                        if path == &self.path {
+                        if direct_key_for_json_path(&self.path).as_ref() == Some(path) {
                             let accessor_type = match udf.name() {
                                 "json_get" => DataType::LargeBinary,
                                 "json_get_int" => DataType::Int64,
@@ -543,7 +564,7 @@ struct JsonTypeInference {
 impl JsonTypeInference {
     fn new() -> Self {
         Self {
-            observed_types: Vec::with_capacity(7),
+            observed_types: Vec::with_capacity(8),
             has_negative_int64: false,
         }
     }
@@ -564,14 +585,16 @@ impl JsonTypeInference {
         let is_numeric = self.observed_types.iter().all(|jsonb_type| {
             matches!(
                 jsonb_type,
-                JsonbType::Int64 | JsonbType::UInt64 | JsonbType::Float64
+                JsonbType::Int64 | JsonbType::UInt64 | JsonbType::Float64 | JsonbType::Decimal
             )
         });
         if is_numeric {
-            if has_type(JsonbType::UInt64) && has_type(JsonbType::Float64) {
+            if has_type(JsonbType::UInt64)
+                && (has_type(JsonbType::Float64) || has_type(JsonbType::Decimal))
+            {
                 return Err(Error::invalid_input_source(
                     format!(
-                        "JSON path '{path}' contains both UInt64 and Float64 values, which cannot share a lossless JSON index type"
+                        "JSON path '{path}' contains UInt64 and non-integer numeric values, which cannot share a lossless JSON index type"
                     )
                     .into(),
                 ));
@@ -587,7 +610,7 @@ impl JsonTypeInference {
                 }
                 return Ok(DataType::UInt64);
             }
-            if has_type(JsonbType::Float64) {
+            if has_type(JsonbType::Float64) || has_type(JsonbType::Decimal) {
                 return Ok(DataType::Float64);
             }
             return Ok(DataType::Int64);
@@ -607,6 +630,7 @@ impl JsonTypeInference {
                 JsonbType::Int64 => DataType::Int64,
                 JsonbType::UInt64 => DataType::UInt64,
                 JsonbType::Float64 => DataType::Float64,
+                JsonbType::Decimal => DataType::Float64,
                 JsonbType::String => DataType::Utf8,
                 JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
                 JsonbType::Null => DataType::Utf8,
@@ -801,7 +825,10 @@ impl JsonIndexPlugin {
                     matches!(actual_type, JsonbType::Int64 | JsonbType::UInt64)
                 }
                 DataType::Float64 => {
-                    matches!(actual_type, JsonbType::Int64 | JsonbType::Float64)
+                    matches!(
+                        actual_type,
+                        JsonbType::Int64 | JsonbType::Float64 | JsonbType::Decimal
+                    )
                 }
                 DataType::Utf8 => actual_type == JsonbType::String,
                 DataType::LargeBinary => {
@@ -1261,6 +1288,35 @@ mod tests {
     use std::ops::Bound;
     use std::sync::Arc;
 
+    #[rstest]
+    #[case::bare("value", Some("value"))]
+    #[case::root_dot("$.value", Some("value"))]
+    #[case::quoted(r#"$["a.b"]"#, Some("a.b"))]
+    #[case::nested("$.user.value", None)]
+    #[case::array_index("$[0]", None)]
+    #[case::numeric_object_key("0", None)]
+    fn test_direct_key_for_json_path(#[case] path: &str, #[case] expected: Option<&str>) {
+        assert_eq!(direct_key_for_json_path(path).as_deref(), expected);
+    }
+
+    #[test]
+    fn test_legacy_json_details_do_not_create_typed_query_parser() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = crate::pb::JsonIndexDetails {
+            path: "value".to_string(),
+            target_details: Some(prost_types::Any::default()),
+            target_type: None,
+        };
+        let details = prost_types::Any::from_msg(&details).unwrap();
+
+        assert!(
+            plugin
+                .new_query_parser("legacy_json".to_string(), &details)
+                .is_none()
+        );
+    }
+
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection
 
@@ -1443,6 +1499,45 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(values, expected);
+    }
+
+    #[rstest]
+    #[case::above_u64(r#"{"v": 18446744073709551616}"#, 18446744073709551616.0)]
+    #[case::fraction(
+        r#"{"v": 1.2345678901234567890123456789012345678}"#,
+        1.2345678901234567
+    )]
+    #[tokio::test]
+    async fn test_json_decimal_index_uses_float_accessor_semantics(
+        #[case] json: &str,
+        #[case] expected: f64,
+    ) {
+        use arrow_array::Float64Array;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::{TryStreamExt, stream};
+
+        let batch = json_update_batch(&[json], vec![0]);
+        let schema = batch.schema();
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter([Ok(batch)]),
+        )) as SendableRecordBatchStream;
+
+        let (extracted, inferred_type) =
+            JsonIndexPlugin::extract_json_with_type_info(source, "$.v".to_string())
+                .await
+                .unwrap();
+        assert_eq!(inferred_type, DataType::Float64);
+
+        let converted =
+            JsonIndexPlugin::convert_stream_by_type(extracted, inferred_type, "$.v".to_string())
+                .unwrap();
+        let batches: Vec<RecordBatch> = converted.try_collect().await.unwrap();
+        let values = batches[0][VALUE_COLUMN_NAME]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), expected);
     }
 
     /// Trains a JSON-path index of `target_index_type` over `json_docs` (fed to the

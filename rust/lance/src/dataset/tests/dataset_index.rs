@@ -5900,6 +5900,9 @@ async fn test_json_btree_uint64_is_lossless_and_order_independent(
         .await
         .unwrap();
 
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices[0].index_version, 1);
+
     let predicate = "json_get_uint(json, 'val') = 9223372036854775809";
     let mut indexed_scan = dataset.scan();
     indexed_scan.filter(predicate).unwrap();
@@ -5943,6 +5946,58 @@ async fn test_json_btree_uint64_is_lossless_and_order_independent(
 
     assert_eq!(incompatible.num_rows(), 1);
     assert_eq!(incompatible, incompatible_baseline);
+}
+
+#[tokio::test]
+async fn test_json_btree_nested_path_bypasses_direct_accessor() {
+    let initial = json_batch(vec![
+        r#"{"user":{"value":9223372036854775808}}"#,
+        r#"{"$.user.value":9223372036854775808}"#,
+    ]);
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "$.user.value",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let predicate = "json_get_uint(json, '$.user.value') = 9223372036854775808";
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(predicate).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ScalarIndexQuery"),
+        "Expected direct-key access to bypass a nested JSONPath BTree:\n{plan}"
+    );
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(indexed.num_rows(), 1);
+    assert_eq!(indexed, baseline);
 }
 
 #[rstest]

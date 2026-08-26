@@ -727,6 +727,43 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_json_columns_preserves_exact_numbers() {
+        let numbers = [
+            "18446744073709551616",
+            "18446744073709551617",
+            "-9223372036854775809",
+            "11111111111111111111111111111111111111",
+            "1111111111111111111111111111111111111111111111111111111111111111111111111111",
+            "1.2345678901234567890123456789012345678",
+            "12345678901234567890.12345",
+            "3.14159265358979311600",
+        ];
+        let json_strings = numbers
+            .iter()
+            .map(|number| format!(r#"{{"v":{number}}}"#))
+            .collect::<Vec<_>>();
+        let json_array = StringArray::from_iter_values(json_strings.iter());
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new("data", DataType::Utf8, false).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(json_array) as ArrayRef]).unwrap();
+
+        let stored = convert_json_columns(&batch).unwrap();
+        let round_tripped = convert_lance_json_to_arrow(&stored).unwrap();
+        let values = round_tripped["data"]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(values.iter().flatten().collect::<Vec<_>>(), json_strings);
+    }
+
+    #[test]
     fn test_convert_nested_json_columns() {
         use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 

@@ -24,6 +24,7 @@ pub enum JsonbType {
     Array = 5,
     Object = 6,
     UInt64 = 7,
+    Decimal = 8,
 }
 
 impl JsonbType {
@@ -38,6 +39,7 @@ impl JsonbType {
             5 => Some(Self::Array),
             6 => Some(Self::Object),
             7 => Some(Self::UInt64),
+            8 => Some(Self::Decimal),
             _ => None,
         }
     }
@@ -394,16 +396,28 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
             } else if raw.is_boolean().unwrap_or(false) {
                 JsonbType::Boolean
             } else if raw.is_number().unwrap_or(false) {
-                let is_float_storage =
-                    matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
-                let is_uint64_storage =
-                    matches!(raw.as_number(), Ok(Some(jsonb::Number::UInt64(_))));
-                if !is_float_storage && raw.is_i64().unwrap_or(false) {
-                    JsonbType::Int64
-                } else if is_uint64_storage {
-                    JsonbType::UInt64
-                } else {
-                    JsonbType::Float64
+                match raw.as_number() {
+                    Ok(Some(jsonb::Number::Int64(_))) => JsonbType::Int64,
+                    Ok(Some(jsonb::Number::UInt64(value))) if value <= i64::MAX as u64 => {
+                        JsonbType::Int64
+                    }
+                    Ok(Some(jsonb::Number::UInt64(_))) => JsonbType::UInt64,
+                    Ok(Some(jsonb::Number::Float64(_))) => JsonbType::Float64,
+                    Ok(Some(
+                        jsonb::Number::Decimal64(_)
+                        | jsonb::Number::Decimal128(_)
+                        | jsonb::Number::Decimal256(_),
+                    )) => JsonbType::Decimal,
+                    Ok(None) => {
+                        return Err(common::execution_error(format!(
+                            "JSON path '{path}' selected a value marked as a number without numeric storage"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(common::execution_error(format!(
+                            "Failed to inspect number at JSON path '{path}': {error}"
+                        )));
+                    }
                 }
             } else if raw.is_string().unwrap_or(false) {
                 JsonbType::String
@@ -1048,6 +1062,7 @@ mod tests {
         assert_eq!(JsonbType::Array.as_u8(), 5);
         assert_eq!(JsonbType::Object.as_u8(), 6);
         assert_eq!(JsonbType::UInt64.as_u8(), 7);
+        assert_eq!(JsonbType::Decimal.as_u8(), 8);
 
         // Test from_u8 conversion
         assert_eq!(JsonbType::from_u8(0), Some(JsonbType::Null));
@@ -1058,7 +1073,8 @@ mod tests {
         assert_eq!(JsonbType::from_u8(5), Some(JsonbType::Array));
         assert_eq!(JsonbType::from_u8(6), Some(JsonbType::Object));
         assert_eq!(JsonbType::from_u8(7), Some(JsonbType::UInt64));
-        assert_eq!(JsonbType::from_u8(8), None); // Invalid value
+        assert_eq!(JsonbType::from_u8(8), Some(JsonbType::Decimal));
+        assert_eq!(JsonbType::from_u8(9), None); // Invalid value
     }
 
     #[tokio::test]
@@ -1381,10 +1397,15 @@ mod tests {
             (r#"{"v": 9223372036854775807}"#, JsonbType::Int64), // i64::MAX
             (r#"{"v": 9223372036854775808}"#, JsonbType::UInt64), // i64::MAX + 1
             (r#"{"v": 18446744073709551615}"#, JsonbType::UInt64), // u64::MAX
-            (r#"{"v": 1.0}"#, JsonbType::Float64),
-            (r#"{"v": 2.7}"#, JsonbType::Float64),
-            (r#"{"v": 1.5}"#, JsonbType::Float64),
-            (r#"{"v": -1.5}"#, JsonbType::Float64),
+            (r#"{"v": 1.0}"#, JsonbType::Decimal),
+            (r#"{"v": 2.7}"#, JsonbType::Decimal),
+            (r#"{"v": 1.5}"#, JsonbType::Decimal),
+            (r#"{"v": -1.5}"#, JsonbType::Decimal),
+            (r#"{"v": 18446744073709551616}"#, JsonbType::Decimal),
+            (
+                r#"{"v": 1.2345678901234567890123456789012345678}"#,
+                JsonbType::Decimal,
+            ),
             (r#"{"v": 1e2}"#, JsonbType::Float64),
         ];
 
