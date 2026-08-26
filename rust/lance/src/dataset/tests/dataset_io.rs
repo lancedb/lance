@@ -14,7 +14,10 @@ use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::Operation;
-use crate::dataset::{ManifestWriteConfig, validate_dataset_root_for_drop, write_manifest_file};
+use crate::dataset::{
+    ManifestWriteConfig, parse_deep_clone_stream_concurrency, validate_dataset_root_for_drop,
+    write_manifest_file,
+};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
@@ -64,6 +67,23 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::zero("0")]
+#[case::negative("-1")]
+#[case::not_a_number("many")]
+fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value: &str) {
+    let error = parse_deep_clone_stream_concurrency(value).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("LANCE_DEEP_CLONE_STREAM_CONCURRENCY"));
+    assert!(message.contains(value));
+}
+
+#[test]
+fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
+    assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
 }
 
 #[tokio::test]

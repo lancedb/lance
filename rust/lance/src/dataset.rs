@@ -176,6 +176,17 @@ pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 
+fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
+    value
+        .parse::<NonZero<usize>>()
+        .map(NonZero::get)
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
+            ))
+        })
+}
+
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
 pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
@@ -3319,10 +3330,7 @@ impl Dataset {
         let io_parallelism = if !uses_streaming_copy {
             configured_io_parallelism
         } else if let Ok(value) = std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
-            value
-                .parse::<NonZero<usize>>()
-                .expect("LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer")
-                .get()
+            parse_deep_clone_stream_concurrency(&value)?
         } else if std::env::var_os("LANCE_IO_THREADS").is_some() {
             configured_io_parallelism
         } else {
