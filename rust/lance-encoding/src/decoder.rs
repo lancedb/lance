@@ -2894,10 +2894,6 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
     fn num_rows(&self) -> u64;
     /// Returns the exact decoded byte count for the next `num_rows` rows
     /// from this decoder's current position, without consuming any rows.
-    ///
-    /// Only implemented for variable-width page decoders. Fixed-width
-    /// decoded sizes are computed directly from the field's data type in
-    /// [`StructuralFieldDecoder::plan_decoded_bytes`].
     fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
         Err(Error::not_supported(
             "decoded_bytes is not implemented for this page decoder".to_string(),
@@ -2954,9 +2950,12 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     /// Returns the exact decoded byte count for each of [`CANDIDATE_BATCH_SIZES`]
     /// row counts, clamped to `rows_remaining`.
     ///
-    /// The default implementation uses a schema-based estimate via
-    /// [`estimate_bytes_per_row`]. Concrete implementations override this
-    /// with exact computation.
+    /// Implementations should do their best to estimate the exact size required for
+    /// the uncompressed data.  In cases where this is not possible they should return
+    /// a worst-case estimate.
+    ///
+    /// The default implementation simply returns a "not supported" error though this
+    /// will hopefully be removed once implementation is complete.
     fn plan_decoded_bytes(&self, _rows_remaining: u64) -> Result<[u64; 8]> {
         Err(Error::not_supported(
             "decoded_bytes is not implemented for this field decoder".to_string(),
