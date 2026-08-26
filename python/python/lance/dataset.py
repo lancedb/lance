@@ -6501,52 +6501,6 @@ _SUBSTRAIT_UNSUPPORTED_FUNCTION = re.compile(
 
 _FILTER_DOCS = "https://lance.org/guide/read_and_write/#filter-push-down"
 
-# PyArrow renders an expression's options inline, e.g.
-# ``match_like(s, {pattern="ab%", ignore_case=true})``.
-_IGNORE_CASE = re.compile(r"ignore_case=true")
-
-# Arrow compute function -> Lance SQL that selects the same rows.  Proven by
-# test_sql_equivalent_selects_the_same_rows, which every entry must have a case
-# in: a name that merely looks equivalent is not enough, since Arrow's ascii_*
-# kernels leave non-ASCII untouched where SQL lower/upper fold it, and
-# binary_length counts bytes where SQL length counts characters.
-_SQL_EQUIVALENT = {
-    "starts_with": "starts_with(column, 'prefix')",
-    "ends_with": "ends_with(column, 'suffix')",
-    "match_substring": "contains(column, 'substring')",
-    "match_substring_regex": "regexp_like(column, 'pattern')",
-    "match_like": "column LIKE 'pattern'",
-    "replace_substring": "replace(column, 'from', 'to')",
-    "replace_substring_regex": "regexp_replace(column, 'pattern', 'to')",
-    "utf8_lower": "lower(column)",
-    "utf8_upper": "upper(column)",
-    "utf8_length": "length(column)",
-    "utf8_reverse": "reverse(column)",
-    "binary_length": "octet_length(column)",
-}
-
-# The same, for an expression that sets Arrow's ignore_case option.  Most of
-# the kernels above have no case-insensitive Lance SQL counterpart, so their
-# absence here is what withholds a hint that would select different rows.
-_SQL_EQUIVALENT_IGNORE_CASE = {
-    "match_like": "column ILIKE 'pattern'",
-}
-
-
-def _sql_equivalent(function: str, expression: str) -> Optional[str]:
-    """Return Lance SQL selecting the same rows as *function*, or None.
-
-    Only a mapping whose full semantics follow from the expression is offered;
-    a hint that quietly selects different rows is worse than no hint.  Arrow
-    renders options per call but the failing function is reported by name
-    alone, so ``ignore_case`` anywhere in a compound expression withholds every
-    mapping that has no case-insensitive form, rather than risk attributing the
-    option to the wrong call.
-    """
-    if _IGNORE_CASE.search(expression):
-        return _SQL_EQUIVALENT_IGNORE_CASE.get(function)
-    return _SQL_EQUIVALENT.get(function)
-
 
 def _substrait_serialization_error(
     filter: pa.compute.Expression, err: pa.ArrowNotImplementedError
@@ -6554,31 +6508,30 @@ def _substrait_serialization_error(
     """Build an actionable error for an expression PyArrow cannot serialize.
 
     Lance ingests a PyArrow expression by serializing it to Substrait, which
-    PyArrow implements for only a subset of its compute functions.  Lance SQL
-    covers many of the rest, so name the offending function and point at the
-    string form instead of surfacing the Arrow internals error.  The exception
-    type is preserved so existing handlers keep working.
+    PyArrow implements for only a subset of its compute functions.  Name the
+    offending function and point at the string form instead of surfacing the
+    Arrow internals error.  The exception type is preserved so existing
+    handlers keep working.
+
+    The error names no SQL equivalent for the function.  Doing so would claim
+    the suggestion selects the same rows, which cannot be established here: a
+    ``pa.compute.Expression`` exposes neither its arguments nor its function
+    options, so a case-insensitive match, a replacement count, or an RE2
+    pattern with no Rust-regex spelling is indistinguishable from the form
+    that does agree.
     """
     expression = str(filter)
     match = _SUBSTRAIT_UNSUPPORTED_FUNCTION.search(str(err))
     function = match.group(1) if match else None
-    if function is None:
-        detail = f"PyArrow cannot serialize this expression to Substrait ({err})"
-        equivalent = None
-    else:
-        detail = (
-            f"PyArrow cannot serialize the compute function '{function}' to Substrait"
-        )
-        equivalent = _sql_equivalent(function, expression)
-    hint = "Pass the filter as a Lance SQL string instead"
-    hint += (
-        f", where this is written `{equivalent}`."
-        if equivalent
-        else f"; see {_FILTER_DOCS} for the supported syntax."
+    detail = (
+        f"PyArrow cannot serialize the compute function '{function}' to Substrait"
+        if function is not None
+        else f"PyArrow cannot serialize this expression to Substrait ({err})"
     )
     return pa.ArrowNotImplementedError(
         f"Cannot apply the filter expression `{expression}`: {detail}, which is"
-        f" how Lance consumes PyArrow expressions. {hint}"
+        f" how Lance consumes PyArrow expressions. Pass the filter as a Lance SQL"
+        f" string instead; see {_FILTER_DOCS} for the supported syntax."
     )
 
 
@@ -6790,7 +6743,8 @@ class ScannerBuilder:
             implements for only a subset of its compute functions; a filter
             using one of the rest (``starts_with`` and the other string
             matchers, for instance) must be given as a Lance SQL string. The
-            error raised for such an expression names the Lance SQL equivalent.
+            error raised for such an expression names the function PyArrow
+            could not serialize.
 
         :return: The scanner builder.
         """
