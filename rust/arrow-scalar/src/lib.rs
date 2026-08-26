@@ -18,63 +18,13 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{
-    Array, ArrayRef, Float16Array, Float32Array, Float64Array, make_array, new_null_array,
-};
+use arrow_array::{ArrayRef, make_array, new_null_array};
 use arrow_cast::display::ArrayFormatter;
 use arrow_data::transform::MutableArrayData;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{ArrowError, DataType};
 
 type Result<T> = std::result::Result<T, ArrowError>;
-
-/// Normalize -0.0 to +0.0 in a length-1 float array so that row encoding
-/// produces identical bytes for both representations. This ensures Eq, Ord,
-/// and Hash consistency for ArrowScalar.
-fn normalize_float_neg_zero(array: &ArrayRef) -> ArrayRef {
-    match array.data_type() {
-        DataType::Float16 => {
-            let arr = array.as_any().downcast_ref::<Float16Array>().unwrap();
-            if arr.is_null(0) {
-                Arc::clone(array)
-            } else {
-                let v = arr.value(0);
-                if v == half::f16::ZERO {
-                    Arc::new(Float16Array::from(vec![half::f16::ZERO])) as ArrayRef
-                } else {
-                    Arc::clone(array)
-                }
-            }
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            if arr.is_null(0) {
-                Arc::clone(array)
-            } else {
-                let v = arr.value(0);
-                if v == 0.0 {
-                    Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef
-                } else {
-                    Arc::clone(array)
-                }
-            }
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            if arr.is_null(0) {
-                Arc::clone(array)
-            } else {
-                let v = arr.value(0);
-                if v == 0.0 {
-                    Arc::new(Float64Array::from(vec![0.0f64])) as ArrayRef
-                } else {
-                    Arc::clone(array)
-                }
-            }
-        }
-        _ => Arc::clone(array),
-    }
-}
 
 /// A scalar value backed by a length-1 Arrow array.
 ///
@@ -141,10 +91,9 @@ impl ArrowScalar {
     }
 
     fn compute_row(array: &ArrayRef) -> Result<OwnedRow> {
-        let array = normalize_float_neg_zero(array);
         let sort_field = SortField::new(array.data_type().clone());
         let converter = RowConverter::new(vec![sort_field])?;
-        let rows = converter.convert_columns(&[array])?;
+        let rows = converter.convert_columns(&[Arc::clone(array)])?;
         Ok(rows.row(0).owned())
     }
 
@@ -372,49 +321,6 @@ mod tests {
         let array: ArrayRef = Arc::new(Float64Array::from(vec![None]));
         let scalar = ArrowScalar::try_from_array(array).unwrap();
         assert!(!scalar.is_nan());
-    }
-
-    #[test]
-    fn test_neg_zero_equals_pos_zero_f32() {
-        let neg = ArrowScalar::from(-0.0f32);
-        let pos = ArrowScalar::from(0.0f32);
-        assert_eq!(neg, pos);
-        assert_eq!(neg.cmp(&pos), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_neg_zero_equals_pos_zero_f64() {
-        let neg = ArrowScalar::from(-0.0f64);
-        let pos = ArrowScalar::from(0.0f64);
-        assert_eq!(neg, pos);
-        assert_eq!(neg.cmp(&pos), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_neg_zero_equals_pos_zero_f16() {
-        let neg = ArrowScalar::from(half::f16::NEG_ZERO);
-        let pos = ArrowScalar::from(half::f16::ZERO);
-        assert_eq!(neg, pos);
-        assert_eq!(neg.cmp(&pos), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_neg_zero_hash_equals_pos_zero() {
-        use std::hash::DefaultHasher;
-
-        let neg = ArrowScalar::from(-0.0f64);
-        let pos = ArrowScalar::from(0.0f64);
-        let hash_neg = {
-            let mut h = DefaultHasher::new();
-            neg.hash(&mut h);
-            h.finish()
-        };
-        let hash_pos = {
-            let mut h = DefaultHasher::new();
-            pos.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(hash_neg, hash_pos);
     }
 
     #[test]

@@ -30,19 +30,6 @@ pub use lance_index_core::scalar::{
     SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
 };
 
-/// Normalize -0.0 to +0.0 in float ScalarValues so that comparisons
-/// using IEEE 754 semantics treat them as equal.
-fn normalize_float_scalar(val: &ScalarValue) -> ScalarValue {
-    match val {
-        ScalarValue::Float16(Some(v)) if *v == half::f16::ZERO => {
-            ScalarValue::Float16(Some(half::f16::ZERO))
-        }
-        ScalarValue::Float32(Some(v)) if *v == 0.0 => ScalarValue::Float32(Some(0.0f32)),
-        ScalarValue::Float64(Some(v)) if *v == 0.0 => ScalarValue::Float64(Some(0.0f64)),
-        other => other.clone(),
-    }
-}
-
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
@@ -287,38 +274,38 @@ impl AnyQuery for SargableQuery {
                     Expr::Literal(ScalarValue::Boolean(Some(true)), None)
                 }
                 (Bound::Unbounded, Bound::Included(rhs)) => {
-                    col_expr.lt_eq(Expr::Literal(normalize_float_scalar(rhs), None))
+                    col_expr.lt_eq(Expr::Literal(rhs.clone(), None))
                 }
                 (Bound::Unbounded, Bound::Excluded(rhs)) => {
-                    col_expr.lt(Expr::Literal(normalize_float_scalar(rhs), None))
+                    col_expr.lt(Expr::Literal(rhs.clone(), None))
                 }
                 (Bound::Included(lhs), Bound::Unbounded) => {
-                    col_expr.gt_eq(Expr::Literal(normalize_float_scalar(lhs), None))
+                    col_expr.gt_eq(Expr::Literal(lhs.clone(), None))
                 }
                 (Bound::Included(lhs), Bound::Included(rhs)) => col_expr.between(
-                    Expr::Literal(normalize_float_scalar(lhs), None),
-                    Expr::Literal(normalize_float_scalar(rhs), None),
+                    Expr::Literal(lhs.clone(), None),
+                    Expr::Literal(rhs.clone(), None),
                 ),
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt_eq(Expr::Literal(normalize_float_scalar(lhs), None))
-                    .and(col_expr.lt(Expr::Literal(normalize_float_scalar(rhs), None))),
+                    .gt_eq(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
                 (Bound::Excluded(lhs), Bound::Unbounded) => {
-                    col_expr.gt(Expr::Literal(normalize_float_scalar(lhs), None))
+                    col_expr.gt(Expr::Literal(lhs.clone(), None))
                 }
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(normalize_float_scalar(lhs), None))
-                    .and(col_expr.lt_eq(Expr::Literal(normalize_float_scalar(rhs), None))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone(), None))),
                 (Bound::Excluded(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
-                    .gt(Expr::Literal(normalize_float_scalar(lhs), None))
-                    .and(col_expr.lt(Expr::Literal(normalize_float_scalar(rhs), None))),
+                    .gt(Expr::Literal(lhs.clone(), None))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
             },
             Self::IsIn(values) => col_expr.in_list(
                 values
                     .iter()
-                    .map(|val| Expr::Literal(normalize_float_scalar(val), None))
+                    .map(|val| Expr::Literal(val.clone(), None))
                     .collect::<Vec<_>>(),
                 false,
             ),
@@ -327,7 +314,7 @@ impl AnyQuery for SargableQuery {
                 None,
             )),
             Self::IsNull() => col_expr.is_null(),
-            Self::Equals(value) => col_expr.eq(Expr::Literal(normalize_float_scalar(value), None)),
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
             Self::LikePrefix(prefix) => match prefix {
                 ScalarValue::Utf8(Some(s))
                 | ScalarValue::LargeUtf8(Some(s))
@@ -555,12 +542,12 @@ impl AnyQuery for BloomFilterQuery {
     fn to_expr(&self, col: String) -> Expr {
         let col_expr = Expr::Column(Column::new_unqualified(col));
         match self {
-            Self::Equals(value) => col_expr.eq(Expr::Literal(normalize_float_scalar(value), None)),
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
             Self::IsNull() => col_expr.is_null(),
             Self::IsIn(values) => col_expr.in_list(
                 values
                     .iter()
-                    .map(|val| Expr::Literal(normalize_float_scalar(val), None))
+                    .map(|val| Expr::Literal(val.clone(), None))
                     .collect::<Vec<_>>(),
                 false,
             ),

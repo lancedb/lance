@@ -218,23 +218,13 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             _ => None,
         },
         ScalarValue::Float32(val) => match ty {
-            DataType::Float32 => Some(ScalarValue::Float32(
-                val.map(|v| if v == 0.0 { 0.0f32 } else { v }),
-            )),
-            DataType::Float64 => val.map(|v| {
-                let v = f64::from(v);
-                ScalarValue::Float64(Some(if v == 0.0 { 0.0f64 } else { v }))
-            }),
+            DataType::Float32 => Some(value.clone()),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::Float64(val) => match ty {
-            DataType::Float32 => val.map(|v| {
-                let v = v as f32;
-                ScalarValue::Float32(Some(if v == 0.0 { 0.0f32 } else { v }))
-            }),
-            DataType::Float64 => Some(ScalarValue::Float64(
-                val.map(|v| if v == 0.0 { 0.0f64 } else { v }),
-            )),
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => Some(value.clone()),
             _ => None,
         },
         ScalarValue::Utf8(val) => match ty {

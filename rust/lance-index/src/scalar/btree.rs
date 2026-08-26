@@ -215,13 +215,7 @@ impl Ord for OrderableScalarValue {
             }
             (Boolean(_), _) => panic!("Attempt to compare boolean with non-boolean"),
             (Float32(v1), Float32(v2)) => match (v1, v2) {
-                (Some(f1), Some(f2)) => {
-                    // Normalize -0.0 to +0.0 before comparison so that
-                    // IEEE 754 -0.0 == +0.0 semantics are preserved.
-                    let f1 = if *f1 == 0.0 { &0.0f32 } else { f1 };
-                    let f2 = if *f2 == 0.0 { &0.0f32 } else { f2 };
-                    f1.total_cmp(f2)
-                }
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
                 (None, Some(_)) => Ordering::Less,
                 (Some(_), None) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
@@ -235,11 +229,7 @@ impl Ord for OrderableScalarValue {
             }
             (Float32(_), _) => panic!("Attempt to compare f32 with non-f32"),
             (Float64(v1), Float64(v2)) => match (v1, v2) {
-                (Some(f1), Some(f2)) => {
-                    let f1 = if *f1 == 0.0 { &0.0f64 } else { f1 };
-                    let f2 = if *f2 == 0.0 { &0.0f64 } else { f2 };
-                    f1.total_cmp(f2)
-                }
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
                 (None, Some(_)) => Ordering::Less,
                 (Some(_), None) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
@@ -253,19 +243,7 @@ impl Ord for OrderableScalarValue {
             }
             (Float64(_), _) => panic!("Attempt to compare f64 with non-f64"),
             (Float16(v1), Float16(v2)) => match (v1, v2) {
-                (Some(f1), Some(f2)) => {
-                    let f1 = if *f1 == half::f16::ZERO {
-                        &half::f16::ZERO
-                    } else {
-                        f1
-                    };
-                    let f2 = if *f2 == half::f16::ZERO {
-                        &half::f16::ZERO
-                    } else {
-                        f2
-                    };
-                    f1.total_cmp(f2)
-                }
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
                 (None, Some(_)) => Ordering::Less,
                 (Some(_), None) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
@@ -3507,36 +3485,6 @@ mod tests {
         // deep_size_of should account for the rust type overhead
         assert!(size_of_i32 > 4);
         assert!(size_of_many_i32 > 128 * 4);
-    }
-
-    #[test]
-    fn test_neg_zero_cmp_f32() {
-        let neg = OrderableScalarValue(ScalarValue::Float32(Some(-0.0)));
-        let pos = OrderableScalarValue(ScalarValue::Float32(Some(0.0)));
-        assert_eq!(neg.cmp(&pos), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn test_neg_zero_cmp_f64() {
-        let neg = OrderableScalarValue(ScalarValue::Float64(Some(-0.0)));
-        let pos = OrderableScalarValue(ScalarValue::Float64(Some(0.0)));
-        assert_eq!(neg.cmp(&pos), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn test_neg_zero_less_than_positive_f64() {
-        let neg_zero = OrderableScalarValue(ScalarValue::Float64(Some(-0.0)));
-        let positive = OrderableScalarValue(ScalarValue::Float64(Some(1.0)));
-        let negative = OrderableScalarValue(ScalarValue::Float64(Some(-1.0)));
-        assert_eq!(neg_zero.cmp(&positive), std::cmp::Ordering::Less);
-        assert_eq!(neg_zero.cmp(&negative), std::cmp::Ordering::Greater);
-    }
-
-    #[test]
-    fn test_neg_zero_cmp_f16() {
-        let neg = OrderableScalarValue(ScalarValue::Float16(Some(half::f16::NEG_ZERO)));
-        let pos = OrderableScalarValue(ScalarValue::Float16(Some(half::f16::ZERO)));
-        assert_eq!(neg.cmp(&pos), std::cmp::Ordering::Equal);
     }
 
     #[test]
