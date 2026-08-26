@@ -4305,6 +4305,23 @@ impl Scanner {
                     return Ok(None);
                 };
 
+                let preloaded_fuzzy_segments = if query_uses_fuzzy && !self.fast_search {
+                    let Some(segments) =
+                        load_segments(&self.dataset, &column, document_granularity).await?
+                    else {
+                        return Ok(None);
+                    };
+                    // Validate metadata before asking which fragments are
+                    // unindexed. Unknown coverage cannot answer that question,
+                    // but it can safely route the whole query to current rows.
+                    if has_unsafe_fts_coverage(&self.dataset, &segments) {
+                        return Ok(None);
+                    }
+                    Some(segments)
+                } else {
+                    None
+                };
+
                 let overlay_fragments = if query_uses_fuzzy && !self.fast_search {
                     self.dataset.fragments()
                 } else {
@@ -4326,20 +4343,20 @@ impl Scanner {
                 }
                 let segments = match overlay_plan {
                     FtsOverlayPlan::Unchanged(Some(segments)) => segments,
-                    FtsOverlayPlan::Unchanged(None) => {
-                        load_segments(&self.dataset, &column, document_granularity)
+                    FtsOverlayPlan::Unchanged(None) => match preloaded_fuzzy_segments {
+                        Some(segments) => segments,
+                        None => load_segments(&self.dataset, &column, document_granularity)
                             .await?
                             .ok_or_else(|| {
                                 Error::invalid_input(format!(
                                     "No Inverted index found for column {column}"
                                 ))
-                            })?
-                    }
+                            })?,
+                    },
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
                 if fts_query_uses_fuzzy_expansion(query) && !self.fast_search {
-                    if has_unsafe_fts_coverage(&self.dataset, &segments)
-                        || has_post_index_deletions(&self.dataset, &segments).await?
+                    if has_post_index_deletions(&self.dataset, &segments).await?
                         || fts_segments_have_deleted_fragments(
                             &self.dataset,
                             &column,
