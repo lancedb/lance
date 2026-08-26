@@ -21,6 +21,7 @@ use tokio::try_join;
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
+    widen_signed_zeros,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -307,6 +308,17 @@ impl SargableQueryParser {
         self.is_null_needs_recheck = false;
         self
     }
+
+    /// A query that gets widened for signed zero always needs a recheck, even
+    /// for an index that is otherwise exact.
+    ///
+    /// The index selects candidates in arrow's total order, where `-0.0` and
+    /// `+0.0` are distinct, so it can only answer with the candidates for both
+    /// encodings. Which of them satisfies the predicate is IEEE 754 semantics,
+    /// which only expression evaluation applies.
+    fn needs_recheck_for(&self, query: &SargableQuery) -> bool {
+        self.needs_recheck || widen_signed_zeros(query).is_some()
+    }
 }
 
 impl ScalarQueryParser for SargableQueryParser {
@@ -336,12 +348,13 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
+        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -350,12 +363,13 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
         let query = SargableQuery::IsIn(in_list.to_vec());
+        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -402,12 +416,13 @@ impl ScalarQueryParser for SargableQueryParser {
             Operator::NotEq => SargableQuery::Equals(value.clone()),
             _ => unreachable!(),
         };
+        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -2667,6 +2682,37 @@ mod tests {
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
     use super::*;
+
+    /// An index that is otherwise exact still needs a recheck for a query that
+    /// gets widened for signed zero, because the widened candidate set holds rows
+    /// under both encodings and only expression evaluation knows which of them
+    /// IEEE 754 matches.
+    #[rstest]
+    #[case::eq_zero(Operator::Eq, ScalarValue::Float64(Some(0.0)), true)]
+    #[case::eq_neg_zero(Operator::Eq, ScalarValue::Float64(Some(-0.0)), true)]
+    #[case::eq_non_zero(Operator::Eq, ScalarValue::Float64(Some(1.0)), false)]
+    #[case::eq_int_zero(Operator::Eq, ScalarValue::Int64(Some(0)), false)]
+    #[case::ge_zero(Operator::GtEq, ScalarValue::Float64(Some(0.0)), true)]
+    #[case::gt_zero(Operator::Gt, ScalarValue::Float64(Some(0.0)), false)]
+    #[case::lt_zero(Operator::Lt, ScalarValue::Float64(Some(0.0)), false)]
+    #[case::le_neg_zero(Operator::LtEq, ScalarValue::Float64(Some(-0.0)), true)]
+    fn test_signed_zero_forces_recheck(
+        #[case] op: Operator,
+        #[case] value: ScalarValue,
+        #[case] expected: bool,
+    ) {
+        let parser = SargableQueryParser::new(
+            "idx".to_string(),
+            "BTree".to_string(),
+            /*needs_recheck=*/ false,
+        );
+        let indexed = parser.visit_comparison("x", &value, &op).unwrap();
+        assert_eq!(
+            indexed.scalar_query.unwrap().needs_recheck(),
+            expected,
+            "{op} {value}"
+        );
+    }
 
     struct ColInfo {
         data_type: DataType,

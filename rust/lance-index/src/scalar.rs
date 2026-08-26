@@ -10,6 +10,7 @@ use datafusion::functions::regex::regexplike::RegexpLikeFunc;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion_common::{Column, scalar::ScalarValue};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -48,6 +49,152 @@ pub mod zoned;
 pub mod zonemap;
 
 pub use inverted::tokenizer::InvertedIndexParams;
+
+/// Both IEEE 754 encodings of zero, if `value` is a float zero.
+///
+/// Scalar indices select candidates in arrow's total order, where `-0.0` sorts
+/// strictly below `+0.0`, and hash float keys by bit pattern. Expression
+/// evaluation follows IEEE 754, where the two compare equal. A query for one
+/// encoding must therefore keep candidates stored under the other, otherwise
+/// they are pruned before any recheck can look at them.
+///
+/// The pair is ordered `(-0.0, +0.0)`. Everything that is not a float zero
+/// yields `None` and is left alone.
+pub(crate) fn signed_zero_pair(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        ScalarValue::Float16(Some(v)) if *v == half::f16::ZERO => Some((
+            ScalarValue::Float16(Some(half::f16::NEG_ZERO)),
+            ScalarValue::Float16(Some(half::f16::ZERO)),
+        )),
+        ScalarValue::Float32(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float32(Some(-0.0)),
+            ScalarValue::Float32(Some(0.0)),
+        )),
+        ScalarValue::Float64(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float64(Some(-0.0)),
+            ScalarValue::Float64(Some(0.0)),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether `value` is the negative encoding of a float zero.
+fn is_negative_zero(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Float16(Some(v)) => *v == half::f16::ZERO && v.is_sign_negative(),
+        ScalarValue::Float32(Some(v)) => *v == 0.0 && v.is_sign_negative(),
+        ScalarValue::Float64(Some(v)) => *v == 0.0 && v.is_sign_negative(),
+        _ => false,
+    }
+}
+
+/// Widen the inclusive range bounds that would exclude one encoding of zero.
+///
+/// Only an inclusive bound on the inner encoding leaves the other one out:
+/// `>= +0.0` starts above `-0.0` in total order and `<= -0.0` stops below
+/// `+0.0`, while IEEE 754 matches both. An exclusive bound, or an inclusive
+/// bound on the outer encoding, already admits every row IEEE 754 would match,
+/// so it is left alone. `None` means nothing needed widening.
+fn widen_signed_zero_range(
+    lower: &Bound<ScalarValue>,
+    upper: &Bound<ScalarValue>,
+) -> Option<(Bound<ScalarValue>, Bound<ScalarValue>)> {
+    let widened_lower = match lower {
+        // `>= +0.0` starts above -0.0. A non-zero bound yields `None` from
+        // `signed_zero_pair` and is left alone.
+        Bound::Included(val) if !is_negative_zero(val) => {
+            signed_zero_pair(val).map(|(neg, _)| Bound::Included(neg))
+        }
+        _ => None,
+    };
+    let widened_upper = match upper {
+        // `<= -0.0` stops below +0.0.
+        Bound::Included(val) if is_negative_zero(val) => {
+            signed_zero_pair(val).map(|(_, pos)| Bound::Included(pos))
+        }
+        _ => None,
+    };
+    if widened_lower.is_none() && widened_upper.is_none() {
+        return None;
+    }
+    Some((
+        widened_lower.unwrap_or_else(|| lower.clone()),
+        widened_upper.unwrap_or_else(|| upper.clone()),
+    ))
+}
+
+/// Expand a float zero in `values` to both of its encodings, so neither can be
+/// pruned. Borrows unchanged when there is no float zero to expand.
+///
+/// A list is a set, so repeated zeros collapse into the single expanded pair.
+fn expand_signed_zeros(values: &[ScalarValue]) -> Cow<'_, [ScalarValue]> {
+    let zeros = values
+        .iter()
+        .filter(|val| signed_zero_pair(val).is_some())
+        .count();
+    if zeros == 0 {
+        return Cow::Borrowed(values);
+    }
+    let mut expanded = Vec::with_capacity(values.len() + zeros);
+    let mut zero_expanded = false;
+    for val in values {
+        match signed_zero_pair(val) {
+            Some((neg, pos)) if !zero_expanded => {
+                expanded.extend([neg, pos]);
+                zero_expanded = true;
+            }
+            Some(_) => {}
+            None => expanded.push(val.clone()),
+        }
+    }
+    Cow::Owned(expanded)
+}
+
+/// Rewrite a query so that a float zero keeps the candidates for both of its
+/// encodings: `Equals` becomes `IsIn` of the two, `IsIn` gains the missing one,
+/// and `Range` bounds widen outward.
+///
+/// Returns `None` when the query carries no float zero, which is every query
+/// that is not about zero.
+///
+/// The rewrite only ever produces a superset in total order, so an index that
+/// applies it answers with candidates rather than an exact match. Callers must
+/// report the result as [`SearchResult::AtMost`] unless the index already does,
+/// and [`expression::SargableQueryParser`] forces the matching recheck so the
+/// extra candidates are removed by expression evaluation.
+pub(crate) fn widen_signed_zeros(query: &SargableQuery) -> Option<SargableQuery> {
+    match query {
+        SargableQuery::Equals(value) => {
+            signed_zero_pair(value).map(|(neg, pos)| SargableQuery::IsIn(vec![neg, pos]))
+        }
+        SargableQuery::IsIn(values) => match expand_signed_zeros(values) {
+            Cow::Owned(expanded) => Some(SargableQuery::IsIn(expanded)),
+            Cow::Borrowed(_) => None,
+        },
+        SargableQuery::Range(low, high) => {
+            widen_signed_zero_range(low, high).map(|(low, high)| SargableQuery::Range(low, high))
+        }
+        _ => None,
+    }
+}
+
+/// [`widen_signed_zeros`] for a bloom filter query.
+///
+/// Bloom filters hash the raw bytes of a float, so the two encodings of zero
+/// land in different blocks and set different bits. Probing only one of them
+/// prunes zones that hold the other.
+pub(crate) fn widen_signed_zeros_bloom(query: &BloomFilterQuery) -> Option<BloomFilterQuery> {
+    match query {
+        BloomFilterQuery::Equals(value) => {
+            signed_zero_pair(value).map(|(neg, pos)| BloomFilterQuery::IsIn(vec![neg, pos]))
+        }
+        BloomFilterQuery::IsIn(values) => match expand_signed_zeros(values) {
+            Cow::Owned(expanded) => Some(BloomFilterQuery::IsIn(expanded)),
+            Cow::Borrowed(_) => None,
+        },
+        BloomFilterQuery::IsNull() => None,
+    }
+}
 
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
 /// `Vec<`[`lance_table::format::IndexFile`]`>`.
@@ -694,6 +841,125 @@ fn next_unicode_char(c: char) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    const NEG: ScalarValue = ScalarValue::Float64(Some(-0.0));
+    const POS: ScalarValue = ScalarValue::Float64(Some(0.0));
+
+    #[rstest]
+    #[case::eq_positive(POS, Some(SargableQuery::IsIn(vec![NEG, POS])))]
+    #[case::eq_negative(NEG, Some(SargableQuery::IsIn(vec![NEG, POS])))]
+    #[case::eq_non_zero(ScalarValue::Float64(Some(1.0)), None)]
+    #[case::eq_null(ScalarValue::Float64(None), None)]
+    #[case::eq_int_zero(ScalarValue::Int64(Some(0)), None)]
+    fn test_widen_equals_covers_both_zeros(
+        #[case] value: ScalarValue,
+        #[case] expected: Option<SargableQuery>,
+    ) {
+        // Equality against either encoding must offer both, because the index
+        // matches keys in total order where the two are distinct.
+        assert_eq!(widen_signed_zeros(&SargableQuery::Equals(value)), expected);
+    }
+
+    #[test]
+    fn test_widen_is_in_adds_the_missing_encoding() {
+        let query = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(1.0)), POS]);
+        assert_eq!(
+            widen_signed_zeros(&query),
+            Some(SargableQuery::IsIn(vec![
+                ScalarValue::Float64(Some(1.0)),
+                NEG,
+                POS
+            ]))
+        );
+        // Both encodings already listed: the pair is emitted once, not twice.
+        let both = SargableQuery::IsIn(vec![POS, NEG]);
+        assert_eq!(
+            widen_signed_zeros(&both),
+            Some(SargableQuery::IsIn(vec![NEG, POS]))
+        );
+        let no_zero = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(1.0))]);
+        assert_eq!(widen_signed_zeros(&no_zero), None);
+    }
+
+    /// Only an inclusive bound on the inner encoding of zero leaves the other
+    /// one out of the total-order range. Every other bound already admits every
+    /// row IEEE 754 would match, and widening it would cost a needless recheck.
+    #[rstest]
+    #[case::ge_positive(
+        Bound::Included(POS),
+        Bound::Unbounded,
+        Some((Bound::Included(NEG), Bound::Unbounded))
+    )]
+    #[case::le_negative(
+        Bound::Unbounded,
+        Bound::Included(NEG),
+        Some((Bound::Unbounded, Bound::Included(POS)))
+    )]
+    #[case::ge_negative(Bound::Included(NEG), Bound::Unbounded, None)]
+    #[case::le_positive(Bound::Unbounded, Bound::Included(POS), None)]
+    #[case::gt_positive(Bound::Excluded(POS), Bound::Unbounded, None)]
+    #[case::gt_negative(Bound::Excluded(NEG), Bound::Unbounded, None)]
+    #[case::lt_positive(Bound::Unbounded, Bound::Excluded(POS), None)]
+    #[case::lt_negative(Bound::Unbounded, Bound::Excluded(NEG), None)]
+    #[case::both_ends(
+        Bound::Included(POS),
+        Bound::Included(NEG),
+        Some((Bound::Included(NEG), Bound::Included(POS)))
+    )]
+    #[case::no_zero(
+        Bound::Included(ScalarValue::Float64(Some(1.0))),
+        Bound::Unbounded,
+        None
+    )]
+    fn test_widen_range_only_touches_inclusive_inner_bounds(
+        #[case] lower: Bound<ScalarValue>,
+        #[case] upper: Bound<ScalarValue>,
+        #[case] expected: Option<(Bound<ScalarValue>, Bound<ScalarValue>)>,
+    ) {
+        let expected = expected.map(|(low, high)| SargableQuery::Range(low, high));
+        assert_eq!(
+            widen_signed_zeros(&SargableQuery::Range(lower, upper)),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_widen_bloom_query() {
+        // Bloom hashes raw float bytes, so the two encodings land in different
+        // blocks and each has to be probed.
+        assert_eq!(
+            widen_signed_zeros_bloom(&BloomFilterQuery::Equals(NEG)),
+            Some(BloomFilterQuery::IsIn(vec![NEG, POS]))
+        );
+        assert_eq!(widen_signed_zeros_bloom(&BloomFilterQuery::IsNull()), None);
+        assert_eq!(
+            widen_signed_zeros_bloom(&BloomFilterQuery::Equals(ScalarValue::Float32(Some(1.0)))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_widen_preserves_float_width() {
+        // The widened values must keep the column's type, or the index compares
+        // them against page statistics of a different physical type.
+        let f32_zero = ScalarValue::Float32(Some(-0.0));
+        assert_eq!(
+            widen_signed_zeros(&SargableQuery::Equals(f32_zero)),
+            Some(SargableQuery::IsIn(vec![
+                ScalarValue::Float32(Some(-0.0)),
+                ScalarValue::Float32(Some(0.0))
+            ]))
+        );
+        let f16_zero = ScalarValue::Float16(Some(half::f16::ZERO));
+        assert_eq!(
+            widen_signed_zeros(&SargableQuery::Equals(f16_zero)),
+            Some(SargableQuery::IsIn(vec![
+                ScalarValue::Float16(Some(half::f16::NEG_ZERO)),
+                ScalarValue::Float16(Some(half::f16::ZERO))
+            ]))
+        );
+    }
 
     #[test]
     fn test_like_prefix_to_expr_escapes_metacharacters() {

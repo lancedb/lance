@@ -39,6 +39,7 @@ use tracing::{instrument, warn};
 use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
+    widen_signed_zeros,
 };
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
@@ -692,6 +693,11 @@ impl ScalarIndex for BitmapIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        // Keys are stored and compared in arrow's total order, where -0.0 and
+        // +0.0 are distinct. A query on either one has to offer both as
+        // candidates, otherwise the rows under the other key are unreachable.
+        let widened = widen_signed_zeros(query);
+        let query = widened.as_ref().unwrap_or(query);
 
         let tracked_null_rows = || {
             if options.track_nulls() && !self.null_map.is_empty() {
@@ -830,6 +836,12 @@ impl ScalarIndex for BitmapIndex {
         };
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
+        if widened.is_some() {
+            // The widened query answers with the candidates for both encodings
+            // of zero; which of them matches is IEEE 754 semantics, applied by
+            // the recheck `SargableQueryParser` forces for these queries.
+            return Ok(SearchResult::AtMost(selection));
+        }
         Ok(SearchResult::Exact(selection))
     }
 
@@ -1924,7 +1936,7 @@ mod tests {
     use super::*;
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
+    use arrow_array::{Float64Array, RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
@@ -2048,6 +2060,83 @@ mod tests {
             .await;
 
         assert!(cache.get_with_key(&second).await.is_none());
+    }
+
+    /// Training splits the two encodings of zero into separate keys, because it
+    /// deduplicates by bit pattern. A query on either one must return the rows
+    /// for both, otherwise the rows under the other key are unreachable through
+    /// the index.
+    #[tokio::test]
+    async fn test_bitmap_signed_zero_keys_are_both_candidates() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, false),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+
+        let index = BitmapIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.index_map.len(), 4, "the two zeros stay distinct keys");
+
+        let rows = |result: SearchResult| {
+            let SearchResult::AtMost(row_ids) = result else {
+                panic!("a widened query answers with candidates, not an exact match");
+            };
+            let mut addrs: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
+            addrs.sort();
+            addrs
+        };
+
+        for zero in [0.0f64, -0.0f64] {
+            let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
+            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            assert_eq!(rows(result), vec![1, 2], "querying {zero}");
+        }
+
+        // `>= +0.0` starts above -0.0 in total order, and `<= -0.0` stops below
+        // +0.0, so both have to reach across to the other encoding.
+        let ge_zero = SargableQuery::Range(
+            Bound::Included(ScalarValue::Float64(Some(0.0))),
+            Bound::Unbounded,
+        );
+        let result = index.search(&ge_zero, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(rows(result), vec![1, 2, 3]);
+
+        let le_neg_zero = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Float64(Some(-0.0))),
+        );
+        let result = index
+            .search(&le_neg_zero, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(rows(result), vec![0, 1, 2]);
     }
 
     #[tokio::test]

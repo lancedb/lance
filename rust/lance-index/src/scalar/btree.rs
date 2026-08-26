@@ -14,7 +14,7 @@ use std::{
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
-    compute_next_prefix,
+    compute_next_prefix, widen_signed_zeros,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
@@ -2140,6 +2140,11 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        // Page bounds are compared in arrow's total order, where -0.0 sorts below
+        // +0.0, so a query on either one has to offer both as candidates or a
+        // page holding only the other encoding is pruned away.
+        let widened = widen_signed_zeros(query);
+        let query = widened.as_ref().unwrap_or(query);
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
@@ -2266,6 +2271,13 @@ impl ScalarIndex for BTreeIndex {
             )
         };
 
+        if widened.is_some() {
+            // Leaf evaluation ran the widened predicate, so the result holds the
+            // candidates for both encodings of zero. Which of them matches is
+            // IEEE 754 semantics, applied by the recheck that
+            // `SargableQueryParser` forces for these queries.
+            return Ok(SearchResult::AtMost(selection));
+        }
         Ok(SearchResult::Exact(selection))
     }
 
@@ -3406,6 +3418,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use std::ops::Bound;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -3628,11 +3641,75 @@ mod tests {
         for (idx, value) in values.into_iter().enumerate() {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let rows = RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7));
+            // A query on zero also offers the other encoding of zero as a
+            // candidate, so the index answers with candidates rather than an
+            // exact match. The rows are the same here because this data has no
+            // -0.0.
+            let expected = if value == 0.0 {
+                SearchResult::at_most(rows)
+            } else {
+                SearchResult::exact(rows)
+            };
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Page bounds keep the sign of a zero and are compared in total order, so a
+    /// page whose max is `-0.0` would be pruned for a `= +0.0` query. Both pages
+    /// have to stay candidates.
+    #[tokio::test]
+    async fn test_btree_signed_zero_reaches_both_pages() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = record_batch!(
+            (
+                "value",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("_rowid", UInt64, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let stream = stream::once(futures::future::ok(batch.clone()));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(batch.schema(), stream))
+            as SendableRecordBatchStream;
+
+        // A batch size of 2 puts [-1.0, -0.0] on one page and [+0.0, 1.0] on the
+        // next, so each page has one encoding of zero as an extremum.
+        train_btree_index(stream, test_store.as_ref(), 2, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let both_zeros = RowAddrTreeMap::from_iter([1u64, 2]);
+        for zero in [0.0f64, -0.0f64] {
+            let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
+            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             assert_eq!(
                 result,
-                SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+                SearchResult::at_most(both_zeros.clone()),
+                "querying {zero}"
             );
         }
+
+        // `>= +0.0` has to reach the page whose max is -0.0.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Float64(Some(0.0))),
+            Bound::Unbounded,
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([1u64, 2, 3]))
+        );
     }
 
     #[tokio::test]
