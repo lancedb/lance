@@ -1349,10 +1349,10 @@ pub(crate) async fn commit_transaction(
     // covering every fragment live here holds every row compaction had copied
     // in by then.
     //
-    // The Arc is kept rather than cloned out: `load_indices` returns shared
+    // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
-    let read_version_indices = read_version_dataset.load_indices().await?;
+    let read_version_indices = load_all_indices(&read_version_dataset).await?;
     let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
         manifest: read_version_dataset.manifest.as_ref(),
         indices: read_version_indices.as_slice(),
