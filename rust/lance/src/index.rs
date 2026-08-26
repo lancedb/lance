@@ -9546,10 +9546,95 @@ mod tests {
         }
     }
 
+    /// A legacy manifest can hold a segment without fragment coverage, and
+    /// planning must reject it up front, or workers would finish a round the
+    /// commit must then refuse.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_rejects_legacy_manifest_without_coverage() {
+        use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_merge_test_dataset(test_uri, 2, false).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let old = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"old",
+        )
+        .await;
+        let new = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"new",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&old), segment_from_metadata(&new)],
+            )
+            .await
+            .unwrap();
+
+        // Strip the oldest segment's coverage and publish the manifest
+        // directly at the next version with no transaction file, as a very
+        // old Lance writer left it. Commits cannot produce this state because
+        // `migrate_indices` recalculates any missing bitmap.
+        let mut indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        indices
+            .iter_mut()
+            .find(|segment| segment.uuid == old.uuid)
+            .unwrap()
+            .fragment_bitmap = None;
+        let mut manifest = (*dataset.manifest).clone();
+        manifest.version += 1;
+        write_manifest_file(
+            dataset.object_store.as_ref(),
+            dataset.commit_handler.as_ref(),
+            &dataset.base,
+            &mut manifest,
+            Some(indices),
+            &ManifestWriteConfig::default(),
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let ordered = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            ordered.last().unwrap().uuid,
+            new.uuid,
+            "the intact segment must be the newest, or Some(1) would select the stripped one and this test pins nothing"
+        );
+
+        // The bound selects only the intact newest segment, yet planning must
+        // still fail: the guard runs over the whole set before the bound. If
+        // the guard were missing or ran after the bound, this call would
+        // return an empty plan instead of an error.
+        let err = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("has no fragment coverage"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// The planner skips segments with no effective coverage. The companion
-    /// rejection of a `None` bitmap cannot be built here: `migrate_indices`
-    /// backfills missing bitmaps on commit, so `None` only occurs in manifests
-    /// written by very old Lance versions.
+    /// rejection of a `None` bitmap cannot be built through a commit, because
+    /// `migrate_indices` backfills missing bitmaps. It needs a raw manifest
+    /// write and lives in
+    /// `test_plan_index_segment_merge_rejects_legacy_manifest_without_coverage`.
     #[tokio::test]
     async fn test_plan_index_segment_merge_coverage_edge_cases() {
         use crate::dataset::transaction::{Operation, Transaction};
@@ -11223,6 +11308,191 @@ mod tests {
         resolve_merge_sources(&cloned, &plan, &plan.tasks[0])
             .await
             .expect("base-aware sources must validate on the worker");
+    }
+
+    /// A mixed-base round must survive execute and commit end to end. The
+    /// commit reads every source's row ids through its base-aware directory,
+    /// and imported segments the round does not touch must survive it, which
+    /// drives the untouched overlap checks against live imported segments.
+    #[tokio::test]
+    async fn test_index_merge_mixed_base_sources_execute_and_commit() {
+        use crate::index::vector::VectorIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::vector::ivf::IvfBuildParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let base_uri = test_dir.path().join("base");
+        let base_uri = base_uri.to_str().unwrap();
+        let (mut source, base_segments) = write_committed_segment_fixture(base_uri, 3).await;
+
+        let clone_uri = test_dir.path().join("clone");
+        let clone_uri = clone_uri.to_str().unwrap();
+        let version = source.version().version;
+        source
+            .shallow_clone(clone_uri, version, None)
+            .await
+            .unwrap();
+
+        // A fourth fragment appended to the clone, indexed by a real segment
+        // built locally, so the plan mixes imported and local sources.
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut cloned = Dataset::write(
+            reader,
+            clone_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // The same single zero centroid the fixture uses, so the locally
+        // built shard stays merge compatible with the imported ones.
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf_params,
+        );
+        // Building under `vector_idx` would be rejected because the clone
+        // already imported that name. Only the built files are used, and the
+        // commit below publishes them under the logical `vector_idx` name.
+        let local = cloned
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx_local".to_string())
+            .fragments(vec![3])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        cloned
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&local)],
+            )
+            .await
+            .unwrap();
+
+        // Bound the plan to the newest two segments so two imported segments
+        // stay outside the round and must survive the commit untouched.
+        let plan = cloned
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let sources = &plan.tasks[0].sources;
+        assert_eq!(sources.len(), 2);
+        let imported_source = sources
+            .iter()
+            .find(|source| source.uuid == base_segments[2].uuid)
+            .expect("the newest base segment must be planned");
+        assert!(
+            imported_source.base_id.is_some(),
+            "the newest base segment must be planned as an imported source"
+        );
+        let local_source = sources
+            .iter()
+            .find(|source| source.uuid == local.uuid)
+            .expect("the locally built segment must be planned");
+        assert_eq!(
+            local_source.base_id, None,
+            "the locally built segment must be planned as a local source"
+        );
+
+        let result = cloned.execute_index_merge_task(&plan, 0).await.unwrap();
+        let output_uuid = result.output.uuid;
+
+        // The commit must read the imported source at the base-aware path the
+        // plan recorded, so corrupting the auxiliary file there has to fail
+        // the round. A commit that skipped imported sources would pass here.
+        // The original bytes come back after, so the same plan and result
+        // can then commit for real.
+        let base_aux = Path::parse(&imported_source.path)
+            .unwrap()
+            .join(lance_index::INDEX_AUXILIARY_FILE_NAME);
+        let genuine_bytes = cloned.object_store.read_one_all(&base_aux).await.unwrap();
+        cloned
+            .object_store
+            .put(&base_aux, b"garbage")
+            .await
+            .unwrap();
+        let err = cloned
+            .commit_index_merge_results(&plan, vec![result.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an unreadable base-resident source must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("has unreadable row ids"),
+            "unexpected error: {err}"
+        );
+        cloned
+            .object_store
+            .put(&base_aux, genuine_bytes.as_ref())
+            .await
+            .unwrap();
+
+        cloned
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        let after = cloned.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            3,
+            "the merged segment replaces only its sources"
+        );
+        for untouched in &base_segments[..2] {
+            assert!(
+                after
+                    .iter()
+                    .any(|segment| segment.uuid == untouched.uuid && segment.base_id.is_some()),
+                "imported segment {} outside the round must survive as imported",
+                untouched.uuid
+            );
+        }
+        let merged = after
+            .iter()
+            .find(|segment| segment.uuid == output_uuid)
+            .expect("the merge output must be committed");
+        assert_eq!(
+            merged.base_id, None,
+            "the merge output is local to the clone"
+        );
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the merged segment must keep exactly its sources' coverage"
+        );
+
+        let query = Float32Array::from(vec![0.0f32; 8]);
+        let batch = cloned
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 5, "the merged index must answer queries");
     }
 
     #[tokio::test]
