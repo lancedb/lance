@@ -1110,7 +1110,7 @@ impl ObjectStore {
             read_chunk_size = Empty,
             multipart_part_size = crate::object_writer::initial_upload_size(),
             multipart_concurrency = crate::object_writer::max_upload_parallelism(),
-            part_count = 1_u64,
+            part_count = Empty,
             bytes_transferred = Empty,
             destination_size = Empty,
             validation = Empty,
@@ -1132,6 +1132,50 @@ impl ObjectStore {
             stream_copy_error("source metadata", source_path, destination_path, source)
         })?;
         Span::current().record("source_size", source_size as u64);
+
+        if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
+            let metrics = self.io_tracker.begin_io("copy");
+            let result = super::local::copy_file(source_path, destination_path);
+            metrics.record(&result, source_size as u64);
+            result.map_err(|source| {
+                stream_copy_error(
+                    "local filesystem copy",
+                    source_path,
+                    destination_path,
+                    source,
+                )
+            })?;
+
+            let destination_size =
+                destination_store
+                    .size(destination_path)
+                    .await
+                    .map_err(|source| {
+                        stream_copy_error(
+                            "destination validation",
+                            source_path,
+                            destination_path,
+                            source,
+                        )
+                    })?;
+            Span::current().record("bytes_transferred", source_size as u64);
+            Span::current().record("destination_size", destination_size);
+            if destination_size != source_size as u64 {
+                Span::current().record("validation", "failed");
+                return Err(Error::io(format!(
+                    "multipart_stream_copy destination size mismatch from {source_path} to \
+                     {destination_path}: source_size={source_size}, \
+                     destination_size={destination_size}"
+                )));
+            }
+
+            Span::current().record("validation", "passed");
+            Span::current().record("elapsed_ms", started_at.elapsed().as_millis() as u64);
+            return Ok(WriteResult {
+                size: source_size,
+                e_tag: None,
+            });
+        }
 
         let mut writer = destination_store
             .create(destination_path)
@@ -1177,8 +1221,8 @@ impl ObjectStore {
             writer.write_all(&bytes).await.map_err(|source| {
                 stream_copy_error("destination write", source_path, destination_path, source)
             })?;
-            Span::current().record("bytes_transferred", bytes_transferred as u64);
         }
+        Span::current().record("bytes_transferred", bytes_transferred as u64);
 
         if bytes_transferred != source_size {
             Span::current().record("validation", "failed");
@@ -2647,7 +2691,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_via_stream_uses_multiple_parts() {
-        let source_store = ObjectStore::memory();
+        let mut source_store = ObjectStore::memory();
+        source_store.max_iop_size = 1024 * 1024;
         let observations = Arc::new(MultipartObservations::default());
         let mut destination_store = ObjectStore::memory();
         destination_store.inner = Arc::new(ObservedMultipartStore {

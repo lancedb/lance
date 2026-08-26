@@ -3249,13 +3249,14 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset without loading data into memory.
+    /// index files) into the target dataset with bounded memory use.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed through this process.
+    /// accounts). Object-store files are streamed through this process instead of
+    /// using provider-native copy operations; local files retain their filesystem
+    /// copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3307,7 +3308,11 @@ impl Dataset {
             path
         };
 
-        let io_parallelism = self.object_store.io_parallelism();
+        const MAX_STREAM_COPY_PARALLELISM: usize = 4;
+        let io_parallelism = self
+            .object_store
+            .io_parallelism()
+            .min(MAX_STREAM_COPY_PARALLELISM);
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {

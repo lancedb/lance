@@ -2001,8 +2001,8 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has
 // known platform-specific quirks on Windows (it reads back empty there; see the note in
 // tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
-// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
-// against real cloud stores is platform-agnostic std/tokio I/O.
+// covered on Windows by `test_deep_clone`, and streaming copies against real cloud stores
+// use platform-agnostic std/tokio I/O.
 #[cfg(not(windows))]
 #[rstest]
 #[tokio::test]
@@ -2011,8 +2011,8 @@ async fn test_deep_clone_cross_store(
     data_storage_version: LanceFileVersion,
 ) {
     // Source lives in an in-memory store while the target is a local directory, so the
-    // two stores have different `store_prefix`es and `deep_clone` must stream files from
-    // the source store to the target store (the cross-account code path).
+    // The two stores have different `store_prefix`es, exercising source and destination
+    // stores with separate credentials and storage implementations.
     let session = Arc::new(Session::default());
     let test_dir = TempStdDir::default();
     let clone_dir = test_dir.join("clone_ds");
