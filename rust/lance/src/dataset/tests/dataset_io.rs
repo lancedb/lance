@@ -3602,6 +3602,36 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
 
 /// The MemWAL variant of the repair path. This is the state the original report
 /// was about, and the one a size-coupled gate blocks: its transactions carry
+/// An overlay attaches files to existing fragments; it carries no schema, so a
+/// dataset that already holds a nullable primary key must still be able to
+/// commit one. `DataOverlay` was missing from the exempt classifier, which
+/// closed that path for exactly the legacy datasets this validation is meant to
+/// leave repairable.
+#[tokio::test]
+async fn an_overlay_commits_on_a_legacy_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::transaction::Operation;
+
+    let test_dir = TempStrDir::default();
+    let dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+    let read_version = dataset.manifest.version;
+
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay { groups: vec![] },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .expect("an overlay leaves the schema alone, so the legacy key must not block it");
+
+    assert_eq!(dataset.manifest.version, read_version + 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
 /// mem-table state, so they stop inlining long before a config update does.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {

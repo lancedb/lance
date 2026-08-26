@@ -61,6 +61,7 @@ pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
                 | Operation::UpdateConfig(_)
                 | Operation::UpdateMemWalState(_)
                 | Operation::UpdateBases(_)
+                | Operation::DataOverlay(_)
         )
     )
 }
@@ -102,6 +103,21 @@ mod tests {
         assert!(large.encoded_len() > small.encoded_len() * 100);
         assert!(!operation_may_change_schema(&small));
         assert!(!operation_may_change_schema(&large));
+    }
+
+    /// An overlay attaches files to existing fragments and supplies new cell
+    /// values; it carries no schema. Omitting it left a legacy nullable-key
+    /// dataset unable to commit one, which is the upgrade path this exemption
+    /// exists to keep open.
+    #[test]
+    fn a_data_overlay_is_exempt() {
+        let overlay = pb::Transaction {
+            operation: Some(pb::transaction::Operation::DataOverlay(
+                pb::transaction::DataOverlay::default(),
+            )),
+            ..Default::default()
+        };
+        assert!(!operation_may_change_schema(&overlay));
     }
 
     /// And the converse, so the exemption cannot silently widen to everything.
