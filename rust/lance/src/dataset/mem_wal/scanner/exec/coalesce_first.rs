@@ -5,7 +5,6 @@
 //!
 //! Used in point lookup queries to stop searching after finding the first match.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,7 +47,7 @@ pub struct CoalesceFirstExec {
     /// Output schema (must be same for all inputs).
     schema: SchemaRef,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CoalesceFirstExec {
@@ -79,12 +78,12 @@ impl CoalesceFirstExec {
             );
         }
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             inputs[0].pipeline_behavior(),
             inputs[0].boundedness(),
-        );
+        ));
 
         Self {
             inputs,
@@ -111,15 +110,11 @@ impl ExecutionPlan for CoalesceFirstExec {
         "CoalesceFirstExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

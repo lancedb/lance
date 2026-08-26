@@ -17,9 +17,18 @@ from typing import Optional
 
 import pyarrow as pa
 
+from .. import _Fragment
+
 class IndexConfig:
     index_type: str
     config: str
+
+class IndexSegment:
+    uuid: str
+    fragment_ids: set[int]
+    index_version: int
+
+    def __repr__(self) -> str: ...
 
 def train_ivf_model(
     dataset,
@@ -29,6 +38,7 @@ def train_ivf_model(
     distance_type: str,
     sample_rate: int,
     max_iters: int,
+    fragment_ids: Optional[list[int]] = None,
 ) -> pa.Array: ...
 def train_pq_model(
     dataset,
@@ -39,6 +49,8 @@ def train_pq_model(
     sample_rate: int,
     max_iters: int,
     ivf_model: pa.Array,
+    fragment_ids: Optional[list[int]] = None,
+    num_bits: int = 8,
 ) -> pa.Array: ...
 def transform_vectors(
     dataset,
@@ -49,7 +61,15 @@ def transform_vectors(
     ivf_centroids: pa.Array,
     pq_codebook: pa.Array,
     dst_uri: str,
+    fragments: list[_Fragment],
+    partitions_ds_uri: Optional[str] = None,
+    num_bits: int = 8,
 ): ...
+def build_rq_model(
+    dimension: int,
+    num_bits: int = 1,
+    dtype: str = "float32",
+) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
@@ -58,6 +78,8 @@ class IndexSegmentDescription:
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]
+    base_id: Optional[int]
+    covering_fields: list[int]
 
     def __repr__(self) -> str: ...
 

@@ -10,14 +10,14 @@ The python integration is done via pyo3 + custom python code:
 To build the Python bindings, first install requirements:
 
 ```bash
-pip install maturin
+cd python
+make install
 ```
 
 To make a dev install:
 
 ```bash
-cd python
-maturin develop
+make build
 ```
 
 After installing, you can run `import lance` in a Python shell within the virtual environment.

@@ -10,18 +10,18 @@ for testing forward and backward compatibility across Lance versions.
 
 import inspect
 import json
+import os
 import subprocess
 import sys
 import urllib.request
-from functools import lru_cache
-from typing import List
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
 
 import pytest
 from packaging.version import Version
 
 
-@lru_cache(maxsize=1)
-def pylance_stable_versions() -> List[Version]:
+def _fetch_stable_versions() -> List[Version]:
     """Fetches and returns a sorted list of stable pylance versions from PyPI."""
     try:
         with urllib.request.urlopen(
@@ -65,12 +65,10 @@ def recent_major_versions(n: int) -> List[str]:
     return major_versions
 
 
-@lru_cache(maxsize=1)
-def last_beta_release():
+def _fetch_last_beta_release():
     """Returns the latest beta version available on fury.io.
 
     Uses pip to query the fury.io index for pre-release versions of pylance.
-    Results are cached to avoid repeated network calls.
     """
     try:
         # Use pip index to get versions from fury.io
@@ -123,10 +121,45 @@ def last_beta_release():
         return None
 
 
-VERSIONS = recent_major_versions(3)
-LAST_BETA_RELEASE = last_beta_release()
-if LAST_BETA_RELEASE is not None:
-    VERSIONS.append(LAST_BETA_RELEASE)
+_SNAPSHOT: Optional[Dict[str, Any]] = None
+
+
+def version_snapshot() -> Dict[str, Any]:
+    """The set of published pylance releases these tests are built from.
+
+    Every process collecting these tests has to agree on this, because it
+    decides the `version` parameters and pytest-xdist aborts a run whose workers
+    collected different tests. Resolving it takes two network queries, so it is
+    resolved once per process -- and once per run on the xdist controller, then
+    handed down to the workers by `pytest_configure_node` in the root tests
+    conftest.
+    """
+    global _SNAPSHOT
+    if _SNAPSHOT is None:
+        _SNAPSHOT = {
+            "stable": [str(v) for v in _fetch_stable_versions()],
+            "beta": _fetch_last_beta_release(),
+        }
+    return _SNAPSHOT
+
+
+def use_version_snapshot(snapshot: Dict[str, Any]) -> None:
+    global _SNAPSHOT
+    _SNAPSHOT = snapshot
+
+
+def pylance_stable_versions() -> List[Version]:
+    """Sorted stable pylance versions published to PyPI."""
+    return [Version(v) for v in version_snapshot()["stable"]]
+
+
+def compat_versions() -> List[str]:
+    """The pylance versions every compat test is parametrized over."""
+    versions = recent_major_versions(3)
+    beta = version_snapshot()["beta"]
+    if beta is not None:
+        versions.append(beta)
+    return versions
 
 
 class UpgradeDowngradeTest:
@@ -146,6 +179,46 @@ class UpgradeDowngradeTest:
 
     def check_write(self):
         pass
+
+    def skip_read_after_current_write(self, version: str) -> bool:
+        """Return True to skip the old-version read after current-version writes."""
+        return False
+
+    def skip_write_after_current_write(self, version: str) -> bool:
+        """Return True to skip the old-version write after current-version writes."""
+        return False
+
+    def skip_downgrade(self, version: str) -> bool:
+        """Return True to skip the current-write -> old-read downgrade test."""
+        return False
+
+    def current_env(self, method_name: str) -> Dict[str, str]:
+        """Return environment overrides for methods executed in the current runtime."""
+        return {}
+
+    def compat_env(self, version: str, method_name: str) -> Dict[str, str]:
+        """Return environment overrides for methods executed in a compat venv."""
+        return {}
+
+
+@contextmanager
+def _temporary_env(overrides: Optional[Dict[str, str]]):
+    if not overrides:
+        yield
+        return
+
+    sentinel = object()
+    old_values = {key: os.environ.get(key, sentinel) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in old_values.items():
+            if value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def compat_test(min_version: str = "0.16.0"):
@@ -168,7 +241,7 @@ def compat_test(min_version: str = "0.16.0"):
     Parameters
     ----------
     versions : list of str, optional
-        List of Lance versions to test against. Defaults to VERSIONS.
+        List of Lance versions to test against. Defaults to `compat_versions()`.
 
     Example
     -------
@@ -191,8 +264,18 @@ def compat_test(min_version: str = "0.16.0"):
             # Write data
             pass
     """
-    version = set([min_version, *VERSIONS])
-    versions = [v for v in version if Version(v) >= Version(min_version)]
+    # Sorted rather than taken straight off the set: set iteration order for
+    # strings depends on PYTHONHASHSEED, which differs per process, so every
+    # pytest-xdist worker would otherwise collect these parameters in its own
+    # order and xdist rejects the run as an inconsistent collection.
+    versions = sorted(
+        (
+            v
+            for v in {min_version, *compat_versions()}
+            if Version(v) >= Version(min_version)
+        ),
+        key=Version,
+    )
 
     def decorator(cls):
         # Extract existing parametrize marks from the class
@@ -285,12 +368,20 @@ def test_func({sig_params}):
     """Test that old Lance version can read data written by current version."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
+    if obj.skip_downgrade(version):
+        pytest.skip(
+            "downgrade compatibility is intentionally unsupported for this test"
+        )
     # Current version: create data
-    obj.create()
+    with _temporary_env(obj.current_env("create")):
+        obj.create()
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
-    venv.execute_method(obj, "check_read")
-    venv.execute_method(obj, "check_write")
+    if not obj.skip_read_after_current_write(version):
+        venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    if not obj.skip_write_after_current_write(version):
+        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
     else:  # upgrade_downgrade
         func_body = f'''
@@ -298,18 +389,21 @@ def test_func({sig_params}):
     """Test round-trip compatibility: old -> current -> old."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
+    obj.compat_version = version
     venv = venv_factory.get_venv(version)
     # Old version: create data
-    venv.execute_method(obj, "create")
+    venv.execute_method(obj, "create", obj.compat_env(version, "create"))
     # Current version: read and write
-    obj.check_read()
-    obj.check_write()
+    with _temporary_env(obj.current_env("check_read")):
+        obj.check_read()
+    with _temporary_env(obj.current_env("check_write")):
+        obj.check_write()
     # Old version: verify can still read
-    venv.execute_method(obj, "check_read")
-    venv.execute_method(obj, "check_write")
+    venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
 
     # Execute to create the function
-    namespace = {"cls": cls}
+    namespace = {"cls": cls, "_temporary_env": _temporary_env, "pytest": pytest}
     exec(func_body, namespace)
     return namespace["test_func"]

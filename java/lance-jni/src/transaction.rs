@@ -3,10 +3,9 @@
 
 use crate::Error;
 use crate::JNIEnvExt;
-use crate::RT;
+use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
-use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
 };
@@ -16,19 +15,19 @@ use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
-    UpdateMap, UpdateMapEntry, UpdateMode,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_file::version::LanceFileVersion;
-use lance_io::object_store::StorageOptionsProvider;
+use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -168,6 +167,10 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         let fields: Vec<i32> = import_vec_from_method(env, self, "fields", |env, field_id| {
             field_id.extract_object(env)
         })?;
+        let covering_fields: Vec<i32> =
+            import_vec_from_method(env, self, "coveringFields", |env, field_id| {
+                field_id.extract_object(env)
+            })?;
 
         let name = env.get_string_from_method(self, "name")?;
         let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
@@ -208,6 +211,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
         Ok(IndexMetadata {
             uuid,
             fields,
+            covering_fields,
             name,
             dataset_version,
             fragment_bitmap,
@@ -412,6 +416,7 @@ fn convert_to_java_operation_inner<'local>(
         Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -430,10 +435,11 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            merged_generations: _,
+            compacted_sstables: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
+            updated_fragment_offsets,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -457,9 +463,48 @@ fn convert_to_java_operation_inner<'local>(
                     &[JValue::Object(&update_mode)],
                 )?
                 .l()?;
+            // Serialize updated_fragment_offsets to Java Map<Long, byte[]>.
+            // Values are portable RoaringBitmap bytes so the JNI boundary stays O(bitmap size)
+            // rather than O(n rows). Empty HashMap when None so the Java constructor always
+            // receives a non-null map.
+            let java_offsets_map = {
+                let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+                if let Some(UpdatedFragmentOffsets(ref map)) = updated_fragment_offsets {
+                    for (frag_id, bitmap) in map {
+                        let mut buf: Vec<u8> = Vec::new();
+                        bitmap.serialize_into(&mut buf).map_err(|e| {
+                            Error::runtime_error(format!(
+                                "failed to serialize updatedFragmentOffsets for fragment \
+                                 {frag_id}: {e}"
+                            ))
+                        })?;
+                        // JNI byte arrays are signed i8; reinterpret without copying.
+                        let buf_i8: &[i8] = unsafe {
+                            std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len())
+                        };
+                        env.with_local_frame(4, |env| {
+                            let java_key = env.new_object(
+                                "java/lang/Long",
+                                "(J)V",
+                                &[JValue::Long(*frag_id as i64)],
+                            )?;
+                            let java_arr = env.new_byte_array(buf_i8.len() as i32)?;
+                            env.set_byte_array_region(&java_arr, 0, buf_i8)?;
+                            env.call_method(
+                                &java_map,
+                                "put",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[JValue::Object(&java_key), JValue::Object(&*java_arr)],
+                            )?;
+                            Ok::<JObject, Error>(JObject::null())
+                        })?;
+                    }
+                }
+                java_map
+            };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -467,16 +512,23 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_modified),
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
+                    JValue::Object(&java_offsets_map),
                 ],
             )?)
         }
-        Operation::Project { schema } => {
+        Operation::Project {
+            schema,
+            preserves_nullability,
+        } => {
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Project",
-                "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
-                &[JValue::Object(&java_schema)],
+                "(Lorg/apache/arrow/vector/types/pojo/Schema;Z)V",
+                &[
+                    JValue::Object(&java_schema),
+                    JValue::Bool(preserves_nullability as u8),
+                ],
             )?)
         }
         Operation::Rewrite {
@@ -552,16 +604,18 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Merge {
             fragments: rust_fragments,
             schema,
+            preserves_nullability,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Merge",
-                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Z)V",
                 &[
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
+                    JValue::Bool(preserves_nullability as u8),
                 ],
             )?)
         }
@@ -594,18 +648,50 @@ pub(crate) fn convert_to_java_schema<'local>(
         .l()?)
 }
 
+/// Parse a `CommitBuilder.storageFormat` string into a [`LanceFileVersion`].
+///
+/// The canonical spellings ("2.1", "stable", ...) are the ones every other Lance
+/// binding accepts and the ones [`LanceFileVersion`]'s `Display` emits.
+///
+/// The `v`-prefixed spellings are a Java-only accident: this function originally
+/// hand-rolled its match by walking the `LanceFileVersion` variant identifiers
+/// (`V2_1` -> `"v2_1"`) instead of delegating to `FromStr`, so it accepted those
+/// identifiers and rejected the canonical "2.1". They were documented on
+/// `CommitBuilder.storageFormat` and shipped from 3.0.0, so they are translated
+/// here for compatibility. The set is deliberately frozen to what shipped —
+/// newer versions are reachable only by their canonical name.
 fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
-    match name.to_lowercase().as_str() {
-        "legacy" => Ok(LanceFileVersion::Legacy),
-        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
-        "stable" => Ok(LanceFileVersion::Stable),
-        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
-        "next" => Ok(LanceFileVersion::Next),
-        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
-        _ => Err(Error::input_error(format!(
-            "Unknown storage format: {}",
-            name
-        ))),
+    let requested = name.to_lowercase();
+    let canonical = match requested.as_str() {
+        "v2_0" | "v2.0" => V2_FORMAT_2_0,
+        "v2_1" | "v2.1" => V2_FORMAT_2_1,
+        "v2_2" | "v2.2" => V2_FORMAT_2_2,
+        _ => requested.as_str(),
+    };
+
+    if canonical != requested {
+        log::warn!(
+            "Storage format \"{}\" is deprecated and will be removed in a future release; use \"{}\" instead",
+            name,
+            canonical
+        );
+    }
+
+    canonical
+        .parse::<LanceFileVersion>()
+        .map_err(|_| Error::input_error(format!("Unknown storage format: {}", name)))
+}
+
+/// Translate the Java `commitTimeoutNanos` sentinel into an
+/// `Option<Duration>` for [`CommitBuilder::with_timeout`]. The Java side is
+/// the source of truth for the default (30 minutes) and for rejecting
+/// zero/negative-from-the-user inputs; here `< 0` simply means "disabled" and
+/// any other value is the timeout in nanoseconds.
+fn parse_commit_timeout(nanos: i64) -> Option<std::time::Duration> {
+    if nanos < 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_nanos(nanos as u64))
     }
 }
 
@@ -623,6 +709,10 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    namespace_client_managed_versioning: jboolean,
+    commit_timeout_nanos: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -637,6 +727,10 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
+            namespace_obj,
+            table_id_obj,
+            namespace_client_managed_versioning != 0,
+            commit_timeout_nanos,
         )
     )
 }
@@ -653,7 +747,12 @@ fn inner_commit_to_dataset<'local>(
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
+    namespace_obj: JObject,
+    table_id_obj: JObject,
+    namespace_client_managed_versioning: bool,
+    commit_timeout_nanos: jlong,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
@@ -745,6 +844,25 @@ fn inner_commit_to_dataset<'local>(
         Some(&mut java_blocking_ds),
     )?;
 
+    // Set namespace commit handler only if namespace_client_managed_versioning is true
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let commit_handler = if namespace_client_managed_versioning {
+        match namespace_info {
+            Some((ns, tid)) => {
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let table_root = java_blocking_ds.inner.branch_location().find_main()?.path;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns, tid, table_root);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
@@ -757,6 +875,8 @@ fn inner_commit_to_dataset<'local>(
             storage_format,
             max_retries,
             skip_auto_cleanup,
+            commit_handler,
+            commit_timeout,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -978,6 +1098,8 @@ fn convert_to_rust_operation(
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
+            preserves_nullability: env
+                .get_boolean_from_method(java_operation, "preservesNullability")?,
             schema: convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1191,15 +1313,69 @@ fn convert_to_rust_operation(
                     update_mode.extract_object(env)
                 })?;
 
+            let updated_fragment_offsets = {
+                let offsets_obj = env
+                    .call_method(
+                        java_operation,
+                        "updatedFragmentOffsets",
+                        "()Ljava/util/Map;",
+                        &[],
+                    )?
+                    .l()?;
+                if offsets_obj.is_null() {
+                    None
+                } else {
+                    let jmap = JMap::from_env(env, &offsets_obj)?;
+                    let mut iter = jmap.iter(env)?;
+                    let mut offsets: HashMap<u64, RoaringBitmap> = HashMap::new();
+                    // Per-iteration local frame: iterator key/value JNI refs are released each
+                    // loop so large multi-fragment maps cannot exhaust the local reference table.
+                    loop {
+                        let entry = env.with_local_frame(
+                            8,
+                            |env| -> Result<Option<(u64, RoaringBitmap)>> {
+                                let Some((key, value)) = iter.next(env)? else {
+                                    return Ok(None);
+                                };
+                                let frag_id =
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let buf: Vec<u8> =
+                                    env.convert_byte_array(JByteArray::from(value))?;
+                                let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())
+                                    .map_err(|e| {
+                                        Error::input_error(format!(
+                                            "invalid updatedFragmentOffsets RoaringBitmap bytes \
+                                         for fragment {frag_id}: {e}"
+                                        ))
+                                    })?;
+                                Ok(Some((frag_id, bitmap)))
+                            },
+                        )?;
+                        match entry {
+                            None => break,
+                            Some((frag_id, bitmap)) => {
+                                offsets.insert(frag_id, bitmap);
+                            }
+                        }
+                    }
+                    if offsets.is_empty() {
+                        None
+                    } else {
+                        Some(UpdatedFragmentOffsets(offsets))
+                    }
+                }
+            };
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations: vec![],
+                compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
+                updated_fragment_offsets,
             }
         }
         "DataReplacement" => {
@@ -1216,6 +1392,8 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
+                preserves_nullability: env
+                    .get_boolean_from_method(java_operation, "preservesNullability")?,
                 schema: convert_schema_from_operation(
                     env,
                     java_operation,
@@ -1350,7 +1528,6 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     java_transaction: JObject,
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
-    storage_options_provider_obj: JObject,
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
@@ -1359,6 +1536,8 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     storage_format_obj: JObject,
     max_retries: jint,
     skip_auto_cleanup: jboolean,
+    namespace_client_managed_versioning: jboolean,
+    commit_timeout_nanos: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1368,7 +1547,6 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             java_transaction,
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
-            storage_options_provider_obj,
             namespace_obj,
             table_id_obj,
             allocator_obj,
@@ -1377,6 +1555,8 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             storage_format_obj,
             max_retries as u32,
             skip_auto_cleanup != 0,
+            namespace_client_managed_versioning != 0,
+            commit_timeout_nanos,
         )
     )
 }
@@ -1388,7 +1568,6 @@ fn inner_commit_to_uri<'local>(
     java_transaction: JObject,
     detached: bool,
     enable_v2_manifest_paths: bool,
-    storage_options_provider_obj: JObject,
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
@@ -1397,7 +1576,10 @@ fn inner_commit_to_uri<'local>(
     storage_format_obj: JObject,
     max_retries: u32,
     skip_auto_cleanup: bool,
+    namespace_client_managed_versioning: bool,
+    commit_timeout_nanos: jlong,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
     let uri_str: String = uri.extract(env)?;
 
     // Extract write params from parameter
@@ -1426,13 +1608,17 @@ fn inner_commit_to_uri<'local>(
         Some(parse_storage_format(&format_str)?)
     };
 
-    // Build storage options accessor
-    let storage_options_provider: Option<JavaStorageOptionsProvider> = env
-        .get_optional(&storage_options_provider_obj, |env, provider_obj| {
-            JavaStorageOptionsProvider::new(env, provider_obj)
-        })?;
-    let storage_options_provider =
-        storage_options_provider.map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
+    // Extract namespace info and create storage options provider if namespace is provided
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> =
+        if let Some((ref ns, ref tid)) = namespace_info {
+            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                ns.clone(),
+                tid.clone(),
+            )))
+        } else {
+            None
+        };
 
     // Keep a copy of initial options for opening the read dataset.
     let initial_storage_options = write_param.clone();
@@ -1455,9 +1641,8 @@ fn inner_commit_to_uri<'local>(
         ..Default::default()
     };
 
-    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     let (open_namespace, open_table_id) = match &namespace_info {
-        Some((ns, tid)) => (Some(ns.clone()), Some(tid.clone())),
+        Some((namespace_client, tid)) => (Some(namespace_client.clone()), Some(tid.clone())),
         None => (None, None),
     };
 
@@ -1470,11 +1655,13 @@ fn inner_commit_to_uri<'local>(
         6 * 1024 * 1024,
         1024 * 1024,
         initial_storage_options,
+        HashMap::new(),
         None,
         storage_options_provider,
         None,
         open_namespace,
         open_table_id,
+        namespace_client_managed_versioning,
     )
     .ok();
 
@@ -1491,7 +1678,8 @@ fn inner_commit_to_uri<'local>(
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
         .with_detached(detached)
-        .enable_v2_manifest_paths(enable_v2_manifest_paths);
+        .enable_v2_manifest_paths(enable_v2_manifest_paths)
+        .with_timeout(commit_timeout);
 
     if let Some(use_stable) = use_stable_row_ids {
         builder = builder.use_stable_row_ids(use_stable);
@@ -1506,16 +1694,17 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_skip_auto_cleanup(true);
     }
 
-    // Set namespace commit handler if provided
-    if let Some((ns, tid)) = namespace_info {
-        let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
+    // Set namespace commit handler only if namespace_client_managed_versioning is true
+    if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
+        let external_store =
+            LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, &uri_str)?;
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(external_store),
         });
         builder = builder.with_commit_handler(commit_handler);
     }
 
-    let dataset = RT.block_on(builder.execute(transaction))?;
+    let dataset = block_on(builder.execute(transaction))?;
     let blocking_ds = BlockingDataset { inner: dataset };
     blocking_ds.into_java(env)
 }
@@ -1776,5 +1965,81 @@ mod tests {
             schema.metadata,
             HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
         );
+    }
+
+    #[test]
+    fn test_parse_storage_format_canonical_forms() {
+        let cases = [
+            ("2.0", LanceFileVersion::V2_0),
+            ("2.1", LanceFileVersion::V2_1),
+            ("2.2", LanceFileVersion::V2_2),
+            ("2.3", LanceFileVersion::V2_3),
+            ("0.1", LanceFileVersion::Legacy),
+            ("legacy", LanceFileVersion::Legacy),
+            ("stable", LanceFileVersion::Stable),
+            ("next", LanceFileVersion::Next),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    /// The `v`-prefixed spellings shipped in the `CommitBuilder.storageFormat`
+    /// Javadoc and must keep working for existing Java callers.
+    #[test]
+    fn test_parse_storage_format_deprecated_aliases() {
+        let cases = [
+            ("v2_0", LanceFileVersion::V2_0),
+            ("v2.0", LanceFileVersion::V2_0),
+            ("v2_1", LanceFileVersion::V2_1),
+            ("v2.1", LanceFileVersion::V2_1),
+            ("v2_2", LanceFileVersion::V2_2),
+            ("v2.2", LanceFileVersion::V2_2),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    /// The alias set is frozen to what shipped, so versions added after the
+    /// aliases were deprecated are reachable only by their canonical name.
+    #[test]
+    fn test_parse_storage_format_does_not_extend_aliases_to_new_versions() {
+        assert!(parse_storage_format("v2_3").is_err());
+        assert!(parse_storage_format("v2.3").is_err());
+        assert_eq!(parse_storage_format("2.3").unwrap(), LanceFileVersion::V2_3);
+    }
+
+    #[test]
+    fn test_parse_storage_format_case_insensitive() {
+        assert_eq!(
+            parse_storage_format("LEGACY").unwrap(),
+            LanceFileVersion::Legacy
+        );
+        assert_eq!(
+            parse_storage_format("Stable").unwrap(),
+            LanceFileVersion::Stable
+        );
+        assert_eq!(
+            parse_storage_format("V2_1").unwrap(),
+            LanceFileVersion::V2_1
+        );
+    }
+
+    #[test]
+    fn test_parse_storage_format_rejects_invalid() {
+        assert!(parse_storage_format("v3.0").is_err());
+        assert!(parse_storage_format("").is_err());
+        assert!(parse_storage_format("foo").is_err());
     }
 }

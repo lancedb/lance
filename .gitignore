@@ -105,10 +105,25 @@ test_data/venv
 
 **/*.profraw
 *.lance
+!test_data/**/*.lance
+!rust/lance-file/test_data/**/*.lance
 
 # Pytest benchmarks
 .benchmarks/
 
 # Auto-built docs
+docs/src/format/catalog/**
 docs/src/format/namespace/**
+docs/src/format/layout.png
+docs/src/integrations/duckdb/**
+docs/src/integrations/huggingface/**
+docs/src/integrations/ray/**
 docs/src/integrations/spark/**
+docs/src/integrations/trino/**
+docs/src/community/project-specific/.pages
+docs/src/community/project-specific/lance/**
+docs/src/community/project-specific/namespace.md
+docs/src/community/project-specific/namespace-impls.md
+docs/src/community/project-specific/ray.md
+docs/src/community/project-specific/spark.md
+docs/src/community/project-specific/trino.md

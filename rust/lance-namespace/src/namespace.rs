@@ -9,14 +9,17 @@ use lance_core::{Error, Result};
 
 use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
@@ -26,13 +29,15 @@ use lance_namespace_reqwest_client::models::{
     ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 /// Base trait for Lance Namespace implementations.
@@ -425,6 +430,37 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Trigger an async backfill job for a computed column.
+    async fn alter_table_backfill_columns(
+        &self,
+        _request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        Err(Error::not_supported(
+            "alter_table_backfill_columns not implemented",
+        ))
+    }
+
+    /// Trigger an async materialized view refresh.
+    async fn refresh_materialized_view(
+        &self,
+        _request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        Err(Error::not_supported(
+            "refresh_materialized_view not implemented",
+        ))
+    }
+
+    /// Create a materialized view (query / UDTF / chunker) backed by a
+    /// stored UDTF/chunker spec and an optional initial refresh.
+    async fn create_materialized_view(
+        &self,
+        _request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        Err(Error::not_supported(
+            "create_materialized_view not implemented",
+        ))
+    }
+
     /// List all tags for a table.
     async fn list_table_tags(
         &self,
@@ -465,6 +501,44 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         _request: UpdateTableTagRequest,
     ) -> Result<UpdateTableTagResponse> {
         Err(Error::not_supported("update_table_tag not implemented"))
+    }
+
+    /// Create a branch for a table.
+    ///
+    /// The new branch forks from the source ref selected by `from_branch` and
+    /// `from_version`, defaulting to the latest version of the main branch when
+    /// both are omitted.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`crate::ErrorCode::TableBranchAlreadyExists`] if a branch with the same name already exists.
+    /// - Returns [`crate::ErrorCode::TableNotFound`] if the table does not exist.
+    /// - Returns [`crate::ErrorCode::InvalidInput`] if `from_branch` or `from_version` references a source that does not exist.
+    async fn create_table_branch(
+        &self,
+        _request: CreateTableBranchRequest,
+    ) -> Result<CreateTableBranchResponse> {
+        Err(Error::not_supported("create_table_branch not implemented"))
+    }
+
+    /// List all branches for a table.
+    async fn list_table_branches(
+        &self,
+        _request: ListTableBranchesRequest,
+    ) -> Result<ListTableBranchesResponse> {
+        Err(Error::not_supported("list_table_branches not implemented"))
+    }
+
+    /// Delete a branch from a table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::TableBranchNotFound`] if the branch does not exist.
+    async fn delete_table_branch(
+        &self,
+        _request: DeleteTableBranchRequest,
+    ) -> Result<DeleteTableBranchResponse> {
+        Err(Error::not_supported("delete_table_branch not implemented"))
     }
 
     /// Return a human-readable unique identifier for this namespace instance.

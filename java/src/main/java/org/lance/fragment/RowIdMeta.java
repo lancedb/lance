@@ -13,6 +13,8 @@
  */
 package org.lance.fragment;
 
+import org.lance.JniLoader;
+
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
@@ -21,11 +23,29 @@ import java.util.Objects;
 public class RowIdMeta implements Serializable {
   private static final long serialVersionUID = -6532828695072614148L;
 
+  static {
+    JniLoader.ensureLoaded();
+  }
+
   private final String metadata;
 
   public RowIdMeta(String metadata) {
     this.metadata = metadata;
   }
+
+  /**
+   * Creates a RowIdMeta from an array of stable row IDs by delegating to the Rust {@code
+   * write_row_ids} encoder via JNI. The returned metadata is a JSON string wrapping the
+   * protobuf-encoded RowIdSequence, matching the format expected by lance-core.
+   *
+   * @param rowIds stable row IDs to encode
+   * @return RowIdMeta containing the serialized inline representation
+   */
+  public static RowIdMeta fromRowIds(long[] rowIds) {
+    return new RowIdMeta(nativeEncodeRowIds(rowIds));
+  }
+
+  private static native String nativeEncodeRowIds(long[] rowIds);
 
   public String getMetadata() {
     return metadata;
@@ -41,6 +61,11 @@ public class RowIdMeta implements Serializable {
     }
     RowIdMeta that = (RowIdMeta) obj;
     return Objects.equals(metadata, that.metadata);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(metadata);
   }
 
   @Override

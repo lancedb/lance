@@ -79,13 +79,9 @@ pub fn new_ivf_transformer_with_quantizer(
             sq,
             range,
         )),
-        Quantizer::Rabit(rq) => Ok(IvfTransformer::with_rq(
-            centroids,
-            metric_type,
-            vector_column,
-            rq,
-            range,
-        )),
+        Quantizer::Rabit(rq) => {
+            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range)
+        }
     }
 }
 
@@ -284,7 +280,7 @@ impl IvfTransformer {
         vector_column: &str,
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -322,9 +318,9 @@ impl IvfTransformer {
             distance_type,
             centroids.clone(),
             vector_column,
-        )));
+        )?));
 
-        Self::new(centroids, distance_type, transforms)
+        Ok(Self::new(centroids, distance_type, transforms))
     }
 
     #[inline]

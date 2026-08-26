@@ -155,6 +155,7 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
 pub trait MetricsExt {
     fn find_count(&self, name: &str) -> Option<Count>;
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)>;
+    fn iter_times(&self) -> impl Iterator<Item = (impl AsRef<str>, &Time)>;
     fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)>;
 }
 
@@ -175,6 +176,13 @@ impl MetricsExt for MetricsSet {
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)> {
         self.iter().filter_map(|m| match m.value() {
             MetricValue::Count { name, count } => Some((name, count)),
+            _ => None,
+        })
+    }
+
+    fn iter_times(&self) -> impl Iterator<Item = (impl AsRef<str>, &Time)> {
+        self.iter().filter_map(|m| match m.value() {
+            MetricValue::Time { name, time } => Some((name, time)),
             _ => None,
         })
     }
@@ -236,11 +244,14 @@ pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
 pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
 pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
+pub const INDEX_CACHE_HITS_METRIC: &str = "index_cache_hits";
+pub const INDEX_CACHE_MISSES_METRIC: &str = "index_cache_misses";
 pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
 pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
 pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
 pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
 pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
+pub const FIND_PARTITIONS_ELAPSED_METRIC: &str = "find_partitions_elapsed";
 pub const SCALAR_INDEX_SEARCH_TIME_METRIC: &str = "search_time";
-pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "ser_time";
+pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "serialization_time";

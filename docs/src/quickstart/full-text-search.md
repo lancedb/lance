@@ -90,7 +90,7 @@ ds.create_scalar_index(
     index_type="INVERTED",
     name="text_idx",              # Optional index name (if omitted, default is "text_idx")
     with_position=False,          # Set True to enable phrase queries (stores token positions)
-    base_tokenizer="simple",      # Tokenizer: "simple" (whitespace+punct), "whitespace", or "raw" (no tokenization)
+    base_tokenizer="simple",      # Tokenizer: "simple", "icu", "icu/split", "whitespace", "raw", or "ngram"
     language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
     max_token_length=40,          # Drop tokens longer than this length
     lower_case=True,              # Lowercase text before tokenization
@@ -98,6 +98,7 @@ ds.create_scalar_index(
     remove_stop_words=True,       # Remove stop words (language-dependent)
     custom_stop_words=None,       # Optional additional stop words (only used if remove_stop_words=True)
     ascii_folding=True,           # Fold accents to ASCII when possible (e.g., "é" -> "e")
+    block_size=128,               # Posting block size: 128 or 256; 256 is experimental
 )
 ```
 
@@ -109,6 +110,7 @@ ds.create_scalar_index(
 
 Lance also supports multilingual tokenization:
 
+- **icu**: Unicode word segmentation with built-in ICU dictionaries
 - **jieba/default**: Chinese text tokenization using Jieba
 - **lindera/ipadic**: Japanese text tokenization using Lindera with IPAdic dictionary
 - **lindera/ko-dic**: Korean text tokenization using Lindera with Ko-dic dictionary
@@ -239,6 +241,9 @@ query_result = ds.to_table(full_text_query=(q1 & q2))
 ```
 
 To combine `OR` queries via operators, use the pattern `q1 | q2`.
+
+Every query combined with `AND` becomes a scoring `MUST` clause: all clauses must match,
+and every matching clause contributes to the final `_score`.
 
 #### Exclude terms: `NOT`
 
@@ -411,7 +416,7 @@ Combining full-text search with metadata filters can significantly reduce the se
 
 ### Further Reading
 
-For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the [full-text index](../format/table/index/scalar/fts.md) specification.
+For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the [full-text index](../format/index/scalar/fts.md) specification.
 
 ## Next Steps
 

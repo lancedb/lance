@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::fragment::FileFragment;
 use super::{
     Dataset,
     transaction::{Operation, Transaction},
+    write::cleanup_data_fragments,
 };
+use crate::index::DatasetIndexExt;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
+use arrow_cast::cast_with_options;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
@@ -19,14 +25,13 @@ use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
-use lance_encoding::version::LanceFileVersion;
+#[cfg(test)]
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
 
-mod optimize;
+pub mod optimize;
 
-use optimize::{
-    ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
-};
+use optimize::{ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer};
 
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
@@ -142,32 +147,17 @@ impl ColumnAlteration {
     }
 }
 
-/// Limit casts to same type. This is mostly to filter out weird casts like
-/// casting a string to a boolean or float to string.
-fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
-    use DataType::*;
-    match from_type {
-        from_type if from_type.is_integer() => to_type.is_integer(),
-        from_type if from_type.is_floating() => to_type.is_floating(),
-        from_type if from_type.is_temporal() => to_type.is_temporal(),
-        Boolean => matches!(to_type, Boolean),
-        Utf8 | LargeUtf8 => matches!(to_type, Utf8 | LargeUtf8),
-        Binary | LargeBinary => matches!(to_type, Binary | LargeBinary),
-        Decimal128(_, _) | Decimal256(_, _) => {
-            matches!(to_type, Decimal128(_, _) | Decimal256(_, _))
-        }
-        List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _) => match to_type {
-            List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
-                is_upcast_downcast(from_field.data_type(), to_field.data_type())
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 trait ArrowFieldExt {
     fn is_packed(&self) -> bool;
+}
+
+#[cfg(test)]
+fn is_upcast_downcast(
+    from_type: &DataType,
+    to_type: &DataType,
+    version: ConcreteFileVersion,
+) -> bool {
+    super::versions::is_upcast_downcast(version, from_type, to_type)
 }
 
 impl ArrowFieldExt for ArrowField {
@@ -180,10 +170,10 @@ impl ArrowFieldExt for ArrowField {
     }
 }
 
-fn check_field_conflict(
+pub fn check_field_conflict_with(
     left: &ArrowField,
     right: &ArrowField,
-    version: &LanceFileVersion,
+    validate_nested_column_add: fn(&ArrowField) -> Result<()>,
 ) -> Result<()> {
     if left.name() != right.name() {
         return Ok(());
@@ -191,13 +181,7 @@ fn check_field_conflict(
 
     match (left.data_type(), right.data_type()) {
         (DataType::Struct(fl), DataType::Struct(fr)) => {
-            if !version.support_add_sub_column() {
-                return Err(Error::invalid_input(format!(
-                    "Column {} is a struct col, add sub column is not supported in Lance file version {}",
-                    left.name(),
-                    version
-                )));
-            }
+            validate_nested_column_add(left)?;
 
             if left.is_packed() || right.is_packed() {
                 return Err(Error::invalid_input(format!(
@@ -208,15 +192,19 @@ fn check_field_conflict(
 
             for l_field in fl.iter() {
                 if let Some((_, r_field)) = fr.find(l_field.name()) {
-                    check_field_conflict(l_field, r_field, version)?;
+                    check_field_conflict_with(l_field, r_field, validate_nested_column_add)?;
                 }
             }
             Ok(())
         }
-        (DataType::List(fl), DataType::List(fr)) => check_field_conflict(fl, fr, version),
-        (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::List(fl), DataType::List(fr)) => {
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
+        }
+        (DataType::LargeList(fl), DataType::LargeList(fr)) => {
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
+        }
         (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
-            check_field_conflict(fl, fr, version)
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
         }
         (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(format!(
             "Column {} already exists in the dataset",
@@ -232,21 +220,30 @@ fn check_field_conflict(
     }
 }
 
+#[cfg(test)]
+fn check_field_conflict(
+    left: &ArrowField,
+    right: &ArrowField,
+    version: &ConcreteFileVersion,
+) -> Result<()> {
+    super::versions::check_field_conflict(*version, left, right)
+}
+
 pub(super) async fn add_columns_to_fragments(
     dataset: &Dataset,
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
-    let version = dataset.manifest.data_storage_format.lance_file_version()?;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
     let check_names = |output_schema: &ArrowSchema| {
         for field in &dataset.schema().fields {
             if let Ok(out_field) = output_schema.field_with_name(&field.name) {
                 let ds_field = ArrowField::from(field);
-                check_field_conflict(&ds_field, out_field, &version)?;
+                super::versions::check_field_conflict(version, &ds_field, out_field)?;
             }
         }
         Ok::<(), Error>(())
@@ -254,16 +251,13 @@ pub(super) async fn add_columns_to_fragments(
 
     // Optimize the transforms
     let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
-    // ALlNull transform can not performed on legacy files
-    if !dataset.is_legacy_storage() {
-        optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
-    }
+    super::versions::configure_new_column_optimizers(version, &mut optimizer);
     let transforms = optimizer.optimize(dataset, transforms)?;
 
-    let (output_schema, fragments) = match transforms {
+    let (output_schema, new_fragments, fragments_to_cleanup) = match transforms {
         NewColumnTransform::BatchUDF(udf) => {
             check_names(udf.output_schema.as_ref())?;
-            let fragments = add_columns_impl(
+            let result = add_columns_impl(
                 fragments,
                 read_columns,
                 udf.mapper,
@@ -272,7 +266,11 @@ pub(super) async fn add_columns_to_fragments(
                 None,
             )
             .await?;
-            Result::Ok((udf.output_schema, fragments))
+            Result::Ok((
+                udf.output_schema,
+                result.fragments,
+                result.fragments_to_cleanup,
+            ))
         }
         NewColumnTransform::SqlExpressions(expressions) => {
             // We just transform the SQL expression into a UDF backed by DataFusion
@@ -335,31 +333,35 @@ pub(super) async fn add_columns_to_fragments(
             let mapper = Box::new(mapper);
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-            let fragments =
+            let result =
                 add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, result.fragments, result.fragments_to_cleanup))
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
 
-            // Check that the schema is compatible considering all the new columns must be nullable
-            let schema = Schema::try_from(output_schema.as_ref())?;
-            if !schema.all_fields_nullable() {
+            // AllNulls is metadata-only; missing columns are synthesized as nulls at
+            // read time, so only each new top-level column needs to be nullable.
+            if let Some(field) = output_schema.fields().iter().find(|f| !f.is_nullable()) {
                 return Err(Error::invalid_input_source(
-                    "All-null columns must be nullable.".into(),
+                    format!(
+                        "All-null columns must be nullable, but field '{}' is not.",
+                        field.name()
+                    )
+                    .into(),
                 ));
             }
 
@@ -368,24 +370,73 @@ pub(super) async fn add_columns_to_fragments(
                 .map(|f| f.metadata.clone())
                 .collect::<Vec<_>>();
 
-            // Check if any of the fragment's files are using the legacy dataset version if so, we
-            // can't add all-null columns as a metadata-only operation. The reason is because we
-            // use the NullReader for fragments that have missing columns and we can't mix legacy
-            // and non-legacy readers when reading the fragment.
-            if dataset.is_legacy_storage() {
-                return Err(Error::not_supported_source(
-                    "Cannot add all-null columns to legacy dataset version.".into(),
-                ));
-            }
+            super::versions::validate_metadata_only_null_columns(version)?;
 
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments, Vec::new()))
         }
     }?;
 
-    let mut schema = dataset.schema().merge(output_schema.as_ref())?;
+    let mut schema = match dataset.schema().merge(output_schema.as_ref()) {
+        Ok(schema) => schema,
+        Err(e) => {
+            cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+            return Err(e);
+        }
+    };
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
-    Ok((fragments, schema))
+    let preserves_nullability = !merge_introduces_required_field(dataset.schema(), &schema);
+
+    Ok((
+        new_fragments,
+        schema,
+        fragments_to_cleanup,
+        preserves_nullability,
+    ))
+}
+
+/// Whether `merged` introduces a field that data staged against `old` cannot
+/// safely omit. The first new node on each path decides: a non-nullable new
+/// field beneath an existing ancestor reads as unmasked null for stale rows,
+/// which do supply the ancestor, while a nullable new field masks its whole
+/// subtree whatever the nullability inside, the same rule the AllNulls
+/// transform enforces at the top level.
+///
+/// A new node under a non-nullable top-level column claims even when the node
+/// itself is nullable: the reader synthesizes missing subcolumns against the
+/// column's declared nullability, so a stale fragment cannot be read at all
+/// under such a column, nullable child or not.
+pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> bool {
+    /// (any node in `merged` is new, any first-new node is non-nullable)
+    fn subtree_new_nodes(old: &[Field], merged: &[Field]) -> (bool, bool) {
+        let mut any_new = false;
+        let mut any_required = false;
+        for field in merged {
+            match old.iter().find(|o| o.name == field.name) {
+                Some(old_field) => {
+                    let (new, required) = subtree_new_nodes(&old_field.children, &field.children);
+                    any_new |= new;
+                    any_required |= required;
+                }
+                None => {
+                    any_new = true;
+                    any_required |= !field.nullable;
+                }
+            }
+        }
+        (any_new, any_required)
+    }
+
+    merged.fields.iter().any(
+        |field| match old.fields.iter().find(|o| o.name == field.name) {
+            Some(old_field) => {
+                let (any_new, any_required) =
+                    subtree_new_nodes(&old_field.children, &field.children);
+                any_required || (any_new && !field.nullable)
+            }
+            None => !field.nullable,
+        },
+    )
 }
 
 pub(super) async fn add_columns(
@@ -394,22 +445,89 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
-    let (fragments, schema) = add_columns_to_fragments(
-        dataset,
-        transforms,
-        read_columns,
-        &dataset.get_fragments(),
-        batch_size,
-    )
-    .await?;
-
-    let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+    let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
+        add_columns_to_fragments(
+            dataset,
+            transforms,
+            read_columns,
+            &dataset.get_fragments(),
+            batch_size,
+        )
         .await?;
 
-    Ok(())
+    let operation = Operation::Merge {
+        fragments,
+        schema,
+        preserves_nullability,
+    };
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    // Once the manifest commit has been attempted, an error does not prove
+    // that the new files are unreferenced: the commit may have landed and only
+    // its response (or a post-commit callback) may have failed. Leave files
+    // from failed attempts for dataset GC instead of risking live-data loss.
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+}
+
+async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
+    let Some(first_fragment) = fragments.first() else {
+        return;
+    };
+
+    // add_columns rewrites fragment metadata in place, so cleanup must delete
+    // only files created by the current attempt and must not touch pre-existing
+    // files that still belong to the fragment.
+    let original_files_by_fragment = fragments
+        .iter()
+        .map(|fragment| {
+            let files = fragment
+                .metadata
+                .files
+                .iter()
+                .map(|file| (file.base_id, file.path.clone()))
+                .collect::<HashSet<_>>();
+            (fragment.id() as u64, files)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let fragments_to_cleanup = new_fragments
+        .iter()
+        .filter_map(|fragment| {
+            let original_files = original_files_by_fragment.get(&fragment.id)?;
+            let files = fragment
+                .files
+                .iter()
+                .filter(|file| !original_files.contains(&(file.base_id, file.path.clone())))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if files.is_empty() {
+                None
+            } else {
+                let mut fragment = fragment.clone();
+                fragment.files = files;
+                Some(fragment)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    cleanup_data_fragments(
+        &first_fragment.dataset().object_store,
+        &first_fragment.dataset().base,
+        None,
+        &fragments_to_cleanup,
+    )
+    .await;
+}
+
+struct AddColumnFragments {
+    /// Fragments produced by the add-columns operation and returned to the
+    /// caller for the final merge commit.
+    fragments: Vec<Fragment>,
+    /// Uncommitted fragments whose newly written data files must be removed if
+    /// the operation fails before the merge commit completes.
+    fragments_to_cleanup: Vec<Fragment>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -420,63 +538,96 @@ async fn add_columns_impl(
     batch_size: Option<u32>,
     result_cache: Option<Arc<dyn UDFCheckpointStore>>,
     schemas: Option<(Schema, Schema)>,
-) -> Result<Vec<Fragment>> {
+) -> Result<AddColumnFragments> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
-    let fragments = futures::stream::iter(fragments)
-        .then(|fragment| {
-            let cache_ref = result_cache.clone();
-            let schemas_ref = &schemas;
-            async move {
-                if let Some(cache) = &cache_ref {
-                    let fragment_id = fragment.id() as u32;
-                    let fragment = cache.get_fragment(fragment_id)?;
-                    if let Some(fragment) = fragment {
-                        return Ok(fragment);
-                    }
+
+    let mut new_fragments = Vec::with_capacity(fragments.len());
+    let mut fragments_to_cleanup = Vec::with_capacity(fragments.len());
+
+    for fragment in fragments {
+        if let Some(cache) = &result_cache {
+            let fragment_id = fragment.id() as u32;
+            let fragment = match cache.get_fragment(fragment_id) {
+                Ok(fragment) => fragment,
+                Err(e) => {
+                    cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+                    return Err(e);
                 }
-
-                let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone(), batch_size)
-                    .await?;
-
-                let mut batch_index = 0;
-                // TODO: the structure of the updater prevents batch-level parallelism here,
-                //       but there is no reason why we couldn't do this in parallel.
-                while let Some(batch) = updater.next().await? {
-                    let batch_info = BatchInfo {
-                        fragment_id: fragment.id() as u32,
-                        batch_index,
-                    };
-
-                    let new_batch = if let Some(cache) = &cache_ref {
-                        if let Some(batch) = cache.get_batch(&batch_info)? {
-                            batch
-                        } else {
-                            let new_batch = mapper_ref(batch)?;
-                            cache.insert_batch(batch_info, new_batch.clone())?;
-                            new_batch
-                        }
-                    } else {
-                        mapper_ref(batch)?
-                    };
-
-                    updater.update(new_batch).await?;
-                    batch_index += 1;
-                }
-
-                let fragment = updater.finish().await?;
-
-                if let Some(cache) = &cache_ref {
-                    cache.insert_fragment(fragment.clone())?;
-                }
-
-                Ok::<_, Error>(fragment)
+            };
+            if let Some(fragment) = fragment {
+                new_fragments.push(fragment);
+                continue;
             }
-        })
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok(fragments)
+        }
+
+        let mut updater = match fragment
+            .updater(read_columns_ref, schemas.clone(), batch_size, None)
+            .await
+        {
+            Ok(updater) => updater,
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+                return Err(e);
+            }
+        };
+        let fragment_result = async {
+            let mut batch_index = 0;
+            // TODO: the structure of the updater prevents batch-level parallelism here,
+            //       but there is no reason why we couldn't do this in parallel.
+            while let Some(batch) = updater.next().await? {
+                let batch_info = BatchInfo {
+                    fragment_id: fragment.id() as u32,
+                    batch_index,
+                };
+
+                let new_batch = if let Some(cache) = &result_cache {
+                    if let Some(batch) = cache.get_batch(&batch_info)? {
+                        batch
+                    } else {
+                        let new_batch = mapper_ref(batch)?;
+                        cache.insert_batch(batch_info, new_batch.clone())?;
+                        new_batch
+                    }
+                } else {
+                    mapper_ref(batch)?
+                };
+
+                updater.update(new_batch).await?;
+                batch_index += 1;
+            }
+
+            let new_fragment = updater.finish().await?;
+            fragments_to_cleanup.push(new_fragment.clone());
+
+            if let Some(cache) = &result_cache {
+                // Once the checkpoint store owns this fragment, retries may load
+                // it back instead of rewriting it. Removing it from the cleanup
+                // set avoids deleting data that has already been checkpointed.
+                cache.insert_fragment(new_fragment.clone())?;
+                fragments_to_cleanup.pop();
+            }
+
+            Ok::<_, Error>(new_fragment)
+        }
+        .await;
+
+        match fragment_result {
+            Ok(new_fragment) => {
+                new_fragments.push(new_fragment);
+            }
+            Err(e) => {
+                updater.cleanup_unfinished_writer().await;
+                cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(AddColumnFragments {
+        fragments: new_fragments,
+        fragments_to_cleanup,
+    })
 }
 
 async fn add_columns_from_stream(
@@ -488,49 +639,80 @@ async fn add_columns_from_stream(
     let mut new_fragments = Vec::with_capacity(fragments.len());
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
-        let mut updater = fragment
-            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
-            .await?;
-        while let Some(batch) = updater.next().await? {
-            debug_assert_eq!(batch.num_columns(), 1);
-            let mut rows_remaining = batch.num_rows();
-
-            let mut batches = Vec::new();
-
-            while rows_remaining > 0 {
-                let next_batch = if let Some(last_seen_batch) = last_seen_batch {
-                    last_seen_batch
-                } else {
-                    stream.next().await.ok_or_else(|| {
-                        Error::invalid_input(
-                            "Stream ended before producing values for all rows in dataset",
-                        )
-                    })??
-                };
-                let num_rows = next_batch.num_rows();
-                if num_rows > rows_remaining {
-                    let new_batch = next_batch.slice(0, rows_remaining);
-                    batches.push(new_batch);
-                    last_seen_batch =
-                        Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
-                    rows_remaining = 0;
-                } else {
-                    batches.push(next_batch);
-                    rows_remaining -= num_rows;
-                    last_seen_batch = None;
-                }
+        let mut updater = match fragment
+            .updater::<String>(Some(&[]), schemas.clone(), batch_size, None)
+            .await
+        {
+            Ok(updater) => updater,
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                return Err(e);
             }
+        };
+        let result: Result<Fragment> = async {
+            while let Some(batch) = updater.next().await? {
+                debug_assert_eq!(batch.num_columns(), 1);
+                let mut rows_remaining = batch.num_rows();
 
-            let new_batch =
-                arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+                // The updater yields an empty batch when every row in a read batch
+                // has been deleted (e.g. a whole batch falls within the deletion
+                // vector). There is nothing to pull from the stream in that case, so
+                // feed an empty batch back to keep the updater in sync and continue.
+                if rows_remaining == 0 {
+                    updater
+                        .update(RecordBatch::new_empty(stream.schema()))
+                        .await?;
+                    continue;
+                }
 
-            updater.update(new_batch).await?;
+                let mut batches = Vec::new();
+
+                while rows_remaining > 0 {
+                    let next_batch = if let Some(last_seen) = last_seen_batch.take() {
+                        last_seen
+                    } else {
+                        stream.next().await.ok_or_else(|| {
+                            Error::invalid_input(
+                                "Stream ended before producing values for all rows in dataset",
+                            )
+                        })??
+                    };
+                    let num_rows = next_batch.num_rows();
+                    if num_rows > rows_remaining {
+                        let new_batch = next_batch.slice(0, rows_remaining);
+                        batches.push(new_batch);
+                        last_seen_batch =
+                            Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
+                        rows_remaining = 0;
+                    } else {
+                        batches.push(next_batch);
+                        rows_remaining -= num_rows;
+                        last_seen_batch = None;
+                    }
+                }
+
+                let new_batch =
+                    arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+
+                updater.update(new_batch).await?;
+            }
+            updater.finish().await
         }
-        new_fragments.push(updater.finish().await?);
+        .await;
+
+        match result {
+            Ok(new_fragment) => new_fragments.push(new_fragment),
+            Err(e) => {
+                updater.cleanup_unfinished_writer().await;
+                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                return Err(e);
+            }
+        }
     }
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
+        cleanup_new_column_data_files(fragments, &new_fragments).await;
         return Err(Error::invalid_input_source(
             "Stream produced more values than expected for dataset".into(),
         ));
@@ -552,8 +734,10 @@ pub(super) async fn alter_columns(
 
     // Mapping of old to new fields that need to be casted.
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -568,6 +752,9 @@ pub(super) async fn alter_columns(
             && !nullable
         {
             validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
+            // A write since this version can falsify it, so withhold the
+            // preserves_nullability assertion from the transaction.
+            tightens_nullability = true;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -580,7 +767,7 @@ pub(super) async fn alter_columns(
 
         if let Some(data_type) = &alteration.data_type {
             if !(can_cast_types(&field_src.data_type(), data_type)
-                && is_upcast_downcast(&field_src.data_type(), data_type))
+                && super::versions::is_upcast_downcast(version, &field_src.data_type(), data_type))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -604,11 +791,56 @@ pub(super) async fn alter_columns(
 
     new_schema.validate()?;
 
+    // If any column being cast has an attached index, fail fast. Cast operations
+    // rewrite the underlying column data and silently invalidate any index on the
+    // affected column(s). The current behavior is to drop such indices without
+    // warning, which has caused production incidents where vector search silently
+    // regressed to brute-force scan. We require users to explicitly drop the
+    // index before altering the column type, so the action is never silent.
+    if !cast_fields.is_empty() {
+        let indices = dataset.load_indices().await?;
+        let affected: Vec<&lance_table::format::IndexMetadata> = indices
+            .iter()
+            .filter(|idx| {
+                cast_fields
+                    .iter()
+                    .any(|(old, _)| idx.fields.contains(&old.id))
+            })
+            .collect();
+        if !affected.is_empty() {
+            let affected_cols: Vec<String> = cast_fields
+                .iter()
+                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
+                .map(|(old, _)| old.name.clone())
+                .collect();
+            let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
+            return Err(Error::invalid_input(format!(
+                "Cannot cast column(s) [{}] to a new type: they have {} index(es) \
+                 attached: [{}]. Cast rewrites column data and invalidates any index \
+                 on the affected column(s). Drop the index(es) with drop_index() \
+                 before altering, then recreate them after the cast completes.",
+                affected_cols.join(", "),
+                affected.len(),
+                affected_idx_names.join(", "),
+            )));
+        }
+    }
+
+    if tightens_nullability && !cast_fields.is_empty() {
+        return Err(Error::invalid_input(
+            "cannot make a column non-nullable and cast columns in the same call: \
+             apply the cast first, then the nullability change",
+        ));
+    }
+
     // If we aren't casting a column, we don't need to touch the fragments.
     let transaction = if cast_fields.is_empty() {
         Transaction::new(
             dataset.manifest.version,
-            Operation::Project { schema: new_schema },
+            Operation::Project {
+                schema: new_schema,
+                preserves_nullability: !tightens_nullability,
+            },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
         )
@@ -630,12 +862,18 @@ pub(super) async fn alter_columns(
         // This schema contains the exact field ids we want to write the new fields with.
         let new_col_schema = new_schema.project_by_ids(&new_ids, true);
 
+        // A cast rewrites the column under a new field id, so data staged
+        // against the pre-cast schema omits that id and its rows read as null.
+        // Withhold the assertion when any recast field is non-nullable, at any
+        // depth: a nested field sits under parent values stale rows do supply.
+        let cast_touches_required = cast_fields.iter().any(|(_old, new)| !new.nullable);
+
         let mapper = move |batch: &RecordBatch| {
             let mut fields = Vec::with_capacity(cast_fields.len());
             let mut columns = Vec::with_capacity(batch.num_columns());
             for (old, new) in &cast_fields {
                 let old_column = batch[&old.name].clone();
-                let new_column = lance_arrow::cast::cast_with_options(
+                let new_column = cast_with_options(
                     &old_column,
                     &new.data_type(),
                     // Safe: false means it will error if the cast is lossy.
@@ -652,7 +890,7 @@ pub(super) async fn alter_columns(
         };
         let mapper = Box::new(mapper);
 
-        let fragments = add_columns_impl(
+        let result = add_columns_impl(
             &dataset.get_fragments(),
             Some(read_columns),
             mapper,
@@ -665,7 +903,8 @@ pub(super) async fn alter_columns(
         // Some data files may no longer contain any columns in the dataset (e.g. if every
         // remaining column has been altered into a different data file) and so we remove them
         let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
-        let fragments = fragments
+        let fragments = result
+            .fragments
             .into_iter()
             .map(|mut frag| {
                 frag.files.retain(|f| {
@@ -682,6 +921,7 @@ pub(super) async fn alter_columns(
             Operation::Merge {
                 schema: new_schema,
                 fragments,
+                preserves_nullability: !cast_touches_required,
             },
             /*blob_op= */ None,
         )
@@ -713,9 +953,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         }
     }
 
-    let version = dataset.manifest.data_storage_format.lance_file_version()?;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema = exclude(&dataset.manifest.schema, &columns_to_remove, &version)?;
+    let new_schema =
+        super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -725,7 +966,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
     let transaction = Transaction::new(
         dataset.manifest.version,
-        Operation::Project { schema: new_schema },
+        Operation::Project {
+            schema: new_schema,
+            preserves_nullability: true,
+        },
         /*blob_op= */ None,
     );
 
@@ -736,17 +980,19 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     Ok(())
 }
 
-/// Exclude the fields from `other` Schema, and returns a new Schema.
-pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> Result<Schema> {
+/// Exclude the fields from `other` Schema using the selected nested-field rule.
+pub fn exclude_with(
+    source: &Schema,
+    other: &Schema,
+    exclude_nested_field: fn(&Field, &Field) -> Option<Field>,
+) -> Result<Schema> {
     let other: Schema = other.try_into().map_err(|_| {
         Error::schema("The other schema is not compatible with this schema".to_string())
     })?;
     let mut fields = vec![];
     for field in source.fields.iter() {
         if let Some(other_field) = other.field(&field.name) {
-            if version.support_remove_sub_column(field)
-                && let Some(f) = field.exclude(other_field)
-            {
+            if let Some(f) = exclude_nested_field(field, other_field) {
                 fields.push(f)
             }
         } else {
@@ -760,9 +1006,93 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
 }
 
 #[cfg(test)]
+fn exclude(source: &Schema, other: &Schema, version: &ConcreteFileVersion) -> Result<Schema> {
+    super::versions::exclude_schema(*version, source, other)
+}
+
+#[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
+
+    #[test]
+    fn test_merge_introduces_required_field() {
+        let schema = |fields: Vec<ArrowField>| Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+        let strukt = |name: &str, nullable: bool, children: Vec<ArrowField>| {
+            ArrowField::new(
+                name,
+                DataType::Struct(ArrowFields::from(children)),
+                nullable,
+            )
+        };
+        let int = |name: &str, nullable: bool| ArrowField::new(name, DataType::Int32, nullable);
+
+        let old = schema(vec![
+            strukt("s", true, vec![int("a", true)]),
+            strukt("r", false, vec![int("a", true)]),
+        ]);
+        // The first new node on each path decides, at any depth; any new node
+        // under a non-nullable top-level column claims regardless.
+        for (merged, expected) in [
+            // A nullable new child under a non-nullable top-level column: the
+            // reader cannot synthesize the missing subcolumn, so claim.
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    strukt("r", false, vec![int("a", true), int("b", true)]),
+                ]),
+                true,
+            ),
+            // Required new child under an existing parent: stale rows supply
+            // the parent, so the child would read as unmasked null.
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), int("b", false)],
+                )]),
+                true,
+            ),
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), int("b", true)],
+                )]),
+                false,
+            ),
+            // A wholly new nullable container masks its required inside.
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    strukt("t", true, vec![int("c", false)]),
+                ]),
+                false,
+            ),
+            // Same, when the new container hangs under an existing parent.
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), strukt("t", true, vec![int("c", false)])],
+                )]),
+                false,
+            ),
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    int("b", false),
+                ]),
+                true,
+            ),
+            (schema(vec![strukt("s", true, vec![int("a", true)])]), false),
+        ] {
+            assert_eq!(
+                merge_introduces_required_field(&old, &merged),
+                expected,
+                "merged={merged:?}"
+            );
+        }
+    }
 
     use crate::dataset::WriteParams;
     use arrow_array::{
@@ -772,12 +1102,54 @@ mod test {
     use super::*;
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
         t
+    }
+
+    fn file_paths_in(dir: impl AsRef<StdPath>) -> Vec<String> {
+        fn collect_files(
+            base_dir: &StdPath,
+            dir: &StdPath,
+            files: &mut Vec<String>,
+        ) -> std::io::Result<()> {
+            if !dir.exists() {
+                return Ok(());
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    collect_files(base_dir, &path, files)?;
+                } else if path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|file_name| !file_name.starts_with('.'))
+                {
+                    files.push(
+                        path.strip_prefix(base_dir)
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let base_dir = dir.as_ref();
+        let mut files = Vec::new();
+        collect_files(base_dir, base_dir, &mut files).unwrap();
+        files.sort();
+        files
+    }
+
+    fn data_file_paths_in(base_dir: &str) -> Vec<String> {
+        file_paths_in(StdPath::new(base_dir).join("data"))
     }
 
     #[tokio::test]
@@ -859,6 +1231,748 @@ mod test {
         ]);
         assert_eq!(data.schema().as_ref(), &expected_schema);
         assert_eq!(data.num_rows(), num_rows);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_files_when_commit_status_is_unknown() -> Result<()> {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let num_rows = 5;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let files_before = data_file_paths_in(test_uri);
+
+        handler.fail_next(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("double_id".into(), "2 * id".into())]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("unverifiable commit outcome must be reported");
+        assert!(
+            error.is_commit_status_unknown(),
+            "expected CommitStatusUnknown, got: {error:?}"
+        );
+        assert!(data_file_paths_in(test_uri).len() > files_before.len());
+
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reopened = Dataset::open(test_uri).await?;
+        let data = reopened.scan().try_into_batch().await?;
+        let double_id = data
+            .column_by_name("double_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(double_id, &Int32Array::from(vec![0, 2, 4, 6, 8]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_with_fully_deleted_batch() -> Result<()> {
+        // Regression test: when an entire read batch has been deleted, the
+        // updater yields a 0-row batch. The inner loop then never runs and
+        // `batches` stays empty, so `concat_batches(&batches[0]..)` used to
+        // panic with "index out of bounds: the len is 0 but the index is 0".
+        //
+        // A single fragment holds 105 rows; deleting the trailing 5 rows means
+        // that, when read with batch_size=50, the third batch [100..105) is
+        // fully filtered out and produces an empty batch.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..105))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200, // keep all rows in a single fragment
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // Delete the entire trailing batch [100..105).
+        dataset.delete("i >= 100").await?;
+        assert_eq!(dataset.count_rows(None).await?, 100);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+
+        // Read with batch_size=50 so the deleted trailing rows form a full empty batch.
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 100);
+        assert_eq!(
+            data.column_by_name("j").unwrap().as_ref(),
+            &Int32Array::from_iter_values(0..100)
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_add_columns_cleans_up_blob_v2_data_on_stream_error(
+        #[values(
+            ("inline", b"inline".to_vec()),
+            ("packed", vec![1u8; 128 * 1024]),
+            ("dedicated", vec![2u8; 5 * 1024 * 1024]),
+            ("external", b"external".to_vec())
+        )]
+        blob_case: (&str, Vec<u8>),
+    ) -> Result<()> {
+        let (blob_kind, payload) = blob_case;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let external_dir = tempfile::tempdir()?;
+        let external_path = external_dir.path().join("blob.bin");
+        fs::write(&external_path, &payload)?;
+        let external_baseline_files = file_paths_in(external_dir.path());
+        let external_baseline_payload = fs::read(&external_path)?;
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(
+                    1,
+                    external_dir.path().to_string_lossy().to_string(),
+                    Some("external".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mut blob_builder = crate::BlobArrayBuilder::new(2);
+        if blob_kind == "external" {
+            blob_builder.push_uri(external_path.to_string_lossy())?;
+        } else {
+            blob_builder.push_bytes(payload)?;
+        }
+        blob_builder.push_bytes(b"extra")?;
+        let blob_array = blob_builder.finish()?;
+        let blob_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let blob_batch = RecordBatch::try_new(blob_schema.clone(), vec![blob_array])?;
+        let reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
+
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Stream produced more values than expected for dataset")
+        );
+
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean up new data files and blob v2 sidecars on failure"
+        );
+        assert_eq!(
+            file_paths_in(external_dir.path()),
+            external_baseline_files,
+            "cleanup must not delete external files"
+        );
+        assert_eq!(
+            fs::read(&external_path)?,
+            external_baseline_payload,
+            "cleanup must not modify external files"
+        );
+        dataset.validate().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_checkpointed_fragment_files() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let original_fragments = dataset.get_fragments();
+        assert_eq!(original_fragments.len(), 2);
+
+        let data_dir = StdPath::new(test_uri).join("data");
+        let cached_file = data_dir.join("checkpointed.lance");
+        let cached_blob_dir = data_dir.join("checkpointed");
+        fs::write(&cached_file, b"checkpointed data")?;
+        fs::create_dir_all(&cached_blob_dir)?;
+        fs::write(
+            cached_blob_dir.join("00000000000000000000000000000001.blob"),
+            b"blob",
+        )?;
+
+        let mut checkpointed_fragment = original_fragments[0].metadata().clone();
+        checkpointed_fragment.files.push(DataFile::new(
+            "checkpointed.lance",
+            vec![dataset.manifest.max_field_id() + 1],
+            vec![0],
+            ConcreteFileVersion::V2_2,
+            NonZero::new(17),
+            None,
+        ));
+
+        #[derive(Default)]
+        struct CheckpointedFragmentStore {
+            fragment: Mutex<Option<Fragment>>,
+        }
+
+        impl UDFCheckpointStore for CheckpointedFragmentStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
+                if fragment_id == 0 {
+                    Ok(self.fragment.lock().unwrap().clone())
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_fragment(&self, _fragment: Fragment) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(|_| Err(Error::invalid_input("injected UDF failure"))),
+            output_schema: Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "checkpointed",
+                DataType::Int32,
+                true,
+            )])),
+            result_checkpoint: Some(Arc::new(CheckpointedFragmentStore {
+                fragment: Mutex::new(Some(checkpointed_fragment)),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected UDF failure"));
+
+        assert!(
+            cached_file.exists(),
+            "cleanup must not delete fragment files restored from a checkpoint"
+        );
+        assert!(
+            cached_blob_dir.exists(),
+            "cleanup must not delete blob sidecars restored from a checkpoint"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_current_blob_v2_writer_on_udf_error() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let call_count = Arc::new(Mutex::new(0usize));
+        let mapper_call_count = call_count.clone();
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut call_count = mapper_call_count.lock().unwrap();
+            *call_count += 1;
+            if *call_count == 2 {
+                return Err(Error::invalid_input("injected UDF failure"));
+            }
+
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: None,
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected UDF failure"));
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean files written by the current unfinished writer"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_checkpointed_blob_v2_fragment_on_checkpoint_lookup_error()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        struct FailingLookupStore {
+            inserted: Arc<Mutex<Option<Fragment>>>,
+        }
+
+        impl UDFCheckpointStore for FailingLookupStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
+                if fragment_id == 1 {
+                    Err(Error::invalid_input("injected checkpoint lookup failure"))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                *self.inserted.lock().unwrap() = Some(fragment);
+                Ok(())
+            }
+        }
+
+        let inserted = Arc::new(Mutex::new(None));
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(FailingLookupStore {
+                inserted: inserted.clone(),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected checkpoint lookup failure")
+        );
+        let inserted = inserted.lock().unwrap().clone().unwrap();
+        let new_file = inserted
+            .files
+            .iter()
+            .find(|file| {
+                file.fields
+                    .iter()
+                    .any(|field| *field > dataset.manifest.max_field_id())
+            })
+            .expect("checkpoint should record the newly written data file");
+        let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
+        let new_blob_dir = StdPath::new(test_uri)
+            .join("data")
+            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        assert!(
+            new_file_path.exists(),
+            "cleanup must not delete data files after checkpoint takes ownership"
+        );
+        assert!(
+            new_blob_dir.exists(),
+            "cleanup must not delete blob sidecars after checkpoint takes ownership"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_finished_blob_v2_writer_on_checkpoint_insert_error()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        struct FailingInsertStore;
+
+        impl UDFCheckpointStore for FailingInsertStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, _fragment_id: u32) -> Result<Option<Fragment>> {
+                Ok(None)
+            }
+
+            fn insert_fragment(&self, _fragment: Fragment) -> Result<()> {
+                Err(Error::invalid_input("injected checkpoint insert failure"))
+            }
+        }
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(FailingInsertStore)),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected checkpoint insert failure")
+        );
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean finished writer files when checkpoint insert fails"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_blob_v2_files_on_declared_schema_merge_error() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema: Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("declared", DataType::Int32, true),
+                ArrowField::new("declared", DataType::Int32, true),
+            ])),
+            result_checkpoint: None,
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Schema { .. }));
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean files written before declared schema merge fails"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_checkpointed_blob_v2_fragment_after_later_failure()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        struct InsertThenFailStore {
+            inserted: Arc<Mutex<Option<Fragment>>>,
+        }
+
+        impl UDFCheckpointStore for InsertThenFailStore {
+            fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                if info.fragment_id == 1 {
+                    Err(Error::invalid_input("injected later checkpoint failure"))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, _fragment_id: u32) -> Result<Option<Fragment>> {
+                Ok(None)
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                *self.inserted.lock().unwrap() = Some(fragment);
+                Ok(())
+            }
+        }
+
+        let inserted = Arc::new(Mutex::new(None));
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(InsertThenFailStore {
+                inserted: inserted.clone(),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected later checkpoint failure")
+        );
+
+        let inserted = inserted.lock().unwrap().clone().unwrap();
+        let new_file = inserted
+            .files
+            .iter()
+            .find(|file| {
+                file.fields
+                    .iter()
+                    .any(|field| *field > dataset.manifest.max_field_id())
+            })
+            .expect("checkpoint should record the newly written data file");
+        let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
+        let new_blob_dir = StdPath::new(test_uri)
+            .join("data")
+            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        assert!(
+            new_file_path.exists(),
+            "cleanup must not delete data files after checkpoint takes ownership"
+        );
+        assert!(
+            new_blob_dir.exists(),
+            "cleanup must not delete blob sidecars after checkpoint takes ownership"
+        );
 
         Ok(())
     }
@@ -1040,6 +2154,7 @@ mod test {
                     Ok(Some(Fragment {
                         files: vec![],
                         id: 0,
+                        overlays: vec![],
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),
@@ -1204,8 +2319,8 @@ mod test {
                 .await
                 .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("All-null columns must be nullable.")
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error: {err}"
         );
 
         let data = dataset.scan().try_into_batch().await?;
@@ -1215,6 +2330,107 @@ mod test {
         ]);
         assert_eq!(data.schema().as_ref(), &expected_schema);
         assert_eq!(data.num_rows(), num_rows as usize);
+
+        Ok(())
+    }
+
+    /// `AllNulls` accepts any nullable top-level column whatever its inner-field
+    /// nullability (Map/List/Struct with non-null children); non-nullable ones are rejected.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_nested() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let map_with_non_null_entries = DataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", DataType::Utf8, false),
+                    ArrowField::new("value", DataType::Float64, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let list_with_non_null_items =
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false)));
+        let struct_with_non_null_child =
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("cutoffs", map_with_non_null_entries.clone(), true),
+                    ArrowField::new("tags", list_with_non_null_items.clone(), true),
+                    ArrowField::new("info", struct_with_non_null_child.clone(), true),
+                ]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), num_rows as usize);
+        for (name, expected_type) in [
+            ("cutoffs", &map_with_non_null_entries),
+            ("tags", &list_with_non_null_items),
+            ("info", &struct_with_non_null_child),
+        ] {
+            let column = data.column_by_name(name).unwrap();
+            assert_eq!(
+                column.data_type(),
+                expected_type,
+                "type mismatch for {name}"
+            );
+            assert_eq!(
+                column.null_count(),
+                num_rows as usize,
+                "column {name} should be all-null"
+            );
+        }
+
+        // A non-nullable top-level field is still rejected, and the error names it.
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_null_cutoffs", map_with_non_null_entries, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error: {err}"
+        );
 
         Ok(())
     }
@@ -1440,7 +2656,7 @@ mod test {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
-        let excluded = exclude(&schema, &projection, &LanceFileVersion::V2_2).unwrap();
+        let excluded = exclude(&schema, &projection, &ConcreteFileVersion::V2_2).unwrap();
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -1787,7 +3003,7 @@ mod test {
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 
@@ -1883,7 +3099,10 @@ mod test {
             assert_eq!(f.files.len(), 2);
         });
 
-        // Cast scalar column with index, should not keep index (TODO: keep it)
+        // Cast scalar column with index. The index must be dropped first; cast
+        // is now a fail-fast operation when an index is attached, see
+        // test_alter_columns_cast_fails_with_attached_index for that path.
+        dataset.drop_index("i_idx").await?;
         dataset
             .alter_columns(&[ColumnAlteration::new("i".into()).cast_to(DataType::Int64)])
             .await?;
@@ -1904,7 +3123,8 @@ mod test {
         ]);
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
-        // We currently lose the index when casting a column
+        // The scalar index on `i` is gone (we dropped it); the vector index on
+        // `vec` is still present.
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 1);
 
@@ -1913,7 +3133,8 @@ mod test {
             assert_eq!(f.files.len(), 3);
         });
 
-        // Cast vector column, should not keep index (TODO: keep it)
+        // Cast vector column. Drop its index first (same reason as above).
+        dataset.drop_index("vec_idx").await?;
         dataset
             .alter_columns(&[
                 ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
@@ -1962,7 +3183,7 @@ mod test {
                 Arc::new(Float16Array::from_iter_values(
                     (0..nrows).map(|i| f16::from_f32(i as f32)),
                 )),
-                lance_arrow::cast::cast_with_options(
+                cast_with_options(
                     batch["vec"].as_ref(),
                     &DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float16, true)),
@@ -1977,6 +3198,294 @@ mod test {
         )?;
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
+
+        Ok(())
+    }
+
+    /// Cast on a column with an attached index must fail fast rather than
+    /// silently dropping the index. This guards against the historical behavior
+    /// where cast would rewrite column data and the index would vanish without
+    /// any error or warning, causing vector search to silently regress to a
+    /// brute-force scan.
+    #[rstest]
+    #[tokio::test]
+    async fn test_alter_columns_cast_fails_with_attached_index(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        use crate::index::vector::VectorIndexParams;
+
+        // Build a small dataset with one indexed vector column.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                64,
+            ),
+            false,
+        )]));
+        let nrows = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                    generate_random_array(64 * nrows as usize),
+                    64,
+                )
+                .unwrap(),
+            )],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // Any attached vector index blocks the cast; IVF_FLAT exercises that
+        // ownership contract without unrelated quantizer training.
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+
+        let indices_before = dataset.load_indices().await?;
+        assert_eq!(indices_before.len(), 1, "precondition: index exists");
+        let index_name = indices_before[0].name.clone();
+
+        // Attempting to cast the indexed column must fail with a clear message
+        // that names the offending index(es).
+        let result = dataset
+            .alter_columns(&[
+                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                    64,
+                )),
+            ])
+            .await;
+        let err = result.expect_err("cast on indexed column should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vec") && msg.contains(&index_name),
+            "error should mention column and index name, got: {msg}"
+        );
+        assert!(
+            msg.contains("drop_index"),
+            "error should suggest the remediation, got: {msg}"
+        );
+
+        // The dataset must be unchanged: schema is still float32, index still present.
+        assert_eq!(
+            dataset.schema().field("vec").unwrap().data_type(),
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                64,
+            ),
+        );
+        let indices_after = dataset.load_indices().await?;
+        assert_eq!(indices_after.len(), 1, "index should still exist");
+        assert_eq!(indices_after[0].name, index_name);
+
+        // Sanity check: after dropping the index, the same cast should succeed.
+        dataset.drop_index(&index_name).await?;
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                    64,
+                )),
+            ])
+            .await?;
+        assert_eq!(
+            dataset.schema().field("vec").unwrap().data_type(),
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                64,
+            ),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_upcast_downcast_dictionary() {
+        use DataType::*;
+
+        let dict_i32_utf8 = Dictionary(Box::new(Int32), Box::new(Utf8));
+        let dict_i16_utf8 = Dictionary(Box::new(Int16), Box::new(Utf8));
+        let dict_i32_large_utf8 = Dictionary(Box::new(Int32), Box::new(LargeUtf8));
+        let dict_i32_int64 = Dictionary(Box::new(Int32), Box::new(Int64));
+        let stable = LanceFileVersion::Stable.resolve();
+        let legacy = LanceFileVersion::Legacy.resolve();
+
+        // Dict(_, Utf8) -> Utf8 / LargeUtf8 (decode direction): both versions.
+        assert!(is_upcast_downcast(&dict_i32_utf8, &Utf8, stable));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &LargeUtf8, stable));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &Utf8, legacy));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &LargeUtf8, legacy));
+
+        // Utf8 / LargeUtf8 -> Dict(_, Utf8) (encode direction): stable only.
+        assert!(is_upcast_downcast(&Utf8, &dict_i32_utf8, stable));
+        assert!(is_upcast_downcast(&LargeUtf8, &dict_i32_utf8, stable));
+        assert!(!is_upcast_downcast(&Utf8, &dict_i32_utf8, legacy));
+        assert!(!is_upcast_downcast(&LargeUtf8, &dict_i32_utf8, legacy));
+
+        // Dict -> Dict with compatible value types, including different index
+        // types. Stable only; Legacy can't materialize a fresh dictionary.
+        assert!(is_upcast_downcast(&dict_i32_utf8, &dict_i16_utf8, stable));
+        assert!(is_upcast_downcast(
+            &dict_i32_utf8,
+            &dict_i32_large_utf8,
+            stable
+        ));
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &dict_i16_utf8, legacy));
+
+        // Dict(_, Int64) <-> integer types (peel applies to non-string families).
+        assert!(is_upcast_downcast(&dict_i32_int64, &Int32, stable));
+        assert!(is_upcast_downcast(&Int32, &dict_i32_int64, stable));
+        assert!(is_upcast_downcast(&dict_i32_int64, &Int32, legacy));
+        assert!(!is_upcast_downcast(&Int32, &dict_i32_int64, legacy));
+
+        // Cross-family casts must still be rejected after peeling.
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &Int32, stable));
+        assert!(!is_upcast_downcast(&Int32, &dict_i32_utf8, stable));
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &Boolean, stable));
+        assert!(!is_upcast_downcast(&Boolean, &dict_i32_utf8, stable));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_dictionary_to_string(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            dict_type.clone(),
+            false,
+        )]));
+
+        let values = ["alpha", "beta", "gamma", "alpha", "beta"];
+        let dict_array: DictionaryArray<Int32Type> = values.iter().copied().collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict_array)])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("d".into()).cast_to(DataType::Utf8)])
+            .await?;
+        dataset.validate().await?;
+        assert_eq!(
+            dataset.schema().field("d").unwrap().data_type(),
+            DataType::Utf8
+        );
+        let scanned = dataset.scan().try_into_batch().await?;
+        let decoded = scanned.column_by_name("d").unwrap();
+        let expected_decoded = StringArray::from(values.to_vec());
+        assert_eq!(
+            decoded.as_ref(),
+            &expected_decoded as &dyn arrow_array::Array
+        );
+
+        // Cross-family casts must still be rejected even through a dictionary.
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("d".into()).cast_to(DataType::Int32)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Cannot cast column"));
+
+        Ok(())
+    }
+
+    // Stable can materialize a fresh Dictionary column via alter; Legacy
+    // cannot, because its writer requires `field.dictionary` metadata to be
+    // pre-populated, so the cast is rejected upfront with a clean error.
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_string_to_dictionary(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let values = ["alpha", "beta", "gamma", "alpha", "beta"];
+        let string_array = StringArray::from(values.to_vec());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_array)])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let result = dataset
+            .alter_columns(&[ColumnAlteration::new("s".into()).cast_to(dict_type.clone())])
+            .await;
+
+        match data_storage_version {
+            LanceFileVersion::Legacy => {
+                let err = result.unwrap_err();
+                assert!(
+                    err.to_string().contains("Cannot cast column"),
+                    "expected upfront rejection on Legacy, got: {err}"
+                );
+            }
+            _ => {
+                result?;
+                dataset.validate().await?;
+                assert_eq!(
+                    dataset.schema().field("s").unwrap().data_type(),
+                    dict_type.clone()
+                );
+                let scanned = dataset.scan().try_into_batch().await?;
+                let encoded = scanned.column_by_name("s").unwrap();
+                let expected_encoded: DictionaryArray<Int32Type> = values.iter().copied().collect();
+                assert_eq!(
+                    encoded.as_ref(),
+                    &expected_encoded as &dyn arrow_array::Array
+                );
+            }
+        }
 
         Ok(())
     }
@@ -2313,7 +3822,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // different struct
         let field1 = ArrowField::new(
@@ -2326,7 +3835,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // same nested struct
         let inner_struct1 = ArrowField::new(
@@ -2341,22 +3850,22 @@ mod test {
         );
         let field1 = ArrowField::new("test", DataType::Struct(vec![inner_struct1].into()), false);
         let field2 = ArrowField::new("test", DataType::Struct(vec![inner_struct2].into()), false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // basic type with different name
         let field1 = ArrowField::new("test1", DataType::Int32, false);
         let field2 = ArrowField::new("test2", DataType::Int32, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // basic type with same name
         let field1 = ArrowField::new("test", DataType::Int32, false);
         let field2 = ArrowField::new("test", DataType::Int32, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // different basic type
         let field1 = ArrowField::new("test", DataType::Int32, false);
         let field2 = ArrowField::new("test", DataType::Float64, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // partial conflict
         let field1 = ArrowField::new(
@@ -2381,7 +3890,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // same list
         let field1 = ArrowField::new(
@@ -2394,7 +3903,7 @@ mod test {
             DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // list with struct
         let field1 = ArrowField::new(
@@ -2415,7 +3924,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // list with different struct
         let field1 = ArrowField::new(
@@ -2436,7 +3945,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // list of struct and basic
         let field1 = ArrowField::new(
@@ -2453,7 +3962,7 @@ mod test {
             DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // FixedSizeList with struct
         let field1 = ArrowField::new(
@@ -2480,7 +3989,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // FixedSizeList with different struct
         let field1 = ArrowField::new(
@@ -2507,7 +4016,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // LargeList with struct
         let field1 = ArrowField::new(
@@ -2528,7 +4037,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // LargeList with different struct
         let field1 = ArrowField::new(
@@ -2549,7 +4058,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // packed struct
         let mut packed_meta = HashMap::new();
@@ -2568,7 +4077,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         let new_packed_field = ArrowField::new(
             "new_packed",
@@ -2581,7 +4090,7 @@ mod test {
             DataType::Struct(vec![new_packed_field].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field3, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field3, &ConcreteFileVersion::V2_2).is_ok());
 
         let conflict_field = ArrowField::new(
             "packed",
@@ -2590,6 +4099,6 @@ mod test {
         )
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
-        assert!(check_field_conflict(&field1, &field4, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
     }
 }

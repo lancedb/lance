@@ -77,7 +77,11 @@ pub enum ErrorCode {
     /// Table schema validation failed
     TableSchemaValidationError = 20,
     /// Request was throttled due to rate limiting or too many concurrent operations
-    Throttled = 21,
+    Throttling = 21,
+    /// The specified table branch does not exist
+    TableBranchNotFound = 22,
+    /// A table branch with this name already exists
+    TableBranchAlreadyExists = 23,
 }
 
 impl ErrorCode {
@@ -112,7 +116,9 @@ impl ErrorCode {
             18 => Some(Self::Internal),
             19 => Some(Self::InvalidTableState),
             20 => Some(Self::TableSchemaValidationError),
-            21 => Some(Self::Throttled),
+            21 => Some(Self::Throttling),
+            22 => Some(Self::TableBranchNotFound),
+            23 => Some(Self::TableBranchAlreadyExists),
             _ => None,
         }
     }
@@ -142,7 +148,9 @@ impl std::fmt::Display for ErrorCode {
             Self::Internal => "Internal",
             Self::InvalidTableState => "InvalidTableState",
             Self::TableSchemaValidationError => "TableSchemaValidationError",
-            Self::Throttled => "Throttled",
+            Self::Throttling => "Throttling",
+            Self::TableBranchNotFound => "TableBranchNotFound",
+            Self::TableBranchAlreadyExists => "TableBranchAlreadyExists",
         };
         write!(f, "{}", name)
     }
@@ -258,11 +266,53 @@ pub enum NamespaceError {
     TableSchemaValidationError { message: String },
 
     /// Request was throttled due to rate limiting or too many concurrent operations.
-    #[snafu(display("Throttled: {message}"))]
-    Throttled { message: String },
+    #[snafu(display("Throttling: {message}"))]
+    Throttling { message: String },
+
+    /// The specified table branch does not exist.
+    #[snafu(display("Table branch not found: {message}"))]
+    TableBranchNotFound { message: String },
+
+    /// A table branch with this name already exists.
+    #[snafu(display("Table branch already exists: {message}"))]
+    TableBranchAlreadyExists { message: String },
 }
 
 impl NamespaceError {
+    /// Returns the inner message without the Display prefix.
+    ///
+    /// Useful when serializing across boundaries (e.g. REST) where
+    /// the receiver will reconstruct the variant from the error code
+    /// and re-apply its own Display formatting.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unsupported { message }
+            | Self::NamespaceNotFound { message }
+            | Self::NamespaceAlreadyExists { message }
+            | Self::NamespaceNotEmpty { message }
+            | Self::TableNotFound { message }
+            | Self::TableAlreadyExists { message }
+            | Self::TableIndexNotFound { message }
+            | Self::TableIndexAlreadyExists { message }
+            | Self::TableTagNotFound { message }
+            | Self::TableTagAlreadyExists { message }
+            | Self::TransactionNotFound { message }
+            | Self::TableVersionNotFound { message }
+            | Self::TableColumnNotFound { message }
+            | Self::InvalidInput { message }
+            | Self::ConcurrentModification { message }
+            | Self::PermissionDenied { message }
+            | Self::Unauthenticated { message }
+            | Self::ServiceUnavailable { message }
+            | Self::Internal { message }
+            | Self::InvalidTableState { message }
+            | Self::TableSchemaValidationError { message }
+            | Self::Throttling { message }
+            | Self::TableBranchNotFound { message }
+            | Self::TableBranchAlreadyExists { message } => message,
+        }
+    }
+
     /// Returns the error code for this error.
     ///
     /// Use this for programmatic error handling across language boundaries.
@@ -289,7 +339,9 @@ impl NamespaceError {
             Self::Internal { .. } => ErrorCode::Internal,
             Self::InvalidTableState { .. } => ErrorCode::InvalidTableState,
             Self::TableSchemaValidationError { .. } => ErrorCode::TableSchemaValidationError,
-            Self::Throttled { .. } => ErrorCode::Throttled,
+            Self::Throttling { .. } => ErrorCode::Throttling,
+            Self::TableBranchNotFound { .. } => ErrorCode::TableBranchNotFound,
+            Self::TableBranchAlreadyExists { .. } => ErrorCode::TableBranchAlreadyExists,
         }
     }
 
@@ -322,7 +374,9 @@ impl NamespaceError {
             Some(ErrorCode::TableSchemaValidationError) => {
                 Self::TableSchemaValidationError { message }
             }
-            Some(ErrorCode::Throttled) => Self::Throttled { message },
+            Some(ErrorCode::Throttling) => Self::Throttling { message },
+            Some(ErrorCode::TableBranchNotFound) => Self::TableBranchNotFound { message },
+            Some(ErrorCode::TableBranchAlreadyExists) => Self::TableBranchAlreadyExists { message },
             None => Self::Internal { message },
         }
     }
@@ -348,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        for code in 0..=21 {
+        for code in 0..=23 {
             let error_code = ErrorCode::from_u32(code).unwrap();
             assert_eq!(error_code.as_u32(), code);
         }

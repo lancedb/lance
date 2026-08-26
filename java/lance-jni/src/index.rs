@@ -12,22 +12,27 @@ use prost::Message;
 use prost_types::Any;
 use std::sync::Arc;
 
+/// Build a `java.util.List<Integer>`.
+///
+/// Not `JLance<Vec<i32>>`'s `IntoJava`: that produces a primitive `int[]`, while
+/// the Java constructors here take `List`.
+fn int_list<'a>(env: &mut JNIEnv<'a>, ids: impl IntoIterator<Item = i32>) -> Result<JObject<'a>> {
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for id in ids {
+        let id_obj = env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(id)])?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&id_obj)],
+        )?;
+    }
+    Ok(array_list)
+}
+
 impl IntoJava for &Arc<dyn IndexDescription> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let field_ids_list = {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for id in self.field_ids() {
-                let int_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*id as i32)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&int_obj)],
-                )?;
-            }
-            array_list
-        };
+        let field_ids_list = int_list(env, self.field_ids().iter().map(|id| *id as i32))?;
         let name = env.new_string(self.name())?;
         let type_url = env.new_string(self.type_url())?;
         let index_type = env.new_string(self.index_type())?;
@@ -35,10 +40,15 @@ impl IntoJava for &Arc<dyn IndexDescription> {
         let metadata_list = export_vec(env, self.metadata())?;
         let details_json = self.details()?;
         let details = env.new_string(details_json)?;
+        let total_size_bytes = if let Some(size) = self.total_size_bytes() {
+            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(size as i64)])?
+        } else {
+            JObject::null()
+        };
 
         let j_index_desc = env.new_object(
             "org/lance/index/IndexDescription",
-            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;)V",
             &[
                 JValue::Object(&name),
                 JValue::Object(&field_ids_list),
@@ -47,6 +57,7 @@ impl IntoJava for &Arc<dyn IndexDescription> {
                 JValue::Long(rows_indexed),
                 JValue::Object(&metadata_list),
                 JValue::Object(&details),
+                JValue::Object(&total_size_bytes),
             ],
         )?;
         Ok(j_index_desc)
@@ -57,37 +68,13 @@ impl IntoJava for &IndexMetadata {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let uuid = self.uuid.into_java(env)?;
 
-        let fields = {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for field in &self.fields {
-                let field_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*field)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&field_obj)],
-                )?;
-            }
-            array_list
-        };
+        let fields = int_list(env, self.fields.iter().copied())?;
+        let covering_fields = int_list(env, self.covering_fields.iter().copied())?;
         let name = env.new_string(&self.name)?;
 
-        let fragments = if let Some(bitmap) = &self.fragment_bitmap {
-            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-            for frag_id in bitmap.iter() {
-                let id_obj =
-                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(frag_id as i32)])?;
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&id_obj)],
-                )?;
-            }
-            array_list
-        } else {
-            JObject::null()
+        let fragments = match &self.fragment_bitmap {
+            Some(bitmap) => int_list(env, bitmap.iter().map(|id| id as i32))?,
+            None => JObject::null(),
         };
 
         // Convert index_details to byte array
@@ -125,16 +112,23 @@ impl IntoJava for &IndexMetadata {
             JObject::null()
         };
 
+        let size_bytes = if let Some(size) = self.total_size_bytes() {
+            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(size as i64)])?
+        } else {
+            JObject::null()
+        };
+
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Lorg/lance/index/IndexType;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
+                JValue::Object(&covering_fields),
                 JValue::Object(&name),
                 JValue::Long(self.dataset_version as i64),
                 JValue::Object(&fragments),
@@ -142,6 +136,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
+                JValue::Object(&size_bytes),
                 JValue::Object(&index_type),
             ],
         )?)
@@ -173,6 +168,8 @@ fn determine_index_type<'local>(
             Some("ZONEMAP")
         } else if lower.contains("bloomfilter") {
             Some("BLOOM_FILTER")
+        } else if lower.contains("rtree") {
+            Some("RTREE")
         } else if lower.contains("ivfhnsw") {
             if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")

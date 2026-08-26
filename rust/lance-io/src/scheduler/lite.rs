@@ -33,7 +33,10 @@ use std::{
 use bytes::Bytes;
 use lance_core::{Error, Result};
 
-use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN};
+use super::{
+    BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN, IoStats, SCHEDULER_STATE_EVENT_TARGET,
+    SchedulerStateEvent, emit_scheduler_state_event,
+};
 
 type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
 
@@ -67,6 +70,26 @@ enum TaskState {
     },
 }
 
+impl TaskState {
+    fn backpressure_reservation(&self) -> Option<BackpressureReservation> {
+        match self {
+            Self::Reserved {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Running {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Finished {
+                backpressure_reservation,
+                ..
+            } => Some(*backpressure_reservation),
+            Self::Initial { .. } | Self::Broken => None,
+        }
+    }
+}
+
 /// A custom error type that might have a backpressure reservation
 ///
 /// This is used instead of Lance's standard error type so we can ensure
@@ -85,25 +108,14 @@ impl BrokenTaskError {
     // This will capture any backpressure reservation the task has and put it into the
     // error so we make sure to release it when returning the error.
     fn new(task_state: TaskState, message: String) -> Self {
-        match task_state {
-            TaskState::Reserved {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Running {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Finished {
-                backpressure_reservation,
-                ..
-            } => Self {
-                message,
-                backpressure_reservation: Some(backpressure_reservation),
-            },
-            TaskState::Broken | TaskState::Initial { .. } => Self {
+        match task_state.backpressure_reservation() {
+            None => Self {
                 message,
                 backpressure_reservation: None,
+            },
+            Some(reservation) => Self {
+                message,
+                backpressure_reservation: Some(reservation),
             },
         }
     }
@@ -119,6 +131,8 @@ struct IoTask {
     priority: u128,
     /// The current state of the task
     state: TaskState,
+    /// When true, the task bypasses backpressure
+    bypass_backpressure: bool,
 }
 
 impl IoTask {
@@ -232,6 +246,10 @@ struct BackpressureReservation {
 trait BackpressureThrottle: Send {
     fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation>;
     fn release(&mut self, reservation: BackpressureReservation);
+    /// Unconditionally acquire a zero-cost reservation, tracking only the priority.
+    /// Used for bypass tasks that must never be blocked by backpressure.
+    fn force_acquire(&mut self, priority: u128) -> BackpressureReservation;
+    fn state(&self) -> BackpressureState;
 }
 
 // We want to allow requests that have a lower priority than any
@@ -257,6 +275,10 @@ impl PrioritiesInFlight {
         self.in_flight.first().copied().unwrap_or(u128::MAX)
     }
 
+    fn contains(&self, prio: u128) -> bool {
+        self.in_flight.binary_search(&prio).is_ok()
+    }
+
     fn push(&mut self, prio: u128) {
         let pos = match self.in_flight.binary_search(&prio) {
             Ok(pos) => pos,
@@ -270,13 +292,28 @@ impl PrioritiesInFlight {
             self.in_flight.remove(pos);
         }
     }
+
+    fn len(&self) -> usize {
+        self.in_flight.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackpressureState {
+    max_bytes: u64,
+    bytes_available: i64,
+    priorities_in_flight: u64,
+    no_backpressure: bool,
 }
 
 struct SimpleBackpressureThrottle {
+    max_bytes: u64,
     start: Instant,
     last_warn: AtomicU64,
     bytes_available: i64,
     priorities_in_flight: PrioritiesInFlight,
+    // When true, skip all byte-based backpressure checks (set when max_bytes == 0)
+    no_backpressure: bool,
 }
 
 impl SimpleBackpressureThrottle {
@@ -286,10 +323,12 @@ impl SimpleBackpressureThrottle {
             panic!("Max bytes must be less than {}", i64::MAX);
         }
         Self {
+            max_bytes,
             start: Instant::now(),
             last_warn: AtomicU64::new(0),
             bytes_available: max_bytes as i64,
             priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
+            no_backpressure: max_bytes == 0,
         }
     }
 
@@ -314,8 +353,13 @@ impl SimpleBackpressureThrottle {
 
 impl BackpressureThrottle for SimpleBackpressureThrottle {
     fn try_acquire(&mut self, num_bytes: u64, priority: u128) -> Option<BackpressureReservation> {
-        if self.bytes_available >= num_bytes as i64
+        if self.no_backpressure
+            || self.bytes_available >= num_bytes as i64
             || self.priorities_in_flight.min_in_flight() >= priority
+            // Chunks from an admitted logical request must keep moving.  A
+            // higher-priority request may be scheduled later and remain
+            // unconsumed while the caller awaits this request.
+            || self.priorities_in_flight.contains(priority)
         {
             self.bytes_available -= num_bytes as i64;
             self.priorities_in_flight.push(priority);
@@ -332,6 +376,23 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
     fn release(&mut self, reservation: BackpressureReservation) {
         self.bytes_available += reservation.num_bytes as i64;
         self.priorities_in_flight.remove(reservation.priority);
+    }
+
+    fn force_acquire(&mut self, priority: u128) -> BackpressureReservation {
+        self.priorities_in_flight.push(priority);
+        BackpressureReservation {
+            num_bytes: 0,
+            priority,
+        }
+    }
+
+    fn state(&self) -> BackpressureState {
+        BackpressureState {
+            max_bytes: self.max_bytes,
+            bytes_available: self.bytes_available,
+            priorities_in_flight: self.priorities_in_flight.len() as u64,
+            no_backpressure: self.no_backpressure,
+        }
     }
 }
 
@@ -402,6 +463,48 @@ impl IoQueueState {
             Ok(())
         }
     }
+
+    fn scheduler_state_event(&self) -> Option<SchedulerStateEvent> {
+        if !tracing::enabled!(target: SCHEDULER_STATE_EVENT_TARGET, tracing::Level::TRACE) {
+            return None;
+        }
+
+        let backpressure = self.backpressure_throttle.state();
+        let pending_bytes = self
+            .pending_tasks
+            .iter()
+            .filter_map(|entry| self.tasks.get(&entry.task_id))
+            .map(|task| task.num_bytes)
+            .sum::<u64>();
+        let active_iops = self
+            .tasks
+            .values()
+            .filter(|task| matches!(task.state, TaskState::Running { .. }))
+            .count() as u64;
+
+        Some(SchedulerStateEvent {
+            queue_kind: "lite",
+            io_capacity: 0,
+            iops_available: 0,
+            active_iops,
+            pending_iops: self.pending_tasks.len() as u64,
+            pending_bytes,
+            bytes_available: backpressure.bytes_available,
+            bytes_reserved: backpressure.max_bytes as i64 - backpressure.bytes_available,
+            io_buffer_size_bytes: backpressure.max_bytes,
+            priorities_in_flight: backpressure.priorities_in_flight,
+            no_backpressure: backpressure.no_backpressure,
+            head_task_bytes: None,
+            head_task_priority_high: None,
+            head_task_priority_low: None,
+            min_in_flight_priority_high: None,
+            min_in_flight_priority_low: None,
+            head_task_can_deliver: None,
+            head_task_priority_bypass: None,
+            head_task_blocked_by_iops: None,
+            head_task_blocked_by_bytes: None,
+        })
+    }
 }
 
 /// A queue of I/O tasks to be shared between the I/O scheduler and the I/O decoder.
@@ -424,24 +527,33 @@ impl IoQueueState {
 /// day as well)
 pub(super) struct IoQueue {
     state: Arc<Mutex<IoQueueState>>,
+    stats: IoStats,
 }
 
 impl IoQueue {
-    pub fn new(max_concurrency: u64, max_bytes: u64) -> Self {
+    pub fn new(max_concurrency: u64, max_bytes: u64, stats: IoStats) -> Self {
         Self {
             state: Arc::new(Mutex::new(IoQueueState::new(max_concurrency, max_bytes))),
+            stats,
         }
     }
 
     fn push(&self, mut task: IoTask, mut state: MutexGuard<IoQueueState>) -> Result<()> {
         let task_id = task.id;
-        if let Some(reservation) = state
-            .backpressure_throttle
-            .try_acquire(task.num_bytes, task.priority)
-        {
+        let maybe_reservation = if task.bypass_backpressure {
+            Some(state.backpressure_throttle.force_acquire(task.priority))
+        } else {
+            state
+                .backpressure_throttle
+                .try_acquire(task.num_bytes, task.priority)
+        };
+        if let Some(reservation) = maybe_reservation {
             state.handle_result(task.reserve(reservation))?;
             state.handle_result(task.start())?;
             state.tasks.insert(task_id, task);
+            let event = state.scheduler_state_event();
+            drop(state);
+            emit_scheduler_state_event(event, &self.stats);
             return Ok(());
         }
 
@@ -451,6 +563,9 @@ impl IoQueue {
             reserved: task.is_reserved(),
         });
         state.tasks.insert(task_id, task);
+        let event = state.scheduler_state_event();
+        drop(state);
+        emit_scheduler_state_event(event, &self.stats);
         Ok(())
     }
 
@@ -459,6 +574,7 @@ impl IoQueue {
         range: Range<u64>,
         priority: u128,
         run_fn: RunFn,
+        bypass_backpressure: bool,
     ) -> Result<TaskHandle> {
         log::trace!(
             "Submitting I/O task with range {:?}, priority {:?}",
@@ -473,6 +589,7 @@ impl IoQueue {
             id: task_id,
             num_bytes: range.end - range.start,
             priority,
+            bypass_backpressure,
             state: TaskState::Initial {
                 idle_waker: None,
                 run_fn,
@@ -487,34 +604,42 @@ impl IoQueue {
 
     // When a task completes we should check to see if any other tasks are now runnable
     fn on_task_complete(&self, mut state: MutexGuard<IoQueueState>) -> Result<()> {
-        let state_ref = &mut *state;
-        let mut task_result = TaskResult::Ok(());
-        while !state_ref.pending_tasks.is_empty() {
-            // Unwrap safe here since we just checked the queue is not empty
-            let next_task = state_ref.pending_tasks.peek().unwrap();
-            let Some(task) = state_ref.tasks.get_mut(&next_task.task_id) else {
-                log::warn!("Task with id {} was lost", next_task.task_id);
-                continue;
-            };
-            if !task.is_reserved() {
-                let Some(reservation) = state_ref
-                    .backpressure_throttle
-                    .try_acquire(task.num_bytes, task.priority)
-                else {
-                    break;
+        let result = {
+            let state_ref = &mut *state;
+            let mut task_result = TaskResult::Ok(());
+            while !state_ref.pending_tasks.is_empty() {
+                // Unwrap safe here since we just checked the queue is not empty
+                let task_id = state_ref.pending_tasks.peek().unwrap().task_id;
+                let Some(task) = state_ref.tasks.get_mut(&task_id) else {
+                    // The caller dropped this task's handle (see `abandon`); discard the
+                    // stale queue entry instead of spinning on it.
+                    state_ref.pending_tasks.pop();
+                    continue;
                 };
-                if let Err(e) = task.reserve(reservation) {
+                if !task.is_reserved() {
+                    let Some(reservation) = state_ref
+                        .backpressure_throttle
+                        .try_acquire(task.num_bytes, task.priority)
+                    else {
+                        break;
+                    };
+                    if let Err(e) = task.reserve(reservation) {
+                        task_result = Err(e);
+                        break;
+                    }
+                }
+                state_ref.pending_tasks.pop();
+                if let Err(e) = task.start() {
                     task_result = Err(e);
                     break;
                 }
             }
-            state_ref.pending_tasks.pop();
-            if let Err(e) = task.start() {
-                task_result = Err(e);
-                break;
-            }
-        }
-        state_ref.handle_result(task_result)
+            state_ref.handle_result(task_result)
+        };
+        let event = state.scheduler_state_event();
+        drop(state);
+        emit_scheduler_state_event(event, &self.stats);
+        result
     }
 
     fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Bytes>> {
@@ -542,10 +667,34 @@ impl IoQueue {
     }
 
     pub(super) fn close(&self) {
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            for task in std::mem::take(&mut state.tasks).values_mut() {
+                task.cancel();
+            }
+            state.scheduler_state_event()
+        };
+        emit_scheduler_state_event(event, &self.stats);
+    }
+
+    // Called when a caller drops a task's handle before the task finishes.  Removes
+    // the task and returns any backpressure reservation it holds to the budget, then
+    // re-checks the queue so newly-affordable tasks can start.  Unlike the standard
+    // release path (`poll`), this runs without the task being polled to completion,
+    // so a cancelled read does not leak its reservation.
+    fn abandon(&self, task_id: u64) {
         let mut state = self.state.lock().unwrap();
-        for task in std::mem::take(&mut state.tasks).values_mut() {
-            task.cancel();
+        let Some(task) = state.tasks.remove(&task_id) else {
+            // Already consumed by `poll`; nothing to release.
+            return;
+        };
+
+        if let Some(reservation) = task.state.backpressure_reservation() {
+            state.backpressure_throttle.release(reservation);
         }
+        // Freed budget may make queued tasks runnable; there is no caller to surface
+        // an error to here.
+        let _ = self.on_task_complete(state);
     }
 }
 
@@ -561,6 +710,12 @@ impl Future for TaskHandle {
     }
 }
 
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        self.queue.abandon(self.task_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn test_priority_ordering() {
         // Backpressure budget of 10 bytes: only one 10-byte task runs at a time.
-        let queue = Arc::new(IoQueue::new(128, 10));
+        let queue = Arc::new(IoQueue::new(128, 10, IoStats::default()));
 
         // Records the priority of each task when its run_fn is invoked (i.e. when
         // the task transitions to Running).
@@ -590,7 +745,12 @@ mod tests {
         let (blocker_tx, blocker_rx) = oneshot::channel();
         let blocker = queue
             .clone()
-            .submit(0..10, 0, make_run_fn(0, blocker_rx, start_order.clone()))
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Submit four tasks with out-of-order priorities.
@@ -598,25 +758,45 @@ mod tests {
         let (tx_30, rx_30) = oneshot::channel();
         let h30 = queue
             .clone()
-            .submit(0..10, 30, make_run_fn(30, rx_30, start_order.clone()))
+            .submit(
+                0..10,
+                30,
+                make_run_fn(30, rx_30, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_10, rx_10) = oneshot::channel();
         let h10 = queue
             .clone()
-            .submit(0..10, 10, make_run_fn(10, rx_10, start_order.clone()))
+            .submit(
+                0..10,
+                10,
+                make_run_fn(10, rx_10, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_50, rx_50) = oneshot::channel();
         let h50 = queue
             .clone()
-            .submit(0..10, 50, make_run_fn(50, rx_50, start_order.clone()))
+            .submit(
+                0..10,
+                50,
+                make_run_fn(50, rx_50, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         let (tx_20, rx_20) = oneshot::channel();
         let h20 = queue
             .clone()
-            .submit(0..10, 20, make_run_fn(20, rx_20, start_order.clone()))
+            .submit(
+                0..10,
+                20,
+                make_run_fn(20, rx_20, start_order.clone()),
+                false,
+            )
             .unwrap();
 
         // Only the blocker has started so far.
@@ -646,5 +826,130 @@ mod tests {
         tx_50.send(Bytes::from_static(b"x")).unwrap();
         h50.await.unwrap();
         assert_eq!(*start_order.lock().unwrap(), vec![0, 10, 20, 30, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_zero_buffer_bypasses_backpressure() {
+        // Budget = 0 sets no_backpressure = true, so all tasks start immediately
+        // regardless of how many bytes are "outstanding".
+        let queue = Arc::new(IoQueue::new(128, 0, IoStats::default()));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        let (tx0, rx0) = oneshot::channel();
+        let h0 = queue
+            .clone()
+            .submit(0..10, 0, make_run_fn(0, rx0, start_order.clone()), false)
+            .unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let h1 = queue
+            .clone()
+            .submit(0..10, 1, make_run_fn(1, rx1, start_order.clone()), false)
+            .unwrap();
+        let (tx2, rx2) = oneshot::channel();
+        let h2 = queue
+            .clone()
+            .submit(0..10, 2, make_run_fn(2, rx2, start_order.clone()), false)
+            .unwrap();
+
+        // All three tasks start immediately — no backpressure budget check when max_bytes=0.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 1, 2]);
+
+        tx0.send(Bytes::from_static(b"done")).unwrap();
+        tx1.send(Bytes::from_static(b"done")).unwrap();
+        tx2.send(Bytes::from_static(b"done")).unwrap();
+        h0.await.unwrap();
+        h1.await.unwrap();
+        h2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bypass_flag_proceeds_past_exhausted_budget() {
+        // Budget of 10 bytes. A blocker task fills it. A task with bypass=true starts
+        // immediately despite the exhausted budget; a normal task stays queued.
+        let queue = Arc::new(IoQueue::new(128, 10, IoStats::default()));
+        let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_run_fn =
+            |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
+                Box::new(move || {
+                    order.lock().unwrap().push(prio);
+                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                })
+            };
+
+        // Blocker (priority 0, 10 bytes): fills the budget.
+        let (blocker_tx, blocker_rx) = oneshot::channel();
+        let blocker = queue
+            .clone()
+            .submit(
+                0..10,
+                0,
+                make_run_fn(0, blocker_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Normal (priority 1, 10 bytes): blocked — budget exhausted, no priority bypass.
+        let (normal_tx, normal_rx) = oneshot::channel();
+        let normal = queue
+            .clone()
+            .submit(
+                0..10,
+                1,
+                make_run_fn(1, normal_rx, start_order.clone()),
+                false,
+            )
+            .unwrap();
+
+        // Bypass (priority 2, 10 bytes): starts immediately via force_acquire.
+        let (bypass_tx, bypass_rx) = oneshot::channel();
+        let bypass = queue
+            .clone()
+            .submit(
+                0..10,
+                2,
+                make_run_fn(2, bypass_rx, start_order.clone()),
+                true,
+            )
+            .unwrap();
+
+        // Blocker (0) and bypass (2) have started; normal (1) is still queued.
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2]);
+
+        // Completing the blocker frees the budget and unblocks the normal task.
+        blocker_tx.send(Bytes::from_static(b"done")).unwrap();
+        blocker.await.unwrap();
+        assert_eq!(*start_order.lock().unwrap(), vec![0, 2, 1]);
+
+        bypass_tx.send(Bytes::from_static(b"done")).unwrap();
+        bypass.await.unwrap();
+        normal_tx.send(Bytes::from_static(b"done")).unwrap();
+        normal.await.unwrap();
+    }
+
+    #[test]
+    fn test_same_priority_reservation_continues_after_higher_priority() {
+        let mut throttle = SimpleBackpressureThrottle::new(10, 128);
+
+        let low_priority_first = throttle.try_acquire(6, 10).unwrap();
+        let high_priority = throttle.try_acquire(4, 0).unwrap();
+        let low_priority_next = throttle.try_acquire(6, 10);
+
+        assert!(
+            low_priority_next.is_some(),
+            "chunks from an already admitted logical request should continue"
+        );
+
+        throttle.release(low_priority_first);
+        throttle.release(high_priority);
+        throttle.release(low_priority_next.unwrap());
     }
 }

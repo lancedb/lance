@@ -5,7 +5,7 @@
 | PyYAML                         | 6.0.3       | MIT License                                       | https://pyyaml.org/                                                  |
 | Pygments                       | 2.19.2      | BSD License                                       | https://pygments.org                                                 |
 | aiohappyeyeballs               | 2.6.1       | Python Software Foundation License                | https://github.com/aio-libs/aiohappyeyeballs                         |
-| aiohttp                        | 3.12.15     | Apache-2.0 AND MIT                                | https://github.com/aio-libs/aiohttp                                  |
+| aiohttp                        | 3.13.4      | Apache-2.0 AND MIT                                | https://github.com/aio-libs/aiohttp                                  |
 | aiosignal                      | 1.4.0       | Apache Software License                           | https://github.com/aio-libs/aiosignal                                |
 | annotated-types                | 0.7.0       | MIT License                                       | https://github.com/annotated-types/annotated-types                   |
 | arro3-core                     | 0.6.5       | UNKNOWN                                           | https://kylebarron.dev/arro3                                         |
@@ -14,7 +14,7 @@
 | botocore                       | 1.40.43     | Apache Software License                           | https://github.com/boto/botocore                                     |
 | certifi                        | 2025.8.3    | Mozilla Public License 2.0 (MPL 2.0)              | https://github.com/certifi/python-certifi                            |
 | charset-normalizer             | 3.4.3       | MIT                                               | https://github.com/jawah/charset_normalizer/blob/master/CHANGELOG.md |
-| datafusion                     | 50.1.0      | Apache Software License                           | https://datafusion.apache.org/python                                 |
+| datafusion                     | 53.0.0      | Apache Software License                           | https://datafusion.apache.org/python                                 |
 | datasets                       | 4.1.1       | Apache Software License                           | https://github.com/huggingface/datasets                              |
 | dill                           | 0.4.0       | BSD License                                       | https://github.com/uqfoundation/dill                                 |
 | duckdb                         | 1.4.0       | MIT License                                       | https://github.com/duckdb/duckdb-python                              |
@@ -28,8 +28,9 @@
 | idna                           | 3.10        | BSD License                                       | https://github.com/kjd/idna                                          |
 | iniconfig                      | 2.1.0       | MIT                                               | https://github.com/pytest-dev/iniconfig                              |
 | jmespath                       | 1.0.1       | MIT License                                       | https://github.com/jmespath/jmespath.py                              |
-| lance-namespace                | 0.4.5       | Apache-2.0                                        | https://github.com/lance-format/lance-namespace                      |
-| lance-namespace-urllib3-client | 0.4.5       | Apache-2.0                                        | https://github.com/lance-format/lance-namespace                      |
+| lance-namespace                | 0.7.6       | Apache-2.0                                        | https://github.com/lance-format/lance-namespace                      |
+| lance-namespace-urllib3-client | 0.7.6       | Apache-2.0                                        | https://github.com/lance-format/lance-namespace                      |
+| maturin                        | 1.13.3      | MIT OR Apache-2.0                                 | https://github.com/pyo3/maturin                                      |
 | ml_dtypes                      | 0.5.3       | Apache-2.0                                        | https://github.com/jax-ml/ml_dtypes                                  |
 | mpmath                         | 1.3.0       | BSD License                                       | http://mpmath.org/                                                   |
 | multidict                      | 6.6.4       | Apache License 2.0                                | https://github.com/aio-libs/multidict                                |
@@ -46,18 +47,18 @@
 | propcache                      | 0.3.2       | Apache Software License                           | https://github.com/aio-libs/propcache                                |
 | psutil                         | 7.1.0       | BSD-3-Clause                                      | https://github.com/giampaolo/psutil                                  |
 | py-cpuinfo                     | 9.0.0       | MIT License                                       | https://github.com/workhorsy/py-cpuinfo                              |
-| pyarrow                        | 21.0.0      | Apache Software License                           | https://arrow.apache.org/                                            |
+| pyarrow                        | 23.0.1      | Apache-2.0                                        | https://arrow.apache.org/                                            |
 | pydantic                       | 2.12.4      | MIT                                               | https://github.com/pydantic/pydantic                                 |
 | pydantic_core                  | 2.41.5      | MIT                                               | https://github.com/pydantic/pydantic-core                            |
-| pylance                        | 3.0.0b2     | Apache Software License                           | UNKNOWN                                                              |
-| pyproj                         | 3.7.2       | MIT                                               | https://github.com/pyproj4/pyproj                                    |
+| pylance                        | 7.0.0b14    | Apache Software License                           | UNKNOWN                                                              |
+| pyproj                         | 3.7.2       | MIT                                               | https://pyproj4.github.io/pyproj/                                    |
 | pyright                        | 1.1.406     | MIT                                               | https://github.com/RobertCraigie/pyright-python                      |
 | pytest                         | 8.4.2       | MIT License                                       | https://docs.pytest.org/en/latest/                                   |
 | pytest-benchmark               | 5.1.0       | BSD License                                       | https://github.com/ionelmc/pytest-benchmark                          |
 | python-dateutil                | 2.9.0.post0 | Apache Software License; BSD License              | https://github.com/dateutil/dateutil                                 |
 | pytz                           | 2025.2      | MIT License                                       | http://pythonhosted.org/pytz                                         |
-| requests                       | 2.32.5      | Apache Software License                           | https://requests.readthedocs.io                                      |
-| ruff                           | 0.4.1       | MIT License                                       | https://docs.astral.sh/ruff                                          |
+| requests                       | 2.33.0      | Apache Software License                           | https://github.com/psf/requests                                      |
+| ruff                           | 0.11.2      | MIT License                                       | https://docs.astral.sh/ruff                                          |
 | s3transfer                     | 0.14.0      | Apache Software License                           | https://github.com/boto/s3transfer                                   |
 | six                            | 1.17.0      | MIT License                                       | https://github.com/benjaminp/six                                     |
 | sympy                          | 1.14.0      | BSD License                                       | https://sympy.org                                                    |

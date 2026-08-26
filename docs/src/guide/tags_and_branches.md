@@ -36,10 +36,10 @@ print(ds.tags.list())
 # {}
 ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list())
-# {'v1-prod': {'version': 1, 'manifest_size': ...}}
+# {'v1-prod': {'version': 1, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...}}
 ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list())
-# {'v1-prod': {'version': 2, 'manifest_size': ...}}
+# {'v1-prod': {'version': 2, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...}}
 ds.tags.delete("v1-prod")
 print(ds.tags.list())
 # {}
@@ -47,10 +47,10 @@ print(ds.tags.list_ordered())
 # []
 ds.tags.create("v1-prod", (None, 1))
 print(ds.tags.list_ordered())
-# [('v1-prod', {'version': 1, 'manifest_size': ...})]
+# [('v1-prod', {'version': 1, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...})]
 ds.tags.update("v1-prod", (None, 2))
 print(ds.tags.list_ordered())
-# [('v1-prod', {'version': 2, 'manifest_size': ...})]
+# [('v1-prod', {'version': 2, 'created_at': ..., 'updated_at': ..., 'manifest_size': ...})]
 ds.tags.delete("v1-prod")
 print(ds.tags.list_ordered())
 # []
@@ -87,7 +87,7 @@ import pyarrow as pa
 # Open dataset
 ds = lance.dataset("/tmp/test.lance")
 
-# Create branch from latest version (default: current branch's latest)
+# Create branch from the currently checked-out version
 experiment_branch = ds.create_branch("experiment")
 experimental_data = pa.Table.from_pydict({"a": [11], "b": [12]})
 lance.write_dataset(experimental_data, experiment_branch, mode="append")

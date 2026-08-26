@@ -7,6 +7,7 @@ use std::vec;
 use crate::Dataset;
 use crate::dataset::tests::dataset_transactions::execute_sql;
 
+use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::cast::AsArray;
@@ -19,8 +20,8 @@ use geoarrow_array::{
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 
 #[tokio::test]
 async fn test_geo_types() {

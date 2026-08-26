@@ -109,10 +109,22 @@ message Manifest {
   // should not attempt to read the dataset.
   //
   // Known flags:
-  // * 1: deletion files are present
-  // * 2: row ids are stable and stored as part of the fragment metadata.
-  // * 4: use v2 format (deprecated)
-  // * 8: table config is present
+  // * 1 << 0: deletion files are present
+  // * 1 << 1: row ids are stable and stored as part of the fragment metadata.
+  // * 1 << 2: use v2 format (deprecated)
+  // * 1 << 3: table config is present
+  // * 1 << 4: dataset uses multiple base paths
+  // * 1 << 5: transaction file writes are disabled
+  // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
+  //   not understand overlays must refuse the dataset, since ignoring an overlay
+  //   would silently return stale base values.
+  // * 1 << 7: some index declares covering columns, so IndexMetadata.fields means
+  //   the keyed columns followed by the carried ones named in covering_fields (see
+  //   IndexMetadata). Readers that do not understand it must refuse the dataset,
+  //   since selecting an index by membership of fields would answer a query on a
+  //   merely-carried column with an index keyed on a different column. Writers must
+  //   refuse it too: one that treats every entry of fields as keyed would maintain
+  //   the index against the wrong dependency set.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -234,6 +246,9 @@ message IndexMetadata {
   UUID uuid = 1;
 
   // The columns to build the index. These refer to file.Field.id.
+  //
+  // fields[0] is always a column the index is keyed on. Trailing entries may
+  // instead be merely carried, not keyed on -- see `covering_fields` below.
   repeated int32 fields = 2;
 
   // Index name. Must be unique within one dataset version.
@@ -286,6 +301,29 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // The subset of `fields` whose values this index co-locates alongside its own
+  // data, so a query projecting only those columns can be answered from the
+  // index without a take against the base table.
+  //
+  // Must be a suffix of `fields`: the columns the index is keyed on come first,
+  // the columns it merely carries come last, and at least one keyed column
+  // always remains. Empty for an index that carries no extra columns, which is
+  // every index written before this field existed.
+  //
+  // Carried columns are listed in `fields` as well. That is deliberate: every
+  // consumer that reads `fields` as the index's dependency set -- staleness,
+  // commit conflict detection, schema evolution guards -- then covers them with
+  // no change and no way to forget one.
+  //
+  // This declaration is not authoritative for what the segment can actually
+  // serve. The segment's own storage schema is: a reader must confirm the
+  // storage carries a column before answering a query from it, and fall back to
+  // a take against the base table otherwise. A declaration naming columns the
+  // storage does not hold is a legal state, not corruption -- a maintenance
+  // operation that cannot carry the values through a rebuild is permitted to
+  // withdraw the payload while leaving this declaration in place.
+  repeated int32 covering_fields = 11;
 }
 
 // Metadata about a single file within an index segment.
@@ -310,6 +348,15 @@ message DataFragment {
   uint64 id = 1;
 
   repeated DataFile files = 2;
+
+  // Optional overlay files for this fragment, which supply new values for a
+  // subset of cells without rewriting the base data files. This MUST be empty
+  // if the data overlay files feature flag (64) is not set in the manifest.
+  //
+  // Order is significant: a later entry is newer than an earlier one. When two
+  // overlays cover the same (offset, field) and share a `committed_version`, the
+  // later entry wins. See DataOverlayFile for the full resolution rules.
+  repeated DataOverlayFile overlays = 11;
 
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
@@ -433,6 +480,66 @@ message DataFile {
   optional uint32 base_id = 7;
 } // DataFile
 
+// An overlay file supplies new values for a subset of (row offset, field) cells
+// within a fragment, without rewriting the fragment's base data files. It is
+// used for efficient updates when only a small fraction of rows and/or columns
+// change.
+//
+// On read, a cell is resolved by consulting the fragment's overlays from newest
+// to oldest: the first overlay that covers that (offset, field) wins; if none
+// cover it, the value falls through to the base data file. Because deletions
+// take precedence over overlays, an overlay value for an offset that is also
+// marked deleted is dead and is ignored.
+//
+// The overlay's data file does NOT store a row-offset key column. Within a value
+// column, the position of a covered offset's value is the rank (0-based count of
+// set bits below it) of that offset within the field's coverage bitmap. Because
+// fields may cover different offset sets, the value columns of a single overlay
+// data file may have different lengths (which the Lance file format permits).
+message DataOverlayFile {
+  // The data file storing the overlay's new cell values, one value column per
+  // field in `data_file.fields`. No row-offset key column is stored.
+  DataFile data_file = 1;
+
+  // Which (offset, field) cells this overlay provides values for.
+  oneof coverage {
+    // A single 32-bit Roaring bitmap of physical row offsets that applies to
+    // every field in `data_file.fields` (a "dense" / rectangular overlay).
+    // Every covered offset has a value for every field. This is the common case
+    // for a plain UPDATE, where one SET list is applied to one set of rows.
+    bytes shared_offset_bitmap = 2;
+    // Per-field coverage for a "sparse" overlay, used when different fields cover
+    // different offset sets (e.g. a MERGE with multiple WHEN MATCHED branches).
+    FieldCoverage field_coverage = 4;
+  }
+
+  // The dataset version at which this overlay became effective: the version of
+  // the commit that introduced it, NOT the version it was read from. It is
+  // stamped at commit time and re-stamped if the commit is retried, in the same
+  // way as the created-at / last-updated-at version sequences.
+  //
+  // This drives two orderings:
+  //  * Versus index builds: an index whose `dataset_version` >= this value
+  //    already incorporates this overlay. Otherwise the overlay's covered cells
+  //    are excluded from index results for the affected fields and re-evaluated
+  //    against their current values (see the Data Overlay Files specification).
+  //  * Versus other overlays: when two overlays cover the same (offset, field),
+  //    the one with the higher `committed_version` wins. Overlays that share a
+  //    `committed_version` are ordered by their position in
+  //    `DataFragment.overlays`, where a later entry is newer and wins.
+  uint64 committed_version = 3;
+}
+
+// Per-field coverage for a sparse overlay.
+message FieldCoverage {
+  // One entry per field in the overlay's `data_file.fields`, in the same order.
+  // Each is a 32-bit Roaring bitmap of the physical row offsets covered for that
+  // field. An offset present in a field's bitmap but mapped to a NULL value
+  // means the cell is overridden to NULL (distinct from an offset that is absent,
+  // which falls through to the base data file).
+  repeated bytes offset_bitmaps = 1;
+}
+
 // Deletion File
 //
 // The path of the deletion file is constructed as:
@@ -474,8 +581,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// Empty details messages for older indexes that don't take advantage of the details field.
-message VectorIndexDetails {}
+// VectorIndexDetails and HnswParameters (formerly HnswIndexDetails) moved to index.proto
 
 message FragmentReuseIndexDetails {
 
@@ -522,111 +628,143 @@ message FragmentReuseIndexDetails {
 // MemWAL Index Types
 // ============================================================================
 
-// Region manifest containing epoch-based fencing and WAL state.
-// Each region has exactly one active writer at any time.
-message RegionManifest {
-  // Region identifier (UUID v4).
-  UUID region_id = 11;
+// Lifecycle status of a WAL shard. Drives drop-table two-phase commit:
+// a SEALED shard refuses new writer claims (reversible) until the drop
+// commits (the shard dir is deleted) or rolls back (status -> ACTIVE).
+enum ShardStatus {
+  // Normal: the shard accepts writer claims.
+  ACTIVE = 0;
+  // A drop is in flight: claims are refused. Reversible to ACTIVE.
+  SEALED = 1;
+}
+
+// Shard manifest containing epoch-based fencing and WAL state.
+// Each shard has exactly one active writer at any time.
+message ShardManifest {
+  // Shard identifier (UUID v4).
+  UUID shard_id = 11;
 
   // Manifest version number.
   // Matches the version encoded in the filename.
   uint64 version = 1;
 
-  // Region spec ID this region was created with.
-  // Set at region creation and immutable thereafter.
-  // A value of 0 indicates a manually-created region not governed by any spec.
-  uint32 region_spec_id = 10;
+  // Shard spec ID this shard was created with.
+  // Set at shard creation and immutable thereafter.
+  // A value of 0 indicates a manually-created shard not governed by any spec.
+  uint32 shard_spec_id = 10;
+
+  // Computed shard field values as raw Arrow scalar bytes, keyed by shard
+  // field id. The byte encoding follows Arrow's little-endian convention:
+  // int32 is 4 LE bytes, utf8 is raw UTF-8 bytes, etc. The receiver looks
+  // up the result_type from the ShardingSpec to interpret each value.
+  repeated ShardFieldEntry shard_field_entries = 14;
 
   // Writer fencing token - monotonically increasing.
-  // A writer must increment this when claiming the region.
+  // A writer must increment this when claiming the shard.
   uint64 writer_epoch = 2;
 
-  // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
+  // The most recent WAL entry position that has been flushed to a MemTable.
   // During recovery, replay starts from replay_after_wal_entry_position + 1.
+  // WAL positions are 1-based, so the default value 0 unambiguously means
+  // "no flush has ever stamped this shard" and recovery replays from 1.
   uint64 replay_after_wal_entry_position = 3;
 
-  // The most recent WAL entry position (0-based) at the time manifest was updated.
-  // This is a hint, not authoritative - recovery must list files to find actual state.
+  // The most recent WAL entry position observed at the time the manifest was
+  // updated. WAL positions are 1-based; default 0 means no entry has been
+  // written yet. This is a hint, not authoritative - recovery must list
+  // files to find actual state.
   uint64 wal_entry_position_last_seen = 4;
 
-  // Next generation ID to create (incremented after each MemTable flush).
+  // Generation to assign to the next SSTable (incremented after each MemTable flush).
   uint64 current_generation = 6;
 
-  // Field 7 removed: merged_generation moved to MemWalIndexDetails.merged_generations
-  // which is the authoritative source for merge progress.
+  // Field 7 removed: compaction progress lives in
+  // MemWalIndexDetails.compacted_sstables.
 
-  // List of flushed MemTable generations and their directory paths.
-  repeated FlushedGeneration flushed_generations = 8;
+  // List of SSTables created by flushing MemTables and their directory paths.
+  repeated SsTable sstables = 8;
+
+  // Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop
+  // (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
+  ShardStatus status = 15;
 }
 
-// A flushed MemTable generation and its storage location.
-message FlushedGeneration {
-  // Generation number.
+// A shard field value stored as raw Arrow scalar bytes.
+message ShardFieldEntry {
+  // Shard field id (matches ShardingField.field_id in the ShardingSpec).
+  string field_id = 1;
+
+  // Raw Arrow scalar value bytes in little-endian encoding.
+  // The data type is determined by the result_type of the matching ShardingField.
+  bytes value = 2;
+}
+
+// An SSTable: the immutable result of flushing a MemTable, stored as a Lance dataset.
+message SsTable {
+  // Generation number identifying this SSTable.
   uint64 generation = 1;
 
-  // Directory name relative to the region directory.
+  // Directory name relative to the shard directory.
   string path = 2;
 }
 
-// A region's merged generation, used in MemWalIndexDetails.
-message MergedGeneration {
-  // Region identifier (UUID v4).
-  UUID region_id = 1;
+// A pointer to the latest SSTable compacted for a shard.
+message CompactedSsTable {
+  // Shard identifier (UUID v4).
+  UUID shard_id = 1;
 
-  // Last generation merged to base table for this region.
+  // Generation of the latest SSTable compacted into the base table for this shard.
   uint64 generation = 2;
 }
 
-// Tracks which merged generation a base table index has been rebuilt to cover.
-// Used to determine whether to read from flushed MemTable indexes or base table.
+// Tracks which compacted SSTable generation a base table index has been rebuilt to cover.
+// Used to determine whether to read from SSTable indexes or base table.
 message IndexCatchupProgress {
   // Name of the base table index (must match an entry in maintained_indexes).
   string index_name = 1;
 
-  // Per-region progress: the generation up to which this index covers.
-  // If a region is not present, the index is assumed to be fully caught up
-  // (i.e., caught_up_generation >= merged_generation for that region).
-  repeated MergedGeneration caught_up_generations = 2;
+  // Per-shard progress: the generation up to which this index covers.
+  //
+  // An absent shard means *unknown*: this index has recorded no catch-up for
+  // that shard, so its SSTables must be retained and a repair scheduled.
+  repeated CompactedSsTable caught_up_generations = 2;
 }
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
 // This is the centralized structure for all MemWAL metadata:
-// - Configuration (region specs, indexes to maintain)
-// - Merge progress (merged generations per region)
-// - Region state snapshots
+// - Configuration (sharding specs, indexes to maintain)
+// - SSTable compaction progress
+// - Shard state snapshots
 //
 // Writers read this index to get configuration before writing.
-// Readers read this index to discover regions and their state.
-// A background process updates the index periodically to keep region snapshots current.
+// Readers may use shard snapshots in this index as a point-in-time
+// optimization. Readers that need the latest shard set should list shard
+// directories in storage and read each shard's latest manifest.
+// A background process updates the index periodically to keep shard snapshots current.
 //
-// Region snapshots are stored as a Lance file with one row per region.
-// The schema has one column per RegionManifest field, with region fields as columns:
-//   region_id: fixed_size_binary(16)  -- UUID bytes
-//   version: uint64
-//   region_spec_id: uint32
-//   writer_epoch: uint64
-//   replay_after_wal_entry_position: uint64
-//   wal_entry_position_last_seen: uint64
-//   current_generation: uint64
-//   merged_generation: uint64
-//   flushed_generations: list<struct<generation: uint64, path: string>>
+// Shard snapshots are stored as a Lance file with one row per shard.
+// The schema records shard discovery fields. Full mutable shard state remains
+// authoritative in the shard manifest files.
+//   shard_id: utf8
+//   shard_spec_id: uint32
+//   shard_field_{field_id}: typed per the matching ShardingField.result_type
 message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;
 
-  // Number of regions in the snapshot.
+  // Number of shards in the snapshot.
   // Used to determine storage format without reading the snapshot data.
-  uint32 num_regions = 2;
+  uint32 num_shards = 2;
 
-  // Inline region snapshots for small region counts.
-  // When num_regions <= threshold (implementation-defined, e.g., 100),
+  // Inline shard snapshots for small shard counts.
+  // When num_shards <= threshold (implementation-defined, e.g., 100),
   // snapshots are stored inline as serialized bytes.
-  // Format: Lance file bytes with the region snapshot schema.
+  // Format: Lance file bytes with the shard snapshot schema.
   optional bytes inline_snapshots = 3;
 
-  // Region specs defining how to derive region identifiers.
-  // This configuration determines how rows are partitioned into regions.
-  repeated RegionSpec region_specs = 7;
+  // Sharding specs defining how to derive shard identifiers.
+  // This configuration determines how rows are partitioned into shards.
+  repeated ShardingSpec sharding_specs = 7;
 
   // Indexes from the base table to maintain in MemTables.
   // These are index names referencing indexes defined on the base table.
@@ -637,46 +775,59 @@ message MemWalIndexDetails {
   // SQ params) from the base table index to ensure distance comparability.
   repeated string maintained_indexes = 8;
 
-  // Last generation merged to base table for each region.
+  // Latest SSTable compacted into the base table for each shard.
   // This is updated atomically with merge-insert data commits, enabling
-  // conflict resolution when multiple mergers operate concurrently.
+  // conflict resolution when multiple compactors operate concurrently.
   //
-  // Note: This is separate from region snapshots because:
-  // 1. merged_generations is updated by mergers (atomic with data commit)
-  // 2. region snapshots are updated by background index builder
-  repeated MergedGeneration merged_generations = 9;
+  // Note: This is separate from shard snapshots because:
+  // 1. compacted_sstables is updated by compactors (atomic with data commit)
+  // 2. shard snapshots are updated by background index builder
+  repeated CompactedSsTable compacted_sstables = 9;
 
   // Per-index catchup progress tracking.
-  // When data is merged to the base table, base table indexes are rebuilt
+  // When data is compacted into the base table, base table indexes are rebuilt
   // asynchronously. This field tracks which generation each index covers.
   //
-  // For indexed queries, if an index's caught_up_generation < merged_generation,
-  // readers should use flushed MemTable indexes for the gap instead of
+  // For indexed queries, if an index's caught_up_generation < compacted_generation,
+  // readers should use SSTable indexes for the gap instead of
   // scanning unindexed data in the base table.
   //
-  // If an index is not present in this list, it is assumed to be fully caught up.
+  // An index absent from this list has recorded no catch-up, so the SSTables it
+  // would need stay live until a repair records it. Only the dedicated WAL
+  // index-repair path may add entries here;
+  // ordinary index operations have their entry removed automatically when they
+  // change an index, since they do not report what the new index covers.
   repeated IndexCatchupProgress index_catchup = 10;
+
+  // Default ShardWriter configuration values for this MemWAL index.
+  //
+  // A free-form string map persisted so that every writer — across
+  // processes and restarts — starts from the same default writer
+  // configuration. These are defaults only: an individual writer may
+  // still override any value at runtime in its own ShardWriterConfig
+  // (which is not persisted).
+  map<string, string> writer_config_defaults = 11;
 }
 
-// Region spec definition.
-message RegionSpec {
+// Sharding spec definition.
+message ShardingSpec {
   // Unique identifier for this spec within the index.
   // IDs are never reused.
   uint32 spec_id = 1;
 
-  // Region field definitions that determine how to compute region identifiers.
-  repeated RegionField fields = 2;
+  // Sharding field definitions that determine how to compute shard identifiers.
+  repeated ShardingField fields = 2;
 }
 
-// Region field definition.
-message RegionField {
-  // Unique string identifier for this region field.
+// Sharding field definition.
+message ShardingField {
+  // Unique string identifier for this shard field.
   string field_id = 1;
 
   // Field IDs referencing source columns in the schema.
   repeated int32 source_ids = 2;
 
-  // Well-known region transform name (e.g., "identity", "year", "bucket").
+  // Well-known shard transform name (e.g., "identity", "year", "bucket").
   // Mutually exclusive with expression.
   optional string transform = 3;
 
@@ -684,10 +835,9 @@ message RegionField {
   // Mutually exclusive with transform.
   optional string expression = 4;
 
-  // Output type of the region value (Arrow type name).
+  // Output type of the shard value (Arrow type name).
   string result_type = 5;
 
   // Transform parameters (e.g., num_buckets for bucket transform).
   map<string, string> parameters = 6;
 }
-

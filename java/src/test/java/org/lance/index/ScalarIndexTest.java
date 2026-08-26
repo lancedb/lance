@@ -13,32 +13,34 @@
  */
 package org.lance.index;
 
-import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.lance.operation.CreateIndex;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
@@ -51,7 +53,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,6 +62,113 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
+
+  private static final class RecordingIndexBuildProgress implements IndexBuildProgress {
+    private final List<String> events = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      events.add(
+          "start:" + stage + ":" + total.map(String::valueOf).orElse("unknown") + ":" + unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      events.add("progress:" + stage + ":" + completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      events.add("complete:" + stage);
+    }
+
+    private List<String> snapshot() {
+      synchronized (events) {
+        return new ArrayList<>(events);
+      }
+    }
+  }
+
+  private static final class FailingProgressIndexBuildProgress implements IndexBuildProgress {
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+      throw new IllegalStateException("progress callback failure");
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+    }
+  }
+
+  private static final class FailingCompleteIndexBuildProgress implements IndexBuildProgress {
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+      throw new IllegalStateException("complete callback failure");
+    }
+  }
+
+  /**
+   * Progress callback that re-enters the same Dataset via JNI. Without releasing the native field
+   * lock before merge starts, these calls would deadlock.
+   */
+  private static final class ReentrantDatasetIndexBuildProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+    private final AtomicInteger reentries = new AtomicInteger();
+
+    private ReentrantDatasetIndexBuildProgress(Dataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+      touchDataset();
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+      touchDataset();
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+      touchDataset();
+    }
+
+    private void touchDataset() {
+      assertNotNull(dataset.uri());
+      assertTrue(dataset.version() > 0);
+      assertTrue(dataset.countRows() > 0);
+      assertFalse(dataset.getFragments().isEmpty());
+      assertFalse(dataset.memWalIndexDetails().isPresent());
+      reentries.incrementAndGet();
+    }
+  }
 
   @Test
   public void testCreateBTreeIndex(@TempDir Path tempDir) throws Exception {
@@ -117,68 +227,36 @@ public class ScalarIndexTest {
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
         List<Fragment> fragments = dataset.getFragments();
-        assertEquals(2, dataset.getFragments().size());
+        assertEquals(2, fragments.size());
 
         ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        UUID uuid = UUID.randomUUID();
+        String indexName = "test_index";
 
-        // 2. partially create index
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                      .withIndexName(indexName)
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
 
-        // then no index should have been created
         assertFalse(
-            dataset.listIndexes().contains("test_index"),
+            dataset.listIndexes().contains(indexName),
             "Partially created index should not present");
 
-        // 3. merge metadata, which will still not be committed
-        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
+        List<Index> committed = dataset.commitExistingIndexSegments(indexName, "name", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(indexName));
 
-        // 4. commit the index
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals("name"))
-                .findAny()
-                .orElseThrow(() -> new RuntimeException("Cannot find 'name' field for TestDataset"))
-                .getId();
-
-        long datasetVersion = dataset.version();
-
-        Index index =
-            Index.builder()
-                .uuid(uuid)
-                .name("test_index")
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(fragments.stream().map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(datasetVersion)
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            // new dataset should contain that index
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains("test_index"));
-          }
-        }
+        assertEquals(2, dataset.countIndexedRows(indexName, "name = 'Person 5'", Optional.empty()));
+        assertEquals(
+            10,
+            dataset.countIndexedRows(
+                indexName, "name >= 'Person 3' AND name < 'Person 8'", Optional.empty()));
       }
     }
   }
@@ -186,108 +264,58 @@ public class ScalarIndexTest {
   @Test
   public void testRangedBTreeIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("ranged_btree_map").toString();
-    UUID indexUUID = UUID.randomUUID();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      // 1. write some data
-      try (Dataset dataset = testDataset.write(1, 200)) {
+      testDataset.write(1, 100).close();
+      try (Dataset dataset = testDataset.write(2, 100)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, fragments.size());
 
-        // 2. scan data out
-        List<long[]> data = new ArrayList<>();
-        try (LanceScanner scanner =
-                dataset.newScan(
-                    new ScanOptions.Builder()
-                        .withRowId(true)
-                        .columns(Collections.singletonList("id"))
-                        .build());
-            ArrowReader arrowReader = scanner.scanBatches(); ) {
-          while (arrowReader.loadNextBatch()) {
-            VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-            UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
-            IntVector idVec = (IntVector) root.getVector("id");
-            for (int i = 0; i < root.getRowCount(); i++) {
-              data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
-            }
-          }
-        }
-
-        // 3. sort data globally (This will be done by computing engines in production)
-        data.sort((d1, d2) -> (int) (d1[0] - d2[0]));
-        int mid = data.size() / 2;
-
-        // 4. divide sorted data into ranges and build index for each range
-        createBtreeIndexForRange(dataset, data.subList(0, mid), 1, allocator, indexUUID);
-        createBtreeIndexForRange(dataset, data.subList(mid, data.size()), 2, allocator, indexUUID);
-
-        // 5. merge index.
-        dataset.mergeIndexMetadata(indexUUID.toString(), IndexType.BTREE, Optional.empty());
-
-        // 6. commit index
-        long datasetVersion = dataset.version();
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals("id"))
-                .findAny()
-                .orElseThrow(() -> new RuntimeException("Cannot find 'id' field for TestDataset"))
-                .getId();
-        Index index =
-            Index.builder()
-                .uuid(indexUUID)
-                .name("test_index")
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(
-                    dataset.getFragments().stream()
-                        .map(Fragment::getId)
-                        .collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(datasetVersion)
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            // new dataset should contain that index
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains("test_index"));
-
-            // 7. compare results
-            // force use index should get the right value
-            ScanOptions scanOptions =
-                new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
-            try (LanceScanner scanner = newDataset.newScan(scanOptions);
-                ArrowReader arrowReader = scanner.scanBatches(); ) {
-              List<Integer> ids = new ArrayList<>();
-              while (arrowReader.loadNextBatch()) {
-                VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-                IntVector idVec = (IntVector) root.getVector("id");
-                for (int i = 0; i < idVec.getValueCount(); i++) {
-                  ids.add(idVec.get(i));
-                }
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          List<long[]> data = new ArrayList<>();
+          try (LanceScanner scanner =
+                  dataset.newScan(
+                      new ScanOptions.Builder()
+                          .fragmentIds(Collections.singletonList(fragment.getId()))
+                          .withRowId(true)
+                          .columns(Collections.singletonList("id"))
+                          .build());
+              ArrowReader arrowReader = scanner.scanBatches(); ) {
+            while (arrowReader.loadNextBatch()) {
+              VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              IntVector idVec = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
               }
-              Collections.sort(ids);
-              Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
             }
           }
+
+          data.sort((d1, d2) -> Long.compare(d1[0], d2[0]));
+          segments.add(createBtreeIndexFromPreprocessedData(dataset, data, fragment, allocator));
         }
+
+        String indexName = "test_index";
+        List<Index> committed = dataset.commitExistingIndexSegments(indexName, "id", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(indexName));
+
+        assertEquals(
+            6, dataset.countIndexedRows(indexName, "id in (10, 20, 30)", Optional.empty()));
+        assertEquals(
+            20, dataset.countIndexedRows(indexName, "id >= 50 AND id < 60", Optional.empty()));
       }
     }
   }
 
-  private void createBtreeIndexForRange(
+  private Index createBtreeIndexFromPreprocessedData(
       Dataset dataset,
       List<long[]> preprocessedData,
-      int rangeId,
-      BufferAllocator allocator,
-      UUID indexUUID) {
-    // Note that the indexing column is called 'value' in btree.
+      Fragment fragment,
+      BufferAllocator allocator) {
     Schema schema =
         new Schema(
             Arrays.asList(
@@ -300,7 +328,7 @@ public class ScalarIndexTest {
       UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
       for (int i = 0; i < preprocessedData.size(); i++) {
         long[] dataPair = preprocessedData.get(i);
-        idVec.set(i, (int) dataPair[0]);
+        idVec.setSafe(i, (int) dataPair[0]);
         rowIdVec.setSafe(i, dataPair[1]);
       }
       root.setRowCount(preprocessedData.size());
@@ -321,18 +349,210 @@ public class ScalarIndexTest {
           ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, stream);
 
-        ScalarIndexParams scalarParams =
-            ScalarIndexParams.create("btree", String.format("{\"range_id\": %s}", rangeId));
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 64}");
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        dataset.createIndex(
+        return dataset.createIndex(
             IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
-                .withIndexUUID(indexUUID.toString())
+                .withIndexName("test_index")
+                .withFragmentIds(Collections.singletonList(fragment.getId()))
                 .withPreprocessedData(stream)
                 .build());
       } catch (Exception e) {
         throw new RuntimeException("Cannot read arrow stream.", e);
       }
     }
+  }
+
+  @Test
+  public void testBtreeMergeIndexMetadataSoftBreak(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("btree_merge_metadata_soft_break").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeIndexMetadata(
+                        UUID.randomUUID().toString(), IndexType.BTREE, Optional.empty()));
+        assertTrue(
+            ex.getMessage() != null
+                && ex.getMessage().contains("no longer supports merge_index_metadata"),
+            "expected BTree merge_index_metadata soft-break error, got: " + ex.getMessage());
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataReportsProgress(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_progress").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        RecordingIndexBuildProgress progress = new RecordingIndexBuildProgress();
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        List<String> events = progress.snapshot();
+        assertEventsInOrder(
+            events,
+            "start:read_partition_metadata:",
+            "complete:read_partition_metadata",
+            "start:remap_partition_files:",
+            "complete:remap_partition_files",
+            "start:write_merged_metadata:",
+            "complete:write_merged_metadata");
+        assertTrue(
+            events.contains("progress:read_partition_metadata:2"),
+            "Expected metadata progress to reach both fragments, got: " + events);
+        assertTrue(
+            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
+            "Expected remap progress, got: " + events);
+        assertTrue(
+            events.contains("progress:write_merged_metadata:1"),
+            "Expected merged metadata write progress, got: " + events);
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataPropagatesProgressFailure(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_progress_failure").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+
+        RuntimeException failure =
+            Assertions.assertThrows(
+                RuntimeException.class,
+                () ->
+                    dataset.mergeIndexMetadata(
+                        indexUuid,
+                        IndexType.INVERTED,
+                        Optional.empty(),
+                        new FailingProgressIndexBuildProgress()));
+
+        assertFalse(
+            failure instanceof IllegalArgumentException,
+            "Progress callback failures should not be reported as invalid input: " + failure);
+        assertTrue(
+            causeChainContains(failure, "stageProgress")
+                && causeChainContains(failure, "read_partition_metadata")
+                && causeChainContains(failure, "java.lang.IllegalStateException")
+                && causeChainContains(failure, "progress callback failure"),
+            "Expected callback context and original Java exception details, got: " + failure);
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataIgnoresCompleteFailure(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_complete_failure").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        FailingCompleteIndexBuildProgress progress = new FailingCompleteIndexBuildProgress();
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to continue after stageComplete callback failures");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  public void testMergeInvertedIndexMetadataAllowsReentrantDatasetAccess(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_reentrant_dataset").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        ReentrantDatasetIndexBuildProgress progress =
+            new ReentrantDatasetIndexBuildProgress(dataset);
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        assertTrue(
+            progress.reentries.get() > 0,
+            "Expected progress callbacks to re-enter Dataset JNI methods");
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to finish after re-entrant Dataset access, got: "
+                + progress.recorder.snapshot());
+      }
+    }
+  }
+
+  private static String createDistributedInvertedIndex(Dataset dataset) {
+    ScalarIndexParams scalarParams =
+        ScalarIndexParams.create(
+            "inverted",
+            "{\"base_tokenizer\":\"simple\",\"language\":\"English\","
+                + "\"max_token_length\":40,\"lower_case\":true,\"stem\":false,"
+                + "\"remove_stop_words\":false}");
+    IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+    String indexUuid = UUID.randomUUID().toString();
+    for (Fragment fragment : dataset.getFragments()) {
+      dataset.createIndex(
+          IndexOptions.builder(Collections.singletonList("name"), IndexType.INVERTED, indexParams)
+              .replace(true)
+              .withIndexName("inverted_progress_idx")
+              .withIndexUUID(indexUuid)
+              .withFragmentIds(Collections.singletonList(fragment.getId()))
+              .build());
+    }
+    return indexUuid;
+  }
+
+  private static void assertEventsInOrder(List<String> events, String... prefixes) {
+    int previous = -1;
+    for (String prefix : prefixes) {
+      int current = -1;
+      for (int i = previous + 1; i < events.size(); i++) {
+        if (events.get(i).startsWith(prefix)) {
+          current = i;
+          break;
+        }
+      }
+      assertTrue(
+          current >= 0,
+          "Missing event '" + prefix + "' after position " + previous + ": " + events);
+      previous = current;
+    }
+  }
+
+  private static boolean causeChainContains(Throwable failure, String expected) {
+    for (Throwable current = failure; current != null; current = current.getCause()) {
+      if (current.getMessage() != null && current.getMessage().contains(expected)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Test
@@ -378,6 +598,80 @@ public class ScalarIndexTest {
         // Currently the Java API doesn't expose index configuration details,
         // but we could add a getIndexDetails() method in the future to verify
         // that the rows_per_zone parameter was correctly set to 1024
+      }
+    }
+  }
+
+  @Test
+  public void testCreateRTreeIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("rtree_test").toString();
+    ArrowType f64 = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+    Field geometryField =
+        new Field(
+            "geometry",
+            new FieldType(
+                true,
+                new ArrowType.Struct(),
+                null,
+                Collections.singletonMap("ARROW:extension:name", "geoarrow.point")),
+            Arrays.asList(Field.notNullable("x", f64), Field.notNullable("y", f64)));
+    Schema schema = new Schema(Collections.singletonList(geometryField), null);
+
+    int rowCount = 3;
+    try (RootAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      StructVector geometry = (StructVector) root.getVector("geometry");
+      Float8Vector x = (Float8Vector) geometry.getChild("x");
+      Float8Vector y = (Float8Vector) geometry.getChild("y");
+      for (int i = 0; i < rowCount; i++) {
+        geometry.setIndexDefined(i);
+        x.setSafe(i, (double) i);
+        y.setSafe(i, i * 2.0);
+      }
+      geometry.setValueCount(rowCount);
+      root.setRowCount(rowCount);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
+          Dataset dataset =
+              Dataset.write()
+                  .reader(reader)
+                  .uri(datasetPath)
+                  .allocator(allocator)
+                  .mode(WriteParams.WriteMode.CREATE)
+                  .execute()) {
+        // The point data round-trips through Lance.
+        assertEquals(rowCount, dataset.countRows());
+        try (ArrowReader scan = dataset.newScan(new ScanOptions.Builder().build()).scanBatches()) {
+          assertTrue(scan.loadNextBatch());
+          StructVector readGeometry =
+              (StructVector) scan.getVectorSchemaRoot().getVector("geometry");
+          assertEquals(2.0, ((Float8Vector) readGeometry.getChild("x")).get(2));
+          assertEquals(4.0, ((Float8Vector) readGeometry.getChild("y")).get(2));
+        }
+
+        // Creating and listing an RTree index via the typed IndexType works end-to-end.
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("geometry"),
+                IndexType.RTREE,
+                Optional.of("rtree_geometry_index"),
+                IndexParams.builder()
+                    .setScalarIndexParams(ScalarIndexParams.create("rtree"))
+                    .build(),
+                true);
+        assertEquals(IndexType.RTREE, index.indexType());
+        assertTrue(
+            dataset.listIndexes().contains("rtree_geometry_index"),
+            "Expected 'rtree_geometry_index' in: " + dataset.listIndexes());
       }
     }
   }

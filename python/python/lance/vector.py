@@ -19,9 +19,10 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .log import LOGGER
-from .util import MetricType, _normalize_metric_type
+from .util import MetricType, _normalize_index_segment_ids, _normalize_metric_type
 
 if TYPE_CHECKING:
+    import uuid
     from pathlib import Path
 
     from . import LanceDataset
@@ -270,10 +271,6 @@ def train_ivf_centroids_on_accelerator(
         kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
     )
 
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        np.save(f, centroids)
-    LOGGER.info("Saved centroids to %s", f.name)
-
     return centroids, kmeans
 
 
@@ -292,12 +289,12 @@ def compute_pq_codes(
         Dataset to compute pq codes for.
     kmeans_list: List[lance.torch.kmeans.KMeans]
         KMeans models to use to compute pq (one per subspace)
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns
@@ -421,12 +418,12 @@ def compute_partitions(
         Column name of the vector column.
     kmeans: lance.torch.kmeans.KMeans
         KMeans model to use to compute partitions.
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns
@@ -753,3 +750,174 @@ def one_pass_assign_ivf_pq_on_accelerator(
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
+
+
+# =============================================================================
+# Hamming Distance Clustering
+# =============================================================================
+
+
+def hamming_clustering_for_ivf_partition(
+    dataset: "LanceDataset",
+    index_name: str,
+    partition_id: int,
+    hamming_threshold: int,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
+) -> pa.RecordBatchReader:
+    """
+    Perform hamming clustering on a partition of an IVF_FLAT index.
+
+    Loads a partition from every segment of an IVF_FLAT index on a hash
+    column, computes pairwise hamming distances between all hashes in the
+    combined partition, filters by threshold, and clusters the results using
+    union-find. All segments of the logical index must share the same global
+    IVF centroids; an error is raised if they do not.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index on the hash column
+    partition_id : int
+        The partition ID within the IVF_FLAT index
+    hamming_threshold : int
+        Maximum hamming distance to consider as similar
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute rows. Use
+        :meth:`LanceDataset.describe_indices` to obtain segment UUIDs from
+        ``IndexDescription.segments``. Defaults to all segments.
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_ivf_partition(
+        index_name,
+        partition_id,
+        hamming_threshold,
+        _normalize_index_segment_ids(index_segments),
+    )
+
+
+def get_ivf_partition_info(
+    dataset: "LanceDataset",
+    index_name: str,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
+) -> List[dict]:
+    """
+    Get partition information for an IVF_FLAT index.
+
+    Partition sizes are aggregated across all segments of the logical index
+    unless a subset is selected via ``index_segments``.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute to the sizes. Defaults to all segments.
+
+    Returns
+    -------
+    list[dict]
+        List of partition info dicts with 'partition_id' and 'size'
+    """
+    return dataset._ds.get_ivf_partition_info(
+        index_name, _normalize_index_segment_ids(index_segments)
+    )
+
+
+def hamming_clustering_for_sample(
+    dataset: "LanceDataset",
+    column: str,
+    sample_size: Optional[int] = None,
+    hamming_threshold: int = 10,
+) -> pa.RecordBatchReader:
+    """
+    Perform pairwise hamming distance clustering on a sample of the dataset.
+
+    Randomly samples rows from the dataset, computes pairwise hamming distances
+    between all hashes in the sample, filters by threshold, and clusters the
+    results using union-find.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
+    sample_size : int, optional
+        Number of rows to sample. If None, uses all rows.
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_sample(
+        column, sample_size, hamming_threshold
+    )
+
+
+def hamming_clustering_for_range(
+    dataset: "LanceDataset",
+    column: str,
+    fragment_id: int,
+    start_row: int,
+    num_rows: int,
+    hamming_threshold: int = 10,
+) -> pa.RecordBatchReader:
+    """
+    Perform pairwise hamming distance clustering on a contiguous range of rows.
+
+    Reads a contiguous range of rows from a specific fragment, computes pairwise
+    hamming distances between all hashes in the range, filters by threshold,
+    and clusters the results using union-find.
+
+    Unlike sampling, this reads sequential rows which is useful for distributed
+    processing where each worker handles a specific range of a fragment.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
+    fragment_id : int
+        The fragment ID to read from
+    start_row : int
+        The starting row offset within the fragment
+    num_rows : int
+        Number of rows to read from the start position
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_range(
+        column, fragment_id, start_row, num_rows, hamming_threshold
+    )

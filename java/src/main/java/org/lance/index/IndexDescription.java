@@ -15,6 +15,7 @@ package org.lance.index;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * High-level description of an index, aggregating metadata across all segments.
@@ -31,6 +32,7 @@ public final class IndexDescription {
   private final long rowsIndexed;
   private final List<Index> metadata;
   private final String detailsJson;
+  private final Long totalSizeBytes;
 
   public IndexDescription(
       String name,
@@ -40,6 +42,18 @@ public final class IndexDescription {
       long rowsIndexed,
       List<Index> metadata,
       String detailsJson) {
+    this(name, fieldIds, typeUrl, indexType, rowsIndexed, metadata, detailsJson, null);
+  }
+
+  public IndexDescription(
+      String name,
+      List<Integer> fieldIds,
+      String typeUrl,
+      String indexType,
+      long rowsIndexed,
+      List<Index> metadata,
+      String detailsJson,
+      Long totalSizeBytes) {
     this.name = Objects.requireNonNull(name, "name must not be null");
     this.fieldIds = Objects.requireNonNull(fieldIds, "fieldIds must not be null");
     this.typeUrl = Objects.requireNonNull(typeUrl, "typeUrl must not be null");
@@ -47,6 +61,7 @@ public final class IndexDescription {
     this.rowsIndexed = rowsIndexed;
     this.metadata = Objects.requireNonNull(metadata, "metadata must not be null");
     this.detailsJson = detailsJson;
+    this.totalSizeBytes = totalSizeBytes;
   }
 
   /** The logical name of the index. */
@@ -84,11 +99,31 @@ public final class IndexDescription {
   }
 
   /**
+   * Physical index segments for this logical index.
+   *
+   * <p>This is an alias for {@link #getMetadata()} with a less ambiguous name.
+   */
+  public List<Index> getSegments() {
+    return metadata;
+  }
+
+  /**
    * JSON representation of index-specific details.
    *
    * <p>The exact structure depends on the index implementation.
    */
   public String getDetailsJson() {
     return detailsJson;
+  }
+
+  /**
+   * Total size of all files across all physical index segments.
+   *
+   * <p>The size is unavailable if any segment predates index file size tracking.
+   *
+   * @return the logical index size in bytes, or empty if unavailable
+   */
+  public Optional<Long> getTotalSizeBytes() {
+    return Optional.ofNullable(totalSizeBytes);
   }
 }

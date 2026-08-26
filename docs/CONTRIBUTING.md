@@ -7,7 +7,7 @@ To build the docs, first install requirements:
 
 ```bash
 cd docs
-uc sync --dev
+uv sync --dev
 ```
 
 Then build and start the docs server:
@@ -18,7 +18,7 @@ uv run mkdocs serve
 
 ### Python Generated Doc
 
-Python code documentation is built using Sphinx in [lance-python-doc](https://github.com/lancedb/lance-python-doc),
+Python code documentation is built using Sphinx in [lance-python-doc](https://github.com/lance-format/lance-python-doc),
 and published through [Github Pages](https://lance-format.github.io/lance-python-doc/) in ReadTheDocs style.
 
 ### Rust Generated Doc

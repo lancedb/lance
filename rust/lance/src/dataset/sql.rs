@@ -3,12 +3,14 @@
 
 use crate::Dataset;
 use crate::datafusion::LanceTableProvider;
+use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
+use lance_core::datatypes::BlobHandling;
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -29,6 +31,15 @@ pub struct SqlQueryBuilder {
 
     /// If true, the query result will include the internal row address
     pub(crate) with_row_addr: bool,
+
+    /// Override how blob columns are materialized for this query.
+    pub(crate) blob_handling: Option<BlobHandling>,
+
+    /// Override the maximum number of rows in each scan batch.
+    pub(crate) batch_size: Option<usize>,
+
+    /// Override the approximate maximum bytes in each scan batch.
+    pub(crate) batch_size_bytes: Option<u64>,
 }
 
 impl SqlQueryBuilder {
@@ -39,6 +50,9 @@ impl SqlQueryBuilder {
             table_name: "dataset".to_string(),
             with_row_id: false,
             with_row_addr: false,
+            blob_handling: None,
+            batch_size: None,
+            batch_size_bytes: None,
         }
     }
 
@@ -65,18 +79,58 @@ impl SqlQueryBuilder {
         self
     }
 
+    /// Override how blob columns are materialized for this query.
+    ///
+    /// When unset, the underlying dataset scan uses its default
+    /// [`BlobHandling::BlobsDescriptions`] policy.
+    pub fn blob_handling(mut self, blob_handling: BlobHandling) -> Self {
+        self.blob_handling = Some(blob_handling);
+        self
+    }
+
+    /// Set the maximum number of rows produced by each query batch.
+    ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive.
+    ///
+    /// When [`Self::batch_size_bytes`] is also set, both limits apply and the
+    /// one reached first determines the scan batch size.
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the approximate maximum number of bytes produced by each scan batch.
+    ///
+    /// When [`Self::batch_size`] is also set, both limits apply and the one
+    /// reached first determines the scan batch size.
+    pub fn batch_size_bytes(mut self, batch_size_bytes: u64) -> Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
+        self
+    }
+
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = SessionContext::new();
+        if let Some(batch_size) = self.batch_size {
+            validate_batch_size(batch_size)?;
+        }
+
+        let ctx = if let Some(batch_size) = self.batch_size {
+            SessionContext::new_with_config(SessionConfig::new().with_batch_size(batch_size))
+        } else {
+            SessionContext::new()
+        };
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
-        ctx.register_table(
-            self.table_name,
-            Arc::new(LanceTableProvider::new(
-                self.dataset.clone(),
-                row_id,
-                row_addr,
-            )),
-        )?;
+        let mut provider = LanceTableProvider::new(self.dataset.clone(), row_id, row_addr);
+        if let Some(blob_handling) = self.blob_handling {
+            provider = provider.with_blob_handling(blob_handling);
+        }
+        if let Some(batch_size) = self.batch_size {
+            provider = provider.with_batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            provider = provider.with_batch_size_bytes(batch_size_bytes);
+        }
+        ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
@@ -123,10 +177,14 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_string_matches};
+    use crate::{BlobArrayBuilder, blob_field};
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::Dataset;
+    use crate::dataset::ReadParams;
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::write::WriteParams;
+    use crate::{Dataset, Error};
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
@@ -135,7 +193,11 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_core::datatypes::BlobHandling;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch};
+    use lance_file::reader::FileReaderOptions;
+    use lance_file::version::LanceFileVersion;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -184,6 +246,183 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_batch_size() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_batch_size",
+                FragmentCount::from(2),
+                FragmentRowCount::from(25),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT x FROM dataset")
+            .batch_size(7)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 50);
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 7));
+    }
+
+    #[tokio::test]
+    async fn test_sql_rejects_invalid_batch_size() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_rejects_invalid_batch_size",
+                FragmentCount::from(1),
+                FragmentRowCount::from(3),
+            )
+            .await
+            .unwrap();
+
+        for batch_size in [0, u32::MAX as usize + 1] {
+            let error = ds
+                .sql("SELECT x FROM dataset")
+                .batch_size(batch_size)
+                .build()
+                .await
+                .err()
+                .expect("invalid batch size should be rejected");
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("batch_size must be between 1 and {}", u32::MAX))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_batch_size_bytes_overrides_dataset_default() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(&test_dir)
+            .with_read_params(ReadParams {
+                file_reader_options: Some(FileReaderOptions {
+                    batch_size_bytes: Some(8_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let batches = dataset
+            .sql("SELECT x FROM dataset")
+            .batch_size_bytes(64)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1000
+        );
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 16));
+    }
+
+    #[tokio::test]
+    async fn test_sql_blob_all_binary() {
+        let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"foo").unwrap();
+        blobs.push_bytes(b"bar").unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://test_sql_blob_all_binary",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let batches = dataset
+            .sql("SELECT blob FROM dataset")
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let blobs = batches[0].column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+
+        // Expressions over the blob column require the planner to see the
+        // materialized LargeBinary type instead of the blob descriptor struct.
+        let batches = dataset
+            .sql("SELECT blob = X'666f6f' FROM dataset")
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let is_foo = batches[0].column(0).as_boolean();
+        assert!(is_foo.value(0));
+        assert!(!is_foo.value(1));
+
+        let batches = dataset
+            .sql("SELECT blob, _rowid, _rowaddr FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let blobs = batch.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.value(0), 0);
+        assert_eq!(row_ids.value(1), 1);
+        let row_addrs = batch.column(2).as_primitive::<UInt64Type>();
+        assert_eq!(row_addrs.value(0), 0);
+        assert_eq!(row_addrs.value(1), 1);
     }
 
     #[tokio::test]

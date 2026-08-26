@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_core::deepsize::DeepSizeOf;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::{IndexParams, IndexType, vector::VectorIndex};
+use uuid::Uuid;
 
 use crate::Dataset;
 
@@ -35,7 +38,7 @@ pub trait VectorIndexExtension: IndexExtension {
         // if we wrap into an Arc, the mutable reference is lost
         dataset: &Dataset,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         params: &dyn IndexParams,
     ) -> Result<()>;
 
@@ -44,8 +47,8 @@ pub trait VectorIndexExtension: IndexExtension {
         &self,
         dataset: Arc<Dataset>,
         column: &str,
-        uuid: &str,
-        reader: PreviousFileReader,
+        uuid: &Uuid,
+        reader: V1FileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
 
@@ -61,22 +64,21 @@ mod test {
 
     use std::{
         any::Any,
-        collections::HashMap,
         sync::{Arc, atomic::AtomicBool},
     };
 
+    use crate::index::DatasetIndexExt;
     use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::DeepSizeOf;
-    use lance_file::previous::writer::{
-        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-    };
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
+    use lance_file::versions::v1::writer::{
+        FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions,
+    };
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
-        DatasetIndexExt, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata,
-        IndexType,
+        INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
         vector::{Query, hnsw::VECTOR_ID_FIELD},
     };
     use lance_index::{
@@ -95,7 +97,7 @@ mod test {
     struct MockIndex;
 
     impl DeepSizeOf for MockIndex {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }
@@ -108,10 +110,6 @@ mod test {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -185,7 +183,7 @@ mod test {
             unimplemented!()
         }
 
-        async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -230,7 +228,7 @@ mod test {
     }
 
     impl DeepSizeOf for MockIndexExtension {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             todo!()
         }
     }
@@ -259,26 +257,22 @@ mod test {
             &self,
             dataset: &Dataset,
             _column: &str,
-            uuid: &str,
+            uuid: &Uuid,
             _params: &dyn IndexParams,
         ) -> Result<()> {
             let store = dataset.object_store.clone();
             let path = dataset
                 .indices_dir()
-                .child(uuid.to_string())
-                .child(INDEX_FILE_NAME);
+                .join(uuid.to_string())
+                .join(INDEX_FILE_NAME);
 
             let writer = store.create(&path).await.unwrap();
 
             let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
             let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
-            let mut writer: PreviousFileWriter<ManifestDescribing> =
-                PreviousFileWriter::with_object_writer(
-                    writer,
-                    schema,
-                    &PreviousFileWriterOptions::default(),
-                )
-                .unwrap();
+            let mut writer: V1FileWriter<ManifestDescribing> =
+                V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())
+                    .unwrap();
             writer.add_metadata(
                 INDEX_METADATA_SCHEMA_KEY,
                 json!(IndexMetadata {
@@ -305,8 +299,8 @@ mod test {
             &self,
             _dataset: Arc<Dataset>,
             _column: &str,
-            _uuid: &str,
-            _reader: PreviousFileReader,
+            _uuid: &Uuid,
+            _reader: V1FileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -391,7 +385,7 @@ mod test {
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid
-        let index_uuid = idx.first().unwrap().uuid.to_string();
+        let index_uuid = idx.first().unwrap().uuid;
 
         // trying to open the index should fail as there is no extension loader
         assert!(

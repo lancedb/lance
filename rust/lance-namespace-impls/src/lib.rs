@@ -46,10 +46,13 @@
 //! # Note: GCP uses ADC; set GOOGLE_APPLICATION_CREDENTIALS env var for service account key
 //! # Note: GCP token duration cannot be configured; it's determined by the STS endpoint
 //! credential_vendor.gcp_service_account = "my-sa@project.iam.gserviceaccount.com"
+//! credential_vendor.gcp_workload_identity_provider = "projects/123456/locations/global/workloadIdentityPools/pool/providers/provider"
+//! credential_vendor.gcp_impersonation_service_account = "my-sa@project.iam.gserviceaccount.com"
 //!
 //! # Azure-specific properties (for az:// locations)
 //! credential_vendor.azure_account_name = "mystorageaccount"  # required for Azure
 //! credential_vendor.azure_tenant_id = "my-tenant-id"
+//! credential_vendor.azure_federated_client_id = "my-app-client-id"
 //! credential_vendor.azure_duration_millis = "3600000"  # 1 hour (default, up to 7 days)
 //! ```
 //!
@@ -82,7 +85,9 @@ pub mod rest_adapter;
 // Re-export connect builder
 pub use connect::ConnectBuilder;
 pub use context::{DynamicContextProvider, OperationInfo};
-pub use dir::{DirectoryNamespace, DirectoryNamespaceBuilder, manifest::ManifestNamespace};
+pub use dir::{
+    DirectoryNamespace, DirectoryNamespaceBuilder, OpsMetrics, manifest::ManifestNamespace,
+};
 
 // Re-export credential vending
 pub use credentials::{

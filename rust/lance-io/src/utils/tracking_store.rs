@@ -13,19 +13,35 @@ use std::ops::Range;
 #[cfg(feature = "test-util")]
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "metrics")]
+use std::time::Instant;
 
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result as OSResult, UploadPart,
 };
 
 use crate::object_store::WrappingObjectStore;
+#[cfg(feature = "metrics")]
+use crate::object_store::metrics::{InFlightGuard, record_outcome};
+use object_store::list::PaginatedListStore;
 
 #[derive(Debug, Default, Clone)]
-pub struct IOTracker(Arc<Mutex<IoStats>>);
+pub struct IOTracker {
+    stats: Arc<Mutex<IoStats>>,
+    /// The `base` label for the object store metrics published by IO that
+    /// bypasses the `object_store` layer (see [`Self::begin_io`]). `None` when
+    /// the IO cannot be attributed to a store, in which case no metrics are
+    /// published.
+    #[cfg(feature = "metrics")]
+    metrics_base: Option<Arc<str>>,
+}
 
 impl IOTracker {
     /// Get IO statistics and reset the counters (incremental pattern).
@@ -33,7 +49,7 @@ impl IOTracker {
     /// This returns the accumulated statistics since the last call and resets
     /// the internal counters to zero.
     pub fn incremental_stats(&self) -> IoStats {
-        std::mem::take(&mut *self.0.lock().unwrap())
+        std::mem::take(&mut *self.stats.lock().unwrap())
     }
 
     /// Get a snapshot of current IO statistics without resetting counters.
@@ -41,7 +57,7 @@ impl IOTracker {
     /// This returns a clone of the current statistics without modifying the
     /// internal state. Use this when you need to check stats without resetting.
     pub fn stats(&self) -> IoStats {
-        self.0.lock().unwrap().clone()
+        self.stats.lock().unwrap().clone()
     }
 
     /// Record a read operation for tracking.
@@ -55,7 +71,7 @@ impl IOTracker {
         num_bytes: u64,
         #[allow(unused_variables)] range: Option<Range<u64>>,
     ) {
-        let mut stats = self.0.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
         #[cfg(feature = "test-util")]
@@ -76,7 +92,7 @@ impl IOTracker {
         #[allow(unused_variables)] path: Path,
         num_bytes: u64,
     ) {
-        let mut stats = self.0.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap();
         stats.write_iops += 1;
         stats.written_bytes += num_bytes;
         #[cfg(feature = "test-util")]
@@ -86,11 +102,97 @@ impl IOTracker {
             range: None,
         });
     }
+
+    /// Label the metrics published through [`Self::begin_io`] with the prefix of
+    /// the store this tracker belongs to, so IO that bypasses the `object_store`
+    /// layer carries the same `base` label as the store's metered operations.
+    ///
+    /// Only `meter_store` should call this, so that labelling the tracker and
+    /// wrapping the store stay inseparable — see the rationale there.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn set_metrics_base(&mut self, base: &str) {
+        self.metrics_base = Some(base.into());
+    }
+
+    /// Begin an operation that talks to storage without going through the
+    /// `object_store` layer, and so is invisible to the `MeteredObjectStore`
+    /// wrapper: the optimized local reads and writes go straight to the
+    /// filesystem. `operation` must be one of the labels that wrapper uses
+    /// (`get`, `put`, `head`, ...) so this IO aggregates with the rest.
+    ///
+    /// The returned guard keeps the in-flight gauge raised until it is dropped.
+    #[cfg(feature = "metrics")]
+    pub fn begin_io(&self, operation: &'static str) -> IoMetricsGuard {
+        IoMetricsGuard {
+            state: self.metrics_base.as_ref().map(|base| IoMetricsState {
+                _in_flight: InFlightGuard::new(base, operation),
+                base: base.clone(),
+                operation,
+                start: Instant::now(),
+            }),
+        }
+    }
+
+    /// Without the `metrics` feature there is nothing to publish.
+    #[cfg(not(feature = "metrics"))]
+    pub fn begin_io(&self, _operation: &'static str) -> IoMetricsGuard {
+        IoMetricsGuard {}
+    }
+}
+
+/// Publishes the object store metrics for a single operation that bypassed the
+/// `object_store` layer (see [`IOTracker::begin_io`]).
+///
+/// The operation is only counted by [`Self::record`]; one dropped before that —
+/// a cancelled read, an abandoned write — counts as neither a success nor a
+/// failure, and only lowers the in-flight gauge.
+#[must_use = "the operation is not recorded until `record` is called"]
+pub struct IoMetricsGuard {
+    #[cfg(feature = "metrics")]
+    state: Option<IoMetricsState>,
+}
+
+#[cfg(feature = "metrics")]
+struct IoMetricsState {
+    base: Arc<str>,
+    operation: &'static str,
+    start: Instant,
+    /// Lowers the in-flight gauge when the guard is dropped.
+    _in_flight: InFlightGuard,
+}
+
+impl IoMetricsGuard {
+    /// Record the operation's count and latency, along with `num_bytes`
+    /// transferred if `result` is `Ok` or an error if it is not.
+    pub fn record<T, E>(self, result: &std::result::Result<T, E>, num_bytes: u64) {
+        #[cfg(feature = "metrics")]
+        if let Some(state) = self.state {
+            record_outcome(
+                &state.base,
+                state.operation,
+                state.start,
+                num_bytes,
+                result.is_err(),
+            );
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (result, num_bytes);
+    }
 }
 
 impl WrappingObjectStore for IOTracker {
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        Arc::new(IoTrackingStore::new(target, self.0.clone()))
+        Arc::new(IoTrackingStore::new(target, self.stats.clone()))
+    }
+
+    // A pushed-down listing records itself against the store's tracker, so it is already
+    // counted without passing through here.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        Some(original)
     }
 }
 
@@ -190,9 +292,8 @@ macro_rules! assert_io_lt {
     };
 }
 
-// These fields are "dead code" because we just use them right now to display
-// in test failure messages through Debug. (The lint ignores Debug impls.)
-#[allow(dead_code)]
+// These request records only exist for test-only diagnostics.
+#[cfg(feature = "test-util")]
 #[derive(Clone)]
 pub struct IoRequestRecord {
     pub method: &'static str,
@@ -200,6 +301,7 @@ pub struct IoRequestRecord {
     pub range: Option<Range<u64>>,
 }
 
+#[cfg(feature = "test-util")]
 impl std::fmt::Debug for IoRequestRecord {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // For example: "put /path/to/file range: 0-100"
@@ -294,12 +396,6 @@ impl IoTrackingStore {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        let _guard = self.stage_guard();
-        self.record_write("put", location.to_owned(), bytes.content_length() as u64);
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -313,19 +409,6 @@ impl ObjectStore for IoTrackingStore {
             bytes.content_length() as u64,
         );
         self.target.put_opts(location, bytes, opts).await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
-        let _guard = self.stage_guard();
-        let target = self.target.put_multipart(location).await?;
-        Ok(Box::new(IoTrackingMultipartUpload {
-            target,
-            stats: self.stats.clone(),
-            #[cfg(feature = "test-util")]
-            path: location.to_owned(),
-            #[cfg(feature = "test-util")]
-            _guard,
-        }))
     }
 
     async fn put_multipart_opts(
@@ -345,16 +428,6 @@ impl ObjectStore for IoTrackingStore {
         }))
     }
 
-    async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        let _guard = self.stage_guard();
-        let result = self.target.get(location).await;
-        if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-            self.record_read("get", location.to_owned(), num_bytes, None);
-        }
-        result
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
         let range = match &options.range {
@@ -366,20 +439,6 @@ impl ObjectStore for IoTrackingStore {
             let num_bytes = result.range.end - result.range.start;
 
             self.record_read("get_opts", location.to_owned(), num_bytes, range);
-        }
-        result
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        let _guard = self.stage_guard();
-        let result = self.target.get_range(location, range.clone()).await;
-        if let Ok(result) = &result {
-            self.record_read(
-                "get_range",
-                location.to_owned(),
-                result.len() as u64,
-                Some(range),
-            );
         }
         result
     }
@@ -398,23 +457,25 @@ impl ObjectStore for IoTrackingStore {
         result
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        let _guard = self.stage_guard();
-        self.record_read("head", location.to_owned(), 0, None);
-        self.target.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("delete", location.to_owned(), 0);
-        self.target.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, OSResult<Path>>,
-    ) -> BoxStream<'a, OSResult<Path>> {
-        self.target.delete_stream(locations)
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        let stats = Arc::clone(&self.stats);
+        let tracked = locations
+            .map_ok(move |path| {
+                let mut stats = stats.lock().unwrap();
+                stats.write_iops += 1;
+                #[cfg(feature = "test-util")]
+                stats.requests.push(IoRequestRecord {
+                    method: "delete",
+                    path: path.clone(),
+                    range: None,
+                });
+                path
+            })
+            .boxed();
+        self.target.delete_stream(tracked)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -448,28 +509,16 @@ impl ObjectStore for IoTrackingStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         let _guard = self.stage_guard();
         self.record_write("copy", from.to_owned(), 0);
-        self.target.copy(from, to).await
+        self.target.copy_opts(from, to, opts).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         let _guard = self.stage_guard();
         self.record_write("rename", from.to_owned(), 0);
-        self.target.rename(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("rename_if_not_exists", from.to_owned(), 0);
-        self.target.rename_if_not_exists(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        let _guard = self.stage_guard();
-        self.record_write("copy_if_not_exists", from.to_owned(), 0);
-        self.target.copy_if_not_exists(from, to).await
+        self.target.rename_opts(from, to, opts).await
     }
 }
 

@@ -17,6 +17,7 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 
 use crate::pb;
+use crate::vector::bq::storage::RABIT_METADATA_KEY;
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel};
 use crate::vector::pq::storage::PQ_METADATA_KEY;
 use crate::vector::sq::storage::SQ_METADATA_KEY;
@@ -34,6 +35,7 @@ pub enum SupportedIvfIndexType {
     IvfFlat,
     IvfPq,
     IvfSq,
+    IvfRq,
     IvfHnswFlat,
     IvfHnswPq,
     IvfHnswSq,
@@ -46,6 +48,7 @@ impl SupportedIvfIndexType {
             Self::IvfFlat => "IVF_FLAT",
             Self::IvfPq => "IVF_PQ",
             Self::IvfSq => "IVF_SQ",
+            Self::IvfRq => "IVF_RQ",
             Self::IvfHnswFlat => "IVF_HNSW_FLAT",
             Self::IvfHnswPq => "IVF_HNSW_PQ",
             Self::IvfHnswSq => "IVF_HNSW_SQ",
@@ -60,6 +63,7 @@ impl SupportedIvfIndexType {
             "IVF_FLAT" => Some(Self::IvfFlat),
             "IVF_PQ" => Some(Self::IvfPq),
             "IVF_SQ" => Some(Self::IvfSq),
+            "IVF_RQ" => Some(Self::IvfRq),
             "IVF_HNSW_FLAT" => Some(Self::IvfHnswFlat),
             "IVF_HNSW_PQ" => Some(Self::IvfHnswPq),
             "IVF_HNSW_SQ" => Some(Self::IvfHnswSq),
@@ -74,6 +78,10 @@ impl SupportedIvfIndexType {
     pub fn detect_from_reader_and_schema(reader: &V2Reader, schema: &ArrowSchema) -> Result<Self> {
         let has_pq_code_col = schema.fields.iter().any(|f| f.name() == PQ_CODE_COLUMN);
         let has_sq_code_col = schema.fields.iter().any(|f| f.name() == SQ_CODE_COLUMN);
+        let has_rq_code_col = schema
+            .fields
+            .iter()
+            .any(|f| f.name() == crate::vector::bq::storage::RABIT_CODE_COLUMN);
 
         let is_pq = reader
             .metadata()
@@ -87,19 +95,26 @@ impl SupportedIvfIndexType {
             .metadata
             .contains_key(SQ_METADATA_KEY)
             || has_sq_code_col;
+        let is_rq = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .contains_key(RABIT_METADATA_KEY)
+            || has_rq_code_col;
 
         // Detect HNSW-related columns
         let has_hnsw_vector_id_col = schema.fields.iter().any(|f| f.name() == "__vector_id");
         let has_hnsw_pointer_col = schema.fields.iter().any(|f| f.name() == "__pointer");
         let has_hnsw = has_hnsw_vector_id_col || has_hnsw_pointer_col;
 
-        let index_type = match (has_hnsw, is_pq, is_sq) {
-            (false, false, false) => Self::IvfFlat,
-            (false, true, false) => Self::IvfPq,
-            (false, false, true) => Self::IvfSq,
-            (true, false, false) => Self::IvfHnswFlat,
-            (true, true, false) => Self::IvfHnswPq,
-            (true, false, true) => Self::IvfHnswSq,
+        let index_type = match (has_hnsw, is_pq, is_sq, is_rq) {
+            (false, false, false, false) => Self::IvfFlat,
+            (false, true, false, false) => Self::IvfPq,
+            (false, false, true, false) => Self::IvfSq,
+            (false, false, false, true) => Self::IvfRq,
+            (true, false, false, false) => Self::IvfHnswFlat,
+            (true, true, false, false) => Self::IvfHnswPq,
+            (true, false, true, false) => Self::IvfHnswSq,
             _ => {
                 return Err(Error::not_supported_source(
                     "Unsupported index type combination detected".into(),

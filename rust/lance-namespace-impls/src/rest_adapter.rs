@@ -12,12 +12,12 @@ use std::sync::Arc;
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
-    extract::{Path, Query, Request, State},
+    extract::{FromRequest, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::sync::watch;
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
@@ -25,6 +25,7 @@ use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
 use lance_namespace::models::*;
 
 /// Configuration for the REST server
@@ -101,7 +102,7 @@ impl RestAdapter {
                 "/v1/table/:id/create_scalar_index",
                 post(create_table_scalar_index),
             )
-            .route("/v1/table/:id/index/list", get(list_table_indices))
+            .route("/v1/table/:id/index/list", post(list_table_indices))
             .route(
                 "/v1/table/:id/index/:index_name/stats",
                 get(describe_table_index_stats),
@@ -118,6 +119,19 @@ impl RestAdapter {
             )
             .route("/v1/table/:id/drop_columns", post(alter_table_drop_columns))
             .route(
+                "/v1/table/:id/backfill_column",
+                post(alter_table_backfill_columns),
+            )
+            .route("/v1/table/:id/refresh", post(refresh_materialized_view))
+            .route(
+                "/v1/materialized_view/:id/refresh",
+                post(refresh_materialized_view),
+            )
+            .route(
+                "/v1/materialized_view/:id/create",
+                post(create_materialized_view),
+            )
+            .route(
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
             )
@@ -127,6 +141,10 @@ impl RestAdapter {
             .route("/v1/table/:id/tags/create", post(create_table_tag))
             .route("/v1/table/:id/tags/delete", post(delete_table_tag))
             .route("/v1/table/:id/tags/update", post(update_table_tag))
+            // Branch operations
+            .route("/v1/table/:id/branches/create", post(create_table_branch))
+            .route("/v1/table/:id/branches/list", post(list_table_branches))
+            .route("/v1/table/:id/branches/delete", post(delete_table_branch))
             // Query plan operations
             .route("/v1/table/:id/explain_plan", post(explain_table_query_plan))
             .route("/v1/table/:id/analyze_plan", post(analyze_table_query_plan))
@@ -153,7 +171,9 @@ impl RestAdapter {
 
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
-            Error::io_source(Box::new(e))
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to bind to {}: {:?}", addr, e),
+            })
         })?;
 
         // Get the actual port (important when port 0 was specified)
@@ -229,8 +249,50 @@ impl RestAdapterHandle {
 }
 
 // ============================================================================
-// Query Parameters
+// Query Parameters and Extractors
 // ============================================================================
+
+/// Optional JSON body extractor that allows empty request bodies.
+/// Similar to sophon's MaybeJson - returns None if body is empty.
+struct MaybeJson<T>(Option<T>);
+
+impl<S, T> FromRequest<S> for MaybeJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send + 'static,
+{
+    type Rejection = Response;
+
+    fn from_request<'life0, 'async_trait>(
+        req: Request,
+        state: &'life0 S,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Self, Self::Rejection>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let bytes = Bytes::from_request(req, state)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+            if bytes.is_empty() {
+                return Ok(Self(None));
+            }
+
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => Ok(Self(Some(value))),
+                Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+            }
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct DelimiterQuery {
@@ -242,73 +304,80 @@ struct PaginationQuery {
     delimiter: Option<String>,
     page_token: Option<String>,
     limit: Option<i32>,
+    include_declared: Option<bool>,
     descending: Option<bool>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeTableQuery {
+    delimiter: Option<String>,
+    with_table_uri: Option<bool>,
+    load_detailed_metadata: Option<bool>,
+    check_declared: Option<bool>,
 }
 
 // ============================================================================
 // Error Conversion
 // ============================================================================
 
-/// Convert Lance errors to HTTP responses
+/// Map a NamespaceError error code to an HTTP status code.
+fn error_code_to_status(code: u32) -> StatusCode {
+    match lance_namespace::error::ErrorCode::from_u32(code) {
+        Some(lance_namespace::error::ErrorCode::NamespaceNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableIndexNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableTagNotFound)
+        | Some(lance_namespace::error::ErrorCode::TransactionNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableVersionNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableColumnNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableBranchNotFound) => StatusCode::NOT_FOUND,
+        Some(lance_namespace::error::ErrorCode::NamespaceAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::TableAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::TableIndexAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::TableTagAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::TableBranchAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::ConcurrentModification) => StatusCode::CONFLICT,
+        Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty)
+        | Some(lance_namespace::error::ErrorCode::InvalidTableState) => StatusCode::CONFLICT,
+        Some(lance_namespace::error::ErrorCode::InvalidInput)
+        | Some(lance_namespace::error::ErrorCode::TableSchemaValidationError) => {
+            StatusCode::BAD_REQUEST
+        }
+        Some(lance_namespace::error::ErrorCode::Unsupported) => StatusCode::NOT_ACCEPTABLE,
+        Some(lance_namespace::error::ErrorCode::PermissionDenied) => StatusCode::FORBIDDEN,
+        Some(lance_namespace::error::ErrorCode::Unauthenticated) => StatusCode::UNAUTHORIZED,
+        Some(lance_namespace::error::ErrorCode::ServiceUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Some(lance_namespace::error::ErrorCode::Throttling) => StatusCode::TOO_MANY_REQUESTS,
+        Some(lance_namespace::error::ErrorCode::Internal) | None => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Convert Lance errors to HTTP responses using the spec's `ErrorResponse` model.
 fn error_to_response(err: Error) -> Response {
     match err {
         Error::Namespace { source, .. } => {
-            let error_msg = source.to_string();
-            if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_msg,
-                            "type": "NamespaceNotFoundException"
-                        }
-                    })),
-                )
-                    .into_response()
-            } else if error_msg.contains("already exists") {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_msg,
-                            "type": "TableAlreadyExistsException"
-                        }
-                    })),
-                )
-                    .into_response()
+            if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
+                let code = ns_err.code().as_u32();
+                let status = error_code_to_status(code);
+                let mut resp = ErrorResponse::new(code as i32);
+                resp.error = Some(ns_err.message().to_string());
+                (status, Json(resp)).into_response()
             } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_msg,
-                            "type": "NamespaceException"
-                        }
-                    })),
-                )
-                    .into_response()
+                let mut resp = ErrorResponse::new(18);
+                resp.error = Some(source.to_string());
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
             }
         }
-        Error::IO { source, .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": source.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": err.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
+        _ => {
+            let mut resp = ErrorResponse::new(18);
+            resp.error = Some(err.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
+        }
     }
 }
 
@@ -414,6 +483,7 @@ async fn list_tables(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -444,11 +514,20 @@ async fn describe_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
+    Query(params): Query<DescribeTableQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    if params.with_table_uri.is_some() {
+        request.with_table_uri = params.with_table_uri;
+    }
+    if params.load_detailed_metadata.is_some() {
+        request.load_detailed_metadata = params.load_detailed_metadata;
+    }
+    if params.check_declared.is_some() {
+        request.check_declared = params.check_declared;
+    }
 
     match backend.describe_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -514,6 +593,33 @@ async fn deregister_table(
 struct CreateTableQuery {
     delimiter: Option<String>,
     mode: Option<String>,
+    properties: Option<String>,
+    storage_options: Option<String>,
+}
+
+fn parse_json_query_param<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+    operation: &str,
+    param_name: &str,
+) -> std::result::Result<Option<T>, Box<Response>> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
+            let response = (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Failed to parse {} {} query parameter as JSON: {}",
+                            operation, param_name, e
+                        )
+                    }
+                })),
+            )
+                .into_response();
+            Box::new(response)
+        }),
+        None => Ok(None),
+    }
 }
 
 async fn create_table(
@@ -523,9 +629,24 @@ async fn create_table(
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
 ) -> Response {
+    let properties =
+        match parse_json_query_param(params.properties.as_deref(), "create_table", "properties") {
+            Ok(properties) => properties,
+            Err(response) => return *response,
+        };
+    let storage_options = match parse_json_query_param(
+        params.storage_options.as_deref(),
+        "create_table",
+        "storage_options",
+    ) {
+        Ok(storage_options) => storage_options,
+        Err(response) => return *response,
+    };
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        properties,
+        storage_options,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -733,6 +854,7 @@ async fn list_table_versions(
         page_token: params.page_token,
         limit: params.limit,
         descending: params.descending,
+        branch: params.branch,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -758,6 +880,7 @@ async fn create_table_version(
         manifest_size: body.manifest_size,
         e_tag: body.e_tag,
         metadata: body.metadata,
+        branch: body.branch,
         ..Default::default()
     };
 
@@ -777,6 +900,7 @@ async fn describe_table_version(
     let request = DescribeTableVersionRequest {
         id: Some(parse_id(&id, query.delimiter.as_deref())),
         version: body.version,
+        branch: body.branch,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -798,6 +922,7 @@ async fn batch_delete_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
         ranges: body.ranges,
+        branch: body.branch,
         ..Default::default()
     };
 
@@ -834,6 +959,7 @@ async fn list_all_tables(
         id: None,
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -885,15 +1011,11 @@ async fn list_table_indices(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    MaybeJson(body): MaybeJson<ListTableIndicesRequest>,
 ) -> Response {
-    let request = ListTableIndicesRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        version: None,
-        page_token: None,
-        limit: None,
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    let mut request = body.unwrap_or_default();
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.list_table_indices(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -978,6 +1100,54 @@ async fn alter_table_alter_columns(
 
     match backend.alter_table_alter_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn alter_table_backfill_columns(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTableBackfillColumnsRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.alter_table_backfill_columns(request).await {
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn refresh_materialized_view(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<RefreshMaterializedViewRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.refresh_materialized_view(request).await {
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_materialized_view(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateMaterializedViewRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.create_materialized_view(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -1097,6 +1267,62 @@ async fn update_table_tag(
     request.identity = extract_identity(&headers);
 
     match backend.update_table_tag(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Branch Operation Handlers
+// ============================================================================
+
+async fn create_table_branch(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateTableBranchRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.create_table_branch(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn list_table_branches(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> Response {
+    let request = ListTableBranchesRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        page_token: params.page_token,
+        limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
+
+    match backend.list_table_branches(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn delete_table_branch(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DeleteTableBranchRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.delete_table_branch(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -1297,15 +1523,25 @@ mod tests {
 
         impl RestServerFixture {
             async fn new() -> Self {
+                Self::build(false).await
+            }
+
+            /// Like [`Self::new`], with managed versioning (table version
+            /// tracking) enabled on the backend.
+            async fn new_managed() -> Self {
+                Self::build(true).await
+            }
+
+            async fn build(managed_versioning: bool) -> Self {
                 let temp_dir = TempDir::new().unwrap();
                 let temp_path = temp_dir.path().to_str().unwrap().to_string();
 
                 // Create DirectoryNamespace backend with manifest enabled
-                let backend = DirectoryNamespaceBuilder::new(&temp_path)
-                    .manifest_enabled(true)
-                    .build()
-                    .await
-                    .unwrap();
+                let mut builder = DirectoryNamespaceBuilder::new(&temp_path).manifest_enabled(true);
+                if managed_versioning {
+                    builder = builder.table_version_tracking_enabled(true);
+                }
+                let backend = builder.build().await.unwrap();
                 let backend = Arc::new(backend);
 
                 // Start REST server with port 0 (OS assigns available port)
@@ -1364,6 +1600,55 @@ mod tests {
             let mut buffer = Vec::new();
             {
                 let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            Bytes::from(buffer)
+        }
+
+        /// Helper to create Arrow IPC data with vector column for testing vector index
+        fn create_test_vector_data(num_rows: usize, dim: i32) -> Bytes {
+            use arrow::array::{FixedSizeListArray, Float32Array, Int32Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dim,
+                    ),
+                    true,
+                ),
+            ]));
+
+            let ids: Vec<i32> = (0..num_rows as i32).collect();
+            let vector_values: Vec<f32> = (0..(num_rows * dim as usize))
+                .map(|i| (i as f32) * 0.01)
+                .collect();
+
+            let vector_field = Arc::new(Field::new("item", DataType::Float32, true));
+            let vectors = FixedSizeListArray::try_new(
+                vector_field,
+                dim,
+                Arc::new(Float32Array::from(vector_values)),
+                None,
+            )
+            .unwrap();
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(vectors)],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
                 writer.write(&batch).unwrap();
                 writer.finish().unwrap();
             }
@@ -1874,6 +2159,17 @@ mod tests {
                 location.contains("test_table"),
                 "Location should contain table name"
             );
+            assert_eq!(response.is_only_declared, None);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
+            describe_req.check_declared = Some(true);
+            let response = fixture
+                .namespace
+                .describe_table(describe_req)
+                .await
+                .expect("Should describe declared table with check_declared");
+            assert_eq!(response.is_only_declared, Some(true));
 
             // Declared tables don't have a version until data is written
             // (version is None for declared tables)
@@ -2207,8 +2503,8 @@ mod tests {
             );
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("is not empty"),
-                "Error should be 'is not empty', got: {}",
+                err_msg.contains("not empty"),
+                "Error should contain 'not empty', got: {}",
                 err_msg
             );
         }
@@ -2308,8 +2604,8 @@ mod tests {
             assert!(result.is_err(), "Cannot create root namespace");
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("Root namespace already exists and cannot be created"),
-                "Error should be 'Root namespace already exists and cannot be created', got: {}",
+                err_msg.contains("already exists") && err_msg.contains("root namespace"),
+                "Error should contain 'already exists' and 'root namespace', got: {}",
                 err_msg
             );
 
@@ -2876,12 +3172,7 @@ mod tests {
                     "context_test_ns".to_string(),
                     "test_table".to_string(),
                 ]),
-                with_table_uri: None,
-                load_detailed_metadata: None,
-                vend_credentials: None,
-                version: None,
-                identity: None,
-                context: None,
+                ..Default::default()
             };
             let result = namespace.describe_table(describe_req).await;
             assert!(result.is_ok(), "Failed to describe table: {:?}", result);
@@ -2976,6 +3267,455 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_branch_param_forwarded_end_to_end() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["branch_fwd_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "branch_fwd_ns".to_string(),
+                            "branch_fwd_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+
+            let id = vec!["branch_fwd_ns".to_string(), "branch_fwd_table".to_string()];
+
+            // Control: no branch succeeds (resolves the main chain).
+            assert!(
+                fixture
+                    .namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(id.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_ok()
+            );
+
+            // list forwards branch as a query param; a bogus branch 404s at the backend.
+            assert!(
+                fixture
+                    .namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(id.clone()),
+                        branch: Some("ghost".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err(),
+                "branch must be forwarded as a query param and honored by the backend"
+            );
+
+            // describe carries branch in the request body; a bogus branch likewise 404s.
+            assert!(
+                fixture
+                    .namespace
+                    .describe_table_version(DescribeTableVersionRequest {
+                        id: Some(id.clone()),
+                        branch: Some("ghost".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err(),
+                "branch must be forwarded in the request body and honored by the backend"
+            );
+
+            fixture.server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_branch_crud_end_to_end() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["branch_crud_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "branch_crud_ns".to_string(),
+                            "branch_crud_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+
+            let id = vec![
+                "branch_crud_ns".to_string(),
+                "branch_crud_table".to_string(),
+            ];
+
+            // create -> list shows it (client -> server -> directory backend)
+            fixture
+                .namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(id.clone()),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let listed = fixture
+                .namespace
+                .list_table_branches(ListTableBranchesRequest {
+                    id: Some(id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                listed.branches.contains_key("dev"),
+                "created branch should appear in list: {:?}",
+                listed.branches
+            );
+
+            // duplicate create -> 409 Conflict
+            let port = fixture.server_handle.port();
+            let client = reqwest::Client::new();
+            let table_path = "branch_crud_ns%24branch_crud_table";
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/{}/branches/create",
+                    port, table_path
+                ))
+                .query(&[("delimiter", "$")])
+                .json(&serde_json::json!({ "name": "dev" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                409,
+                "duplicate branch create should map to 409, got {}",
+                resp.status()
+            );
+
+            // delete -> list no longer shows it
+            fixture
+                .namespace
+                .delete_table_branch(DeleteTableBranchRequest {
+                    id: Some(id.clone()),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let listed = fixture
+                .namespace
+                .list_table_branches(ListTableBranchesRequest {
+                    id: Some(id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                !listed.branches.contains_key("dev"),
+                "deleted branch must not appear in list: {:?}",
+                listed.branches
+            );
+
+            // delete missing -> 404 Not Found (raw HTTP validates TableBranchNotFound -> 404).
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/{}/branches/delete",
+                    port, table_path
+                ))
+                .query(&[("delimiter", "$")])
+                .json(&serde_json::json!({ "name": "dev" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                404,
+                "deleting a missing branch should map to 404, got {}",
+                resp.status()
+            );
+
+            fixture.server_handle.shutdown();
+        }
+
+        /// The managed (manifest-tracked) branch flow over REST: create a
+        /// managed table and a branch through the RestNamespace client, open
+        /// the branch via `from_namespace(...).with_branch`, commit on it,
+        /// check out across branches at an overlapping version number, and
+        /// round-trip a branch-pointing tag. Mirrors the DirectoryNamespace
+        /// e2e to prove the REST layer forwards everything the managed commit
+        /// store needs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_namespace_managed_branch_e2e() {
+            use arrow::array::Int32Array;
+            use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+            use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+            use futures::TryStreamExt;
+            use lance::dataset::builder::DatasetBuilder;
+            use lance::dataset::refs::Ref;
+            use lance::dataset::{Dataset, WriteMode, WriteParams};
+            use lance_namespace::LanceNamespace;
+
+            async fn scan_ids(ds: &Dataset) -> Vec<i32> {
+                let batches: Vec<RecordBatch> = ds
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut ids: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                ids.sort();
+                ids
+            }
+
+            let fixture = RestServerFixture::new_managed().await;
+            let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
+            let table_id = vec!["mb_table".to_string()];
+
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]));
+            let batch = |seed: i32| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![seed]))])
+                    .unwrap()
+            };
+
+            // Managed main: v1 (id=1), v2 (id=2).
+            let mut main_ds = Dataset::write_into_namespace(
+                RecordBatchIterator::new(vec![Ok(batch(1))], schema.clone()),
+                namespace.clone(),
+                table_id.clone(),
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            main_ds
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(2))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // The REST layer must surface managed versioning for the deferred
+            // commit handler to engage.
+            let described = namespace
+                .describe_table(DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                described.managed_versioning,
+                Some(true),
+                "managed_versioning must survive the REST round trip"
+            );
+            let main_chain_len = |ns: Arc<dyn LanceNamespace>, table_id: Vec<String>| async move {
+                ns.list_table_versions(ListTableVersionsRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .versions
+                .len()
+            };
+            assert_eq!(main_chain_len(namespace.clone(), table_id.clone()).await, 2);
+
+            // Branch via the REST client, then open and commit on it.
+            namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(table_id.clone()),
+                    name: "exp".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let mut branch_ds = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .with_branch("exp", None)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(branch_ds.manifest().branch.as_deref(), Some("exp"));
+            assert!(
+                branch_ds
+                    .branch_location()
+                    .path
+                    .as_ref()
+                    .ends_with("tree/exp"),
+                "the branch dataset must be rooted at the branch chain"
+            );
+            branch_ds
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(3))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(branch_ds.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(scan_ids(&branch_ds).await, vec![1, 2, 3]);
+            assert_eq!(
+                main_chain_len(namespace.clone(), table_id.clone()).await,
+                2,
+                "a branch commit must not advance main's chain"
+            );
+
+            // Cross-branch checkout at an overlapping version number must land
+            // on the branch chain (branch numbering continues from the fork
+            // point, so both chains have this version).
+            let overlap_version = branch_ds.version().version;
+            while main_ds.version().version < overlap_version {
+                main_ds
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(batch(100))], schema.clone()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let on_branch = main_ds
+                .checkout_version(Ref::Version(Some("exp".to_string()), Some(overlap_version)))
+                .await
+                .unwrap();
+            assert_eq!(on_branch.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(scan_ids(&on_branch).await, vec![1, 2, 3]);
+            let on_branch_latest = main_ds.checkout_branch("exp").await.unwrap();
+            assert_eq!(on_branch_latest.manifest().branch.as_deref(), Some("exp"));
+
+            // Branch-pointing tag round trip through the builder.
+            main_ds
+                .tags()
+                .create("exp-tag", ("exp", Some(overlap_version)))
+                .await
+                .unwrap();
+            let tag_open = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .with_tag("exp-tag")
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(tag_open.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(tag_open.version().version, overlap_version);
+            assert_eq!(scan_ids(&tag_open).await, vec![1, 2, 3]);
+
+            fixture.server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_list_branches_bodyless_post() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["list_post_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "list_post_ns".to_string(),
+                            "list_post_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(vec![
+                        "list_post_ns".to_string(),
+                        "list_post_table".to_string(),
+                    ]),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let port = fixture.server_handle.port();
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/list_post_ns%24list_post_table/branches/list",
+                    port
+                ))
+                .query(&[("delimiter", "$")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "bodyless list POST should succeed, got {}",
+                resp.status()
+            );
+            let body: ListTableBranchesResponse = resp.json().await.unwrap();
+            assert!(
+                body.branches.contains_key("dev"),
+                "bodyless list should return the branch, got: {:?}",
+                body.branches
+            );
+
+            fixture.server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_describe_table_version() {
             let fixture = RestServerFixture::new().await;
             let table_data = create_test_arrow_data();
@@ -3043,6 +3783,145 @@ mod tests {
             assert_eq!(
                 version_info.version.version, 1,
                 "Latest version should be 1"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_and_list_table_index() {
+            let fixture = RestServerFixture::new().await;
+            let table_data = create_test_arrow_data();
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["index_test_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Create scalar index on 'id' column
+            let create_index_req = CreateTableIndexRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                column: "id".to_string(),
+                index_type: "BTREE".to_string(),
+                name: Some("id_idx".to_string()),
+                ..Default::default()
+            };
+            let result = fixture.namespace.create_table_index(create_index_req).await;
+            assert!(result.is_ok(), "Failed to create index: {:?}", result.err());
+
+            // List indices
+            let list_indices_req = ListTableIndicesRequest {
+                id: Some(vec![
+                    "index_test_ns".to_string(),
+                    "index_test_table".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_indices(list_indices_req).await;
+            assert!(result.is_ok(), "Failed to list indices: {:?}", result.err());
+            let indices = result.unwrap();
+            assert_eq!(indices.indexes.len(), 1, "Should have exactly one index");
+            assert_eq!(
+                indices.indexes[0].index_name, "id_idx",
+                "Index name should match"
+            );
+            assert_eq!(
+                indices.indexes[0].columns,
+                vec!["id"],
+                "Index column should be 'id'"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_vector_index() {
+            let fixture = RestServerFixture::new().await;
+            // Create 256 rows with 8-dimensional vectors for vector index
+            let table_data = create_test_vector_data(256, 8);
+
+            // Create namespace
+            let create_ns_req = CreateNamespaceRequest {
+                id: Some(vec!["vector_index_ns".to_string()]),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_namespace(create_ns_req)
+                .await
+                .unwrap();
+
+            // Create table with vector data
+            let create_table_req = CreateTableRequest {
+                id: Some(vec![
+                    "vector_index_ns".to_string(),
+                    "vector_table".to_string(),
+                ]),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, table_data)
+                .await
+                .unwrap();
+
+            // Create vector index on 'vector' column using IVF_FLAT
+            let mut create_index_req =
+                CreateTableIndexRequest::new("vector".to_string(), "IVF_FLAT".to_string());
+            create_index_req.id = Some(vec![
+                "vector_index_ns".to_string(),
+                "vector_table".to_string(),
+            ]);
+            create_index_req.name = Some("vector_idx".to_string());
+            create_index_req.distance_type = Some("l2".to_string());
+            let result = fixture.namespace.create_table_index(create_index_req).await;
+            assert!(
+                result.is_ok(),
+                "Failed to create vector index: {:?}",
+                result.err()
+            );
+
+            // List indices to verify
+            let list_indices_req = ListTableIndicesRequest {
+                id: Some(vec![
+                    "vector_index_ns".to_string(),
+                    "vector_table".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let result = fixture.namespace.list_table_indices(list_indices_req).await;
+            assert!(result.is_ok(), "Failed to list indices: {:?}", result.err());
+            let indices = result.unwrap();
+            assert_eq!(indices.indexes.len(), 1, "Should have exactly one index");
+            assert_eq!(
+                indices.indexes[0].index_name, "vector_idx",
+                "Index name should match"
+            );
+            assert_eq!(
+                indices.indexes[0].columns,
+                vec!["vector"],
+                "Index column should be 'vector'"
             );
         }
     }

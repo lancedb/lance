@@ -17,7 +17,30 @@ use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncod
 use lance_core::Result;
 
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
-pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
+
+const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
+/// Maximum number of values that any mini-block decoder accepts from page metadata.
+pub(crate) const MAX_CONFIGURABLE_MINIBLOCK_VALUES: u64 = 32768;
+
+fn parse_max_miniblock_values() -> u64 {
+    let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES);
+    val.clamp(1, MAX_CONFIGURABLE_MINIBLOCK_VALUES)
+}
+
+pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
+    std::sync::LazyLock::new(parse_max_miniblock_values);
+
+/// Maximum number of rep/def levels the structural planner should place into
+/// a single mini-block chunk.
+pub fn max_repdef_levels_per_chunk(bits_per_level: u64) -> u64 {
+    debug_assert!(bits_per_level > 0);
+    const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
+    let budgeted_levels = REPDEF_BUDGET_BITS / bits_per_level;
+    budgeted_levels.min(u16::MAX as u64)
+}
 
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
@@ -31,15 +54,43 @@ pub struct MiniBlockCompressed {
     pub num_values: u64,
 }
 
+/// Per-page framing details that can affect a mini-block compressor's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiniBlockCompressionContext {
+    common_chunk_buffers: u64,
+    support_large_chunk: bool,
+    allow_generic_offsets: bool,
+}
+
+impl MiniBlockCompressionContext {
+    /// Creates the framing context supplied by the owning mini-block page.
+    pub fn new(
+        common_chunk_buffers: u64,
+        support_large_chunk: bool,
+        allow_generic_offsets: bool,
+    ) -> Self {
+        Self {
+            common_chunk_buffers,
+            support_large_chunk,
+            allow_generic_offsets,
+        }
+    }
+}
+
 /// Describes the size of a mini-block chunk of data
 ///
 /// Mini-block chunks are designed to be small (just a few disk sectors)
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
-/// To enforce this we limit a chunk to 4Ki values and slightly less than
-/// 8KiB of compressed data.  This means that even in the extreme case
-/// where we have 4 bytes of rep/def then we will have at most 24KiB of
-/// data (values, repetition, and definition) per mini-block.
+/// By default we limit a chunk to 4Ki values and slightly less than
+/// 8KiB of compressed value data.  The byte budget remains the primary
+/// constraint, so only encodings that compress many values into that
+/// budget can use larger value counts when explicitly configured.
+///
+/// The maximum number of values per chunk can be configured via the
+/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.  This is only
+/// useful in extremely bandwidth-limited environments; the default is
+/// appropriate for local disks and same-region cloud object storage.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
@@ -51,10 +102,10 @@ pub struct MiniBlockChunk {
     // then this should be 0 (the number of values will be calculated by subtracting the
     // size of all other chunks from the total size of the page)
     //
-    // For example, 1 would mean there are 2 values in the chunk and 12 would mean there
-    // are 4Ki values in the chunk.
+    // For example, 1 would mean there are 2 values in the chunk and 15 would mean there
+    // are 32Ki values in the chunk.
     //
-    // This must be <= 12 (i.e. <= 4096 values)
+    // This must be <= log2(MAX_MINIBLOCK_VALUES) (i.e. <= 12 at the default of 4096)
     pub log_num_values: u8,
 }
 
@@ -85,5 +136,66 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        page: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_parse_default() {
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+        assert_eq!(parse_max_miniblock_values(), 4096);
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_custom_value() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "256") };
+        assert_eq!(parse_max_miniblock_values(), 256);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_can_raise_to_32k() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "32768") };
+        assert_eq!(parse_max_miniblock_values(), 32768);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_zero_to_one() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "0") };
+        assert_eq!(parse_max_miniblock_values(), 1);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_clamps_above_max() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "99999") };
+        assert_eq!(
+            parse_max_miniblock_values(),
+            MAX_CONFIGURABLE_MINIBLOCK_VALUES
+        );
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_invalid_falls_back_to_default() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "not_a_number") };
+        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
 }

@@ -10,7 +10,7 @@ use lance_linalg::kernels::argmin_opt;
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 #[inline]
 fn argmin_arrow(x: &Float32Array) -> u32 {

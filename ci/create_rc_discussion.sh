@@ -21,7 +21,7 @@ DISCUSSION_TITLE="[VOTE] Release Candidate ${RC_TAG}"
 # Determine vote duration based on release type
 case "$RELEASE_TYPE" in
     major)
-        VOTE_DURATION_DAYS=7
+        VOTE_DURATION_DAYS=3
         ;;
     minor)
         VOTE_DURATION_DAYS=3

@@ -25,41 +25,35 @@ lance-bitpacking = { workspace = true, optional = true }
 bytes.workspace = true
 futures.workspace = true
 fsst.workspace = true
-hex = "0.4.3"
+hex.workspace = true
 itertools.workspace = true
 log.workspace = true
 num-traits.workspace = true
 prost.workspace = true
 hyperloglogplus.workspace = true
-prost-types.workspace = true
-rand.workspace = true
-snafu.workspace = true
-strum = { workspace =true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-bytemuck = { version = "1.14", features = ["extern_crate_alloc"] }
+bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
-lance-testing.workspace = true
 lance-datagen.workspace = true
 arrow-ord.workspace = true
 rand.workspace = true
 rstest.workspace = true
 test-log.workspace = true
 criterion = { workspace = true }
+lance-testing.workspace = true
 rand_xoshiro = { workspace = true }
 proptest.workspace = true
+serial_test.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
+protobuf-src = { workspace = true, optional = true }
 
 [features]
 default = ["lz4", "zstd", "bitpacking"]
@@ -71,6 +65,9 @@ zstd = ["dep:zstd"]
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
+
+[package.metadata.cargo-machete]
+ignored = ["prost"]
 
 [[bench]]
 name = "decoder"

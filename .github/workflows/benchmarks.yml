@@ -3,6 +3,9 @@ name: Run benchmarks
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   dataset:
     timeout-minutes: 30

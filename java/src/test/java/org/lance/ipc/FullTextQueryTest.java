@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.DocumentGranularity;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -39,6 +41,7 @@ public class FullTextQueryTest {
     assertEquals(50, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.OR, q.getOperator());
     assertEquals(0, q.getPrefixLength());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
@@ -46,7 +49,14 @@ public class FullTextQueryTest {
     FullTextQuery.MatchQuery q =
         (FullTextQuery.MatchQuery)
             FullTextQuery.match(
-                "hello", "title", 2.0f, Optional.of(1), 10, FullTextQuery.Operator.AND, 3);
+                "hello",
+                "title",
+                2.0f,
+                Optional.of(1),
+                10,
+                FullTextQuery.Operator.AND,
+                3,
+                DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH, q.getType());
     assertEquals("hello", q.getQueryText());
@@ -56,6 +66,7 @@ public class FullTextQueryTest {
     assertEquals(10, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.AND, q.getOperator());
     assertEquals(3, q.getPrefixLength());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -67,17 +78,20 @@ public class FullTextQueryTest {
     assertEquals("exact match", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(0, q.getSlop());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
   void testPhraseQueryCustomSlop() {
     FullTextQuery.PhraseQuery q =
-        (FullTextQuery.PhraseQuery) FullTextQuery.phrase("ordered terms", "content", 2);
+        (FullTextQuery.PhraseQuery)
+            FullTextQuery.phrase("ordered terms", "content", 2, DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH_PHRASE, q.getType());
     assertEquals("ordered terms", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(2, q.getSlop());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -166,5 +180,163 @@ public class FullTextQueryTest {
     assertEquals(FullTextQuery.Type.BOOLEAN, q.getType());
     assertEquals(1, q.getClauses().size());
     assertEquals(FullTextQuery.Occur.SHOULD, q.getClauses().get(0).getOccur());
+  }
+
+  @Test
+  void testMatchQueryEquality() {
+    FullTextQuery a = FullTextQuery.match("hello", "body");
+    FullTextQuery b = FullTextQuery.match("hello", "body");
+    assertEquals(a, b, "Two MatchQuery instances with the same fields must be equal");
+    assertEquals(
+        a.hashCode(), b.hashCode(), "Equal MatchQuery instances must have the same hashCode");
+  }
+
+  @Test
+  void testMatchQueryInequalityDifferentText() {
+    FullTextQuery a = FullTextQuery.match("hello", "body");
+    FullTextQuery b = FullTextQuery.match("world", "body");
+    assertFalse(a.equals(b), "MatchQuery instances with different queryText must not be equal");
+  }
+
+  @Test
+  void testMatchQueryInequalityDifferentColumn() {
+    FullTextQuery a = FullTextQuery.match("hello", "body");
+    FullTextQuery b = FullTextQuery.match("hello", "title");
+    assertFalse(a.equals(b), "MatchQuery instances with different column must not be equal");
+  }
+
+  @Test
+  void testMatchQueryEqualityWithOptions() {
+    FullTextQuery a =
+        FullTextQuery.match(
+            "hello", "body", 2.0f, Optional.of(1), 10, FullTextQuery.Operator.AND, 2);
+    FullTextQuery b =
+        FullTextQuery.match(
+            "hello", "body", 2.0f, Optional.of(1), 10, FullTextQuery.Operator.AND, 2);
+    assertEquals(a, b, "MatchQuery instances with all custom fields equal must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testMatchQueryInequalityDifferentFuzziness() {
+    FullTextQuery a =
+        FullTextQuery.match(
+            "hello", "body", 1.0f, Optional.of(1), 50, FullTextQuery.Operator.OR, 0);
+    FullTextQuery b =
+        FullTextQuery.match(
+            "hello", "body", 1.0f, Optional.of(2), 50, FullTextQuery.Operator.OR, 0);
+    assertFalse(a.equals(b), "MatchQuery instances with different fuzziness must not be equal");
+  }
+
+  @Test
+  void testPhraseQueryEquality() {
+    FullTextQuery a = FullTextQuery.phrase("hello world", "body");
+    FullTextQuery b = FullTextQuery.phrase("hello world", "body");
+    assertEquals(a, b, "Two PhraseQuery instances with the same fields must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testPhraseQueryEqualityWithSlop() {
+    FullTextQuery a = FullTextQuery.phrase("hello world", "body", 2);
+    FullTextQuery b = FullTextQuery.phrase("hello world", "body", 2);
+    assertEquals(a, b, "PhraseQuery instances with same slop must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testPhraseQueryInequalityDifferentSlop() {
+    FullTextQuery a = FullTextQuery.phrase("hello world", "body", 1);
+    FullTextQuery b = FullTextQuery.phrase("hello world", "body", 2);
+    assertFalse(a.equals(b), "PhraseQuery instances with different slop must not be equal");
+  }
+
+  @Test
+  void testPhraseQueryInequalityDifferentColumn() {
+    FullTextQuery a = FullTextQuery.phrase("hello world", "body");
+    FullTextQuery b = FullTextQuery.phrase("hello world", "title");
+    assertFalse(a.equals(b));
+  }
+
+  @Test
+  void testMultiMatchQueryEquality() {
+    FullTextQuery a = FullTextQuery.multiMatch("hello", Arrays.asList("title", "body"));
+    FullTextQuery b = FullTextQuery.multiMatch("hello", Arrays.asList("title", "body"));
+    assertEquals(a, b, "Two MultiMatchQuery instances with the same fields must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testMultiMatchQueryEqualityWithOperator() {
+    FullTextQuery a =
+        FullTextQuery.multiMatch(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.AND);
+    FullTextQuery b =
+        FullTextQuery.multiMatch(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.AND);
+    assertEquals(a, b);
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testMultiMatchQueryInequalityDifferentOperator() {
+    FullTextQuery a =
+        FullTextQuery.multiMatch(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.AND);
+    FullTextQuery b =
+        FullTextQuery.multiMatch(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.OR);
+    assertFalse(a.equals(b), "MultiMatchQuery instances with different operator must not be equal");
+  }
+
+  @Test
+  void testMultiMatchQueryInequalityDifferentColumns() {
+    FullTextQuery a = FullTextQuery.multiMatch("hello", Arrays.asList("title", "body"));
+    FullTextQuery b = FullTextQuery.multiMatch("hello", Arrays.asList("title", "content"));
+    assertFalse(a.equals(b), "MultiMatchQuery instances with different columns must not be equal");
+  }
+
+  @Test
+  void testMultiMatchQueryEqualityWithBoosts() {
+    FullTextQuery a =
+        FullTextQuery.multiMatch(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(2.0f, 0.5f),
+            FullTextQuery.Operator.OR);
+    FullTextQuery b =
+        FullTextQuery.multiMatch(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(2.0f, 0.5f),
+            FullTextQuery.Operator.OR);
+    assertEquals(a, b, "MultiMatchQuery instances with same boosts must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testMultiMatchQueryInequalityDifferentBoosts() {
+    FullTextQuery a =
+        FullTextQuery.multiMatch(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(2.0f, 0.5f),
+            FullTextQuery.Operator.OR);
+    FullTextQuery b =
+        FullTextQuery.multiMatch(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(1.0f, 0.5f),
+            FullTextQuery.Operator.OR);
+    assertFalse(a.equals(b), "MultiMatchQuery instances with different boosts must not be equal");
+  }
+
+  @Test
+  void testDifferentSubtypesNotEqual() {
+    FullTextQuery match = FullTextQuery.match("hello", "body");
+    FullTextQuery phrase = FullTextQuery.phrase("hello", "body");
+    assertFalse(
+        match.equals(phrase),
+        "MatchQuery and PhraseQuery must not be equal even with same text/column");
   }
 }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use futures::FutureExt;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance::{
     Dataset,
@@ -17,7 +18,7 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
-use lance_index::{DatasetIndexExt, IndexParams, IndexType};
+use lance_index::{IndexParams, IndexType};
 use lance_linalg::distance::{DistanceType, MetricType};
 
 #[derive(Clone, Copy, Debug)]

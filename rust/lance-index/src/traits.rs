@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::fmt::Display;
 
-use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use lance_core::{Error, Result};
+use lance_core::Result;
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
+
+use crate::scalar::inverted::DocumentGranularity;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
@@ -20,6 +19,8 @@ pub struct IndexCriteria<'a> {
     pub has_name: Option<&'a str>,
     /// If true, only consider indices that support FTS
     pub must_support_fts: bool,
+    /// Logical FTS document boundary. FTS lookups default to row documents.
+    pub fts_document_granularity: Option<DocumentGranularity>,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
 }
@@ -44,6 +45,15 @@ impl<'a> IndexCriteria<'a> {
         self
     }
 
+    /// Select an FTS index with the requested logical document boundary.
+    pub fn with_fts_document_granularity(
+        mut self,
+        document_granularity: DocumentGranularity,
+    ) -> Self {
+        self.fts_document_granularity = Some(document_granularity);
+        self
+    }
+
     /// Only consider indices that support exact equality
     ///
     /// This will disqualify, for example, the ngram and inverted indices
@@ -56,6 +66,236 @@ impl<'a> IndexCriteria<'a> {
 
 #[deprecated(since = "0.39.0", note = "Use IndexCriteria instead")]
 pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
+
+/// Options for prewarming an inverted index.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FtsPrewarmOptions {
+    /// If true, prewarm positions along with posting lists.
+    pub with_position: bool,
+    /// Controls whether prewarm requires the full requested FTS working set to
+    /// remain resident when the operation completes.
+    pub mode: FtsPrewarmMode,
+}
+
+impl FtsPrewarmOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: FtsPrewarmMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn best_effort(mut self) -> Self {
+        self.mode = FtsPrewarmMode::BestEffort;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FtsPrewarmMode {
+    #[default]
+    Strict,
+    BestEffort,
+}
+
+impl FtsPrewarmMode {
+    pub fn is_best_effort(self) -> bool {
+        matches!(self, Self::BestEffort)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsPrewarmResult {
+    pub fully_resident: bool,
+    pub diagnostics: Option<FtsPrewarmDiagnostics>,
+}
+
+impl FtsPrewarmResult {
+    pub fn fully_resident() -> Self {
+        Self {
+            fully_resident: true,
+            diagnostics: None,
+        }
+    }
+
+    pub fn partial(diagnostics: FtsPrewarmDiagnostics) -> Self {
+        Self {
+            fully_resident: false,
+            diagnostics: Some(diagnostics),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsPrewarmDiagnostics {
+    pub partition_count: usize,
+    pub failing_segments: Vec<FtsPrewarmSegmentStatus>,
+    pub failing_partitions: Vec<FtsPrewarmPartitionStatus>,
+}
+
+impl FtsPrewarmDiagnostics {
+    pub fn fully_resident(&self) -> bool {
+        self.failing_segments.is_empty() && self.failing_partitions.is_empty()
+    }
+}
+
+impl Display for FtsPrewarmDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FTS prewarm completed without publishing query-ready scalar container, document, and posting state; \
+             {} segment(s) and {} of {} partition(s) are not fully resident",
+            self.failing_segments.len(),
+            self.failing_partitions.len(),
+            self.partition_count
+        )?;
+        if !self.failing_segments.is_empty() || !self.failing_partitions.is_empty() {
+            write!(f, ": ")?;
+            let mut first = true;
+            for segment in &self.failing_segments {
+                if !first {
+                    write!(f, "; ")?;
+                }
+                first = false;
+                write!(f, "{segment}")?;
+            }
+            for partition in &self.failing_partitions {
+                if !first {
+                    write!(f, "; ")?;
+                }
+                first = false;
+                write!(f, "{partition}")?;
+            }
+        }
+        write!(
+            f,
+            ". Likely cause: index cache pressure or insufficient capacity. \
+             Suggested remediation: increase index-cache capacity, reduce the number of FTS \
+             segments assigned to each executor, or adjust placement/segment sizing."
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsPrewarmSegmentStatus {
+    pub segment_id: String,
+    pub scalar_index_container_resident: bool,
+    pub scalar_index_container_matches_prewarmed: bool,
+}
+
+impl FtsPrewarmSegmentStatus {
+    pub fn query_ready(&self) -> bool {
+        self.scalar_index_container_resident && self.scalar_index_container_matches_prewarmed
+    }
+}
+
+impl Display for FtsPrewarmSegmentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut missing = Vec::new();
+        if !self.scalar_index_container_resident {
+            missing.push("resident scalar index container");
+        }
+        if !self.scalar_index_container_matches_prewarmed {
+            missing.push("stable scalar index container identity");
+        }
+        write!(
+            f,
+            "segment {} missing {}",
+            self.segment_id,
+            missing.join(", ")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsPrewarmPartitionStatus {
+    pub segment_id: Option<String>,
+    pub partition_id: u64,
+    pub documents: FtsPrewarmDocumentStatus,
+    pub posting_validation_ready: bool,
+    pub posting_resident: bool,
+    pub position_resident: Option<bool>,
+}
+
+impl FtsPrewarmPartitionStatus {
+    pub fn query_ready(&self) -> bool {
+        self.documents.query_ready()
+            && self.posting_validation_ready
+            && self.posting_resident
+            && self.position_resident.unwrap_or(true)
+    }
+}
+
+impl Display for FtsPrewarmPartitionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut missing = Vec::new();
+        if !self.documents.prewarm_complete {
+            missing.push("document prewarm completion");
+        }
+        if !self.documents.scoring_ready {
+            missing.push("scoring lengths/norms");
+        }
+        if !self.documents.reverse_lookup_ready {
+            missing.push("reverse document lookup");
+        }
+        if !self.documents.projection_resident {
+            missing.push("resident row-address projection");
+        }
+        if !self.posting_validation_ready {
+            missing.push("posting validation");
+        }
+        if !self.posting_resident {
+            missing.push("resident posting lists");
+        }
+        if self.position_resident == Some(false) {
+            missing.push("resident positions");
+        }
+        let segment = self
+            .segment_id
+            .as_deref()
+            .map(|segment_id| format!("segment {segment_id} "))
+            .unwrap_or_default();
+        write!(
+            f,
+            "{}partition {} missing {}",
+            segment,
+            self.partition_id,
+            missing.join(", ")
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FtsPrewarmDocumentStatus {
+    pub prewarm_complete: bool,
+    pub scoring_ready: bool,
+    pub reverse_lookup_ready: bool,
+    pub projection_resident: bool,
+}
+
+impl FtsPrewarmDocumentStatus {
+    pub fn query_ready(&self) -> bool {
+        self.prewarm_complete
+            && self.scoring_ready
+            && self.reverse_lookup_ready
+            && self.projection_resident
+    }
+}
+
+/// Options for prewarming an index.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmOptions {
+    Fts(FtsPrewarmOptions),
+}
 
 /// Additional information about an index
 ///
@@ -76,6 +316,13 @@ pub trait IndexDescription: Send + Sync {
     /// This is the raw metadata information stored in the manifest.  There is one
     /// IndexMetadata for each segment of the index.
     fn metadata(&self) -> &[IndexMetadata];
+
+    /// Returns the physical index segments that make up this logical index.
+    ///
+    /// This is an alias for [`Self::metadata`] with a less ambiguous name.
+    fn segments(&self) -> &[IndexMetadata] {
+        self.metadata()
+    }
 
     /// Returns the index type URL
     ///
@@ -120,172 +367,4 @@ pub trait IndexDescription: Send + Sync {
     /// Returns `None` if file size information is not available for any segment
     /// (for backward compatibility with indices created before file tracking was added).
     fn total_size_bytes(&self) -> Option<u64>;
-}
-
-// Extends Lance Dataset with secondary index.
-#[async_trait]
-pub trait DatasetIndexExt {
-    type IndexBuilder<'a>
-    where
-        Self: 'a;
-
-    /// Create a builder for creating an index on columns.
-    ///
-    /// This returns a builder that can be configured with additional options
-    /// like `name()`, `replace()`, and `train()` before awaiting to execute.
-    ///
-    /// # Parameters
-    /// - `columns`: the columns to build the indices on.
-    /// - `index_type`: specify [`IndexType`].
-    /// - `params`: index parameters.
-    fn create_index_builder<'a>(
-        &'a mut self,
-        columns: &'a [&'a str],
-        index_type: IndexType,
-        params: &'a dyn IndexParams,
-    ) -> Self::IndexBuilder<'a>;
-
-    /// Create indices on columns.
-    ///
-    /// Upon finish, a new dataset version is generated.
-    ///
-    /// Parameters:
-    ///
-    ///  - `columns`: the columns to build the indices on.
-    ///  - `index_type`: specify [`IndexType`].
-    ///  - `name`: optional index name. Must be unique in the dataset.
-    ///            if not provided, it will auto-generate one.
-    ///  - `params`: index parameters.
-    ///  - `replace`: replace the existing index if it exists.
-    ///
-    /// Returns the metadata of the created index.
-    async fn create_index(
-        &mut self,
-        columns: &[&str],
-        index_type: IndexType,
-        name: Option<String>,
-        params: &dyn IndexParams,
-        replace: bool,
-    ) -> Result<IndexMetadata>;
-
-    /// Drop indices by name.
-    ///
-    /// Upon finish, a new dataset version is generated.
-    ///
-    /// Parameters:
-    ///
-    /// - `name`: the name of the index to drop.
-    async fn drop_index(&mut self, name: &str) -> Result<()>;
-
-    /// Prewarm an index by name.
-    ///
-    /// This will load the index into memory and cache it.
-    ///
-    /// Generally, this should only be called when it is known the entire index will
-    /// fit into the index cache.
-    ///
-    /// This is a hint that is not enforced by all indices today.  Some indices may choose
-    /// to ignore this hint.
-    async fn prewarm_index(&self, name: &str) -> Result<()>;
-
-    /// Read all indices of this Dataset version.
-    ///
-    /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
-    /// The cache is invalidated when the dataset version (Manifest) is changed.
-    async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>>;
-
-    /// Loads all the indies of a given UUID.
-    ///
-    /// Note that it is possible to have multiple indices with the same UUID,
-    /// as they are the deltas of the same index.
-    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices().await.map(|indices| {
-            indices
-                .iter()
-                .find(|idx| idx.uuid.to_string() == uuid)
-                .cloned()
-        })
-    }
-
-    /// Loads a specific index with the given index name
-    ///
-    /// Returns
-    /// -------
-    /// - `Ok(indices)`: if the index exists, returns the index.
-    /// - `Ok(vec![])`: if the index does not exist.
-    /// - `Err(e)`: if there is an error loading indices.
-    ///
-    async fn load_indices_by_name(&self, name: &str) -> Result<Vec<IndexMetadata>> {
-        self.load_indices().await.map(|indices| {
-            indices
-                .iter()
-                .filter(|idx| idx.name == name)
-                .cloned()
-                .collect()
-        })
-    }
-
-    /// Loads a specific index with the given index name.
-    /// This function only works for indices that are unique.
-    /// If there are multiple indices sharing the same name, please use [`Self::load_indices_by_name`]
-    ///
-    /// Returns
-    /// -------
-    /// - `Ok(Some(index))`: if the index exists, returns the index.
-    /// - `Ok(None)`: if the index does not exist.
-    /// - `Err(e)`: Index error if there are multiple indexes sharing the same name.
-    ///
-    async fn load_index_by_name(&self, name: &str) -> Result<Option<IndexMetadata>> {
-        let indices = self.load_indices_by_name(name).await?;
-        if indices.is_empty() {
-            Ok(None)
-        } else if indices.len() == 1 {
-            Ok(Some(indices[0].clone()))
-        } else {
-            Err(Error::index(format!(
-                "Found multiple indices of the same name: {:?}, please use load_indices_by_name",
-                indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()
-            )))
-        }
-    }
-
-    /// Describes indexes in a dataset
-    ///
-    /// This method should only access the index metadata and should not load the index into memory.
-    ///
-    /// More detailed information may be available from `index_statistics` but that will require
-    /// loading the index into memory.
-    async fn describe_indices<'a, 'b>(
-        &'a self,
-        criteria: Option<IndexCriteria<'b>>,
-    ) -> Result<Vec<Arc<dyn IndexDescription>>>;
-
-    /// Loads a specific index with the given index name.
-    async fn load_scalar_index<'a, 'b>(
-        &'a self,
-        criteria: IndexCriteria<'b>,
-    ) -> Result<Option<IndexMetadata>>;
-
-    /// Optimize indices.
-    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;
-
-    /// Find index with a given index_name and return its serialized statistics.
-    ///
-    /// If the index does not exist, return Error.
-    async fn index_statistics(&self, index_name: &str) -> Result<String>;
-
-    /// Commit one or more existing physical index segments as a logical index.
-    async fn commit_existing_index_segments(
-        &mut self,
-        index_name: &str,
-        column: &str,
-        segments: Vec<IndexSegment>,
-    ) -> Result<()>;
-
-    async fn read_index_partition(
-        &self,
-        index_name: &str,
-        partition_id: usize,
-        with_vector: bool,
-    ) -> Result<SendableRecordBatchStream>;
 }

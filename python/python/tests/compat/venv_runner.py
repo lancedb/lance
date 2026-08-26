@@ -22,6 +22,7 @@ import struct
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 
 # Enable detailed timing output with DEBUG=1
 DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
@@ -55,17 +56,41 @@ def write_message(stream, obj):
     stream.buffer.flush()
 
 
+@contextmanager
+def temporary_env(overrides):
+    if not overrides:
+        yield
+        return
+
+    sentinel = object()
+    old_values = {key: os.environ.get(key, sentinel) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in old_values.items():
+            if value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main():
     """Main loop that processes method calls until EOF."""
     while True:
         try:
-            # Read request (obj, method_name)
+            # Read request (obj, method_name, env_overrides)
             request = read_message(sys.stdin)
             if request is None:
                 # EOF - parent closed connection
                 break
 
-            obj, method_name = request
+            if len(request) == 2:
+                obj, method_name = request
+                env_overrides = {}
+            else:
+                obj, method_name, env_overrides = request
 
             # Execute method with timing
             start_time = time.time()
@@ -77,7 +102,8 @@ def main():
                 )
 
             method = getattr(obj, method_name)
-            result = method()
+            with temporary_env(env_overrides):
+                result = method()
 
             if DEBUG:
                 exec_time = time.time() - start_time

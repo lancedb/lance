@@ -22,7 +22,7 @@ use datafusion_substrait::substrait::proto::{
         reference_segment::{self, StructField},
     },
     extensions::{
-        SimpleExtensionDeclaration, SimpleExtensionUri,
+        SimpleExtensionDeclaration, SimpleExtensionUrn,
         simple_extension_declaration::{ExtensionFunction, MappingType},
     },
     function_argument::ArgType,
@@ -38,12 +38,14 @@ use tempfile::tempdir;
 
 use crate::Dataset;
 use crate::dataset::scanner::AggregateExpr;
+use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_plan_node_equals};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::InvertedIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 
 /// Helper to create a field reference expression for a column index
@@ -93,17 +95,6 @@ fn create_aggregate_rel(
             git_hash: String::new(),
             producer: "lance-test".to_string(),
         }),
-        #[allow(deprecated)]
-        extension_uris: vec![
-            SimpleExtensionUri {
-                extension_uri_anchor: 1,
-                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
-            },
-            SimpleExtensionUri {
-                extension_uri_anchor: 2,
-                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml".to_string(),
-            },
-        ],
         extensions,
         relations: vec![PlanRel {
             rel_type: Some(datafusion_substrait::substrait::proto::plan_rel::RelType::Root(
@@ -115,7 +106,16 @@ fn create_aggregate_rel(
         }],
         advanced_extensions: None,
         expected_type_urls: vec![],
-        extension_urns: vec![],
+        extension_urns: vec![
+            SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
+            },
+            SimpleExtensionUrn {
+                extension_urn_anchor: 2,
+                urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml".to_string(),
+            },
+        ],
         parameter_bindings: vec![],
         type_aliases: vec![],
     };
@@ -127,9 +127,7 @@ fn create_aggregate_rel(
 fn agg_extension(anchor: u32, name: &str) -> SimpleExtensionDeclaration {
     SimpleExtensionDeclaration {
         mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
-            #[allow(deprecated)]
-            extension_uri_reference: 1,
-            extension_urn_reference: 0,
+            extension_urn_reference: 1,
             function_anchor: anchor,
             name: name.to_string(),
         })),
@@ -267,7 +265,9 @@ async fn test_count_star_single_fragment() {
         vec![],
     );
 
-    // Verify COUNT(*) has empty projection optimization
+    // COUNT(*) is rewritten by CountPushdown into a Final aggregate
+    // over CountFromMaskExec, which answers from manifest metadata + the
+    // deletion mask instead of scanning column data.
     let mut scanner = ds.scan();
     scanner
         .aggregate(AggregateExpr::substrait(agg_bytes.clone()))
@@ -275,8 +275,8 @@ async fn test_count_star_single_fragment() {
     let plan = scanner.create_plan().await.unwrap();
     assert_plan_node_equals(
         plan,
-        "AggregateExec: mode=Single, gby=[], aggr=[count(...)]
-  LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
+  CountFromMask",
     )
     .await
     .unwrap();
@@ -1203,11 +1203,12 @@ async fn test_scanner_count_rows() {
         .unwrap();
     let plan = scanner.create_plan().await.unwrap();
 
-    // COUNT(*) should have empty projection (optimized to not read any columns)
+    // COUNT(*) is rewritten by CountPushdown into a Final aggregate
+    // over CountFromMaskExec.
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CountFromMask",
     )
     .await
     .unwrap();
@@ -1251,6 +1252,264 @@ async fn test_scanner_count_rows_with_filter() {
     assert_eq!(
         batches[0].column(0).as_primitive::<Int64Type>().value(0),
         50
+    );
+}
+
+#[tokio::test]
+async fn test_scanner_count_rows_with_indexed_filter() {
+    // When the filter is fully evaluable by a scalar index that covers
+    // every dataset fragment, the rule rewrites COUNT(*) into a Final
+    // aggregate over CountFromMaskExec, with the ScalarIndexExec
+    // wired in as the prefilter — no LanceRead, no column scan.
+    let mut ds = create_numeric_dataset("memory://test_count_indexed", 2, 50).await;
+    ds.create_index(
+        &["x"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("x < 50").unwrap();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+
+    assert_plan_node_equals(
+        plan.clone(),
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CountFromMask
+    ScalarIndexQuery: query=[x < 50]@x_idx(BTree)",
+    )
+    .await
+    .unwrap();
+
+    let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].column(0).as_primitive::<Int64Type>().value(0),
+        50,
+    );
+}
+
+#[tokio::test]
+async fn test_scanner_count_rows_with_indexed_filter_stable_row_ids() {
+    // Indexed-filter count under stable row ids, with deletions in both
+    // fragments. The rule fires and the cross-fragment count stays correct.
+    let tmp = tempdir().unwrap();
+    let uri = tmp.path().to_str().unwrap();
+    let mut ds = gen_batch()
+        .col("x", array::step::<Int64Type>())
+        .col("y", array::step_custom::<Int64Type>(0, 2))
+        .col("category", array::cycle::<Int64Type>(vec![1, 2, 3]))
+        .into_dataset_with_params(
+            uri,
+            FragmentCount::from(2),
+            FragmentRowCount::from(50),
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    ds.create_index(
+        &["x"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    // Delete one row from each fragment (x=10 in frag 0, x=70 in frag 1).
+    ds.delete("x = 10 OR x = 70").await.unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("x < 100").unwrap();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+
+    assert_plan_node_equals(
+        plan.clone(),
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CountFromMask
+    ScalarIndexQuery: query=[x < 100]@x_idx(BTree)",
+    )
+    .await
+    .unwrap();
+
+    let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    // 100 rows match `x < 100`, minus the two deletions.
+    assert_eq!(
+        batches[0].column(0).as_primitive::<Int64Type>().value(0),
+        98,
+    );
+}
+
+#[tokio::test]
+async fn test_scanner_count_rows_indexed_filter_stable_row_ids_after_compaction() {
+    // Update rewrites a scattered subset of rows under stable row ids; the
+    // rewritten copies keep their stable ids, so compaction folds the surviving
+    // and rewritten halves of a fragment into row-id segments whose ranges
+    // overlap. The indexed-filter count must still see every live row.
+    let tmp = tempdir().unwrap();
+    let uri = tmp.path().to_str().unwrap();
+    let ds = gen_batch()
+        .col("x", array::step::<Int64Type>())
+        .col("category", array::cycle::<Int64Type>(vec![1, 2, 3]))
+        .into_dataset_with_params(
+            uri,
+            FragmentCount::from(2),
+            FragmentRowCount::from(50),
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    // Update every third row (category == 1), scattered across stable ids.
+    let res = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+        .update_where("category = 1")
+        .unwrap()
+        .set("category", "0")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let mut ds = res.new_dataset.as_ref().clone();
+    // Compaction merges the surviving and rewritten fragments, producing a
+    // fragment whose row-id sequence has overlapping segments.
+    crate::dataset::optimize::compact_files(&mut ds, Default::default(), None)
+        .await
+        .unwrap();
+    // Index after compaction: it covers every fragment and no deletions remain,
+    // so the count is answered from the stable-id universe (the path the
+    // overlapping segments corrupt).
+    ds.create_index(
+        &["x"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("x < 100").unwrap();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+
+    assert_plan_node_equals(
+        plan.clone(),
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CountFromMask
+    ScalarIndexQuery: query=[x < 100]@x_idx(BTree)",
+    )
+    .await
+    .unwrap();
+
+    let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    // No deletions remain after compaction; all 100 rows match `x < 100`.
+    assert_eq!(
+        batches[0].column(0).as_primitive::<Int64Type>().value(0),
+        100,
+    );
+}
+
+#[tokio::test]
+async fn test_scanner_count_rows_with_partial_index_coverage() {
+    // Index covers the first two fragments, then a third fragment is
+    // appended. The rule cannot answer the count from the index alone for
+    // the appended fragment, so it emits a split plan: CountFromMaskExec
+    // over the indexed fragments + AggregateExec(Partial)/FilteredReadExec
+    // over the rest, both unioned and summed by AggregateExec(Final).
+    let tmp = tempdir().unwrap();
+    let uri = tmp.path().to_str().unwrap();
+    let mut ds = create_numeric_dataset(uri, 2, 50).await;
+    ds.create_index(
+        &["x"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // Append a third fragment that the index does not cover.
+    let reader = gen_batch()
+        .col("x", array::step_custom::<Int64Type>(100, 1))
+        .col("y", array::step_custom::<Int64Type>(0, 2))
+        .col("category", array::cycle::<Int64Type>(vec![1, 2, 3]))
+        .into_reader_rows(
+            lance_datagen::RowCount::from(50),
+            lance_datagen::BatchCount::from(1),
+        );
+    let ds = Dataset::write(
+        reader,
+        uri,
+        Some(crate::dataset::WriteParams {
+            mode: crate::dataset::WriteMode::Append,
+            max_rows_per_file: 50,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.get_fragments().len(), 3);
+
+    let mut scanner = ds.scan();
+    // `x < 1000` matches every row (values are 0..100 + 100..150). The
+    // pushdown branch contributes the first 100 from the indexed fragments;
+    // the scan branch contributes the 50 rows from the appended fragment.
+    scanner.filter("x < 1000").unwrap();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    // Pin target_parallelism=1 so EnforceDistribution produces a deterministic
+    // plan snapshot regardless of the machine's CPU count.
+    scanner.target_parallelism(1);
+    let plan = scanner.create_plan().await.unwrap();
+
+    assert_plan_node_equals(
+        plan.clone(),
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CoalescePartitionsExec
+    UnionExec
+      CountFromMask
+        ScalarIndexQuery: query=[x < 1000]@x_idx(BTree)
+      AggregateExec: mode=Partial, gby=[], aggr=[count(Int32(1))]
+        LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=x < Int64(1000), refine_filter=--",
+    )
+    .await
+    .unwrap();
+
+    let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].column(0).as_primitive::<Int64Type>().value(0),
+        150,
     );
 }
 
@@ -1339,7 +1598,7 @@ async fn test_scanner_count_rows_with_fts() {
     assert_plan_node_equals(
         plan.clone(),
         "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  MatchQuery: column=text, query=document",
+  MatchQuery: column=text, query=[document]",
     )
     .await
     .unwrap();

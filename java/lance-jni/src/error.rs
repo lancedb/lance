@@ -17,6 +17,7 @@ pub enum JavaExceptionClass {
     UnsupportedOperationException,
     AlreadyInException,
     LanceNamespaceException,
+    LanceTimeoutException,
 }
 
 impl JavaExceptionClass {
@@ -29,6 +30,7 @@ impl JavaExceptionClass {
             // Included for display purposes.  This is not a real exception.
             Self::AlreadyInException => "AlreadyInException",
             Self::LanceNamespaceException => "org/lance/namespace/errors/LanceNamespaceException",
+            Self::LanceTimeoutException => "org/lance/LanceTimeoutException",
         }
     }
 }
@@ -67,6 +69,10 @@ impl Error {
 
     pub fn unsupported_error(message: String) -> Self {
         Self::new(message, JavaExceptionClass::UnsupportedOperationException)
+    }
+
+    pub fn timeout_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::LanceTimeoutException)
     }
 
     pub fn namespace_error(code: u32, message: String) -> Self {
@@ -120,60 +126,29 @@ impl Error {
         env: &mut JNIEnv,
         code: u32,
     ) -> std::result::Result<(), ()> {
-        // Try to find and call the LanceNamespaceException constructor
-        // that takes ErrorCode and message
-        let class_name = "org/lance/namespace/errors/LanceNamespaceException";
-        let error_code_class = "org/lance/namespace/errors/ErrorCode";
+        // Use ErrorFactory.fromErrorCode(code, message) to get the specific exception subclass
+        // (e.g., TableNotFoundException, NamespaceNotFoundException, etc.)
+        let factory_class = "org/lance/namespace/errors/ErrorFactory";
 
-        // Find the ErrorCode.fromCode method
-        let error_code_cls = env.find_class(error_code_class).map_err(|_| ())?;
-        let from_code_method = env
+        let factory_cls = env.find_class(factory_class).map_err(|_| ())?;
+        let from_error_code_method = env
             .get_static_method_id(
-                &error_code_cls,
-                "fromCode",
-                "(I)Lorg/lance/namespace/errors/ErrorCode;",
+                &factory_cls,
+                "fromErrorCode",
+                "(ILjava/lang/String;)Lorg/lance/namespace/errors/LanceNamespaceException;",
             )
             .map_err(|_| ())?;
-        let error_code_obj = unsafe {
-            env.call_static_method_unchecked(
-                &error_code_cls,
-                from_code_method,
-                jni::signature::ReturnType::Object,
-                &[jni::sys::jvalue {
-                    i: code as jni::sys::jint,
-                }],
-            )
-        }
-        .map_err(|_| ())?;
 
-        let error_code = match error_code_obj {
-            jni::objects::JValueGen::Object(obj) => obj,
-            _ => return Err(()),
-        };
-
-        // Find the LanceNamespaceException class
-        let exception_cls = env.find_class(class_name).map_err(|_| ())?;
-
-        // Create message JString
         let message_str = env.new_string(&self.message).map_err(|_| ())?;
 
-        // Find constructor (ErrorCode, String)
-        let constructor = env
-            .get_method_id(
-                &exception_cls,
-                "<init>",
-                "(Lorg/lance/namespace/errors/ErrorCode;Ljava/lang/String;)V",
-            )
-            .map_err(|_| ())?;
-
-        // Create the exception object
         let exception_obj = unsafe {
-            env.new_object_unchecked(
-                &exception_cls,
-                constructor,
+            env.call_static_method_unchecked(
+                &factory_cls,
+                from_error_code_method,
+                jni::signature::ReturnType::Object,
                 &[
                     jni::sys::jvalue {
-                        l: error_code.as_raw(),
+                        i: code as jni::sys::jint,
                     },
                     jni::sys::jvalue {
                         l: message_str.as_raw(),
@@ -183,8 +158,13 @@ impl Error {
         }
         .map_err(|_| ())?;
 
+        let exception = match exception_obj {
+            jni::objects::JValueGen::Object(obj) => obj,
+            _ => return Err(()),
+        };
+
         // Throw the exception
-        env.throw(jni::objects::JThrowable::from(exception_obj))
+        env.throw(jni::objects::JThrowable::from(exception))
             .map_err(|_| ())?;
 
         Ok(())
@@ -201,28 +181,36 @@ impl std::fmt::Display for Error {
 
 impl From<LanceError> for Error {
     fn from(err: LanceError) -> Self {
+        let backtrace_suffix = err
+            .backtrace()
+            .map(|bt| format!("\n\nRust backtrace:\n{}", bt))
+            .unwrap_or_default();
+        let message = format!("{}{}", err, backtrace_suffix);
+
         match &err {
             LanceError::DatasetNotFound { .. }
             | LanceError::DatasetAlreadyExists { .. }
             | LanceError::CommitConflict { .. }
-            | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
-            LanceError::IO { .. } => Self::io_error(err.to_string()),
-            LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
-            LanceError::NotFound { .. } => Self::io_error(err.to_string()),
+            | LanceError::InvalidInput { .. } => Self::input_error(message),
+            LanceError::IO { .. } => Self::io_error(message),
+            LanceError::Timeout { .. } => Self::timeout_error(message),
+            LanceError::NotSupported { .. } => Self::unsupported_error(message),
+            LanceError::NotFound { .. } => Self::io_error(message),
             LanceError::Namespace { source, .. } => {
                 // Try to downcast to NamespaceError and get the error code
                 if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
-                    Self::namespace_error(ns_err.code().as_u32(), ns_err.to_string())
+                    let ns_message = format!("{}{}", ns_err, backtrace_suffix);
+                    Self::namespace_error(ns_err.code().as_u32(), ns_message)
                 } else {
                     log::warn!(
                         "Failed to downcast NamespaceError source, falling back to runtime error. \
                          This may indicate a version mismatch. Source type: {:?}",
                         source
                     );
-                    Self::runtime_error(err.to_string())
+                    Self::runtime_error(message)
                 }
             }
-            _ => Self::runtime_error(err.to_string()),
+            _ => Self::runtime_error(message),
         }
     }
 }
@@ -258,5 +246,106 @@ impl From<JniError> for Error {
 impl From<Utf8Error> for Error {
     fn from(err: Utf8Error) -> Self {
         Self::input_error(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: extract the java_class from an Error via Display output
+    fn java_class(err: &Error) -> &JavaExceptionClass {
+        &err.java_class
+    }
+
+    #[test]
+    fn test_invalid_input_maps_to_illegal_argument() {
+        let lance_err = LanceError::invalid_input("bad input");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::IllegalArgumentException
+        );
+        assert!(jni_err.message.contains("bad input"));
+    }
+
+    #[test]
+    fn test_dataset_not_found_maps_to_illegal_argument() {
+        let lance_err = LanceError::dataset_not_found("my_dataset", "not found".to_string().into());
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::IllegalArgumentException
+        );
+        assert!(jni_err.message.contains("my_dataset"));
+    }
+
+    #[test]
+    fn test_dataset_already_exists_maps_to_illegal_argument() {
+        let lance_err = LanceError::dataset_already_exists("my_dataset");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::IllegalArgumentException
+        );
+        assert!(jni_err.message.contains("my_dataset"));
+    }
+
+    #[test]
+    fn test_commit_conflict_maps_to_illegal_argument() {
+        let lance_err = LanceError::commit_conflict_source(42, "conflict".to_string().into());
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::IllegalArgumentException
+        );
+    }
+
+    #[test]
+    fn test_io_maps_to_ioexception() {
+        let lance_err = LanceError::io("disk failure");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(*java_class(&jni_err), JavaExceptionClass::IOException);
+        assert!(jni_err.message.contains("disk failure"));
+    }
+
+    #[test]
+    fn test_not_supported_maps_to_unsupported() {
+        let lance_err = LanceError::not_supported("nope");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::UnsupportedOperationException
+        );
+        assert!(jni_err.message.contains("nope"));
+    }
+
+    #[test]
+    fn test_not_found_maps_to_ioexception() {
+        let lance_err = LanceError::not_found("missing_uri");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(*java_class(&jni_err), JavaExceptionClass::IOException);
+        assert!(jni_err.message.contains("missing_uri"));
+    }
+
+    #[test]
+    fn test_fallthrough_maps_to_runtime() {
+        let lance_err = LanceError::internal("internal oops");
+        let jni_err: Error = lance_err.into();
+        assert_eq!(*java_class(&jni_err), JavaExceptionClass::RuntimeException);
+        assert!(jni_err.message.contains("internal oops"));
+    }
+
+    #[test]
+    fn test_no_backtrace_suffix_when_backtrace_is_none() {
+        // Without the backtrace feature enabled in lance-core default tests,
+        // backtrace() returns None, so no suffix should be appended.
+        let lance_err = LanceError::io("clean message");
+        let jni_err: Error = lance_err.into();
+        assert!(
+            !jni_err.message.contains("Rust backtrace:"),
+            "Expected no backtrace suffix, got: {}",
+            jni_err.message
+        );
     }
 }

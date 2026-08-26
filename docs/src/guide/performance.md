@@ -21,8 +21,13 @@ The Python/Java logger can be configured with several environment variables:
 
 ## Trace Events
 
-Lance uses tracing to log events. If you are running `pylance` then these events will be emitted to
+Lance uses tracing to log events. If you are running `pylance` then these events will be emitted
 as log messages. For Rust connections you can use the `tracing` crate to capture these events.
+
+Rust tracing targets are listed below. In `pylance` logs, trace events are emitted under a
+`lance::events::` prefix so they can be filtered separately from normal log records. For example,
+`LANCE_LOG="warn,lance::events::object_store::throttle=info"` shows storage throttling events
+without enabling other Lance event logs.
 
 ### File Audit
 
@@ -32,6 +37,31 @@ File audit events are emitted when significant files are created or deleted.
 | ------------------- | --------- | -------------------------------------------------------------------------- |
 | `lance::file_audit` | `mode`    | The mode of I/O operation (create, delete, delete_unverified)              |
 | `lance::file_audit` | `type`    | The type of file affected (manifest, data file, index file, deletion file) |
+
+### Dataset Events
+
+Dataset events are emitted when datasets are loaded, written, committed, deleted, compacted, or cleaned.
+
+| Event                   | Parameter   | Description                                                               |
+| ----------------------- | ----------- | ------------------------------------------------------------------------- |
+| `lance::dataset_events` | `event`     | The dataset event type (loading, writing, committed, deleting, and others) |
+| `lance::dataset_events` | `uri`       | The dataset URI                                                           |
+| `lance::dataset_events` | `mode`      | The write mode                                                            |
+| `lance::dataset_events` | `operation` | The committed transaction operation                                       |
+| `lance::dataset_events` | `predicate` | The delete predicate                                                      |
+| `lance::dataset_events` | `columns`   | The removed columns                                                       |
+
+### Object Store Throttle Events
+
+Object store throttle events are emitted when Lance observes cloud storage throttle responses and
+reduces or retries request rates.
+
+| Event                            | Parameter       | Description                              |
+| -------------------------------- | --------------- | ---------------------------------------- |
+| `lance::object_store::throttle`  | `previous_rate` | The request rate before AIMD adjustment  |
+| `lance::object_store::throttle`  | `new_rate`      | The request rate after AIMD adjustment   |
+| `lance::object_store::throttle`  | `attempt`       | The retry attempt for retry debug events |
+| `lance::object_store::throttle`  | `error`         | The underlying object store throttle error      |
 
 ### I/O Events
 
@@ -64,7 +94,7 @@ debugging query performance.
 Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
 explicitly stated otherwise. Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts. For
-details see [conflict resolution](../format/table/transaction/#conflict-resolution).
+details see [conflict resolution](../format/table/transaction.md/#conflict-resolution).
 
 Most Lance operations will use multiple threads to perform work in parallel. There are two thread
 pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for
@@ -111,7 +141,7 @@ Keys are often a composite of multiple fields and all keys are scoped to the dat
 | Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
 | Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
 | Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
-| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Row Id Sequence   | Dataset URI, fragment_id, row_id_meta            | The row id sequence for a fragment  |
 | Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
 | Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
 | File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |
@@ -159,15 +189,142 @@ working with 1024-dimensional vector embeddings (e.g. 32-bit floats) then 8192 r
 spread that across 16 CPU threads then you would need 512MB of compute memory per scan. You might find working
 with 1024 rows per batch is more appropriate.
 
+#### Tuning remote scans
+
+An ordered dataset scan still overlaps I/O from multiple fragments. `scan_in_order=True` controls the order in
+which batches are returned; it does not make fragment reads sequential. This is why a dataset scan can issue
+more concurrent requests than scanning one fragment directly. The following controls tune different parts of
+the scan:
+
+* `fragment_readahead` limits how many fragments may have reads scheduled concurrently. Set it to `1` to match
+  the fragment-level I/O pattern, then increase it if the storage connection has spare bandwidth.
+* `LANCE_IO_THREADS` limits concurrent storage requests for the process. Cloud stores default to 64, which is
+  intended for high-bandwidth, in-region access and can be too aggressive across regions or over the public
+  internet.
+* `io_buffer_size` limits buffered I/O bytes and applies backpressure when decoding falls behind.
+* `batch_readahead` limits concurrent batch decoding. It does not control the size of storage range requests.
+
+For a bandwidth-constrained remote connection, start with conservative settings and tune upward:
+
+```shell
+LANCE_IO_THREADS=8 python scan.py
+```
+
+```python
+scanner = dataset.scanner(
+    fragment_readahead=1,
+    batch_readahead=2,
+    io_buffer_size=64 * 1024 * 1024,
+)
+for batch in scanner.to_batches():
+    process(batch)
+```
+
+Lance reads encoded pages from storage, so reducing `batch_size` changes the returned and decoded batch sizes
+but may not reduce the initial range request. The first batch can require loading one encoded page for each
+selected column.
+
 In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_compute_threads)` bytes of memory.
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
 
-The above limits refer to limits per-scan. There is an additional limit on the number of IOPS that is applied
-across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
-The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
-with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store.
+### Cloud Store Throttling
+
+Cloud object stores (S3, GCS, Azure) are automatically wrapped with an AIMD (Additive Increase / Multiplicative
+Decrease) rate limiter. When the store returns throttle errors (HTTP 429/503), the request rate decreases
+multiplicatively. During sustained success, the rate increases additively. This applies to all operations
+(reads, writes, deletes, lists) and replaces the old `LANCE_PROCESS_IO_THREADS_LIMIT` process-wide cap.
+
+Local and in-memory stores are **not** throttled.
+
+The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
+over environment variables:
+
+| Setting            | Storage Option Key              | Env Var                         | Default |
+| ------------------ | ------------------------------- | ------------------------------- | ------- |
+| Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
+| Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
+| Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
+| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
+
+These initial settings are balanced and should work for most
+use cases. For example, S3 can typically get up to 5000
+req/s and with these settings we should get there in about
+10 seconds.
+
+## Fragment Sizing
+
+A Lance table is a collection of fragments tracked by a manifest. How you size those fragments
+trades off two classes of work:
+
+- **Manifest-level operations** scale with the *number* of fragments. Every dataset mutation
+  (appends, metadata updates, schema changes, compactions, etc.) rewrites the manifest, so a
+  larger fragment list makes every write slower. Reads pay a similar cost up front: opening a
+  dataset, listing fragments, planning a scan, and resolving transaction conflicts at the
+  dataset level all walk the manifest.
+- **Fragment-level operations** scale with the *size* of a fragment. These include scans
+  against a matching fragment, compaction, updates, deletes, and `merge_insert`. Conflict
+  detection for these operations is also done at the fragment level.
+
+Fewer, larger fragments make manifest-level operations cheap but make each fragment-level
+operation heavier and increase the chance of conflicts when many writers target the same
+fragment. More, smaller fragments do the reverse.
+
+Practical guidance:
+
+- The default of 1M rows per fragment works well up to ~1B rows. Past that, bumping toward
+  ~100M rows per fragment is reasonable, though fragment-count limits are rarely the bottleneck
+  in practice.
+- Tens of thousands of fragments per table is generally fine.
+- Keep individual fragments well under object-store object-size limits (S3 caps at 5 TB, and
+  stores tend to misbehave well before that). 10 GB–100 GB per fragment is a reasonable upper
+  range; 1 TB is a hard ceiling.
+- If you run many concurrent updates, deletes, or `merge_insert` operations, err toward more
+  fragments — conflict detection is per-fragment, so too few fragments leads to excess
+  retries.
+
+## Conflict Handling
+
+Lance supports concurrent operations on the same table using optimistic concurrency control. When two
+operations conflict, one of them must be retried. Retries are handled automatically but they repeat
+work that has already been done, which can hurt throughput. Understanding and minimizing conflicts is
+important for maintaining good performance in write-heavy workloads.
+
+Common sources of conflicts include:
+
+- Concurrent compaction and index building, since both need to modify the same indices
+- Update operations that affect the same fragments, since both need to rewrite the same data files
+
+For more details on which operations conflict with each other, see
+[conflict resolution](../format/table/transaction.md#conflict-resolution).
+
+### Fragment Reuse Index
+
+Compaction is one of the most expensive write operations because it rewrites data files and, by
+default, remaps all indices to reflect the new row addresses. When compaction and index building
+run concurrently, they often conflict because both need to modify the same indices. This typically
+causes the compaction to fail and retry, and repeated failures can cause table layout to degrade
+over time.
+
+The Fragment Reuse Index (FRI) solves this by allowing compaction to skip the index remap step.
+Instead of immediately updating indices, compaction records a mapping from old fragment row
+addresses to new ones. When indices are loaded into the cache, the FRI is applied to translate
+the old row addresses to the current ones. This adds a small cost to index load time but does
+not affect query performance once the index is cached.
+
+This decoupling means compaction and index building no longer conflict, which is especially
+valuable for tables that are continuously ingesting data while also maintaining indices.
+
+To enable the FRI, set `defer_index_remap=True` when compacting:
+
+```python
+dataset.optimize.compact_files(defer_index_remap=True)
+```
+
+For details on the index format and usage patterns, see the
+[Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 
 ## Indexes
 
@@ -323,11 +480,40 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are quantized to binary codes with a configurable number of bits per
-dimension. Each row also stores per-row scale and offset factors (4 bytes each) used for distance correction. Each
-row requires `dimension * num_bits / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For
-example, 100M rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
+scale and offset factors (4 bytes each) used for distance correction. Each row requires
+`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
+rows with 768 dimensions and 1 bit per dimension:
 
 ```
-100M * (768 * 1 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 16) = ~10.8 GiB
 ```
+
+#### AMX Acceleration
+
+On Linux x86_64 with an AMX-FP16 CPU (Intel Granite Rapids / Xeon 6 and newer), a `float16`
+vector column indexed with `dot` distance uses the AMX tile instructions, provided the build
+machine had clang >= 16 or gcc >= 13 to compile the kernel. There is nothing to enable —
+Lance checks the CPU at run time and falls back to the previous implementation everywhere else.
+
+The accelerated paths are also shape-gated, because below these sizes a tile pass costs more
+than it saves and the kernel declines the work:
+
+| Condition | Why |
+|---|---|
+| `float16` vectors, `dot` distance | The kernel is fp16-specific; other types and metrics keep their existing paths |
+| `dimension >= 32` | One tile pass covers 32 dimensions; a shorter vector would be all scalar cleanup |
+| `num_centroids >= 32` | The GEMM steps its centroid loop by 32 and has no partial-tile path |
+
+Anything outside them behaves exactly as it does today, so a small dataset or a low-dimensional
+column simply keeps the previous implementation rather than changing behaviour.
+
+Index build also changes algorithm where all of the above hold: comparing every vector against
+every centroid becomes affordable, so partition assignment is exact instead of approximated with
+a graph search over the centroids. Recall improves, and partition assignments differ from what an
+older build produced.
+
+Set `LANCE_DISABLE_AMX=1` to take the AMX paths out of service without rebuilding — for
+A/B measurement, or to get the previous behaviour back. Because it also moves partition
+assignment back to the approximate path, an index built with it set is not equivalent to one
+built without it; compare recall, not just build time.

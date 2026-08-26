@@ -13,7 +13,6 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::parser::from_json;
 use serde_json::Value;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -61,10 +60,6 @@ impl FtsTableProvider {
 
 #[async_trait]
 impl TableProvider for FtsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -256,16 +251,17 @@ impl FtsQueryUDTFBuilder {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use crate::Dataset;
     use crate::dataset::udtf::FtsQueryUDTFBuilder;
+    use crate::index::DatasetIndexExt;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
+    use lance_index::IndexType;
     use lance_index::scalar::InvertedIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
     use std::sync::Arc;
 
     #[tokio::test]

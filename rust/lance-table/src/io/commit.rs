@@ -39,6 +39,7 @@ use futures::{
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
+use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
@@ -69,6 +70,13 @@ use {
 pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
+/// File name for the JSON version hint file, stored under `_versions/`.
+///
+/// The file contains `{"version":N}` where `N` is the latest committed version
+/// at the time of writing. It enables O(1)/O(k) latest-version lookup via HEAD
+/// requests on object stores where listing is not lexicographically ordered
+/// (e.g. S3 Express, local filesystem) instead of an O(n) listing.
+const VERSION_HINT_FILE: &str = "latest_version_hint.json";
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,22 +91,21 @@ pub enum ManifestNamingScheme {
 
 impl ManifestNamingScheme {
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
-        let directory = base.child(VERSIONS_DIR);
         if is_detached_version(version) {
             // Detached versions should never show up first in a list operation which
             // means it needs to come lexicographically after all attached manifest
             // files and so we add the prefix `d`.  There is no need to invert the
             // version number since detached versions are not part of the version
-            let directory = base.child(VERSIONS_DIR);
-            directory.child(format!(
+            base.clone().join(VERSIONS_DIR).join(format!(
                 "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
             ))
         } else {
+            let directory = base.clone().join(VERSIONS_DIR);
             match self {
-                Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
+                Self::V1 => directory.join(format!("{version}.{MANIFEST_EXTENSION}")),
                 Self::V2 => {
                     let inverted_version = u64::MAX - version;
-                    directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+                    directory.join(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
                 }
             }
         }
@@ -113,6 +120,19 @@ impl ManifestNamingScheme {
             Self::V1 => file_number,
             Self::V2 => file_number.map(|v| u64::MAX - v),
         }
+    }
+
+    /// Parse a detached version from a filename like `d123456.manifest`.
+    ///
+    /// Returns the full version number with the detached mask bit set.
+    pub fn parse_detached_version(filename: &str) -> Option<u64> {
+        if !filename.starts_with(DETACHED_VERSION_PREFIX) {
+            return None;
+        }
+        let without_prefix = &filename[DETACHED_VERSION_PREFIX.len()..];
+        without_prefix
+            .split_once('.')
+            .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
     }
 
     pub fn detect_scheme(filename: &str) -> Option<Self> {
@@ -155,7 +175,7 @@ impl ManifestNamingScheme {
 pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
     object_store
         .inner
-        .list(Some(&dataset_base.child(VERSIONS_DIR)))
+        .list(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
             let res = if let Some(filename) = res.location.filename() {
                 ManifestNamingScheme::detect_scheme(filename) == Some(ManifestNamingScheme::V1)
@@ -219,9 +239,23 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token observed at `path`.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity. The generic
+    /// [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// workflow therefore neither persists nor validates it: COPY and external
+    /// index publication are not atomic, so an otherwise correct equivalent
+    /// materialization can make a stored token stale before it is published.
+    ///
+    /// When present, the token still distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
 }
 
@@ -247,23 +281,303 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     }
 }
 
-/// Get the latest manifest path
+/// Get the latest manifest path.
+///
+/// - Local filesystem: a single directory read.
+/// - Stores where listing is not lexicographically ordered (e.g. S3 Express):
+///   the version hint (read the hint file, then probe higher versions with
+///   HEADs), falling back to a listing if the hint is missing or stale. A full
+///   listing on these stores is O(n) in the number of versions.
+/// - Lexicographically ordered stores (e.g. S3 Standard, GCS): the listing
+///   already resolves the latest version in roughly one request.
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local()
-        && let Ok(Some(location)) = current_manifest_local(base)
+    if object_store.has_direct_local_paths() {
+        if let Ok(Some(location)) = current_manifest_local(base) {
+            return Ok(location);
+        }
+    } else if uses_version_hint(object_store)
+        && let Some(location) = read_version_hint_and_probe(object_store, base).await
     {
         return Ok(location);
     }
 
-    let manifest_files = object_store.list(Some(base.child(VERSIONS_DIR)));
+    resolve_version_from_listing(object_store, base).await
+}
+
+/// JSON body of the version hint file: `{"version":N}`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VersionHint {
+    version: u64,
+}
+
+/// Set `LANCE_USE_VERSION_HINT=0` (or `false`) to globally disable the version
+/// hint — writers stop emitting the hint file and readers stop consulting it,
+/// falling back to plain listing. Intended as a benchmark/escape-hatch knob;
+/// the hint is on by default.
+const VERSION_HINT_ENV: &str = "LANCE_USE_VERSION_HINT";
+
+fn version_hint_globally_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(VERSION_HINT_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Whether this object store benefits from a version hint.
+///
+/// On stores where listing is lexicographically ordered (S3 Standard, GCS,
+/// Azure, ...) the latest version is already resolved in roughly one request,
+/// so the hint would only add a write per commit for nothing. We write (and
+/// read) it only on stores where listing is not lexicographically ordered —
+/// S3 Express and the local filesystem. Can be force-disabled with the
+/// `LANCE_USE_VERSION_HINT=0` environment variable.
+pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
+    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
+}
+
+/// Path to the JSON version hint file for a dataset.
+fn version_hint_path(base: &Path) -> Path {
+    base.clone().join(VERSIONS_DIR).join(VERSION_HINT_FILE)
+}
+
+/// Write the version hint file after a successful commit.
+///
+/// The hint is stored as JSON: `{"version":N}`. This write is best-effort —
+/// failures are logged and ignored, since the hint only accelerates reads and
+/// never affects correctness (readers verify the hinted version and probe
+/// upward from there). It is a no-op for detached versions and for stores that
+/// do not benefit from a hint (see [`uses_version_hint`]).
+pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
+    if is_detached_version(version) || !uses_version_hint(object_store) {
+        return;
+    }
+    let hint_path = version_hint_path(base);
+    let content = serde_json::to_vec(&VersionHint { version }).expect("serialize version hint");
+    if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
+        warn!("Failed to write version hint file for version {version}: {e}");
+    }
+}
+
+/// Read the latest version from the hint file, or `None` if it does not exist
+/// or cannot be parsed.
+async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
+    let bytes = object_store
+        .inner
+        .get(&version_hint_path(base))
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    Some(serde_json::from_slice::<VersionHint>(&bytes).ok()?.version)
+}
+
+/// Read the version hint and probe upward to find the true latest manifest.
+///
+/// Returns `None` if the hint file is missing, the hinted version no longer
+/// exists, or any error occurred — callers should fall back to listing.
+async fn read_version_hint_and_probe(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Option<ManifestLocation> {
+    let hint_version = read_version_from_hint(object_store, base).await?;
+    let (version, scheme, mut probed) = probe_versions_upward(object_store, base, hint_version)
+        .await
+        .ok()
+        .flatten()?;
+    // `probed` is non-empty and its last entry is the highest version found.
+    let (_, meta) = probed.pop()?;
+    Some(ManifestLocation {
+        version,
+        path: scheme.manifest_path(base, version),
+        size: Some(meta.size),
+        naming_scheme: scheme,
+        e_tag: meta.e_tag,
+    })
+}
+
+/// Maximum version gap between the hint and the read version for which we use
+/// the hint-based parallel-HEAD path; beyond this a single (paginated) listing
+/// is cheaper, so callers fall back to it.
+const MAX_HINT_PROBE_GAP: u64 = 1000;
+
+/// Probe `from_version`, then `from_version + 1`, `+ 2`, ... with HEAD requests
+/// until one is not found.
+///
+/// Assumes attached versions are contiguous above `from_version` (true in
+/// practice: every commit increments by one, and cleanup only removes *old*
+/// versions, never ones newer than the latest). A `NotFound` therefore marks
+/// the end of the history.
+///
+/// - `Ok(Some((true_latest_version, naming_scheme, [(version, meta), ...])))`:
+///   the vec covers every version from `from_version` through the true latest
+///   in ascending order.
+/// - `Ok(None)`: `from_version` itself does not exist (a `NotFound` for both
+///   naming schemes) — i.e. the hint pointed past the end.
+/// - `Err(_)`: a transient object-store error was hit, so the probed range may
+///   be incomplete; callers should fall back to a full listing rather than
+///   trust a possibly-stale result.
+async fn probe_versions_upward(
+    object_store: &ObjectStore,
+    base: &Path,
+    from_version: u64,
+) -> Result<
+    Option<(
+        u64,
+        ManifestNamingScheme,
+        Vec<(u64, object_store::ObjectMeta)>,
+    )>,
+> {
+    // Newer datasets use V2; fall back to V1 if the V2 path is not found.
+    let mut scheme = ManifestNamingScheme::V2;
+    let meta = match object_store
+        .inner
+        .head(&scheme.manifest_path(base, from_version))
+        .await
+    {
+        Ok(meta) => meta,
+        Err(ObjectStoreError::NotFound { .. }) => {
+            scheme = ManifestNamingScheme::V1;
+            match object_store
+                .inner
+                .head(&scheme.manifest_path(base, from_version))
+                .await
+            {
+                Ok(meta) => meta,
+                Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut probed = vec![(from_version, meta)];
+    let mut version = from_version;
+    loop {
+        let next = version + 1;
+        match object_store
+            .inner
+            .head(&scheme.manifest_path(base, next))
+            .await
+        {
+            Ok(meta) => {
+                probed.push((next, meta));
+                version = next;
+            }
+            // NotFound means we found the latest version.
+            Err(ObjectStoreError::NotFound { .. }) => break,
+            // A transient error means a newer version might exist that we
+            // failed to observe — surface it so callers fall back to listing.
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Some((version, scheme, probed)))
+}
+
+/// List manifest locations with version `> since_version` using the version
+/// hint, in descending order of version.
+///
+/// Returns `None` if the hint is missing or stale enough that this is not
+/// usable — callers should fall back to a full listing. `Some(vec![])` is the
+/// fast path where the hint confirms there are no new versions.
+async fn list_manifests_since_version_with_hint(
+    object_store: &ObjectStore,
+    base: &Path,
+    since_version: u64,
+) -> Option<Vec<ManifestLocation>> {
+    let hint_version = read_version_from_hint(object_store, base).await?;
+
+    // A reader that is very far behind is cheaper to serve with one paginated
+    // listing than with thousands of HEADs.
+    if hint_version.saturating_sub(since_version) > MAX_HINT_PROBE_GAP {
+        return None;
+    }
+
+    // If the hint is not newer than the read version, the only versions that
+    // could exist are right above it; otherwise start at the hint.
+    let probe_from = if hint_version > since_version {
+        hint_version
+    } else {
+        since_version + 1
+    };
+
+    let (scheme, probed) = match probe_versions_upward(object_store, base, probe_from).await {
+        Ok(Some((_true_latest, scheme, probed))) => (scheme, probed),
+        // Nothing at `probe_from`. If we were probing from the hint, the hint
+        // is stale — bail to a full listing. If we were probing from
+        // `since_version + 1`, there are simply no new versions.
+        Ok(None) if hint_version > since_version => return None,
+        Ok(None) => return Some(Vec::new()),
+        // Transient error: don't trust the hint path, fall back to listing.
+        Err(_) => return None,
+    };
+
+    let mut locations: Vec<ManifestLocation> = probed
+        .into_iter()
+        .filter(|(v, _)| *v > since_version)
+        .map(|(version, meta)| ManifestLocation {
+            version,
+            path: scheme.manifest_path(base, version),
+            size: Some(meta.size),
+            naming_scheme: scheme,
+            e_tag: meta.e_tag,
+        })
+        .collect();
+
+    // Fill the gap between `since_version` and the hint with HEADs (the probe
+    // above already covered `hint_version` and up). The range is contiguous, so
+    // any error here (including a `NotFound`) means we can't trust the hint path
+    // — fall back to a full listing.
+    if hint_version > since_version + 1 {
+        let gap_locations: Vec<ManifestLocation> =
+            futures::stream::iter((since_version + 1)..hint_version)
+                .map(|version| async move {
+                    object_store
+                        .inner
+                        .head(&scheme.manifest_path(base, version))
+                        .await
+                        .map(|meta| ManifestLocation {
+                            version,
+                            path: scheme.manifest_path(base, version),
+                            size: Some(meta.size),
+                            naming_scheme: scheme,
+                            e_tag: meta.e_tag,
+                        })
+                })
+                .buffer_unordered(object_store.io_parallelism())
+                .try_collect()
+                .await
+                .ok()?;
+        locations.extend(gap_locations);
+    }
+
+    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+    Some(locations)
+}
+
+/// Resolve the latest manifest by listing the versions directory.
+async fn resolve_version_from_listing(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Result<ManifestLocation> {
+    let manifest_files = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
-        if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())
-        {
-            future::ready(Ok(Some((scheme, res))))
+        let filename = res.location.filename().unwrap();
+        if let Some(scheme) = ManifestNamingScheme::detect_scheme(filename) {
+            // Only include if we can parse a version (skip detached versions)
+            if scheme.parse_version(filename).is_some() {
+                future::ready(Ok(Some((scheme, res))))
+            } else {
+                future::ready(Ok(None))
+            }
         } else {
             future::ready(Ok(None))
         }
@@ -343,7 +657,9 @@ async fn current_manifest_path(
                 e_tag: current_meta.e_tag,
             })
         }
-        (None, _) => Err(Error::not_found(base.child(VERSIONS_DIR).to_string())),
+        (None, _) => Err(Error::not_found(
+            base.clone().join(VERSIONS_DIR).to_string(),
+        )),
     }
 }
 
@@ -351,10 +667,10 @@ async fn current_manifest_path(
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
 fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
+    let path = lance_io::local::to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
-    let mut latest_entry: Option<(u64, DirEntry)> = None;
+    let mut latest_entry: Option<(u64, DirEntry, ManifestNamingScheme)> = None;
 
     let mut scheme: Option<ManifestNamingScheme> = None;
 
@@ -387,24 +703,22 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             continue;
         };
 
-        if let Some((latest_version, _)) = &latest_entry {
+        if let Some((latest_version, _, _)) = &latest_entry {
             if version > *latest_version {
-                latest_entry = Some((version, entry));
+                latest_entry = Some((version, entry, entry_scheme));
             }
         } else {
-            latest_entry = Some((version, entry));
+            latest_entry = Some((version, entry, entry_scheme));
         }
     }
 
-    if let Some((version, entry)) = latest_entry {
-        let path = Path::from_filesystem_path(entry.path())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if let Some((version, entry, naming_scheme)) = latest_entry {
         let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
-            path,
+            path: naming_scheme.manifest_path(base, version),
             size: Some(metadata.len()),
-            naming_scheme: scheme.unwrap(),
+            naming_scheme,
             e_tag: Some(get_etag(&metadata)),
         }))
     } else {
@@ -417,11 +731,43 @@ fn list_manifests<'a>(
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     object_store
-        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
                     .map(|m| ManifestLocation::try_from(m).ok())
+                    .transpose(),
+            )
+        })
+        .boxed()
+}
+
+/// Convert object metadata to ManifestLocation for detached manifests.
+fn detached_manifest_location_from_meta(
+    meta: object_store::ObjectMeta,
+) -> Option<ManifestLocation> {
+    let filename = meta.location.filename()?;
+    let version = ManifestNamingScheme::parse_detached_version(filename)?;
+    Some(ManifestLocation {
+        version,
+        path: meta.location,
+        size: Some(meta.size),
+        naming_scheme: ManifestNamingScheme::V2,
+        e_tag: meta.e_tag,
+    })
+}
+
+/// List all detached manifest files in the versions directory.
+pub fn list_detached_manifests<'a>(
+    base_path: &Path,
+    object_store: &'a dyn OSObjectStore,
+) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    object_store
+        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
+        .filter_map(|obj_meta| {
+            futures::future::ready(
+                obj_meta
+                    .map(detached_manifest_location_from_meta)
                     .transpose(),
             )
         })
@@ -447,6 +793,27 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait CommitHandler: Debug + Send + Sync {
+    /// Whether a not-found result from [`Self::resolve_version_location`] is
+    /// definitive immediately after a commit attempt.
+    ///
+    /// Handlers backed by an eventually consistent or external source of
+    /// truth should keep the conservative default. This prevents callers from
+    /// deleting files that a newly committed manifest may reference while the
+    /// manifest is not yet visible through the resolver.
+    fn is_version_not_found_definitive(&self) -> bool {
+        false
+    }
+
+    /// Whether an error should still be returned after readback proves that
+    /// the manifest from the current commit attempt landed.
+    ///
+    /// The conservative default preserves errors from custom handlers. Built-in
+    /// object-store handlers override this because their commit errors may be
+    /// ambiguous transport failures whose successful outcome is authoritative.
+    fn propagate_commit_error_after_success(&self) -> bool {
+        true
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
@@ -462,6 +829,37 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &dyn OSObjectStore,
     ) -> Result<ManifestLocation> {
         default_resolve_version(base_path, version, object_store).await
+    }
+
+    /// Check whether an attached manifest version exists without loading it.
+    ///
+    /// The default implementation probes the deterministic manifest path for
+    /// the given naming scheme. Commit handlers with an external source of
+    /// truth should override this method.
+    async fn version_exists(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<bool> {
+        let path = naming_scheme.manifest_path(base_path, version);
+        match object_store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List detached manifest locations.
+    ///
+    /// Returns a stream of detached manifest locations in arbitrary order.
+    fn list_detached_manifest_locations<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        list_detached_manifests(base_path, &object_store.inner).boxed()
     }
 
     /// If `sorted_descending` is `true`, the stream will yield manifests in descending
@@ -523,6 +921,51 @@ pub trait CommitHandler: Debug + Send + Sync {
                 .try_flatten()
                 .boxed()
         }
+    }
+
+    /// List manifest locations with version `> since_version`, in descending
+    /// order of version.
+    ///
+    /// On lexically-ordered stores this is the standard listing with early
+    /// termination. On non-lexically-ordered stores (e.g. S3 Express) it uses
+    /// the version hint to avoid an O(n) listing, falling back to a full
+    /// listing if the hint is missing or stale.
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        if !uses_version_hint(object_store) {
+            return self
+                .list_manifest_locations(base_path, object_store, true)
+                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+                .boxed();
+        }
+
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            let locations = match list_manifests_since_version_with_hint(
+                object_store,
+                &base_path,
+                since_version,
+            )
+            .await
+            {
+                Some(locations) => locations,
+                None => {
+                    let mut locations = list_manifests(&base_path, &object_store.inner)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    locations.retain(|loc| loc.version > since_version);
+                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                    locations
+                }
+            };
+            Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
+        })
+        .try_flatten()
+        .boxed()
     }
 
     /// Commit a manifest.
@@ -681,9 +1124,10 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" => {
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "tos" | "shared-memory" | "goosefs" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
+        "cos" => Ok(Arc::new(TencentCosCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -723,12 +1167,15 @@ pub async fn commit_handler_from_url(
             // Get accessor from the options
             let accessor = options.get_accessor();
 
+            let provider_scheme = storage_options_raw.aws_provider_scheme()?;
+
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
+                provider_scheme,
             )
             .await?;
 
@@ -791,6 +1238,14 @@ pub struct UnsafeCommitHandler;
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 impl CommitHandler for UnsafeCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -813,6 +1268,8 @@ impl CommitHandler for UnsafeCommitHandler {
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
         let res =
             manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
+
+        write_version_hint(object_store, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -853,11 +1310,73 @@ pub trait CommitLock: Debug {
 #[async_trait::async_trait]
 pub trait CommitLease: Send + Sync {
     /// Return the lease, indicating whether the commit was successful.
+    ///
+    /// Implementations should tolerate being called more than once: if a commit
+    /// is cancelled (e.g. by a timeout) while `release` is in flight, a
+    /// best-effort `release(false)` may be issued afterwards from the drop path.
     async fn release(&self, success: bool) -> std::result::Result<(), CommitError>;
 }
 
+/// Guards a [CommitLease] so the lock is released even if the commit future is
+/// dropped (e.g. cancelled by a commit timeout) before reaching an explicit
+/// release.
+///
+/// [CommitLease::release] is async and cannot be awaited from `Drop`, so on the
+/// drop path we spawn a best-effort background task that releases the lock with
+/// `success = false`. Without this, a cancelled commit would leak the lock until
+/// the lease's own TTL expired, blocking other writers in the meantime.
+struct LeaseGuard<L: CommitLease + 'static> {
+    lease: Option<L>,
+}
+
+impl<L: CommitLease + 'static> LeaseGuard<L> {
+    fn new(lease: L) -> Self {
+        Self { lease: Some(lease) }
+    }
+
+    /// Explicitly release the lease, consuming the guard so `Drop` is a no-op.
+    async fn release(mut self, success: bool) -> std::result::Result<(), CommitError> {
+        // Keep the lease inside the guard across the await so that, if this
+        // future is cancelled mid-release (e.g. the release call itself hangs
+        // and the commit timeout fires), `Drop` still issues a best-effort
+        // release. Only clear it once the release has fully completed.
+        let result = {
+            let lease = self
+                .lease
+                .as_ref()
+                .expect("LeaseGuard released more than once");
+            lease.release(success).await
+        };
+        self.lease = None;
+        result
+    }
+}
+
+impl<L: CommitLease + 'static> Drop for LeaseGuard<L> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            // The guard was dropped without an explicit release, meaning the
+            // commit future was cancelled while holding the lock. We can't await
+            // in `Drop`, so spawn a best-effort release. If there is no runtime,
+            // leave the lease for its TTL to reclaim.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = lease.release(false).await;
+                });
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl<T: CommitLock + Send + Sync> CommitHandler for T {
+impl<T: CommitLock + Send + Sync> CommitHandler for T
+where
+    T::Lease: 'static,
+{
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -869,9 +1388,11 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
-        // NOTE: once we have the lease we cannot use ? to return errors, since
-        // we must release the lease before returning.
-        let lease = self.lock(manifest.version).await?;
+        // Hold the lease in a guard so the lock is released even if this future
+        // is cancelled before we reach an explicit release below. The explicit
+        // releases are still preferred since they report the correct success
+        // flag and surface release errors; the guard only covers cancellation.
+        let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
         // Head the location and make sure it's not already committed
         match object_store.inner.head(&path).await {
@@ -897,6 +1418,9 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         lease.release(res.is_ok()).await?;
 
         let res = res?;
+
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             size: Some(res.size as u64),
@@ -908,7 +1432,18 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
 }
 
 #[async_trait::async_trait]
-impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
+impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T>
+where
+    T::Lease: 'static,
+{
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.as_ref().is_version_not_found_definitive()
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        self.as_ref().propagate_commit_error_after_success()
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -940,6 +1475,14 @@ pub struct RenameCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for RenameCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -965,6 +1508,7 @@ impl CommitHandler for RenameCommitHandler {
         {
             Ok(_) => {
                 // Successfully committed
+                write_version_hint(object_store, base_path, manifest.version).await;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
@@ -998,6 +1542,14 @@ pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for ConditionalPutCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1040,6 +1592,8 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 _ => CommitError::OtherError(err.into()),
             })?;
 
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             path,
@@ -1053,6 +1607,45 @@ impl CommitHandler for ConditionalPutCommitHandler {
 impl Debug for ConditionalPutCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConditionalPutCommitHandler").finish()
+    }
+}
+
+/// A read-capable handler that prevents unsafe default commits to Tencent COS.
+///
+/// COS silently ignores its put-if-not-exists header on buckets that have ever
+/// had versioning enabled. Since that bucket history cannot be inferred from
+/// the URI or storage options, using [`ConditionalPutCommitHandler`] here can
+/// let concurrent writers overwrite the same manifest without reporting a
+/// conflict.
+struct TencentCosCommitHandler;
+
+#[async_trait::async_trait]
+impl CommitHandler for TencentCosCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    async fn commit(
+        &self,
+        _manifest: &mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: ManifestWriter,
+        _naming_scheme: ManifestNamingScheme,
+        _transaction: Option<Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        Err(CommitError::OtherError(Error::not_supported(
+            "Default writes to Tencent COS are disabled because COS does not reliably enforce \
+             put-if-not-exists after bucket versioning has ever been enabled. Provide a \
+             distributed commit_lock in Python or a custom CommitHandler in Rust.",
+        )))
+    }
+}
+
+impl Debug for TencentCosCommitHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TencentCosCommitHandler").finish()
     }
 }
 
@@ -1074,6 +1667,8 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use lance_core::utils::tempfile::TempObjDir;
 
     use super::*;
@@ -1127,11 +1722,11 @@ mod tests {
     async fn test_manifest_naming_migration() {
         let object_store = ObjectStore::memory();
         let base = Path::from("base");
-        let versions_dir = base.child(VERSIONS_DIR);
+        let versions_dir = base.clone().join(VERSIONS_DIR);
 
         // Write two v1 files and one v1
         let original_files = vec![
-            versions_dir.child("irrelevant"),
+            versions_dir.clone().join("irrelevant"),
             ManifestNamingScheme::V1.manifest_path(&base, 0),
             ManifestNamingScheme::V2.manifest_path(&base, 1),
         ];
@@ -1144,7 +1739,7 @@ mod tests {
         let expected_files = vec![
             ManifestNamingScheme::V2.manifest_path(&base, 1),
             ManifestNamingScheme::V2.manifest_path(&base, 0),
-            versions_dir.child("irrelevant"),
+            versions_dir.clone().join("irrelevant"),
         ];
         let actual_files = object_store
             .inner
@@ -1168,7 +1763,7 @@ mod tests {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
             tempdir = TempObjDir::default();
-            let path = tempdir.child("base");
+            let path = tempdir.clone().join("base");
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
             (store, path)
@@ -1217,5 +1812,534 @@ mod tests {
         assert_eq!(location.version, 11);
         assert_eq!(location.naming_scheme, naming_scheme);
         assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
+    }
+
+    /// A memory store that reports `list_is_lexically_ordered == false`, like
+    /// S3 Express, so the version-hint paths are exercised.
+    fn non_lexical_memory_store() -> Box<ObjectStore> {
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = false;
+        Box::new(object_store)
+    }
+
+    #[tokio::test]
+    async fn test_write_version_hint() {
+        let base = Path::from("base");
+
+        // No hint is written on lexically-ordered stores (it would not be read).
+        let lexical = ObjectStore::memory();
+        write_version_hint(&lexical, &base, 42).await;
+        assert_eq!(read_version_from_hint(&lexical, &base).await, None);
+
+        let object_store = non_lexical_memory_store();
+        write_version_hint(&object_store, &base, 42).await;
+        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(42));
+
+        // A later commit overwrites the hint.
+        write_version_hint(&object_store, &base, 100).await;
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            Some(100)
+        );
+
+        // Detached versions are never written to the hint.
+        write_version_hint(
+            &object_store,
+            &base,
+            crate::format::DETACHED_VERSION_MASK | 7,
+        )
+        .await;
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            Some(100)
+        );
+
+        // A corrupt / non-JSON hint file is treated as missing.
+        let hint_path = version_hint_path(&base);
+        object_store
+            .put(&hint_path, b"not json".as_slice())
+            .await
+            .unwrap();
+        assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_read_version_hint_and_probe(
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+
+        // No hint file yet.
+        assert!(
+            read_version_hint_and_probe(&object_store, &base)
+                .await
+                .is_none()
+        );
+
+        for version in 1..=5 {
+            object_store
+                .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // Stale hint: should probe forward and find version 5.
+        write_version_hint(&object_store, &base, 3).await;
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+        assert_eq!(location.naming_scheme, naming_scheme);
+
+        // Up-to-date hint: returns version 5 directly.
+        write_version_hint(&object_store, &base, 5).await;
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+
+        // Hint points past the latest version: not usable.
+        write_version_hint(&object_store, &base, 10).await;
+        assert!(
+            read_version_hint_and_probe(&object_store, &base)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_manifests_since_version_with_hint() {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let scheme = ManifestNamingScheme::V2;
+
+        for version in 1..=10 {
+            object_store
+                .put(&scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // No hint yet -> not usable, caller must fall back.
+        assert!(
+            list_manifests_since_version_with_hint(&object_store, &base, 7)
+                .await
+                .is_none()
+        );
+
+        // Hint exactly at the read version -> fast path, nothing new.
+        write_version_hint(&object_store, &base, 10).await;
+        assert!(matches!(
+            list_manifests_since_version_with_hint(&object_store, &base, 10).await,
+            Some(v) if v.is_empty()
+        ));
+
+        // Hint ahead of the read version, with a gap to fill (8, 9) plus probing
+        // from the hint (10). Results are descending by version.
+        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.version).collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
+
+        // Slightly stale hint (points at 8) still probes up to the true latest.
+        write_version_hint(&object_store, &base, 8).await;
+        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.version).collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
+
+        // Hint points past the latest -> not usable, caller falls back.
+        write_version_hint(&object_store, &base, 20).await;
+        assert!(
+            list_manifests_since_version_with_hint(&object_store, &base, 7)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_current_manifest_path_with_hint_non_lexical() {
+        // Simulate S3 Express (non-lexically ordered list) with many versions.
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        for version in 1..=100 {
+            object_store
+                .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // Slightly stale hint: probing from 98 still resolves the true latest.
+        write_version_hint(&object_store, &base, 98).await;
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 100);
+    }
+
+    #[tokio::test]
+    async fn test_current_manifest_path_with_stale_hint_falls_back_to_listing() {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        // Only version 5 exists, but the hint claims version 10.
+        object_store
+            .put(&naming_scheme.manifest_path(&base, 5), b"".as_slice())
+            .await
+            .unwrap();
+        write_version_hint(&object_store, &base, 10).await;
+
+        // The stale hint is ignored; listing finds version 5.
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 5);
+    }
+
+    #[test]
+    fn test_parse_detached_version() {
+        // Valid detached version filenames
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("d12345.manifest"),
+            Some(12345)
+        );
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("d9223372036854775808.manifest"),
+            Some(9223372036854775808)
+        );
+
+        // Invalid: not starting with 'd' prefix
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("12345.manifest"),
+            None
+        );
+
+        // Invalid: regular V2 manifest
+        assert_eq!(
+            ManifestNamingScheme::parse_detached_version("18446744073709551615.manifest"),
+            None
+        );
+
+        // Invalid: no extension
+        assert_eq!(ManifestNamingScheme::parse_detached_version("d12345"), None);
+    }
+
+    #[tokio::test]
+    async fn test_list_detached_manifests() {
+        use crate::format::DETACHED_VERSION_MASK;
+        use futures::TryStreamExt;
+
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        let versions_dir = base.clone().join(VERSIONS_DIR);
+
+        // Create some regular manifests
+        for version in [1, 2, 3] {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // Create some detached manifests
+        let detached_versions: Vec<u64> = vec![
+            100 | DETACHED_VERSION_MASK,
+            200 | DETACHED_VERSION_MASK,
+            300 | DETACHED_VERSION_MASK,
+        ];
+        for version in &detached_versions {
+            let path = versions_dir.clone().join(format!("d{}.manifest", version));
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // List detached manifests
+        let detached_locations: Vec<ManifestLocation> =
+            list_detached_manifests(&base, &object_store.inner)
+                .try_collect()
+                .await
+                .unwrap();
+
+        assert_eq!(detached_locations.len(), 3);
+        for loc in &detached_locations {
+            assert_eq!(loc.naming_scheme, ManifestNamingScheme::V2);
+        }
+
+        let mut found_versions: Vec<u64> = detached_locations.iter().map(|l| l.version).collect();
+        found_versions.sort();
+        let mut expected_versions = detached_versions.clone();
+        expected_versions.sort();
+        assert_eq!(found_versions, expected_versions);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::memory("memory://bucket-a/ds")]
+    #[case::shared_memory("shared-memory://bucket-a/ds")]
+    #[case::s3("s3://bucket-a/ds")]
+    #[case::gs("gs://bucket-a/ds")]
+    #[case::az("az://bucket-a/ds")]
+    #[case::abfss("abfss://bucket-a/ds")]
+    #[case::oss("oss://bucket-a/ds")]
+    #[case::tos("tos://bucket-a/ds")]
+    #[case::goosefs("goosefs://bucket-a/ds")]
+    async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
+        // Every scheme whose store supports atomic put-if-not-exists must
+        // route to ConditionalPutCommitHandler — otherwise concurrent writers
+        // fall through to UnsafeCommitHandler and silently clobber each
+        // other's manifests.
+        let handler = commit_handler_from_url(url, &None).await.unwrap();
+        assert_eq!(
+            format!("{:?}", handler),
+            "ConditionalPutCommitHandler",
+            "{url} should route to ConditionalPutCommitHandler",
+        );
+    }
+
+    /// A [CommitLock] whose lease records whether it was released, so we can
+    /// assert the lock does not leak when the commit future is cancelled.
+    #[derive(Debug)]
+    struct TrackingLock {
+        released: Arc<AtomicBool>,
+    }
+
+    struct TrackingLease {
+        released: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLock for TrackingLock {
+        type Lease = TrackingLease;
+        async fn lock(&self, _version: u64) -> std::result::Result<Self::Lease, CommitError> {
+            Ok(TrackingLease {
+                released: self.released.clone(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLease for TrackingLease {
+        async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A [CommitLock] whose lease hangs on its first `release` call but completes
+    /// on subsequent ones, so we can assert the drop-path best-effort release
+    /// fires when a commit is cancelled *during* the explicit release.
+    #[derive(Debug)]
+    struct HangingReleaseLock {
+        release_calls: Arc<AtomicUsize>,
+        released: Arc<AtomicBool>,
+    }
+
+    struct HangingReleaseLease {
+        release_calls: Arc<AtomicUsize>,
+        released: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLock for HangingReleaseLock {
+        type Lease = HangingReleaseLease;
+        async fn lock(&self, _version: u64) -> std::result::Result<Self::Lease, CommitError> {
+            Ok(HangingReleaseLease {
+                release_calls: self.release_calls.clone(),
+                released: self.released.clone(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLease for HangingReleaseLease {
+        async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
+            // The first release (the explicit one) hangs, simulating a release
+            // call that stalls long enough for the commit timeout to fire. The
+            // best-effort release issued from `Drop` is the second call and
+            // succeeds.
+            if self
+                .release_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                future::pending::<()>().await;
+                unreachable!()
+            }
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A manifest writer that succeeds immediately, so the commit reaches the
+    /// explicit lease release.
+    fn succeeding_manifest_writer<'a>(
+        _object_store: &'a ObjectStore,
+        _manifest: &'a mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _path: &'a Path,
+        _transaction: Option<Transaction>,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        Box::pin(async move { Ok(WriteResult::default()) })
+    }
+
+    fn test_manifest() -> Manifest {
+        use std::collections::HashMap;
+
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::format::DataStorageFormat;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
+            HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_cos_commit_requires_custom_handler() {
+        let handler = commit_handler_from_url("cos://bucket-a/ds", &None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
+
+        let mut manifest = test_manifest();
+        let error = handler
+            .commit(
+                &mut manifest,
+                None,
+                &Path::from("test"),
+                &ObjectStore::memory(),
+                succeeding_manifest_writer,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let CommitError::OtherError(error) = error else {
+            panic!("expected a not-supported commit error");
+        };
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("distributed commit_lock"));
+    }
+
+    /// A manifest writer that never completes, simulating a hung object store.
+    fn hanging_manifest_writer<'a>(
+        _object_store: &'a ObjectStore,
+        _manifest: &'a mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _path: &'a Path,
+        _transaction: Option<Transaction>,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        Box::pin(async move {
+            future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+
+    /// Cancelling a commit (as a commit timeout does) while the lock is held must
+    /// still release the lock; otherwise it leaks until the lease's TTL expires.
+    #[tokio::test]
+    async fn test_commit_lock_released_on_cancellation() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let released = Arc::new(AtomicBool::new(false));
+        let lock = TrackingLock {
+            released: released.clone(),
+        };
+
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        // The commit will hang on the manifest writer while holding the lock.
+        // Cancel it the same way a commit timeout would: drop the future.
+        let commit_fut = lock.commit(
+            &mut manifest,
+            None,
+            &base_path,
+            &object_store,
+            hanging_manifest_writer,
+            ManifestNamingScheme::V2,
+            None,
+        );
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), commit_fut).await;
+        assert!(timed_out.is_err(), "commit should not have completed");
+
+        // The drop guard releases the lock on a background task; wait for it.
+        for _ in 0..100 {
+            if released.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "lock must be released after the commit future is cancelled"
+        );
+    }
+
+    /// Cancelling a commit *during* the explicit lease release (e.g. the release
+    /// call itself hangs and the commit timeout fires) must still release the
+    /// lock via the drop-path best-effort release.
+    #[tokio::test]
+    async fn test_commit_lock_released_on_cancellation_during_release() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let lock = HangingReleaseLock {
+            release_calls: release_calls.clone(),
+            released: released.clone(),
+        };
+
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let mut manifest = test_manifest();
+
+        // The manifest writer succeeds, so the commit reaches the explicit
+        // release, which hangs. Cancel it the same way a commit timeout would.
+        let commit_fut = lock.commit(
+            &mut manifest,
+            None,
+            &base_path,
+            &object_store,
+            succeeding_manifest_writer,
+            ManifestNamingScheme::V2,
+            None,
+        );
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), commit_fut).await;
+        assert!(timed_out.is_err(), "commit should not have completed");
+
+        // The drop guard issues a best-effort release on a background task; wait
+        // for it. This is the second release call (the first one hung).
+        for _ in 0..100 {
+            if released.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "lock must be released even when cancelled during the explicit release"
+        );
+        assert_eq!(
+            release_calls.load(Ordering::SeqCst),
+            2,
+            "expected the hung explicit release plus one best-effort drop release"
+        );
     }
 }

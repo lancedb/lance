@@ -80,13 +80,12 @@ ignore = [
     #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
     #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
-    { id = "RUSTSEC-2021-0153", reason = "`encoding` is used by lindera" },
-    { id = "RUSTSEC-2024-0370", reason = "`proc-macro-error` is used by jieba-rs via include-flate" },
     { id = "RUSTSEC-2024-0436", reason = "`paste` is used by datafusion" },
     { id = "RUSTSEC-2023-0071", reason = "`rsa` is used by opendal via reqsign" },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` used by hf-hub in examples" },
-    { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` unmaintained; awaiting upstream object_store/hyper-rustls migration to rustls-pki-types" },
-    { id = "RUSTSEC-2025-0141", reason = "`bincode` is unmaintained and used by tantivy"},
+    { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
+    { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
+    { id = "RUSTSEC-2026-0002", reason = "`lru` 0.12.x pulled transitively via goosefs-sdk; fixed in >=0.16.3, goosefs-sdk must upgrade first" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -129,6 +128,7 @@ exceptions = [
     # Each entry is the crate and version constraint, and its specific allow
     # list
     #{ allow = ["Zlib"], crate = "adler32" },
+    { allow = ["CDDL-1.0"], crate = "inferno" },
 ]
 
 # Some crates don't have (easily) machine readable licensing information,
@@ -166,6 +166,10 @@ registries = [
 # More documentation about the 'bans' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
+# Lint every dependency declared by a workspace member against the shared
+# `[workspace.dependencies]` table: any crate used by more than one member must
+# go through `workspace = true`, and entries nothing uses are an error.
+workspace-dependencies = { duplicates = "deny", unused = "deny" }
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`

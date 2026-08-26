@@ -7,18 +7,27 @@ use std::iter::once;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::pb::vector_index_details::RabitQuantization;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, ArrayRef, UInt8Array, cast::AsArray};
 use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
+use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
+pub(crate) mod dist_table_quant;
+pub mod ex_dot;
+pub mod prune;
 pub mod rotation;
 pub mod storage;
 pub mod transform;
+
+pub const RABIT_MIN_NUM_BITS: u8 = 1;
+pub const RABIT_MAX_NUM_BITS: u8 = 9;
+pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}
@@ -99,10 +108,49 @@ impl FromStr for RQRotationType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RQBuildParams {
     pub num_bits: u8,
     pub rotation_type: RQRotationType,
+    /// Optional pre-built rotation to reuse instead of generating a fresh random one.
+    ///
+    /// Distributed `IVF_RQ` builds mint one rotation and broadcast it so every segment
+    /// rotates vectors identically. This is transient build-time state and is never
+    /// persisted to the `RabitQuantization` params proto.
+    pub rotation: Option<RabitQuantizationMetadata>,
+}
+
+pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
+    if !(RABIT_MIN_NUM_BITS..=RABIT_MAX_NUM_BITS).contains(&num_bits) {
+        return Err(Error::invalid_input(format!(
+            "IVF_RQ num_bits must be in {}..={}, got {}",
+            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, num_bits
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_supported_rq_num_bits(num_bits: u8) -> Result<()> {
+    validate_rq_num_bits(num_bits)
+}
+
+pub fn rabit_ex_bits(num_bits: u8) -> Result<u8> {
+    validate_rq_num_bits(num_bits)?;
+    Ok(num_bits - RABIT_BINARY_NUM_BITS)
+}
+
+pub fn rabit_binary_code_bytes(rotated_dim: usize) -> usize {
+    rotated_dim.div_ceil(u8::BITS as usize)
+}
+
+pub fn rabit_ex_code_bytes(rotated_dim: usize, ex_bits: u8) -> Result<usize> {
+    let total_bits = rotated_dim.checked_mul(ex_bits as usize).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "IVF_RQ ex-code byte size overflow: rotated_dim={}, ex_bits={}",
+            rotated_dim, ex_bits
+        ))
+    })?;
+    Ok(total_bits.div_ceil(u8::BITS as usize))
 }
 
 impl RQBuildParams {
@@ -110,6 +158,7 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 
@@ -117,6 +166,20 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type,
+            rotation: None,
+        }
+    }
+}
+
+impl From<&RQBuildParams> for RabitQuantization {
+    fn from(value: &RQBuildParams) -> Self {
+        use crate::pb::vector_index_details::rabit_quantization::RotationType;
+        Self {
+            num_bits: value.num_bits as u32,
+            rotation_type: match value.rotation_type {
+                RQRotationType::Fast => RotationType::Fast as i32,
+                RQRotationType::Matrix => RotationType::Matrix as i32,
+            },
         }
     }
 }
@@ -132,6 +195,7 @@ impl Default for RQBuildParams {
         Self {
             num_bits: 1,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 }
@@ -171,5 +235,42 @@ mod tests {
             RQRotationType::Matrix
         );
         assert!("invalid".parse::<RQRotationType>().is_err());
+    }
+
+    #[test]
+    fn test_rabit_num_bits_validation() {
+        validate_rq_num_bits(1).unwrap();
+        validate_rq_num_bits(9).unwrap();
+
+        let err = validate_rq_num_bits(0).unwrap_err();
+        assert!(
+            err.to_string().contains("IVF_RQ num_bits must be in"),
+            "{}",
+            err
+        );
+
+        let err = validate_rq_num_bits(10).unwrap_err();
+        assert!(
+            err.to_string().contains("IVF_RQ num_bits must be in"),
+            "{}",
+            err
+        );
+
+        validate_supported_rq_num_bits(1).unwrap();
+        validate_supported_rq_num_bits(9).unwrap();
+    }
+
+    #[test]
+    fn test_rabit_split_code_byte_sizing() {
+        assert_eq!(rabit_ex_bits(1).unwrap(), 0);
+        assert_eq!(rabit_ex_bits(9).unwrap(), 8);
+
+        assert_eq!(rabit_binary_code_bytes(128), 16);
+        assert_eq!(rabit_binary_code_bytes(129), 17);
+
+        assert_eq!(rabit_ex_code_bytes(128, 0).unwrap(), 0);
+        assert_eq!(rabit_ex_code_bytes(128, 3).unwrap(), 48);
+        assert_eq!(rabit_ex_code_bytes(128, 8).unwrap(), 128);
+        assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }

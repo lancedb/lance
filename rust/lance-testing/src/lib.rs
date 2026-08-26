@@ -2,3 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod datagen;
+#[cfg(target_os = "linux")]
+pub mod pprof;
+pub mod progress;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
@@ -18,6 +18,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_expr::Expr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
@@ -43,12 +44,10 @@ use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 /// to the address (1, 10), assuming the second fragment starts with 10 undeleted rows.
 ///
 /// If any offsets are beyond the end of the dataset, they will be mapped to a tombstone row address.
-pub(super) async fn row_offsets_to_row_addresses(
-    dataset: &Dataset,
+pub async fn row_offsets_to_row_addresses(
+    fragments: &[FileFragment],
     row_indices: &[u64],
 ) -> Result<Vec<u64>> {
-    let fragments = dataset.get_fragments();
-
     let mut perm = permutation::sort(row_indices);
     let sorted_offsets = perm.apply_slice(row_indices);
 
@@ -109,13 +108,14 @@ pub async fn take(
 ) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
     if offsets.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
+        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             projection.output_schema()?,
         )));
     }
 
     // First, convert the dataset offsets into row addresses
-    let addrs = row_offsets_to_row_addresses(dataset, offsets).await?;
+    let fragments = dataset.get_fragments();
+    let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
@@ -170,9 +170,11 @@ async fn do_take_rows(
             let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            return Ok(empty_batch.try_with_column(row_addr_field, row_addr_col)?);
+            return to_logical_json_batch(
+                empty_batch.try_with_column(row_addr_field, row_addr_col)?,
+            );
         }
-        return Ok(empty_batch);
+        return to_logical_json_batch(empty_batch);
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -226,7 +228,7 @@ async fn do_take_rows(
             .with_row_created_at_version(with_row_created_at_version_in_projection)
             .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
         let reader = fragment.open(&physical_schema, read_config).await?;
-        reader.legacy_read_range_as_batch(range).await
+        reader.read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
         let mut batches: Vec<_> = Vec::new();
@@ -297,7 +299,10 @@ async fn do_take_rows(
                 .or_insert_with(|| vec![offset]);
         });
 
-        let fragments = builder.dataset.get_fragments();
+        let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
+        let fragments = builder
+            .dataset
+            .get_existing_fragments_from_ids(&addressed_ids);
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
             let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
             Some((f, row_offset))
@@ -334,14 +339,14 @@ async fn do_take_rows(
             .as_primitive::<UInt64Type>()
             .values();
 
+        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (*addr, i as u64))
+            .collect();
         let remapping_index: UInt64Array = row_addrs
             .iter()
-            .filter_map(|o| {
-                returned_row_addr
-                    .iter()
-                    .position(|id| id == o)
-                    .map(|pos| pos as u64)
-            })
+            .filter_map(|o| addr_to_pos.get(o).copied())
             .collect();
 
         // remapping_index may be greater than the number of rows in one_batch
@@ -374,23 +379,27 @@ async fn do_take_rows(
                 AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
             let row_offset_field =
                 ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
-            batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+            if batch.schema().column_with_name(ROW_OFFSET).is_none() {
+                batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+            }
         }
 
         if builder.with_row_address {
             // inject `ROW_ADDR` column
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+            if batch.schema().column_with_name(ROW_ADDR).is_none() {
+                batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+            }
         }
     }
 
-    Ok(projection.project_batch(batch).await?)
+    to_logical_json_batch(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
+        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             builder.projection.output_schema()?,
         )));
     }
@@ -398,6 +407,10 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     let projection = builder.projection.clone();
 
     do_take_rows(builder, projection).await
+}
+
+fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    Ok(convert_lance_json_to_arrow(&batch)?)
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -450,7 +463,7 @@ fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
     let first_fragment_id = row_addrs[0] >> 32;
 
     for addr in row_addrs.iter().skip(1) {
-        sorted &= *addr > last_offset;
+        sorted &= *addr >= last_offset;
         contiguous &= *addr == last_offset + 1;
         // Contiguous also requires the fragment ids are all the same
         contiguous &= (*addr >> 32) == first_fragment_id;
@@ -468,6 +481,14 @@ pub struct TakeBuilder {
     row_addrs: Option<Vec<u64>>,
     projection: Arc<ProjectionPlan>,
     with_row_address: bool,
+    missing_row_policy: MissingRowPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum MissingRowPolicy {
+    #[default]
+    Ignore,
+    Error,
 }
 
 impl TakeBuilder {
@@ -483,6 +504,7 @@ impl TakeBuilder {
             projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
             dataset,
             with_row_address: false,
+            missing_row_policy: MissingRowPolicy::default(),
         })
     }
 
@@ -498,12 +520,18 @@ impl TakeBuilder {
             projection,
             dataset,
             with_row_address: false,
+            missing_row_policy: MissingRowPolicy::default(),
         })
     }
 
     /// Adds row addresses to the output
     pub fn with_row_address(mut self, with_row_address: bool) -> Self {
         self.with_row_address = with_row_address;
+        self
+    }
+
+    pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
+        self.missing_row_policy = policy;
         self
     }
 
@@ -527,9 +555,22 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                row_ids
-                    .iter()
-                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                let resolved = row_id_index.get_many(row_ids);
+                if self.missing_row_policy == MissingRowPolicy::Error
+                    && let Some(first_missing_index) =
+                        resolved.iter().position(|address| address.is_none())
+                {
+                    let missing_count = resolved.iter().filter(|address| address.is_none()).count();
+                    return Err(Error::invalid_input(format!(
+                        "Could not resolve all requested row IDs: requested {}, resolved {}; first missing row ID {} was deleted or not found",
+                        row_ids.len(),
+                        row_ids.len() - missing_count,
+                        row_ids[first_missing_index]
+                    )));
+                }
+                resolved
+                    .into_iter()
+                    .filter_map(|opt| opt.map(|address| address.into()))
                     .collect::<Vec<_>>()
             } else {
                 row_ids.clone()
@@ -578,8 +619,13 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray};
-    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use arrow_array::{
+        Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray, StructArray,
+    };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
@@ -610,6 +656,72 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    fn nested_arrow_json_batch() -> RecordBatch {
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, false));
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let extra_field =
+            Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(metadata));
+        let item_fields = Fields::from(vec![uri_field, extra_field]);
+        let values = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"codec":"h264"}"#),
+                    None::<&str>,
+                ])) as ArrayRef,
+            ],
+            None,
+        );
+        let item = Arc::new(ArrowField::new("item", DataType::Struct(item_fields), true));
+        let media = ListArray::new(
+            item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            Arc::new(values),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "media",
+            media.data_type().clone(),
+            true,
+        )]));
+
+        RecordBatch::try_new(schema, vec![Arc::new(media) as ArrayRef]).unwrap()
+    }
+
+    fn assert_nested_arrow_json_schema(batch: &RecordBatch) {
+        let schema = batch.schema();
+        let DataType::List(item) = schema.field(0).data_type() else {
+            panic!("expected list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected struct item");
+        };
+        assert!(is_arrow_json_field(&fields[1]));
+    }
+
+    fn assert_first_nested_json_value(batch: &RecordBatch) {
+        let media: &ListArray = batch.column(0).as_list();
+        let values = media.values().as_struct();
+        let uri = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(uri.value(0), "a.jpg");
+        assert!(extra.value(0).contains("h264"));
     }
 
     #[rstest]
@@ -666,6 +778,41 @@ mod test {
             .unwrap(),
             values
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_nested_arrow_json_returns_logical_schema(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = nested_arrow_json_batch();
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: false,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+
+        let values = dataset.take(&[0], projection.clone()).await.unwrap();
+        assert_nested_arrow_json_schema(&values);
+        assert_first_nested_json_value(&values);
+
+        let empty = dataset.take(&[], projection.clone()).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_nested_arrow_json_schema(&empty);
+
+        let values = dataset.take_rows(&[0], projection.clone()).await.unwrap();
+        assert_nested_arrow_json_schema(&values);
+        assert_first_nested_json_value(&values);
+
+        let empty = dataset.take_rows(&[], projection).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_nested_arrow_json_schema(&empty);
     }
 
     #[tokio::test]
@@ -823,6 +970,46 @@ mod test {
         assert_eq!(struct_arr.fields()[2].name(), "size");
         assert_eq!(struct_arr.fields()[3].name(), "blob_id");
         assert_eq!(struct_arr.fields()[4].name(), "blob_uri");
+    }
+
+    #[tokio::test]
+    async fn test_projection_plan_accepts_unloaded_legacy_blob_schema() {
+        let mut metadata = HashMap::new();
+        metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(
+                b"hello".as_slice(),
+            )]))],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        let mut projection = dataset.schema().project(&["blob"]).unwrap();
+        projection.fields[0].unloaded_mut();
+
+        let projection = ProjectionRequest::from_schema(projection)
+            .into_projection_plan(Arc::new(dataset))
+            .unwrap();
+
+        let output_schema = projection.output_schema().unwrap();
+        let blob_field = output_schema.field_with_name("blob").unwrap();
+        let DataType::Struct(fields) = blob_field.data_type() else {
+            panic!("expected blob output schema to be a struct, got {blob_field:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "position");
+        assert_eq!(fields[1].name(), "size");
     }
 
     #[rstest]

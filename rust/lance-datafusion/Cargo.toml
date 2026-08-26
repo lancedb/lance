@@ -13,6 +13,7 @@ version.workspace = true
 arrow = {workspace = true, features = ["ffi"]}
 arrow-array = {workspace = true, features = ["ffi"]}
 arrow-buffer.workspace = true
+arrow-cast.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
@@ -26,28 +27,27 @@ futures.workspace = true
 jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
-lance-datagen.workspace = true
+lance-datagen = {workspace = true, optional = true}
 lance-geo = {workspace = true, optional = true}
 chrono.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
-snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# We only need this to pin the substrait version to 0.62.2 for now.
-substrait = {version = "=0.62.2", optional = true}
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = {version = "2.1", optional = true}
+protobuf-src = { workspace = true, optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
+rstest.workspace = true
 
 [features]
+datagen = ["dep:lance-datagen"]
 geo = ["dep:lance-geo"]
-substrait = ["dep:datafusion-substrait", "dep:substrait"]
+substrait = ["dep:datafusion-substrait"]
 protoc = ["dep:protobuf-src"]
 
 [lints]

@@ -27,7 +27,6 @@ import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
-import org.lance.operation.CreateIndex;
 import org.lance.operation.Overwrite;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
@@ -61,6 +60,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -71,7 +71,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -81,6 +80,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -123,12 +123,15 @@ public class DatasetTest {
   @Test
   void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      // Test default version (V2_0)
+      // Test default version (V2_1)
       String defaultPath = tempDir.resolve("default_version").toString();
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_0, dataset.getLanceFileFormatVersion());
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertFalse(writerVersion.getVersion().isEmpty());
       }
 
       // Test LEGACY version
@@ -143,6 +146,67 @@ public class DatasetTest {
               .execute()) {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
+      }
+
+      // This dataset was written before writer_version was added to the manifest.
+      String historicalPath =
+          Path.of("..", "test_data", "v0.7.5", "with_deletions")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
+        assertTrue(historicalDataset.getWriterVersion().isEmpty());
+      }
+
+      // This fixture was written by lance 2.0.0-beta.1. Reading it through Dataset verifies
+      // that the manifest's prerelease qualifier survives the Rust-to-Java JNI mapping.
+      String prereleasePath =
+          Path.of("..", "test_data", "pre_file_sizes", "index_without_file_sizes")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset prereleaseDataset = Dataset.open(prereleasePath, allocator)) {
+        WriterVersion writerVersion =
+            prereleaseDataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertEquals("2.0.0", writerVersion.getVersion());
+        assertEquals("beta.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+        assertTrue(writerVersion.getBuildMetadata().isEmpty());
+      }
+    }
+  }
+
+  @Test
+  void testWriterVersionPreservesOpaqueAndOptionalFields() {
+    WriterVersion writerVersion =
+        new WriterVersion("custom-writer", "release-2026", "preview.1", "build.42");
+
+    assertEquals("custom-writer", writerVersion.getLibrary());
+    assertEquals("release-2026", writerVersion.getVersion());
+    assertEquals("preview.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+    assertEquals("build.42", writerVersion.getBuildMetadata().orElseThrow(AssertionError::new));
+  }
+
+  @Test
+  void testListManifestLocations(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("manifest_locations").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 1).close();
+
+      List<ManifestLocation> manifests = Dataset.listManifestLocations(datasetPath);
+      assertEquals(2, manifests.size());
+      assertEquals(
+          Set.of(1L, 2L),
+          manifests.stream().map(ManifestLocation::getVersion).collect(Collectors.toSet()));
+      for (ManifestLocation manifest : manifests) {
+        assertTrue(manifest.getPath().contains("manifest_locations/_versions/"));
+        assertFalse(manifest.getPath().startsWith("_versions/"));
+        assertTrue(manifest.getPath().endsWith(".manifest"));
+        assertTrue(manifest.getSizeBytes() > 0);
+        assertNotNull(manifest.getNamingScheme());
       }
     }
   }
@@ -178,6 +242,7 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         ZonedDateTime time1 = dataset.getVersion().getDataTime();
         assertEquals(1, dataset.version());
+        assertEquals(dataset.getVersion().getId(), dataset.version());
         assertTrue(time1.isEqual(before) || time1.isAfter(before));
         assertTrue(time1.isEqual(ZonedDateTime.now()) || time1.isBefore(ZonedDateTime.now()));
         assertEquals(time1.getZone(), Clock.systemUTC().getZone());
@@ -187,8 +252,10 @@ public class DatasetTest {
         try (Dataset dataset2 = testDataset.write(1, 5)) {
           ZonedDateTime time2 = dataset2.getVersion().getDataTime();
           assertEquals(1, dataset.version());
+          assertEquals(dataset.getVersion().getId(), dataset.version());
           assertEquals(2, dataset.latestVersion());
           assertEquals(2, dataset2.version());
+          assertEquals(dataset2.getVersion().getId(), dataset2.version());
           assertEquals(2, dataset2.latestVersion());
           assertTrue(time2.isEqual(before) || time2.isAfter(before));
           assertTrue(time2.isEqual(time1) || time2.isAfter(time1));
@@ -198,6 +265,7 @@ public class DatasetTest {
           ReadOptions options1 = new ReadOptions.Builder().setVersion(1).build();
           try (Dataset datasetV1 = Dataset.open(allocator, datasetPath, options1)) {
             assertEquals(1, datasetV1.version());
+            assertEquals(datasetV1.getVersion().getId(), datasetV1.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(2, datasetV1.latestVersion());
           }
@@ -206,19 +274,23 @@ public class DatasetTest {
           try (Dataset dataset3 = testDataset.write(2, 3)) {
             ZonedDateTime time3 = dataset3.getVersion().getDataTime();
             assertEquals(1, dataset.version());
+            assertEquals(dataset.getVersion().getId(), dataset.version());
             assertTrue(time1.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
             assertEquals(2, dataset2.version());
+            assertEquals(dataset2.getVersion().getId(), dataset2.version());
             assertTrue(time2.isEqual(dataset2.getVersion().getDataTime()));
             assertEquals(3, dataset2.latestVersion());
             assertTrue(time3.isEqual(before) || time3.isAfter(before));
             assertEquals(3, dataset3.version());
+            assertEquals(dataset3.getVersion().getId(), dataset3.version());
             assertEquals(3, dataset3.latestVersion());
 
             // Open dataset with version 2
             ReadOptions options2 = new ReadOptions.Builder().setVersion(2).build();
             try (Dataset datasetV2 = Dataset.open(allocator, datasetPath, options2)) {
               assertEquals(2, datasetV2.version());
+              assertEquals(datasetV2.getVersion().getId(), datasetV2.version());
               assertTrue(time2.isEqual(datasetV2.getVersion().getDataTime()));
               assertEquals(3, datasetV2.latestVersion());
             }
@@ -226,12 +298,16 @@ public class DatasetTest {
             // Open dataset with latest version (3)
             try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
               assertEquals(3, datasetLatest.version());
+              assertEquals(datasetLatest.getVersion().getId(), datasetLatest.version());
               assertTrue(time3.isEqual(datasetLatest.getVersion().getDataTime()));
               assertEquals(3, datasetLatest.latestVersion());
             }
 
             List<Version> versions = dataset.listVersions();
             assertEquals(3, versions.size());
+            assertEquals(3, dataset.getVersionCount());
+            assertEquals(3, dataset2.getVersionCount());
+            assertEquals(3, dataset3.getVersionCount());
             assertEquals(1, versions.get(0).getId());
             assertEquals(2, versions.get(1).getId());
             assertEquals(3, versions.get(2).getId());
@@ -242,6 +318,7 @@ public class DatasetTest {
             assertArrayEquals(versions.toArray(), dataset3.listVersions().toArray());
             dataset.checkoutLatest();
             assertEquals(3, dataset.version());
+            assertEquals(dataset.getVersion().getId(), dataset.version());
             assertTrue(time3.isEqual(dataset.getVersion().getDataTime()));
             assertEquals(3, dataset.latestVersion());
 
@@ -307,8 +384,15 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         dataset.tags().create("tag1", Ref.ofMain());
-        assertEquals(1, dataset.tags().list().size());
-        assertEquals(1, dataset.tags().list().get(0).getVersion());
+        dataset.tags().replaceMetadata("tag1", Map.of("description", "primary tag"));
+        List<Tag> tags = dataset.tags().list();
+        Tag tag1 = tags.get(0);
+        assertEquals(1, tags.size());
+        assertEquals(1, tag1.getVersion());
+        assertEquals(Map.of("description", "primary tag"), tag1.getMetadata());
+        assertTrue(tag1.getCreatedAt().isPresent());
+        assertTrue(tag1.getUpdatedAt().isPresent());
+        assertEquals(tag1.getCreatedAt(), tag1.getUpdatedAt());
         assertEquals(1, dataset.tags().getVersion("tag1"));
       }
 
@@ -322,12 +406,67 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
         assertEquals(2, dataset2.tags().getVersion("tag2"));
-        dataset2.tags().update("tag2", Ref.ofMain(1));
+        dataset2.tags().replaceMetadata("tag2", Map.of("description", "rollback tag"));
+        Instant tag2CreatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getCreatedAt()
+                .orElseThrow();
+        Instant tag2UpdatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getUpdatedAt()
+                .orElseThrow();
+        assertEquals(tag2CreatedAt, tag2UpdatedAt);
         assertEquals(2, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
-        assertEquals(1, dataset2.tags().list().get(1).getVersion());
+        assertEquals(2, dataset2.tags().list().get(1).getVersion());
         assertEquals(1, dataset2.tags().getVersion("tag1"));
+        assertEquals(2, dataset2.tags().getVersion("tag2"));
+        assertEquals(
+            Map.of("description", "rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().update("tag2", Ref.ofMain(1));
+        Instant updatedTag2CreatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getCreatedAt()
+                .orElseThrow();
+        Instant updatedTag2UpdatedAt =
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getUpdatedAt()
+                .orElseThrow();
         assertEquals(1, dataset2.tags().getVersion("tag2"));
+        assertEquals(updatedTag2CreatedAt, tag2CreatedAt);
+        assertFalse(updatedTag2UpdatedAt.isBefore(tag2UpdatedAt));
+        assertEquals(
+            Map.of("description", "rollback tag"),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
+        dataset2.tags().replaceMetadata("tag2", Collections.emptyMap());
+        assertEquals(
+            Collections.emptyMap(),
+            dataset2.tags().list().stream()
+                .filter(tag -> tag.getName().equals("tag2"))
+                .findFirst()
+                .orElseThrow()
+                .getMetadata());
         dataset2.tags().delete("tag2");
         assertEquals(1, dataset2.tags().list().size());
         assertEquals(1, dataset2.tags().list().get(0).getVersion());
@@ -347,6 +486,7 @@ public class DatasetTest {
 
         try (Dataset branch = dataset2.createBranch("branch", Ref.ofMain(2))) {
           branch.tags().create("tag_on_branch", Ref.ofBranch("branch"));
+          branch.tags().replaceMetadata("tag_on_branch", Map.of("description", "branch tag"));
           assertEquals(2, dataset2.tags().getVersion("tag_on_branch"));
           List<Tag> tags = dataset2.tags().list();
           Optional<Tag> tagOptional =
@@ -357,6 +497,7 @@ public class DatasetTest {
           assertTrue(tagOptional.isPresent());
           assertEquals(2, tagOptional.get().getVersion());
           assertEquals(Optional.of("branch"), tagOptional.get().getBranch());
+          assertEquals(Map.of("description", "branch tag"), tagOptional.get().getMetadata());
 
           dataset2.tags().update("tag1", Ref.ofBranch("branch"));
           tags = dataset2.tags().list();
@@ -453,7 +594,12 @@ public class DatasetTest {
         assertEquals(1, dataset1.version());
         Path manifestPath = datasetPath.resolve("_versions");
         try (Stream<Path> fileStream = Files.list(manifestPath)) {
-          assertEquals(1, fileStream.count());
+          // Ignore the version hint file, which is not a manifest.
+          assertEquals(
+              1,
+              fileStream
+                  .filter(p -> !p.getFileName().toString().startsWith("latest_version_hint"))
+                  .count());
           ByteBuffer manifestBuffer = readManifest(manifestPath.resolve("1.manifest"));
           try (Dataset dataset2 = testDataset.write(1, 5)) {
             assertEquals(2, dataset2.version());
@@ -578,6 +724,40 @@ public class DatasetTest {
       nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testAlterColumnsCastType(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Widen "id" from Int32 to Int64. The cast target type is a parameterized ArrowType, which
+      // must survive the trip to the native side; regression test for a dropped cast that left the
+      // stored type unchanged.
+      ColumnAlteration widenId =
+          new ColumnAlteration.Builder("id").castTo(new ArrowType.Int(64, true)).build();
+      dataset.alterColumns(Collections.singletonList(widenId));
+
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id").getType());
+
+      // A cast combined with rename must apply both.
+      ColumnAlteration renameAndWiden =
+          new ColumnAlteration.Builder("id")
+              .rename("id_long")
+              .castTo(new ArrowType.Int(64, true))
+              .build();
+      dataset.alterColumns(Collections.singletonList(renameAndWiden));
+
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
     }
   }
 
@@ -802,6 +982,23 @@ public class DatasetTest {
   }
 
   @Test
+  void testDropRejectsNonDatasetPath(@TempDir Path tempDir) {
+    Path warehouse = tempDir.resolve("warehouse");
+    Path tablePath = warehouse.resolve("table.lance");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tablePath.toString());
+      dataset = testDataset.createEmptyDataset();
+
+      // Pointing at the parent of a dataset must not wipe out the whole warehouse.
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Dataset.drop(warehouse.toString(), new HashMap<>()));
+      assertTrue(Files.exists(tablePath));
+    }
+  }
+
+  @Test
   void testTake(@TempDir Path tempDir) throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -824,6 +1021,99 @@ public class DatasetTest {
               assertNotNull(result.getVector("name").getObject(i));
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testTakeRows(@TempDir Path tempDir) throws IOException, ClosedChannelException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        // For a single-fragment dataset, physical row IDs match row offsets
+        List<Long> rowIds = Arrays.asList(1L, 4L);
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.takeRows(rowIds, columns)) {
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot result = reader.getVectorSchemaRoot();
+            assertNotNull(result);
+            assertEquals(rowIds.size(), result.getRowCount());
+
+            for (int i = 0; i < rowIds.size(); i++) {
+              assertEquals(rowIds.get(i).intValue(), result.getVector("id").getObject(i));
+              assertNotNull(result.getVector("name").getObject(i));
+            }
+          }
+        }
+
+        // Verify input order is preserved: reversed input yields reversed output
+        List<Long> reversed = Arrays.asList(4L, 1L);
+        try (ArrowReader reader = dataset2.takeRows(reversed, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(4, result.getVector("id").getObject(0));
+          assertEquals(1, result.getVector("id").getObject(1));
+        }
+
+        // Empty row IDs should be rejected
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(Collections.emptyList(), columns);
+            });
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(null, columns);
+            });
+      }
+    }
+  }
+
+  @Test
+  void testSample(@TempDir Path tempDir) throws IOException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 20)) {
+        // Sample without fragment filter
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.sample(5, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(5, result.getRowCount());
+          assertEquals(2, result.getSchema().getFields().size());
+        }
+
+        // Sample with fragment filter
+        List<Fragment> fragments = dataset2.getFragments();
+        assertFalse(fragments.isEmpty());
+        List<Integer> fragmentIds =
+            fragments.stream().map(f -> f.getId()).collect(Collectors.toList());
+        try (ArrowReader reader = dataset2.sample(3, columns, Optional.of(fragmentIds))) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(3, result.getRowCount());
+        }
+
+        // Sample more than available rows returns all rows
+        try (ArrowReader reader = dataset2.sample(100, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(20, result.getRowCount());
         }
       }
     }
@@ -859,7 +1149,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(100, dataset2.calculateDataSize());
+        assertEquals(108, dataset2.calculateDataSize());
       }
     }
   }
@@ -1283,6 +1573,33 @@ public class DatasetTest {
   }
 
   @Test
+  void testHasStableRowIds(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("uses_stable_row_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // Dataset created without stable row IDs
+      try (Dataset ds = testDataset.createEmptyDataset()) {
+        assertFalse(ds.hasStableRowIds());
+      }
+    }
+
+    String datasetPathWithRowIds = tempDir.resolve("uses_stable_row_ids_enabled").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPathWithRowIds);
+
+      // Dataset created with stable row IDs
+      try (Dataset ds =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())) {
+        assertTrue(ds.hasStableRowIds());
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -1699,12 +2016,34 @@ public class DatasetTest {
                   assertEquals("branch1", branch1Meta.getName());
                   assertEquals(2, branch1Meta.getParentVersion());
                   assertFalse(branch1Meta.getParentBranch().isPresent());
+                  assertEquals(1, branch1Meta.getBranchIdentifier().size());
+                  assertEquals(2, branch1Meta.getBranchIdentifier().get(0).getVersion());
+                  assertFalse(branch1Meta.getBranchIdentifier().get(0).getUuid().isEmpty());
                   assertTrue(branch1Meta.getCreateAt() > 0);
                   assertTrue(branch1Meta.getManifestSize() > 0);
+                  assertEquals(Collections.emptyMap(), branch1Meta.getMetadata());
+                  mainV2
+                      .branches()
+                      .replaceMetadata("branch1", Map.of("description", "long-lived branch"));
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Map.of("description", "long-lived branch"), b1.get().getMetadata());
+                  mainV2.branches().replaceMetadata("branch1", Collections.emptyMap());
+                  branches = branch2V4.branches().list();
+                  b1 = branches.stream().filter(b -> b.getName().equals("branch1")).findFirst();
+                  assertTrue(b1.isPresent());
+                  assertEquals(Collections.emptyMap(), b1.get().getMetadata());
 
                   assertEquals("branch2", branch2Meta.getName());
                   assertTrue(branch2Meta.getParentBranch().isPresent());
                   assertEquals("branch1", branch2Meta.getParentBranch().get());
+                  assertEquals(2, branch2Meta.getBranchIdentifier().size());
+                  assertEquals(
+                      branch1Meta.getBranchIdentifier().get(0),
+                      branch2Meta.getBranchIdentifier().get(0));
+                  assertEquals(3, branch2Meta.getBranchIdentifier().get(1).getVersion());
+                  assertFalse(branch2Meta.getBranchIdentifier().get(1).getUuid().isEmpty());
                   assertEquals(3, branch2Meta.getParentVersion());
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
@@ -1773,18 +2112,20 @@ public class DatasetTest {
           OptimizeOptions options = OptimizeOptions.builder().numIndicesToMerge(0).build();
           dsAppended.optimizeIndices(options);
 
-          List<Index> afterIndexes = dsAppended.getIndexes();
-          Index idIndexAfter =
-              afterIndexes.stream()
+          List<Index> idIndexes =
+              dsAppended.getIndexes().stream()
                   .filter(idx -> "id_idx".equals(idx.name()))
-                  .findFirst()
-                  .orElse(null);
-          assertNotNull(idIndexAfter);
-          List<Integer> afterFragments = idIndexAfter.fragments().orElse(Collections.emptyList());
+                  .collect(Collectors.toList());
+          assertEquals(
+              2,
+              idIndexes.size(),
+              "append-only optimize must add a delta segment instead of merging");
 
-          assertTrue(afterFragments.contains(0));
-          assertTrue(afterFragments.contains(1));
-          assertEquals(2, afterFragments.size());
+          Set<Integer> coveredFragments =
+              idIndexes.stream()
+                  .flatMap(idx -> idx.fragments().orElse(Collections.emptyList()).stream())
+                  .collect(Collectors.toSet());
+          assertEquals(new HashSet<>(Arrays.asList(0, 1)), coveredFragments);
         }
       }
     }
@@ -1801,6 +2142,16 @@ public class DatasetTest {
       assertEquals(0L, blobFile.size());
       assertArrayEquals(new byte[0], blobFile.read());
       blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeNullBlobPreservesSelection(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testTakeNullBlobPreservesSelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(15L), "blobs");
+      assertEquals(1, blobs.size());
+      assertNull(blobs.get(0));
     }
   }
 
@@ -1914,7 +2265,23 @@ public class DatasetTest {
         assertTrue(desc.getRowsIndexed() > 0, "rowsIndexed should be positive");
         assertNotNull(desc.getMetadata(), "Metadata list should not be null");
         assertFalse(desc.getMetadata().isEmpty(), "Metadata list should not be empty");
+        assertEquals(
+            desc.getMetadata(), desc.getSegments(), "segments alias should match metadata");
         assertNotNull(desc.getDetailsJson(), "Details JSON should not be null");
+
+        assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
+        assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
+        assertTrue(
+            desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
+            "segment size should be positive");
+        assertEquals(
+            desc.getSegments().get(0).getSizeBytes(),
+            desc.getTotalSizeBytes(),
+            "single-segment size should equal the logical index size");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
@@ -1922,7 +2289,13 @@ public class DatasetTest {
           assertTrue(indexDesc.getRowsIndexed() > 0, "rowsIndexed should be positive");
           assertNotNull(indexDesc.getMetadata(), "Metadata list should not be null");
           assertFalse(indexDesc.getMetadata().isEmpty(), "Metadata list should not be empty");
+          assertEquals(
+              indexDesc.getMetadata(),
+              indexDesc.getSegments(),
+              "segments alias should match metadata");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
+          assertTrue(
+              indexDesc.getTotalSizeBytes().orElse(0L) > 0, "total index size should be positive");
         }
       }
     }
@@ -1944,72 +2317,36 @@ public class DatasetTest {
 
         ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        UUID uuid = UUID.randomUUID();
 
         // 2. partially create index
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                      .withIndexName("test_index")
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
 
         // then no index should have been created
         assertFalse(
             dataset.listIndexes().contains("test_index"),
             "Partially created index should not present");
 
-        // 3. merge metadata, which will still not be committed
-        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
+        // 3. commit the index
+        List<Index> committed = dataset.commitExistingIndexSegments("test_index", "name", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains("test_index"));
 
-        // 4. commit the index
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals("name"))
-                .findAny()
-                .orElseThrow(() -> new RuntimeException("Cannot find 'name' field for TestDataset"))
-                .getId();
+        List<Index> indexes = dataset.getIndexes();
+        assertTrue(indexes.stream().anyMatch(idx -> idx.name().equals("test_index")));
 
-        long datasetVersion = dataset.version();
+        dataset.dropIndex("test_index");
 
-        Index index =
-            Index.builder()
-                .uuid(uuid)
-                .name("test_index")
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(fragments.stream().map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(datasetVersion)
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            // new dataset should contain that index
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains("test_index"));
-
-            List<Index> indexes = newDataset.getIndexes();
-            assertTrue(indexes.stream().anyMatch(idx -> idx.name().equals("test_index")));
-
-            newDataset.dropIndex("test_index");
-
-            List<String> indexNamesAfterDrop = newDataset.listIndexes();
-            assertFalse(indexNamesAfterDrop.contains("test_index"));
-          }
-        }
+        List<String> indexNamesAfterDrop = dataset.listIndexes();
+        assertFalse(indexNamesAfterDrop.contains("test_index"));
       }
     }
   }

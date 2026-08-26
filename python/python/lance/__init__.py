@@ -6,10 +6,21 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from . import io, log
-from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
+from .blob import (
+    Blob,
+    BlobArray,
+    BlobColumn,
+    BlobDescriptor,
+    BlobDescriptorArrayBuilder,
+    BlobFile,
+    DedicatedBlobWriter,
+    PackedBlobWriter,
+    blob_array,
+    blob_field,
+)
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -27,17 +38,36 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    CleanupCandidateFile,
+    CleanupExplanation,
+    CleanupReferencedBranch,
+    CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
+    FtsToken,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
+    simd_info,
+    tokenize,
+)
+from .mem_wal import (
+    CompactedSsTable,
+    ExecutionPlan,
+    LsmPointLookupPlanner,
+    LsmScanner,
+    LsmVectorSearchPlanner,
+    ShardingField,
+    ShardingSpec,
+    ShardSnapshot,
+    ShardWriter,
+    evaluate_sharding_spec,
 )
 from .namespace import (
     DescribeTableRequest,
     LanceNamespace,
-    LanceNamespaceStorageOptionsProvider,
 )
+from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -56,19 +86,27 @@ __all__ = [
     "BlobArray",
     "BlobColumn",
     "BlobFile",
+    "DedicatedBlobWriter",
+    "BlobDescriptorArrayBuilder",
+    "PackedBlobWriter",
+    "BlobDescriptor",
     "blob_array",
     "blob_field",
+    "CleanupCandidateFile",
+    "CleanupExplanation",
+    "CleanupReferencedBranch",
+    "CleanupStats",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
+    "FtsToken",
     "Index",
     "IndexFile",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",
     "LanceScanner",
-    "LanceNamespaceStorageOptionsProvider",
     "MergeInsertBuilder",
     "ScanStatistics",
     "Transaction",
@@ -81,8 +119,21 @@ __all__ = [
     "json_to_schema",
     "schema_to_json",
     "set_logger",
+    "simd_info",
+    "tokenize",
     "write_dataset",
     "FFILanceTableProvider",
+    "IndexProgress",
+    "ExecutionPlan",
+    "LsmPointLookupPlanner",
+    "LsmScanner",
+    "LsmVectorSearchPlanner",
+    "CompactedSsTable",
+    "ShardSnapshot",
+    "ShardWriter",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
 ]
 
 
@@ -99,9 +150,9 @@ def dataset(
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
     session: Optional[Session] = None,
-    namespace: Optional[LanceNamespace] = None,
+    namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
-    storage_options_provider: Optional[Any] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -111,7 +162,7 @@ def dataset(
     uri : str, optional
         Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
         or a cloud object store URI, i.e., `s3://bucket/data.lance`.
-        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
+        Either `uri` or (`namespace_client` + `table_id`) must be provided.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -136,6 +187,13 @@ def dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+
+        For datasets with additional registered base paths, a key of the form
+        ``base_<id>.<key>`` applies ``<key>`` only to the base path with that
+        manifest id, overriding the unscoped options that every base inherits.
+        For example ``{"account_key": "shared", "base_1.account_key": "abc"}``
+        makes base 1 use ``account_key = abc`` while all other options are
+        shared.
     default_scan_options : optional, dict
         Default scan options that are used when scanning the dataset.  This accepts
         the same arguments described in :py:meth:`lance.LanceDataset.scanner`.  The
@@ -161,69 +219,73 @@ def dataset(
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
         across multiple datasets.
-    namespace : optional, LanceNamespace
-        A namespace instance from which to fetch table location and storage options.
+    namespace_client : optional, LanceNamespace
+        A namespace client from which to fetch table location and storage options.
         Use lance.namespace.connect() to create a namespace instance.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table().
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
-        Must be provided together with `namespace`. Cannot be used with `uri`.
-    storage_options_provider : optional
-        A storage options provider for automatic credential refresh. Must implement
-        `fetch_storage_options()` method that returns a dict of storage options.
-        If provided along with `namespace`, this takes precedence over the
-        namespace-created provider.
+        Must be provided together with `namespace_client`. Cannot be used with `uri`.
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by base path URI. Each key
+        is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+        of storage options (credentials, endpoint, etc.) for that base.  These
+        take precedence over ``base_<id>.<key>`` entries in ``storage_options``.
+        When a base has no explicit entry here, the top-level
+        ``storage_options`` is used as a fallback.
 
     Notes
     -----
-    When using `namespace` and `table_id`:
+    When using `namespace_client` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
     - Storage options from describe_table() will be used automatically
     - A dynamic storage options provider will be created to refresh credentials
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
-    # Validate that user provides either uri OR (namespace + table_id), not both
+    # Validate that user provides either uri OR (namespace_client + table_id), not both
     has_uri = uri is not None
-    has_namespace = namespace is not None or table_id is not None
+    has_namespace = namespace_client is not None or table_id is not None
 
     if has_uri and has_namespace:
         raise ValueError(
-            "Cannot specify both 'uri' and 'namespace/table_id'. "
-            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client/table_id'. "
+            "Please provide either 'uri' or both 'namespace_client' and 'table_id'."
         )
     elif not has_uri and not has_namespace:
         raise ValueError(
-            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+            "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
         )
 
     # Handle namespace resolution in Python
-    managed_versioning = False
-    if namespace is not None:
+    namespace_client_managed_versioning = False
+    if namespace_client is not None:
         if table_id is None:
             raise ValueError(
-                "Both 'namespace' and 'table_id' must be provided together."
+                "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
-        request = DescribeTableRequest(id=table_id, version=version)
-        response = namespace.describe_table(request)
+        # Resolve the latest table metadata here. The requested dataset version is
+        # applied by the lower-level dataset open path after namespace resolution.
+        request = DescribeTableRequest(id=table_id, version=None)
+        response = namespace_client.describe_table(request)
 
         uri = response.location
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
 
         # Check if namespace manages versioning (commits go through namespace API)
-        managed_versioning = getattr(response, "managed_versioning", None) is True
+        namespace_client_managed_versioning = (
+            getattr(response, "managed_versioning", None) is True
+        )
 
         namespace_storage_options = response.storage_options
 
-        if namespace_storage_options:
-            if storage_options_provider is None:
-                storage_options_provider = LanceNamespaceStorageOptionsProvider(
-                    namespace=namespace, table_id=table_id
-                )
+        # Merge namespace storage options with user-provided options
+        # Namespace options take precedence
+        if namespace_storage_options is not None:
             if storage_options is None:
                 storage_options = namespace_storage_options
             else:
@@ -231,7 +293,9 @@ def dataset(
                 merged_options.update(namespace_storage_options)
                 storage_options = merged_options
     elif table_id is not None:
-        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
 
     ds = LanceDataset(
         uri,
@@ -245,9 +309,10 @@ def dataset(
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
         session=session,
-        storage_options_provider=storage_options_provider,
-        namespace=namespace if managed_versioning else None,
-        table_id=table_id if managed_versioning else None,
+        namespace_client=namespace_client,
+        table_id=table_id,
+        namespace_client_managed_versioning=namespace_client_managed_versioning,
+        base_store_params=base_store_params,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -271,7 +336,10 @@ def dataset(
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
                 session=session,
-                storage_options_provider=storage_options_provider,
+                namespace_client=namespace_client,
+                table_id=table_id,
+                namespace_client_managed_versioning=namespace_client_managed_versioning,
+                base_store_params=base_store_params,
             )
     else:
         return ds

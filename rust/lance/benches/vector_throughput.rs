@@ -13,16 +13,17 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{StreamExt, TryStreamExt};
 use lance_file::version::LanceFileVersion;
-use log::info;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use log::info;
 use rand::Rng;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{
-    DatasetIndexExt, IndexType,
+    IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;

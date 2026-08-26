@@ -20,77 +20,18 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
-use lance_io::object_store::StorageOptions;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
-use prost::Message;
 
 use crate::Dataset;
-use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
-
-// =============================================================================
-// TableIdentifier helpers (reusable by other execs)
-// =============================================================================
-
-/// Build a [`TableIdentifier`] from a [`Dataset`].
-///
-/// Default: lightweight mode (uri + version + etag only, no serialized manifest).
-/// Includes the dataset's latest storage options (if any) so the remote executor
-/// can open or cache the dataset with the correct storage configuration.
-pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::TableIdentifier> {
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: None,
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Build a [`TableIdentifier`] with serialized manifest bytes included.
-///
-/// Fast path: remote executor skips manifest read from storage.
-pub async fn table_identifier_from_dataset_with_manifest(
-    dataset: &Dataset,
-) -> Result<pb::TableIdentifier> {
-    let manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
-    Ok(pb::TableIdentifier {
-        uri: dataset.uri().to_string(),
-        version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
-        serialized_manifest: Some(manifest_proto.encode_to_vec()),
-        storage_options: dataset
-            .latest_storage_options()
-            .await?
-            .map(|StorageOptions(m)| m)
-            .unwrap_or_default(),
-    })
-}
-
-/// Open a dataset from a table identifier proto
-pub async fn open_dataset_from_table_identifier(
-    table_id: &pb::TableIdentifier,
-) -> Result<Arc<Dataset>> {
-    let mut builder = DatasetBuilder::from_uri(&table_id.uri).with_version(table_id.version);
-    if let Some(manifest_bytes) = &table_id.serialized_manifest {
-        builder = builder.with_serialized_manifest(manifest_bytes)?;
-    }
-    if !table_id.storage_options.is_empty() {
-        builder = builder.with_storage_options(table_id.storage_options.clone());
-    }
-    Ok(Arc::new(builder.load().await?))
-}
+use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 // =============================================================================
 // FilteredReadExec <-> Proto
@@ -131,17 +72,7 @@ pub async fn filtered_read_exec_from_proto(
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
-    let dataset = match dataset {
-        Some(ds) => ds, // dataset could be opened or cached by the caller
-        None => {
-            let table_id = proto.table.as_ref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Missing table identifier in FilteredReadExecProto".into(),
-                )
-            })?;
-            open_dataset_from_table_identifier(table_id).await?
-        }
-    };
+    let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
     let options_proto = proto.options.ok_or_else(|| {
         Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
@@ -556,9 +487,10 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen_batch};
+    use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use std::collections::HashSet;
 
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -630,23 +562,6 @@ mod tests {
             back.with_row_created_at_version
         );
         assert_eq!(projection.blob_handling, back.blob_handling);
-    }
-
-    #[test]
-    fn test_table_identifier_without_manifest() {
-        let id = pb::TableIdentifier {
-            uri: "s3://bucket/table.lance".to_string(),
-            version: 42,
-            manifest_etag: Some("etag123".to_string()),
-            serialized_manifest: None,
-            storage_options: HashMap::new(),
-        };
-        let bytes = id.encode_to_vec();
-        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
-        assert_eq!(id.uri, back.uri);
-        assert_eq!(id.version, back.version);
-        assert_eq!(id.manifest_etag, back.manifest_etag);
-        assert!(back.serialized_manifest.is_none());
     }
 
     #[test]
@@ -812,21 +727,57 @@ mod tests {
         );
     }
 
+    /// A row-stream (take) exec serializes like any other: the input plan
+    /// travels as the node's child through the plan codec, and decoding
+    /// re-derives the row-stream selector from the child's schema
     #[tokio::test]
-    async fn test_table_identifier_with_manifest() {
-        let dataset = make_test_dataset().await;
+    async fn test_exec_to_proto_roundtrip_row_stream() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::{ROW_ID, ROW_ID_FIELD};
+        use lance_datafusion::exec::OneShotExec;
 
-        let id = table_identifier_from_dataset_with_manifest(&dataset)
-            .await
+        fn keys_input() -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![3u64, 1, 4]))],
+            )
             .unwrap();
-        assert_eq!(id.uri, dataset.uri());
-        assert_eq!(id.version, dataset.manifest.version);
-        assert!(id.serialized_manifest.is_some());
+            let stream = futures::stream::iter(vec![Ok(batch)]);
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        }
 
-        // Verify the serialized manifest bytes decode
-        let manifest_bytes = id.serialized_manifest.unwrap();
-        let _manifest_proto =
-            lance_table::format::pb::Manifest::decode(manifest_bytes.as_slice()).unwrap();
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, Some(keys_input())).unwrap();
+        assert!(exec.row_stream_input().is_some());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+
+        // The codec hands the decoded child back; the selector re-derives
+        // from its schema
+        let back =
+            filtered_read_exec_from_proto(proto, Some(dataset.clone()), Some(keys_input()), &state)
+                .await
+                .unwrap();
+        assert!(back.row_stream_input().is_some());
+        assert_eq!(exec.schema(), back.schema());
+        assert_eq!(
+            exec.options().projection.field_ids,
+            back.options().projection.field_ids
+        );
+        assert!(
+            back.row_stream_input()
+                .unwrap()
+                .schema()
+                .column_with_name(ROW_ID)
+                .is_some()
+        );
     }
 
     #[tokio::test]

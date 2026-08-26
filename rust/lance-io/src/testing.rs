@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use mockall::mock;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as OSObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, path::Path,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as OSResult, path::Path,
 };
 use std::future::Future;
 
@@ -30,11 +31,10 @@ mock! {
         Self: 'async_trait,
         'life0: 'async_trait,
         'life1: 'async_trait;
-        async fn delete(&self, location: &Path) -> OSResult<()>;
+        fn delete_stream(&self, locations: BoxStream<'static, OSResult<Path>>) -> BoxStream<'static, OSResult<Path>>;
         fn list<'a>(&'a self, prefix: Option<&'a Path>) -> BoxStream<'_, OSResult<ObjectMeta>>;
         async fn list_with_delimiter<'a, 'b>(&'a self, prefix: Option<&'b Path>) -> OSResult<ListResult>;
-        async fn copy(&self, from: &Path, to: &Path) -> OSResult<()>;
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()>;
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()>;
     }
 }
 

@@ -2,9 +2,23 @@
 
 ## Overview
 
-The Lance table format organizes datasets as versioned collections of fragments and indices.
-Each version is described by an immutable manifest file that references data files, deletion files, transaction file and indices.
-The format supports ACID transactions, schema evolution, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).
+The Lance table format organizes datasets as versioned collections of fragments, data files, deletion files, and indices. Each version is described by an immutable manifest that references the physical data for that snapshot.
+
+The format is designed for machine learning and highly selective workloads where column additions, index maintenance, and partial rewrites must be cheap. It supports ACID transactions, schema evolution, time travel, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).
+
+## Design Goals
+
+### Two-Dimensional Storage
+
+Rows are partitioned into fragments, and each fragment can contain multiple data files that each provide one or more columns. This lets writers add or backfill columns by attaching new data files to existing fragments instead of rewriting the full table.
+
+### First-Class Indices
+
+Indices are part of the table format lifecycle. The table metadata describes index discovery and transactional coordination, while the detailed search structures remain separate index formats. This gives engines a uniform way to create, drop, update, and query indices without coupling the table format to any single indexing algorithm.
+
+### External Manifest Store
+
+Lance can commit directly to object storage, but deployments may also coordinate commits through an external manifest store. In that model, the external system helps serialize commits and apply governance checks, while the canonical table state is still persisted in the Lance table format.
 
 ## Manifest
 
@@ -121,6 +135,17 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
 </details>
 
+!!! note "Field-to-column mapping differs between data storage versions"
+
+    In **2.0**, all fields (including non-leaf fields like struct and list containers) are assigned
+    sequential column indices in `column_indices`.
+
+    In **2.1+**, non-leaf fields (unpacked structs, list containers) are assigned `-1` in
+    `column_indices` because their validity information is folded into repetition/definition
+    levels. Only leaf fields and packed structs have column indices.
+
+    See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
+
 ## Deletion Files
 
 Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.
@@ -142,6 +167,29 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 ```
 
 </details>
+
+## Data Overlay Files
+
+!!! warning "Experimental"
+
+    This feature is currently experimental and not yet supported in any library.
+
+<!-- TODO: When overlay file support is implemented, update this note to state
+     the released version that first supports the feature. -->
+
+!!! note "Overlay files require feature flag 64 (data overlay files)"
+
+Overlay files supply new values for a subset of cells within
+a fragment without rewriting the base data files. They make updates cheap when only
+a small percentage of rows and/or columns change: a writer appends a small file
+carrying just the changed cells instead of rewriting whole columns or moving rows
+to a new fragment.
+
+For the full specification — coverage and resolution rules, dense vs. sparse layout,
+versioning, index integration, compaction, and a worked example — see the
+[Data Overlay Files Specification](data_overlay_file.md).
+
+
 
 ## Related Specifications
 
@@ -167,7 +215,7 @@ See [Row ID & Lineage Specification](row_id_lineage.md)
 
 Vector indices, scalar indices, full-text search, and index management.
 
-See [Index Specification](index/index.md)
+See [Index Formats](../index/index.md)
 
 ### Versioning
 
