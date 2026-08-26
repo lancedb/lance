@@ -11663,6 +11663,100 @@ mod tests {
         assert_eq!(manifest_index(&dataset, "id_idx").await.uuid, before.uuid);
     }
 
+    /// Holding back the fragments an unreadable index covers is an optimization
+    /// in the planner, not the rule: `compact_files_with_planner` takes any
+    /// planner, `CompactionPlan` is public and serializable, and a distributed
+    /// driver hands `commit_compaction` results planned on another machine. This
+    /// takes that last route, so the refusal is pinned to the commit boundary.
+    ///
+    /// The other half - that the boundary does not refuse a rewrite the index
+    /// does not cover - is the test above, which compacts the uncovered
+    /// fragments of this same shape through `compact_files`.
+    #[tokio::test]
+    async fn test_committing_a_compaction_an_unsupported_index_covers_is_rejected() {
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{CompactionPlan, TaskData, commit_compaction};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: false,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, "id_idx").await;
+        let covered = manifest_index(&dataset, "id_idx")
+            .await
+            .fragment_bitmap
+            .unwrap();
+
+        // Two more fragments the hidden index does not cover, so the plan below
+        // is a genuine selection rather than "every fragment there is".
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+        let before = manifest_index(&dataset, "id_idx").await;
+
+        let plan = CompactionPlan {
+            tasks: vec![TaskData {
+                fragments: dataset
+                    .fragments()
+                    .iter()
+                    .filter(|fragment| covered.contains(fragment.id as u32))
+                    .cloned()
+                    .collect(),
+            }],
+            read_version: dataset.version().version,
+            options: CompactionOptions::default(),
+        };
+        assert_eq!(plan.tasks[0].fragments.len(), 2);
+
+        let mut rewrites = Vec::new();
+        for task in plan.compaction_tasks() {
+            rewrites.push(task.execute(&dataset).await.unwrap());
+        }
+
+        let err = commit_compaction(
+            &mut dataset,
+            rewrites,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan.options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("id_idx"),
+            "the refusal has to name the index that blocks the rewrite: {err}"
+        );
+
+        // Nothing was committed: the fragments the plan named are still there,
+        // and the index still covers them.
+        assert_eq!(dataset.get_fragments().len(), 4);
+        let after = manifest_index(&dataset, "id_idx").await;
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+    }
+
     /// Optimizing a name whose segments this build cannot all read would commit
     /// a merged segment overlapping the one it left behind - a state
     /// `Dataset::validate` reports as corruption and no later commit can heal.

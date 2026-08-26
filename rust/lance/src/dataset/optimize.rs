@@ -760,7 +760,13 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         // letting the candidates on either side of the gap be planned together.
         let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
         if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
-            let unremappable = unremappable_fragments(dataset).await?;
+            let unremappable = unremappable_index_coverage(dataset)
+                .await?
+                .into_iter()
+                .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
+                    covered |= fragments;
+                    covered
+                });
             if !unremappable.is_empty() {
                 // Otherwise a compaction that plans nothing looks like a
                 // compaction that found nothing to do.
@@ -2127,7 +2133,7 @@ async fn index_fragment_coverage(
     Ok(RoaringBitmap::from_sorted_iter(frags).unwrap())
 }
 
-/// Fragments covered by an index this build has no reader for.
+/// Each index this build has no reader for, by name, and the fragments it covers.
 ///
 /// A rewrite moves every row address in the fragments it touches, and putting an
 /// index back in step means opening it. A build that cannot open one cannot
@@ -2139,15 +2145,53 @@ async fn index_fragment_coverage(
 /// Only the eager remap path needs this. Stable row ids keep the addresses
 /// across a rewrite, and `defer_index_remap` hands the repair to a build that
 /// can read the index, through the fragment-reuse index it writes.
-async fn unremappable_fragments(dataset: &Dataset) -> Result<RoaringBitmap> {
-    let mut covered = RoaringBitmap::new();
+async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
+    let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
         if is_system_index(index) || unsupported_index_version(index).is_none() {
             continue;
         }
-        covered |= index_fragment_coverage(dataset, index).await?;
+        coverage.push((
+            index.name.clone(),
+            index_fragment_coverage(dataset, index).await?,
+        ));
     }
-    Ok(covered)
+    Ok(coverage)
+}
+
+/// Refuse a plan that rewrites fragments an index this build cannot read covers.
+///
+/// [`DefaultCompactionPlanner`] keeps those fragments out of the plan, but
+/// nothing forces a caller through it: `compact_files_with_planner` takes any
+/// planner, [`CompactionPlan`] is public and serializable, and a distributed
+/// driver hands [`commit_compaction`] results planned elsewhere. Committing such
+/// a plan strands the index on fragment ids the rewrite deleted, so the commit
+/// boundary refuses it rather than the planner alone.
+async fn reject_unremappable_rewrite(
+    dataset: &Dataset,
+    completed_tasks: &[RewriteResult],
+) -> Result<()> {
+    let rewritten = completed_tasks
+        .iter()
+        .flat_map(|task| task.original_fragments.iter())
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<RoaringBitmap>();
+
+    for (name, covered) in unremappable_index_coverage(dataset).await? {
+        let blocked = covered & &rewritten;
+        if !blocked.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "compaction would rewrite fragment(s) {:?}, which index {:?} covers. This build \
+                 has no reader for that index, so it cannot be remapped onto the rewritten \
+                 fragments and the commit would leave it addressing rows that no longer exist. \
+                 Plan with DefaultCompactionPlanner, which holds those fragments back, set \
+                 defer_index_remap, or compact from a build that can read the index.",
+                blocked.iter().collect::<Vec<_>>(),
+                name,
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub async fn plan_compaction(
@@ -2635,6 +2679,14 @@ pub async fn commit_compaction(
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
+    }
+
+    // Before anything is written or committed. The condition is the planner's,
+    // not `has_address_style`: a dataset whose only index is one this build
+    // cannot read captures no row addresses at all, which is exactly the plan
+    // that has to be refused here.
+    if !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap {
+        reject_unremappable_rewrite(dataset, &completed_tasks).await?;
     }
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
