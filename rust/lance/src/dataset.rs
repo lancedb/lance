@@ -3325,12 +3325,22 @@ impl Dataset {
         let configured_io_parallelism = src_ds.object_store.io_parallelism();
         let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
             && target_store.has_direct_local_paths());
+        let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be valid UTF-8 and a positive \
+                     integer, got {value:?}"
+                )));
+            }
+        };
         // Limit the number of concurrently buffered transfers by default while
         // preserving efficient local copies and explicit operator settings.
         let io_parallelism = if !uses_streaming_copy {
             configured_io_parallelism
-        } else if let Ok(value) = std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
-            parse_deep_clone_stream_concurrency(&value)?
+        } else if let Some(value) = stream_copy_parallelism {
+            value
         } else if std::env::var_os("LANCE_IO_THREADS").is_some() {
             configured_io_parallelism
         } else {

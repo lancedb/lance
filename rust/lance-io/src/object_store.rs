@@ -1102,7 +1102,7 @@ impl ObjectStore {
     #[instrument(
         name = "multipart_stream_copy",
         level = "info",
-        skip(self, destination_store),
+        skip(self, source_path, destination_store, destination_path),
         fields(
             source = %source_path,
             destination = %destination_path,
@@ -1125,16 +1125,21 @@ impl ObjectStore {
         destination_path: &Path,
     ) -> Result<WriteResult> {
         let started_at = Instant::now();
-        let reader = self.open(source_path).await.map_err(|source| {
-            stream_copy_error("source open", source_path, destination_path, source)
-        })?;
-        let source_size = reader.size().await.map_err(|source| {
-            stream_copy_error("source metadata", source_path, destination_path, source)
-        })?;
-        Span::current().record("source_size", source_size as u64);
-
         if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
-            let metrics = self.io_tracker.begin_io("copy");
+            let source_size = self.size(source_path).await.map_err(|source| {
+                stream_copy_error("source metadata", source_path, destination_path, source)
+            })?;
+            let source_size = usize::try_from(source_size).map_err(|source| {
+                stream_copy_error(
+                    "source size conversion",
+                    source_path,
+                    destination_path,
+                    source,
+                )
+            })?;
+            Span::current().record("source_size", source_size as u64);
+
+            let metrics = destination_store.io_tracker.begin_io("copy");
             let result = super::local::copy_file(source_path, destination_path);
             metrics.record(&result, source_size as u64);
             result.map_err(|source| {
@@ -1176,6 +1181,14 @@ impl ObjectStore {
                 e_tag: None,
             });
         }
+
+        let reader = self.open(source_path).await.map_err(|source| {
+            stream_copy_error("source open", source_path, destination_path, source)
+        })?;
+        let source_size = reader.size().await.map_err(|source| {
+            stream_copy_error("source metadata", source_path, destination_path, source)
+        })?;
+        Span::current().record("source_size", source_size as u64);
 
         let mut writer = destination_store
             .create(destination_path)
@@ -1250,15 +1263,6 @@ impl ObjectStore {
             }
         }
         Span::current().record("bytes_transferred", bytes_transferred as u64);
-
-        if bytes_transferred != source_size {
-            Span::current().record("validation", "failed");
-            return Err(Error::io(format!(
-                "multipart_stream_copy source size mismatch from {source_path} to \
-                 {destination_path}: source_size={source_size}, \
-                 bytes_transferred={bytes_transferred}"
-            )));
-        }
 
         let write_result = Writer::shutdown(writer.as_mut()).await.map_err(|source| {
             stream_copy_error(
