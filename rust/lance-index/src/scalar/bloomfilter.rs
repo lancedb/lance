@@ -483,6 +483,11 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
+        // The filter hashes the raw bytes of a float, so the two encodings of zero
+        // are unrelated keys and each has to be probed. Like the zone map this
+        // needs no opt-in from the caller: every probe result is `AtMost`, so
+        // callers already narrow it down themselves. `IsNull` is the one exact
+        // answer, and `widen_signed_zeros_bloom` leaves it alone.
         let widened = widen_signed_zeros_bloom(query);
         let query = widened.as_ref().unwrap_or(query);
         let result = if let BloomFilterQuery::IsNull() = query
@@ -2343,9 +2348,9 @@ mod tests {
         assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
     }
 
-    /// Bloom filters hash the raw bytes of a float, so `-0.0` and `+0.0` set
-    /// different bits. A query for one encoding has to probe the other too, or a
-    /// zone that only holds the other encoding is pruned.
+    /// Bloom filters hash the raw bytes of a float, so `-0.0` and `+0.0` are
+    /// unrelated keys. A query for one encoding has to probe the other too, or a
+    /// zone that only holds the other encoding can be pruned.
     #[tokio::test]
     async fn test_bloomfilter_signed_zero_keeps_both_zones() {
         let tmpdir = TempObjDir::default();
@@ -2356,8 +2361,9 @@ mod tests {
         ));
 
         // Two zones of two rows: [-1.0, -0.0] then [+0.0, 1.0], so each zone
-        // holds exactly one encoding of zero.
-        let values = arrow_array::Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0]);
+        // holds exactly one encoding of zero. A third zone holds no zero and must
+        // stay pruned, so the assertion below fails if pruning stops working.
+        let values = arrow_array::Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0, 5.0, 6.0]);
         let schema = Arc::new(Schema::new(vec![Field::new(
             VALUE_COLUMN_NAME,
             DataType::Float64,
@@ -2381,16 +2387,16 @@ mod tests {
         let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert_eq!(index.zones.len(), 2);
+        assert_eq!(index.zones.len(), 3);
 
-        let mut both_zones = RowAddrTreeMap::new();
-        both_zones.insert_range(0..4);
+        let mut both_zeros = RowAddrTreeMap::new();
+        both_zeros.insert_range(0..4);
         for zero in [0.0f64, -0.0f64] {
             let query = BloomFilterQuery::Equals(ScalarValue::Float64(Some(zero)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             assert_eq!(
                 result,
-                SearchResult::at_most(both_zones.clone()),
+                SearchResult::at_most(both_zeros.clone()),
                 "querying {zero}"
             );
         }

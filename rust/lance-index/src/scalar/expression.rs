@@ -21,7 +21,7 @@ use tokio::try_join;
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
-    widen_signed_zeros,
+    query_touches_signed_zero,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -309,15 +309,17 @@ impl SargableQueryParser {
         self
     }
 
-    /// A query that gets widened for signed zero always needs a recheck, even
-    /// for an index that is otherwise exact.
+    /// A query on a float zero always gets a recheck, even for an index that is
+    /// otherwise exact.
     ///
-    /// The index selects candidates in arrow's total order, where `-0.0` and
-    /// `+0.0` are distinct, so it can only answer with the candidates for both
-    /// encodings. Which of them satisfies the predicate is IEEE 754 semantics,
-    /// which only expression evaluation applies.
+    /// The index compares in arrow's total order, where `-0.0` and `+0.0` are
+    /// distinct, so it can only answer with the candidates for both encodings.
+    /// Which of them satisfies the predicate is IEEE 754 semantics, which only
+    /// expression evaluation applies. This has to cover every query carrying a
+    /// zero, not just the ones [`widen_signed_zeros`] rewrites: `> -0.0` needs no
+    /// widening yet still admits `+0.0`, which IEEE 754 excludes.
     fn needs_recheck_for(&self, query: &SargableQuery) -> bool {
-        self.needs_recheck || widen_signed_zeros(query).is_some()
+        self.needs_recheck || query_touches_signed_zero(query)
     }
 }
 
@@ -1996,7 +1998,12 @@ impl ScalarIndexExpr {
                 let search_result = index
                     .search_with_options(
                         search.query.as_ref(),
-                        SearchOptions::default().with_track_nulls(track_nulls),
+                        SearchOptions::default()
+                            .with_track_nulls(track_nulls)
+                            // Pass down the plan's recheck decision: an index that
+                            // is otherwise exact needs it to widen a signed-zero
+                            // query into both encodings.
+                            .with_recheck(search.needs_recheck),
                         metrics,
                     )
                     .await?;
@@ -2683,19 +2690,19 @@ mod tests {
 
     use super::*;
 
-    /// An index that is otherwise exact still needs a recheck for a query that
-    /// gets widened for signed zero, because the widened candidate set holds rows
-    /// under both encodings and only expression evaluation knows which of them
-    /// IEEE 754 matches.
+    /// An index that is otherwise exact is still forced to recheck any query
+    /// carrying a float zero, because it compares in total order and only
+    /// expression evaluation applies IEEE 754.
     #[rstest]
     #[case::eq_zero(Operator::Eq, ScalarValue::Float64(Some(0.0)), true)]
     #[case::eq_neg_zero(Operator::Eq, ScalarValue::Float64(Some(-0.0)), true)]
     #[case::eq_non_zero(Operator::Eq, ScalarValue::Float64(Some(1.0)), false)]
     #[case::eq_int_zero(Operator::Eq, ScalarValue::Int64(Some(0)), false)]
     #[case::ge_zero(Operator::GtEq, ScalarValue::Float64(Some(0.0)), true)]
-    #[case::gt_zero(Operator::Gt, ScalarValue::Float64(Some(0.0)), false)]
-    #[case::lt_zero(Operator::Lt, ScalarValue::Float64(Some(0.0)), false)]
+    #[case::gt_zero(Operator::Gt, ScalarValue::Float64(Some(0.0)), true)]
+    #[case::lt_zero(Operator::Lt, ScalarValue::Float64(Some(0.0)), true)]
     #[case::le_neg_zero(Operator::LtEq, ScalarValue::Float64(Some(-0.0)), true)]
+    #[case::gt_non_zero(Operator::Gt, ScalarValue::Float64(Some(1.0)), false)]
     fn test_signed_zero_forces_recheck(
         #[case] op: Operator,
         #[case] value: ScalarValue,

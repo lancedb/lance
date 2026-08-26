@@ -5080,6 +5080,63 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
+    /// `MapIndexExec` uses the scalar index result as the answer and panics on a
+    /// non-exact one, so a float key of zero must not make the index widen. The
+    /// indexed path is selected here because the single join key is indexed and
+    /// nothing forces the full-scan path.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_on_float_zero_key() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, test_uri, None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(("key", Float64, [Some(0.0)]), ("value", Int32, [99])).unwrap();
+        let source = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+
+        let (ds, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        // Only the +0.0 row is updated, because the index matches keys in arrow's
+        // total order. Checking both sides pins which row was replaced, not just
+        // how many.
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_indexed_merge_insert() {
         let test_dir = TempStrDir::default();

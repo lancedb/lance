@@ -14,7 +14,7 @@ use std::{
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
-    compute_next_prefix, widen_signed_zeros,
+    compute_next_prefix, query_touches_signed_zero, widen_signed_zeros,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
@@ -2141,9 +2141,11 @@ impl ScalarIndex for BTreeIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Page bounds are compared in arrow's total order, where -0.0 sorts below
-        // +0.0, so a query on either one has to offer both as candidates or a
-        // page holding only the other encoding is pruned away.
-        let widened = widen_signed_zeros(query);
+        // +0.0, so a query on zero may lose a page holding the other encoding, or
+        // admit a row IEEE 754 excludes. Only a caller that rechecks can take that
+        // answer, so ask for both encodings and report candidates.
+        let inexact = options.is_rechecked() && query_touches_signed_zero(query);
+        let widened = inexact.then(|| widen_signed_zeros(query)).flatten();
         let query = widened.as_ref().unwrap_or(query);
         let mut pages = match query {
             SargableQuery::Equals(val) => self
@@ -2271,10 +2273,9 @@ impl ScalarIndex for BTreeIndex {
             )
         };
 
-        if widened.is_some() {
-            // Leaf evaluation ran the widened predicate, so the result holds the
-            // candidates for both encodings of zero. Which of them matches is
-            // IEEE 754 semantics, applied by the recheck that
+        if inexact {
+            // The answer covers both encodings of zero, or admits a row IEEE 754
+            // excludes. Which rows match is decided by the recheck that
             // `SargableQueryParser` forces for these queries.
             return Ok(SearchResult::AtMost(selection));
         }
@@ -3641,17 +3642,10 @@ mod tests {
         for (idx, value) in values.into_iter().enumerate() {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(value)));
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let rows = RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7));
-            // A query on zero also offers the other encoding of zero as a
-            // candidate, so the index answers with candidates rather than an
-            // exact match. The rows are the same here because this data has no
-            // -0.0.
-            let expected = if value == 0.0 {
-                SearchResult::at_most(rows)
-            } else {
-                SearchResult::exact(rows)
-            };
-            assert_eq!(result, expected);
+            assert_eq!(
+                result,
+                SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+            );
         }
     }
 
@@ -3689,13 +3683,28 @@ mod tests {
             .await
             .unwrap();
 
+        let rechecked = SearchOptions::default().with_recheck(true);
         let both_zeros = RowAddrTreeMap::from_iter([1u64, 2]);
         for zero in [0.0f64, -0.0f64] {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
-            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let result = index
+                .search_with_options(&query, rechecked, &NoOpMetricsCollector)
+                .await
+                .unwrap();
             assert_eq!(
                 result,
                 SearchResult::at_most(both_zeros.clone()),
+                "querying {zero}"
+            );
+
+            // A caller that does not recheck gets the total-order answer, exactly
+            // as before this widening existed. merge_insert's key lookup panics on
+            // a non-exact result (`scalar_index.rs`'s `todo!`).
+            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let one_zero = if zero.is_sign_negative() { 1u64 } else { 2u64 };
+            assert_eq!(
+                result,
+                SearchResult::exact(RowAddrTreeMap::from_iter([one_zero])),
                 "querying {zero}"
             );
         }
@@ -3705,10 +3714,28 @@ mod tests {
             Bound::Included(ScalarValue::Float64(Some(0.0))),
             Bound::Unbounded,
         );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let result = index
+            .search_with_options(&query, rechecked, &NoOpMetricsCollector)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             SearchResult::at_most(RowAddrTreeMap::from_iter([1u64, 2, 3]))
+        );
+
+        // `> -0.0` needs no rewrite, but total order still admits +0.0, which IEEE
+        // 754 excludes. The answer has to be candidates so the recheck can drop it.
+        let query = SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Float64(Some(-0.0))),
+            Bound::Unbounded,
+        );
+        let result = index
+            .search_with_options(&query, rechecked, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([2u64, 3]))
         );
     }
 

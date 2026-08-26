@@ -60,7 +60,7 @@ pub use inverted::tokenizer::InvertedIndexParams;
 ///
 /// The pair is ordered `(-0.0, +0.0)`. Everything that is not a float zero
 /// yields `None` and is left alone.
-pub(crate) fn signed_zero_pair(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+fn signed_zero_pair(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
     match value {
         ScalarValue::Float16(Some(v)) if *v == half::f16::ZERO => Some((
             ScalarValue::Float16(Some(half::f16::NEG_ZERO)),
@@ -126,7 +126,8 @@ fn widen_signed_zero_range(
 /// Expand a float zero in `values` to both of its encodings, so neither can be
 /// pruned. Borrows unchanged when there is no float zero to expand.
 ///
-/// A list is a set, so repeated zeros collapse into the single expanded pair.
+/// The first zero expands to the pair; later zeros are dropped, since an `IsIn`
+/// list holds one type and they could only repeat it.
 fn expand_signed_zeros(values: &[ScalarValue]) -> Cow<'_, [ScalarValue]> {
     let zeros = values
         .iter()
@@ -150,18 +151,40 @@ fn expand_signed_zeros(values: &[ScalarValue]) -> Cow<'_, [ScalarValue]> {
     Cow::Owned(expanded)
 }
 
+/// Whether any value in `query` is a float zero.
+///
+/// In general a query on zero cannot be answered exactly in total order, and not
+/// only where [`widen_signed_zeros`] has something to rewrite: `> -0.0` admits
+/// `+0.0` in total order while IEEE 754 does not.
+pub(crate) fn query_touches_signed_zero(query: &SargableQuery) -> bool {
+    let bound_touches = |bound: &Bound<ScalarValue>| match bound {
+        Bound::Included(value) | Bound::Excluded(value) => signed_zero_pair(value).is_some(),
+        Bound::Unbounded => false,
+    };
+    match query {
+        SargableQuery::Equals(value) => signed_zero_pair(value).is_some(),
+        SargableQuery::IsIn(values) => values.iter().any(|v| signed_zero_pair(v).is_some()),
+        SargableQuery::Range(low, high) => bound_touches(low) || bound_touches(high),
+        _ => false,
+    }
+}
+
 /// Rewrite a query so that a float zero keeps the candidates for both of its
 /// encodings: `Equals` becomes `IsIn` of the two, `IsIn` gains the missing one,
 /// and `Range` bounds widen outward.
 ///
-/// Returns `None` when the query carries no float zero, which is every query
-/// that is not about zero.
+/// Returns `None` when the query has no float zero to expand. That is not the same as "the
+/// index can answer this exactly": a bound like `> -0.0` needs no rewrite and
+/// still admits a row IEEE 754 excludes. [`query_touches_signed_zero`] is the
+/// predicate for that question.
 ///
-/// The rewrite only ever produces a superset in total order, so an index that
-/// applies it answers with candidates rather than an exact match. Callers must
-/// report the result as [`SearchResult::AtMost`] unless the index already does,
-/// and [`expression::SargableQueryParser`] forces the matching recheck so the
-/// extra candidates are removed by expression evaluation.
+/// The rewrite widens in total order, so an index that applies it answers with
+/// candidates rather than an exact match. An index whose answer is otherwise
+/// exact must therefore both report
+/// [`SearchResult::AtMost`] and apply this only when
+/// [`SearchOptions::is_rechecked`] says the caller narrows the result down.
+/// [`expression::SargableQueryParser`] turns that on for every query
+/// [`query_touches_signed_zero`] accepts.
 pub(crate) fn widen_signed_zeros(query: &SargableQuery) -> Option<SargableQuery> {
     match query {
         SargableQuery::Equals(value) => {
@@ -180,9 +203,9 @@ pub(crate) fn widen_signed_zeros(query: &SargableQuery) -> Option<SargableQuery>
 
 /// [`widen_signed_zeros`] for a bloom filter query.
 ///
-/// Bloom filters hash the raw bytes of a float, so the two encodings of zero
-/// land in different blocks and set different bits. Probing only one of them
-/// prunes zones that hold the other.
+/// Bloom filters hash the raw bytes of a float, so the two encodings of zero are
+/// unrelated keys: a probe for one says nothing about the other, and a zone
+/// holding only the other encoding can be pruned.
 pub(crate) fn widen_signed_zeros_bloom(query: &BloomFilterQuery) -> Option<BloomFilterQuery> {
     match query {
         BloomFilterQuery::Equals(value) => {
@@ -845,10 +868,20 @@ mod tests {
 
     const NEG: ScalarValue = ScalarValue::Float64(Some(-0.0));
     const POS: ScalarValue = ScalarValue::Float64(Some(0.0));
+    const NEG32: ScalarValue = ScalarValue::Float32(Some(-0.0));
+    const POS32: ScalarValue = ScalarValue::Float32(Some(0.0));
+    const NEG16: ScalarValue = ScalarValue::Float16(Some(half::f16::NEG_ZERO));
+    const POS16: ScalarValue = ScalarValue::Float16(Some(half::f16::ZERO));
 
+    /// Equality against either encoding must offer both, because the index
+    /// matches keys in total order where the two are distinct.
     #[rstest]
     #[case::eq_positive(POS, Some(SargableQuery::IsIn(vec![NEG, POS])))]
     #[case::eq_negative(NEG, Some(SargableQuery::IsIn(vec![NEG, POS])))]
+    // The pair must keep the column's float width: `OrderableScalarValue::cmp`
+    // panics when it compares two different non-null `ScalarValue` variants.
+    #[case::eq_f32(NEG32, Some(SargableQuery::IsIn(vec![NEG32, POS32])))]
+    #[case::eq_f16(POS16, Some(SargableQuery::IsIn(vec![NEG16, POS16])))]
     #[case::eq_non_zero(ScalarValue::Float64(Some(1.0)), None)]
     #[case::eq_null(ScalarValue::Float64(None), None)]
     #[case::eq_int_zero(ScalarValue::Int64(Some(0)), None)]
@@ -856,35 +889,32 @@ mod tests {
         #[case] value: ScalarValue,
         #[case] expected: Option<SargableQuery>,
     ) {
-        // Equality against either encoding must offer both, because the index
-        // matches keys in total order where the two are distinct.
         assert_eq!(widen_signed_zeros(&SargableQuery::Equals(value)), expected);
     }
 
-    #[test]
-    fn test_widen_is_in_adds_the_missing_encoding() {
-        let query = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(1.0)), POS]);
+    #[rstest]
+    #[case::adds_the_missing_encoding(
+        vec![ScalarValue::Float64(Some(1.0)), POS],
+        Some(vec![ScalarValue::Float64(Some(1.0)), NEG, POS])
+    )]
+    // Both encodings already listed: the pair is emitted once, not twice.
+    #[case::already_both(vec![POS, NEG], Some(vec![NEG, POS]))]
+    #[case::no_zero(vec![ScalarValue::Float64(Some(1.0))], None)]
+    fn test_widen_is_in(
+        #[case] values: Vec<ScalarValue>,
+        #[case] expected: Option<Vec<ScalarValue>>,
+    ) {
         assert_eq!(
-            widen_signed_zeros(&query),
-            Some(SargableQuery::IsIn(vec![
-                ScalarValue::Float64(Some(1.0)),
-                NEG,
-                POS
-            ]))
+            widen_signed_zeros(&SargableQuery::IsIn(values)),
+            expected.map(SargableQuery::IsIn)
         );
-        // Both encodings already listed: the pair is emitted once, not twice.
-        let both = SargableQuery::IsIn(vec![POS, NEG]);
-        assert_eq!(
-            widen_signed_zeros(&both),
-            Some(SargableQuery::IsIn(vec![NEG, POS]))
-        );
-        let no_zero = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(1.0))]);
-        assert_eq!(widen_signed_zeros(&no_zero), None);
     }
 
     /// Only an inclusive bound on the inner encoding of zero leaves the other
-    /// one out of the total-order range. Every other bound already admits every
-    /// row IEEE 754 would match, and widening it would cost a needless recheck.
+    /// one out of the total-order range, so only those two get rewritten. Two of
+    /// the exclusive bounds (`> -0.0`, `< +0.0`) still need the recheck that
+    /// [`query_touches_signed_zero`] forces, because total order admits a zero
+    /// that IEEE 754 excludes.
     #[rstest]
     #[case::ge_positive(
         Bound::Included(POS),
@@ -924,41 +954,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_widen_bloom_query() {
-        // Bloom hashes raw float bytes, so the two encodings land in different
-        // blocks and each has to be probed.
-        assert_eq!(
-            widen_signed_zeros_bloom(&BloomFilterQuery::Equals(NEG)),
-            Some(BloomFilterQuery::IsIn(vec![NEG, POS]))
-        );
-        assert_eq!(widen_signed_zeros_bloom(&BloomFilterQuery::IsNull()), None);
-        assert_eq!(
-            widen_signed_zeros_bloom(&BloomFilterQuery::Equals(ScalarValue::Float32(Some(1.0)))),
-            None
-        );
-    }
-
-    #[test]
-    fn test_widen_preserves_float_width() {
-        // The widened values must keep the column's type, or the index compares
-        // them against page statistics of a different physical type.
-        let f32_zero = ScalarValue::Float32(Some(-0.0));
-        assert_eq!(
-            widen_signed_zeros(&SargableQuery::Equals(f32_zero)),
-            Some(SargableQuery::IsIn(vec![
-                ScalarValue::Float32(Some(-0.0)),
-                ScalarValue::Float32(Some(0.0))
-            ]))
-        );
-        let f16_zero = ScalarValue::Float16(Some(half::f16::ZERO));
-        assert_eq!(
-            widen_signed_zeros(&SargableQuery::Equals(f16_zero)),
-            Some(SargableQuery::IsIn(vec![
-                ScalarValue::Float16(Some(half::f16::NEG_ZERO)),
-                ScalarValue::Float16(Some(half::f16::ZERO))
-            ]))
-        );
+    #[rstest]
+    #[case::eq_negative(BloomFilterQuery::Equals(NEG), Some(BloomFilterQuery::IsIn(vec![NEG, POS])))]
+    #[case::eq_positive(BloomFilterQuery::Equals(POS), Some(BloomFilterQuery::IsIn(vec![NEG, POS])))]
+    #[case::is_null(BloomFilterQuery::IsNull(), None)]
+    #[case::eq_non_zero(BloomFilterQuery::Equals(ScalarValue::Float32(Some(1.0))), None)]
+    fn test_widen_bloom_query(
+        #[case] query: BloomFilterQuery,
+        #[case] expected: Option<BloomFilterQuery>,
+    ) {
+        // Bloom hashes the raw bytes of a float, so the two encodings are
+        // unrelated keys and each has to be probed.
+        assert_eq!(widen_signed_zeros_bloom(&query), expected);
     }
 
     #[test]

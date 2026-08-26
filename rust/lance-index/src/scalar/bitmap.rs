@@ -39,7 +39,7 @@ use tracing::{instrument, warn};
 use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
-    widen_signed_zeros,
+    query_touches_signed_zero, widen_signed_zeros,
 };
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
@@ -693,10 +693,12 @@ impl ScalarIndex for BitmapIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        // Keys are stored and compared in arrow's total order, where -0.0 and
-        // +0.0 are distinct. A query on either one has to offer both as
-        // candidates, otherwise the rows under the other key are unreachable.
-        let widened = widen_signed_zeros(query);
+        // Keys are compared in arrow's total order, where -0.0 and +0.0 are
+        // distinct, so a query on zero may miss rows stored under the other key,
+        // or admit a row IEEE 754 excludes. Only a caller that rechecks can take
+        // that answer, so ask for both encodings and report candidates.
+        let inexact = options.is_rechecked() && query_touches_signed_zero(query);
+        let widened = inexact.then(|| widen_signed_zeros(query)).flatten();
         let query = widened.as_ref().unwrap_or(query);
 
         let tracked_null_rows = || {
@@ -836,10 +838,10 @@ impl ScalarIndex for BitmapIndex {
         };
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
-        if widened.is_some() {
-            // The widened query answers with the candidates for both encodings
-            // of zero; which of them matches is IEEE 754 semantics, applied by
-            // the recheck `SargableQueryParser` forces for these queries.
+        if inexact {
+            // The answer covers both encodings of zero, or admits a row IEEE 754
+            // excludes. Which rows match is decided by the recheck that
+            // `SargableQueryParser` forces for these queries.
             return Ok(SearchResult::AtMost(selection));
         }
         Ok(SearchResult::Exact(selection))
@@ -1936,7 +1938,7 @@ mod tests {
     use super::*;
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{Float64Array, RecordBatch, StringArray, UInt64Array, record_batch};
+    use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
@@ -2075,18 +2077,18 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, false),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0])),
-                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
-            ],
+        // A null row rides along so the widened path is exercised with null
+        // tracking on.
+        let batch = record_batch!(
+            (
+                "value",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0), None]
+            ),
+            ("_rowid", UInt64, [0, 1, 2, 3, 4])
         )
         .unwrap();
+        let schema = batch.schema();
         let batch = sort_batch_by_value(&batch);
         let stream = stream::once(async move { Ok(batch) });
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
@@ -2099,10 +2101,7 @@ mod tests {
             .unwrap();
         assert_eq!(index.index_map.len(), 4, "the two zeros stay distinct keys");
 
-        let rows = |result: SearchResult| {
-            let SearchResult::AtMost(row_ids) = result else {
-                panic!("a widened query answers with candidates, not an exact match");
-            };
+        let addrs = |row_ids: NullableRowAddrSet| {
             let mut addrs: Vec<u64> = row_ids
                 .true_rows()
                 .row_addrs()
@@ -2112,11 +2111,42 @@ mod tests {
             addrs.sort();
             addrs
         };
+        let rechecked = SearchOptions::default().with_recheck(true);
+        let candidates = |result: SearchResult| {
+            let SearchResult::AtMost(row_ids) = result else {
+                panic!("a widened query answers with candidates, not an exact match");
+            };
+            addrs(row_ids)
+        };
 
         for zero in [0.0f64, -0.0f64] {
             let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
+            let result = index
+                .search_with_options(&query, rechecked, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let SearchResult::AtMost(row_ids) = result else {
+                panic!("a widened query answers with candidates, not an exact match");
+            };
+            // Widening must not disturb null tracking: the null row stays NULL,
+            // neither promoted into the answer nor dropped.
+            assert_eq!(
+                row_ids.null_rows().row_addrs().unwrap().count(),
+                1,
+                "querying {zero}"
+            );
+            assert_eq!(addrs(row_ids), vec![1, 2], "querying {zero}");
+
+            // A caller that does not recheck gets the total-order answer, exactly
+            // as before this widening existed. merge_insert's key lookup panics on
+            // a non-exact result (`scalar_index.rs`'s `todo!`) and the label-list
+            // sub-index turns one into `Error::internal`.
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            assert_eq!(rows(result), vec![1, 2], "querying {zero}");
+            let SearchResult::Exact(row_ids) = result else {
+                panic!("an un-rechecked query must stay exact");
+            };
+            let expected = if zero.is_sign_negative() { 1 } else { 2 };
+            assert_eq!(addrs(row_ids), vec![expected], "querying {zero}");
         }
 
         // `>= +0.0` starts above -0.0 in total order, and `<= -0.0` stops below
@@ -2125,18 +2155,21 @@ mod tests {
             Bound::Included(ScalarValue::Float64(Some(0.0))),
             Bound::Unbounded,
         );
-        let result = index.search(&ge_zero, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(rows(result), vec![1, 2, 3]);
+        let result = index
+            .search_with_options(&ge_zero, rechecked, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(candidates(result), vec![1, 2, 3]);
 
         let le_neg_zero = SargableQuery::Range(
             Bound::Unbounded,
             Bound::Included(ScalarValue::Float64(Some(-0.0))),
         );
         let result = index
-            .search(&le_neg_zero, &NoOpMetricsCollector)
+            .search_with_options(&le_neg_zero, rechecked, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(rows(result), vec![0, 1, 2]);
+        assert_eq!(candidates(result), vec![0, 1, 2]);
     }
 
     #[tokio::test]
