@@ -33,7 +33,8 @@ use lance_namespace_impls::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 use crate::error::PythonErrorExt;
 use crate::session::Session;
@@ -819,33 +820,51 @@ impl PyDirectoryNamespace {
     }
 }
 
-/// Keys the caller's Python object set that `typed` (the generated request
-/// model `request` was `depythonize`d into) has no field for.
+/// A generated request struct plus whatever the caller's Python object set
+/// that the struct has no field for -- e.g. a newer Geneva tuning kwarg the
+/// namespace schema hasn't caught up to yet.
 ///
-/// `depythonize` silently drops anything the target struct doesn't declare
-/// -- there's no `deny_unknown_fields` and no flatten catch-all on the
-/// generated namespace request models, so a knob the model hasn't caught up
-/// to yet (e.g. a newer Geneva tuning kwarg) just disappears before the
-/// request is even built. Recovering it here, from the original object
-/// rather than from `typed`, is what lets a caller forward it anyway --
-/// see `alter_table_backfill_columns` / `refresh_materialized_view` below,
-/// which merge this into the JSON body instead of relying solely on the
-/// generated struct's own serialization.
-fn extra_options<T: Serialize>(
+/// Deserializing straight into `T` (plain `depythonize`) silently drops
+/// those extras -- there's no `deny_unknown_fields` and no flatten
+/// catch-all on the generated namespace request models, so a knob like
+/// that just disappears before the request is even built. This combined
+/// struct recovers it: `#[serde(flatten)]` on both fields makes serde
+/// attribute every key either to `typed` (if `T` declares it) or to
+/// `extra` (everything else), in one deserialization pass.
+///
+/// That's deliberately not "deserialize `T`, then diff its own
+/// *serialization* against the raw object to see what's left over" --
+/// the generated structs mark every optional field
+/// `skip_serializing_if = "Option::is_none"`, so an unset field is
+/// *absent* from `T`'s own serialized JSON but *present* (as `null`) in
+/// the caller's raw object. A diff-based approach reads that mismatch as
+/// "extra" and sends the field back as an explicit `null` on the wire --
+/// which some namespace implementations reject for a field that's
+/// optional (may be absent) but not nullable (may not be `null`).
+/// Flatten-based deserialization doesn't have this problem: it's about
+/// which keys `T::deserialize` recognizes, independent of how `T` itself
+/// would serialize.
+///
+/// Also deliberately not "read the caller's object's `model_extra`
+/// directly" -- by the time a request reaches here, the Python-level
+/// `RestNamespace` wrapper (`python/lance/namespace.py`) has already
+/// called `request.model_dump()` on it, so `py_request` is a plain dict,
+/// not a live pydantic model; `model_extra` isn't available to read.
+#[derive(Deserialize)]
+struct WithExtraOptions<T> {
+    #[serde(flatten)]
+    typed: T,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn depythonize_with_extras<T: DeserializeOwned>(
     py_request: &Bound<'_, PyAny>,
-    typed: &T,
-) -> PyResult<serde_json::Map<String, serde_json::Value>> {
+) -> PyResult<(T, serde_json::Map<String, serde_json::Value>)> {
     let raw: serde_json::Value = depythonize(py_request)?;
-    let typed_value = serde_json::to_value(typed)
+    let combined: WithExtraOptions<T> = serde_json::from_value(raw)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let (Some(raw_obj), Some(typed_obj)) = (raw.as_object(), typed_value.as_object()) else {
-        return Ok(serde_json::Map::new());
-    };
-    Ok(raw_obj
-        .iter()
-        .filter(|(key, _)| !typed_obj.contains_key(*key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect())
+    Ok((combined.typed, combined.extra))
 }
 
 /// Python wrapper for RestNamespace
@@ -1435,8 +1454,8 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let typed: AlterTableBackfillColumnsRequest = depythonize(request)?;
-        let extra = extra_options(request, &typed)?;
+        let (typed, extra): (AlterTableBackfillColumnsRequest, _) =
+            depythonize_with_extras(request)?;
         let response = crate::rt()
             .block_on(
                 Some(py),
@@ -1452,8 +1471,8 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let typed: RefreshMaterializedViewRequest = depythonize(request)?;
-        let extra = extra_options(request, &typed)?;
+        let (typed, extra): (RefreshMaterializedViewRequest, _) =
+            depythonize_with_extras(request)?;
         let response = crate::rt()
             .block_on(
                 Some(py),

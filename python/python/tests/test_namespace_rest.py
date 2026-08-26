@@ -863,3 +863,47 @@ class TestBackfillAndRefreshExtraOptions:
 
         assert len(capturing_server.captured_bodies) == 1
         assert capturing_server.captured_bodies[0]["a_future_refresh_knob"] == 1000
+
+    def test_backfill_no_extras_matches_plain_request_body(self, capturing_server):
+        """An extras-*capable* request with nothing actually extra set must
+        send the identical body a plain (non extras-enabled) request would.
+
+        Regression guard for a bug review caught before merge: the generated
+        struct's optional fields use `skip_serializing_if`, so an *unset*
+        field is absent from `serde_json::to_value(typed)` but present as
+        `null` in a raw `depythonize` of the whole object. A diff between
+        those two would misread every unset field as an "extra" and add it
+        back as an explicit `null` -- turning e.g. `branch: None` into a
+        `"branch": null` on the wire, which some namespace implementations
+        reject for a field that's optional but not nullable. Comparing full
+        captured bodies (not just checking one field's absence) is what
+        would have caught that.
+        """
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+
+        client.alter_table_backfill_columns(
+            AlterTableBackfillColumnsRequest(id=["db", "table"], column="embedding")
+        )
+        plain_body = capturing_server.captured_bodies[-1]
+
+        extras_capable_request_cls = _with_options(AlterTableBackfillColumnsRequest)
+        client.alter_table_backfill_columns(
+            extras_capable_request_cls(id=["db", "table"], column="embedding")
+        )
+        no_extras_set_body = capturing_server.captured_bodies[-1]
+
+        assert no_extras_set_body == plain_body
+
+    def test_refresh_no_extras_matches_plain_request_body(self, capturing_server):
+        """See test_backfill_no_extras_matches_plain_request_body -- same
+        guard, for refresh_materialized_view."""
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+
+        client.refresh_materialized_view(RefreshMaterializedViewRequest(id=["db", "view"]))
+        plain_body = capturing_server.captured_bodies[-1]
+
+        extras_capable_request_cls = _with_options(RefreshMaterializedViewRequest)
+        client.refresh_materialized_view(extras_capable_request_cls(id=["db", "view"]))
+        no_extras_set_body = capturing_server.captured_bodies[-1]
+
+        assert no_extras_set_body == plain_body
