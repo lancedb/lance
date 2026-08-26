@@ -2148,29 +2148,48 @@ def test_no_stale_duplicate_after_partial_column_update(tmp_path):
     assert res["id"].is_unique, f"duplicate ids in result: {res['id'].tolist()}"
 
 
-@pytest.mark.skip(reason="retrain is deprecated")
-def test_retrain_indices(indexed_dataset):
-    data = create_table()
-    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+@pytest.mark.parametrize("retrain", [None, False, True])
+def test_retrain_indices(tmp_path, retrain):
+    rng = np.random.default_rng(42)
+    ndim = 16
+    initial_vectors = rng.standard_normal((64, ndim), dtype=np.float32)
+    appended_vectors = rng.standard_normal((64, ndim), dtype=np.float32) + 100
+    old_centroid = np.full((1, ndim), -1000, dtype=np.float32)
+
+    indexed_dataset = lance.write_dataset(vec_to_table(initial_vectors), tmp_path)
+    indexed_dataset = indexed_dataset.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=old_centroid,
+        index_file_version=IndexFileVersion.V3,
+    )
+    indexed_dataset = lance.write_dataset(
+        vec_to_table(appended_vectors), indexed_dataset.uri, mode="append"
+    )
+
     stats = indexed_dataset.stats.index_stats("vector_idx")
     assert stats["num_indices"] == 1
 
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     stats = indexed_dataset.stats.index_stats("vector_idx")
     assert stats["num_indices"] == 2
+    assert all(
+        index["centroids"] == old_centroid.tolist() for index in stats["indices"]
+    )
 
+    kwargs = {} if retrain is None else {"retrain": retrain}
+    indexed_dataset.optimize.optimize_indices(**kwargs)
     stats = indexed_dataset.stats.index_stats("vector_idx")
-    centroids = stats["indices"][0]["centroids"]
-    delta_centroids = stats["indices"][1]["centroids"]
-    assert centroids == delta_centroids
-
-    indexed_dataset.optimize.optimize_indices(retrain=True)
-    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
-        "centroids"
-    ]
-    stats = indexed_dataset.stats.index_stats("vector_idx")
-    assert stats["num_indices"] == 1
-    assert centroids != new_centroids
+    centroids = [index["centroids"] for index in stats["indices"]]
+    if retrain:
+        expected_centroid = np.concatenate([initial_vectors, appended_vectors]).mean(
+            axis=0
+        )
+        assert stats["num_indices"] == 1
+        assert np.allclose(centroids[0][0], expected_centroid)
+    else:
+        assert all(centroid == old_centroid.tolist() for centroid in centroids)
 
 
 def test_no_include_deleted_rows(indexed_dataset):
