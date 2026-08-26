@@ -2053,6 +2053,11 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
+        // What a retained sibling has to agree with. Every incoming segment
+        // already carries the same pair: `build_index_metadata_from_segments`
+        // compares them against each other before this point.
+        let expected_fields = new_indices[0].fields.clone();
+        let expected_covering_fields = new_indices[0].covering_fields.clone();
         let removed_indices = existing_named_indices
             .into_iter()
             .map(|idx| -> Result<Option<IndexMetadata>> {
@@ -2081,6 +2086,28 @@ impl DatasetIndexExt for Dataset {
                 }
 
                 if existing_fragments.is_disjoint(&incoming_fragments) {
+                    // Retained, so its declaration outlives this commit and has
+                    // to match what is being written: `IndexDescriptionImpl::try_new`
+                    // requires `fields` to be identical across the segments of one
+                    // logical index. Nothing above catches a disagreement, because
+                    // `keyed_fields` is the prefix left after the carried ones -- a
+                    // segment carrying columns keys on exactly what a plain one
+                    // keys on, and both pass the keyed-field guard.
+                    if idx.fields != expected_fields
+                        || idx.covering_fields != expected_covering_fields
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
+                             but retained segment {} declares fields {:?} and covering_fields {:?}; \
+                             a logical index cannot mix declarations - rebuild every segment in one commit",
+                            index_name,
+                            expected_fields,
+                            expected_covering_fields,
+                            idx.uuid,
+                            idx.fields,
+                            idx.covering_fields
+                        )));
+                    }
                     return Ok(None);
                 }
 
@@ -11126,6 +11153,169 @@ mod tests {
         );
     }
 
+    /// The retention path itself: a segment on fragments the existing one does
+    /// not cover is kept beside it, and agreeing declarations are what makes
+    /// that legal. This is the case the rejection below must not swallow -
+    /// partial-coverage builds depend on it.
+    #[tokio::test]
+    async fn test_committing_a_segment_on_disjoint_fragments_keeps_the_existing_one() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::write(two_column_reader(), test_uri, None)
+            .await
+            .unwrap();
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        // Given by hand: an untrained segment commits with an empty bitmap, which
+        // takes the zero-coverage removal branch rather than the disjoint one.
+        // See `dataset_with_an_index_from_a_newer_build` for why nothing here trains.
+        let untrained = manifest_index(&dataset, "id_idx").await;
+        let mut existing = untrained.clone();
+        existing.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![existing.clone()],
+                        removed_indices: vec![untrained],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let covered = existing.fragment_bitmap.clone().unwrap();
+        assert!(!covered.is_empty());
+
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = dataset.fragment_bitmap.as_ref() - &covered;
+        assert!(!appended.is_empty());
+
+        let mut segment = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .replace(true)
+            .fragments(appended.iter().collect())
+            .train(false)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        segment.fragment_bitmap = Some(appended);
+        assert_eq!(segment.fields, existing.fields);
+        assert_eq!(segment.covering_fields, existing.covering_fields);
+
+        dataset
+            .commit_existing_index_segments("id_idx", "id", vec![segment])
+            .await
+            .unwrap();
+
+        let uuids = raw_manifest_indices(&dataset)
+            .await
+            .into_iter()
+            .filter(|idx| idx.name == "id_idx")
+            .map(|idx| idx.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids.len(), 2, "the disjoint existing segment was dropped");
+        assert!(uuids.contains(&existing.uuid));
+    }
+
+    /// One logical index needs one declaration, and the complete view is what
+    /// makes the disagreement reachable: a segment this build cannot read may
+    /// carry columns, and a plain segment committed beside it on disjoint
+    /// fragments is retained rather than replaced. Both pass the per-segment
+    /// rules - `keyed_fields` is the prefix left after the carried ones, so
+    /// `[id, payload]` carrying `[payload]` keys on `id` exactly as `[id]` does.
+    /// Committing the pair would leave `describe_indices` erroring on metadata
+    /// this call just wrote, the same failure
+    /// `test_build_index_metadata_from_segments_rejects_mixed_covering_declarations`
+    /// pins for the incoming side.
+    #[tokio::test]
+    async fn test_committing_a_plain_segment_beside_a_covered_unsupported_one_is_rejected() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        // Give the hidden segment a carried column. A newer build is exactly
+        // where a covering segment would come from.
+        let hidden = manifest_index(&dataset, "id_idx").await;
+        let payload_id = dataset.schema().field("payload").unwrap().id;
+        let mut hidden_covered = hidden.clone();
+        hidden_covered.fields.push(payload_id);
+        hidden_covered.covering_fields = vec![payload_id];
+        assert_eq!(hidden_covered.keyed_field(), hidden.keyed_field());
+        let covered_fragments = hidden_covered.fragment_bitmap.clone().unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![hidden_covered],
+                        removed_indices: vec![hidden],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Fragments the hidden segment does not cover, so the incoming segment
+        // takes the disjoint branch and the hidden one is retained.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = dataset.fragment_bitmap.as_ref() - &covered_fragments;
+        assert!(!appended.is_empty());
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut plain = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .replace(true)
+            .fragments(appended.iter().collect())
+            .train(false)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        plain.fragment_bitmap = Some(appended);
+        assert!(plain.covering_fields.is_empty());
+
+        let err = dataset
+            .commit_existing_index_segments("id_idx", "id", vec![plain])
+            .await
+            .expect_err("a logical index cannot mix covered and plain segment declarations");
+        assert!(
+            err.to_string().contains("covering_fields"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A cast reassigns the field id, so no index on that column can be carried
     /// forward. The guard that makes that explicit has to see the hidden ones
     /// too, or they get exactly the silent drop it exists to abolish.
@@ -11385,6 +11575,92 @@ mod tests {
             !after.fragment_bitmap.unwrap().is_disjoint(&live),
             "the surviving index covers only fragments the rewrite deleted"
         );
+    }
+
+    /// Without stable row ids a rewrite moves every row address, so each index
+    /// over the rewritten fragments has to be remapped - and remapping one means
+    /// opening it. A build with no reader for an index cannot remap it, so
+    /// compacting the fragments it covers would leave it addressing rows that no
+    /// longer exist. Those fragments are held back from the plan instead; the
+    /// rest of the table still compacts.
+    ///
+    /// The stable-row-id case is the test above: there the fragment-reuse index
+    /// repairs the coverage afterwards, so nothing has to be held back.
+    #[tokio::test]
+    async fn test_compaction_defers_fragments_an_unsupported_index_covers() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: false,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, "id_idx").await;
+        let covered = manifest_index(&dataset, "id_idx")
+            .await
+            .fragment_bitmap
+            .unwrap();
+
+        // Two more fragments the hidden index does not cover: they are the ones
+        // compaction is still free to rewrite.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+        let before = manifest_index(&dataset, "id_idx").await;
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // The two uncovered fragments coalesce; the two the hidden index covers
+        // are left alone. Both halves matter: no rewrite at all would satisfy the
+        // coverage assertion below for the wrong reason.
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+        let live = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert!(
+            covered.is_subset(&live),
+            "a fragment the unreadable index covers was rewritten: covered {covered:?}, live {live:?}"
+        );
+
+        let after = manifest_index(&dataset, "id_idx").await;
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+
+        // Nothing compactable is left outside the held-back set, so the plan is
+        // empty. That has to be an ordinary no-op: on a table the index covers
+        // whole - the usual shape - every compaction takes this path.
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(metrics.fragments_added, 0);
+        assert_eq!(manifest_index(&dataset, "id_idx").await.uuid, before.uuid);
     }
 
     /// Optimizing a name whose segments this build cannot all read would commit

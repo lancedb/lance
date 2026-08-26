@@ -99,7 +99,7 @@ use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_inte
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{DatasetIndexExt, load_all_indices};
+use crate::index::{DatasetIndexExt, load_all_indices, unsupported_index_version};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -125,7 +125,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -752,10 +752,32 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
         );
+        // Without stable row ids a rewrite moves every row address, so the
+        // indices over the rewritten fragments have to be remapped in the same
+        // commit. An index this build cannot open cannot be remapped, so its
+        // fragments join the caller's own exclusions and are left uncompacted -
+        // taking the same path, which terminates the current bin rather than
+        // letting the candidates on either side of the gap be planned together.
+        let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
+        if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
+            let unremappable = unremappable_fragments(dataset).await?;
+            if !unremappable.is_empty() {
+                // Otherwise a compaction that plans nothing looks like a
+                // compaction that found nothing to do.
+                log::info!(
+                    "holding {} fragment(s) back from compaction: they are covered by an index \
+                     this build cannot read, and so cannot be remapped here",
+                    unremappable.len(),
+                );
+            }
+            excluded_fragment_ids |= unremappable;
+        }
+        let excluded_fragment_ids = &excluded_fragment_ids;
+
         let mut fragment_metrics = futures::stream::iter(fragments)
-            .map(|fragment| async {
+            .map(|fragment| async move {
                 if u32::try_from(fragment.id())
-                    .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id))
+                    .is_ok_and(|fragment_id| excluded_fragment_ids.contains(fragment_id))
                 {
                     Ok(None)
                 } else {
@@ -2080,20 +2102,52 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
     // splits the small-fragment run and they never coalesce.
     for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
-            index_fragmaps.push(fragment_bitmap.clone());
-        } else {
-            let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            // max_fragment_id is inclusive (the highest id); +1 for an exclusive
-            // upper bound so the last fragment is covered (None => empty range).
-            let frags = 0..dataset_at_index
-                .manifest
-                .max_fragment_id
-                .map_or(0, |m| m + 1);
-            index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
-        }
+        index_fragmaps.push(index_fragment_coverage(dataset, index).await?);
     }
     Ok(index_fragmaps)
+}
+
+/// The fragments an index segment covers, reconstructing the coverage of a
+/// legacy segment that predates the bitmap from the dataset it was written
+/// against.
+async fn index_fragment_coverage(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<RoaringBitmap> {
+    if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+        return Ok(fragment_bitmap.clone());
+    }
+    let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
+    // max_fragment_id is inclusive (the highest id); +1 for an exclusive
+    // upper bound so the last fragment is covered (None => empty range).
+    let frags = 0..dataset_at_index
+        .manifest
+        .max_fragment_id
+        .map_or(0, |m| m + 1);
+    Ok(RoaringBitmap::from_sorted_iter(frags).unwrap())
+}
+
+/// Fragments covered by an index this build has no reader for.
+///
+/// A rewrite moves every row address in the fragments it touches, and putting an
+/// index back in step means opening it. A build that cannot open one cannot
+/// remap it, so compacting the fragments it covers would leave it addressing
+/// rows that are gone -- worse than the erase this whole path exists to prevent.
+/// They are held out of the plan instead, and the rest of the table still
+/// compacts.
+///
+/// Only the eager remap path needs this. Stable row ids keep the addresses
+/// across a rewrite, and `defer_index_remap` hands the repair to a build that
+/// can read the index, through the fragment-reuse index it writes.
+async fn unremappable_fragments(dataset: &Dataset) -> Result<RoaringBitmap> {
+    let mut covered = RoaringBitmap::new();
+    for index in load_all_indices(dataset).await?.iter() {
+        if is_system_index(index) || unsupported_index_version(index).is_none() {
+            continue;
+        }
+        covered |= index_fragment_coverage(dataset, index).await?;
+    }
+    Ok(covered)
 }
 
 pub async fn plan_compaction(
