@@ -136,9 +136,16 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
+        let target_type = self
+            .target_index
+            .training_data_type()
+            .as_ref()
+            .and_then(JsonIndexTargetType::from_data_type)
+            .map(JsonIndexTargetType::to_proto);
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
+            target_type,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -162,6 +169,8 @@ impl ScalarIndex for JsonIndex {
                 self.target_index.index_type()
             ))
         })?;
+        let persisted_target_type =
+            JsonIndexTargetType::from_data_type(&target_type).map(JsonIndexTargetType::to_proto);
         let new_data = JsonIndexPlugin::extract_json(new_data, self.path.clone())?;
         let new_data =
             JsonIndexPlugin::convert_stream_by_type(new_data, target_type, self.path.clone())?;
@@ -177,6 +186,7 @@ impl ScalarIndex for JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
+            target_type: persisted_target_type,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -234,6 +244,47 @@ enum JsonIndexTargetType {
     Float64,
     Utf8,
     LargeBinary,
+}
+
+impl JsonIndexTargetType {
+    fn from_data_type(data_type: &DataType) -> Option<Self> {
+        match data_type {
+            DataType::Boolean => Some(Self::Boolean),
+            DataType::Int64 => Some(Self::Int64),
+            DataType::UInt64 => Some(Self::UInt64),
+            DataType::Float64 => Some(Self::Float64),
+            DataType::Utf8 => Some(Self::Utf8),
+            DataType::LargeBinary => Some(Self::LargeBinary),
+            _ => None,
+        }
+    }
+
+    fn from_proto(value: i32) -> Option<Self> {
+        use crate::pb::json_index_details::TargetType;
+
+        match TargetType::try_from(value).ok()? {
+            TargetType::Boolean => Some(Self::Boolean),
+            TargetType::Int64 => Some(Self::Int64),
+            TargetType::Uint64 => Some(Self::UInt64),
+            TargetType::Float64 => Some(Self::Float64),
+            TargetType::Utf8 => Some(Self::Utf8),
+            TargetType::LargeBinary => Some(Self::LargeBinary),
+            TargetType::Unspecified => None,
+        }
+    }
+
+    fn to_proto(self) -> i32 {
+        use crate::pb::json_index_details::TargetType;
+
+        (match self {
+            Self::Boolean => TargetType::Boolean,
+            Self::Int64 => TargetType::Int64,
+            Self::UInt64 => TargetType::Uint64,
+            Self::Float64 => TargetType::Float64,
+            Self::Utf8 => TargetType::Utf8,
+            Self::LargeBinary => TargetType::LargeBinary,
+        }) as i32
+    }
 }
 
 impl TryFrom<&DataType> for JsonIndexTargetType {
@@ -313,13 +364,19 @@ impl AnyQuery for JsonQuery {
 #[derive(Debug)]
 pub struct JsonQueryParser {
     path: String,
+    target_type: DataType,
     target_parser: Box<dyn ScalarQueryParser>,
 }
 
 impl JsonQueryParser {
-    pub fn new(path: String, target_parser: Box<dyn ScalarQueryParser>) -> Self {
+    pub fn new(
+        path: String,
+        target_type: DataType,
+        target_parser: Box<dyn ScalarQueryParser>,
+    ) -> Self {
         Self {
             path,
+            target_type,
             target_parser,
         }
     }
@@ -407,19 +464,6 @@ impl ScalarQueryParser for JsonQueryParser {
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                // Support multiple JSON extraction functions
-                let json_functions = [
-                    "json_extract",
-                    "json_get",
-                    "json_get_int",
-                    "json_get_uint",
-                    "json_get_float",
-                    "json_get_bool",
-                    "json_get_string",
-                ];
-                if !json_functions.contains(&udf.name()) {
-                    return None;
-                }
                 if udf.args.len() != 2 {
                     return None;
                 }
@@ -428,14 +472,19 @@ impl ScalarQueryParser for JsonQueryParser {
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
                         if path == &self.path {
-                            // Return the appropriate type based on the function
-                            match udf.name() {
-                                "json_get_int" => Some(DataType::Int64),
-                                "json_get_uint" => Some(DataType::UInt64),
-                                "json_get_float" => Some(DataType::Float64),
-                                "json_get_bool" => Some(DataType::Boolean),
-                                "json_get_string" | "json_extract" => Some(DataType::Utf8),
-                                _ => None,
+                            let accessor_type = match udf.name() {
+                                "json_get" => DataType::LargeBinary,
+                                "json_get_int" => DataType::Int64,
+                                "json_get_uint" => DataType::UInt64,
+                                "json_get_float" => DataType::Float64,
+                                "json_get_bool" => DataType::Boolean,
+                                "json_get_string" => DataType::Utf8,
+                                _ => return None,
+                            };
+                            if accessor_type == self.target_type {
+                                Some(accessor_type)
+                            } else {
+                                None
                             }
                         } else {
                             None
@@ -1099,7 +1148,7 @@ impl BasicTrainer for JsonIndexPlugin {
                 .target_index_parameters
                 .as_deref()
                 .unwrap_or("{}"),
-            &Field::new("", target_type, true),
+            &Field::new("", target_type.clone(), true),
         )?;
 
         let target_index = target_trainer
@@ -1115,6 +1164,8 @@ impl BasicTrainer for JsonIndexPlugin {
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
+            target_type: JsonIndexTargetType::from_data_type(&target_type)
+                .map(JsonIndexTargetType::to_proto),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1158,11 +1209,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details =
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
+        let target_type = JsonIndexTargetType::from_proto(json_details.target_type?)?.into();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
+        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
         Some(Box::new(JsonQueryParser::new(
             json_details.path.clone(),
+            target_type,
             target_parser,
         )) as Box<dyn ScalarQueryParser>)
     }

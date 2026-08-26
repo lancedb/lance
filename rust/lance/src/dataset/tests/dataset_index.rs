@@ -5921,6 +5921,28 @@ async fn test_json_btree_uint64_is_lossless_and_order_independent(
 
     assert_eq!(indexed.num_rows(), 1);
     assert_eq!(indexed, baseline);
+
+    let incompatible_predicate = "json_get_float(json, 'val') = 1.0";
+    let mut incompatible_scan = dataset.scan();
+    incompatible_scan.filter(incompatible_predicate).unwrap();
+    let plan = incompatible_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ScalarIndexQuery"),
+        "Expected Float64 access to bypass a UInt64 JSON BTree:\n{plan}"
+    );
+    let incompatible = incompatible_scan.try_into_batch().await.unwrap();
+
+    let mut incompatible_baseline_scan = dataset.scan();
+    incompatible_baseline_scan.use_scalar_index(false);
+    let incompatible_baseline = incompatible_baseline_scan
+        .filter(incompatible_predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(incompatible.num_rows(), 1);
+    assert_eq!(incompatible, incompatible_baseline);
 }
 
 #[rstest]

@@ -2986,7 +2986,8 @@ mod tests {
                 ColInfo::new(
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
-                        "$.name".to_string(),
+                        "name".to_string(),
+                        DataType::Utf8,
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -2999,13 +3000,13 @@ mod tests {
 
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, 'name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.name".to_string(),
+                "name".to_string(),
             ),
         );
 
@@ -4162,9 +4163,10 @@ mod tests {
     #[test]
     fn test_multi_json_indices_route_by_path() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // path "a" and one for path "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
-            "$.a".to_string(),
+            "a".to_string(),
+            DataType::Utf8,
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4172,7 +4174,8 @@ mod tests {
             )),
         )));
         multi.add(Box::new(JsonQueryParser::new(
-            "$.b".to_string(),
+            "b".to_string(),
+            DataType::Utf8,
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
                 "Json".to_string(),
@@ -4185,7 +4188,7 @@ mod tests {
             ColInfo::with_multi(DataType::LargeBinary, Box::new(multi)),
         )]);
 
-        // Query against path "$.b" must hit the "$.b" index.
+        // Query against path "b" must hit the "b" index.
         let expected_b = IndexedExpression::index_query(
             "json".to_string(),
             "json_b_idx".to_string(),
@@ -4194,17 +4197,17 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.b".to_string(),
+                "b".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, 'b') = 'foo'",
             Some(expected_b),
             false,
         );
 
-        // Query against path "$.a" must hit the "$.a" index.
+        // Query against path "a" must hit the "a" index.
         let expected_a = IndexedExpression::index_query(
             "json".to_string(),
             "json_a_idx".to_string(),
@@ -4213,18 +4216,18 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.a".to_string(),
+                "a".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, 'a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'c') = 'foo'");
     }
 
     #[test]

@@ -241,8 +241,22 @@ message HnswParameters {
 }
 
 message JsonIndexDetails {
+  enum TargetType {
+    TARGET_TYPE_UNSPECIFIED = 0;
+    TARGET_TYPE_BOOLEAN = 1;
+    TARGET_TYPE_INT64 = 2;
+    TARGET_TYPE_UINT64 = 3;
+    TARGET_TYPE_FLOAT64 = 4;
+    TARGET_TYPE_UTF8 = 5;
+    TARGET_TYPE_LARGE_BINARY = 6;
+  }
+
   string path = 1;
   google.protobuf.Any target_details = 2;
+
+  // The native Arrow type used to train the wrapped index. Present for current
+  // JSON indices; absent legacy details must not be used for typed query planning.
+  optional TargetType target_type = 3;
 }
 message BloomFilterIndexDetails {}
 
