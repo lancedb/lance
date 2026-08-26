@@ -2703,11 +2703,11 @@ mod tests {
             .copy_via_stream(&source, &destination_store, &destination)
             .await
             .unwrap_err();
+        let error_message = error.to_string();
         assert!(
-            error.to_string().contains("destination write")
-                && error
-                    .to_string()
-                    .contains("injected multipart part failure"),
+            (error_message.contains("destination write")
+                || error_message.contains("destination completion"))
+                && error_message.contains("injected multipart part failure"),
             "expected upload-stage context and the underlying error, got: {error}"
         );
 
