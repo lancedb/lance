@@ -4316,7 +4316,6 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "bitvec",
- "blake3",
  "bytes",
  "crossbeam-queue",
  "datafusion",

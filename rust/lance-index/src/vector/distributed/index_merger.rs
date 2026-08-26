@@ -256,10 +256,10 @@ async fn open_aux_reader(
 
 /// Order independent multiset digest of a segment's stored row ids.
 ///
-/// Every id contributes the first two lanes of its blake3 hash through
-/// wrapping addition, so accumulation is insensitive to read order and batch
-/// boundaries, and digests of disjoint segments combine by [`Self::merge`].
-/// This fences defective outputs with memory independent of segment size.
+/// Two independently prefixed std hash lanes accumulate by wrapping addition,
+/// so the digest ignores read order and batch boundaries, and disjoint
+/// segments combine by [`Self::merge`]. Never persist it: both sides are
+/// computed in one process, which makes the unversioned std hasher safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RowIdentityDigest {
     lanes: [u64; 2],
@@ -268,12 +268,8 @@ pub struct RowIdentityDigest {
 impl RowIdentityDigest {
     /// Fold one row id into the digest.
     pub fn insert(&mut self, row_id: u64) {
-        let hash = blake3::hash(&row_id.to_le_bytes());
-        let bytes = hash.as_bytes();
-        self.lanes[0] =
-            self.lanes[0].wrapping_add(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
-        self.lanes[1] =
-            self.lanes[1].wrapping_add(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+        self.lanes[0] = self.lanes[0].wrapping_add(row_id_lane_hash(0, row_id));
+        self.lanes[1] = self.lanes[1].wrapping_add(row_id_lane_hash(1, row_id));
     }
 
     /// Combine with the digest of another segment's row ids.
@@ -281,6 +277,16 @@ impl RowIdentityDigest {
         self.lanes[0] = self.lanes[0].wrapping_add(other.lanes[0]);
         self.lanes[1] = self.lanes[1].wrapping_add(other.lanes[1]);
     }
+}
+
+/// Hash one row id into a digest lane, keyed by the lane's prefix.
+fn row_id_lane_hash(lane: u64, row_id: u64) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    lane.hash(&mut hasher);
+    row_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Durable row identity of a segment: its stored row count and a digest of
