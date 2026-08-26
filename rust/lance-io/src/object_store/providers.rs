@@ -793,4 +793,27 @@ mod tests {
             .unwrap();
         assert_eq!(cached.commit_handler_type(), CommitHandlerType::Unsafe);
     }
+
+    #[test]
+    fn test_builtin_providers_keep_conditional_put_capability() {
+        // Regression guard for existing providers: the declared capability now
+        // drives commit-handler selection, so every provider the default
+        // registry ships must keep declaring the conflict-safe put-if-not-exists
+        // handler it resolved to before this change. A built-in that silently
+        // switched to Unsafe would change the commit handler of every store on
+        // that scheme.
+        let registry = ObjectStoreRegistry::default();
+        let providers = registry
+            .providers
+            .read()
+            .expect("ObjectStoreRegistry lock poisoned");
+        assert!(!providers.is_empty());
+        for (scheme, provider) in providers.iter() {
+            assert_eq!(
+                provider.commit_handler(),
+                CommitHandlerType::ConditionalPut,
+                "built-in provider for `{scheme}` changed its declared commit handler",
+            );
+        }
+    }
 }

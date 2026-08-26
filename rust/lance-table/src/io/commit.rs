@@ -2151,6 +2151,29 @@ mod tests {
         assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
     }
 
+    #[tokio::test]
+    async fn test_builtin_provider_resolves_unchanged_end_to_end() {
+        // Regression guard across the full chain for a built-in scheme: the
+        // capability the memory provider declares, captured on the store the
+        // default registry builds, must still resolve to the handler that
+        // scheme used before the capability was made provider-driven.
+        use lance_io::object_store::ObjectStoreRegistry;
+
+        let registry = ObjectStoreRegistry::default();
+        let store = registry
+            .new_store(
+                Url::parse("memory://bucket/ds").unwrap(),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+        let handler =
+            commit_handler_from_url("memory://bucket/ds", &None, store.commit_handler_type())
+                .await
+                .unwrap();
+        assert_eq!(format!("{:?}", handler), "ConditionalPutCommitHandler");
+    }
+
     /// A [CommitLock] whose lease records whether it was released, so we can
     /// assert the lock does not leak when the commit future is cancelled.
     #[derive(Debug)]
