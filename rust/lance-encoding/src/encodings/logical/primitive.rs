@@ -3555,7 +3555,7 @@ impl VariableFullZipDecoder {
     /// The bytes come from the file, so both the prefix and the length it claims are
     /// bounds checked and report a corrupt file rather than reading past the end of
     /// the buffer. Reading the prefix and advancing past it happen here together, so
-    /// a page can only be walked with the width it was written with.
+    /// the prefix cannot be read at one width and skipped at another.
     fn split_next_value(data: &[u8], bits_per_length: u8) -> Result<(&[u8], &[u8])> {
         let width = bits_per_length as usize / 8;
         if data.len() < width {
@@ -3606,7 +3606,8 @@ impl VariableFullZipDecoder {
         // This undercounts if there are lists but, at this point, we don't really know how many items we have
         let mut rep = Vec::with_capacity(num_rows as usize);
         let mut def = Vec::with_capacity(num_rows as usize);
-        let bytes_cw = self.details.ctrl_word_parser.bytes_per_word() * num_rows as usize;
+        let bytes_per_word = self.details.ctrl_word_parser.bytes_per_word();
+        let bytes_cw = bytes_per_word * num_rows as usize;
 
         // This undercounts if there are lists
         // It can also overcount if there are invisible items
@@ -3636,13 +3637,12 @@ impl VariableFullZipDecoder {
             while !databuf.is_empty() {
                 // The remaining byte count comes from the file, so a page truncated
                 // mid-item can leave less than one control word here.
-                let bytes_per_word = self.details.ctrl_word_parser.bytes_per_word();
                 if databuf.len() < bytes_per_word {
                     return Err(Error::corrupt_file_named(
                         "variable_full_zip",
                         format!(
                             "truncated control word: {} byte(s) remain in the page buffer but \
-                             each item needs {bytes_per_word}",
+                             each control word needs {bytes_per_word}",
                             databuf.len()
                         ),
                     ));
@@ -7089,6 +7089,7 @@ mod tests {
     };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::Error;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
 
@@ -10297,7 +10298,7 @@ mod tests {
     /// is the true maximum only at one bit. Callers that need `parse_desc` to classify
     /// items correctly at wider levels have to pass the real maxima instead; today's
     /// callers either use one bit or fail before `parse_desc` runs.
-    fn truncated_tail_details(
+    fn full_zip_variable_details(
         bits_rep: u8,
         bits_def: u8,
     ) -> std::sync::Arc<super::FullZipDecodeDetails> {
@@ -10340,7 +10341,7 @@ mod tests {
         let mut data = VecDeque::new();
         data.push_back(crate::buffer::LanceBuffer::from(buf));
         super::VariableFullZipDecoder::new(
-            truncated_tail_details(bits_rep, bits_def),
+            full_zip_variable_details(bits_rep, bits_def),
             data,
             num_rows,
             in_bits_per_length,
@@ -10365,8 +10366,6 @@ mod tests {
     /// release build read up to 8 bytes out of a 4 byte allocation.
     #[test]
     fn variable_full_zip_truncated_length_prefix_is_corrupt_file() {
-        use lance_core::Error;
-
         for (bits, buf_len) in [(32u8, 3usize), (64u8, 4usize)] {
             let err = decode_variable_full_zip(vec![0xAA; buf_len], 1, bits, bits)
                 .expect_err("a truncated length prefix must not decode");
@@ -10390,8 +10389,6 @@ mod tests {
     /// in production: `range end index 2903552 out of range for slice of length 38469`.
     #[test]
     fn variable_full_zip_value_length_past_page_end_is_corrupt_file() {
-        use lance_core::Error;
-
         // The prefix claims 64 bytes of value data but only 4 follow it.
         let mut page = 64_u32.to_le_bytes().to_vec();
         page.extend_from_slice(b"abcd");
@@ -10438,8 +10435,6 @@ mod tests {
     /// aborts the process before either length check above can run.
     #[test]
     fn variable_full_zip_truncated_control_word_is_corrupt_file() {
-        use lance_core::Error;
-
         // rep and def wide enough together to need a two byte control word, and a
         // single byte that cannot hold it.
         let err = decode_variable_full_zip_with_levels(vec![0xAAu8], 1, 32, 32, 4, 5)
@@ -10464,8 +10459,6 @@ mod tests {
         #[case] out_bits_per_offset: u8,
         #[case] keyword: &str,
     ) {
-        use lance_core::Error;
-
         let err =
             decode_variable_full_zip(vec![0xAA; 8], 1, in_bits_per_length, out_bits_per_offset)
                 .expect_err("an unsupported width must not decode");
@@ -10480,13 +10473,12 @@ mod tests {
     }
 
     /// A page claiming more rows than it carries bytes for must not underflow the
-    /// capacity estimate. This page's tail is also short, so the walk rejects it too —
-    /// a page that ends exactly on an item boundary while carrying fewer rows than
-    /// claimed is still accepted, which is tracked separately.
+    /// capacity estimate. This page's tail is also short, so the walk rejects it too.
+    /// A page that ends exactly on an item boundary while carrying fewer rows than
+    /// claimed still gets past the walk and then panics in `drain`, which indexes its
+    /// row-start vectors with that row count; see #8768.
     #[test]
     fn variable_full_zip_row_count_past_data_does_not_underflow() {
-        use lance_core::Error;
-
         // 10 rows x 1 control word byte is already more than the 4 bytes on hand, so
         // the capacity estimate underflows without saturating subtraction.
         let err = decode_variable_full_zip_with_levels(vec![0xAA; 4], 10, 32, 32, 1, 1)
