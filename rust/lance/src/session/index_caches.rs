@@ -120,18 +120,25 @@ impl CacheKey for FragReuseIndexKey<'_> {
 pub struct IndexMetadataKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
+    /// See `ManifestKey::identity`.
+    pub identity: Option<&'a str>,
 }
 
 impl CacheKey for IndexMetadataKey<'_> {
     type ValueType = Vec<IndexMetadata>;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
+        let mut key = format!(
             "{}:{}/{}",
             self.store_identity.len(),
             self.store_identity,
             self.version
-        ))
+        );
+        if let Some(identity) = self.identity {
+            key.push_str("/id/");
+            key.push_str(identity);
+        }
+        Cow::Owned(key)
     }
 
     fn type_name() -> &'static str {
@@ -145,6 +152,12 @@ impl CacheKey for IndexMetadataKey<'_> {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.store_identity);
         builder.write_u64(self.version);
+        if let Some(identity) = self.identity {
+            builder.write_some();
+            builder.write_str(identity);
+        } else {
+            builder.write_none();
+        }
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -200,10 +213,12 @@ mod tests {
         let first = IndexMetadataKey {
             version: 7,
             store_identity: "s3$first-options",
+            identity: None,
         };
         let second = IndexMetadataKey {
             version: 7,
             store_identity: "s3$second-options",
+            identity: None,
         };
 
         assert_ne!(first.key(), second.key());

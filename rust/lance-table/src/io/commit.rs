@@ -22,6 +22,7 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1747,10 +1748,43 @@ pub struct PredecessorIdentity {
     pub identity: String,
 }
 
+/// A condition on the latest manifest, judged on every commit attempt;
+/// publication is then conditioned on that manifest still being the
+/// predecessor (`CommitHandler::commit_after`). Sees the manifest only.
+pub trait CommitPrecondition: Debug + Send + Sync {
+    /// `Err(Error::PrerequisiteFailed)` when `latest` does not satisfy it.
+    fn check(&self, latest: &Manifest) -> Result<()>;
+}
+
+/// The latest manifest must carry every `(key, value)` in its schema metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequiredSchemaMetadata(pub HashMap<String, String>);
+
+impl CommitPrecondition for RequiredSchemaMetadata {
+    fn check(&self, latest: &Manifest) -> Result<()> {
+        for (key, expected) in &self.0 {
+            let actual = latest.schema.metadata.get(key);
+            if actual != Some(expected) {
+                return Err(lance_core::error::PrerequisiteFailedSnafu {
+                    message: format!(
+                        "commit requires schema metadata {key:?} = {expected:?} on version {}, \
+                         found {actual:?}",
+                        latest.version
+                    ),
+                }
+                .build());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    /// Conditions on the latest manifest, all re-checked on every attempt.
+    pub preconditions: Vec<Arc<dyn CommitPrecondition>>,
     // TODO: add isolation_level
 }
 
@@ -1759,6 +1793,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            preconditions: Vec::new(),
         }
     }
 }

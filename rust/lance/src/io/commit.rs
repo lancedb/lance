@@ -39,7 +39,8 @@ use lance_table::format::{
     is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
+    CommitConfig, CommitError, CommitHandler, CommitPrecondition, ManifestLocation,
+    ManifestNamingScheme, PredecessorIdentity,
 };
 use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
@@ -51,7 +52,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    write_manifest_file, write_manifest_file_after,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
@@ -292,6 +293,68 @@ async fn read_manifest_transaction(
     } else {
         Ok(None)
     }
+}
+
+/// Judge `preconditions` on the latest manifest and return the predecessor
+/// identity publication is conditioned on. The manifest at `handle`'s version
+/// must still carry the handle's identity: content cannot prove the base is live.
+async fn judge_preconditions(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    handle: &ManifestLocation,
+    preconditions: &[Arc<dyn CommitPrecondition>],
+) -> Result<Option<PredecessorIdentity>> {
+    if preconditions.is_empty() {
+        return Ok(None);
+    }
+    let failed = |message: String| lance_core::error::PrerequisiteFailedSnafu { message }.build();
+    let Some(handle_identity) = handle.identity.as_deref() else {
+        return Err(failed(format!(
+            "the handle for version {} carries no identity to condition the commit on; reload it",
+            handle.version
+        )));
+    };
+    let Some(latest) = commit_handler
+        .resolve_latest_identity(base_path, object_store)
+        .await?
+    else {
+        return Err(failed(
+            "the latest manifest carries no identity to condition the commit on".to_string(),
+        ));
+    };
+    let recreated = || {
+        failed(format!(
+            "the dataset at '{base_path}' was recreated since version {} was loaded",
+            handle.version
+        ))
+    };
+    if latest.version < handle.version {
+        return Err(recreated());
+    }
+    let current = if latest.version == handle.version {
+        Some(latest.clone())
+    } else {
+        commit_handler
+            .resolve_identity(base_path, object_store, handle.version)
+            .await?
+    };
+    match current {
+        Some(current) if current.identity == handle_identity => {}
+        _ => return Err(recreated()),
+    }
+    let Some((manifest, _)) =
+        try_read_manifest_at(object_store, commit_handler, base_path, latest.version).await?
+    else {
+        return Err(failed(format!(
+            "manifest {} is no longer readable",
+            latest.version
+        )));
+    };
+    for precondition in preconditions {
+        precondition.check(&manifest)?;
+    }
+    Ok(Some(latest))
 }
 
 /// Read the manifest at `version`, distinguishing "no such version"
@@ -587,6 +650,7 @@ async fn record_new_dataset_commit(
 ) {
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
+        identity: location.identity.as_deref(),
     };
     metadata_cache
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
@@ -595,6 +659,8 @@ async fn record_new_dataset_commit(
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
         e_tag: location.e_tag.as_deref(),
+
+        identity: location.identity.as_deref(),
     };
     metadata_cache
         .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
@@ -1264,6 +1330,7 @@ async fn record_successful_commit(
 ) {
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
+        identity: location.identity.as_deref(),
     };
     dataset
         .metadata_cache
@@ -1273,6 +1340,8 @@ async fn record_successful_commit(
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
         e_tag: location.e_tag.as_deref(),
+
+        identity: location.identity.as_deref(),
     };
     dataset
         .metadata_cache
@@ -1282,6 +1351,7 @@ async fn record_successful_commit(
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.object_store.store_prefix,
+            identity: location.identity.as_deref(),
         };
         dataset
             .index_cache
@@ -1316,6 +1386,12 @@ pub(crate) async fn commit_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
+    if !commit_config.preconditions.is_empty() && !commit_handler.supports_predecessor_condition() {
+        return Err(Error::not_supported(
+            "commit preconditions need a commit handler that can condition publication on \
+             the predecessor manifest, which this store's cannot",
+        ));
+    }
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
@@ -1388,6 +1464,15 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        let predecessor = judge_preconditions(
+            object_store,
+            commit_handler,
+            &dataset.base,
+            &original_dataset.manifest_location,
+            &commit_config.preconditions,
+        )
+        .await?;
+
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
@@ -1456,7 +1541,7 @@ pub(crate) async fn commit_transaction(
         )?;
 
         // Try to commit the manifest
-        let result = write_manifest_file(
+        let result = write_manifest_file_after(
             object_store,
             commit_handler,
             &dataset.base,
@@ -1469,6 +1554,7 @@ pub(crate) async fn commit_transaction(
             write_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
+            predecessor.as_ref(),
         )
         .await;
 
@@ -1560,6 +1646,12 @@ pub(crate) async fn commit_transaction(
                 } else {
                     break;
                 }
+            }
+            // A refused reservation applied nothing; the outcome is known.
+            Err(CommitError::OtherError(err @ Error::PrerequisiteFailed { .. })) => {
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
+                return Err(err);
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(

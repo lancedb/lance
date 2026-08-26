@@ -10,7 +10,10 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
-    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+    io::commit::{
+        CommitConfig, CommitHandler, CommitPrecondition, ManifestNamingScheme,
+        RequiredSchemaMetadata,
+    },
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -213,6 +216,28 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Judge `precondition` on every attempt; see [`CommitPrecondition`].
+    /// Handlers that cannot condition publication on the predecessor,
+    /// detached commits and dataset creation refuse it.
+    pub fn with_precondition(mut self, precondition: Arc<dyn CommitPrecondition>) -> Self {
+        self.commit_config.preconditions.push(precondition);
+        self
+    }
+
+    /// [`Self::with_precondition`] with [`RequiredSchemaMetadata`]: the latest
+    /// manifest must carry `value` under schema-metadata `key`, so a dataset
+    /// recreated at the same path is refused with [`Error::PrerequisiteFailed`].
+    pub fn with_required_schema_metadata(
+        self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.with_precondition(Arc::new(RequiredSchemaMetadata(HashMap::from([(
+            key.into(),
+            value.into(),
+        )]))))
+    }
+
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
         self
@@ -335,6 +360,7 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        let staged_against_handle = matches!(self.dest, WriteDestination::Dataset(_));
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
@@ -432,6 +458,20 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
+        if !self.commit_config.preconditions.is_empty() {
+            if self.detached {
+                return Err(Error::invalid_input(
+                    "commit preconditions cannot be enforced on a detached commit",
+                ));
+            }
+            // A URI resolves to whatever occupies it now, not the incarnation
+            // the transaction was staged against.
+            if !staged_against_handle {
+                return Err(Error::invalid_input(
+                    "commit preconditions need the dataset handle the transaction was staged against, not a URI",
+                ));
+            }
+        }
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
@@ -612,7 +652,13 @@ mod tests {
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::io::commit::PredecessorIdentity;
+    use lance_table::io::commit::external_manifest::{
+        ExternalManifestCommitHandler, ExternalManifestStore, Reservation, finalize_staged,
+    };
+    use object_store::path::Path;
 
     use super::*;
 
@@ -1224,5 +1270,582 @@ mod tests {
             "read_iops = {}; a full listing was likely used",
             io_stats.read_iops
         );
+    }
+
+    /// `(path, size, identity)` per version; identities are minted per
+    /// record and never reused, so a recreation at the same version differs.
+    type StoredRows = HashMap<(String, u64), (String, u64, String)>;
+
+    #[derive(Debug, Default)]
+    struct IdentifiedStore {
+        rows: std::sync::Mutex<StoredRows>,
+        next_identity: std::sync::atomic::AtomicU64,
+        hold_next_reservation: std::sync::atomic::AtomicBool,
+        reservation_held: tokio::sync::Notify,
+        release_reservation: tokio::sync::Notify,
+        fail_next_finalize: std::sync::atomic::AtomicBool,
+    }
+
+    impl IdentifiedStore {
+        fn mint(&self) -> String {
+            format!(
+                "identity-{}",
+                self.next_identity
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )
+        }
+
+        fn handler(self: &Arc<Self>) -> Arc<dyn CommitHandler> {
+            Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: self.clone(),
+            })
+        }
+
+        fn versions(&self) -> Vec<u64> {
+            let mut versions: Vec<u64> = self.rows.lock().unwrap().keys().map(|k| k.1).collect();
+            versions.sort();
+            versions
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalManifestStore for IdentifiedStore {
+        async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|row| row.0.clone())
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))
+        }
+
+        async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.0 == base_uri)
+                .max_by_key(|(key, _)| key.1)
+                .map(|(key, row)| (key.1, row.0.clone())))
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let identity = self.mint();
+            let mut rows = self.rows.lock().unwrap();
+            let key = (base_uri.to_string(), version);
+            if rows.contains_key(&key) {
+                return Err(Error::commit_conflict_source(
+                    version,
+                    "manifest already exists".into(),
+                ));
+            }
+            rows.insert(key, (path.to_string(), size, identity));
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&(base_uri.to_string(), version))
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
+            row.0 = path.to_string();
+            row.1 = size;
+            Ok(())
+        }
+
+        async fn delete(&self, base_uri: &str) -> Result<()> {
+            self.rows.lock().unwrap().retain(|key, _| key.0 != base_uri);
+            Ok(())
+        }
+
+        async fn get_manifest_location(
+            &self,
+            base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            let row = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .cloned()
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
+            Ok(ManifestLocation {
+                version,
+                path: Path::parse(&row.0).unwrap(),
+                size: Some(row.1),
+                naming_scheme: ManifestNamingScheme::V2,
+                e_tag: None,
+                identity: Some(row.2),
+            })
+        }
+
+        async fn get_latest_manifest_location(
+            &self,
+            base_uri: &str,
+        ) -> Result<Option<ManifestLocation>> {
+            match self.get_latest_version(base_uri).await? {
+                Some((version, _)) => self
+                    .get_manifest_location(base_uri, version)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+
+        async fn list_versions(
+            &self,
+            base_uri: &str,
+            since: Option<u64>,
+        ) -> Result<Option<Vec<ManifestLocation>>> {
+            let versions: Vec<u64> = self
+                .rows
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(base, _)| base == base_uri)
+                .map(|(_, version)| *version)
+                .collect();
+            let mut locations = Vec::new();
+            for version in versions {
+                if since.is_none_or(|since| version > since) {
+                    locations.push(self.get_manifest_location(base_uri, version).await?);
+                }
+            }
+            Ok(Some(locations))
+        }
+
+        async fn put(
+            &self,
+            base_path: &Path,
+            version: u64,
+            staging_path: &Path,
+            size: u64,
+            _e_tag: Option<String>,
+            object_store: &dyn object_store::ObjectStore,
+            naming_scheme: ManifestNamingScheme,
+        ) -> Result<ManifestLocation> {
+            self.put_if_not_exists(
+                base_path.as_ref(),
+                version,
+                staging_path.as_ref(),
+                size,
+                None,
+            )
+            .await?;
+            let mut location = finalize_staged(
+                self,
+                base_path,
+                version,
+                staging_path,
+                size,
+                object_store,
+                naming_scheme,
+            )
+            .await?;
+            location.identity = self.get_identity(base_path.as_ref(), version).await?;
+            Ok(location)
+        }
+
+        async fn finalize(
+            &self,
+            base_path: &Path,
+            version: u64,
+            staging_path: &Path,
+            size: u64,
+            object_store: &dyn object_store::ObjectStore,
+            naming_scheme: ManifestNamingScheme,
+        ) -> Result<ManifestLocation> {
+            if self
+                .fail_next_finalize
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::io("simulated copy failure after reservation"));
+            }
+            finalize_staged(
+                self,
+                base_path,
+                version,
+                staging_path,
+                size,
+                object_store,
+                naming_scheme,
+            )
+            .await
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn get_identity(&self, base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|row| row.2.clone()))
+        }
+
+        async fn put_if_predecessor(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            predecessor: &PredecessorIdentity,
+        ) -> Result<Reservation> {
+            if self
+                .hold_next_reservation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reservation_held.notify_one();
+                self.release_reservation.notified().await;
+            }
+            let identity = self.mint();
+            let mut rows = self.rows.lock().unwrap();
+            let held = rows
+                .get(&(base_uri.to_string(), predecessor.version))
+                .is_some_and(|row| row.2 == predecessor.identity);
+            if !held {
+                return Ok(Reservation::PredecessorChanged);
+            }
+            let key = (base_uri.to_string(), version);
+            if rows.contains_key(&key) {
+                return Ok(Reservation::Taken);
+            }
+            rows.insert(key, (path.to_string(), size, identity.clone()));
+            Ok(Reservation::Reserved { identity })
+        }
+    }
+
+    fn gen_batch(generation: &str) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![ArrowField::new("i", DataType::Int32, false)],
+            HashMap::from([("gen".to_string(), generation.to_string())]),
+        ));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..3_i32))],
+        )
+        .unwrap()
+    }
+
+    async fn create_with(uri: &str, generation: &str, handler: Arc<dyn CommitHandler>) -> Dataset {
+        InsertBuilder::new(uri)
+            .with_params(&WriteParams {
+                commit_handler: Some(handler),
+                ..Default::default()
+            })
+            .execute(vec![gen_batch(generation)])
+            .await
+            .unwrap()
+    }
+
+    async fn staged_append(dataset: &Dataset) -> Transaction {
+        InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![gen_batch("a")])
+            .await
+            .unwrap()
+    }
+
+    /// Drop the dataset at `uri` from storage and from the store, then
+    /// create a new one there with a different generation.
+    async fn recreate(uri: &str, store: &Arc<IdentifiedStore>, generation: &str) -> Dataset {
+        std::fs::remove_dir_all(uri).unwrap();
+        store.delete(uri.trim_start_matches('/')).await.unwrap();
+        create_with(uri, generation, store.handler()).await
+    }
+
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_where_publication_cannot_be_conditioned() {
+        let dataset = InsertBuilder::new("memory://required-unsupported")
+            .execute(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let txn = staged_append(&dataset).await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    /// Matching metadata lands; metadata changed before the commit fails it
+    /// even though the stale handle still shows the old value.
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_judged_on_the_latest_manifest() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&dataset).await;
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 2);
+
+        let stale = committed.clone();
+        let txn = staged_append(&stale).await;
+        let mut moved = committed;
+        moved
+            .update_schema_metadata([("gen".to_string(), Some("b".to_string()))])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(store.versions(), vec![1, 2, 3]);
+    }
+
+    /// A dataset recreated at the same path restarts its versions, so the
+    /// stale handle's conflict scan sees nothing newer; the requirement is
+    /// judged on the store's latest record and refuses the writer.
+    #[tokio::test]
+    async fn test_required_schema_metadata_refuses_a_same_version_recreation() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let mut recreated = recreate(uri.as_str(), &store, "b").await;
+        assert_eq!(recreated.version().version, stale.version().version);
+
+        let txn = staged_append(&stale).await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// A recreation landing after the judgement but before the reservation
+    /// is refused by the reservation itself: nothing is published and the
+    /// recreated dataset is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_recreation_between_judgement_and_reservation_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale).await;
+
+        store
+            .hold_next_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let committing = tokio::spawn(async move {
+            CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+                .with_required_schema_metadata("gen", "a")
+                .execute(txn)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), store.reservation_held.notified())
+            .await
+            .expect("the commit never reached its reservation");
+
+        let mut recreated = recreate(uri.as_str(), &store, "b").await;
+        store.release_reservation.notify_one();
+
+        let err = committing.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+        assert_eq!(
+            recreated.schema().metadata.get("gen").map(String::as_str),
+            Some("b")
+        );
+    }
+
+    /// Any precondition is judged on the latest manifest, not the handle's.
+    #[tokio::test]
+    async fn test_a_custom_precondition_is_judged_on_the_latest_manifest() {
+        #[derive(Debug)]
+        struct AtMostVersion(u64);
+        impl CommitPrecondition for AtMostVersion {
+            fn check(&self, latest: &Manifest) -> Result<()> {
+                if latest.version <= self.0 {
+                    return Ok(());
+                }
+                Err(lance_core::error::PrerequisiteFailedSnafu {
+                    message: format!("version {} > {}", latest.version, self.0),
+                }
+                .build())
+            }
+        }
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let stale = dataset.clone();
+        let txn = staged_append(&stale).await;
+        InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_precondition(Arc::new(AtMostVersion(1)))
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        assert_eq!(store.versions(), vec![1, 2]);
+    }
+
+    /// Two creations of an empty table write identical manifests, so only
+    /// the store's identity can tell the stale handle from the new table.
+    #[tokio::test]
+    async fn test_an_identical_empty_recreation_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let create_empty = || async {
+            InsertBuilder::new(uri.as_str())
+                .with_params(&WriteParams {
+                    commit_handler: Some(store.handler()),
+                    ..Default::default()
+                })
+                .execute(vec![gen_batch("a").slice(0, 0)])
+                .await
+                .unwrap()
+        };
+        let stale = create_empty().await;
+        let txn = staged_append(&stale).await;
+        std::fs::remove_dir_all(uri.as_str()).unwrap();
+        store
+            .delete(uri.as_str().trim_start_matches('/'))
+            .await
+            .unwrap();
+        let mut recreated = create_empty().await;
+        assert_eq!(recreated.manifest().fragments, stale.manifest().fragments);
+
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// A recreation that carries the same metadata still fails: the
+    /// candidate would be built from the deleted incarnation's manifest.
+    #[tokio::test]
+    async fn test_a_recreation_with_matching_metadata_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale).await;
+        let mut recreated = recreate(uri.as_str(), &store, "a").await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(stale)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PrerequisiteFailed { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    /// The version is ours once reserved; a finalization error afterwards is
+    /// resolved by outcome verification, not reported as a failed commit.
+    #[tokio::test]
+    async fn test_a_finalization_error_after_reservation_is_not_a_failure() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let dataset = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&dataset).await;
+        store
+            .fail_next_finalize
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 2);
+        assert_eq!(store.versions(), vec![1, 2]);
+    }
+
+    /// A URI destination reloads whatever occupies the URI, so a transaction
+    /// staged against a dropped dataset would land in its replacement.
+    #[tokio::test]
+    async fn test_preconditions_are_refused_for_uri_destinations() {
+        let store = Arc::new(IdentifiedStore::default());
+        let uri = TempStrDir::default();
+        let stale = create_with(uri.as_str(), "a", store.handler()).await;
+        let txn = staged_append(&stale).await;
+        let mut recreated = recreate(uri.as_str(), &store, "a").await;
+        let err = CommitBuilder::new(uri.as_str())
+            .with_commit_handler(store.handler())
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        recreated.checkout_latest().await.unwrap();
+        assert_eq!(recreated.version().version, 1);
+        assert_eq!(store.versions(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_for_new_datasets() {
+        let uri = TempStrDir::default();
+        let txn = InsertBuilder::new(uri.as_str())
+            .execute_uncommitted(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(uri.as_str())
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_required_schema_metadata_is_refused_on_detached_commits() {
+        let dataset = InsertBuilder::new("memory://required-detached")
+            .execute(vec![gen_batch("a")])
+            .await
+            .unwrap();
+        let txn = staged_append(&dataset).await;
+        let err = CommitBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_detached(true)
+            .with_required_schema_metadata("gen", "a")
+            .execute(txn)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 }

@@ -1124,6 +1124,8 @@ async fn test_checkout_removed_version_not_served_from_cache() {
             .get_with_key(&ManifestKey {
                 version,
                 e_tag: location.e_tag.as_deref(),
+
+                identity: location.identity.as_deref(),
             })
             .await
             .is_some(),
@@ -1150,6 +1152,8 @@ async fn test_checkout_removed_version_not_served_from_cache() {
             &ManifestKey {
                 version,
                 e_tag: None,
+
+                identity: None,
             },
             Arc::new(dataset.manifest().clone()),
         )

@@ -66,16 +66,24 @@ impl Deref for DSMetadataCache {
 pub struct ManifestKey<'a> {
     pub version: u64,
     pub e_tag: Option<&'a str>,
+    /// `ManifestLocation::identity`: a recreated dataset reuses versions,
+    /// and without an e_tag the version alone would hit the old manifest.
+    pub identity: Option<&'a str>,
 }
 
 impl CacheKey for ManifestKey<'_> {
     type ValueType = Manifest;
     fn key(&self) -> Cow<'_, str> {
+        let mut key = format!("manifest/{}", self.version);
         if let Some(e_tag) = self.e_tag {
-            Cow::Owned(format!("manifest/{}/{}", self.version, e_tag))
-        } else {
-            Cow::Owned(format!("manifest/{}", self.version))
+            key.push('/');
+            key.push_str(e_tag);
         }
+        if let Some(identity) = self.identity {
+            key.push_str("/id/");
+            key.push_str(identity);
+        }
+        Cow::Owned(key)
     }
     fn type_name() -> &'static str {
         "Manifest"
@@ -93,18 +101,29 @@ impl CacheKey for ManifestKey<'_> {
         } else {
             builder.write_none();
         }
+        if let Some(identity) = self.identity {
+            builder.write_some();
+            builder.write_str(identity);
+        } else {
+            builder.write_none();
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct TransactionKey {
+pub struct TransactionKey<'a> {
     pub version: u64,
+    /// See [`ManifestKey::identity`].
+    pub identity: Option<&'a str>,
 }
 
-impl CacheKey for TransactionKey {
+impl CacheKey for TransactionKey<'_> {
     type ValueType = Transaction;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("txn/{}", self.version))
+        match self.identity {
+            Some(identity) => Cow::Owned(format!("txn/{}/id/{}", self.version, identity)),
+            None => Cow::Owned(format!("txn/{}", self.version)),
+        }
     }
     fn type_name() -> &'static str {
         "Transaction"
@@ -116,6 +135,12 @@ impl CacheKey for TransactionKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        if let Some(identity) = self.identity {
+            builder.write_some();
+            builder.write_str(identity);
+        } else {
+            builder.write_none();
+        }
     }
 }
 
@@ -290,6 +315,44 @@ mod tests {
     use lance_table::rowids::write_row_ids;
 
     use super::*;
+    use crate::session::index_caches::IndexMetadataKey;
+
+    /// A recreated dataset reuses version numbers, so every version-scoped
+    /// key separates on identity.
+    #[test]
+    fn version_scoped_keys_separate_on_identity() {
+        let a = ManifestKey {
+            version: 2,
+            e_tag: None,
+            identity: Some("a"),
+        };
+        let b = ManifestKey {
+            version: 2,
+            e_tag: None,
+            identity: Some("b"),
+        };
+        assert_ne!(a.key(), b.key());
+        let a = TransactionKey {
+            version: 2,
+            identity: Some("a"),
+        };
+        let b = TransactionKey {
+            version: 2,
+            identity: Some("b"),
+        };
+        assert_ne!(a.key(), b.key());
+        let a = IndexMetadataKey {
+            version: 2,
+            store_identity: "s",
+            identity: Some("a"),
+        };
+        let b = IndexMetadataKey {
+            version: 2,
+            store_identity: "s",
+            identity: Some("b"),
+        };
+        assert_ne!(a.key(), b.key());
+    }
 
     #[tokio::test]
     async fn deletion_file_key_separates_storage_bases() {
