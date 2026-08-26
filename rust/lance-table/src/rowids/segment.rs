@@ -277,14 +277,14 @@ impl U64Segment {
         }
     }
 
-    pub(crate) fn use_dense_range_expansion(&self) -> bool {
+    pub(crate) fn use_dense_range_expansion(&self, segment_len: usize) -> bool {
         let Self::RangeWithBitmap { bitmap, .. } = self else {
             return false;
         };
         // Keep sparse segments on the compact per-bit decoder. Contiguous-run
         // expansion pays off when dense bytes dominate the segment.
         let dense_threshold = bitmap.len().saturating_sub(bitmap.len() / 4);
-        bitmap.count_ones() >= dense_threshold
+        segment_len >= dense_threshold
     }
 
     pub fn is_empty(&self) -> bool {
@@ -897,7 +897,17 @@ mod test {
             range: 100..124,
             bitmap,
         };
-        assert!(segment.use_dense_range_expansion());
+        assert!(segment.use_dense_range_expansion(segment.len()));
+
+        let mut sparse_bitmap = Bitmap::new_empty(24);
+        for i in [0, 8, 16] {
+            sparse_bitmap.set(i);
+        }
+        let sparse_segment = U64Segment::RangeWithBitmap {
+            range: 0..24,
+            bitmap: sparse_bitmap,
+        };
+        assert!(!sparse_segment.use_dense_range_expansion(sparse_segment.len()));
         let expected = segment.iter().collect::<Vec<_>>();
 
         let mut state = SegmentCursorState::default();

@@ -122,7 +122,7 @@ impl RowIdSequenceCursor {
             let local_end = local_start + count;
             let use_dense_range_expansion = *self
                 .use_dense_range_expansion
-                .get_or_insert_with(|| segment.use_dense_range_expansion());
+                .get_or_insert_with(|| segment.use_dense_range_expansion(segment_len));
             if use_dense_range_expansion {
                 self.segment_cursor
                     .extend_dense_range(segment, local_start..local_end, row_ids);
