@@ -2782,6 +2782,51 @@ async fn recalc_versions_for_rewritten_fragments(
     Ok(())
 }
 
+async fn validate_rewrite_groups_preserve_index_boundaries(
+    dataset: &Dataset,
+    completed_tasks: &[RewriteResult],
+) -> Result<()> {
+    let indices = load_all_indices(dataset).await?;
+    let mut physical_index_boundaries = Vec::new();
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        physical_index_boundaries.push((
+            index.name.clone(),
+            index.uuid,
+            index_fragment_coverage(dataset, index).await?,
+        ));
+    }
+
+    for (task_idx, task) in completed_tasks.iter().enumerate() {
+        let old_fragment_ids = task
+            .original_fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        for (index_name, segment_id, fragment_bitmap) in &physical_index_boundaries {
+            let covered_fragment_ids = old_fragment_ids
+                .iter()
+                .copied()
+                .filter(|fragment_id| {
+                    u32::try_from(*fragment_id)
+                        .is_ok_and(|fragment_id| fragment_bitmap.contains(fragment_id))
+                })
+                .collect::<Vec<_>>();
+            if !covered_fragment_ids.is_empty()
+                && covered_fragment_ids.len() != old_fragment_ids.len()
+            {
+                return Err(Error::invalid_input(format!(
+                    "Compaction rewrite group {task_idx} with old fragments {old_fragment_ids:?} \
+                     crosses the physical coverage boundary of index '{index_name}' segment \
+                     {segment_id} (covered fragments {covered_fragment_ids:?}), but the selected \
+                     commit path does not remap index segments. Replan with the same \
+                     CompactionOptions used for commit"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Commit the results of file compaction.
 ///
 /// It is not required that all tasks are passed to this method. If some failed,
@@ -2817,6 +2862,9 @@ pub async fn commit_compaction(
     } else {
         None
     };
+    if index_remapper.is_none() {
+        validate_rewrite_groups_preserve_index_boundaries(dataset, &completed_tasks).await?;
+    }
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -7254,6 +7302,207 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plan.num_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_vector_boundary_crossing_when_remap_mode_changes() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let plan_options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let completed_tasks = execute_compaction_plan(&dataset, &plan_options).await;
+        assert_eq!(completed_tasks.len(), 1);
+        assert_eq!(completed_tasks[0].original_fragments.len(), 2);
+
+        let deferred_options = CompactionOptions {
+            defer_index_remap: true,
+            ..plan_options.clone()
+        };
+        let version_before_commit = dataset.manifest.version;
+        let error = commit_compaction(
+            &mut dataset,
+            completed_tasks.clone(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &deferred_options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical coverage boundary"));
+        assert_eq!(dataset.manifest.version, version_before_commit);
+
+        commit_compaction(
+            &mut dataset,
+            completed_tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan_options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            1
+        );
+        dataset.validate().await.unwrap();
+    }
+
+    /// A deferred commit over a plan that groups covered and uncovered fragments
+    /// must refuse to cross a physical index boundary even when this build cannot
+    /// open the covering segment.
+    ///
+    /// The commit guard reloads live non-system segment coverage before
+    /// publication; it must see every physical boundary, not only the ones in the
+    /// usable-index view. Filtering out a segment this build cannot open would
+    /// let the deferred rewrite delete old covered fragment ids during bitmap
+    /// repair without adding the merged fragment, stranding a capable reader on a
+    /// flat scan of that range.
+    #[tokio::test]
+    async fn test_deferred_compaction_rejects_crossing_an_unsupported_index_boundary() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        // A single physical vector segment covering only the first two fragments,
+        // so a plan rewriting all four fragments together partially crosses it.
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let segment = CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .fragments(fragment_ids[..2].to_vec())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", vec![segment])
+            .await
+            .unwrap();
+
+        // Raise the segment's version so this build can no longer open it, keeping
+        // its physical coverage over the first two fragments intact.
+        let committed = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "vec_idx")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 1);
+        let mut hidden = committed.clone();
+        hidden[0].index_version = IndexType::max_vector_version() as i32 + 1;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: hidden.clone(),
+                removed_indices: committed,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("vec_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the segment must be hidden from the usable-index view"
+        );
+
+        // A public/custom plan can group the covered fragments (0,1) with the
+        // uncovered ones (2,3) into one rewrite task - something the default
+        // planner never does, because it keeps covered and uncovered fragments in
+        // separate candidate bins. Execute that plan and commit it deferred, so
+        // publication runs the guard without any remapper.
+        let deferred_options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let task = CompactionTask {
+            task: TaskData {
+                fragments: dataset.fragments().as_ref().clone(),
+            },
+            read_version: dataset.manifest.version,
+            options: deferred_options.clone(),
+        };
+        let rewrite_result = task.execute(&dataset).await.unwrap();
+        let completed_tasks = vec![rewrite_result];
+        assert_eq!(completed_tasks[0].original_fragments.len(), 4);
+
+        let version_before_commit = dataset.manifest.version;
+        let error = commit_compaction(
+            &mut dataset,
+            completed_tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &deferred_options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical coverage boundary"));
+        assert_eq!(dataset.manifest.version, version_before_commit);
     }
 
     #[tokio::test]
