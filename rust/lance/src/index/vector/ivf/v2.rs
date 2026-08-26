@@ -2591,6 +2591,7 @@ mod tests {
             num_bits: 4,
             max_iters: 2,
             sample_rate: 16,
+            kmeans_seed: Some(42),
             ..Default::default()
         }
     }
@@ -2601,6 +2602,7 @@ mod tests {
             num_bits,
             max_iters: 2,
             sample_rate: 16,
+            kmeans_seed: Some(42),
             ..Default::default()
         }
     }
@@ -2666,6 +2668,7 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        ivf_params.kmeans_seed = Some(42);
         let pq_params = lightweight_pq_params_with_bits(num_bits);
         let params = if use_hnsw {
             VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -5139,6 +5142,7 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        ivf_params.kmeans_seed = Some(42);
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
