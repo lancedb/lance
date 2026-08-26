@@ -4719,6 +4719,10 @@ class LanceDataset(pa.dataset.Dataset):
         index model. Workers revalidate at the pinned version before writing
         and the commit compare-and-swaps that exact source set.
 
+        Only vector indexes can be planned. Planning any other index family
+        raises ``NotImplementedError``, because the commit validates results
+        through vector specific checks.
+
         Segments with no effective fragment coverage are skipped. A legacy
         segment without fragment coverage is rejected, and that check runs
         over the whole segment set before ``max_segments_to_merge`` selects a

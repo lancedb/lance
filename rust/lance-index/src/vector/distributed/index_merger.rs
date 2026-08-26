@@ -69,9 +69,9 @@ static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
 
-/// Rows per decoded batch when scanning a segment's row id column. This bounds
-/// the transient decode buffer, while the accumulated id set still grows with
-/// the segment's distinct row ids.
+/// Rows per decoded batch when scanning a segment's row id column. Together
+/// with the constant size row digest this keeps admission memory independent
+/// of how many rows the segment holds.
 const ROW_ID_READ_BATCH_SIZE: u32 = 64 * 1024;
 
 /// Strict bitwise equality check for FixedSizeListArray values.
@@ -254,23 +254,50 @@ async fn open_aux_reader(
     .await
 }
 
-/// Durable row identity of a segment: its stored row count and the distinct
-/// row ids it holds.
-#[derive(Debug, Clone)]
+/// Order independent multiset digest of a segment's stored row ids.
+///
+/// Every id contributes the first two lanes of its blake3 hash through
+/// wrapping addition, so accumulation is insensitive to read order and batch
+/// boundaries, and digests of disjoint segments combine by [`Self::merge`].
+/// This fences defective outputs with memory independent of segment size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowIdentityDigest {
+    lanes: [u64; 2],
+}
+
+impl RowIdentityDigest {
+    /// Fold one row id into the digest.
+    pub fn insert(&mut self, row_id: u64) {
+        let hash = blake3::hash(&row_id.to_le_bytes());
+        let bytes = hash.as_bytes();
+        self.lanes[0] =
+            self.lanes[0].wrapping_add(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
+        self.lanes[1] =
+            self.lanes[1].wrapping_add(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+    }
+
+    /// Combine with the digest of another segment's row ids.
+    pub fn merge(&mut self, other: &Self) {
+        self.lanes[0] = self.lanes[0].wrapping_add(other.lanes[0]);
+        self.lanes[1] = self.lanes[1].wrapping_add(other.lanes[1]);
+    }
+}
+
+/// Durable row identity of a segment: its stored row count and a digest of
+/// the row ids it holds.
+#[derive(Debug, Clone, Copy)]
 pub struct SegmentRowIdentity {
     /// Rows the storage actually holds.
     pub num_rows: u64,
-    /// Distinct row ids stored by the segment.
-    pub row_ids: roaring::RoaringTreemap,
+    /// Order independent digest of the stored row ids.
+    pub digest: RowIdentityDigest,
 }
 
 /// Read a segment's durable row identity from its auxiliary file.
 ///
-/// A report's task binding is untrusted, but the stored row ids prove which
-/// rows the segment holds. The ids are treated as opaque u64 identities and
-/// never decoded into fragments: physical row addresses, stable row ids, and
-/// addresses written before a deferred fragment reuse remap all validate the
-/// same way, by set equality against the rows of the claimed sources.
+/// The stored row ids prove which rows a segment holds. They are digested as
+/// opaque u64 identities, never decoded into fragments, so physical
+/// addresses, stable row ids, and pre remap addresses validate identically.
 pub async fn read_segment_row_ids(
     object_store: &lance_io::object_store::ObjectStore,
     segment_dir: &object_store::path::Path,
@@ -303,7 +330,7 @@ pub async fn read_segment_row_ids(
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
         .await?;
-    let mut row_ids_set = roaring::RoaringTreemap::new();
+    let mut digest = RowIdentityDigest::default();
     let mut num_rows = 0u64;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -318,13 +345,10 @@ pub async fn read_segment_row_ids(
             })?;
         num_rows += row_ids.len() as u64;
         for row_id in row_ids.values() {
-            row_ids_set.insert(*row_id);
+            digest.insert(*row_id);
         }
     }
-    Ok(SegmentRowIdentity {
-        num_rows,
-        row_ids: row_ids_set,
-    })
+    Ok(SegmentRowIdentity { num_rows, digest })
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
@@ -2003,9 +2027,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(identity.num_rows, total_rows as u64);
-        let expected =
-            (base_row_id..base_row_id + total_rows as u64).collect::<roaring::RoaringTreemap>();
-        assert_eq!(identity.row_ids, expected);
+        let mut expected = RowIdentityDigest::default();
+        for row_id in base_row_id..base_row_id + total_rows as u64 {
+            expected.insert(row_id);
+        }
+        assert_eq!(identity.digest, expected);
+    }
+
+    /// The digest must not depend on insertion order or batch boundaries, must
+    /// merge additively across segments, must expose any changed id, and must
+    /// catch a duplicated id that preserves the count and the distinct id set.
+    #[test]
+    fn test_row_identity_digest_is_order_independent() {
+        let mut forward = RowIdentityDigest::default();
+        let mut backward = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            forward.insert(row_id);
+            backward.insert(999 - row_id);
+        }
+        assert_eq!(forward, backward);
+
+        let mut first_half = RowIdentityDigest::default();
+        let mut second_half = RowIdentityDigest::default();
+        for row_id in 0u64..500 {
+            first_half.insert(row_id);
+        }
+        for row_id in 500u64..1000 {
+            second_half.insert(row_id);
+        }
+        let mut merged = first_half;
+        merged.merge(&second_half);
+        assert_eq!(merged, forward);
+
+        let mut swapped_one = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            swapped_one.insert(if row_id == 800 { 1800 } else { row_id });
+        }
+        assert_ne!(swapped_one, forward);
+
+        let mut duplicated = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            duplicated.insert(if row_id == 800 { 799 } else { row_id });
+        }
+        assert_ne!(duplicated, forward);
     }
 
     #[tokio::test]

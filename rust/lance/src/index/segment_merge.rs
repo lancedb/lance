@@ -270,6 +270,22 @@ impl IndexMergePlan {
         Ok(())
     }
 
+    /// Reject a plan whose declared coverage drifted from its tasks, which can
+    /// only happen through a forged or corrupted plan artifact.
+    pub fn check_expected_coverage(&self) -> Result<()> {
+        let mut union: Vec<u32> = self.tasks.iter().flat_map(|task| task.coverage()).collect();
+        union.sort_unstable();
+        union.dedup();
+        if union != self.expected_coverage {
+            return Err(Error::invalid_input(format!(
+                "index merge plan {}: expected_coverage {:?} does not match the union \
+                 of its task coverages {:?}",
+                self.plan_id, self.expected_coverage, union
+            )));
+        }
+        Ok(())
+    }
+
     /// Look up one task by id.
     pub fn task(&self, task_id: u32) -> Result<&IndexMergeTask> {
         self.tasks
@@ -701,6 +717,43 @@ mod tests {
         let err = check_output_identity(&[result(0, uuid(1), uuid(50))], &[], &live).unwrap_err();
         assert!(
             err.to_string().contains("already a committed segment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A plan whose declared coverage drifted from its tasks is corrupted
+    /// and must not commit.
+    #[test]
+    fn test_check_expected_coverage_rejects_drift() {
+        let source = |id: u8, fragment_ids: Vec<u32>| IndexMergeSource {
+            uuid: uuid(id),
+            dataset_version: 7,
+            base_id: None,
+            store_prefix: "memory".to_owned(),
+            path: "indices".to_owned(),
+            fragment_ids,
+        };
+        let mut plan = IndexMergePlan {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id: Uuid::nil(),
+            index_name: "vector_idx".to_owned(),
+            read_version: 7,
+            fingerprint: IndexMergeFingerprint::default(),
+            source_frontier: vec![uuid(1), uuid(2)],
+            expected_coverage: vec![0, 1, 2],
+            tasks: vec![IndexMergeTask {
+                contract_version: INDEX_MERGE_CONTRACT_VERSION,
+                plan_id: Uuid::nil(),
+                task_id: 0,
+                sources: vec![source(1, vec![0, 1]), source(2, vec![2])],
+            }],
+        };
+        plan.check_expected_coverage().unwrap();
+
+        plan.expected_coverage = vec![0, 1];
+        let err = plan.check_expected_coverage().unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the union"),
             "unexpected error: {err}"
         );
     }

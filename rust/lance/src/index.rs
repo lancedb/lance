@@ -286,6 +286,16 @@ async fn validate_merge_output_files(
         .fingerprint
         .index_type_url
         .ends_with("VectorIndexDetails");
+    // Planning is vector only, so a non vector fingerprint can only reach the
+    // commit through a forged or version skewed contract. Fail closed instead
+    // of skipping the vector admission checks below.
+    if !vector_plan {
+        return Err(Error::invalid_input(format!(
+            "index merge result for task {} targets a non vector index ({}), \
+             distributed merge currently supports vector indexes",
+            result.task_id, result.fingerprint.index_type_url
+        )));
+    }
     // The production open starts at the index file, so a segment without one
     // is never readable and its family fallback cannot fail closed.
     if vector_plan && !listed.iter().any(|file| file.path == INDEX_FILE_NAME) {
@@ -351,16 +361,11 @@ async fn validate_merge_output_files(
             ))
         })?;
 
-        // The scanner routes an ANN query on the committed segment's metric
-        // without re-opening the index, and a merge output's model lives only
-        // in worker written bytes, so the output's durable model must match the
-        // sources it merged. A genuine merge preserves the sources' metric,
-        // compression, and graph config: comparing the output only against its
-        // own reported details would prove worker self consistency, not that a
-        // flipped distance string cannot silently misroute later queries. Build
-        // hints (target partition size, runtime hints) are not part of the
-        // query model and stay unchecked. Sources are already committed, so the
-        // first one's durable model is the trusted reference.
+        // The scanner routes ANN queries on the committed metric without
+        // re-opening the index, so the output's durable model must match the
+        // sources, not merely its own reported details. Build hints are not
+        // part of the query model and stay unchecked. Sources are committed,
+        // so the first one's durable model is the trusted reference.
         let output_model = durable_vector_model(&validation_dataset, &output_meta)
             .await
             .map_err(|err| {
@@ -435,12 +440,11 @@ async fn validate_merge_output_files(
             }
         }
 
-        // Openability is not provenance: the report's task binding is
-        // untrusted. The stored row ids prove which rows the output holds, so
-        // it must hold exactly the rows its claimed sources hold. Row ids are
-        // compared as opaque u64 identities, never decoded into fragments, so
-        // physical addresses, stable row ids, and addresses written before a
-        // deferred fragment reuse remap all validate the same way.
+        // Openability is not provenance: the task binding is untrusted, so
+        // the output must hold exactly the rows its claimed sources hold.
+        // Row ids are digested as opaque u64 identities, never decoded into
+        // fragments, so physical addresses, stable row ids, and pre remap
+        // addresses all validate the same way.
         let output_rows = lance_index::vector::distributed::index_merger::read_segment_row_ids(
             &dataset.object_store,
             &dir,
@@ -455,7 +459,8 @@ async fn validate_merge_output_files(
         })?;
         let source_dirs = resolve_vector_source_dirs(dataset, source_segments).await?;
         let mut expected_rows = 0u64;
-        let mut expected_ids = roaring::RoaringTreemap::new();
+        let mut expected_digest =
+            lance_index::vector::distributed::index_merger::RowIdentityDigest::default();
         for (segment, source_dir) in source_segments.iter().zip(&source_dirs) {
             let source_rows = lance_index::vector::distributed::index_merger::read_segment_row_ids(
                 &dataset.object_store,
@@ -470,7 +475,7 @@ async fn validate_merge_output_files(
                 ))
             })?;
             expected_rows += source_rows.num_rows;
-            expected_ids |= source_rows.row_ids;
+            expected_digest.merge(&source_rows.digest);
         }
         if output_rows.num_rows != expected_rows {
             return Err(Error::invalid_input(format!(
@@ -480,13 +485,12 @@ async fn validate_merge_output_files(
                 result.output.uuid, result.task_id, output_rows.num_rows, expected_rows
             )));
         }
-        if output_rows.row_ids != expected_ids {
-            let differing = (&output_rows.row_ids ^ &expected_ids).len();
+        if output_rows.digest != expected_digest {
             return Err(Error::invalid_input(format!(
                 "index merge output {} of task {} does not hold the exact rows of its \
-                 claimed sources ({} row ids differ); the output does not come from \
-                 this task. Re-plan the merge.",
-                result.output.uuid, result.task_id, differing
+                 claimed sources (stored digest {:?}, expected {:?}); the output does \
+                 not come from this task. Re-plan the merge.",
+                result.output.uuid, result.task_id, output_rows.digest, expected_digest
             )));
         }
     }
@@ -790,8 +794,8 @@ async fn open_vector_index_from_meta(
         let (index, ivf_entry) = result?;
         metrics.record_index_load();
         // Attribute the one-time index-open I/O (file footers, IVF centroids,
-        // quantization metadata) to this query's metrics.  This runs only on a
-        // real open; cache hits return earlier, so a warm query reports zero
+        // quantization metadata) to this query's metrics. This runs only on a
+        // real open, cache hits return earlier, so a warm query reports zero
         // index-open I/O.
         if let Some(io_stats) = metrics.io_stats()
             && let Some(open_stats) = index.open_io_stats()
@@ -870,12 +874,11 @@ fn fragment_field_paths<'a>(
         .collect()
 }
 
-/// Resolve the field ids a segment's staleness check must consider: the subtree of
-/// every field the segment declares, keyed and carried alike (see
-/// [`IndexSegment::fields`] and [`IndexSegment::covering_fields`]). A covered
-/// segment's carried columns can go stale independently of its keyed column, so
-/// checking only the keyed subtree would leave a fragment covered after a carried
-/// column was rewritten, and the segment would answer with the obsolete value.
+/// Resolve the field ids a segment's staleness check must consider: the
+/// subtree of every declared field, keyed and carried alike. Carried columns
+/// go stale independently of the keyed column, so checking only the keyed
+/// subtree would leave a fragment covered after a carried column was
+/// rewritten, and the segment would answer with the obsolete value.
 fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
     for field_id in segment.fields() {
@@ -970,13 +973,10 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
-    // One logical index needs one declaration. The per-segment rules below only
-    // pin the *keyed* field and its count, so segments that disagree on the
-    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
-    // individually. Committing that pair produces an index whose own description
-    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
-    // identical across segments, so `describe_indices` would error on metadata
-    // this function just wrote. Same rule, and same reason, as
+    // One logical index needs one declaration. The per-segment rules below
+    // pin only the keyed field and its count, so segments disagreeing on
+    // carried columns each pass individually while `IndexDescriptionImpl`
+    // would refuse the committed pair. Same rule, and same reason, as
     // `merge_existing_index_segments`.
     let expected_fields = segments[0].fields().to_vec();
     let expected_covering_fields = segments[0].covering_fields().to_vec();
@@ -2594,6 +2594,26 @@ impl DatasetIndexExt for Dataset {
             return Err(Error::index_not_found(format!("name={}", index_name)));
         }
 
+        // The distributed contract admits results through vector specific checks
+        // (production open, model fence, row identity), so planning any other
+        // index family would commit outputs those checks never see.
+        if let Some(non_vector) = all_segments
+            .iter()
+            .find(|segment| !segment_has_vector_details(segment))
+        {
+            return Err(Error::not_supported(format!(
+                "plan_index_segment_merge currently supports vector indexes, segment {} \
+                 of index {} has type {}",
+                non_vector.uuid,
+                index_name,
+                non_vector
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str())
+                    .unwrap_or("unknown (no index details)")
+            )));
+        }
+
         // Reject missing coverage across the whole segment set before bounding to a
         // suffix: `commit_index_merge_results` cannot compare-and-swap a segment whose
         // coverage it cannot read, so its failure would be guaranteed.
@@ -2779,6 +2799,10 @@ impl DatasetIndexExt for Dataset {
         results: Vec<IndexMergeResult>,
     ) -> Result<()> {
         IndexMergePlan::check_contract_version(plan.contract_version, "index merge plan")?;
+        for task in &plan.tasks {
+            IndexMergePlan::check_contract_version(task.contract_version, "index merge task")?;
+        }
+        plan.check_expected_coverage()?;
         if results.is_empty() {
             return Err(Error::invalid_input(
                 "commit_index_merge_results requires at least one merge result".to_owned(),
@@ -2819,18 +2843,19 @@ impl DatasetIndexExt for Dataset {
         let mut replaced = Vec::new();
         let mut replaced_uuids = HashSet::new();
         for result in &results {
+            let context = format!("commit_index_merge_results (task {})", result.task_id);
             for source in &result.sources {
                 let Some(segment) = current_by_uuid.get(&source.uuid) else {
                     return Err(Error::invalid_input(format!(
-                        "commit_index_merge_results: source segment {} of index '{}' is no \
-                         longer part of the index; a concurrent commit replaced or pruned \
-                         it, so this merge would republish stale entries. Re-plan the merge.",
-                        source.uuid, plan.index_name
+                        "commit_index_merge_results: source segment {} of task {} of index \
+                         '{}' is no longer part of the index; a concurrent commit replaced \
+                         or pruned it, so this merge would republish stale entries. Re-plan \
+                         the merge.",
+                        source.uuid, result.task_id, plan.index_name
                     )));
                 };
-                source.check(segment, "commit_index_merge_results")?;
-                plan.fingerprint
-                    .check(segment, "commit_index_merge_results")?;
+                source.check(segment, &context)?;
+                plan.fingerprint.check(segment, &context)?;
                 if replaced_uuids.insert(source.uuid) {
                     replaced.push((*segment).clone());
                 }
@@ -9370,6 +9395,41 @@ mod tests {
         );
     }
 
+    /// The distributed contract admits results through vector specific checks,
+    /// so planning must reject any other index family instead of producing
+    /// tasks whose outputs those checks never see.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_rejects_non_vector_index() {
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::scalar::ScalarIndexParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(2));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let error = dataset
+            .plan_index_segment_merge("id_idx", 2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("supports vector indexes"),
+            "unexpected error: {error}"
+        );
+    }
+
     /// A leftover singleton must not collapse the plan's parallelism. For k>=3 the
     /// planner borrows one segment back from the previous task, keeping both tasks
     /// within the bound. Only k=2 has nothing to borrow and must emit a task of three.
@@ -10689,7 +10749,7 @@ mod tests {
     ///
     /// Stable row ids are logical identifiers, so deriving fragments from
     /// their high bits would reject every genuine output. The commit compares
-    /// exact row id sets instead, which holds in both row id modes.
+    /// row identity digests instead, which holds in both row id modes.
     #[tokio::test]
     async fn test_commit_index_merge_results_accepts_stable_row_ids() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -10744,7 +10804,7 @@ mod tests {
     /// The frag reuse index remaps segment coverage to post compaction
     /// fragment ids at load time while the auxiliary files keep the addresses
     /// written before compaction, so decoding fragments out of the stored row
-    /// ids would reject every genuine output. The exact row id comparison is
+    /// ids would reject every genuine output. The row identity digest is
     /// remap agnostic because output and sources store the same addresses.
     #[tokio::test]
     async fn test_commit_index_merge_results_accepts_deferred_frag_reuse() {
@@ -10865,7 +10925,7 @@ mod tests {
             lance_linalg::distance::MetricType::Cosine,
             ivf_params,
         );
-        // A distinct name avoids the uniqueness check; only its files are used.
+        // A distinct name avoids the uniqueness check, only its files are used.
         let cosine_segment = dataset
             .create_index_builder(&["vector"], IndexType::Vector, &cosine_params)
             .name("vector_idx_cosine".to_string())

@@ -4814,6 +4814,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "bitvec",
+ "blake3",
  "bytes",
  "chrono",
  "criterion",

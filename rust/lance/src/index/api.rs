@@ -359,9 +359,13 @@ pub trait DatasetIndexExt {
     /// snapshot, and the commit compare-and-swaps the exact source set, which
     /// is what makes a plan built at version V safe to publish at V+n.
     ///
+    /// Only vector indexes can be planned. Planning any other index family
+    /// fails with a not supported error, because the commit validates results
+    /// through vector specific checks.
+    ///
     /// `max_segments_to_merge` bounds the plan to the newest qualifying
     /// segments, mirroring
-    /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge),
+    /// [`OptimizeOptions::num_indices_to_merge`](lance_index::optimize::OptimizeOptions::num_indices_to_merge),
     /// and `None` plans every segment. Segments with no effective coverage
     /// are skipped before the bound applies.
     ///
@@ -453,9 +457,9 @@ pub trait DatasetIndexExt {
     /// file must match the store listing and decode as a Lance file, the
     /// segment must open through the production vector index reader, any
     /// populated index details must match the durable files, and its stored
-    /// row ids must equal the rows of its claimed sources exactly, so a
-    /// genuine output cannot be re-labeled to another task. Row ids are
-    /// compared as opaque identities, so datasets with stable row ids or
+    /// row id multiset must match its claimed sources' by count and digest,
+    /// so a genuine output cannot be re-labeled to another task. Row ids are
+    /// digested as opaque identities, so datasets with stable row ids or
     /// deferred fragment reuse remaps validate the same way.
     ///
     /// `results` may cover a subset of the plan's tasks, so a round survives a

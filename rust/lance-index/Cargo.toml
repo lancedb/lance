@@ -23,6 +23,7 @@ arrow-arith.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
+blake3.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
