@@ -246,29 +246,30 @@ async fn has_post_index_deletions(dataset: &Dataset, segments: &[IndexMetadata])
     Ok(false)
 }
 
-fn has_retired_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
+/// Return whether selected segment metadata cannot prove one disjoint,
+/// current-fragment coverage domain. Fuzzy rewrite and BM25 statistics are
+/// corpus-wide, so even overlap outside a fragment-scoped candidate set makes
+/// posting-backed preparation unsafe.
+fn has_unsafe_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
     let current_fragments = RoaringBitmap::from_iter(
         dataset
             .fragments()
             .iter()
             .map(|fragment| fragment.id as u32),
     );
-    segments.iter().any(|segment| {
-        segment
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|coverage| !coverage.is_subset(&current_fragments))
-    })
-}
-
-fn has_unknown_fts_coverage(segments: &[IndexMetadata]) -> bool {
-    segments
-        .iter()
-        .any(|segment| segment.fragment_bitmap.is_none())
-}
-
-fn has_retired_or_unknown_fts_coverage(dataset: &Dataset, segments: &[IndexMetadata]) -> bool {
-    has_retired_fts_coverage(dataset, segments) || has_unknown_fts_coverage(segments)
+    let mut covered_fragments = RoaringBitmap::new();
+    for segment in segments {
+        let Some(segment_fragments) = segment.fragment_bitmap.as_ref() else {
+            return true;
+        };
+        if !segment_fragments.is_subset(&current_fragments)
+            || !(&covered_fragments & segment_fragments).is_empty()
+        {
+            return true;
+        }
+        covered_fragments |= segment_fragments;
+    }
+    false
 }
 
 fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
@@ -4373,7 +4374,7 @@ impl Scanner {
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
                 if fts_query_uses_fuzzy_expansion(query) && !self.fast_search {
-                    if has_retired_or_unknown_fts_coverage(&self.dataset, &segments)
+                    if has_unsafe_fts_coverage(&self.dataset, &segments)
                         || has_post_index_deletions(&self.dataset, &segments).await?
                         || fts_segments_have_deleted_fragments(
                             &self.dataset,
@@ -4905,6 +4906,24 @@ impl Scanner {
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
+                let full_fuzzy_segments =
+                    if uses_fuzzy_expansion(query.fuzziness) && !self.fast_search {
+                        let Some(segments) =
+                            load_segments(&self.dataset, &column, document_granularity).await?
+                        else {
+                            return self
+                                .plan_target_flat_match_leaf_query(query, params, filter_plan)
+                                .await;
+                        };
+                        if has_unsafe_fts_coverage(&self.dataset, &segments) {
+                            return self
+                                .plan_target_flat_match_leaf_query(query, params, filter_plan)
+                                .await;
+                        }
+                        Some(segments)
+                    } else {
+                        None
+                    };
                 let global_unindexed_fragments =
                     self.dataset.unindexed_fragments(&index.name).await?;
                 let unindexed_fragments =
@@ -4994,28 +5013,22 @@ impl Scanner {
                             ))
                         })?,
                 };
-                if uses_fuzzy_expansion(query.fuzziness)
-                    && !self.fast_search
-                    && (has_retired_or_unknown_fts_coverage(&self.dataset, &resolved_segments)
-                        || !stale_rows.is_empty()
-                        || has_post_index_deletions(&self.dataset, &resolved_segments).await?)
-                {
-                    return self
-                        .plan_target_flat_match_leaf_query(query, params, filter_plan)
-                        .await;
-                }
-                if uses_fuzzy_expansion(query.fuzziness)
-                    && !self.fast_search
-                    && fts_segments_have_deleted_fragments(
-                        &self.dataset,
-                        &column,
-                        &resolved_segments,
-                    )
-                    .await?
-                {
-                    return self
-                        .plan_target_flat_match_leaf_query(query, params, filter_plan)
-                        .await;
+                if let Some(full_fuzzy_segments) = full_fuzzy_segments.as_deref() {
+                    if !stale_rows.is_empty()
+                        || has_post_index_deletions(&self.dataset, full_fuzzy_segments).await?
+                        // Current writers physically filter retired postings;
+                        // retain this defensive gate for legacy persisted segments.
+                        || fts_segments_have_deleted_fragments(
+                            &self.dataset,
+                            &column,
+                            full_fuzzy_segments,
+                        )
+                        .await?
+                    {
+                        return self
+                            .plan_target_flat_match_leaf_query(query, params, filter_plan)
+                            .await;
+                    }
                 }
                 if uses_fuzzy_expansion(query.fuzziness) && has_flat_path {
                     let details =

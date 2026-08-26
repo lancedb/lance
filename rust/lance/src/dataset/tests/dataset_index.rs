@@ -15,6 +15,7 @@ use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
+use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::covering;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
@@ -54,6 +55,7 @@ use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
+use lance_table::format::Fragment;
 
 use datafusion::common::{assert_contains, assert_not_contains};
 use futures::{StreamExt, TryStreamExt};
@@ -1281,6 +1283,24 @@ async fn create_fragmented_fts_index_with_groups(
     assert_eq!(segments.len(), expected_segments);
 }
 
+async fn replace_index_segments_for_test(
+    dataset: &mut Dataset,
+    index_name: &str,
+    mutate: impl FnOnce(&mut [lance_table::format::IndexMetadata]),
+) {
+    let committed = dataset.load_indices_by_name(index_name).await.unwrap();
+    let mut replacement = committed.to_vec();
+    mutate(&mut replacement);
+    let metadata_key = IndexMetadataKey {
+        version: dataset.version().version,
+        store_identity: &dataset.object_store.store_prefix,
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&metadata_key, Arc::new(replacement))
+        .await;
+}
+
 fn compound_multimatch_query() -> FtsQuery {
     MultiMatchQuery::try_new(
         "common".to_owned(),
@@ -1319,6 +1339,45 @@ async fn compound_fts_results(
         .copied()
         .zip(scores.iter().copied())
         .collect()
+}
+
+async fn compound_fts_results_with_fragments(
+    dataset: &Dataset,
+    query: FtsQuery,
+    fragments: Vec<Fragment>,
+    limit: i64,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_fragments(fragments)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(limit), None)
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn compound_fts_plan_with_fragments(
+    dataset: &Dataset,
+    query: FtsQuery,
+    fragments: Vec<Fragment>,
+    limit: i64,
+) -> String {
+    let mut scan = dataset.scan();
+    scan.with_fragments(fragments)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(limit), None)
+        .unwrap();
+    scan.explain_plan(false).await.unwrap()
 }
 
 async fn compound_fts_results_with_prefilter(
@@ -2271,6 +2330,158 @@ async fn test_partial_fuzzy_multimatch_matches_rebuilt_current_value_oracle() {
     assert_scored_rows_close("partial_plain_match_prepared", &actual, &expected);
     let exhaustive = compound_fts_results(&partial, plain_query, None).await;
     assert_scored_rows_close("partial_plain_match_topk", &actual, &exhaustive[..1]);
+}
+
+fn fuzzy_body_coverage_queries() -> Vec<(&'static str, FtsQuery)> {
+    let plain = FtsQuery::Match(
+        MatchQuery::new("noisf".to_owned())
+            .with_column(Some("body".to_owned()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(2)
+            .with_document_granularity(DocumentGranularity::Row),
+    );
+    let mut multi_match =
+        MultiMatchQuery::try_new("noisf".to_owned(), vec!["body".to_owned()]).unwrap();
+    multi_match.match_queries[0].fuzziness = Some(1);
+    multi_match.match_queries[0].max_expansions = 2;
+    let multi_match = FtsQuery::MultiMatch(multi_match);
+    let nested: FtsQuery = BooleanQuery::new([(Occur::Must, multi_match.clone())]).into();
+    vec![
+        ("plain", plain),
+        ("multimatch", multi_match),
+        ("nested", nested),
+    ]
+}
+
+#[tokio::test]
+async fn test_fuzzy_unsafe_segment_coverage_uses_current_values() {
+    for (case_name, append_residual) in [
+        ("unknown", true),
+        ("overlap", true),
+        ("overlap_full", false),
+    ] {
+        let mut dataset = write_cross_column_compound_dataset().await;
+        create_fragmented_fts_index(&mut dataset, "body", true).await;
+        if append_residual {
+            let appended = arrow_array::record_batch!(
+                ("title", Utf8, ["residual"]),
+                ("body", Utf8, ["noise"]),
+                ("id", Int32, [10])
+            )
+            .unwrap();
+            let schema = appended.schema();
+            dataset
+                .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+                .await
+                .unwrap();
+        }
+
+        let queries = fuzzy_body_coverage_queries();
+        let mut expected = Vec::with_capacity(queries.len());
+        for (_, query) in &queries {
+            expected.push(compound_fts_results(&dataset, query.clone(), Some(10)).await);
+        }
+
+        replace_index_segments_for_test(&mut dataset, "body_idx", |segments| match case_name {
+            "unknown" => segments[0].fragment_bitmap = None,
+            "overlap" | "overlap_full" => {
+                let overlapping_fragment =
+                    segments[0].fragment_bitmap.as_ref().unwrap().min().unwrap();
+                assert!(
+                    segments[1]
+                        .fragment_bitmap
+                        .as_mut()
+                        .unwrap()
+                        .insert(overlapping_fragment),
+                    "the fixture must introduce new cross-segment overlap"
+                );
+            }
+            _ => unreachable!(),
+        })
+        .await;
+
+        for ((query_name, query), expected) in queries.into_iter().zip(expected) {
+            let plan = compound_fts_plan(&dataset, query.clone(), 10).await;
+            assert!(
+                plan.contains("FlatMatchQuery") && !plan.contains("CompoundFtsScorer"),
+                "{case_name}/{query_name} must leave posting-backed fuzzy execution: {plan}"
+            );
+            let actual = compound_fts_results(&dataset, query, Some(10)).await;
+            assert_scored_rows_close(
+                &format!("unsafe_coverage_{case_name}_{query_name}"),
+                &actual,
+                &expected,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fragment_scoped_fuzzy_rejects_non_target_segment_overlap() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["residual"]),
+        ("body", Utf8, ["noise"]),
+        ("id", Int32, [10])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    let target_fragment = dataset.fragments().last().unwrap().clone();
+
+    let queries = fuzzy_body_coverage_queries();
+    let mut expected = Vec::with_capacity(queries.len());
+    for (_, query) in &queries {
+        expected.push(
+            compound_fts_results_with_fragments(
+                &dataset,
+                query.clone(),
+                vec![target_fragment.clone()],
+                10,
+            )
+            .await,
+        );
+    }
+
+    replace_index_segments_for_test(&mut dataset, "body_idx", |segments| {
+        assert!(segments.len() >= 3);
+        let non_target_fragment = segments[0].fragment_bitmap.as_ref().unwrap().min().unwrap();
+        assert!(
+            segments[1]
+                .fragment_bitmap
+                .as_mut()
+                .unwrap()
+                .insert(non_target_fragment),
+            "the fixture must introduce overlap outside the selected fragment"
+        );
+    })
+    .await;
+
+    for ((query_name, query), expected) in queries.into_iter().zip(expected) {
+        let plan = compound_fts_plan_with_fragments(
+            &dataset,
+            query.clone(),
+            vec![target_fragment.clone()],
+            10,
+        )
+        .await;
+        assert!(
+            plan.contains("FlatMatchQuery") && !plan.contains("CompoundFtsScorer"),
+            "fragment-scoped {query_name} must reject non-target segment overlap: {plan}"
+        );
+        let actual =
+            compound_fts_results_with_fragments(&dataset, query, vec![target_fragment.clone()], 10)
+                .await;
+        assert_scored_rows_close(
+            &format!("fragment_scoped_non_target_overlap_{query_name}"),
+            &actual,
+            &expected,
+        );
+    }
 }
 
 #[tokio::test]
