@@ -2010,9 +2010,8 @@ async fn test_deep_clone_cross_store(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
-    // Source lives in an in-memory store while the target is a local directory, so the
-    // The two stores have different `store_prefix`es, exercising source and destination
-    // stores with separate credentials and storage implementations.
+    // Source lives in an in-memory store while the target is a local directory. Their
+    // different `store_prefix`es exercise separate source and destination implementations.
     let session = Arc::new(Session::default());
     let test_dir = TempStdDir::default();
     let clone_dir = test_dir.join("clone_ds");

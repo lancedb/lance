@@ -2756,12 +2756,16 @@ mod tests {
             "expected upload-stage context and the underlying error, got: {error}"
         );
 
-        for _ in 0..10 {
-            if observations.abort_count.load(Ordering::SeqCst) > 0 {
-                break;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observations.abort_count.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("multipart abort should complete");
         assert_eq!(observations.abort_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             source_store.read_one_all(&source).await.unwrap().as_ref(),

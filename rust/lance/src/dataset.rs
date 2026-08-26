@@ -3308,11 +3308,19 @@ impl Dataset {
             path
         };
 
-        const MAX_STREAM_COPY_PARALLELISM: usize = 4;
-        let io_parallelism = self
-            .object_store
-            .io_parallelism()
-            .min(MAX_STREAM_COPY_PARALLELISM);
+        const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
+        // A streaming copy may hold one source range plus several upload parts.
+        // Bound the default aggregate footprint while preserving efficient local
+        // copies and an operator's explicit LANCE_IO_THREADS override.
+        let io_parallelism =
+            if uses_streaming_copy && std::env::var_os("LANCE_IO_THREADS").is_none() {
+                configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+            } else {
+                configured_io_parallelism
+            };
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
