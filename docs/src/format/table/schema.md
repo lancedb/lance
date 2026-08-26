@@ -247,6 +247,15 @@ Primary key configuration is handled by two protobuf fields in the Field message
 
 For detailed discussion on primary key configuration, see [Unenforced Primary Key](index.md#unenforced-primary-key) in the table format overview.
 
+### Clustering Key Metadata
+
+Clustering key configuration uses a single protobuf field in the Field message:
+- **unenforced_clustering_key_position** (uint32): 1-based position in clustering key ordering. 0 means not a clustering key field.
+
+Clustering keys hint at the physical ordering of data within a table. Unlike primary keys,
+clustering key fields may be nullable. This metadata enables query engines to perform
+optimizations such as storage-partitioned joins.
+
 ### Encoding Metadata
 
 Column encoding configurations are specified with the `lance-encoding:` prefix.

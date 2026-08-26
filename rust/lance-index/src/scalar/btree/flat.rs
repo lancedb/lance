@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BTreeSet;
 use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
@@ -11,17 +12,20 @@ use arrow_array::{
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
-use deepsize::DeepSizeOf;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
+use datafusion_common::ScalarValue;
+
 use crate::metrics::MetricsCollector;
-use crate::scalar::btree::BTREE_VALUES_COLUMN;
+use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
@@ -41,7 +45,7 @@ pub struct FlatIndex {
 }
 
 impl DeepSizeOf for FlatIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.data.get_array_memory_size()
     }
 }
@@ -81,6 +85,46 @@ impl FlatIndex {
         self.data.column(IDS_COL_IDX)
     }
 
+    fn values(&self) -> &ArrayRef {
+        self.data.column(VALUES_COL_IDX)
+    }
+
+    /// Which of `needles` are present in this page.
+    ///
+    /// Batched existence sibling of [`Self::search`]: it runs the same `IsIn`
+    /// predicate over the page's `values` column, but returns the matched
+    /// *values* rather than row addresses — so the caller can map each result
+    /// back to the input key it asked about. The page scan stays vectorized;
+    /// only the (small) matched subset is lifted into `ScalarValue`.
+    ///
+    /// Nulls: a null `values` entry never matches a (non-null) primary-key
+    /// needle, so it is simply absent from the result.
+    pub(crate) fn contains_values(
+        &self,
+        needles: &[OrderableScalarValue],
+    ) -> Result<BTreeSet<OrderableScalarValue>> {
+        if needles.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
+        let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let predicate = expr.evaluate(&self.data)?;
+        let predicate = predicate.into_array(self.data.num_rows())?;
+        let predicate = predicate
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Predicate should return boolean array");
+        let matched = arrow_select::filter::filter(self.values(), predicate)?;
+        (0..matched.len())
+            .map(|i| {
+                Ok(OrderableScalarValue(ScalarValue::try_from_array(
+                    &matched, i,
+                )?))
+            })
+            .collect()
+    }
+
     pub fn all(&self) -> NullableRowAddrSet {
         // Some rows will be in both sets but that is ok, null trumps true
         NullableRowAddrSet::new(self.all_addrs_map.clone(), self.null_addrs_map.clone())
@@ -90,10 +134,15 @@ impl FlatIndex {
         NullableRowAddrSet::new(self.all_addrs_map.clone(), Default::default())
     }
 
-    pub fn remap_batch(
-        batch: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<RecordBatch> {
+    /// Return every non-null row as TRUE without preserving NULL rows.
+    pub fn all_non_null(&self) -> NullableRowAddrSet {
+        NullableRowAddrSet::new(
+            self.all_addrs_map.clone() - &self.null_addrs_map,
+            Default::default(),
+        )
+    }
+
+    pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
         let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
         let val_idx_and_new_id = row_ids
             .values()
@@ -101,8 +150,7 @@ impl FlatIndex {
             .enumerate()
             .filter_map(|(idx, old_id)| {
                 mapping
-                    .get(old_id)
-                    .copied()
+                    .get(*old_id)
                     .unwrap_or(Some(*old_id))
                     .map(|new_id| (idx, new_id))
             })
@@ -136,6 +184,7 @@ impl FlatIndex {
     pub fn search(
         &self,
         query: &dyn AnyQuery,
+        track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         metrics.record_comparisons(self.data.num_rows());
@@ -149,10 +198,11 @@ impl FlatIndex {
             SargableQuery::Equals(value) => {
                 if value.is_null() {
                     // if we have x = NULL then the correct SQL behavior is to return all NULLs
-                    return Ok(NullableRowAddrSet::new(
-                        Default::default(),
-                        self.all_addrs_map.clone(),
-                    ));
+                    return Ok(if track_nulls {
+                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                    } else {
+                        NullableRowAddrSet::empty()
+                    });
                 }
             }
             // x IS NULL we can use pre-computed nulls
@@ -172,19 +222,21 @@ impl FlatIndex {
                 }
                 (Bound::Unbounded, Bound::Included(upper) | Bound::Excluded(upper)) => {
                     if upper.is_null() {
-                        return Ok(NullableRowAddrSet::new(
-                            Default::default(),
-                            self.all_addrs_map.clone(),
-                        ));
+                        return Ok(if track_nulls {
+                            NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                        } else {
+                            NullableRowAddrSet::empty()
+                        });
                     }
                 }
-                (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded) => {
-                    if lower.is_null() {
-                        return Ok(NullableRowAddrSet::new(
-                            Default::default(),
-                            self.all_addrs_map.clone(),
-                        ));
-                    }
+                (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded)
+                    if lower.is_null() =>
+                {
+                    return Ok(if track_nulls {
+                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                    } else {
+                        NullableRowAddrSet::empty()
+                    });
                 }
                 _ => {}
             },
@@ -194,14 +246,33 @@ impl FlatIndex {
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
         let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        self.eval_expr(&expr, track_nulls)
+    }
 
+    /// Evaluate a predicate compiled once by the caller. Lets a large IsIn that
+    /// spans many pages build the physical expr a single time instead of
+    /// rebuilding the whole IN-list per page (the dominant cost of a big lookup).
+    pub fn search_prebuilt(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        track_nulls: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableRowAddrSet> {
+        metrics.record_comparisons(self.data.num_rows());
+        self.eval_expr(expr, track_nulls)
+    }
+
+    fn eval_expr(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        track_nulls: bool,
+    ) -> Result<NullableRowAddrSet> {
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("Predicate should return boolean array");
-        let nulls = arrow::compute::is_null(&predicate)?;
 
         let matching_ids = arrow_select::filter::filter(self.ids(), predicate)?;
         let matching_ids = matching_ids
@@ -210,6 +281,11 @@ impl FlatIndex {
             .expect("Result of arrow_select::filter::filter did not match input type");
         let selected = RowAddrTreeMap::from_sorted_iter(matching_ids.values().iter().copied())?;
 
+        if !track_nulls {
+            return Ok(NullableRowAddrSet::new(selected, Default::default()));
+        }
+
+        let nulls = arrow::compute::is_null(&predicate)?;
         let null_row_ids = arrow_select::filter::filter(self.ids(), &nulls)?;
         let null_row_ids = null_row_ids
             .as_any()
@@ -233,6 +309,51 @@ impl FlatIndex {
     }
 }
 
+impl CacheCodecImpl for FlatIndex {
+    const TYPE_ID: &'static str = "lance.scalar.FlatIndex";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // Format:
+        // RAW_BLOB  : all_addrs_map (roaring tree map)
+        // RAW_BLOB  : null_addrs_map (roaring tree map)
+        // ARROW_IPC : data batch
+        let mut all_addrs_bytes = Vec::with_capacity(self.all_addrs_map.serialized_size());
+        self.all_addrs_map.serialize_into(&mut all_addrs_bytes)?;
+        w.write_raw(&all_addrs_bytes)?;
+
+        let mut null_addrs_bytes = Vec::with_capacity(self.null_addrs_map.serialized_size());
+        self.null_addrs_map.serialize_into(&mut null_addrs_bytes)?;
+        w.write_raw(&null_addrs_bytes)?;
+
+        w.write_ipc(self.data.as_ref())?;
+
+        Ok(())
+    }
+
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let all_addrs_bytes = r.read_raw()?;
+        let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
+
+        let null_addrs_bytes = r.read_raw()?;
+        let null_addrs_map = RowAddrTreeMap::deserialize_from(null_addrs_bytes.as_ref())?;
+
+        let batch = r.read_ipc()?;
+
+        let df_schema = DFSchema::try_from(batch.schema())?;
+
+        Ok(Self {
+            data: Arc::new(batch),
+            all_addrs_map,
+            null_addrs_map,
+            df_schema,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -243,7 +364,11 @@ mod tests {
     use super::*;
     use arrow_array::{record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
+    use lance_core::utils::row_addr_remap::GroupInput;
     use lance_datagen::{RowCount, array, gen_batch};
+    use roaring::RoaringTreemap;
+    use rstest::rstest;
+    use std::collections::HashMap;
 
     fn example_index() -> FlatIndex {
         let batch = gen_batch()
@@ -260,10 +385,77 @@ mod tests {
 
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
-        let actual = index.search(query, &NoOpMetricsCollector).unwrap();
+        let actual = index.search(query, true, &NoOpMetricsCollector).unwrap();
         let expected =
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(expected), Default::default());
         assert_eq!(actual, expected);
+    }
+
+    fn assert_roundtrips(index: &FlatIndex) {
+        let mut buf = Vec::new();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, FlatIndex::CURRENT_VERSION);
+        let restored = FlatIndex::deserialize(&mut reader).unwrap();
+
+        assert_eq!(restored.data, index.data);
+        assert_eq!(restored.all_addrs_map, index.all_addrs_map);
+        assert_eq!(restored.null_addrs_map, index.null_addrs_map);
+    }
+
+    #[test]
+    fn test_cache_codec_roundtrip() {
+        // No nulls
+        assert_roundtrips(&example_index());
+
+        // With nulls in the values column
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [None, Some(0), Some(5)]),
+            (BTREE_IDS_COLUMN, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
+
+        // Empty index
+        let empty = RecordBatch::new_empty(example_index().data.schema());
+        assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    /// The data batch must decode zero-copy through the full envelope-bearing
+    /// [`CacheCodec`], even though the two roaring blobs and the envelope push
+    /// the IPC section to a non-aligned starting offset.
+    #[test]
+    fn test_flat_index_data_is_zero_copy() {
+        use lance_core::cache::CacheCodec;
+        const ALIGN: usize = 64;
+
+        let index = example_index();
+        let codec = CacheCodec::from_impl::<FlatIndex>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(index);
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).hit().unwrap();
+        let restored = restored.downcast::<FlatIndex>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.data.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "data batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -320,9 +512,10 @@ mod tests {
         // 3 -> delete
         // Keep remaining as is
         let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
-        let remapped =
-            FlatIndex::try_new(FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap())
-                .unwrap();
+        let remapped = FlatIndex::try_new(
+            FlatIndex::remap_batch((*index.data).clone(), &RowAddrRemap::direct(mapping)).unwrap(),
+        )
+        .unwrap();
 
         let expected = FlatIndex::try_new(
             gen_batch()
@@ -335,18 +528,22 @@ mod tests {
         assert_eq!(remapped.data, expected.data);
     }
 
-    // It's possible, during compaction, that an entire page of values is deleted.  We just serialize
-    // it as an empty record batch.
-    #[tokio::test]
-    async fn test_remap_to_nothing() {
+    // An entire page (frag 0) is deleted during compaction. remap_batch must
+    // drop every row regardless of which RowAddrRemap mode expresses it.
+    // example_index holds row ids 5, 0, 3, 100, all in frag 0.
+    #[rstest]
+    #[case::compact(RowAddrRemap::compact([GroupInput {
+        rewritten_old_row_addrs: RoaringTreemap::new(),
+        old_frag_ids: vec![0],
+        new_frags: vec![],
+    }])
+    .unwrap())]
+    #[case::explicit(RowAddrRemap::direct(
+        [5u64, 0, 3, 100].into_iter().map(|id| (id, None)).collect(),
+    ))]
+    fn test_remap_to_nothing(#[case] remap: RowAddrRemap) {
         let index = example_index();
-        let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![
-            (5, None),
-            (0, None),
-            (3, None),
-            (100, None),
-        ]);
-        let remapped = FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap();
+        let remapped = FlatIndex::remap_batch((*index.data).clone(), &remap).unwrap();
         assert_eq!(remapped.num_rows(), 0);
     }
 
@@ -361,7 +558,7 @@ mod tests {
         let index = FlatIndex::try_new(batch).unwrap();
 
         let check = |query: SargableQuery, true_ids: &[u64], null_ids: &[u64]| {
-            let actual = index.search(&query, &NoOpMetricsCollector).unwrap();
+            let actual = index.search(&query, true, &NoOpMetricsCollector).unwrap();
             let expected = NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(true_ids),
                 RowAddrTreeMap::from_iter(null_ids),

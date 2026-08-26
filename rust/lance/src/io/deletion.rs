@@ -22,12 +22,13 @@ pub async fn read_dataset_deletion_file(
     if let Some(cached) = dataset.metadata_cache.get_with_key(&key).await {
         Ok(cached)
     } else {
+        let object_store = dataset.object_store_for_deletion(deletion_file).await?;
         let deletion_vector = Arc::new(
             read_deletion_file(
                 fragment_id,
                 deletion_file,
                 &dataset_dir,
-                dataset.object_store.as_ref(),
+                object_store.as_ref(),
             )
             .await?,
         );

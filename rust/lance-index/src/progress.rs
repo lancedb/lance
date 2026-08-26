@@ -5,12 +5,15 @@ use async_trait::async_trait;
 use lance_core::Result;
 use std::sync::Arc;
 
-/// Progress callback for index building.
+/// Progress callback for index building and distributed index finalization.
 ///
-/// Called at stage boundaries during index construction. Stages are sequential: `stage_complete`
-/// is always called before the next `stage_start`, so only one stage is active at a time. Stage
-/// names are index-type-specific (e.g. "train_ivf", "shuffle", "merge_partitions" for vector
-/// indices; "load_data", "build_pages" for scalar indices).
+/// Called at stage boundaries during index construction. For a single logical stream, stages are
+/// sequential: `stage_complete` is always called before the next `stage_start`, so only one stage
+/// is active at a time. Callers that orchestrate independent sub-builds in parallel may prefix
+/// stage names (for example `segment_plan[0]/merge_partitions`) to represent separate logical
+/// streams. Stage names are index-type-specific (e.g. "train_ivf", "shuffle", "merge_partitions"
+/// for vector indices; "load_data", "build_pages" for scalar indices; merge/finalization stages
+/// for distributed index construction).
 ///
 /// Methods take `&self` to allow concurrent calls from within a single stage. Implementations
 /// must be thread-safe.

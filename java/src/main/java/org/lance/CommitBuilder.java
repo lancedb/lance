@@ -13,12 +13,12 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
 import org.lance.namespace.LanceNamespace;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -65,15 +65,17 @@ public class CommitBuilder {
   private final BufferAllocator allocator;
 
   private Map<String, String> writeParams;
-  private StorageOptionsProvider storageOptionsProvider;
-  private LanceNamespace namespace;
+  private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private boolean namespaceClientManagedVersioning = false;
   private boolean enableV2ManifestPaths = true;
   private boolean detached = false;
   private Boolean useStableRowIds;
   private String storageFormat;
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
+  // -1 disables the timeout; any positive value is the timeout in nanoseconds.
+  private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -113,35 +115,43 @@ public class CommitBuilder {
   }
 
   /**
-   * Set the storage options provider for credential refresh during URI-based commits.
+   * Set the namespace client for managed versioning. When set, commits are routed through the
+   * namespace client's {@code createTableVersion} API instead of writing directly to the object
+   * store. This is supported for both dataset-based and URI-based commits.
    *
-   * @param provider the storage options provider
+   * @param namespaceClient the LanceNamespace client instance
    * @return this builder instance
    */
-  public CommitBuilder storageOptionsProvider(StorageOptionsProvider provider) {
-    this.storageOptionsProvider = provider;
+  public CommitBuilder namespaceClient(LanceNamespace namespaceClient) {
+    this.namespaceClient = namespaceClient;
     return this;
   }
 
   /**
-   * Set the namespace for managed versioning during URI-based commits.
+   * Set the table ID for namespace client-based commit handling.
    *
-   * @param namespace the LanceNamespace instance
-   * @return this builder instance
-   */
-  public CommitBuilder namespace(LanceNamespace namespace) {
-    this.namespace = namespace;
-    return this;
-  }
-
-  /**
-   * Set the table ID for namespace-based commit handling.
+   * <p>Must be provided together with `namespaceClient`.
    *
    * @param tableId the table identifier (e.g., ["workspace", "table_name"])
    * @return this builder instance
    */
   public CommitBuilder tableId(List<String> tableId) {
     this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Set whether namespace manages versioning.
+   *
+   * <p>When true and namespaceClient/tableId are set, commits are routed through the namespace
+   * client's create_table_version API. This is typically set based on the managed_versioning field
+   * from describe_table or declare_table responses.
+   *
+   * @param namespaceClientManagedVersioning whether namespace manages versioning
+   * @return this builder instance
+   */
+  public CommitBuilder namespaceClientManagedVersioning(boolean namespaceClientManagedVersioning) {
+    this.namespaceClientManagedVersioning = namespaceClientManagedVersioning;
     return this;
   }
 
@@ -190,8 +200,14 @@ public class CommitBuilder {
    * Set the storage format to use for the dataset.
    *
    * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
-   * "v2_1", "next", "v2_2".
+   * storage format will be inferred from the data files. Valid values are the numeric versions
+   * ("0.1", "2.0", "2.1", "2.2", "2.3") and the release selectors ("legacy", "stable", "next"),
+   * matching {@link WriteParams.Builder#withDataStorageVersion(String)}. Parsing is
+   * case-insensitive.
+   *
+   * <p>The {@code v}-prefixed spellings ("v2_0", "v2.0", "v2_1", "v2.1", "v2_2", "v2.2") are
+   * deprecated. They were accepted only by this method, never by the rest of Lance, and will be
+   * removed in a future release — use the numeric version instead ("v2_1" becomes "2.1").
    *
    * @param storageFormat the storage format name
    * @return this builder instance
@@ -229,6 +245,29 @@ public class CommitBuilder {
   }
 
   /**
+   * Set a timeout for the commit operation.
+   *
+   * <p>If the commit (including retries on conflict) does not complete within {@code timeout},
+   * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely. The
+   * default is 30 minutes.
+   *
+   * @param timeout the commit timeout, or {@code null} to disable
+   * @return this builder instance
+   * @throws IllegalArgumentException if {@code timeout} is zero or negative
+   */
+  public CommitBuilder commitTimeout(Duration timeout) {
+    if (timeout == null) {
+      this.commitTimeoutNanos = -1L;
+    } else {
+      Preconditions.checkArgument(
+          !timeout.isZero() && !timeout.isNegative(),
+          "commit timeout must be a positive duration; pass null to disable");
+      this.commitTimeoutNanos = timeout.toNanos();
+    }
+    return this;
+  }
+
+  /**
    * Execute the commit with the given transaction.
    *
    * <p>The caller is responsible for closing the transaction (via try-with-resources or {@link
@@ -240,19 +279,25 @@ public class CommitBuilder {
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
-      Dataset result =
-          nativeCommitToDataset(
-              dataset,
-              transaction,
-              detached,
-              enableV2ManifestPaths,
-              writeParams,
-              useStableRowIds,
-              storageFormat,
-              maxRetries,
-              skipAutoCleanup);
-      result.setAllocator(dataset.allocator());
-      return result;
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        Dataset result =
+            nativeCommitToDataset(
+                dataset,
+                transaction,
+                detached,
+                enableV2ManifestPaths,
+                writeParams,
+                useStableRowIds,
+                storageFormat,
+                maxRetries,
+                skipAutoCleanup,
+                namespaceClient,
+                tableId,
+                namespaceClientManagedVersioning,
+                commitTimeoutNanos);
+        result.setAllocator(dataset.allocator());
+        return result;
+      }
     }
     if (uri != null) {
       Dataset result =
@@ -261,15 +306,16 @@ public class CommitBuilder {
               transaction,
               detached,
               enableV2ManifestPaths,
-              storageOptionsProvider,
-              namespace,
+              namespaceClient,
               tableId,
               allocator,
               writeParams,
               useStableRowIds,
               storageFormat,
               maxRetries,
-              skipAutoCleanup);
+              skipAutoCleanup,
+              namespaceClientManagedVersioning,
+              commitTimeoutNanos);
       result.setAllocator(allocator);
       return result;
     }
@@ -285,14 +331,17 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
-      boolean skipAutoCleanup);
+      boolean skipAutoCleanup,
+      Object namespace,
+      Object tableId,
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 
   private static native Dataset nativeCommitToUri(
       String uri,
       Transaction transaction,
       boolean detached,
       boolean enableV2ManifestPaths,
-      Object storageOptionsProvider,
       Object namespace,
       Object tableId,
       Object allocator,
@@ -300,5 +349,7 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
-      boolean skipAutoCleanup);
+      boolean skipAutoCleanup,
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 }

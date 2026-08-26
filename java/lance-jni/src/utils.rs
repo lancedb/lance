@@ -12,7 +12,7 @@ use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -23,11 +23,9 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::storage_options::JavaStorageOptionsProvider;
 
 use crate::traits::FromJObjectWithEnv;
-use lance_index::vector::Query;
-use lance_io::object_store::StorageOptionsProvider;
+use lance_index::vector::{ApproxMode, Query};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -38,6 +36,56 @@ pub fn extract_storage_options(
     let jmap = JMap::from_env(env, storage_options_obj)?;
     let storage_options: HashMap<String, String> = to_rust_map(env, &jmap)?;
     Ok(storage_options)
+}
+
+pub fn extract_base_store_params(
+    env: &mut JNIEnv,
+    base_store_params_obj: &JObject,
+) -> Result<HashMap<String, ObjectStoreParams>> {
+    if base_store_params_obj.is_null() {
+        return Ok(HashMap::new());
+    }
+
+    env.with_local_frame(16, |env| {
+        let jmap = JMap::from_env(env, base_store_params_obj)?;
+        let mut base_store_params = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+
+        while let Some((key, value)) = iter.next(env)? {
+            if value.is_null() {
+                return Err(Error::input_error(
+                    "baseStoreParams values must be non-null maps".to_string(),
+                ));
+            }
+
+            let key_jstring = JString::from(key);
+            let base_path: String = env.get_string(&key_jstring)?.into();
+            let storage_options = extract_storage_options(env, &value)?;
+            base_store_params.insert(
+                base_path,
+                ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+                    )),
+                    ..Default::default()
+                },
+            );
+        }
+
+        Ok::<_, Error>(base_store_params)
+    })
+}
+
+pub(crate) fn parse_approx_mode(value: &str) -> Result<ApproxMode> {
+    match value {
+        "fast" => Ok(ApproxMode::Fast),
+        "normal" => Ok(ApproxMode::Normal),
+        "accurate" => Ok(ApproxMode::Accurate),
+        _ => Err(Error::input_error(format!(
+            "Invalid approx mode '{}'. Expected one of: fast, normal, accurate",
+            value
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,9 +99,11 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
-    storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
-    initial_bases: &JObject,                // Optional<BasePath>
-    target_bases: &JObject,                 // Optional<String>
+    base_store_params_obj: &JObject,
+    initial_bases: &JObject,                     // Optional<BasePath>
+    target_bases: &JObject,                      // Optional<String>
+    allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
+    blob_pack_file_size_threshold: &JObject,     // Optional<Long>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -89,13 +139,7 @@ pub fn extract_write_params(
 
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
-
-    // Extract storage options provider if present
-    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> = env
-        .get_optional(storage_options_provider_obj, |env, provider_obj| {
-            JavaStorageOptionsProvider::new(env, provider_obj)
-        })?
-        .map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
+    let base_store_params = extract_base_store_params(env, base_store_params_obj)?;
 
     if let Some(initial_bases) =
         env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
@@ -107,24 +151,29 @@ pub fn extract_write_params(
         write_params.target_base_names_or_paths = Some(names);
     }
 
-    // Create storage options accessor from storage_options and provider
-    let accessor = match (storage_options.is_empty(), storage_options_provider) {
-        (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
-        )),
-        (false, None) => Some(Arc::new(
+    if let Some(allow) = env.get_boolean_opt(allow_external_blob_outside_bases)? {
+        write_params.allow_external_blob_outside_bases = allow;
+    }
+    if let Some(max_bytes) = env.get_long_opt(blob_pack_file_size_threshold)? {
+        write_params.blob_pack_file_size_threshold = Some(max_bytes as usize);
+    }
+
+    // Create storage options accessor from static storage_options
+    let accessor = if storage_options.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
             lance::io::StorageOptionsAccessor::with_static_options(storage_options),
-        )),
-        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            provider,
-        ))),
-        (true, None) => None,
+        ))
     };
 
     write_params.store_params = Some(ObjectStoreParams {
         storage_options_accessor: accessor,
         ..Default::default()
     });
+    for (base_path, store_params) in base_store_params {
+        write_params = write_params.with_base_store_params(base_path, store_params);
+    }
     Ok(write_params)
 }
 
@@ -141,6 +190,10 @@ pub fn build_compaction_options(
     defer_index_remap: &JObject,               // Optional<Boolean>
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
+    max_source_fragments: &JObject,            // Optional<Long>
+    max_source_rows: &JObject,                 // Optional<Long>
+    max_source_bytes: &JObject,                // Optional<Long>
+    excluded_fragment_ids: &JObject,           // List<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -181,6 +234,28 @@ pub fn build_compaction_options(
         compaction_options.binary_copy_read_batch_bytes =
             Some(binary_copy_read_batch_bytes_val as usize);
     }
+    if let Some(max_source_fragments_val) = env.get_long_opt(max_source_fragments)? {
+        compaction_options.max_source_fragments = Some(max_source_fragments_val as usize);
+    }
+    if let Some(max_source_rows_val) = env.get_long_opt(max_source_rows)? {
+        compaction_options.max_source_rows = Some(max_source_rows_val as usize);
+    }
+    if let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)? {
+        compaction_options.max_source_bytes = Some(max_source_bytes_val as u64);
+    }
+    compaction_options.excluded_fragment_ids = env
+        .get_longs(excluded_fragment_ids)?
+        .into_iter()
+        .map(|fragment_id| {
+            u32::try_from(fragment_id).map_err(|_| {
+                Error::input_error(format!(
+                    "excluded_fragment_ids must contain values between 0 and {}, got {}",
+                    u32::MAX,
+                    fragment_id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(compaction_options)
 }
@@ -209,6 +284,11 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
+        let query_parallelism = env
+            .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
+            .i()?;
+        let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
+        let approx_mode = parse_approx_mode(&approx_mode_str)?;
 
         Ok(Query {
             column,
@@ -223,6 +303,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             metric_type: distance_type,
             use_index,
             dist_q_c: 0.0,
+            query_parallelism,
+            approx_mode,
         })
     })?;
 
@@ -432,6 +514,7 @@ pub fn get_vector_index_params(
                 stages,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
+                runtime_hints: Default::default(),
             })
         },
     )?;
@@ -574,5 +657,87 @@ pub fn to_java_float_obj<'local>(
             &[JValue::Float(base_index as jfloat)],
         )?),
         None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_double_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<f64>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => Ok(env.new_object("java/lang/Double", "(D)V", &[JValue::Double(v)])?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_string_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<&str>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => {
+            let jstr = env.new_string(v)?;
+            Ok(jstr.into())
+        }
+        None => Ok(JObject::null()),
+    }
+}
+
+/// Convert a DataFusion ScalarValue to a Java Comparable object.
+///
+/// Maps numeric types to their boxed Java equivalents (Long, Double)
+/// and string types to Java String. Null ScalarValues produce JObject::null().
+///
+/// This is useful for exposing index statistics (e.g., zonemap min/max)
+/// to Java clients in a type-safe, Comparable-compatible way.
+pub fn scalar_value_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    value: &datafusion_common::ScalarValue,
+) -> Result<JObject<'a>> {
+    use datafusion_common::ScalarValue;
+
+    match value {
+        ScalarValue::Null => Ok(JObject::null()),
+
+        ScalarValue::Boolean(v) => to_java_boolean_obj(env, *v),
+
+        // Integer types → Java Long
+        ScalarValue::Int8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int64(v) => to_java_long_obj(env, *v),
+        ScalarValue::UInt8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        // UInt64 may overflow i64, but for min/max stats this is acceptable
+        ScalarValue::UInt64(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+
+        // Float types → Java Double
+        ScalarValue::Float16(v) => to_java_double_obj(env, v.map(|x| f64::from(x.to_f32()))),
+        ScalarValue::Float32(v) => to_java_double_obj(env, v.map(|x| x as f64)),
+        ScalarValue::Float64(v) => to_java_double_obj(env, *v),
+
+        // String types → Java String
+        ScalarValue::Utf8(v) => to_java_string_obj(env, v.as_deref()),
+        ScalarValue::LargeUtf8(v) => to_java_string_obj(env, v.as_deref()),
+
+        // Date types → Java Long
+        ScalarValue::Date32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Date64(v) => to_java_long_obj(env, *v),
+
+        // Timestamp types → Java Long
+        ScalarValue::TimestampSecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMillisecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMicrosecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampNanosecond(v, _) => to_java_long_obj(env, *v),
+
+        // For any unsupported type, return null (conservative: caller will skip)
+        _ => {
+            log::warn!(
+                "Unsupported ScalarValue type for Java conversion: {:?}",
+                value.data_type()
+            );
+            Ok(JObject::null())
+        }
     }
 }

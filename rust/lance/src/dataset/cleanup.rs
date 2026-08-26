@@ -46,7 +46,8 @@ use lance_core::{
     Error, Result,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
-        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
+        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, TRACE_DATASET_EVENTS,
+        TRACE_FILE_AUDIT,
     },
 };
 use lance_table::{
@@ -57,8 +58,8 @@ use lance_table::{
         manifest::{read_manifest, read_manifest_indexes},
     },
 };
+use object_store::ObjectMeta;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectMeta};
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -68,7 +69,7 @@ use std::{
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{Span, debug, info, instrument};
+use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -78,7 +79,7 @@ struct ReferencedFiles {
     index_uuids: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemovalStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
@@ -88,12 +89,194 @@ pub struct RemovalStats {
     pub deletion_files_removed: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum RemovedFileType {
+/// A read-only explanation of what a cleanup operation would remove.
+///
+/// This is an explanation, not a deletion plan.  Calling
+/// [`CleanupOperation::execute`] re-evaluates the current dataset and reference
+/// state before deleting files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupExplanation {
+    /// Dataset version observed when the explanation was produced.
+    pub read_version: u64,
+    /// Aggregate statistics for files that would be removed.
+    pub stats: RemovalStats,
+    /// Candidate files that would be removed, capped by `candidate_file_limit`.
+    pub candidate_files: Vec<CleanupCandidateFile>,
+    /// True if more candidate files were found than are included.
+    pub candidate_files_truncated: bool,
+    /// Maximum number of candidate files included in this explanation.
+    pub candidate_file_limit: usize,
+    /// Referenced child branches and whether cleanup would cascade into them.
+    pub referenced_branches: Vec<CleanupReferencedBranch>,
+    /// Non-fatal warnings about the explanation.
+    pub warnings: Vec<String>,
+}
+
+/// A file that cleanup identified as removable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupCandidateFile {
+    /// Dataset-relative or storage path for the candidate file.
+    pub path: String,
+    /// Kind of file identified by cleanup.
+    pub kind: CleanupFileKind,
+    /// True if the file is removable only because it aged past the unverified
+    /// retention threshold or `delete_unverified` is enabled.
+    pub unverified: bool,
+    /// Candidate file size in bytes.
+    pub size_bytes: u64,
+}
+
+/// A branch that references the current branch lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupReferencedBranch {
+    /// Branch name.
+    pub name: String,
+    /// Version of the current lineage referenced by this branch.
+    pub referenced_version: u64,
+    /// True if this branch would be cleaned when cascading cleanup is enabled.
+    pub cleanup_candidate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupFileKind {
+    Manifest,
     Data,
     Transaction,
     Index,
     Deletion,
+    /// A leftover `_versions/.tmp` manifest from a failed transaction.  These
+    /// are deleted but excluded from per-kind `RemovalStats` counts and audit
+    /// logs to match the long-standing cleanup behavior.  Their bytes
+    /// are still included in `bytes_removed`.
+    TemporaryManifest,
+}
+
+impl CleanupCandidateFile {
+    fn from_cleanup_file(file: &CleanupFile) -> Self {
+        Self {
+            path: file.path.to_string(),
+            kind: file.kind,
+            unverified: file.unverified,
+            size_bytes: file.size_bytes,
+        }
+    }
+}
+
+fn cleanup_file(
+    path: Path,
+    kind: CleanupFileKind,
+    unverified: bool,
+    size_bytes: u64,
+) -> Option<CleanupFile> {
+    Some(CleanupFile {
+        path,
+        kind,
+        unverified,
+        size_bytes,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CleanupFile {
+    path: Path,
+    kind: CleanupFileKind,
+    /// True when the file was kept on disk past its referenced lifetime
+    /// because we could not verify it was safe to remove (e.g. produced by an
+    /// unfinished commit) and is being deleted only because it has aged past
+    /// the unverified-retention threshold or `delete_unverified` is set.
+    unverified: bool,
+    size_bytes: u64,
+}
+
+impl RemovalStats {
+    fn record_file(&mut self, file: &CleanupFile) {
+        self.bytes_removed += file.size_bytes;
+        match file.kind {
+            CleanupFileKind::Manifest => self.old_versions += 1,
+            CleanupFileKind::Data => self.data_files_removed += 1,
+            CleanupFileKind::Transaction => self.transaction_files_removed += 1,
+            CleanupFileKind::Index => self.index_files_removed += 1,
+            CleanupFileKind::Deletion => self.deletion_files_removed += 1,
+            CleanupFileKind::TemporaryManifest => {}
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.bytes_removed += other.bytes_removed;
+        self.old_versions += other.old_versions;
+        self.data_files_removed += other.data_files_removed;
+        self.transaction_files_removed += other.transaction_files_removed;
+        self.index_files_removed += other.index_files_removed;
+        self.deletion_files_removed += other.deletion_files_removed;
+    }
+}
+
+#[derive(Debug, Default)]
+struct CleanupRunResult {
+    stats: RemovalStats,
+    removed_manifests: HashSet<Path>,
+    candidate_files: Vec<CleanupCandidateFile>,
+    candidate_files_truncated: bool,
+    referenced_branches: Vec<CleanupReferencedBranch>,
+}
+
+impl CleanupRunResult {
+    fn record_file(
+        &mut self,
+        file: &CleanupFile,
+        candidate_file_limit: Option<usize>,
+        track_removed_manifests: bool,
+    ) {
+        self.stats.record_file(file);
+        if track_removed_manifests && matches!(file.kind, CleanupFileKind::Manifest) {
+            self.removed_manifests.insert(file.path.clone());
+        }
+        if let Some(limit) = candidate_file_limit {
+            if self.candidate_files.len() < limit {
+                self.candidate_files
+                    .push(CleanupCandidateFile::from_cleanup_file(file));
+            } else {
+                self.candidate_files_truncated = true;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self, candidate_file_limit: Option<usize>) {
+        self.stats.merge(&other.stats);
+        self.removed_manifests.extend(other.removed_manifests);
+        self.referenced_branches.extend(other.referenced_branches);
+        if let Some(limit) = candidate_file_limit {
+            for file in other.candidate_files {
+                if self.candidate_files.len() < limit {
+                    self.candidate_files.push(file);
+                } else {
+                    self.candidate_files_truncated = true;
+                }
+            }
+            self.candidate_files_truncated |= other.candidate_files_truncated;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CleanupAction {
+    Execute,
+    Explain { max_candidate_files: usize },
+}
+
+impl CleanupAction {
+    fn deletes_files(self) -> bool {
+        matches!(self, Self::Execute)
+    }
+
+    fn candidate_file_limit(self) -> Option<usize> {
+        match self {
+            Self::Execute => None,
+            Self::Explain {
+                max_candidate_files,
+            } => Some(max_candidate_files),
+        }
+    }
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
@@ -108,6 +291,11 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
     policy: CleanupPolicy,
+    action: CleanupAction,
+    read_version: u64,
+    ignored_manifests: HashSet<Path>,
+    track_removed_manifests: bool,
+    include_referenced_branches: bool,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -124,6 +312,32 @@ struct CleanupInspection {
     tagged_old_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
+    /// The latest timestamp of all manifests that will be removed.
+    latest_deleted_manifest_time: Option<DateTime<Utc>>,
+}
+
+impl CleanupInspection {
+    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    ///
+    /// Listing only files with `last_modified <= earliest_retained` is valid
+    /// when the working set is a time suffix: every retained version is newer
+    /// than every deleted one. A tagged old version (or any other sparse
+    /// retain) pulls that cutoff backwards, so files from newer deleted
+    /// versions are never listed. Their manifests are still removed, which
+    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
+    ///
+    /// When a deleted manifest is newer than the earliest retained one, drop
+    /// the cutoff and scan the whole subtree — the same approach already used
+    /// for `_indices/`.
+    fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
+        match (
+            self.earliest_retained_manifest_time,
+            self.latest_deleted_manifest_time,
+        ) {
+            (Some(retained), Some(deleted)) if deleted > retained => None,
+            (retained, _) => retained,
+        }
+    }
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -131,21 +345,131 @@ struct CleanupInspection {
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
 const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
+const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 
-impl<'a> CleanupTask<'a> {
-    fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
-        Self { dataset, policy }
+/// Builder-style cleanup operation.
+///
+/// Call [`Self::explain`] for a read-only explanation of what cleanup would
+/// remove, or [`Self::execute`] to re-evaluate the current dataset state and
+/// delete files.
+pub struct CleanupOperation<'a> {
+    dataset: &'a Dataset,
+    policy: CleanupPolicy,
+    max_candidate_files: usize,
+}
+
+impl<'a> CleanupOperation<'a> {
+    pub(crate) fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
+        Self {
+            dataset,
+            policy,
+            max_candidate_files: DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES,
+        }
     }
 
-    async fn run(self) -> Result<RemovalStats> {
-        let mut final_stats = RemovalStats::default();
+    /// Set the maximum number of candidate files included in explanations.
+    ///
+    /// The aggregate [`RemovalStats`] in [`CleanupExplanation`] still include
+    /// all files that would be removed.
+    pub fn with_max_candidate_files(mut self, max_candidate_files: usize) -> Self {
+        self.max_candidate_files = max_candidate_files;
+        self
+    }
+
+    /// Explain what cleanup would remove without deleting files.
+    pub async fn explain(&self) -> Result<CleanupExplanation> {
+        let cleanup = CleanupTask::new(
+            self.dataset,
+            self.policy.clone(),
+            CleanupAction::Explain {
+                max_candidate_files: self.max_candidate_files,
+            },
+        );
+        let read_version = cleanup.read_version;
+        let result = cleanup.run().await?;
+        let warnings = if result.candidate_files_truncated {
+            vec![format!(
+                "candidate_files truncated to {} entries",
+                self.max_candidate_files
+            )]
+        } else {
+            Vec::new()
+        };
+        Ok(CleanupExplanation {
+            read_version,
+            stats: result.stats,
+            candidate_files: result.candidate_files,
+            candidate_files_truncated: result.candidate_files_truncated,
+            candidate_file_limit: self.max_candidate_files,
+            referenced_branches: result.referenced_branches,
+            warnings,
+        })
+    }
+
+    /// Execute cleanup by re-evaluating the current dataset state.
+    pub async fn execute(&self) -> Result<RemovalStats> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
+        let cleanup = CleanupTask::new(self.dataset, self.policy.clone(), CleanupAction::Execute);
+        Ok(cleanup.run().await?.stats)
+    }
+}
+
+impl<'a> CleanupTask<'a> {
+    fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
+        let track_removed_manifests = policy.clean_referenced_branches;
+        let include_referenced_branches = action.candidate_file_limit().is_some();
+        Self::new_with_ignored_manifests(
+            dataset,
+            policy,
+            action,
+            HashSet::new(),
+            track_removed_manifests,
+            include_referenced_branches,
+        )
+    }
+
+    fn new_with_ignored_manifests(
+        dataset: &'a Dataset,
+        policy: CleanupPolicy,
+        action: CleanupAction,
+        ignored_manifests: HashSet<Path>,
+        track_removed_manifests: bool,
+        include_referenced_branches: bool,
+    ) -> Self {
+        Self {
+            dataset,
+            policy,
+            action,
+            read_version: dataset.version().version,
+            ignored_manifests,
+            track_removed_manifests,
+            include_referenced_branches,
+        }
+    }
+
+    async fn run(self) -> Result<CleanupRunResult> {
+        let mut final_result = CleanupRunResult::default();
+        let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
         // For cases that referenced branches never clean and the current cleanup cannot clean anything
         // This must happen before cleaning the current branch if the setting is enabled.
 
         let referenced_branches: Vec<(String, u64)> = self.find_referenced_branches().await?;
+        if self.include_referenced_branches {
+            final_result.referenced_branches = referenced_branches
+                .iter()
+                .map(|(name, referenced_version)| CleanupReferencedBranch {
+                    name: name.clone(),
+                    referenced_version: *referenced_version,
+                    cleanup_candidate: self.policy.clean_referenced_branches,
+                })
+                .collect();
+        }
         if self.policy.clean_referenced_branches {
-            self.clean_referenced_branches(&referenced_branches).await?;
+            final_result.merge(
+                self.clean_referenced_branches(&referenced_branches).await?,
+                candidate_file_limit,
+            );
         }
 
         // we process all manifest files in parallel to figure
@@ -179,19 +503,21 @@ impl<'a> CleanupTask<'a> {
         }
 
         if !referenced_branches.is_empty() {
+            let ignored_manifests: HashSet<_> = final_result
+                .removed_manifests
+                .union(&self.ignored_manifests)
+                .cloned()
+                .collect();
             inspection = self
-                .retain_branch_lineage_files(inspection, &referenced_branches)
+                .retain_branch_lineage_files(inspection, &referenced_branches, &ignored_manifests)
                 .await?
         };
 
-        let stats = self.delete_unreferenced_files(inspection).await?;
-        final_stats.bytes_removed += stats.bytes_removed;
-        final_stats.old_versions += stats.old_versions;
-        final_stats.data_files_removed += stats.data_files_removed;
-        final_stats.transaction_files_removed += stats.transaction_files_removed;
-        final_stats.index_files_removed += stats.index_files_removed;
-        final_stats.deletion_files_removed += stats.deletion_files_removed;
-        Ok(final_stats)
+        final_result.merge(
+            self.delete_unreferenced_files(inspection).await?,
+            candidate_file_limit,
+        );
+        Ok(final_result)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -203,6 +529,7 @@ impl<'a> CleanupTask<'a> {
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+            .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
@@ -222,19 +549,35 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
-        let dataset_version = self.dataset.version().version;
-
+        let manifest_and_indexes = async {
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            Ok::<_, Error>((manifest, indexes))
+        }
+        .await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if location.version < self.read_version && error.is_not_found() => {
+                // Another cleanup may remove an old manifest after this cleanup lists it.
+                // The current manifest is never safe to skip because it anchors our snapshot.
+                debug!(
+                    manifest_version = location.version,
+                    read_version = self.read_version,
+                    manifest_path = %location.path,
+                    "Skipping old manifest removed by concurrent cleanup"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
-        let is_latest = dataset_version <= manifest.version;
+        let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -244,18 +587,19 @@ impl<'a> CleanupTask<'a> {
         }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        let commit_ts = manifest.timestamp();
         if !in_working_set {
             inspection
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
+            match inspection.latest_deleted_manifest_time {
+                Some(ts) if commit_ts <= ts => {}
+                _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
+            }
         } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            match inspection.earliest_retained_manifest_time {
+                Some(ts) if commit_ts >= ts => {}
+                _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
             }
         }
         Ok(())
@@ -277,8 +621,8 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
-                let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+            for file in fragment.referenced_lance_files() {
+                let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
             }
@@ -294,7 +638,7 @@ impl<'a> CleanupTask<'a> {
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
                 .tx_paths
-                .insert(Path::parse(TRANSACTIONS_DIR)?.child(relative_tx_path.as_str()));
+                .insert(Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str()));
         }
 
         for index in indexes {
@@ -319,28 +663,32 @@ impl<'a> CleanupTask<'a> {
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
-    ) -> Result<RemovalStats> {
-        let removal_stats = Mutex::new(RemovalStats::default());
+    ) -> Result<CleanupRunResult> {
+        let cleanup_result = Mutex::new(CleanupRunResult::default());
+        let deletes_files = self.action.deletes_files();
+        let removes_empty_dirs = matches!(
+            self.dataset.object_store.scheme(),
+            "file" | "file+uring" | "file-object-store"
+        );
+        let indices_dir = self.dataset.indices_dir();
+        let retained_index_dirs = inspection
+            .referenced_files
+            .index_uuids
+            .iter()
+            .map(|uuid| indices_dir.clone().join(uuid.as_str()))
+            .collect::<HashSet<_>>();
+        let index_dirs_to_remove = Mutex::new(HashSet::new());
+        let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        let is_not_found_err = |e: &Error| {
-            matches!(
-                e,
-                Error::IO { source,.. }
-                    if source
-                      .downcast_ref::<ObjectStoreError>()
-                      .map(|os_err| matches!(os_err, ObjectStoreError::NotFound {.. }))
-                      .unwrap_or(false)
-            )
-        };
+        let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
-        let build_listing_stream = |dir: Path, file_type: Option<RemovedFileType>| {
+        let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
-            let removal_stats_ref = &removal_stats;
             self.dataset
                 .object_store
-                .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
+                .read_dir_all(&dir, unmodified_since)
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
@@ -356,118 +704,171 @@ impl<'a> CleanupTask<'a> {
                     // delete it if we can verify it is part of an old version.
                     let maybe_in_progress = !self.policy.delete_unverified
                         && obj_meta.last_modified >= verification_threshold;
-                    let path_to_remove = self.path_if_not_referenced(
-                        obj_meta.location,
+                    let file_to_remove = self.cleanup_file_if_not_referenced(
+                        obj_meta,
                         maybe_in_progress,
                         inspection_ref,
                     );
-                    if matches!(path_to_remove, Ok(Some(..))) {
-                        let mut stats = removal_stats_ref.lock().unwrap();
-                        stats.bytes_removed += obj_meta.size;
-                        if let Some(file_type) = file_type {
-                            match file_type {
-                                RemovedFileType::Data => stats.data_files_removed += 1,
-                                RemovedFileType::Transaction => {
-                                    stats.transaction_files_removed += 1
-                                }
-                                RemovedFileType::Index => stats.index_files_removed += 1,
-                                RemovedFileType::Deletion => stats.deletion_files_removed += 1,
-                            }
-                        }
-                    }
-                    future::ready(path_to_remove)
+                    future::ready(file_to_remove)
                 })
                 .boxed()
         };
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
+        // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
+        // would hide files that belong to newer deleted versions. See
+        // [`CleanupInspection::listing_unmodified_since`].
+        let unmodified_since = inspection.listing_unmodified_since();
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir(), None),
-            build_listing_stream(
-                self.dataset.transactions_dir(),
-                Some(RemovedFileType::Transaction),
-            ),
-            build_listing_stream(self.dataset.data_dir(), Some(RemovedFileType::Data)),
-            build_listing_stream(self.dataset.indices_dir(), Some(RemovedFileType::Index)),
-            build_listing_stream(
-                self.dataset.deletions_dir(),
-                Some(RemovedFileType::Deletion),
-            ),
+            build_listing_stream(self.dataset.versions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            // Index UUIDs from manifests being removed are proof that their files are
+            // safe to delete. Scan every index artifact while that proof is available;
+            // a retained-manifest cutoff can otherwise skip newer artifacts and lose
+            // the proof when the old manifests are removed by this cleanup pass.
+            build_listing_stream(self.dataset.indices_dir(), None),
+            build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
-        let unreferenced_paths = stream::iter(streams).flatten().boxed();
+        let unreferenced_files = stream::iter(streams).flatten().boxed();
 
         let old_manifests = inspection.old_manifests.clone();
-        let num_old_manifests = old_manifests.len();
-
-        // Ideally this collect shouldn't be needed here but it seems necessary
-        // to avoid https://github.com/rust-lang/rust/issues/102211
-        let manifest_bytes_removed = stream::iter(old_manifests.keys())
-            .map(|path| self.dataset.object_store.size(path))
-            .collect::<Vec<_>>()
-            .await;
-        let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
-            .buffer_unordered(self.dataset.object_store.io_parallelism())
-            .try_fold(0, |acc, size| async move { Ok(acc + (size)) })
-            .await;
-
-        let old_manifests_stream = stream::iter(old_manifests.into_keys())
-            .map(|path| {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path.as_ref());
-                Ok(path)
+        let manifest_files = stream::iter(old_manifests)
+            .map(|(path, _version)| async move {
+                let size_bytes = self.dataset.object_store.size(&path).await?;
+                Ok::<CleanupFile, Error>(CleanupFile {
+                    path,
+                    kind: CleanupFileKind::Manifest,
+                    unverified: false,
+                    size_bytes,
+                })
             })
+            .buffer_unordered(self.dataset.object_store.io_parallelism())
             .boxed();
-        let all_paths_to_remove =
-            stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
-        let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
-            self.policy.delete_rate_limit
-        {
-            let duration = calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
-            let mut ticker = interval(duration);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            IntervalStream::new(ticker)
-                .zip(all_paths_to_remove)
-                .map(|(_, path)| path)
-                .boxed()
+        let all_files = stream::iter(vec![unreferenced_files, manifest_files]).flatten();
+        let all_paths_to_remove = all_files.map(|file| {
+            let file = file?;
+            if deletes_files {
+                let mode = if file.unverified {
+                    AUDIT_MODE_DELETE_UNVERIFIED
+                } else {
+                    AUDIT_MODE_DELETE
+                };
+                let path_str = file.path.as_ref();
+                match file.kind {
+                    CleanupFileKind::Manifest => {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = path_str);
+                    }
+                    CleanupFileKind::Data => {
+                        info!(target: TRACE_FILE_AUDIT, mode=mode, r#type=AUDIT_TYPE_DATA, path = path_str);
+                    }
+                    CleanupFileKind::Deletion => {
+                        info!(target: TRACE_FILE_AUDIT, mode=mode, r#type=AUDIT_TYPE_DELETION, path = path_str);
+                    }
+                    CleanupFileKind::Index => {
+                        info!(target: TRACE_FILE_AUDIT, mode=mode, r#type=AUDIT_TYPE_INDEX, path = path_str);
+                    }
+                    CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
+                }
+            }
+            cleanup_result
+                .lock()
+                .unwrap()
+                .record_file(&file, candidate_file_limit, self.track_removed_manifests);
+            if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
+                let mut parent = file.path.parent();
+                let mut index_dirs = index_dirs_to_remove.lock().unwrap();
+                while let Some(dir_path) = parent {
+                    if dir_path == indices_dir || !dir_path.prefix_matches(&indices_dir) {
+                        break;
+                    }
+                    index_dirs.insert(dir_path.clone());
+                    parent = dir_path.parent();
+                }
+            }
+            Ok(file.path)
+        });
+
+        if deletes_files {
+            let paths_to_delete: BoxStream<Result<Path>> =
+                if let Some(rate) = self.policy.delete_rate_limit {
+                    let duration =
+                        calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
+                    let mut ticker = interval(duration);
+                    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    IntervalStream::new(ticker)
+                        .zip(all_paths_to_remove)
+                        .map(|(_, path)| path)
+                        .boxed()
+                } else {
+                    all_paths_to_remove.boxed()
+                };
+
+            self.dataset
+                .object_store
+                .remove_stream(paths_to_delete)
+                .try_for_each(|_| future::ready(Ok(())))
+                .await?;
+
+            if removes_empty_dirs
+                && let Err(error) = self
+                    .dataset
+                    .object_store
+                    .remove_empty_dirs(
+                        indices_dir.clone(),
+                        retained_index_dirs,
+                        index_dirs_to_remove.into_inner().unwrap(),
+                        (!self.policy.delete_unverified).then_some(verification_threshold),
+                    )
+                    .await
+            {
+                warn!(
+                    path = indices_dir.as_ref(),
+                    error = %error,
+                    "Failed to remove empty index directories"
+                );
+            }
         } else {
-            all_paths_to_remove.boxed()
-        };
+            // Drain the stream to populate stats, but do not call remove_stream.
+            all_paths_to_remove
+                .try_for_each(|_| future::ready(Ok(())))
+                .await?;
+        }
 
-        let delete_fut = self
-            .dataset
-            .object_store
-            .remove_stream(paths_to_delete)
-            .try_for_each(|_| future::ready(Ok(())));
-
-        delete_fut.await?;
-
-        let mut removal_stats = removal_stats.into_inner().unwrap();
-        removal_stats.old_versions = num_old_manifests as u64;
-        removal_stats.bytes_removed += manifest_bytes_removed?;
+        let cleanup_result = cleanup_result.into_inner().unwrap();
 
         let span = Span::current();
-        span.record("bytes_removed", removal_stats.bytes_removed);
-        span.record("data_files_removed", removal_stats.data_files_removed);
+        span.record("bytes_removed", cleanup_result.stats.bytes_removed);
+        span.record(
+            "data_files_removed",
+            cleanup_result.stats.data_files_removed,
+        );
         span.record(
             "transaction_files_removed",
-            removal_stats.transaction_files_removed,
+            cleanup_result.stats.transaction_files_removed,
         );
-        span.record("index_files_removed", removal_stats.index_files_removed);
+        span.record(
+            "index_files_removed",
+            cleanup_result.stats.index_files_removed,
+        );
         span.record(
             "deletion_files_removed",
-            removal_stats.deletion_files_removed,
+            cleanup_result.stats.deletion_files_removed,
         );
 
-        Ok(removal_stats)
+        Ok(cleanup_result)
     }
 
-    fn path_if_not_referenced(
+    fn cleanup_file_if_not_referenced(
         &self,
-        path: Path,
+        obj_meta: ObjectMeta,
         maybe_in_progress: bool,
         inspection: &CleanupInspection,
-    ) -> Result<Option<Path>> {
+    ) -> Result<Option<CleanupFile>> {
+        let path = obj_meta.location;
         let relative_path = remove_prefix(&path, &self.dataset.base);
+        let size_bytes = obj_meta.size;
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
             //
@@ -476,7 +877,12 @@ impl<'a> CleanupTask<'a> {
             if maybe_in_progress {
                 return Ok(None);
             } else {
-                return Ok(Some(path));
+                return Ok(cleanup_file(
+                    path,
+                    CleanupFileKind::TemporaryManifest,
+                    true,
+                    size_bytes,
+                ));
             }
         }
         if relative_path.as_ref().starts_with("_indices") {
@@ -490,15 +896,18 @@ impl<'a> CleanupTask<'a> {
                 {
                     return Ok(None);
                 } else if !maybe_in_progress {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
-                    return Ok(Some(path));
+                    return Ok(cleanup_file(path, CleanupFileKind::Index, true, size_bytes));
                 } else if inspection
                     .verified_files
                     .index_uuids
                     .contains(uuid.as_ref())
                 {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_INDEX, path = path.to_string());
-                    return Ok(Some(path));
+                    return Ok(cleanup_file(
+                        path,
+                        CleanupFileKind::Index,
+                        false,
+                        size_bytes,
+                    ));
                 }
             } else {
                 return Ok(None);
@@ -514,15 +923,13 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                        Ok(Some(path))
+                        Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
                     } else if inspection
                         .verified_files
                         .data_paths
                         .contains(&relative_path)
                     {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                        Ok(Some(path))
+                        Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                     } else {
                         Ok(None)
                     }
@@ -587,15 +994,13 @@ impl<'a> CleanupTask<'a> {
                 {
                     Ok(None)
                 } else if !maybe_in_progress {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                    Ok(Some(path))
+                    Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
                 } else if inspection
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
                 {
-                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = path.to_string());
-                    Ok(Some(path))
+                    Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
                     Ok(None)
                 }
@@ -613,15 +1018,23 @@ impl<'a> CleanupTask<'a> {
                     {
                         Ok(None)
                     } else if !maybe_in_progress {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-                        Ok(Some(path))
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Deletion,
+                            true,
+                            size_bytes,
+                        ))
                     } else if inspection
                         .verified_files
                         .delete_paths
                         .contains(&relative_path)
                     {
-                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-                        Ok(Some(path))
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Deletion,
+                            false,
+                            size_bytes,
+                        ))
                     } else {
                         Ok(None)
                     }
@@ -640,7 +1053,14 @@ impl<'a> CleanupTask<'a> {
                     } else if !maybe_in_progress
                         || inspection.verified_files.tx_paths.contains(&relative_path)
                     {
-                        Ok(Some(path))
+                        let unverified =
+                            !inspection.verified_files.tx_paths.contains(&relative_path);
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Transaction,
+                            unverified,
+                            size_bytes,
+                        ))
                     } else {
                         Ok(None)
                     }
@@ -709,8 +1129,8 @@ impl<'a> CleanupTask<'a> {
     async fn clean_referenced_branches(
         &self,
         referenced_branches: &[(String, u64)],
-    ) -> Result<RemovalStats> {
-        let final_stats = Mutex::new(RemovalStats::default());
+    ) -> Result<CleanupRunResult> {
+        let final_result = Mutex::new(CleanupRunResult::default());
 
         // Group branches by their lineage identifier (BranchIdentifier).
         // Branches with the same identifier share a lineage and must be cleaned sequentially
@@ -722,30 +1142,32 @@ impl<'a> CleanupTask<'a> {
                 .or_insert_with(Vec::new)
                 .push(branch.clone());
         }
+        let action = self.action;
+        let candidate_file_limit = self.action.candidate_file_limit();
         let tasks: Vec<_> = branches_chains
             .values()
             .map(|branch_chain| {
-                let final_stats = &final_stats;
+                let final_result = &final_result;
                 async move {
                     for branch in branch_chain {
                         let branch_dataset = self
                             .dataset
                             .checkout_version((branch.as_str(), None))
                             .await?;
-                        if let Some(stats) = cleanup_cascade_branch(
+                        let ignored_manifests =
+                            final_result.lock().unwrap().removed_manifests.clone();
+                        if let Some(result) = cleanup_cascade_branch_run(
                             &branch_dataset,
                             branch_dataset.manifest.as_ref(),
+                            action,
+                            ignored_manifests,
                         )
                         .await?
                         {
-                            let mut stats_guard = final_stats.lock().unwrap();
-                            stats_guard.bytes_removed += stats.bytes_removed;
-                            stats_guard.old_versions += stats.old_versions;
-                            stats_guard.data_files_removed += stats.data_files_removed;
-                            stats_guard.transaction_files_removed +=
-                                stats.transaction_files_removed;
-                            stats_guard.index_files_removed += stats.index_files_removed;
-                            stats_guard.deletion_files_removed += stats.deletion_files_removed;
+                            final_result
+                                .lock()
+                                .unwrap()
+                                .merge(result, candidate_file_limit);
                         }
                     }
                     Ok::<(), Error>(())
@@ -753,7 +1175,7 @@ impl<'a> CleanupTask<'a> {
             })
             .collect();
         try_join_all(tasks).await?;
-        Ok(final_stats.into_inner().unwrap())
+        Ok(final_result.into_inner().unwrap())
     }
 
     // Retain manifests containing files referenced by descendant branches.
@@ -762,6 +1184,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         inspection: CleanupInspection,
         referenced_branches: &[(String, u64)],
+        removed_branch_manifests: &HashSet<Path>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(inspection);
         for (branch, root_version_number) in referenced_branches {
@@ -772,6 +1195,9 @@ impl<'a> CleanupTask<'a> {
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
+                .try_filter(|location| {
+                    future::ready(!removed_branch_manifests.contains(&location.path))
+                })
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
                         location,
@@ -798,13 +1224,14 @@ impl<'a> CleanupTask<'a> {
         let mut is_referenced = false;
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
                     if let Some(base_path) = base_path
                         && base_path.path == self.dataset.uri
                     {
-                        let full_data_path = self.dataset.data_dir().child(file.path.as_str());
+                        let full_data_path =
+                            self.dataset.data_dir().clone().join(file.path.as_str());
                         let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                         inspection
                             .verified_files
@@ -951,7 +1378,16 @@ impl CleanupPolicyBuilder {
     }
 
     /// Cleanup all versions except the last `n` versions of the dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `n` is zero.
     pub async fn retain_n_versions(mut self, dataset: &Dataset, n: usize) -> Result<Self> {
+        if n == 0 {
+            return Err(Error::invalid_input(format!(
+                "retain_versions must be greater than 0, got {n}"
+            )));
+        }
         let versions = dataset.versions().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
@@ -1019,8 +1455,7 @@ pub async fn cleanup_old_versions(
     dataset: &Dataset,
     policy: CleanupPolicy,
 ) -> Result<RemovalStats> {
-    let cleanup = CleanupTask::new(dataset, policy);
-    cleanup.run().await
+    CleanupOperation::new(dataset, policy).execute().await
 }
 
 /// If the dataset config has `lance.auto_cleanup` parameters set,
@@ -1047,11 +1482,35 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
+    Ok(
+        cleanup_cascade_branch_run(dataset, manifest, CleanupAction::Execute, HashSet::new())
+            .await?
+            .map(|result| result.stats),
+    )
+}
+
+async fn cleanup_cascade_branch_run(
+    dataset: &Dataset,
+    manifest: &Manifest,
+    action: CleanupAction,
+    ignored_manifests: HashSet<Path>,
+) -> Result<Option<CleanupRunResult>> {
     let policy = build_cleanup_policy(dataset, manifest).await?;
     if let Some(mut policy) = policy {
         policy.clean_referenced_branches = false;
         policy.error_if_tagged_old_versions = false;
-        Ok(Some(dataset.cleanup_with_policy(policy).await?))
+        if action.deletes_files() {
+            info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
+        }
+        let cleanup = CleanupTask::new_with_ignored_manifests(
+            dataset,
+            policy,
+            action,
+            ignored_manifests,
+            true,
+            false,
+        );
+        Ok(Some(cleanup.run().await?))
     } else {
         Ok(None)
     }
@@ -1180,8 +1639,10 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::index::DatasetIndexExt;
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::transaction::{Operation, Transaction},
+        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1193,7 +1654,7 @@ mod tests {
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -1201,6 +1662,8 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -1215,6 +1678,15 @@ mod tests {
             original: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+        }
+
+        // Injects behaviour into every request, so a listing must not go around it.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
         }
     }
 
@@ -1266,7 +1738,7 @@ mod tests {
     struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempStrDir,
+        tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
     }
@@ -1286,10 +1758,17 @@ mod tests {
             };
             let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
-                _tmpdir: tmpdir,
+                tmpdir,
                 dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
             })
+        }
+
+        fn local_index_dir(&self, uuid: Uuid) -> std::path::PathBuf {
+            std::path::Path::new(self.tmpdir.as_str())
+                .join("my_db")
+                .join(crate::dataset::INDICES_DIR)
+                .join(uuid.to_string())
         }
 
         fn os_params(&self) -> ObjectStoreParams {
@@ -1325,6 +1804,24 @@ mod tests {
 
         async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
+        }
+
+        // Auto-cleanup is disabled by default; this helper creates a dataset
+        // with auto-cleanup enabled using the default interval/older_than.
+        async fn create_some_data_with_auto_cleanup(&self) -> Result<()> {
+            Dataset::write(
+                some_batch(),
+                &self.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    auto_cleanup: Some(AutoCleanupParams::default()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+            Ok(())
         }
 
         async fn overwrite_some_data(&self) -> Result<()> {
@@ -1378,8 +1875,8 @@ mod tests {
             policy.set_before_policy(
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
-                    if op.contains("copy") {
-                        return Err(Error::internal("Copy blocked".to_string()));
+                    if op.contains("copy") || op.contains("rename") {
+                        return Err(Error::internal("Commit blocked".to_string()));
                     }
                     Ok(())
                 }),
@@ -1419,6 +1916,14 @@ mod tests {
         async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
             let db = self.open().await?;
             cleanup_old_versions(&db, policy).await
+        }
+
+        async fn explain_cleanup_with_policy(
+            &self,
+            policy: CleanupPolicy,
+        ) -> Result<CleanupExplanation> {
+            let db = self.open().await?;
+            db.cleanup(policy).explain().await
         }
 
         async fn run_cleanup_with_override(
@@ -1529,6 +2034,64 @@ mod tests {
         }
     }
 
+    async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        dataset
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store
+            .as_ref()
+            .put(&index_dir.clone().join("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    async fn write_dummy_staging_partial(
+        dataset: &Dataset,
+        staging_uuid: Uuid,
+        shard_uuid: Uuid,
+    ) -> Result<()> {
+        let shard_dir = dataset
+            .indices_dir()
+            .join(staging_uuid.to_string())
+            .join(format!("partial_{}", shard_uuid));
+        dataset
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("index.idx"), b"idx")
+            .await?;
+        dataset
+            .object_store
+            .as_ref()
+            .put(&shard_dir.clone().join("auxiliary.idx"), b"aux")
+            .await?;
+        Ok(())
+    }
+
+    fn dummy_index_metadata(
+        dataset: &Dataset,
+        field_id: i32,
+        uuid: Uuid,
+        fragment_bitmap: impl IntoIterator<Item = u32>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name: "some_index".to_string(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            dataset_version: dataset.version().version,
+            fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
+            index_details: None,
+            index_version: IndexType::Vector.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
     fn blob_v2_batch(blob_len: usize) -> Box<dyn RecordBatchReader + Send> {
         let mut blobs = BlobArrayBuilder::new(1);
         blobs.push_bytes(vec![0u8; blob_len]).unwrap();
@@ -1589,6 +2152,87 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_ignores_old_manifest_removed_after_listing() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let old_manifest = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .try_filter(|location| future::ready(location.version == 1))
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        dataset
+            .object_store
+            .delete(&old_manifest.path)
+            .await
+            .unwrap();
+
+        let cleanup = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        cleanup
+            .process_manifest_file(
+                old_manifest,
+                &Mutex::new(CleanupInspection::default()),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explain_cleanup_does_not_delete_files() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_seconds(1).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now())
+            .build();
+
+        let explanation = fixture
+            .explain_cleanup_with_policy(policy.clone())
+            .await
+            .unwrap();
+        let after_preview_count = fixture.count_files().await.unwrap();
+
+        // Files are not actually removed when explaining cleanup.
+        assert_eq!(before_count, after_preview_count);
+        assert_eq!(explanation.read_version, 2);
+        assert_eq!(explanation.stats.old_versions, 1);
+        assert_eq!(explanation.stats.data_files_removed, 1);
+        assert_eq!(explanation.stats.transaction_files_removed, 1);
+        assert_gt!(explanation.stats.bytes_removed, 0);
+        assert!(!explanation.candidate_files.is_empty());
+        assert!(!explanation.candidate_files_truncated);
+
+        // Running cleanup with the same policy should remove the same files the
+        // explanation reported for this unchanged dataset.
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+        let after_cleanup_count = fixture.count_files().await.unwrap();
+
+        assert_eq!(
+            removed.bytes_removed,
+            before_count.num_bytes - after_cleanup_count.num_bytes
+        );
+        assert_eq!(removed.old_versions, explanation.stats.old_versions);
+        assert_eq!(
+            removed.data_files_removed,
+            explanation.stats.data_files_removed
+        );
+        assert_eq!(removed.bytes_removed, explanation.stats.bytes_removed);
     }
 
     #[tokio::test]
@@ -1825,6 +2469,49 @@ mod tests {
         assert_eq!(removed.old_versions, 1);
     }
 
+    #[tokio::test]
+    async fn cleanup_deletes_data_files_newer_than_tagged_version() {
+        // A tag on an old version must not prevent cleanup from deleting data
+        // files that belong only to newer, untagged versions. The listing
+        // cutoff used to be the earliest retained manifest time; with a tag
+        // that pulled the cutoff backwards and skipped those newer files.
+        // After their manifests were removed they became permanent orphans
+        // (https://github.com/lance-format/lance/issues/8705).
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(2).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let dataset = *(fixture.open().await.unwrap());
+        dataset.tags().create("keep-v1", 1).await.unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_data_files, 3);
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let removed = fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                None,
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_data_files, 2);
+        assert_eq!(after_count.num_tx_files, 2);
+    }
+
     // Helper function to check that the number of files is correct.
     async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize) {
         let file_count = fixture.count_files().await.unwrap();
@@ -1846,7 +2533,7 @@ mod tests {
         // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        fixture.create_some_data().await.unwrap();
+        fixture.create_some_data_with_auto_cleanup().await.unwrap();
 
         let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
@@ -2160,6 +2847,147 @@ mod tests {
         assert_gt!(removed.deletion_files_removed, 0);
     }
 
+    /// A branch reaches its parent's files through `base_id`, and
+    /// `retain_branch_lineage_files` promotes those into the parent's keep set. An
+    /// overlay inherited that way must be promoted too, or the parent deletes a
+    /// file the branch still reads.
+    #[tokio::test]
+    async fn lineage_retention_covers_inherited_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // Give the parent an overlay, then branch from it: `shallow_clone` stamps
+        // the overlay's `base_id` so the branch resolves it against the parent.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let branch = fixture
+            .create_branch_and_load(&mut dataset, "child", (None, None))
+            .await
+            .unwrap();
+        let branch_fragments = branch.get_fragments();
+        let inherited = &branch_fragments[0].metadata().overlays[0].data_file;
+        assert!(
+            inherited.base_id.is_some(),
+            "the branch must reach the parent's overlay through base_id"
+        );
+
+        // The parent's cleanup walks the branch's manifest and must promote that
+        // overlay out of `verified_files`.
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        let inspection = task
+            .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
+            .await
+            .unwrap();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            inspection
+                .referenced_files
+                .data_paths
+                .contains(&overlay_path),
+            "the inherited overlay must be promoted into the parent's keep set"
+        );
+    }
+
+    /// A keep set built from `fragment.files` alone omits overlay data files, so
+    /// cleanup would delete live data.
+    #[tokio::test]
+    async fn keep_set_covers_referenced_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // The overlay file need not exist: the keep set comes from manifest
+        // metadata alone.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let kept: HashSet<&Path> = inspection
+            .referenced_files
+            .data_paths
+            .iter()
+            .chain(inspection.verified_files.data_paths.iter())
+            .collect();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            kept.contains(&overlay_path),
+            "the overlay's data file must be in the keep set, got {kept:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dont_clean_index_data_files() {
         // Indexes have .lance files in them that are not referenced
@@ -2182,6 +3010,365 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_removes_preexisting_empty_index_directories() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let stale_uuid = Uuid::new_v4();
+        let nested_stale_uuid = Uuid::new_v4();
+        let referenced_uuid = Uuid::new_v4();
+
+        std::fs::create_dir_all(fixture.local_index_dir(stale_uuid)).unwrap();
+        std::fs::create_dir_all(
+            fixture
+                .local_index_dir(nested_stale_uuid)
+                .join("empty_nested_dir"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(fixture.local_index_dir(referenced_uuid)).unwrap();
+
+        let referenced_index = dummy_index_metadata(&dataset, field_id, referenced_uuid, [0_u32]);
+        let create_index_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![referenced_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(create_index_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let in_progress_uuid = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, in_progress_uuid)
+            .await
+            .unwrap();
+        let in_progress_empty_dir = fixture
+            .local_index_dir(in_progress_uuid)
+            .join("empty_in_progress_dir");
+        std::fs::create_dir_all(&in_progress_empty_dir).unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 0);
+        assert!(!fixture.local_index_dir(stale_uuid).exists());
+        assert!(!fixture.local_index_dir(nested_stale_uuid).exists());
+        assert!(fixture.local_index_dir(referenced_uuid).exists());
+        assert!(fixture.local_index_dir(in_progress_uuid).exists());
+        assert!(in_progress_empty_dir.exists());
+    }
+
+    #[rstest]
+    #[case::default_policy(false, true)]
+    #[case::delete_unverified(true, false)]
+    #[tokio::test]
+    async fn cleanup_applies_unverified_policy_to_fresh_empty_index_directory(
+        #[case] delete_unverified: bool,
+        #[case] should_preserve: bool,
+    ) {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let in_progress_dir = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(&in_progress_dir).unwrap();
+
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(in_progress_dir.exists(), should_preserve);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_does_not_remove_empty_directory_through_index_symlink() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_empty_dir = outside.path().join("must_remain");
+        std::fs::create_dir_all(&outside_empty_dir).unwrap();
+
+        let link_path = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        fixture
+            .run_cleanup_with_override(utc_now(), Some(true), None)
+            .await
+            .unwrap();
+
+        assert!(outside_empty_dir.exists());
+        assert!(link_path.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+
+        let seg_a = Uuid::new_v4();
+        let seg_b = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_a).await.unwrap();
+        write_dummy_index_artifact(&dataset, seg_b).await.unwrap();
+
+        let index_a = dummy_index_metadata(&dataset, field_id, seg_a, [0_u32]);
+        let index_b = dummy_index_metadata(&dataset, field_id, seg_b, [1_u32]);
+        let initial_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_a.clone(), index_b.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(initial_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let seg_c = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, seg_c).await.unwrap();
+        let index_c = dummy_index_metadata(&dataset, field_id, seg_c, [2_u32]);
+        let replace_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_c.clone()],
+                removed_indices: vec![index_a.clone()],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(replace_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 2);
+        assert!(!fixture.local_index_dir(seg_a).exists());
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_a.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_b.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(seg_c.to_string())
+                        .join("index.idx")
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_recent_replaced_index_with_short_retention() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let old_uuid = Uuid::new_v4();
+        let current_uuid = Uuid::new_v4();
+
+        let old_index = dummy_index_metadata(&dataset, field_id, old_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![old_index.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_minutes(1).unwrap().to_std().unwrap());
+        let current_index = dummy_index_metadata(&dataset, field_id, current_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![current_index],
+                        removed_indices: vec![old_index],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Model index artifacts whose storage timestamp is newer than the retained
+        // manifest. UUID verification must not be hidden by the manifest cutoff.
+        MockClock::set_system_time(TimeDelta::try_minutes(2).unwrap().to_std().unwrap());
+        write_dummy_index_artifact(&dataset, old_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, current_uuid)
+            .await
+            .unwrap();
+
+        let short_retention = TimeDelta::try_seconds(30).unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - short_retention)
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 3);
+        assert_eq!(removed.index_files_removed, 2);
+
+        let old_index_file = dataset
+            .indices_dir()
+            .join(old_uuid.to_string())
+            .join("index.idx");
+        let current_index_file = dataset
+            .indices_dir()
+            .join(current_uuid.to_string())
+            .join("index.idx");
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(&old_index_file)
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(&current_index_file)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_uncommitted_index_artifacts() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let dataset = fixture.open().await.unwrap();
+        let staging_uuid = Uuid::new_v4();
+        let shard_uuid = Uuid::new_v4();
+        let built_segment_uuid = Uuid::new_v4();
+
+        write_dummy_staging_partial(&dataset, staging_uuid, shard_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, built_segment_uuid)
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.index_files_removed, 4);
+        assert!(!fixture.local_index_dir(staging_uuid).exists());
+        assert!(!fixture.local_index_dir(built_segment_uuid).exists());
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(staging_uuid.to_string())
+                        .join(format!("partial_{}", shard_uuid))
+                        .join("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .clone()
+                        .join(built_segment_uuid.to_string())
+                        .join("index.idx"),
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_failed_commit_data_file() {
         // We should clean up data files that are written but the commit failed
         // for whatever reason
@@ -2197,7 +3384,8 @@ mod tests {
         // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
-        assert_eq!(before_count.num_tx_files, 2);
+        // Only 1 txn file: the failed commit's txn file was already cleaned up.
+        assert_eq!(before_count.num_tx_files, 1);
 
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
@@ -2301,6 +3489,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_rejects_retain_zero_versions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let error = CleanupPolicyBuilder::default()
+            .retain_n_versions(&fixture.open().await.unwrap(), 0)
+            .await
+            .err()
+            .expect("retaining zero versions should return an error");
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("retain_versions must be greater than 0, got 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_and_retain_3_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -2332,16 +3540,27 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|version| version.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[tokio::test]
     async fn cleanup_before_ts_and_retain_n_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        let mut time = 1i64;
-        for _ in 0..4 {
+        for time in (1i64..).take(4) {
             MockClock::set_system_time(TimeDelta::try_days(time).unwrap().to_std().unwrap());
-            time += 1i64;
             fixture.overwrite_some_data().await.unwrap();
         }
 
@@ -2402,18 +3621,18 @@ mod tests {
                 .unwrap();
 
         // Create unmanaged directories/files under dataset root
-        let img = base.child("images").child("clip.mp4");
-        let misc = base.child("misc").child("notes.txt");
-        let branch_file = base.child("tree").child("branchA").child("data.bin");
+        let img = base.clone().join("images").join("clip.mp4");
+        let misc = base.clone().join("misc").join("notes.txt");
+        let branch_file = base.clone().join("tree").join("branchA").join("data.bin");
         os.put(&img, b"video").await.unwrap();
         os.put(&misc, b"notes").await.unwrap();
         os.put(&branch_file, b"branch").await.unwrap();
 
         // Create a temporary manifest file that should be cleaned
-        let tmp_manifest = base.child("_versions").child(".tmp").child("orphan");
+        let tmp_manifest = base.clone().join("_versions").join(".tmp").join("orphan");
         os.put(&tmp_manifest, b"tmp").await.unwrap();
         // Delete the _transactions directory so that we can test that if not_found err will be swallowed
-        os.remove_dir_all(base.child(TRANSACTIONS_DIR))
+        os.remove_dir_all(base.clone().join(TRANSACTIONS_DIR))
             .await
             .unwrap();
 
@@ -2642,8 +3861,9 @@ mod tests {
         // Create a full-text index (Inverted) on the "text" column once.
         // We only create this on main during dataset creation. Branches inherit the index configuration.
         async fn create_text_index(&mut self) -> Result<()> {
+            use crate::index::DatasetIndexExt;
+            use lance_index::IndexType;
             use lance_index::scalar::InvertedIndexParams;
-            use lance_index::{DatasetIndexExt, IndexType};
             let params = InvertedIndexParams::default();
             self.dataset
                 .create_index(&["text"], IndexType::Inverted, None, &params, true)
@@ -2660,7 +3880,7 @@ mod tests {
             // Optimize indices after write and delete
             use lance_index::optimize::OptimizeOptions;
             self.dataset
-                .optimize_indices(&OptimizeOptions::append())
+                .optimize_indices(&OptimizeOptions::merge(1))
                 .await?;
             Ok(())
         }
@@ -2737,7 +3957,7 @@ mod tests {
                 Ok(count)
             }
 
-            let manifest_dir = branch_path.child("_versions");
+            let manifest_dir = branch_path.clone().join("_versions");
             self.counts.num_manifest_files = count_dir(
                 &self.dataset.object_store,
                 &manifest_dir,
@@ -2747,20 +3967,20 @@ mod tests {
             .unwrap_or(0);
 
             // Transactions: count files under _transactions (extension .txn)
-            let txn_dir = branch_path.child("_transactions");
+            let txn_dir = branch_path.clone().join("_transactions");
             self.counts.num_tx_files =
                 count_dir(&self.dataset.object_store, &txn_dir, Some(&["txn"]))
                     .await
                     .unwrap_or(0);
 
             // Indices: count files under _indices
-            let idx_dir = branch_path.child(crate::dataset::INDICES_DIR);
+            let idx_dir = branch_path.clone().join(crate::dataset::INDICES_DIR);
             self.counts.num_index_files = count_dir(&self.dataset.object_store, &idx_dir, None)
                 .await
                 .unwrap_or(0);
 
             // Deletions: count files under _deletions (extensions .arrow / .bin)
-            let del_dir = branch_path.child("_deletions");
+            let del_dir = branch_path.clone().join("_deletions");
             self.counts.num_delete_files = count_dir(
                 &self.dataset.object_store,
                 &del_dir,
@@ -2770,7 +3990,7 @@ mod tests {
             .unwrap_or(0);
 
             // Data files: count .lance files under data/
-            let data_dir = branch_path.child(crate::dataset::DATA_DIR);
+            let data_dir = branch_path.clone().join(crate::dataset::DATA_DIR);
             self.counts.num_data_files =
                 count_dir(&self.dataset.object_store, &data_dir, Some(&["lance"]))
                     .await
@@ -2839,6 +4059,17 @@ mod tests {
             self.run_cleanup_inner(policy).await
         }
 
+        async fn explain_cleanup_with_referenced_branches(&mut self) -> Result<CleanupExplanation> {
+            let policy = CleanupPolicyBuilder::default()
+                .error_if_tagged_old_versions(false)
+                .clean_referenced_branches(true)
+                .retain_n_versions(&self.dataset, 1)
+                .await?
+                .build();
+            self.dataset.checkout_latest().await?;
+            self.dataset.cleanup(policy).explain().await
+        }
+
         async fn run_cleanup_inner(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
             let pre_count = self.count_data().await?;
             self.dataset.checkout_latest().await?;
@@ -2867,7 +4098,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 2);
-        assert_eq!(setup.branch1.counts.num_index_files, 23);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         setup.branch1.compact().await.unwrap();
@@ -2882,7 +4113,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 23);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         // Now we clean the referenced files of branch1 by branch2 and branch3
@@ -2896,14 +4127,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.branch1.run_cleanup().await.unwrap();
 
         // Only the latest manifest is retained.
@@ -2912,7 +4143,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
     }
 
@@ -2929,7 +4160,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -2945,7 +4176,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.compact().await.unwrap();
         setup.branch3.run_cleanup().await.unwrap();
@@ -2955,7 +4186,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -2968,7 +4199,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -2985,7 +4216,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 2);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 2);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3005,7 +4236,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 17);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
@@ -3015,7 +4246,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.run_cleanup().await.unwrap();
@@ -3029,7 +4260,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 17);
+        assert_eq!(setup.main.counts.num_index_files, 14);
     }
 
     #[tokio::test]
@@ -3054,7 +4285,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 30);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3065,7 +4296,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 30);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.branch1.write_data().await.unwrap();
@@ -3086,14 +4317,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 29);
+        assert_eq!(setup.branch2.counts.num_index_files, 14);
         setup.branch1.run_cleanup().await.unwrap();
         // Cleanup 4 index files referenced from branch2
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch3 holds references from main:
@@ -3109,7 +4340,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3119,7 +4350,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
@@ -3127,7 +4358,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         // Cleanup doesn't take effect if we don't clean branch2 first
         setup.branch1.run_cleanup().await.unwrap();
@@ -3135,7 +4366,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3144,7 +4375,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch1.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3153,7 +4384,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch4 holds references from main:
@@ -3165,7 +4396,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.write_data().await.unwrap();
         setup.branch4.compact().await.unwrap();
@@ -3176,7 +4407,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3185,7 +4416,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -3209,7 +4440,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // After auto-clean: branch3
         // 2 appends produced 2 data files
         // 2 deletes produced 2 deletion files
@@ -3217,7 +4448,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3239,14 +4470,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3276,7 +4507,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.main.compact().await.unwrap();
         setup
@@ -3296,7 +4527,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.branch4.compact().await.unwrap();
         setup
@@ -3313,13 +4544,13 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.branch1.write_data().await.unwrap();
         setup.branch1.compact().await.unwrap();
@@ -3337,7 +4568,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 and branch2 still hold references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3346,7 +4577,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.write_data().await.unwrap();
         setup.branch2.compact().await.unwrap();
@@ -3364,7 +4595,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 still holds references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3373,7 +4604,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         // Branch3 still holds references from branch2:
         // - 1 manifest file
         // - 1 data files
@@ -3382,7 +4613,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3400,23 +4631,91 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.assert_unchanged(&["branch4"]).await;
+    }
+
+    #[tokio::test]
+    async fn explain_cleanup_with_referenced_branches_matches_cleanup() {
+        let mut setup = build_lineage_datasets().await.unwrap();
+
+        setup.enable_auto_cleanup().await.unwrap();
+        setup.main.write_data().await.unwrap();
+        setup.main.compact().await.unwrap();
+        setup.branch4.compact().await.unwrap();
+        setup.branch1.write_data().await.unwrap();
+        setup.branch1.compact().await.unwrap();
+        setup.branch2.write_data().await.unwrap();
+        setup.branch2.compact().await.unwrap();
+        setup.branch3.write_data().await.unwrap();
+        setup.branch3.compact().await.unwrap();
+
+        setup.main.refresh().await.unwrap();
+        setup.branch1.refresh().await.unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        let main_counts_before = setup.main.counts;
+        let branch1_counts_before = setup.branch1.counts;
+        let branch2_counts_before = setup.branch2.counts;
+        let branch3_counts_before = setup.branch3.counts;
+        let branch4_counts_before = setup.branch4.counts;
+
+        let explanation = setup
+            .main
+            .explain_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+
+        setup.main.refresh().await.unwrap();
+        setup.branch1.refresh().await.unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        assert_eq!(setup.main.counts, main_counts_before);
+        assert_eq!(setup.branch1.counts, branch1_counts_before);
+        assert_eq!(setup.branch2.counts, branch2_counts_before);
+        assert_eq!(setup.branch3.counts, branch3_counts_before);
+        assert_eq!(setup.branch4.counts, branch4_counts_before);
+
+        let removed = setup
+            .main
+            .run_cleanup_with_referenced_branches()
+            .await
+            .unwrap();
+
+        assert!(!explanation.referenced_branches.is_empty());
+        assert!(
+            explanation
+                .referenced_branches
+                .iter()
+                .any(|branch| branch.cleanup_candidate)
+        );
+        assert_eq!(explanation.stats, removed);
+        setup.branch1.refresh().await.unwrap();
+        setup.branch2.refresh().await.unwrap();
+        setup.branch3.refresh().await.unwrap();
+        setup.branch4.refresh().await.unwrap();
+        assert_eq!(setup.main.counts.num_manifest_files, 1);
+        assert_eq!(setup.branch1.counts.num_manifest_files, 1);
+        assert_eq!(setup.branch2.counts.num_manifest_files, 1);
+        assert_eq!(setup.branch3.counts.num_manifest_files, 1);
+        assert_eq!(setup.branch4.counts.num_manifest_files, 1);
     }
 
     #[tokio::test]
@@ -3459,24 +4758,24 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 20);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup
             .branch3
@@ -3499,27 +4798,27 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 20);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 10);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
@@ -3535,22 +4834,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 10);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
     }
 
     #[test]

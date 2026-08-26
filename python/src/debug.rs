@@ -61,8 +61,8 @@ impl PrettyPrintableFragment {
                 let schema = schema.project_by_ids(&file.fields, false);
                 PrettyPrintableDataFile {
                     path: file.path.clone(),
-                    fields: file.fields.clone(),
-                    column_indices: file.column_indices.clone(),
+                    fields: file.fields.to_vec(),
+                    column_indices: file.column_indices.to_vec(),
                     schema,
                     major_version: file.file_major_version,
                     minor_version: file.file_minor_version,

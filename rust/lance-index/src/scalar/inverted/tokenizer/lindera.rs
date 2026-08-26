@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use lance_core::{Error, Result};
-use lindera_tantivy::tokenizer::LinderaTokenizer;
+use lance_tokenizer::{LinderaTokenizer, TextAnalyzerBuilder};
 
 pub const LINDERA_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.yml";
 
@@ -22,7 +22,7 @@ pub trait LinderaTokenizerBuilder: Sized {
 
     fn new(config_path: &Path) -> Result<Self>;
 
-    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
+    fn build(&self) -> Result<TextAnalyzerBuilder>;
 }
 
 pub struct LinderaBuilder {
@@ -36,7 +36,7 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
         })
     }
 
-    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    fn build(&self) -> Result<TextAnalyzerBuilder> {
         let tokenizer = if self.config_path.exists() {
             match LinderaTokenizer::from_file(&self.config_path) {
                 Ok(tok) => tok,
@@ -56,6 +56,6 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
             LinderaTokenizer::new()
                 .map_err(|e| Error::io(format!("Failed to initialize default tokenizer: {}", e)))?
         };
-        Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
+        Ok(tokenizer.analyzer_builder())
     }
 }

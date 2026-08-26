@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 
 use lance_core::Result;
 
+mod array_encoding;
 pub mod buffer;
 pub mod compression;
 pub mod compression_config;
@@ -17,13 +18,11 @@ pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
-pub mod previous;
 pub mod repdef;
 pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;
-pub mod version;
 
 // We can definitely add support for big-endian machines someday.  However, it's not a priority and
 // would involve extensive testing (probably through emulation) to ensure that the encodings are
@@ -74,6 +73,33 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
         self.submit_request(vec![range], priority)
             .map_ok(|mut v| v.pop().unwrap())
             .boxed()
+    }
+
+    /// Returns a version of this I/O service that bypasses backpressure for all requests.
+    ///
+    /// This is intended for indirect I/O (e.g. fetching items after decoding offsets) where
+    /// blocking on backpressure could cause deadlocks or excessive latency.
+    ///
+    /// Returns `None` if this implementation does not support bypass (e.g. in-memory or test
+    /// schedulers), in which case the caller should fall back to using self.
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
+
+    /// Returns a version of this I/O service that additionally records the I/O it
+    /// performs into `stats`, on top of any global accounting.  This is the seam
+    /// used to measure exact per-scope (e.g. per-query) I/O without re-opening
+    /// files: wrap a reader's I/O service, perform the reads, then inspect the
+    /// recorder.
+    ///
+    /// Returns `None` if this implementation does not support per-scope I/O
+    /// statistics (e.g. in-memory or test schedulers), in which case the caller
+    /// should fall back to using self (and no statistics are recorded).
+    fn with_io_stats(
+        &self,
+        _stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Option<Arc<dyn EncodingsIo>> {
+        None
     }
 }
 

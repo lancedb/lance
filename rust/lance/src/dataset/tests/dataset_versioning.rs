@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -14,13 +15,18 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use mock_instant::thread_local::MockClock;
+use tokio::sync::Barrier;
 
 use crate::dataset::refs::branch_contents_path;
+use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
 use object_store::path::Path;
@@ -33,6 +39,8 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         .read_dir()
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        // Ignore the version hint file, which is not a manifest.
+        .filter(|name| !name.starts_with("latest_version_hint"))
         .collect::<Vec<_>>();
     assert!(
         entries_names
@@ -41,6 +49,23 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
+}
+
+#[tokio::test]
+async fn test_list_manifest_locations_rejects_explicit_refs() {
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+    let builders = [
+        DatasetBuilder::from_uri(test_uri).with_version(1),
+        DatasetBuilder::from_uri(test_uri).with_branch("dev", None),
+        DatasetBuilder::from_uri(test_uri).with_tag("release"),
+    ];
+
+    for builder in builders {
+        let err = builder.list_manifest_locations().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("does not support an explicit"));
+    }
 }
 
 #[tokio::test]
@@ -161,6 +186,212 @@ async fn test_strict_overwrite() {
         .expect("Unstrict overwrite should succeed when committing to a stale version");
 }
 
+#[tokio::test]
+async fn test_version_id_fast_path() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+    let original = Dataset::write(reader, &test_uri, None).await.unwrap();
+    assert_eq!(original.version_id(), 1);
+    assert_eq!(original.version_id(), original.version().version);
+    assert_eq!(original.latest_version_id().await.unwrap(), 1);
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.version_id(), 2);
+    assert_eq!(updated.version_id(), updated.version().version);
+    assert_eq!(updated.latest_version_id().await.unwrap(), 2);
+
+    let historical = updated.checkout_version(1).await.unwrap();
+    assert_eq!(historical.version_id(), 1);
+    assert_eq!(historical.version_id(), historical.version().version);
+    assert_eq!(historical.latest_version_id().await.unwrap(), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_stale_checks_cover_fast_successor_and_latest_version(
+    #[values(false, true)] enable_v2_manifest_paths: bool,
+) {
+    let expected_scheme = if enable_v2_manifest_paths {
+        ManifestNamingScheme::V2
+    } else {
+        ManifestNamingScheme::V1
+    };
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+    let original = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(original.manifest_location().naming_scheme, expected_scheme);
+    assert!(!original.is_stale().await.unwrap());
+    assert!(!original.has_successor_version().await.unwrap());
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(original.is_stale().await.unwrap());
+    assert!(original.has_successor_version().await.unwrap());
+    assert_eq!(updated.manifest_location().naming_scheme, expected_scheme);
+    assert!(!updated.is_stale().await.unwrap());
+    assert!(!updated.has_successor_version().await.unwrap());
+
+    let historical = updated.checkout_version(1).await.unwrap();
+    assert_eq!(
+        historical.manifest_location().naming_scheme,
+        expected_scheme
+    );
+    assert!(historical.is_stale().await.unwrap());
+    assert!(historical.has_successor_version().await.unwrap());
+}
+
+/// All row ids visible in `dataset`, in scan order.
+async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .with_row_id()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch["_rowid"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+fn u32_batch(values: std::ops::Range<u32>) -> RecordBatch {
+    arrow_array::record_batch!(("i", UInt32, values.collect::<Vec<u32>>())).unwrap()
+}
+
+/// Restoring past activation would turn stable row ids off, putting row
+/// addresses back into a namespace this table has already issued ids from.
+#[tokio::test]
+async fn test_restore_rejects_crossing_stable_id_activation() {
+    let test_uri = TempStrDir::default();
+    let batch = u32_batch(0..10);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        test_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    let mut restored = dataset.checkout_version(1).await.unwrap();
+    let err = restored.restore().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("stable row ids were enabled after"),
+        "{err}"
+    );
+}
+
+/// A restore must not rewind the row-id high-water mark, or the next append reuses old ids.
+#[tokio::test]
+async fn test_restore_preserves_row_id_high_water_mark() {
+    let test_uri = TempStrDir::default();
+    let write = |values: std::ops::Range<u32>, mode| {
+        let uri = test_uri.as_str().to_string();
+        async move {
+            let batch = u32_batch(values);
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    write(0..10, WriteMode::Create).await;
+    let appended = write(10..20, WriteMode::Append).await;
+    let mark = appended.manifest.next_row_id;
+
+    let mut restored = appended.checkout_version(1).await.unwrap();
+    restored.restore().await.unwrap();
+    assert!(
+        restored.manifest.next_row_id >= mark,
+        "restore rewound the row id high-water mark: {} < {mark}",
+        restored.manifest.next_row_id
+    );
+
+    // The rows appended after the restore must not reuse the dropped rows' ids.
+    let reused = write(20..30, WriteMode::Append).await;
+    let ids = scan_row_ids(&reused).await;
+    assert_eq!(
+        ids.iter().filter(|id| **id >= mark).count(),
+        10,
+        "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_restore(
@@ -277,7 +508,12 @@ async fn test_tag(
         "Ref not found error: tag tag1 does not exist"
     );
 
+    MockClock::set_system_time(std::time::Duration::from_secs(1));
     dataset.tags().create("tag1", 1).await.unwrap();
+    let mut tag_map = dataset.tags().list().await.unwrap();
+    let tag1_meta = tag_map.remove("tag1").unwrap();
+    assert_eq!(tag1_meta.created_at, tag1_meta.updated_at);
+    assert!(tag1_meta.created_at.is_some());
 
     assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
 
@@ -358,13 +594,81 @@ async fn test_tag(
         "Version not found error: version main:3 does not exist"
     );
 
+    let tag1_before_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(2));
     dataset.tags().update("tag1", 2).await.unwrap();
+    let tag1_after_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(tag1_after_update.created_at, tag1_before_update.created_at);
+    assert!(tag1_after_update.updated_at > tag1_before_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 2);
 
+    let tag1_before_second_update = dataset.tags().get("tag1").await.unwrap();
+    MockClock::set_system_time(std::time::Duration::from_secs(3));
     dataset.tags().update("tag1", 1).await.unwrap();
+    let tag1_after_second_update = dataset.tags().get("tag1").await.unwrap();
+    assert_eq!(
+        tag1_after_second_update.created_at,
+        tag1_before_second_update.created_at
+    );
+    assert!(tag1_after_second_update.updated_at > tag1_before_second_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
+}
+
+#[tokio::test]
+async fn test_concurrent_tag_creation_conflict() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data)], schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.delete("i >= 5").await.unwrap();
+
+    let dataset = Arc::new(dataset);
+    let concurrency = 32;
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let handles = (0..concurrency)
+        .map(|attempt| {
+            let dataset = dataset.clone();
+            let barrier = barrier.clone();
+            let version = (attempt % 2 + 1) as u64;
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (version, dataset.tags().create("race", version).await)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut successful_version = None;
+    let mut conflicts = 0;
+    for handle in handles {
+        let (version, result) = handle.await.unwrap();
+        match result {
+            Ok(()) => successful_version = Some(version),
+            Err(Error::RefConflict { .. }) => conflicts += 1,
+            Err(error) => panic!("unexpected tag creation error: {error}"),
+        }
+    }
+
+    assert_eq!(conflicts, concurrency - 1);
+    assert_eq!(
+        dataset.tags().get_version("race").await.unwrap(),
+        successful_version.unwrap()
+    );
 }
 
 #[rstest]
@@ -498,6 +802,235 @@ async fn test_fragment_id_never_reset() {
 }
 
 #[tokio::test]
+async fn test_overwrite_does_not_reuse_fragment_ids() {
+    // An overwrite replaces every fragment, but the ids it hands out must still
+    // continue from the dataset's high water mark: an id that named one set of
+    // rows must never name another.
+    let test_dir = TempStrDir::default();
+    let write = |mode: WriteMode, rows: u64| {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+        let params = WriteParams {
+            mode,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        Dataset::write(reader, test_dir.as_str(), Some(params))
+    };
+    let fragment_ids = |dataset: &Dataset| {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id())
+            .collect::<Vec<_>>()
+    };
+
+    let dataset = write(WriteMode::Create, 30).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2]);
+
+    let dataset = write(WriteMode::Overwrite, 20).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![3, 4]);
+    assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+
+    let dataset = write(WriteMode::Append, 10).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![3, 4, 5]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_overwrite_rejects_fragment_with_deletion_file(
+    // Every form of the operation must be rejected: upserting config alongside
+    // the overwrite does not make renumbering the fragment any safer.
+    #[values(None, Some(HashMap::from([("key".to_string(), "value".to_string())])))]
+    config_upsert_values: Option<HashMap<String, String>>,
+) {
+    // A deletion file's path embeds the fragment id, so it cannot follow its
+    // fragment to the fresh id an overwrite assigns. Such a fragment belongs to
+    // the dataset being replaced, so the operation is rejected rather than
+    // silently losing the deletions.
+    let test_dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+        .await
+        .unwrap();
+    dataset.delete("i < 3").await.unwrap();
+
+    let fragment = dataset.manifest.fragments[0].clone();
+    assert!(fragment.deletion_file.is_some());
+    let schema = dataset.schema().clone();
+    let read_version = dataset.manifest.version;
+
+    let err = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Overwrite {
+                fragments: vec![fragment],
+                schema,
+                config_upsert_values,
+                initial_bases: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected invalid input, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("must be newly written"),
+        "unexpected message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_rejects_duplicate_fragment_ids() {
+    // Append honors an id a fragment arrives with, so a caller can still hand in
+    // one that an existing fragment already uses. Committing that would leave two
+    // fragments sharing everything keyed by the id.
+    let test_dir = TempStrDir::default();
+    let write = |mode: WriteMode| {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let params = WriteParams {
+            mode,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        Dataset::write(reader, test_dir.as_str(), Some(params))
+    };
+    let dataset = write(WriteMode::Create).await.unwrap();
+    let existing = dataset.manifest.fragments[1].clone();
+    assert_eq!(existing.id, 1);
+
+    let err = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            1,
+            Operation::Append {
+                fragments: vec![existing],
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("two fragments with id 1"),
+        "unexpected message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_on_dataset_with_mixed_file_versions() {
+    // A v0.16 dataset that has both v1 and v2 files also has two fragments with
+    // id 1, because the id allocation of that era could hand out an id a caller
+    // had already supplied. The mixture is the more actionable diagnosis, so the
+    // duplicate check must not preempt it.
+    let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let ids = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|f| f.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![0, 1, 1, 2]);
+
+    let err = dataset.delete("false").await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("The dataset contains a mixture of file versions"),
+        "unexpected message: {err}"
+    );
+}
+
+/// create_branch and shallow_clone must read the SOURCE ref's chain, not the
+/// receiver's. Both chains get a version 2 with diverged row counts so a clone
+/// that wrongly resolves the version under the receiver succeeds silently with
+/// the wrong data.
+#[tokio::test]
+async fn test_create_branch_and_shallow_clone_from_other_branch() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+
+    let gen_rows = |start: i32, rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<Int32Type>(start, 1))
+            .into_reader_rows(RowCount::from(rows), BatchCount::from(1))
+    };
+    let write = |uri: String, start: i32, rows: u64, mode: WriteMode| async move {
+        Dataset::write(
+            gen_rows(start, rows),
+            uri.as_str(),
+            Some(WriteParams {
+                mode,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    };
+
+    // main v1: 50 rows.
+    let mut main_ds = write(test_uri.clone(), 0, 50, WriteMode::Create).await;
+    // dev: forked at v1, appended 30 rows -> dev v2 has 80 rows.
+    let dev_ds = main_ds.create_branch("dev", 1, None).await.unwrap();
+    write(dev_ds.uri().to_string(), 1000, 30, WriteMode::Append).await;
+    // Diverge main to the same version number with a different row count.
+    let mut main_ds = write(test_uri.clone(), 5000, 10, WriteMode::Append).await; // main v2: 60 rows
+
+    // Cross-source create_branch: receiver is main, source is dev.
+    let child_ds = main_ds
+        .create_branch("child", ("dev", 2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        child_ds.count_rows(None).await.unwrap(),
+        80,
+        "child must clone dev@2, not main@2"
+    );
+
+    // Cross-source shallow_clone: same rule.
+    let clone_uri = format!("{}_clone", test_uri);
+    let cloned_ds = main_ds
+        .shallow_clone(&clone_uri, ("dev", 2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        cloned_ds.count_rows(None).await.unwrap(),
+        80,
+        "shallow clone must read dev@2, not main@2"
+    );
+}
+
+#[tokio::test]
+async fn test_cannot_delete_branch_referenced_by_tag() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let branch = dataset
+        .create_branch("dev", /*version=*/ 1, /*store_params=*/ None)
+        .await
+        .unwrap();
+    dataset
+        .tags()
+        .create("keep-dev", ("dev", branch.version().version))
+        .await
+        .unwrap();
+
+    let error = dataset.delete_branch("dev").await.unwrap_err();
+    assert!(matches!(&error, Error::RefConflict { .. }));
+    assert!(error.to_string().contains("keep-dev"));
+    dataset.checkout_version("keep-dev").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -623,12 +1156,39 @@ async fn test_branch() {
     let (main_rows, _) = collect_rows(&main_dataset).await;
     assert_eq!(main_rows, 50); // only batch1
     assert_eq!(main_dataset.version().version, 1);
+    let main_versions = main_dataset.version_refs().await.unwrap();
+    assert_eq!(
+        main_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        main_dataset.latest_version_id().await.unwrap(),
+        main_versions.last().unwrap().version
+    );
 
     // branch1 has data 1 + 2 (80 rows)
     let updated_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
     let (branch1_rows, _) = collect_rows(&updated_branch1).await;
     assert_eq!(branch1_rows, 80); // batch1+batch2
     assert_eq!(updated_branch1.version().version, 2);
+    let _ = updated_branch1.object_store.as_ref().io_stats_incremental();
+    let branch1_versions = updated_branch1.version_refs().await.unwrap();
+    let io_stats = updated_branch1.object_store.as_ref().io_stats_incremental();
+    assert_eq!(io_stats.read_bytes, 0);
+    assert_eq!(
+        branch1_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        updated_branch1.latest_version_id().await.unwrap(),
+        branch1_versions.last().unwrap().version
+    );
 
     // branch2 has data 1 + 2 + 3 (100 rows)
     let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();
@@ -729,6 +1289,86 @@ async fn test_branch() {
         "branch1"
     );
 
+    // Opening at a branch-pointing tag through the builder must check out the
+    // tag's branch chain, not main's chain at the tag's version number.
+    let tag_open = DatasetBuilder::from_uri(&test_uri)
+        .with_tag("tag1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(tag_open.manifest.branch.as_deref(), Some("dev/branch2"));
+    assert_eq!(tag_open.version().version, 3);
+    assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
+
+    // Malformed branch names are rejected at the boundary
+    for bad_name in ["", "branch1/"] {
+        let err = main_dataset
+            .checkout_version((Some(bad_name), None::<u64>))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRef { .. }),
+            "checkout of {:?} must be rejected as InvalidRef, got: {}",
+            bad_name,
+            err
+        );
+        let err = DatasetBuilder::from_uri(&test_uri)
+            .with_branch(bad_name, None)
+            .load()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRef { .. }),
+            "open of {:?} must be rejected as InvalidRef, got: {}",
+            bad_name,
+            err
+        );
+    }
+
+    // "main" stays a valid spelling of the main branch on checkout; the JNI
+    // bindings construct Ref::Version(Some("main"), _) directly.
+    let main_by_name = checkout_branch1.checkout_branch("main").await.unwrap();
+    assert_eq!(main_by_name.manifest.branch, None);
+    assert_eq!(main_by_name.version().version, 1);
+    let main_by_ref = checkout_branch1
+        .checkout_version(crate::dataset::refs::Ref::Version(
+            Some("main".to_string()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(main_by_ref.manifest.branch, None);
+
+    // A checkout whose resolved manifest is not on the requested branch must
+    // error loudly instead of handing back another branch's data: stage main's
+    // manifest under a branch path that was never created, so resolution finds
+    // a manifest belonging to main.
+    use object_store::ObjectStoreExt as _;
+    let staged_manifest = main_dataset.manifest_location().path.clone();
+    let staged_copy = Path::parse(format!(
+        "{}/tree/ghost/_versions/{}",
+        test_uri,
+        staged_manifest.filename().unwrap()
+    ))
+    .unwrap();
+    main_dataset
+        .object_store
+        .inner
+        .copy(&staged_manifest, &staged_copy)
+        .await
+        .unwrap();
+    let err = main_dataset.checkout_branch("ghost").await.unwrap_err();
+    assert!(
+        err.to_string().contains("resolved a manifest belonging to"),
+        "expected the branch-mismatch guardrail, got: {}",
+        err
+    );
+    main_dataset
+        .object_store
+        .remove_dir_all(Path::parse(format!("{}/tree/ghost", test_uri)).unwrap())
+        .await
+        .unwrap();
+
     let mut dataset = main_dataset;
     // Finally delete all branches
     assert!(matches!(
@@ -748,6 +1388,7 @@ async fn test_branch() {
     let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
+    dataset.tags().delete("tag1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 
@@ -759,7 +1400,7 @@ async fn test_branch() {
     let test_path = tempdir.obj_path();
     let branches = dataset
         .object_store
-        .read_dir(test_path.child("tree"))
+        .read_dir(test_path.clone().join("tree"))
         .await
         .unwrap();
     assert!(branches.is_empty());

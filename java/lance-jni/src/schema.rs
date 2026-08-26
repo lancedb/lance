@@ -46,8 +46,9 @@ pub fn convert_to_java_field<'local>(
         + "Lorg/apache/arrow/vector/types/pojo/ArrowType;"
         + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
         + "Ljava/util/Map;"
-        + "Ljava/util/List;ZI)V";
+        + "Ljava/util/List;ZIZI)V";
     let pk_position = lance_field.unenforced_primary_key_position.unwrap_or(0) as jint;
+    let ck_position = lance_field.unenforced_clustering_key_position.unwrap_or(0) as jint;
     let field_obj = env.new_object(
         "org/lance/schema/LanceField",
         ctor_sig.as_str(),
@@ -63,6 +64,8 @@ pub fn convert_to_java_field<'local>(
             JValue::Object(&children),
             JValue::Bool(lance_field.is_unenforced_primary_key() as jboolean),
             JValue::Int(pk_position),
+            JValue::Bool(lance_field.is_unenforced_clustering_key() as jboolean),
+            JValue::Int(ck_position),
         ],
     )?;
 

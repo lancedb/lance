@@ -24,7 +24,7 @@ from tqdm.auto import tqdm  # optional for progress tracking
 
 tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
-dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', streaming=True)['train']
+dataset = load_dataset('Salesforce/wikitext', 'wikitext-103-raw-v1', streaming=True)['train']
 dataset = dataset.shuffle(seed=1337)
 ```
 

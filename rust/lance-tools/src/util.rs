@@ -35,7 +35,7 @@ pub(crate) async fn get_object_store_and_path(source: &String) -> Result<(Arc<Ob
             &object_store_params,
         )
         .await?;
-        let child_path = dir_path.child(filename);
+        let child_path = dir_path.clone().join(filename);
         return Ok((object_store, child_path));
     }
     let path = Path::from_filesystem_path(source)?;

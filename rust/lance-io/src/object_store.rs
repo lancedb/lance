@@ -3,7 +3,8 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -13,32 +14,59 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream};
 use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
 use object_store::DynObjectStore;
-use object_store::Error as ObjectStoreError;
+use object_store::ObjectStoreExt as OSObjectStoreExt;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
+use object_store::list::PaginatedListStore;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
+    path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+#[cfg(target_os = "linux")]
+use crate::uring::{UringCurrentThreadReader, UringReader};
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) mod dynamic_credentials;
+#[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
+pub(crate) mod dynamic_opendal;
 mod list_retry;
+#[cfg(feature = "metrics")]
+pub mod metrics;
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+    feature = "goosefs",
+))]
+pub(crate) mod opendal_store;
 pub mod providers;
+pub(crate) mod read_dir;
 pub mod storage_options;
+#[cfg(test)]
+pub(crate) mod test_utils;
+pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
-use crate::traits::Writer;
+use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -52,7 +80,16 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+    feature = "goosefs",
+))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
@@ -64,9 +101,12 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use read_dir::ReadDirOptions;
 pub use storage_options::{
-    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
-    StorageOptionsAccessor, StorageOptionsProvider,
+    BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+    LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY, StorageOptionsAccessor,
+    StorageOptionsProvider, has_base_scoped_options, parse_base_scoped_key,
+    resolve_base_scoped_options,
 };
 
 #[async_trait]
@@ -82,6 +122,11 @@ pub trait ObjectStoreExt {
         dir_path: impl Into<&'b Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> BoxStream<'a, Result<ObjectMeta>>;
+}
+
+#[async_trait]
+pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
 }
 
 #[async_trait]
@@ -111,10 +156,12 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 }
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // Provider-owned native directory operations for rooted local stores.
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -133,10 +180,35 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// The backend's paginated listing API, when it has one. `None` means
+    /// [`Self::read_dir_page`] has to list a directory in full to page through it.
+    pub(crate) paginated_lister: Option<Arc<dyn PaginatedListStore>>,
+}
+
+// Hand-written because `PaginatedListStore` is not `Debug`.
+impl std::fmt::Debug for ObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStore")
+            .field("inner", &self.inner)
+            .field("scheme", &self.scheme)
+            .field("block_size", &self.block_size)
+            .field("max_iop_size", &self.max_iop_size)
+            .field(
+                "use_constant_size_upload_parts",
+                &self.use_constant_size_upload_parts,
+            )
+            .field("list_is_lexically_ordered", &self.list_is_lexically_ordered)
+            .field("io_parallelism", &self.io_parallelism)
+            .field("download_retry_count", &self.download_retry_count)
+            .field("io_tracker", &self.io_tracker)
+            .field("store_prefix", &self.store_prefix)
+            .field("paginated_lister", &self.paginated_lister.is_some())
+            .finish()
+    }
 }
 
 impl DeepSizeOf for ObjectStore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We aren't counting `inner` here which is problematic but an ObjectStore
         // shouldn't be too big.  The only exception might be the write cache but, if
         // the writer cache has data, it means we're using it somewhere else that isn't
@@ -157,6 +229,34 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Wrap the paginated listing API that goes with the store, if it has one.
+    ///
+    /// [`ObjectStore::read_dir_page`] pushes the page size and the resume position into
+    /// [`PaginatedListStore`], which is a separate trait from [`OSObjectStore`] and so cannot
+    /// be reached through the store [`Self::wrap`] returns. A listing that is pushed down
+    /// therefore does not pass through [`Self::wrap`], and this is where a wrapper says what
+    /// should happen instead:
+    ///
+    /// - `Some(lister)` keeps the pushdown, wrapping the lister or handing back the one
+    ///   given. Right for a wrapper that observes rather than intercepts — metering, caching,
+    ///   mirroring writes.
+    /// - `None` gives up the pushdown, so listings go through [`Self::wrap`] as a full
+    ///   directory read. Right for a wrapper that hides, rewrites or fails paths, which a
+    ///   pushed-down listing would otherwise walk straight past.
+    ///
+    /// A wrapper that keeps the pushdown must leave the listing itself alone: setting
+    /// [`offset`](object_store::list::PaginatedListOptions::offset) or changing the delimiter
+    /// breaks paging, since `read_dir_page` reads one directory level and resumes by the token
+    /// it got back.
+    ///
+    /// There is deliberately no default: getting this wrong is either a silent loss of speed
+    /// or a silent loss of the wrapper, and neither announces itself.
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>>;
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +279,18 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    // One wrapper giving up the pushdown gives it up for the chain: the listing has to go
+    // through `wrap`, which is every wrapper in the chain at once.
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        self.wrappers.iter().try_fold(original, |acc, wrapper| {
+            wrapper.wrap_paginated(store_prefix, acc)
+        })
     }
 }
 
@@ -240,6 +352,33 @@ impl ObjectStoreParams {
             .as_ref()
             .and_then(|a| a.initial_storage_options())
     }
+
+    /// Resolve these params for a single base path scope.
+    ///
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// apply only to one registered base path; see
+    /// [`StorageOptionsAccessor::scoped_to_base`]. Returns the params unchanged
+    /// when the storage options contain no base-scoped entries.
+    pub fn scoped_to_base(&self, base_id: Option<u32>) -> Cow<'_, Self> {
+        let Some(accessor) = &self.storage_options_accessor else {
+            return Cow::Borrowed(self);
+        };
+        let scoped = accessor.scoped_to_base(base_id);
+        if Arc::ptr_eq(&scoped, accessor) {
+            Cow::Borrowed(self)
+        } else {
+            Cow::Owned(Self {
+                storage_options_accessor: Some(scoped),
+                ..self.clone()
+            })
+        }
+    }
+}
+
+fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
+    // Trait object pointers include vtable metadata, which is not stable across codegen units.
+    // Cache identity must follow the Arc allocation instead.
+    Arc::as_ptr(wrapper) as *const ()
 }
 
 // We implement hash for caching
@@ -258,7 +397,7 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(aws_credentials).hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            Arc::as_ptr(wrapper).hash(state);
+            wrapper_allocation_ptr(wrapper).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -290,8 +429,14 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
-                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self
+                .object_store_wrapper
+                .as_ref()
+                .map(wrapper_allocation_ptr)
+                == other
+                    .object_store_wrapper
+                    .as_ref()
+                    .map(wrapper_allocation_ptr)
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -439,21 +584,47 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, true).await
+    }
+
+    /// Parse a URI and build a fresh object store outside the registry cache.
+    ///
+    /// The caller must retain the returned store for as long as its
+    /// provider-local state should be reused.
+    #[doc(hidden)]
+    pub async fn from_uri_and_params_uncached(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+    ) -> Result<(Arc<Self>, Path)> {
+        Self::from_uri_and_params_impl(registry, uri, params, false).await
+    }
+
+    async fn from_uri_and_params_impl(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        params: &ObjectStoreParams,
+        use_registry_cache: bool,
+    ) -> Result<(Arc<Self>, Path)> {
         #[allow(deprecated)]
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
+
+            let mut io_tracker = IOTracker::default();
+            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
 
             // Always wrap with IO tracking
-            let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
                 inner: tracked_store,
+                local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -463,13 +634,19 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                // Type-erased on the way in, so there is no telling if it can paginate.
+                paginated_lister: None,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
 
-        let store = registry.get_store(url.clone(), params).await?;
+        let store = if use_registry_cache {
+            registry.get_store(url.clone(), params).await?
+        } else {
+            registry.new_store(url.clone(), params).await?
+        };
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
         let path = provider.extract_path(&url)?;
@@ -531,11 +708,30 @@ impl ObjectStore {
 
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
-        self.scheme == "file"
+        self.scheme == "file" || self.scheme == "file+uring"
+    }
+
+    /// Returns true when object paths directly encode absolute local filesystem paths.
+    ///
+    /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
+    /// their inner object-store implementation instead of direct filesystem access.
+    pub fn has_direct_local_paths(&self) -> bool {
+        self.is_local() && self.store_prefix == self.scheme
     }
 
     pub fn is_cloud(&self) -> bool {
-        self.scheme != "file" && self.scheme != "memory"
+        if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
+            return false;
+        }
+        true
+    }
+
+    /// Whether this object store prefers the lite scheduler.
+    ///
+    /// The lite scheduler is designed for backends like io_uring where
+    /// tasks should only be polled when the consumer polls them.
+    pub fn prefers_lite_scheduler(&self) -> bool {
+        self.scheme == "file+uring"
     }
 
     pub fn scheme(&self) -> &str {
@@ -550,10 +746,17 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// The amount of parallelism to use for I/O operations.
+    ///
+    /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
+    /// Always at least 1: callers feed this straight into `buffered` / `buffer_unordered`, and a
+    /// window of 0 makes those streams never poll their input — e.g. a metadata-only `count_rows`
+    /// would hang rather than return.
     pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+            .max(1)
     }
 
     /// Get the IO tracker for this object store
@@ -581,13 +784,26 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
+    /// Apply a [`WrappingObjectStore`] to both `inner` and `paginated_lister` together.
+    ///
+    /// Keeps both halves in sync: a wrapper returning `None` from
+    /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
+    /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
+    pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
+        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        self.paginated_lister = self
+            .paginated_lister
+            .take()
+            .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -595,6 +811,31 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )
                 .await
+            }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
@@ -624,7 +865,7 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -632,6 +873,31 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )
                 .await
+            }
+            #[cfg(target_os = "linux")]
+            "file+uring" => {
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| str_is_truthy(&v))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
@@ -662,7 +928,7 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 if let Some(parent) = local_path.parent() {
@@ -696,20 +962,119 @@ impl ObjectStore {
         Writer::shutdown(writer.as_mut()).await
     }
 
+    /// Atomically creates an object without replacing an existing object.
+    ///
+    /// Local stores publish a uniquely named staging object with a conditional
+    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// is rejected because it can silently ignore conditional create requests.
+    ///
+    /// Returns [`object_store::Error::NotSupported`] without writing when the
+    /// backend cannot reliably provide put-if-absent semantics.
+    pub async fn put_if_absent(
+        &self,
+        path: &Path,
+        content: PutPayload,
+    ) -> object_store::Result<()> {
+        if self.scheme == "cos" {
+            return Err(object_store::Error::NotSupported {
+                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
+                         versioning has ever been enabled"
+                    .into(),
+            });
+        }
+
+        if self.is_local() {
+            let staging_path =
+                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            self.inner.put(&staging_path, content).await?;
+            let result = self.inner.rename_if_not_exists(&staging_path, path).await;
+            if result.is_err()
+                && let Err(error) = self.inner.delete(&staging_path).await
+            {
+                log::warn!(
+                    "Failed to remove staging object {} after atomic create failed: {}",
+                    staging_path,
+                    error
+                );
+            }
+            result
+        } else {
+            self.inner
+                .put_opts(
+                    path,
+                    content,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
+    }
+
     pub async fn delete(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;
         Ok(())
     }
 
+    /// AWS S3 and GCS reject a single-shot server-side copy whose source is
+    /// larger than this; such sources are streamed through a multipart write.
+    const MAX_SINGLE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+
     pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        if self.is_local() {
+        // S3 and GCS cap single-shot server-side copies at 5 GiB and object_store
+        // does not fall back to a multipart copy for larger sources
+        // (https://github.com/apache/arrow-rs-object-store/issues/563). Azure and
+        // other blob stores don't have this limit, so we only pay for the fallback
+        // (an extra size lookup) on S3 and GCS.
+        let multipart_copy_fallback = matches!(self.scheme.as_str(), "s3" | "s3+ddb" | "gs");
+        self.copy_impl(
+            from,
+            to,
+            multipart_copy_fallback,
+            Self::MAX_SINGLE_COPY_BYTES,
+        )
+        .await
+    }
+
+    /// Copy `from` to `to`. When `multipart_copy_fallback` is set, a source
+    /// larger than `max_single_copy` is streamed through a multipart write
+    /// instead of a single-shot server-side copy. Both are parameters so tests
+    /// can drive the streaming path without a multi-gigabyte fixture or an S3
+    /// endpoint.
+    async fn copy_impl(
+        &self,
+        from: &Path,
+        to: &Path,
+        multipart_copy_fallback: bool,
+        max_single_copy: u64,
+    ) -> Result<()> {
+        if self.has_direct_local_paths() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            return super::local::copy_file(from, to);
+            let metrics = self.io_tracker.begin_io("copy");
+            let result = super::local::copy_file(from, to);
+            metrics.record(&result, 0);
+            return result;
+        }
+        if multipart_copy_fallback {
+            // Reuse the reader for both the size lookup (a single cached HEAD)
+            // and the streamed copy, avoiding a separate HEAD request.
+            let reader = self.open(from).await?;
+            if reader.size().await? as u64 > max_single_copy {
+                let mut writer = self.create(to).await?;
+                writer.copy_from_reader(reader.as_ref()).await?;
+                Writer::shutdown(writer.as_mut()).await?;
+                return Ok(());
+            }
         }
         Ok(self.inner.copy(from, to).await?)
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
+    ///
+    /// This enumerates the whole prefix before it returns, however many children it holds.
+    /// Use [`Self::read_dir_page`] to page through a directory instead.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
@@ -718,8 +1083,18 @@ impl ObjectStore {
             .common_prefixes
             .iter()
             .chain(output.objects.iter().map(|o| &o.location))
-            .map(|s| s.filename().unwrap().to_string())
+            .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
+    }
+
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`].
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
     pub fn list(
@@ -745,9 +1120,20 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if self.is_local() {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = local_dir_operations.remove_dir_all(&path).await;
+            metrics.record(&result, 0);
+            return result;
+        }
+        if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
-            return super::local::remove_dir_all(&path);
+            // Counted as a single delete request, matching how `delete_stream`
+            // counts one batched request regardless of how many paths it removes.
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = super::local::remove_dir_all(&path);
+            metrics.record(&result, 0);
+            return result;
         }
         let sub_entries = self
             .inner
@@ -766,13 +1152,66 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Remove eligible materialized empty directories below a local root.
+    ///
+    /// This is a no-op for object stores, which do not materialize directories.
+    /// Traversal does not follow symbolic links. Directories in `retained_dirs` and their
+    /// descendants are preserved. Other directories are removed only if they are empty and
+    /// either appear in `verified_dirs` or predate `unmodified_since`. Passing `None` for
+    /// `unmodified_since` disables the age check.
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// # use chrono::Utc;
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> Result<()> {
+    /// store
+    ///     .remove_empty_dirs(
+    ///         "dataset/_indices",
+    ///         HashSet::new(),
+    ///         HashSet::new(),
+    ///         Some(Utc::now()),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remove_empty_dirs(
+        &self,
+        root_path: impl Into<Path>,
+        retained_dirs: HashSet<Path>,
+        verified_dirs: HashSet<Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
+            return Ok(());
+        }
+
+        let path = Path::parse(root_path.into())?;
+        let metrics = self.io_tracker.begin_io("delete");
+        let result = tokio::task::spawn_blocking(move || {
+            super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
+        })
+        .await
+        .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
+        metrics.record(&result, 0);
+        result
+    }
+
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
     ) -> BoxStream<'a, Result<Path>> {
-        self.inner
-            .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
-            .err_into::<Error>()
+        let store = Arc::clone(&self.inner);
+        locations
+            .and_then(move |location| {
+                let store = Arc::clone(&store);
+                async move {
+                    store.delete(&location).await?;
+                    Ok(location)
+                }
+            })
             .boxed()
     }
 
@@ -873,7 +1312,7 @@ impl StorageOptions {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
             .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(10)
+            .unwrap_or(3)
     }
 
     /// Seconds of timeout to set in RetryConfig for object store client
@@ -939,7 +1378,7 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<DynObjectStore>,
+        mut store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -964,17 +1403,20 @@ impl ObjectStore {
                 store_prefix
             }
         };
+        let mut io_tracker = IOTracker::default();
+        meter_store(&mut store, &mut io_tracker, &store_prefix);
+
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
         // Always wrap with IO tracking
-        let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
         Self {
             inner: tracked_store,
+            local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -984,8 +1426,33 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            // Type-erased on the way in, so there is no telling if it can paginate.
+            paginated_lister: None,
         }
     }
+}
+
+/// Wrap `inner` so its operations publish metrics labelled by `store_prefix`,
+/// and label `io_tracker` with the same prefix so the local reads and writes
+/// that bypass `inner` publish under it too.
+///
+/// The two go together on purpose: a store metered on one path but not the other
+/// would report a partial picture that reads like a complete one. Every
+/// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
+/// through here, or through nothing at all.
+#[cfg(feature = "metrics")]
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+    use crate::object_store::metrics::ObjectStoreMetricsExt;
+    io_tracker.set_metrics_base(store_prefix);
+    *inner = inner.clone().metered(store_prefix.to_owned());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn meter_store(
+    _inner: &mut Arc<dyn OSObjectStore>,
+    _io_tracker: &mut IOTracker,
+    _store_prefix: &str,
+) {
 }
 
 fn infer_block_size(scheme: &str) -> usize {
@@ -1001,11 +1468,19 @@ fn infer_block_size(scheme: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lance_core::utils::tempfile::{TempStdDir, TempStdFile, TempStrDir};
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as OSResult,
+    };
     use rstest::rstest;
     use std::env::set_current_dir;
+    use std::fmt::{Display, Formatter};
     use std::fs::{create_dir_all, write};
+    use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1025,6 +1500,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_if_absent() {
+        let temp_dir = TempStrDir::default();
+        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let store = ObjectStore::local();
+        store
+            .put_if_absent(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"second").into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ));
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"first".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent_rejects_cos() {
+        let mut store = ObjectStore::memory();
+        store.scheme = "cos".to_string();
+        let path = Path::from("atomic-create");
+
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(!store.exists(&path).await.unwrap());
+    }
+
+    #[test]
+    fn test_io_parallelism_clamped_to_nonzero() {
+        // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
+        // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
+        let store = ObjectStore::local();
+
+        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
+        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        assert_eq!(
+            store.io_parallelism(),
+            1,
+            "LANCE_IO_THREADS=0 must clamp to 1"
+        );
+
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
+        assert_eq!(
+            store.io_parallelism(),
+            8,
+            "a positive override must pass through unchanged"
+        );
+
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+        assert!(
+            store.io_parallelism() >= 1,
+            "the configured default parallelism must be at least 1"
+        );
+    }
+
+    #[tokio::test]
     async fn test_absolute_paths() {
         let tmp_path = TempStrDir::default();
         write_to_file(
@@ -1040,7 +1582,7 @@ mod tests {
             format!("{tmp_path}/bar/foo.lance/../foo.lance"),
         ] {
             let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -1152,7 +1694,7 @@ mod tests {
         set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
         let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -1163,7 +1705,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store.as_ref(), &path.child("test_file"))
+        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -1182,7 +1724,7 @@ mod tests {
         .unwrap();
         let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
 
-        let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
+        let sub_dirs = store.read_dir(base.clone().join("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 
@@ -1220,9 +1762,90 @@ mod tests {
             url
         };
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
-        store.remove_dir_all(base.child("foo")).await.unwrap();
+        store
+            .remove_dir_all(base.clone().join("foo"))
+            .await
+            .unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[tokio::test]
+    async fn test_remove_empty_directories(#[case] scheme: &str) {
+        let path = TempStdDir::default();
+        let stale_dir = path.join("stale");
+        let nested_stale_dir = path.join("nested_stale");
+        let nested_stale_child = nested_stale_dir.join("child");
+        create_dir_all(&stale_dir).unwrap();
+        create_dir_all(&nested_stale_child).unwrap();
+        create_dir_all(path.join("retained").join("child")).unwrap();
+        write_to_file(
+            path.join("file_bearing")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
+            "keep",
+        )
+        .unwrap();
+        create_dir_all(path.join("file_bearing").join("empty_child")).unwrap();
+
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
+
+        #[cfg(unix)]
+        let unmodified_since = {
+            let old_modified_time =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+            for directory in [&stale_dir, &nested_stale_dir, &nested_stale_child] {
+                std::fs::File::open(directory)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(old_modified_time))
+                    .unwrap();
+            }
+            DateTime::<Utc>::from(std::time::SystemTime::now())
+                - chrono::TimeDelta::try_days(7).unwrap()
+        };
+        #[cfg(not(unix))]
+        let unmodified_since = DateTime::<Utc>::from(std::time::SystemTime::now())
+            + chrono::TimeDelta::try_days(1).unwrap();
+
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::new(),
+                Some(unmodified_since),
+            )
+            .await
+            .unwrap();
+
+        assert!(!path.join("stale").exists());
+        assert!(!path.join("nested_stale").exists());
+        assert!(path.join("retained").join("child").exists());
+        assert!(path.join("file_bearing").join("empty_child").exists());
+
+        create_dir_all(path.join("fresh")).unwrap();
+        create_dir_all(path.join("verified")).unwrap();
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::from([base.clone().join("verified")]),
+                Some(
+                    DateTime::<Utc>::from(std::time::SystemTime::now())
+                        - chrono::TimeDelta::try_days(7).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(path.join("fresh").exists());
+        assert!(!path.join("verified").exists());
     }
 
     #[derive(Debug)]
@@ -1243,12 +1866,169 @@ mod tests {
             // return a mocked value so we can check if the final store is the one we expect
             self.return_value.clone()
         }
+
+        // This one swaps the store out entirely, so a listing that went around it would be
+        // listing something else.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            None
+        }
     }
 
     impl TestWrapper {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    /// A lister that exists only to be wrapped.
+    #[derive(Debug)]
+    struct StubLister;
+
+    #[async_trait]
+    impl PaginatedListStore for StubLister {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _opts: object_store::list::PaginatedListOptions,
+        ) -> object_store::Result<object_store::list::PaginatedListResult> {
+            unimplemented!("this lister exists to be wrapped, not to list")
+        }
+    }
+
+    /// Records the listers it was handed, and leaves the store alone.
+    #[derive(Debug)]
+    struct PaginatedTestWrapper {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WrappingObjectStore for PaginatedTestWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            original
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}@{store_prefix}", self.name));
+            Some(original)
+        }
+    }
+
+    /// A chain hands the lister to each of its wrappers in turn. One wrapper giving up the
+    /// pushdown gives it up for the chain, and the wrappers after it are never asked: the
+    /// listing is going through `wrap` either way, which is every wrapper at once.
+    #[rstest]
+    #[case::every_wrapper_keeps_it(false, vec!["first@memory", "second@memory"])]
+    #[case::one_wrapper_gives_it_up(true, vec!["first@memory"])]
+    fn test_a_chain_wraps_the_lister_until_one_gives_it_up(
+        #[case] gives_up: bool,
+        #[case] expected_log: Vec<&str>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> =
+            vec![Arc::new(PaginatedTestWrapper {
+                name: "first",
+                log: log.clone(),
+            })];
+        if gives_up {
+            wrappers.push(Arc::new(TestWrapper {
+                called: AtomicBool::new(false),
+                return_value: Arc::new(InMemory::new()),
+            }));
+        }
+        wrappers.push(Arc::new(PaginatedTestWrapper {
+            name: "second",
+            log: log.clone(),
+        }));
+
+        let wrapped = ChainedWrappingObjectStore::new(wrappers)
+            .wrap_paginated("memory", Arc::new(StubLister));
+
+        assert_eq!(wrapped.is_none(), gives_up);
+        assert_eq!(*log.lock().unwrap(), expected_log);
+    }
+
+    /// `apply_wrapper` keeps both halves of the store in sync. A wrapper that gives up the
+    /// pushdown has to clear the lister too, or `read_dir_page` would keep talking to the
+    /// backend behind the wrapper's back.
+    #[rstest]
+    #[case::gives_up_the_pushdown(true)]
+    #[case::keeps_the_pushdown(false)]
+    fn test_apply_wrapper_keeps_inner_and_the_lister_in_sync(#[case] gives_up: bool) {
+        let replacement = Arc::new(InMemory::new());
+        let giving_up = TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        };
+        let keeping = PaginatedTestWrapper {
+            name: "passthrough",
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let wrapper: &dyn WrappingObjectStore = match gives_up {
+            true => &giving_up,
+            false => &keeping,
+        };
+
+        let mut store = ObjectStore::memory();
+        store.paginated_lister = Some(Arc::new(StubLister) as Arc<dyn PaginatedListStore>);
+        store.apply_wrapper(wrapper);
+
+        assert_eq!(
+            store.paginated_lister.is_some(),
+            !gives_up,
+            "the lister has to follow what the wrapper said"
+        );
+        // The wrapper that gives up the pushdown is also the one that swaps the store out, so
+        // whether `inner` was replaced says that `wrap` ran on the same wrapper.
+        assert_eq!(
+            Arc::ptr_eq(&store.inner, &(replacement as Arc<dyn OSObjectStore>)),
+            gives_up
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrapper_identity_is_stable_across_tasks() {
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: Arc::new(InMemory::new()),
+        });
+        let initial_params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let task_params = tokio::spawn(async move {
+            ObjectStoreParams {
+                object_store_wrapper: Some(wrapper),
+                ..ObjectStoreParams::default()
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(initial_params, task_params);
+
+        let mut initial_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&initial_params, &mut initial_hasher);
+        let mut task_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&task_params, &mut task_hasher);
+        assert_eq!(
+            std::hash::Hasher::finish(&initial_hasher),
+            std::hash::Hasher::finish(&task_hasher)
+        );
     }
 
     #[tokio::test]
@@ -1319,7 +2099,7 @@ mod tests {
         use std::path::Prefix;
         use std::path::Prefix::*;
 
-        fn get_path_prefix(path: &StdPath) -> Prefix {
+        fn get_path_prefix(path: &StdPath) -> Prefix<'_> {
             match path.components().next().unwrap() {
                 Component::Prefix(prefix_component) => prefix_component.kind(),
                 _ => panic!(),
@@ -1348,7 +2128,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
-            let contents = read_from_store(store.as_ref(), &base.child("test_file"))
+            let contents = read_from_store(store.as_ref(), &base.clone().join("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");
@@ -1372,7 +2152,7 @@ mod tests {
             .unwrap();
 
         // Create paths relative to the ObjectStore base
-        let from_path = base_path.child(source_file_name);
+        let from_path = base_path.clone().join(source_file_name);
 
         // Use object_store::Path::parse for the destination
         let dest_file = dest_dir.join("copied_file.txt");
@@ -1404,7 +2184,7 @@ mod tests {
             .unwrap();
 
         // Create paths
-        let from_path = base_path.child(source_file_name);
+        let from_path = base_path.clone().join(source_file_name);
 
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir.join("nested").join("dirs").join("copied_file.txt");
@@ -1419,6 +2199,106 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    /// Inner store that forwards everything to `InMemory` except single-shot
+    /// server-side copy (`copy_opts`), which always fails. This lets a test
+    /// prove that `ObjectStore::copy` fell back to a streaming multipart copy
+    /// for an oversized source rather than issuing a single `CopyObject`.
+    #[derive(Debug)]
+    struct CopyFailingStore {
+        inner: InMemory,
+    }
+
+    impl Display for CopyFailingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyFailingStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyFailingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            Err(object_store::Error::Generic {
+                store: "CopyFailingStore",
+                source: "single-shot copy disabled in test".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_streams_objects_larger_than_threshold() {
+        // memory:// is non-local but isn't an S3/GCS scheme, so copy() wouldn't
+        // enable the fallback on its own. Drive copy_impl directly with
+        // multipart_copy_fallback = true to exercise the streaming path. The
+        // inner store rejects any single-shot copy, so a successful copy can only
+        // have gone through the streaming branch.
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(CopyFailingStore {
+            inner: InMemory::new(),
+        });
+
+        let from = Path::from("source.bin");
+        let contents = b"streaming multipart copy payload well past the tiny threshold";
+        store.put(&from, contents).await.unwrap();
+
+        // Source size (61 bytes) exceeds the threshold -> must stream via a
+        // multipart write rather than a single-shot server-side copy.
+        let streamed = Path::from("streamed.bin");
+        store.copy_impl(&from, &streamed, true, 8).await.unwrap();
+        let copied = store.read_one_all(&streamed).await.unwrap();
+        assert_eq!(copied.as_ref(), contents.as_slice());
+
+        // Source size below the threshold -> single-shot copy, which the inner
+        // store rejects, confirming that the streaming branch (not native copy)
+        // is what made the first copy succeed.
+        let native = Path::from("native.bin");
+        assert!(
+            store
+                .copy_impl(&from, &native, true, u64::MAX)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

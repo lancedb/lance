@@ -25,8 +25,7 @@ use arrow_schema::DataType;
 use lance::Result;
 use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
-use lance_index::scalar::IndexWriter;
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::kmeans::{
     KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams, compute_partitions,
@@ -243,7 +242,7 @@ impl Hnsw {
         let mut writer = rt()
             .block_on(
                 Some(py),
-                PreviousFileWriter::<ManifestDescribing>::try_new(
+                V1FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())
@@ -255,7 +254,7 @@ impl Hnsw {
         rt().block_on(Some(py), async {
             let batch = self.hnsw.to_batch()?;
             let metadata = batch.schema_ref().metadata().clone();
-            writer.write_record_batch(batch).await?;
+            writer.write(&[batch]).await?;
             writer.finish_with_metadata(&metadata).await?;
             Result::Ok(())
         })?
@@ -274,9 +273,9 @@ impl Hnsw {
 pub struct PyLance<T>(pub T);
 
 /// Extract a Vec of PyLance types from a Python object.
-pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
+pub fn extract_vec<'py, T>(ob: &Bound<'py, PyAny>) -> PyResult<Vec<T>>
 where
-    PyLance<T>: FromPyObject<'a>,
+    PyLance<T>: FromPyObjectOwned<'py>,
 {
     ob.extract::<Vec<PyLance<T>>>()
         .map(|v| v.into_iter().map(|t| t.0).collect())

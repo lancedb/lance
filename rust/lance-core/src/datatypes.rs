@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
-use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 
@@ -18,12 +18,14 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+    LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
-    escape_field_path_for_project, format_field_path, parse_field_path,
+    escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -46,6 +48,83 @@ pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
+/// The minimal logical blob v2 fields accepted from writers.
+///
+/// Logical values may also use [`BLOB_V2_LOGICAL_FIELDS`] when an external
+/// object range is present.
+pub static BLOB_V2_LOGICAL_MINIMAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+    ])
+});
+
+/// The complete logical blob v2 fields used for writer input and rewrite output.
+///
+/// `position` and `size` are an optional range within the external object named
+/// by `uri`. They do not describe Lance-managed data, packed, or dedicated
+/// storage.
+pub static BLOB_V2_LOGICAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    let mut fields = BLOB_V2_LOGICAL_MINIMAL_FIELDS
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.extend([
+        Arc::new(ArrowField::new("position", DataType::UInt64, true)),
+        Arc::new(ArrowField::new("size", DataType::UInt64, true)),
+    ]);
+    Fields::from(fields)
+});
+
+/// The complete logical blob v2 struct type.
+pub static BLOB_V2_LOGICAL_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()));
+
+/// Writer-prepared blob v2 fields consumed by the structural encoder.
+///
+/// The populated fields depend on [`BlobKind`]:
+///
+/// - [`BlobKind::Inline`] carries `data`; the encoder derives the stored
+///   `position` and `size` from the out-of-line buffer it creates.
+/// - [`BlobKind::Packed`] carries `blob_id`, `position`, and `blob_size`.
+/// - [`BlobKind::Dedicated`] carries `blob_id` and `blob_size`; its stored
+///   `position` is zero.
+/// - [`BlobKind::External`] carries `uri`, optional `blob_id`, `position`, and
+///   `blob_size`. A zero `blob_size` is resolved to the complete external object
+///   length when read.
+///
+/// `blob_size` is distinct from the logical `size`, which is only an optional
+/// external-object range before preparation. For external blobs, `uri` is
+/// normalized into the stable stored `blob_uri` field.
+pub static BLOB_V2_PREPARED_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("kind", DataType::UInt8, true),
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("blob_id", DataType::UInt32, true),
+        ArrowField::new("blob_size", DataType::UInt64, true),
+        ArrowField::new("position", DataType::UInt64, true),
+    ])
+});
+
+/// The writer-prepared blob v2 struct type.
+pub static BLOB_V2_PREPARED_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_PREPARED_FIELDS.clone()));
+
+/// Stored blob v2 descriptor fields.
+///
+/// These field names are part of the stable file format. Their meaning depends
+/// on `kind`:
+///
+/// - [`BlobKind::Inline`]: `position` and `size` locate an out-of-line buffer in
+///   the Lance data file.
+/// - [`BlobKind::Packed`]: `blob_id` identifies a shared packed blob file, and
+///   `position` and `size` locate a range within it.
+/// - [`BlobKind::Dedicated`]: `blob_id` identifies a dedicated raw blob file,
+///   `position` is zero, and `size` is the complete file length.
+/// - [`BlobKind::External`]: `blob_uri` and `blob_id` identify the object, while
+///   `position` and `size` select a range. A zero `size` is resolved to the
+///   object's complete length when read.
 pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
         ArrowField::new("kind", DataType::UInt8, false),
@@ -68,6 +147,96 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
+
+/// The in-memory representation of a blob v2 struct.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobV2Layout {
+    /// Writer input or rewrite output.
+    ///
+    /// Both the minimal `data, uri` fields and the complete
+    /// `data, uri, position, size` fields have this layout.
+    Logical,
+    /// Kind-aware writer intermediate consumed by the structural encoder.
+    Prepared,
+    /// Stable descriptor stored in Lance files and returned by descriptor scans.
+    Descriptor,
+}
+
+impl BlobV2Layout {
+    /// Classify blob v2 child fields by name, type, order, and layout-specific
+    /// nullability requirements.
+    ///
+    /// Child metadata is not part of the representation. The complete logical
+    /// layout also accepts non-nullable `position` and `size` fields, matching
+    /// the existing writer-input contract. Descriptor child nullability is
+    /// ignored because it changed across released schemas; row nullness has
+    /// been represented by either parent struct validity or a nullable `kind`
+    /// child.
+    pub fn classify(fields: &Fields) -> Option<Self> {
+        if logical_blob_v2_fields_match(fields) {
+            Some(Self::Logical)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_PREPARED_FIELDS, true) {
+            Some(Self::Prepared)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_DESC_FIELDS, false) {
+            Some(Self::Descriptor)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for BlobV2Layout {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Logical => write!(f, "logical"),
+            Self::Prepared => write!(f, "prepared"),
+            Self::Descriptor => write!(f, "descriptor"),
+        }
+    }
+}
+
+fn blob_v2_field_matches(
+    actual: &ArrowField,
+    expected: &ArrowField,
+    compare_nullability: bool,
+) -> bool {
+    actual.name() == expected.name()
+        && actual.data_type() == expected.data_type()
+        && (!compare_nullability || actual.is_nullable() == expected.is_nullable())
+}
+
+fn blob_v2_fields_match(actual: &Fields, expected: &Fields, compare_nullability: bool) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), compare_nullability)
+            })
+}
+
+fn logical_blob_v2_fields_match(fields: &Fields) -> bool {
+    if blob_v2_fields_match(fields, &BLOB_V2_LOGICAL_MINIMAL_FIELDS, true) {
+        return true;
+    }
+    fields.len() == BLOB_V2_LOGICAL_FIELDS.len()
+        && fields
+            .iter()
+            .zip(BLOB_V2_LOGICAL_FIELDS.iter())
+            .enumerate()
+            .all(|(index, (actual, expected))| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), index < 2)
+            })
+}
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_FIELDS`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_FIELDS")]
+pub use self::BLOB_V2_LOGICAL_FIELDS as BLOB_V2_USER_FIELDS;
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_TYPE`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_TYPE")]
+pub use self::BLOB_V2_LOGICAL_TYPE as BLOB_V2_USER_TYPE;
 
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
@@ -95,7 +264,7 @@ impl LogicalType {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
-    fn is_struct(&self) -> bool {
+    pub fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 
@@ -120,6 +289,17 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
         TimeUnit::Millisecond => "ms",
         TimeUnit::Microsecond => "us",
         TimeUnit::Nanosecond => "ns",
+    }
+}
+
+fn is_supported_fixed_size_list_child(data_type: &DataType, nested: bool) -> bool {
+    match data_type {
+        DataType::Struct(_) => !nested,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => false,
+        DataType::FixedSizeList(field, _) => {
+            is_supported_fixed_size_list_child(field.data_type(), true)
+        }
+        _ => true,
     }
 }
 
@@ -153,8 +333,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float64 => "double".to_string(),
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
-            DataType::Utf8 => "string".to_string(),
-            DataType::Binary => "binary".to_string(),
+            DataType::Utf8 | DataType::Utf8View => "string".to_string(),
+            DataType::Binary | DataType::BinaryView => "binary".to_string(),
             DataType::LargeUtf8 => "large_string".to_string(),
             DataType::LargeBinary => "large_binary".to_string(),
             DataType::Date32 => "date32:day".to_string(),
@@ -192,6 +372,8 @@ impl TryFrom<&DataType> for LogicalType {
                     // Don't want to directly use `bfloat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
+                } else if !is_supported_fixed_size_list_child(field.data_type(), false) {
+                    return Err(Error::schema(format!("Unsupported data type: {:?}", dt)));
                 } else {
                     format!(
                         "fixed_size_list:{}:{}",
@@ -374,10 +556,10 @@ pub struct Dictionary {
 }
 
 impl DeepSizeOf for Dictionary {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut crate::deepsize::Context) -> usize {
         self.values
             .as_ref()
-            .map(|v| v.get_array_memory_size())
+            .map(|v| (v.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }
@@ -425,5 +607,81 @@ impl TryFrom<u8> for BlobKind {
                 format!("Unknown blob kind {other:?}").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_blob_v2_layouts() {
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_MINIMAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_PREPARED_FIELDS),
+            Some(BlobV2Layout::Prepared)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_DESC_FIELDS),
+            Some(BlobV2Layout::Descriptor)
+        );
+    }
+
+    #[test]
+    fn test_classify_blob_v2_layout_uses_structural_contract() {
+        let logical_with_required_range = Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::Utf8, true),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt64, false),
+        ]);
+        assert_eq!(
+            BlobV2Layout::classify(&logical_with_required_range),
+            Some(BlobV2Layout::Logical)
+        );
+
+        let prepared_with_child_metadata =
+            Fields::from(
+                BLOB_V2_PREPARED_FIELDS
+                    .iter()
+                    .map(|field| {
+                        Arc::new(field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )])))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        assert_eq!(
+            BlobV2Layout::classify(&prepared_with_child_metadata),
+            Some(BlobV2Layout::Prepared)
+        );
+
+        let nullable_descriptor = Fields::from(
+            BLOB_V2_DESC_FIELDS
+                .iter()
+                .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&nullable_descriptor),
+            Some(BlobV2Layout::Descriptor)
+        );
+
+        let malformed_descriptor = Fields::from(vec![
+            ArrowField::new("kind", DataType::UInt8, false),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt32, false),
+            ArrowField::new("blob_id", DataType::UInt32, false),
+            ArrowField::new("blob_uri", DataType::Utf8, false),
+        ]);
+        assert_eq!(BlobV2Layout::classify(&malformed_descriptor), None);
     }
 }

@@ -11,7 +11,7 @@ use object_store::path::Path;
 /// - `blob_id` is transformed via `reverse_bits()` before binary formatting.
 pub fn blob_path(base: &Path, data_file_key: &str, blob_id: u32) -> Path {
     let file_name = format!("{:032b}.blob", blob_id.reverse_bits());
-    base.child(data_file_key).child(file_name.as_str())
+    base.clone().join(data_file_key).join(file_name.as_str())
 }
 
 #[cfg(test)]

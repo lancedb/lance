@@ -8,13 +8,15 @@ use arrow_array::{
     Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::bf16;
 use lance_arrow::{ArrowFloatType, FloatArray};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_linalg::distance::dot::{Dot, dot, dot_distance};
 use lance_testing::datagen::generate_random_array_with_seed;
@@ -106,6 +108,40 @@ fn bench_distance(c: &mut Criterion) {
             )
         });
     });
+
+    // u8 dot product benchmarks: scalar baseline vs SIMD dispatch
+    {
+        use lance_linalg::distance::dot_u8::{dot_u8, dot_u8_scalar};
+
+        for &dim in &[128, 256, 512, 1024] {
+            let num_vectors = 1024 * 1024 / dim; // ~1M elements total
+            let mut rng = rand::rng();
+            let key_u8: Vec<u8> = (0..dim).map(|_| rng.random()).collect();
+            let target_u8: Vec<u8> = (0..num_vectors * dim).map(|_| rng.random()).collect();
+
+            c.bench_function(&format!("Dot(u8, scalar, dim={dim})"), |b| {
+                b.iter(|| {
+                    black_box(
+                        target_u8
+                            .chunks(dim)
+                            .map(|y| dot_u8_scalar(key_u8.as_slice(), y))
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            });
+
+            c.bench_function(&format!("Dot(u8, dispatch, dim={dim})"), |b| {
+                b.iter(|| {
+                    black_box(
+                        target_u8
+                            .chunks(dim)
+                            .map(|y| dot_u8(key_u8.as_slice(), y))
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            });
+        }
+    }
 
     run_bench::<Float32Type>(c);
     c.bench_function("Dot(f32, SIMD)", |b| {

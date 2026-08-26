@@ -2,19 +2,20 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::fmt;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::{collections::HashMap, fmt::Debug};
 
 use arrow::{array::AsArray, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
@@ -65,6 +66,7 @@ pub trait Quantization:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationType {
     Flat,
+    FlatBin,
     Product,
     Scalar,
     Rabit,
@@ -76,9 +78,12 @@ impl FromStr for QuantizationType {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "FLAT" => Ok(Self::Flat),
+            "FLATBIN" => Ok(Self::FlatBin),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
-            "RABIT" => Ok(Self::Rabit),
+            // `Display` writes "RQ"; "RABIT" is accepted for headers written
+            // before this variant round-tripped.
+            "RQ" | "RABIT" => Ok(Self::Rabit),
             _ => Err(Error::index(format!("Unknown quantization type: {}", s))),
         }
     }
@@ -88,6 +93,7 @@ impl std::fmt::Display for QuantizationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Flat => write!(f, "FLAT"),
+            Self::FlatBin => write!(f, "FLATBIN"),
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
             Self::Rabit => write!(f, "RQ"),
@@ -96,7 +102,29 @@ impl std::fmt::Display for QuantizationType {
 }
 
 pub trait QuantizerBuildParams: Send + Sync {
+    /// Returns the number of rows to sample when training the quantizer.
     fn sample_size(&self) -> usize;
+
+    /// Returns the number of rows to sample, rejecting parameters whose sample size
+    /// cannot be represented by [`usize`].
+    ///
+    /// Implementations with fallible sample-size calculations should override this
+    /// method. The default preserves the behavior of existing implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::vector::pq::PQBuildParams;
+    /// use lance_index::vector::quantizer::QuantizerBuildParams;
+    ///
+    /// let params = PQBuildParams::new(16, 8);
+    /// assert_eq!(params.try_sample_size()?, 65_536);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn try_sample_size(&self) -> Result<usize> {
+        Ok(self.sample_size())
+    }
+
     fn use_residual(_: DistanceType) -> bool {
         false
     }
@@ -156,7 +184,7 @@ impl Quantizer {
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::Flat(_) => QuantizationType::Flat,
-            Self::FlatBin(_) => QuantizationType::Flat,
+            Self::FlatBin(_) => QuantizationType::FlatBin,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
             Self::Rabit(_) => QuantizationType::Rabit,
@@ -219,7 +247,7 @@ pub trait QuantizerMetadata:
         Ok(None)
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self>;
+    async fn load(reader: &V1FileReader) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
@@ -237,7 +265,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
     fn metadata(&self) -> &Self::Metadata;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let batches = self
             .to_batches()?
             .map(|b| {
@@ -246,10 +274,10 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
                 let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
                 for (i, row_id) in row_ids.iter().enumerate() {
-                    match mapping.get(row_id) {
+                    match mapping.get(*row_id) {
                         Some(Some(new_id)) => {
                             indices.push(i as u32);
-                            new_row_ids.push(*new_id);
+                            new_row_ids.push(new_id);
                         }
                         Some(None) => {}
                         None => {
@@ -273,7 +301,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     }
 
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
@@ -283,7 +311,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
 /// Loader to load partitioned [VectorStore] from disk.
 pub struct IvfQuantizationStorage<Q: Quantization> {
-    reader: PreviousFileReader,
+    reader: V1FileReader,
 
     distance_type: DistanceType,
     quantizer: Quantizer,
@@ -293,7 +321,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.reader.deep_size_of_children(context)
             + self.quantizer.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
@@ -313,13 +341,12 @@ impl<Q: Quantization> Clone for IvfQuantizationStorage<Q> {
     }
 }
 
-#[allow(dead_code)]
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
     ///
     ///
     pub async fn open(reader: Arc<dyn Reader>) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described_from_reader(reader, None).await?;
+        let reader = V1FileReader::try_new_self_described_from_reader(reader, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -380,5 +407,36 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             None,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// `IvfIndexState` persists the quantization type with `Display` and reads
+    /// it back with `FromStr`, so the two must agree for every variant.
+    #[rstest]
+    #[case::flat(QuantizationType::Flat)]
+    #[case::flat_bin(QuantizationType::FlatBin)]
+    #[case::product(QuantizationType::Product)]
+    #[case::scalar(QuantizationType::Scalar)]
+    #[case::rabit(QuantizationType::Rabit)]
+    fn test_display_from_str_round_trip(#[case] quantization_type: QuantizationType) {
+        let encoded = quantization_type.to_string();
+        assert_eq!(
+            encoded.parse::<QuantizationType>().unwrap(),
+            quantization_type,
+            "{encoded} did not round-trip"
+        );
+    }
+
+    #[test]
+    fn test_from_str_accepts_legacy_rabit_spelling() {
+        assert_eq!(
+            "RABIT".parse::<QuantizationType>().unwrap(),
+            QuantizationType::Rabit
+        );
     }
 }

@@ -65,7 +65,7 @@ impl FieldEncoder for FixedSizeListStructuralEncoder {
         } else {
             deep_copy_nulls(array.nulls())
         };
-        repdef.add_fsl(validity.clone(), dimension, num_rows as usize);
+        repdef.add_fsl(validity.clone(), dimension, fsl_arr.len());
 
         // FSL forces child elements to exist even under null rows. Normalize any
         // nested lists under null FSL rows to null empty lists.
@@ -247,11 +247,15 @@ impl StructuralFixedSizeListDecodeTask {
 
 impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        let DecodedArray {
+            array,
+            mut repdef,
+            data_size,
+        } = self.child_task.decode()?;
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
                 let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize);
+                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
                     *dimension,
@@ -261,6 +265,7 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
                 Ok(DecodedArray {
                     array: Arc::new(fsl_array),
                     repdef,
+                    data_size,
                 })
             }
             _ => Err(Error::internal(
@@ -529,7 +534,6 @@ mod tests {
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
         testing::{TestCases, check_specific_random},
-        version::LanceFileVersion,
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -617,19 +621,83 @@ mod tests {
         ])
     }
 
+    fn make_fsl_of_list() -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            2,
+        )
+    }
+
+    fn make_fsl_of_large_list() -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new(
+                "item",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            2,
+        )
+    }
+
+    fn make_fsl_of_map() -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new(
+                "item",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int32, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            )),
+            2,
+        )
+    }
+
+    fn make_fsl_of_nested_fsl_struct() -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(Fields::from(vec![Field::new(
+                            "x",
+                            DataType::Int32,
+                            true,
+                        )])),
+                        true,
+                    )),
+                    4,
+                ),
+                true,
+            )),
+            2,
+        )
+    }
+
     #[rstest]
-    #[case::simple(simple_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct(nested_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_list(struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_large_list(struct_with_large_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_map(struct_with_map_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::simple(simple_struct_fields(), 2)]
+    #[case::nested_struct(nested_struct_fields(), 2)]
+    #[case::struct_with_list(struct_with_list_fields(), 2)]
+    #[case::struct_with_large_list(struct_with_large_list_fields(), 2)]
+    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2)]
+    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2)]
+    #[case::struct_with_map(struct_with_map_fields(), 2)]
     #[test_log::test(tokio::test)]
     async fn test_fsl_struct_random(
         #[case] struct_fields: Fields,
         #[case] dimension: i32,
-        #[case] min_version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
@@ -640,47 +708,19 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        let test_cases = TestCases::basic().with_min_file_version(min_version);
+        let test_cases = TestCases::basic().with_u32_structural_encodings();
         check_specific_random(field, test_cases).await;
     }
 
-    // FSL<List> and FSL<Map> are not yet supported (blocked by repdef)
-    #[test]
-    #[should_panic(expected = "Unsupported logical type: list")]
-    fn test_fsl_list_rejected() {
-        let inner = Field::new(
-            "item",
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-            true,
-        );
-        let data_type = DataType::FixedSizeList(Arc::new(inner), 2);
+    #[rstest]
+    #[case::list(make_fsl_of_list())]
+    #[case::large_list(make_fsl_of_large_list())]
+    #[case::map(make_fsl_of_map())]
+    #[case::nested_fsl_struct(make_fsl_of_nested_fsl_struct())]
+    fn test_unsupported_fsl_child_types_return_error(#[case] data_type: DataType) {
         let arrow_field = Field::new("test", data_type, true);
-        let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
-        let _ = lance_field.data_type();
-    }
-
-    #[test]
-    #[should_panic(expected = "Unsupported logical type: map")]
-    fn test_fsl_map_rejected() {
-        let inner = Field::new(
-            "item",
-            DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![
-                        Field::new("key", DataType::Utf8, false),
-                        Field::new("value", DataType::Int32, true),
-                    ])),
-                    false,
-                )),
-                false,
-            ),
-            true,
-        );
-        let data_type = DataType::FixedSizeList(Arc::new(inner), 2);
-        let arrow_field = Field::new("test", data_type, true);
-        let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
-        let _ = lance_field.data_type();
+        let err = lance_core::datatypes::Field::try_from(&arrow_field).unwrap_err();
+        assert!(err.to_string().contains("Unsupported data type"));
     }
 
     #[test]

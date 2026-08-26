@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
     dataset::transaction::{Operation, Transaction},
@@ -10,8 +11,8 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, ROW_ID, Result};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use std::collections::BTreeMap;
@@ -26,6 +27,21 @@ use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 pub struct DeleteResult {
     /// The new dataset after the delete operation.
     pub new_dataset: Arc<Dataset>,
+    /// The number of rows that were deleted.
+    pub num_deleted_rows: u64,
+}
+
+/// Result of a staged delete operation.
+///
+/// The returned transaction can be committed later with [`CommitBuilder`].
+/// Pass `affected_rows` to [`CommitBuilder::with_affected_rows`] when present
+/// to preserve row-level conflict resolution for concurrent deletes and updates.
+#[derive(Debug, Clone)]
+pub struct UncommittedDelete {
+    /// The transaction to commit.
+    pub transaction: Transaction,
+    /// The row addresses affected by the delete, if available.
+    pub affected_rows: Option<RowAddrTreeMap>,
     /// The number of rows that were deleted.
     pub num_deleted_rows: u64,
 }
@@ -104,17 +120,27 @@ async fn apply_deletions(
 #[derive(Debug, Clone)]
 pub struct DeleteBuilder {
     dataset: Arc<Dataset>,
-    predicate: String,
+    filter: ExprFilter,
     conflict_retries: u32,
     retry_timeout: Duration,
 }
 
 impl DeleteBuilder {
-    /// Create a new DeleteBuilder
+    /// Create a new DeleteBuilder with a SQL predicate string
     pub fn new(dataset: Arc<Dataset>, predicate: impl Into<String>) -> Self {
         Self {
             dataset,
-            predicate: predicate.into(),
+            filter: ExprFilter::Sql(predicate.into()),
+            conflict_retries: 10,
+            retry_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Create a new DeleteBuilder with a DataFusion expression filter
+    pub fn from_expr(dataset: Arc<Dataset>, expr: Expr) -> Self {
+        Self {
+            dataset,
+            filter: ExprFilter::Datafusion(expr),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
         }
@@ -136,7 +162,7 @@ impl DeleteBuilder {
     pub async fn execute(self) -> Result<DeleteResult> {
         let job = DeleteJob {
             dataset: self.dataset.clone(),
-            predicate: self.predicate,
+            filter: self.filter,
         };
 
         let config = RetryConfig {
@@ -146,13 +172,63 @@ impl DeleteBuilder {
 
         execute_with_retry(job, self.dataset, config).await
     }
+
+    /// Execute the delete operation without committing the transaction.
+    ///
+    /// Use [`CommitBuilder`] to commit the returned transaction.
+    ///
+    /// # Example: Delete rows from a dataset
+    ///
+    /// ```rust
+    /// use lance::dataset::{CommitBuilder, DeleteBuilder};
+    ///
+    /// # use std::sync::Arc;
+    /// # use lance::Result;
+    /// # use lance::dataset::Dataset;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let staged_delete = DeleteBuilder::new(dataset.clone(), "age > 65")
+    ///     .execute_uncommitted()
+    ///     .await?;
+    /// let mut commit_builder = CommitBuilder::new(dataset);
+    /// if let Some(affected_rows) = staged_delete.affected_rows {
+    ///     commit_builder = commit_builder.with_affected_rows(affected_rows);
+    /// }
+    /// commit_builder
+    ///     .execute(staged_delete.transaction)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_uncommitted(self) -> Result<UncommittedDelete> {
+        let job = DeleteJob {
+            dataset: self.dataset,
+            filter: self.filter,
+        };
+        let data = job.execute_impl().await?;
+        let DeleteData {
+            updated_fragments,
+            deleted_fragment_ids,
+            affected_rows,
+            num_deleted_rows,
+        } = data;
+        let transaction = job.build_transaction(
+            job.dataset.as_ref(),
+            updated_fragments,
+            deleted_fragment_ids,
+        );
+        Ok(UncommittedDelete {
+            transaction,
+            affected_rows,
+            num_deleted_rows,
+        })
+    }
 }
 
 /// Job that executes the delete operation
 #[derive(Debug, Clone)]
 struct DeleteJob {
     dataset: Arc<Dataset>,
-    predicate: String,
+    filter: ExprFilter,
 }
 
 /// Data returned by delete operation
@@ -163,6 +239,29 @@ struct DeleteData {
     num_deleted_rows: u64,
 }
 
+impl DeleteJob {
+    fn build_transaction(
+        &self,
+        dataset: &Dataset,
+        updated_fragments: Vec<Fragment>,
+        deleted_fragment_ids: Vec<u64>,
+    ) -> Transaction {
+        let predicate = match &self.filter {
+            ExprFilter::Sql(s) => s.clone(),
+            ExprFilter::Datafusion(expr) => expr.to_string(),
+            ExprFilter::Substrait(_) => {
+                unreachable!("Substrait filters are not supported in DeleteBuilder")
+            }
+        };
+        let operation = Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        };
+        Transaction::new(dataset.manifest.version, operation, None)
+    }
+}
+
 impl RetryExecutor for DeleteJob {
     type Data = DeleteData;
     type Result = DeleteResult;
@@ -170,10 +269,18 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner
-            .with_row_id()
-            .project(&[ROW_ID])?
-            .filter(&self.predicate)?;
+        scanner.with_row_id().project(&[ROW_ID])?;
+        match &self.filter {
+            ExprFilter::Sql(s) => {
+                scanner.filter(s)?;
+            }
+            ExprFilter::Datafusion(expr) => {
+                scanner.filter_expr(expr.clone());
+            }
+            ExprFilter::Substrait(_) => {
+                unreachable!("Substrait filters are not supported in DeleteBuilder")
+            }
+        }
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
@@ -246,17 +353,18 @@ impl RetryExecutor for DeleteJob {
     }
 
     async fn commit(&self, dataset: Arc<Dataset>, data: Self::Data) -> Result<Self::Result> {
-        let num_deleted_rows = data.num_deleted_rows;
-        let operation = Operation::Delete {
-            updated_fragments: data.updated_fragments,
-            deleted_fragment_ids: data.deleted_fragment_ids,
-            predicate: self.predicate.clone(),
-        };
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let DeleteData {
+            updated_fragments,
+            deleted_fragment_ids,
+            affected_rows,
+            num_deleted_rows,
+        } = data;
+        let transaction =
+            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids);
 
         let mut builder = CommitBuilder::new(dataset);
 
-        if let Some(affected_rows) = data.affected_rows {
+        if let Some(affected_rows) = affected_rows {
             builder = builder.with_affected_rows(affected_rows);
         }
 
@@ -288,6 +396,7 @@ mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, UpdateBuilder};
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
@@ -296,7 +405,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
-    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use rstest::rstest;
     use std::collections::HashSet;
     use std::ops::Range;
@@ -589,6 +698,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_execute_uncommitted_preserves_affected_rows_for_rebase() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
+        }
+
+        let tmp_dir = TempStrDir::default();
+        let tmp_path = tmp_dir.as_str().to_string();
+
+        let dataset = InsertBuilder::new(&tmp_path)
+            .execute(vec![sequence_data(0..100)])
+            .await
+            .unwrap();
+        let initial_version = dataset.version().version;
+
+        let staged_delete = DeleteBuilder::new(Arc::new(dataset.clone()), "i < 10")
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let dataset_before_commit = Dataset::open(&tmp_path).await.unwrap();
+        assert_eq!(dataset_before_commit.version().version, initial_version);
+        assert_eq!(dataset_before_commit.count_rows(None).await.unwrap(), 100);
+
+        assert_eq!(staged_delete.num_deleted_rows, 10);
+        assert!(staged_delete.affected_rows.is_some());
+        assert_eq!(staged_delete.transaction.read_version, initial_version);
+        match &staged_delete.transaction.operation {
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate,
+            } => {
+                assert_eq!(predicate, "i < 10");
+                assert_eq!(updated_fragments.len(), 1);
+                assert!(deleted_fragment_ids.is_empty());
+            }
+            other => panic!("expected delete transaction, got {other:?}"),
+        }
+
+        DeleteBuilder::new(Arc::new(dataset.clone()), "i >= 10 AND i < 20")
+            .execute()
+            .await
+            .unwrap();
+
+        let mut commit_builder = CommitBuilder::new(&tmp_path);
+        if let Some(affected_rows) = staged_delete.affected_rows {
+            commit_builder = commit_builder.with_affected_rows(affected_rows);
+        }
+        let committed = commit_builder
+            .execute(staged_delete.transaction)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, initial_version + 2);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 80);
+    }
+
+    #[tokio::test]
     async fn test_concurrent_delete_with_retries() {
         use futures::future::try_join_all;
         use tokio::sync::Barrier;
@@ -820,7 +992,7 @@ mod tests {
         let dataset_arc = Arc::new(dataset);
         let delete_job = DeleteJob {
             dataset: dataset_arc.clone(),
-            predicate: "true".to_string(),
+            filter: ExprFilter::Sql("true".to_string()),
         };
         let delete_data = delete_job.execute_impl().await.unwrap();
 
@@ -863,5 +1035,38 @@ mod tests {
             .unwrap();
         // All rows should be deleted, including the updated ones
         assert_eq!(final_result.new_dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_expr_filter() {
+        use datafusion::prelude::{col, lit};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100u32))],
+        )
+        .unwrap();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        // Delete rows where i < 10 using an Expr filter
+        let expr = col("i").lt(lit(10u32));
+        let result = DeleteBuilder::from_expr(Arc::new(dataset.clone()), expr)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_deleted_rows, 10);
+
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
     }
 }

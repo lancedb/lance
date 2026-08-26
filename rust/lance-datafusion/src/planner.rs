@@ -14,8 +14,10 @@ use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
+use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
@@ -39,13 +41,11 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::{
     common::Column,
     logical_expr::{Between, BinaryExpr, Like, Operator},
-    physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
 
@@ -57,6 +57,31 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+// The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
+// Reject empty or multi-character escape strings rather than silently treating
+// them as "no escape" or truncating to the first character.
+fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+    let Some(value) = escape_char else {
+        return Ok(None);
+    };
+    let ValueWithSpan {
+        value: Value::SingleQuotedString(escape),
+        ..
+    } = value
+    else {
+        return Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
+        )));
+    };
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character, got '{escape}'"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -73,10 +98,6 @@ impl CastListF16Udf {
 }
 
 impl ScalarUDFImpl for CastListF16Udf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_cast_list_f16"
     }
@@ -198,6 +219,13 @@ impl ContextProvider for LanceContextProvider {
         self.state.window_functions().get(name).cloned()
     }
 
+    fn get_higher_order_meta(
+        &self,
+        name: &str,
+    ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
+        self.state.higher_order_functions().get(name).cloned()
+    }
+
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
         match f {
             // TODO: cast should go thru CAST syntax instead of UDF
@@ -226,6 +254,14 @@ impl ContextProvider for LanceContextProvider {
 
     fn udwf_names(&self) -> Vec<String> {
         self.state.window_functions().keys().cloned().collect()
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        self.state
+            .higher_order_functions()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -322,6 +358,8 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
+            BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -330,17 +368,89 @@ impl Planner {
         })
     }
 
+    fn is_logical_binary_op(op: &BinaryOperator) -> bool {
+        matches!(op, BinaryOperator::And | BinaryOperator::Or)
+    }
+
+    fn is_same_logical_binary_op(left: &BinaryOperator, right: &BinaryOperator) -> bool {
+        matches!(
+            (left, right),
+            (BinaryOperator::And, BinaryOperator::And) | (BinaryOperator::Or, BinaryOperator::Or)
+        )
+    }
+
+    fn flatten_logical_binary_exprs<'a>(
+        left: &'a SQLExpr,
+        op: &BinaryOperator,
+        right: &'a SQLExpr,
+    ) -> Vec<&'a SQLExpr> {
+        let mut leaves = Vec::new();
+        let mut stack = vec![right, left];
+
+        while let Some(expr) = stack.pop() {
+            match expr {
+                SQLExpr::BinaryOp {
+                    left,
+                    op: child_op,
+                    right,
+                } if Self::is_same_logical_binary_op(op, child_op) => {
+                    stack.push(right.as_ref());
+                    stack.push(left.as_ref());
+                }
+                _ => leaves.push(expr),
+            }
+        }
+
+        leaves
+    }
+
+    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+        if exprs.is_empty() {
+            return Err(Error::invalid_input("Binary expression has no operands"));
+        }
+
+        while exprs.len() > 1 {
+            let mut next = VecDeque::with_capacity(exprs.len().div_ceil(2));
+            while let Some(left) = exprs.pop_front() {
+                if let Some(right) = exprs.pop_front() {
+                    next.push_back(Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(left),
+                        op,
+                        Box::new(right),
+                    )));
+                } else {
+                    next.push_back(left);
+                }
+            }
+            exprs = next;
+        }
+
+        exprs
+            .pop_front()
+            .ok_or_else(|| Error::invalid_input("Binary expression has no operands"))
+    }
+
     fn binary_expr(&self, left: &SQLExpr, op: &BinaryOperator, right: &SQLExpr) -> Result<Expr> {
+        let df_op = self.binary_op(op)?;
+        if Self::is_logical_binary_op(op) {
+            let leaves = Self::flatten_logical_binary_exprs(left, op, right);
+            let mut exprs = VecDeque::with_capacity(leaves.len());
+            for leaf in leaves {
+                exprs.push_back(self.parse_sql_expr(leaf)?);
+            }
+            return Self::balanced_binary_expr(exprs, df_op);
+        }
+
         Ok(Expr::BinaryExpr(BinaryExpr::new(
             Box::new(self.parse_sql_expr(left)?),
-            self.binary_op(op)?,
+            df_op,
             Box::new(self.parse_sql_expr(right)?),
         )))
     }
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
         Ok(match op {
-            UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
 
@@ -379,6 +489,8 @@ impl Planner {
             Cow::Borrowed(value)
         };
         if let Ok(n) = value.parse::<i64>() {
+            Ok(lit(n))
+        } else if let Ok(n) = value.parse::<u64>() {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
@@ -432,7 +544,7 @@ impl Planner {
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported function args: {:?}",
-                &func.args
+                func.args
             ))),
         }
     }
@@ -676,10 +788,10 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
-                Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
-                    data_type: self.parse_type(data_type)?,
-                }))
+                Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
+                    self.parse_type(data_type)?,
+                )))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(expr) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
@@ -711,16 +823,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 true,
             ))),
             SQLExpr::Like {
@@ -733,16 +836,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 false,
             ))),
             // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
@@ -767,15 +861,15 @@ impl Planner {
             } => match kind {
                 datafusion::sql::sqlparser::ast::CastKind::TryCast
                 | datafusion::sql::sqlparser::ast::CastKind::SafeCast => {
-                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast {
-                        expr: Box::new(self.parse_sql_expr(expr)?),
-                        data_type: self.parse_type(data_type)?,
-                    }))
+                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast::new(
+                        Box::new(self.parse_sql_expr(expr)?),
+                        self.parse_type(data_type)?,
+                    )))
                 }
-                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(self.parse_sql_expr(expr)?),
-                    data_type: self.parse_type(data_type)?,
-                })),
+                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(self.parse_sql_expr(expr)?),
+                    self.parse_type(data_type)?,
+                ))),
             },
             SQLExpr::JsonAccess { .. } => Err(Error::invalid_input("JSON access is not supported")),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
@@ -918,15 +1012,18 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
-        // DataFusion needs the simplify and coerce passes to be applied before
+        // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
-        let props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-        let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
+        let simplify_context = SimplifyContext::builder()
+            .with_schema(df_schema.clone())
+            .with_query_execution_start_time(Some(Utc::now()))
+            .build();
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
-        let expr = simplifier.simplify(expr)?;
+        // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+        let expr = simplifier.simplify(expr)?;
 
         Ok(expr)
     }
@@ -939,6 +1036,16 @@ impl Planner {
             df_schema.as_ref(),
             &Default::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.
@@ -989,13 +1096,9 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
                 self.columns.insert(path);
                 self.current_path.clear();
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                        self.current_path.push_front(name.to_string())
-                    } else {
-                        self.current_path.clear();
-                    }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
+                    self.current_path.push_front(name.to_string())
                 } else {
                     self.current_path.clear();
                 }
@@ -1020,7 +1123,7 @@ mod tests {
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
         StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1028,6 +1131,7 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1098,6 +1202,88 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_parse_filter_uint64_literal_above_i64_max() {
+        let value = u64::MAX - 1;
+        let batch = arrow_array::record_batch!(("id", UInt64, [1, value])).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(&format!("id = {value}")).unwrap();
+        assert_eq!(expr, col("id").eq(lit(value)));
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
+    }
+
+    #[test]
+    fn test_parse_deep_logical_filter() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+
+        for op in ["AND", "OR"] {
+            let filter = std::iter::repeat_n("true", 1000)
+                .collect::<Vec<_>>()
+                .join(&format!(" {op} "));
+
+            let expr = planner.parse_filter(&filter).unwrap();
+            let optimized = planner.optimize_expr(expr).unwrap();
+
+            assert_eq!(optimized, lit(true));
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Hash)]
+    struct StrictFloat64Udf {
+        signature: Signature,
+    }
+
+    impl StrictFloat64Udf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for StrictFloat64Udf {
+        fn name(&self) -> &str {
+            "strict_float64"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+            let data_type = args.args[0].data_type();
+            assert_eq!(
+                data_type,
+                DataType::Float64,
+                "strict_float64 expected Float64, got {data_type}"
+            );
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(0.0))))
+        }
+    }
+
+    #[test]
+    fn test_coerce_before_simplify() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+        let strict_float64 = Arc::new(ScalarUDF::new_from_impl(StrictFloat64Udf::new()));
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(strict_float64, vec![lit(0_i64)]))
+            .eq(lit(0.0_f64));
+
+        let optimized = planner.optimize_expr(expr).unwrap();
+
+        planner.create_physical_expr(&optimized).unwrap();
     }
 
     #[test]
@@ -1232,6 +1418,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
+    #[case::left(
+        "value << 1",
+        Operator::BitwiseShiftLeft,
+        vec![0, 2_u64 << 32, ((3_u64 << 32) + 7) << 1]
+    )]
+    fn test_bitwise_shift_expressions(
+        #[case] sql: &str,
+        #[case] expected_op: Operator,
+        #[case] expected: Vec<u64>,
+    ) {
+        let input = vec![0, 1_u64 << 32, (3_u64 << 32) + 7];
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(UInt64Array::from(input)) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let values = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(values.as_ref(), &UInt64Array::from(expected));
+    }
+
     #[test]
     fn test_negative_array_expressions() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -1308,6 +1528,36 @@ mod tests {
                 true, true, true, true, false, true, true, true, true, true
             ])
         );
+    }
+
+    #[test]
+    fn test_like_escape_char() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A valid single-character escape is captured for both LIKE and ILIKE.
+        for filter in ["s LIKE 'a!%' ESCAPE '!'", "s ILIKE 'a!%' ESCAPE '!'"] {
+            match planner.parse_filter(filter).unwrap() {
+                Expr::Like(like) => assert_eq!(like.escape_char, Some('!'), "{filter}"),
+                other => panic!("expected a LIKE expression for `{filter}`, got {other:?}"),
+            }
+        }
+
+        // Empty and multi-character escapes are rejected rather than silently
+        // dropped or truncated to the first character.
+        for filter in [
+            "s LIKE 'x' ESCAPE ''",
+            "s LIKE 'x' ESCAPE 'ab'",
+            "s ILIKE 'x' ESCAPE ''",
+            "s ILIKE 'x' ESCAPE 'ab'",
+        ] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid escape character in LIKE expression"),
+                "unexpected error for `{filter}`: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1466,7 +1716,7 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
@@ -1476,7 +1726,7 @@ mod tests {
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },
@@ -1517,14 +1767,14 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },

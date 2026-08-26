@@ -13,6 +13,7 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.DocumentGranularity;
 import org.lance.util.JsonUtils;
 
 import com.google.common.base.Preconditions;
@@ -53,7 +54,10 @@ public final class InvertedIndexParams {
     private Integer minNgramLength;
     private Integer maxNgramLength;
     private Boolean prefixOnly;
+    private Integer blockSize = 128;
     private Boolean skipMerge;
+    private Integer formatVersion;
+    private DocumentGranularity documentGranularity = DocumentGranularity.ROW;
 
     /**
      * Configure the base tokenizer.
@@ -65,6 +69,9 @@ public final class InvertedIndexParams {
      *   <li>{@code "whitespace"}: splits tokens on whitespace
      *   <li>{@code "raw"}: no tokenization
      *   <li>{@code "ngram"}: N-Gram tokenizer
+     *   <li>{@code "code"}: code-aware tokenizer
+     *   <li>{@code "icu"}: ICU dictionary-based Unicode word segmentation
+     *   <li>{@code "icu/split"}: ICU segmentation with simple-style delimiter splitting
      *   <li>{@code "lindera/*"}: Lindera tokenizer
      *   <li>{@code "jieba/*"}: Jieba tokenizer
      * </ul>
@@ -224,6 +231,27 @@ public final class InvertedIndexParams {
     }
 
     /**
+     * Configure the number of documents in each compressed posting block.
+     *
+     * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 128} when
+     * this is not set.
+     *
+     * <p>{@code blockSize = 256} requires FTS format v3. Format v3 also supports the default {@code
+     * blockSize = 128}.
+     *
+     * @param blockSize posting block size
+     * @return this builder
+     * @throws IllegalArgumentException if {@code blockSize} is unsupported
+     */
+    public Builder blockSize(int blockSize) {
+      if (blockSize != 128 && blockSize != 256) {
+        throw new IllegalArgumentException("blockSize must be one of 128 or 256");
+      }
+      this.blockSize = blockSize;
+      return this;
+    }
+
+    /**
      * Configure whether to skip the partition merge stage after indexing. If true, skip the
      * partition merge stage after indexing. This can be useful for distributed indexing where merge
      * is handled separately.
@@ -236,8 +264,50 @@ public final class InvertedIndexParams {
       return this;
     }
 
+    /**
+     * Configure the on-disk FTS format version to write when creating a new index.
+     *
+     * <p>If unset, Lance uses {@code LANCE_FTS_FORMAT_VERSION} when present and otherwise selects
+     * v3 for the code analyzer or {@code blockSize = 256}, and v2 for other indexes. Format v3
+     * supports both posting block sizes. Formats v1 and v2 support only {@code blockSize = 128} and
+     * cannot be used with the code analyzer.
+     *
+     * @param formatVersion FTS format version, must be 1, 2, or 3
+     * @return this builder
+     * @throws IllegalArgumentException
+     */
+    public Builder formatVersion(int formatVersion) {
+      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3) {
+        throw new IllegalArgumentException("formatVersion must be 1, 2, or 3");
+      }
+      this.formatVersion = formatVersion;
+      return this;
+    }
+
+    /**
+     * Configure the unit treated as one FTS document.
+     *
+     * <p>{@link DocumentGranularity#LIST_ELEMENT} uses each element of the deepest list on the
+     * indexed field path as one document. The default is {@link DocumentGranularity#ROW}.
+     *
+     * @param documentGranularity document boundary semantics
+     * @return this builder
+     */
+    public Builder documentGranularity(DocumentGranularity documentGranularity) {
+      this.documentGranularity =
+          Objects.requireNonNull(documentGranularity, "documentGranularity must not be null");
+      return this;
+    }
+
     /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
+      if (formatVersion != null) {
+        Preconditions.checkArgument(
+            formatVersion == 3 || blockSize == 128, "formatVersion 1 and 2 require blockSize 128");
+        Preconditions.checkArgument(
+            !"code".equals(baseTokenizer) || formatVersion == 3,
+            "baseTokenizer 'code' requires formatVersion 3");
+      }
       Map<String, Object> params = new HashMap<>();
       if (baseTokenizer != null) {
         params.put("base_tokenizer", baseTokenizer);
@@ -280,9 +350,16 @@ public final class InvertedIndexParams {
       if (prefixOnly != null) {
         params.put("prefix_only", prefixOnly);
       }
+      if (blockSize != null) {
+        params.put("block_size", blockSize);
+      }
       if (skipMerge != null) {
         params.put("skip_merge", skipMerge);
       }
+      if (formatVersion != null) {
+        params.put("format_version", formatVersion);
+      }
+      params.put("document_granularity", documentGranularity.toRustString());
 
       String json = JsonUtils.toJson(params);
       return ScalarIndexParams.create(INDEX_TYPE, json);

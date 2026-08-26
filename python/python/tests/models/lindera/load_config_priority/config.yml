@@ -1,7 +1,6 @@
 segmenter:
   mode: "normal"
-  dictionary:
-    path: "./python/tests/models/lindera/ipadic/main"
+  dictionary: "./python/tests/models/lindera/ipadic/main"
 
 character_filters:
   - kind: mapping

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import pyarrow as pa
 
-from .io import StorageOptionsProvider
 from .lance import (
     LanceBufferDescriptor,
     LanceColumnMetadata,
@@ -24,6 +24,10 @@ from .lance import (
 from .lance import (
     LanceFileWriter as _LanceFileWriter,
 )
+
+if TYPE_CHECKING:
+    from .blob import DedicatedBlobWriter, PackedBlobWriter
+    from .namespace import LanceNamespace
 
 
 class ReaderResults:
@@ -67,7 +71,8 @@ class LanceFileReader:
         storage_options: Optional[Dict[str, str]] = None,
         columns: Optional[List[str]] = None,
         *,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -82,9 +87,12 @@ class LanceFileReader:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional
-            A provider that can provide storage options dynamically. This is useful
-            for credentials that need to be refreshed or vended on-demand.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         columns: list of str, default None
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
@@ -97,7 +105,8 @@ class LanceFileReader:
             self._reader = _LanceFileReader(
                 path,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
+                namespace_client=namespace_client,
+                table_id=table_id,
                 columns=columns,
             )
 
@@ -200,6 +209,26 @@ class LanceFileReader:
         return self._reader.num_rows()
 
 
+@dataclass
+class ListResult:
+    """
+    Result of a non-recursive, delimited list (see
+    :meth:`LanceFileSession.list_with_delimiter`).
+
+    Attributes
+    ----------
+    common_prefixes : List[str]
+        The immediate child "directories" of the listed path, relative to the
+        session's base path.
+    objects : List[str]
+        The immediate child files of the listed path, relative to the session's
+        base path.
+    """
+
+    common_prefixes: List[str]
+    objects: List[str]
+
+
 class LanceFileSession:
     """
     A file session for reading and writing Lance files.
@@ -213,7 +242,8 @@ class LanceFileSession:
         self,
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ):
         """
         Creates a new file session
@@ -227,16 +257,20 @@ class LanceFileSession:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional
-            A provider that can provide storage options dynamically. This is useful
-            for credentials that need to be refreshed or vended on-demand.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         """
         if isinstance(base_path, Path):
             base_path = str(base_path)
         self._session = _LanceFileSession(
             base_path,
             storage_options=storage_options,
-            storage_options_provider=storage_options_provider,
+            namespace_client=namespace_client,
+            table_id=table_id,
         )
 
     def open_reader(
@@ -299,6 +333,24 @@ class LanceFileSession:
             _inner_writer=inner,
         )
 
+    def open_packed_blob_writer(self, path: str, blob_id: int) -> "PackedBlobWriter":
+        """
+        Opens a packed blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_packed_blob_writer(path, blob_id)
+
+    def open_dedicated_blob_writer(
+        self, path: str, blob_id: int
+    ) -> "DedicatedBlobWriter":
+        """
+        Opens a dedicated blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_dedicated_blob_writer(path, blob_id)
+
     def contains(self, path: str) -> bool:
         """
         Check if a file exists at the given path (relative to this session's base path).
@@ -331,6 +383,66 @@ class LanceFileSession:
             List of file paths.
         """
         return self._session.list(path)
+
+    def list_with_delimiter(self, path: Optional[str] = None) -> ListResult:
+        """
+        Non-recursively list a single directory level (relative to this
+        session's base path).
+
+        Unlike :meth:`list`, which recurses into the entire subtree, this
+        returns only the immediate children of ``path``: the child
+        "directories" as ``common_prefixes`` and the direct child files as
+        ``objects``.
+
+        Parameters
+        ----------
+        path : str, optional
+            Path relative to `base_path` to list. If None, lists the base path.
+
+        Returns
+        -------
+        ListResult
+            The immediate child prefixes and objects of `path`.
+        """
+        common_prefixes, objects = self._session.list_with_delimiter(path)
+        return ListResult(common_prefixes=common_prefixes, objects=objects)
+
+    def read_range(self, path: str, offset: int, length: int) -> bytes:
+        """
+        Read a byte range from a file (relative to this session's base path).
+
+        Issues a single ranged read. Reading a missing object raises
+        ``OSError``, consistent with ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to read from.
+        offset : int
+            Byte offset at which to start reading.
+        length : int
+            Number of bytes to read.
+
+        Returns
+        -------
+        bytes
+            The requested byte range.
+        """
+        return self._session.read_range(path, offset, length)
+
+    def delete_file(self, path: str) -> None:
+        """
+        Delete a file (relative to this session's base path).
+
+        Deleting a path that does not exist raises ``OSError``, consistent with
+        ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to delete.
+        """
+        self._session.delete_file(path)
 
     def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
         """
@@ -370,6 +482,12 @@ class LanceFileWriter:
     This class is used to write Lance data files, a low level structure
     optimized for storing multi-modal tabular data.  If you are working with
     Lance datasets then you should use the LanceDataset class instead.
+
+    Attributes
+    ----------
+    size_bytes: Optional[int]
+        The final size of the file in bytes.  This is None until `close` is
+        called.
     """
 
     def __init__(
@@ -380,7 +498,8 @@ class LanceFileWriter:
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional[StorageOptionsProvider] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
         max_page_bytes: Optional[int] = None,
         _inner_writer: Optional[_LanceFileWriter] = None,
         **kwargs,
@@ -407,10 +526,12 @@ class LanceFileWriter:
         storage_options : optional, dict
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : optional, StorageOptionsProvider
-            A storage options provider that can fetch and refresh storage options
-            dynamically. This is useful for credentials that expire and need to be
-            refreshed automatically.
+        namespace_client : optional, LanceNamespace
+            A namespace client for automatic credential refresh.
+            Must be provided together with table_id.
+        table_id : optional, List[str]
+            The table identifier within the namespace.
+            Must be provided together with namespace_client.
         max_page_bytes : optional, int
             The maximum size of a page in bytes, if a single array would create a
             page larger than this then it will be split into multiple pages. The
@@ -427,11 +548,13 @@ class LanceFileWriter:
                 data_cache_bytes=data_cache_bytes,
                 version=version,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
+                namespace_client=namespace_client,
+                table_id=table_id,
                 max_page_bytes=max_page_bytes,
                 **kwargs,
             )
         self.closed = False
+        self.size_bytes: Optional[int] = None
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """
@@ -453,11 +576,17 @@ class LanceFileWriter:
         Write the file metadata and close the file
 
         Returns the number of rows written to the file
+
+        After this returns, ``size_bytes`` holds the final size of the file.  This
+        is reported by the writer itself, so it is available for object stores
+        without issuing a separate metadata request.
         """
         if self.closed:
             return
         self.closed = True
-        return self._writer.finish()
+        summary = self._writer.finish()
+        self.size_bytes = summary.size_bytes
+        return summary.num_rows
 
     def add_schema_metadata(self, key: str, value: str) -> None:
         """

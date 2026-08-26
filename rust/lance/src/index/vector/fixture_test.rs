@@ -5,10 +5,10 @@
 
 #[cfg(test)]
 mod test {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::{
         any::Any,
         cell::OnceCell,
-        collections::HashMap,
         sync::{Arc, Mutex},
     };
 
@@ -18,8 +18,8 @@ mod test {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::deepsize::{Context, DeepSizeOf};
     use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{Index, IndexType, vector::Query};
@@ -54,7 +54,8 @@ mod test {
 
     impl DeepSizeOf for ResidualCheckMockIndex {
         fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-            self.assert_query_value.deep_size_of_children(cx) + self.ret_val.get_array_memory_size()
+            self.assert_query_value.deep_size_of_children(cx)
+                + self.ret_val.deep_size_of_children(cx)
         }
     }
 
@@ -68,10 +69,6 @@ mod test {
         /// Cast to [Index]
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -152,7 +149,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -207,11 +204,11 @@ mod test {
                 assert_query_value: assert_query,
                 ret_val: RecordBatch::new_empty(Arc::new(Schema::new(vec![
                     Field::new("id", DataType::UInt64, false),
-                    Field::new("_distance", DataType::Float32, false),
+                    Field::new("_distance", DataType::Float32, true),
                 ]))),
             });
             IVFIndex::try_new(
-                &Uuid::new_v4().to_string(),
+                Uuid::new_v4(),
                 ivf,
                 reader.into(),
                 mock_sub_index,
@@ -266,7 +263,9 @@ mod test {
                 refine_factor: None,
                 metric_type: Some(metric),
                 use_index: true,
+                query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                 dist_q_c: 0.0,
+                approx_mode: Default::default(),
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
             let (partition_ids, _) = idx.find_partitions(&q).unwrap();
@@ -278,6 +277,8 @@ mod test {
                 Arc::new(DatasetPreFilter {
                     deleted_ids: None,
                     filtered_ids: None,
+                    deleted_fragments: None,
+                    overlay_block: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
                 &NoOpMetricsCollector,

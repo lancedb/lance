@@ -10,7 +10,7 @@ use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::Statistics;
@@ -29,8 +29,6 @@ use crate::Dataset;
 use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
-
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
@@ -47,7 +45,7 @@ pub struct AddRowAddrExec {
     /// Position in the output schema where to insert the row address
     rowaddr_pos: usize,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -106,10 +104,13 @@ impl AddRowAddrExec {
 
         // Is just a simple projections, so it inherits the partitioning and
         // execution mode from parent.
-        let properties = input
-            .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+        );
 
         Ok(Self {
             input,
@@ -188,15 +189,19 @@ impl AddRowAddrExec {
         let rowid_pos = self.rowid_pos;
         let rowaddr_pos = self.rowaddr_pos;
         let output_schema = self.output_schema.clone();
-        let stream = input_stream.then(move |batch| {
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input_stream.then(move |batch_result| {
             let output_schema = output_schema.clone();
             let index_prereq = index_prereq.clone();
+            let elapsed_compute = elapsed_compute.clone();
             async move {
-                let batch = batch?;
+                let batch = batch_result?;
                 index_prereq.wait_ready().await?;
                 let row_id_index = index_prereq.get_ready();
                 let index_ref = row_id_index.as_deref();
 
+                let _t = elapsed_compute.timer();
                 let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
@@ -208,14 +213,17 @@ impl AddRowAddrExec {
                 Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
             }
         });
-
-        let stream = InstrumentedRecordBatchStreamAdapter::new(
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
-            stream.boxed(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream))
+            stream,
+        )))
     }
 }
 
@@ -232,10 +240,6 @@ impl DisplayAs for AddRowAddrExec {
 impl ExecutionPlan for AddRowAddrExec {
     fn name(&self) -> &str {
         "AddRowAddrExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> Arc<Schema> {
@@ -283,8 +287,8 @@ impl ExecutionPlan for AddRowAddrExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        let mut stats = self.input.partition_statistics(partition)?;
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -319,14 +323,14 @@ impl ExecutionPlan for AddRowAddrExec {
             .column_statistics
             .insert(self.rowaddr_pos, row_addr_col_stats);
 
-        Ok(stats)
+        Ok(Arc::new(stats))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 }
@@ -347,7 +351,7 @@ pub struct AddRowOffsetExec {
     input: Arc<dyn ExecutionPlan>,
     row_addr_pos: usize,
     frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AddRowOffsetExec {
@@ -376,7 +380,13 @@ impl AddRowOffsetExec {
 
         let new_eq_props =
             EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
-        let properties = input.properties().clone().with_eq_properties(new_eq_props);
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(new_eq_props),
+        );
 
         Ok(Self {
             input,
@@ -428,15 +438,19 @@ impl AddRowOffsetExec {
         frag_id_to_offset: &HashMap<u32, FragInfo>,
     ) -> Result<ArrayRef> {
         let row_addr_values = row_addr.as_primitive::<UInt64Type>().values();
-        let mut row_offsets = Vec::with_capacity(row_addr_values.len());
+        let mut row_offsets = vec![0; row_addr_values.len()];
+        // The deletion iterator only moves forward, so compute in address order and
+        // scatter the offsets back into input order.
+        let mut sorted_row_indices = (0..row_addr_values.len()).collect::<Vec<_>>();
+        sorted_row_indices.sort_unstable_by_key(|index| row_addr_values[*index]);
 
         let mut last_frag_id = u32::MAX;
         let mut last_frag_offset = 0;
         let mut last_frag_delete_count = 0;
         let mut dv_iter = None;
 
-        for addr in row_addr_values {
-            let addr = RowAddress::new_from_u64(*addr);
+        for row_index in sorted_row_indices {
+            let addr = RowAddress::new_from_u64(row_addr_values[row_index]);
             let frag_id = addr.fragment_id();
             if frag_id != last_frag_id {
                 last_frag_id = frag_id;
@@ -466,10 +480,10 @@ impl AddRowOffsetExec {
                         break;
                     }
                 }
-                row_offsets
-                    .push(last_frag_offset + row_offset as u64 - last_frag_delete_count as u64);
+                row_offsets[row_index] =
+                    last_frag_offset + row_offset as u64 - last_frag_delete_count as u64;
             } else {
-                row_offsets.push(last_frag_offset + row_offset as u64);
+                row_offsets[row_index] = last_frag_offset + row_offset as u64;
             }
         }
 
@@ -492,11 +506,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         "AddRowOffsetExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -512,7 +522,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         vec![false]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -720,5 +730,28 @@ mod test {
             .iter()
             .fold(0, |acc, col| acc + col.get_array_memory_size());
         assert_eq!(stats.total_byte_size, Precision::Exact(actual_byte_size));
+    }
+
+    #[test]
+    fn test_row_offsets_with_unsorted_addresses() {
+        let row_addrs: ArrayRef = Arc::new(UInt64Array::from(vec![
+            u64::from(RowAddress::new_from_parts(0, 100)),
+            u64::from(RowAddress::new_from_parts(0, 50)),
+        ]));
+        let frag_id_to_offset = HashMap::from([(
+            0,
+            FragInfo {
+                row_offset: 1_000,
+                deletion_vector: Some(Arc::new(DeletionVector::from_iter([10, 60]))),
+            },
+        )]);
+
+        let row_offsets =
+            AddRowOffsetExec::compute_row_offsets(&row_addrs, &frag_id_to_offset).unwrap();
+
+        assert_eq!(
+            row_offsets.as_primitive::<UInt64Type>().values(),
+            &[1_098, 1_049]
+        );
     }
 }

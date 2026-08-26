@@ -13,12 +13,53 @@
  */
 package org.lance.namespace;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
+import org.lance.Fragment;
+import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
+import org.lance.Transaction;
 import org.lance.WriteParams;
-import org.lance.namespace.model.*;
+import org.lance.namespace.errors.ErrorCode;
+import org.lance.namespace.errors.LanceNamespaceException;
+import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CreateNamespaceRequest;
+import org.lance.namespace.model.CreateNamespaceResponse;
+import org.lance.namespace.model.CreateTableIndexRequest;
+import org.lance.namespace.model.CreateTableIndexResponse;
+import org.lance.namespace.model.CreateTableRequest;
+import org.lance.namespace.model.CreateTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
+import org.lance.namespace.model.DeregisterTableRequest;
+import org.lance.namespace.model.DeregisterTableResponse;
+import org.lance.namespace.model.DescribeNamespaceRequest;
+import org.lance.namespace.model.DescribeNamespaceResponse;
+import org.lance.namespace.model.DescribeTableRequest;
+import org.lance.namespace.model.DescribeTableResponse;
 import org.lance.namespace.model.DescribeTableVersionRequest;
 import org.lance.namespace.model.DescribeTableVersionResponse;
+import org.lance.namespace.model.DropNamespaceRequest;
+import org.lance.namespace.model.DropNamespaceResponse;
+import org.lance.namespace.model.DropTableRequest;
+import org.lance.namespace.model.DropTableResponse;
+import org.lance.namespace.model.InsertIntoTableRequest;
+import org.lance.namespace.model.InsertIntoTableResponse;
+import org.lance.namespace.model.ListNamespacesRequest;
+import org.lance.namespace.model.ListNamespacesResponse;
+import org.lance.namespace.model.ListTableIndicesRequest;
+import org.lance.namespace.model.ListTableIndicesResponse;
+import org.lance.namespace.model.ListTableVersionsRequest;
+import org.lance.namespace.model.ListTableVersionsResponse;
+import org.lance.namespace.model.ListTablesRequest;
+import org.lance.namespace.model.ListTablesResponse;
+import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableRequestVector;
+import org.lance.namespace.model.RegisterTableRequest;
+import org.lance.namespace.model.RegisterTableResponse;
+import org.lance.namespace.model.TableExistsRequest;
+import org.lance.operation.Append;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -55,23 +96,40 @@ import static org.junit.jupiter.api.Assertions.*;
 public class DirectoryNamespaceTest {
   @TempDir Path tempDir;
 
-  private BufferAllocator allocator;
-  private DirectoryNamespace namespace;
+  protected BufferAllocator allocator;
+  protected LanceNamespace namespaceClient;
+  protected DirectoryNamespace innerNamespaceClient;
 
   @BeforeEach
   void setUp() {
     allocator = new RootAllocator(Long.MAX_VALUE);
-    namespace = new DirectoryNamespace();
+    innerNamespaceClient = new DirectoryNamespace();
 
     Map<String, String> config = new HashMap<>();
     config.put("root", tempDir.toString());
-    namespace.initialize(config, allocator);
+    innerNamespaceClient.initialize(config, allocator);
+    namespaceClient = wrapNamespace(innerNamespaceClient);
+  }
+
+  /**
+   * Factory method to wrap the DirectoryNamespace. Subclasses can override this to provide a custom
+   * namespace implementation.
+   *
+   * @param inner The DirectoryNamespace to wrap
+   * @return The namespace client to use in tests (may be the same as inner or a wrapper)
+   */
+  protected LanceNamespace wrapNamespace(DirectoryNamespace inner) {
+    return inner;
   }
 
   @AfterEach
   void tearDown() {
-    if (namespace != null) {
-      namespace.close();
+    if (namespaceClient != null && namespaceClient instanceof java.io.Closeable) {
+      try {
+        ((java.io.Closeable) namespaceClient).close();
+      } catch (Exception e) {
+        // Ignore
+      }
     }
     if (allocator != null) {
       allocator.close();
@@ -124,21 +182,50 @@ public class DirectoryNamespaceTest {
 
   @Test
   void testNamespaceId() {
-    String namespaceId = namespace.namespaceId();
+    String namespaceId = namespaceClient.namespaceId();
     assertNotNull(namespaceId);
-    assertTrue(namespaceId.contains("DirectoryNamespace"));
+    assertTrue(
+        namespaceId.contains("DirectoryNamespace"),
+        "namespaceId should contain 'DirectoryNamespace', got: " + namespaceId);
+  }
+
+  @Test
+  void testOpenSpecificVersionDoesNotPassVersionToDescribeTable() throws Exception {
+    VersionRejectingNamespace versionRejectingNamespace =
+        new VersionRejectingNamespace(innerNamespaceClient);
+    namespaceClient = versionRejectingNamespace;
+    List<String> tableId = Arrays.asList("test_table");
+
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+    namespaceClient.insertIntoTable(
+        new InsertIntoTableRequest().id(tableId).mode("append"), createTestTableData());
+
+    try (Dataset versionOne =
+        Dataset.open()
+            .allocator(allocator)
+            .namespaceClient(namespaceClient)
+            .tableId(tableId)
+            .readOptions(new ReadOptions.Builder().setVersion(1L).build())
+            .build()) {
+      assertEquals(1, versionOne.version());
+      assertEquals(3, versionOne.countRows());
+    }
+
+    assertTrue(
+        versionRejectingNamespace.getDescribeTableCallCount() > 0,
+        "Expected describeTable to be called when opening through namespace");
   }
 
   @Test
   void testCreateAndListNamespaces() {
     // Create a namespace
     CreateNamespaceRequest createReq = new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    CreateNamespaceResponse createResp = namespace.createNamespace(createReq);
+    CreateNamespaceResponse createResp = namespaceClient.createNamespace(createReq);
     assertNotNull(createResp);
 
     // List namespaces
     ListNamespacesRequest listReq = new ListNamespacesRequest();
-    ListNamespacesResponse listResp = namespace.listNamespaces(listReq);
+    ListNamespacesResponse listResp = namespaceClient.listNamespaces(listReq);
     assertNotNull(listResp);
     assertNotNull(listResp.getNamespaces());
     assertTrue(listResp.getNamespaces().contains("workspace"));
@@ -148,12 +235,12 @@ public class DirectoryNamespaceTest {
   void testDescribeNamespace() {
     // Create a namespace
     CreateNamespaceRequest createReq = new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createReq);
+    namespaceClient.createNamespace(createReq);
 
     // Describe namespace
     DescribeNamespaceRequest descReq =
         new DescribeNamespaceRequest().id(Arrays.asList("workspace"));
-    DescribeNamespaceResponse descResp = namespace.describeNamespace(descReq);
+    DescribeNamespaceResponse descResp = namespaceClient.describeNamespace(descReq);
     assertNotNull(descResp);
     assertNotNull(descResp.getProperties());
   }
@@ -162,32 +249,35 @@ public class DirectoryNamespaceTest {
   void testNamespaceExists() {
     // Create a namespace
     CreateNamespaceRequest createReq = new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createReq);
+    namespaceClient.createNamespace(createReq);
 
     // Check existence
     NamespaceExistsRequest existsReq = new NamespaceExistsRequest().id(Arrays.asList("workspace"));
-    assertDoesNotThrow(() -> namespace.namespaceExists(existsReq));
+    assertDoesNotThrow(() -> namespaceClient.namespaceExists(existsReq));
 
     // Check non-existent namespace
     NamespaceExistsRequest notExistsReq =
         new NamespaceExistsRequest().id(Arrays.asList("nonexistent"));
-    assertThrows(RuntimeException.class, () -> namespace.namespaceExists(notExistsReq));
+    LanceNamespaceException ex =
+        assertThrows(
+            LanceNamespaceException.class, () -> namespaceClient.namespaceExists(notExistsReq));
+    assertEquals(ErrorCode.NAMESPACE_NOT_FOUND, ex.getErrorCode());
   }
 
   @Test
   void testDropNamespace() {
     // Create a namespace
     CreateNamespaceRequest createReq = new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createReq);
+    namespaceClient.createNamespace(createReq);
 
     // Drop namespace
     DropNamespaceRequest dropReq = new DropNamespaceRequest().id(Arrays.asList("workspace"));
-    DropNamespaceResponse dropResp = namespace.dropNamespace(dropReq);
+    DropNamespaceResponse dropResp = namespaceClient.dropNamespace(dropReq);
     assertNotNull(dropResp);
 
     // Verify it's gone
     NamespaceExistsRequest existsReq = new NamespaceExistsRequest().id(Arrays.asList("workspace"));
-    assertThrows(RuntimeException.class, () -> namespace.namespaceExists(existsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespaceClient.namespaceExists(existsReq));
   }
 
   @Test
@@ -195,13 +285,13 @@ public class DirectoryNamespaceTest {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     // Create table with data
     byte[] tableData = createTestTableData();
     CreateTableRequest createReq =
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
-    CreateTableResponse createResp = namespace.createTable(createReq, tableData);
+    CreateTableResponse createResp = namespaceClient.createTable(createReq, tableData);
 
     assertNotNull(createResp);
     assertNotNull(createResp.getLocation());
@@ -214,17 +304,17 @@ public class DirectoryNamespaceTest {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     // Create a table
     byte[] tableData = createTestTableData();
     CreateTableRequest createReq =
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
-    namespace.createTable(createReq, tableData);
+    namespaceClient.createTable(createReq, tableData);
 
     // List tables
     ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList("workspace"));
-    ListTablesResponse listResp = namespace.listTables(listReq);
+    ListTablesResponse listResp = namespaceClient.listTables(listReq);
 
     assertNotNull(listResp);
     assertNotNull(listResp.getTables());
@@ -236,18 +326,18 @@ public class DirectoryNamespaceTest {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     // Create a table
     byte[] tableData = createTestTableData();
     CreateTableRequest createReq =
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
-    namespace.createTable(createReq, tableData);
+    namespaceClient.createTable(createReq, tableData);
 
     // Describe table
     DescribeTableRequest descReq =
         new DescribeTableRequest().id(Arrays.asList("workspace", "test_table"));
-    DescribeTableResponse descResp = namespace.describeTable(descReq);
+    DescribeTableResponse descResp = namespaceClient.describeTable(descReq);
 
     assertNotNull(descResp);
     assertNotNull(descResp.getLocation());
@@ -259,23 +349,23 @@ public class DirectoryNamespaceTest {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     // Create a table
     byte[] tableData = createTestTableData();
     CreateTableRequest createReq =
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
-    namespace.createTable(createReq, tableData);
+    namespaceClient.createTable(createReq, tableData);
 
     // Check existence
     TableExistsRequest existsReq =
         new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
-    assertDoesNotThrow(() -> namespace.tableExists(existsReq));
+    assertDoesNotThrow(() -> namespaceClient.tableExists(existsReq));
 
     // Check non-existent table
     TableExistsRequest notExistsReq =
         new TableExistsRequest().id(Arrays.asList("workspace", "nonexistent"));
-    assertThrows(RuntimeException.class, () -> namespace.tableExists(notExistsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespaceClient.tableExists(notExistsReq));
   }
 
   @Test
@@ -283,23 +373,23 @@ public class DirectoryNamespaceTest {
     // Create parent namespace
     CreateNamespaceRequest createNsReq =
         new CreateNamespaceRequest().id(Arrays.asList("workspace"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     // Create a table
     byte[] tableData = createTestTableData();
     CreateTableRequest createReq =
         new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
-    namespace.createTable(createReq, tableData);
+    namespaceClient.createTable(createReq, tableData);
 
     // Drop table
     DropTableRequest dropReq = new DropTableRequest().id(Arrays.asList("workspace", "test_table"));
-    DropTableResponse dropResp = namespace.dropTable(dropReq);
+    DropTableResponse dropResp = namespaceClient.dropTable(dropReq);
     assertNotNull(dropResp);
 
     // Verify it's gone
     TableExistsRequest existsReq =
         new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
-    assertThrows(RuntimeException.class, () -> namespace.tableExists(existsReq));
+    assertThrows(LanceNamespaceException.class, () -> namespaceClient.tableExists(existsReq));
   }
 
   @Test
@@ -377,99 +467,47 @@ public class DirectoryNamespaceTest {
   }
 
   /**
-   * Inner class that wraps DirectoryNamespace and tracks API calls for testing managed versioning.
+   * Creates a DirectoryNamespace configured for testing managed versioning with ops metrics.
+   *
+   * @param root The root path for the namespace
+   * @return A DirectoryNamespace with table_version_tracking_enabled and ops_metrics_enabled
    */
-  static class TableVersionTrackingNamespace implements LanceNamespace, java.io.Closeable {
-    private final DirectoryNamespace inner;
-    private final AtomicInteger createTableVersionCount = new AtomicInteger(0);
-    private final AtomicInteger describeTableVersionCount = new AtomicInteger(0);
-    private final AtomicInteger listTableVersionsCount = new AtomicInteger(0);
+  private DirectoryNamespace createManagedVersioningNamespace(Path root) {
+    Map<String, String> dirProps = new HashMap<>();
+    dirProps.put("root", root.toString());
+    dirProps.put("table_version_tracking_enabled", "true");
+    dirProps.put("manifest_enabled", "true");
+    dirProps.put("ops_metrics_enabled", "true");
 
-    public TableVersionTrackingNamespace(Path root) {
-      Map<String, String> dirProps = new HashMap<>();
-      dirProps.put("root", root.toString());
-      dirProps.put("table_version_tracking_enabled", "true");
-      dirProps.put("manifest_enabled", "true");
-
-      this.inner = new DirectoryNamespace();
-      try (BufferAllocator allocator = new RootAllocator()) {
-        this.inner.initialize(dirProps, allocator);
-      }
+    DirectoryNamespace ns = new DirectoryNamespace();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      ns.initialize(dirProps, allocator);
     }
+    return ns;
+  }
 
-    public int getCreateTableVersionCount() {
-      return createTableVersionCount.get();
-    }
+  private static int getCreateTableVersionCount(DirectoryNamespace ns) {
+    Map<String, Long> metrics = ns.retrieveOpsMetrics();
+    return metrics.getOrDefault("create_table_version", 0L).intValue();
+  }
 
-    public int getDescribeTableVersionCount() {
-      return describeTableVersionCount.get();
-    }
+  private static int getDescribeTableVersionCount(DirectoryNamespace ns) {
+    Map<String, Long> metrics = ns.retrieveOpsMetrics();
+    return metrics.getOrDefault("describe_table_version", 0L).intValue();
+  }
 
-    public int getListTableVersionsCount() {
-      return listTableVersionsCount.get();
-    }
-
-    public long getNativeHandle() {
-      return inner.getNativeHandle();
-    }
-
-    @Override
-    public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
-      // Already initialized in constructor
-    }
-
-    @Override
-    public String namespaceId() {
-      return "TableVersionTrackingNamespace { inner: " + inner.namespaceId() + " }";
-    }
-
-    @Override
-    public DeclareTableResponse declareTable(DeclareTableRequest request) {
-      return inner.declareTable(request);
-    }
-
-    @Override
-    public DescribeTableResponse describeTable(DescribeTableRequest request) {
-      return inner.describeTable(request);
-    }
-
-    @Override
-    public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
-      createTableVersionCount.incrementAndGet();
-      return inner.createTableVersion(request);
-    }
-
-    @Override
-    public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
-      describeTableVersionCount.incrementAndGet();
-      return inner.describeTableVersion(request);
-    }
-
-    @Override
-    public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
-      listTableVersionsCount.incrementAndGet();
-      return inner.listTableVersions(request);
-    }
-
-    @Override
-    public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
-        BatchDeleteTableVersionsRequest request) {
-      return inner.batchDeleteTableVersions(request);
-    }
-
-    @Override
-    public void close() {
-      inner.close();
-    }
+  private static int getListTableVersionsCount(DirectoryNamespace ns) {
+    Map<String, Long> metrics = ns.retrieveOpsMetrics();
+    return metrics.getOrDefault("list_table_versions", 0L).intValue();
   }
 
   @Test
   void testExternalManifestStoreInvokesNamespaceApis(@TempDir Path managedVersioningTempDir)
       throws Exception {
     try (BufferAllocator allocator = new RootAllocator()) {
-      // Create namespace with table_version_tracking_enabled
-      TableVersionTrackingNamespace namespace =
-          new TableVersionTrackingNamespace(managedVersioningTempDir);
+      // Create namespace with table_version_tracking_enabled and ops_metrics_enabled
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
       String tableName = "test_table";
       java.util.List<String> tableId = Arrays.asList(tableName);
 
@@ -533,7 +571,7 @@ public class DirectoryNamespaceTest {
             Dataset.write()
                 .allocator(allocator)
                 .reader(testReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(tableId)
                 .mode(WriteParams.WriteMode.CREATE)
                 .execute()) {
@@ -545,7 +583,7 @@ public class DirectoryNamespaceTest {
       // Verify describe_table returns managed_versioning=true
       DescribeTableRequest descReq = new DescribeTableRequest();
       descReq.setId(tableId);
-      DescribeTableResponse descResp = namespace.describeTable(descReq);
+      DescribeTableResponse descResp = namespaceClient.describeTable(descReq);
 
       assertEquals(
           Boolean.TRUE,
@@ -553,22 +591,26 @@ public class DirectoryNamespaceTest {
           "Expected managedVersioning=true when table_version_tracking_enabled");
 
       // Open dataset through namespace - this should call list_table_versions for latest
-      int initialListCount = namespace.getListTableVersionsCount();
+      int initialListCount = getListTableVersionsCount(namespaceClient);
       try (Dataset dsFromNamespace =
-          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
 
         assertEquals(2, dsFromNamespace.countRows());
         assertEquals(1, dsFromNamespace.version());
       }
       assertEquals(
           initialListCount + 1,
-          namespace.getListTableVersionsCount(),
+          getListTableVersionsCount(namespaceClient),
           "list_table_versions should have been called once when opening latest version");
 
       // Verify create_table_version was called once during CREATE
       assertEquals(
           1,
-          namespace.getCreateTableVersionCount(),
+          getCreateTableVersionCount(namespaceClient),
           "create_table_version should have been called once during CREATE");
 
       try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
@@ -624,7 +666,7 @@ public class DirectoryNamespaceTest {
             Dataset.write()
                 .allocator(allocator)
                 .reader(appendReader)
-                .namespace(namespace)
+                .namespaceClient(namespaceClient)
                 .tableId(tableId)
                 .mode(WriteParams.WriteMode.APPEND)
                 .execute()) {
@@ -635,28 +677,32 @@ public class DirectoryNamespaceTest {
 
       assertEquals(
           2,
-          namespace.getCreateTableVersionCount(),
+          getCreateTableVersionCount(namespaceClient),
           "create_table_version should have been called twice (once for CREATE, once for APPEND)");
 
       // Open latest version - should call list_table_versions
-      int listCountBeforeLatest = namespace.getListTableVersionsCount();
+      int listCountBeforeLatest = getListTableVersionsCount(namespaceClient);
       try (Dataset latestDs =
-          Dataset.open().allocator(allocator).namespace(namespace).tableId(tableId).build()) {
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
 
         assertEquals(4, latestDs.countRows());
         assertEquals(2, latestDs.version());
       }
       assertEquals(
           listCountBeforeLatest + 1,
-          namespace.getListTableVersionsCount(),
+          getListTableVersionsCount(namespaceClient),
           "list_table_versions should have been called once when opening latest version");
 
       // Open specific version (version 1) - should call describe_table_version
-      int describeCountBeforeV1 = namespace.getDescribeTableVersionCount();
+      int describeCountBeforeV1 = getDescribeTableVersionCount(namespaceClient);
       try (Dataset v1Ds =
           Dataset.open()
               .allocator(allocator)
-              .namespace(namespace)
+              .namespaceClient(namespaceClient)
               .tableId(tableId)
               .readOptions(new ReadOptions.Builder().setVersion(1L).build())
               .build()) {
@@ -666,10 +712,160 @@ public class DirectoryNamespaceTest {
       }
       assertEquals(
           describeCountBeforeV1 + 1,
-          namespace.getDescribeTableVersionCount(),
+          getDescribeTableVersionCount(namespaceClient),
           "describe_table_version should have been called once when opening version 1");
 
-      namespace.close();
+      namespaceClient.close();
+    }
+  }
+
+  @Test
+  void testDatasetBasedCommitBuilderWithNamespace(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      String tableName = "test_table";
+      List<String> tableId = Arrays.asList(tableName);
+
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                  new Field("name", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+      // Create initial dataset through namespace using WriteDatasetBuilder
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 1);
+        idVector.set(1, 2);
+        nameVector.set(0, "Alice".getBytes());
+        nameVector.set(1, "Bob".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        root.setRowCount(2);
+
+        ArrowReader reader =
+            new ArrowReader(allocator) {
+              boolean firstRead = true;
+
+              @Override
+              public boolean loadNextBatch() {
+                if (firstRead) {
+                  firstRead = false;
+                  return true;
+                }
+                return false;
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+
+              @Override
+              protected Schema readSchema() {
+                return schema;
+              }
+
+              @Override
+              public VectorSchemaRoot getVectorSchemaRoot() {
+                return root;
+              }
+            };
+
+        try (Dataset dataset =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(reader)
+                .namespaceClient(namespaceClient)
+                .tableId(tableId)
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+          assertEquals(2, dataset.countRows());
+          assertEquals(1, dataset.version());
+        }
+      }
+
+      // Verify initial create used createTableVersion once
+      assertEquals(
+          1,
+          getCreateTableVersionCount(namespaceClient),
+          "create_table_version should be called once during CREATE");
+
+      // Open dataset through namespace (returns dataset with managed versioning)
+      Dataset existingDataset =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build();
+
+      // Get the dataset URI for Fragment.create()
+      String datasetUri = existingDataset.uri();
+
+      // Create a new fragment independently (simulating Spark worker behavior)
+      List<FragmentMetadata> fragments;
+      try (VectorSchemaRoot appendRoot = VectorSchemaRoot.create(schema, allocator)) {
+        IntVector idVector = (IntVector) appendRoot.getVector("id");
+        VarCharVector nameVector = (VarCharVector) appendRoot.getVector("name");
+
+        idVector.allocateNew(2);
+        nameVector.allocateNew(2);
+        idVector.set(0, 3);
+        idVector.set(1, 4);
+        nameVector.set(0, "Charlie".getBytes());
+        nameVector.set(1, "Diana".getBytes());
+        idVector.setValueCount(2);
+        nameVector.setValueCount(2);
+        appendRoot.setRowCount(2);
+
+        fragments =
+            Fragment.create(datasetUri, allocator, appendRoot, new WriteParams.Builder().build());
+      }
+
+      // Commit using dataset-based CommitBuilder WITH namespace (the new path)
+      int createCountBefore = getCreateTableVersionCount(namespaceClient);
+      try (Transaction txn =
+              new Transaction.Builder()
+                  .readVersion(existingDataset.version())
+                  .operation(Append.builder().fragments(fragments).build())
+                  .build();
+          Dataset committed =
+              new CommitBuilder(existingDataset)
+                  .namespaceClient(namespaceClient)
+                  .tableId(tableId)
+                  .execute(txn)) {
+        assertEquals(2, committed.version());
+        assertEquals(4, committed.countRows());
+      }
+
+      // Verify createTableVersion was called for the dataset-based commit
+      assertEquals(
+          createCountBefore + 1,
+          getCreateTableVersionCount(namespaceClient),
+          "create_table_version should be called for dataset-based CommitBuilder with namespace");
+
+      // Verify the data is accessible through namespace
+      try (Dataset latestDs =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
+        assertEquals(4, latestDs.countRows());
+        assertEquals(2, latestDs.version());
+      }
+
+      existingDataset.close();
+      namespaceClient.close();
     }
   }
 
@@ -678,7 +874,7 @@ public class DirectoryNamespaceTest {
     // Initialize namespace first - create parent namespace to ensure __manifest table
     // is created before concurrent operations
     CreateNamespaceRequest createNsReq = new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
-    namespace.createNamespace(createNsReq);
+    namespaceClient.createNamespace(createNsReq);
 
     int numTables = 10;
     ExecutorService executor = Executors.newFixedThreadPool(numTables);
@@ -699,11 +895,11 @@ public class DirectoryNamespaceTest {
 
               CreateTableRequest createReq =
                   new CreateTableRequest().id(Arrays.asList("test_ns", tableName));
-              namespace.createTable(createReq, tableData);
+              namespaceClient.createTable(createReq, tableData);
 
               DropTableRequest dropReq =
                   new DropTableRequest().id(Arrays.asList("test_ns", tableName));
-              namespace.dropTable(dropReq);
+              namespaceClient.dropTable(dropReq);
 
               successCount.incrementAndGet();
             } catch (Exception e) {
@@ -724,7 +920,7 @@ public class DirectoryNamespaceTest {
     assertEquals(0, failCount.get(), "No tasks should fail");
 
     ListTablesRequest listReq = new ListTablesRequest().id(Arrays.asList("test_ns"));
-    ListTablesResponse listResp = namespace.listTables(listReq);
+    ListTablesResponse listResp = namespaceClient.listTables(listReq);
     assertEquals(0, listResp.getTables().size(), "All tables should be dropped");
   }
 
@@ -947,5 +1143,348 @@ public class DirectoryNamespaceTest {
 
     assertEquals(numTables, dropSuccessCount.get(), "All drops should succeed");
     assertEquals(0, dropFailCount.get(), "No drops should fail");
+  }
+
+  @Test
+  void testCountTableRows() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Count rows
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(3, count);
+  }
+
+  @Test
+  void testCountTableRowsWithFilter() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows (ages: 30, 25, 35)
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Count rows with predicate
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .predicate("age > 28");
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(2, count); // Alice (30) and Charlie (35)
+  }
+
+  @Test
+  void testInsertIntoTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Insert more data
+    byte[] newData = createTestTableData(); // Another 3 rows
+    InsertIntoTableRequest insertReq =
+        new InsertIntoTableRequest().id(Arrays.asList("workspace", "test_table")).mode("append");
+    InsertIntoTableResponse insertResp = namespaceClient.insertIntoTable(insertReq, newData);
+    assertNotNull(insertResp);
+
+    // Verify row count increased
+    CountTableRowsRequest countReq =
+        new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
+    long count = namespaceClient.countTableRows(countReq);
+    assertEquals(6, count);
+  }
+
+  @Test
+  void testQueryTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table with 3 rows
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Query table - just verify we can execute a simple query
+    QueryTableRequest queryReq =
+        new QueryTableRequest()
+            .id(Arrays.asList("workspace", "test_table"))
+            .k(10)
+            .vector(new QueryTableRequestVector());
+    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    assertNotNull(resultBytes);
+    assertTrue(resultBytes.length > 0);
+  }
+
+  @Test
+  void testListTableVersions() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // List versions
+    ListTableVersionsRequest listReq =
+        new ListTableVersionsRequest().id(Arrays.asList("workspace", "test_table"));
+    ListTableVersionsResponse listResp = namespaceClient.listTableVersions(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getVersions());
+    assertTrue(listResp.getVersions().size() >= 1);
+  }
+
+  @Test
+  void testRegisterTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // First create a table directly to get a valid location
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "source_table"));
+    CreateTableResponse createResp = namespaceClient.createTable(createReq, tableData);
+    String location = createResp.getLocation();
+
+    // Register the table under a new name (using relative path)
+    String relativePath = "source_table.lance";
+    RegisterTableRequest registerReq =
+        new RegisterTableRequest()
+            .id(Arrays.asList("workspace", "registered_table"))
+            .location(relativePath);
+    RegisterTableResponse registerResp = namespaceClient.registerTable(registerReq);
+    assertNotNull(registerResp);
+
+    // Verify the registered table exists
+    TableExistsRequest existsReq =
+        new TableExistsRequest().id(Arrays.asList("workspace", "registered_table"));
+    assertDoesNotThrow(() -> namespaceClient.tableExists(existsReq));
+  }
+
+  @Test
+  void testDeclareTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Declare a table
+    DeclareTableRequest declareReq =
+        new DeclareTableRequest().id(Arrays.asList("workspace", "declared_table"));
+    DeclareTableResponse declareResp = namespaceClient.declareTable(declareReq);
+    assertNotNull(declareResp);
+    assertNotNull(declareResp.getLocation());
+
+    DescribeTableRequest descReq =
+        new DescribeTableRequest().id(Arrays.asList("workspace", "declared_table"));
+    DescribeTableResponse descResp = namespaceClient.describeTable(descReq);
+    assertNull(descResp.getIsOnlyDeclared());
+
+    DescribeTableRequest checkReq =
+        new DescribeTableRequest()
+            .id(Arrays.asList("workspace", "declared_table"))
+            .checkDeclared(true);
+    DescribeTableResponse checkResp = namespaceClient.describeTable(checkReq);
+    assertEquals(Boolean.TRUE, checkResp.getIsOnlyDeclared());
+  }
+
+  @Test
+  void testDeregisterTable() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Deregister the table
+    DeregisterTableRequest deregisterReq =
+        new DeregisterTableRequest().id(Arrays.asList("workspace", "test_table"));
+    DeregisterTableResponse deregisterResp = namespaceClient.deregisterTable(deregisterReq);
+    assertNotNull(deregisterResp);
+
+    // Verify the table no longer exists
+    TableExistsRequest existsReq =
+        new TableExistsRequest().id(Arrays.asList("workspace", "test_table"));
+    assertThrows(LanceNamespaceException.class, () -> namespaceClient.tableExists(existsReq));
+  }
+
+  @Test
+  void testListTableIndices() throws Exception {
+    // Create parent namespace
+    CreateNamespaceRequest createNsReq =
+        new CreateNamespaceRequest().id(Arrays.asList("workspace"));
+    namespaceClient.createNamespace(createNsReq);
+
+    // Create a table
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq =
+        new CreateTableRequest().id(Arrays.asList("workspace", "test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // List indices (should be empty initially)
+    ListTableIndicesRequest listReq =
+        new ListTableIndicesRequest().id(Arrays.asList("workspace", "test_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(0, listResp.getIndexes().size());
+  }
+
+  @Test
+  void testCreateScalarIndex() throws Exception {
+    // Create table at root level
+    byte[] tableData = createTestTableData();
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("test_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create scalar index on 'id' column
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("test_table"))
+            .column("id")
+            .indexType("BTREE")
+            .name("id_idx");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq = new ListTableIndicesRequest().id(Arrays.asList("test_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("id_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("id"));
+  }
+
+  @Test
+  void testCreateVectorIndex() throws Exception {
+    // Create table with vector data (256 rows with 8-dim vectors)
+    byte[] tableData = createVectorTableData(256, 8);
+    CreateTableRequest createReq = new CreateTableRequest().id(Arrays.asList("vector_table"));
+    namespaceClient.createTable(createReq, tableData);
+
+    // Create vector index using IVF_FLAT
+    CreateTableIndexRequest createIndexReq =
+        new CreateTableIndexRequest()
+            .id(Arrays.asList("vector_table"))
+            .column("vector")
+            .indexType("IVF_FLAT")
+            .name("vector_idx")
+            .distanceType("l2");
+    CreateTableIndexResponse response = namespaceClient.createTableIndex(createIndexReq);
+    assertNotNull(response);
+
+    // List indices to verify
+    ListTableIndicesRequest listReq =
+        new ListTableIndicesRequest().id(Arrays.asList("vector_table"));
+    ListTableIndicesResponse listResp = namespaceClient.listTableIndices(listReq);
+    assertNotNull(listResp);
+    assertNotNull(listResp.getIndexes());
+    assertEquals(1, listResp.getIndexes().size());
+    assertEquals("vector_idx", listResp.getIndexes().get(0).getIndexName());
+    assertTrue(listResp.getIndexes().get(0).getColumns().contains("vector"));
+  }
+
+  private byte[] createVectorTableData(int numRows, int dim) throws Exception {
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(
+                    "vector",
+                    FieldType.nullable(new ArrowType.FixedSizeList(dim)),
+                    Arrays.asList(
+                        new Field(
+                            "item",
+                            FieldType.nullable(
+                                new ArrowType.FloatingPoint(
+                                    org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE)),
+                            null)))));
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      IntVector idVector = (IntVector) root.getVector("id");
+      org.apache.arrow.vector.complex.FixedSizeListVector vectorCol =
+          (org.apache.arrow.vector.complex.FixedSizeListVector) root.getVector("vector");
+      org.apache.arrow.vector.Float4Vector itemsVector =
+          (org.apache.arrow.vector.Float4Vector) vectorCol.getDataVector();
+
+      idVector.allocateNew(numRows);
+      vectorCol.allocateNew();
+      itemsVector.allocateNew(numRows * dim);
+
+      for (int i = 0; i < numRows; i++) {
+        idVector.set(i, i);
+        for (int j = 0; j < dim; j++) {
+          itemsVector.set(i * dim + j, (float) (i * dim + j) * 0.01f);
+        }
+        vectorCol.setNotNull(i);
+      }
+
+      idVector.setValueCount(numRows);
+      itemsVector.setValueCount(numRows * dim);
+      vectorCol.setValueCount(numRows);
+      root.setRowCount(numRows);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.writeBatch();
+      }
+      return out.toByteArray();
+    }
+  }
+
+  private static class VersionRejectingNamespace extends CustomNamespace {
+    private final AtomicInteger describeTableCallCount = new AtomicInteger();
+
+    VersionRejectingNamespace(DirectoryNamespace inner) {
+      super(inner);
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      describeTableCallCount.incrementAndGet();
+      assertNull(
+          request.getVersion(),
+          "Dataset version should be passed to dataset open, not describeTable");
+      return super.describeTable(request);
+    }
+
+    int getDescribeTableCallCount() {
+      return describeTableCallCount.get();
+    }
   }
 }

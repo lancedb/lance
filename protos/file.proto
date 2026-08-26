@@ -171,6 +171,13 @@ message Field {
   // When set to a positive value, primary key fields are ordered by this position.
   uint32 unenforced_primary_key_position = 13;
 
+  // Reserved for future use. Use unenforced_clustering_key_position instead.
+  bool unenforced_clustering_key = 14;
+
+  // Position of this field in the clustering key (1-based).
+  // 0 means the field is not part of the clustering key.
+  uint32 unenforced_clustering_key_position = 15;
+
   // DEPRECATED ----------------------------------------------------------------
 
   // Deprecated: Only used in V1 file format. V2 uses variable encodings defined

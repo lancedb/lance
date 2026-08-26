@@ -13,6 +13,11 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.util.JsonUtils;
+
+import java.util.HashMap;
+import java.util.Map;
+
 /** Builder-style configuration for Bitmap scalar index parameters. */
 public final class BitmapIndexParams {
   private static final String INDEX_TYPE = "bitmap";
@@ -25,9 +30,36 @@ public final class BitmapIndexParams {
   }
 
   public static final class Builder {
+    private Integer shardId;
+
+    /**
+     * Configure an explicit shard ID for distributed bitmap builds spanning multiple fragments.
+     *
+     * @param shardId non-negative shard identifier
+     * @return this builder
+     * @throws IllegalArgumentException
+     */
+    public Builder shardId(int shardId) {
+      if (shardId < 0) {
+        throw new IllegalArgumentException("shardId must be non-negative");
+      }
+      this.shardId = shardId;
+      return this;
+    }
+
     /** Build a {@link ScalarIndexParams} instance for a Bitmap index. */
     public ScalarIndexParams build() {
-      return ScalarIndexParams.create(INDEX_TYPE);
+      Map<String, Object> params = new HashMap<>();
+      if (shardId != null) {
+        params.put("shard_id", shardId);
+      }
+
+      if (params.isEmpty()) {
+        return ScalarIndexParams.create(INDEX_TYPE);
+      }
+
+      String json = JsonUtils.toJson(params);
+      return ScalarIndexParams.create(INDEX_TYPE, json);
     }
   }
 }

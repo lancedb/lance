@@ -72,7 +72,7 @@
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
-pub use lance_core::{Error, Result};
+pub use lance_core::{Error, Result, cache};
 use std::sync::LazyLock;
 
 pub mod arrow;
@@ -81,11 +81,22 @@ pub mod datafusion;
 pub mod dataset;
 pub mod index;
 pub mod io;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod session;
 pub mod table;
 pub mod utils;
 
-pub use blob::{BlobArrayBuilder, blob_field};
+pub mod pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+}
+
+pub use blob::{
+    BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
+    BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,
+    blob_field_with_options,
+};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
 

@@ -12,8 +12,8 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use deepsize::{Context, DeepSizeOf};
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
@@ -63,15 +63,29 @@ impl Deref for DSIndexCache {
 
 impl DSIndexCache {
     /// Create an index-specific cache with the given UUID prefix.
-    pub fn for_index(&self, uuid: &str, fri_uuid: Option<&Uuid>) -> LanceCache {
+    pub fn for_index(&self, uuid: &Uuid, fri_uuid: Option<&Uuid>) -> LanceCache {
+        let mut uuid_buffer = Uuid::encode_buffer();
+        let cache = self
+            .0
+            .with_key_prefix(uuid.as_hyphenated().encode_lower(&mut uuid_buffer));
         if let Some(fri_uuid) = fri_uuid {
             // If a FRI UUID is provided, use it to create a more specific cache key.
-            let cache_key = format!("{}-{}", uuid, fri_uuid);
-            self.0.with_key_prefix(&cache_key)
+            let mut fri_uuid_buffer = Uuid::encode_buffer();
+            cache.with_key_prefix(fri_uuid.as_hyphenated().encode_lower(&mut fri_uuid_buffer))
         } else {
             // Otherwise, just use the index UUID as the key prefix.
-            self.0.with_key_prefix(uuid)
+            cache
         }
+    }
+}
+
+pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uuid: Option<&Uuid>) {
+    builder.write_fixed_bytes(uuid.as_bytes());
+    if let Some(fri_uuid) = fri_uuid {
+        builder.write_some();
+        builder.write_fixed_bytes(fri_uuid.as_bytes());
+    } else {
+        builder.write_none();
     }
 }
 
@@ -79,7 +93,7 @@ impl DSIndexCache {
 
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
-    pub uuid: &'a str,
+    pub uuid: &'a Uuid,
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
@@ -88,18 +102,53 @@ impl CacheKey for FragReuseIndexKey<'_> {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("frag_reuse/{}", self.uuid))
     }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
 }
 
-#[derive(Debug)]
-pub struct IndexMetadataKey {
+#[derive(Clone, Copy, Debug)]
+pub struct IndexMetadataKey<'a> {
     pub version: u64,
+    pub store_identity: &'a str,
 }
 
-impl CacheKey for IndexMetadataKey {
+impl CacheKey for IndexMetadataKey<'_> {
     type ValueType = Vec<IndexMetadata>;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(self.version.to_string())
+        Cow::Owned(format!(
+            "{}:{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+    }
+
+    fn codec() -> Option<lance_core::cache::CacheCodec> {
+        Some(lance_table::format::index_metadata_codec())
     }
 }
 
@@ -119,7 +168,7 @@ impl DeepSizeOf for ProstAny {
 /// what they are.  These we cache.
 #[derive(Debug)]
 pub struct ScalarIndexDetailsKey<'a> {
-    pub uuid: &'a str,
+    pub uuid: &'a Uuid,
 }
 
 impl CacheKey for ScalarIndexDetailsKey<'_> {
@@ -127,5 +176,36 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("type/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "ScalarIndexDetails"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.scalar-details-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_metadata_key_isolates_object_store_identity() {
+        let first = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$first-options",
+        };
+        let second = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$second-options",
+        };
+
+        assert_ne!(first.key(), second.key());
     }
 }

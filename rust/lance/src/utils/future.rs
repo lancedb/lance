@@ -16,17 +16,6 @@ use tracing::Instrument;
 pub struct SharedPrerequisite<T: Clone>(Arc<AsyncCell<std::result::Result<T, String>>>);
 
 impl<T: Clone> SharedPrerequisite<T> {
-    /// Asynchronously get a cloned copy of the output
-    ///
-    /// If the child task failed then a PrerequisiteFailed error is raised.
-    #[allow(dead_code)]
-    pub async fn get_fut(&self) -> crate::Result<T> {
-        self.0
-            .get()
-            .await
-            .map_err(|err| crate::Error::prerequisite_failed(err))
-    }
-
     /// Synchronously get a cloned copy of the cached output
     ///
     /// Must be called after a call to `wait_ready`

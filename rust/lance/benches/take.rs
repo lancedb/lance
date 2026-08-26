@@ -20,9 +20,9 @@ use lance_file::version::LanceFileVersion;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -190,7 +190,7 @@ fn file_reader_take(
         let fragment = fragments.first().unwrap();
         assert_eq!(fragment.num_data_files(), 1);
         let file = fragment.metadata().files.first().unwrap();
-        let file_path = dataset.data_dir().child(file.path.as_str());
+        let file_path = dataset.data_dir().join(file.path.as_str());
 
         (dataset, file_path)
     });
@@ -213,6 +213,7 @@ fn file_reader_take(
                             16,
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .unwrap();
                     stream.fold(Vec::new(), |mut acc, item| async move {
                         acc.push(item);
@@ -226,10 +227,8 @@ fn file_reader_take(
 
 async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     // Create file reader v2.
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::new(2 * 1024 * 1024 * 1024),
-    );
+    let object_store = dataset.object_store(None).await.unwrap();
+    let scheduler = ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
     let file = scheduler
         .open_file(file_path, &CachedFileSize::unknown())
         .await
@@ -376,7 +375,7 @@ fn bench_sample(c: &mut Criterion) {
                     let schema = schema.clone();
                     let dataset = dataset.clone();
                     async move {
-                        dataset.sample(sample_size, &schema).await.unwrap();
+                        dataset.sample(sample_size, &schema, None).await.unwrap();
                     }
                 })
             },

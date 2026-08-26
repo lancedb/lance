@@ -31,7 +31,7 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::validate_fixed_size_list_dimensions};
 use log::trace;
 
 #[derive(Debug)]
@@ -276,6 +276,12 @@ impl StructuralStructDecoder {
             DataType::FixedSizeList(child_field, _)
                 if matches!(child_field.data_type(), DataType::Struct(_)) =>
             {
+                // The scheduler factories run the same guard, but the decoder tree can be
+                // built independently (e.g. `create_decode_stream`) so a zero dimension from
+                // a malformed schema must be rejected here as well.  Draining and unraveling
+                // validity both scale by the dimension and a zero would make that math
+                // degenerate.
+                validate_fixed_size_list_dimensions(field.name(), field.data_type())?;
                 // FixedSizeList containing Struct needs structural decoding
                 let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
                 Ok(Box::new(StructuralFixedSizeListDecoder::new(
@@ -358,6 +364,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             return Ok(DecodedArray {
                 array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
                 repdef: CompositeRepDefUnraveler::new(vec![]),
+                data_size: 0,
             });
         }
 
@@ -367,23 +374,57 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
+        let mut repdefs = Vec::with_capacity(arrays.len());
+        let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
-        let first_array = arrays_iter.next().unwrap();
+        let first_array = arrays_iter.next().ok_or_else(|| {
+            Error::internal("Struct decoder unexpectedly has no child arrays".to_string())
+        })?;
         let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
-        let mut repdef = first_array.repdef;
+        repdefs.push(first_array.repdef);
+        data_size += first_array.data_size;
         children.push(first_array.array);
 
         for array in arrays_iter {
-            debug_assert_eq!(length, array.array.len());
+            if length != array.array.len() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Struct child array length {} does not match sibling length {}",
+                        array.array.len(),
+                        length
+                    )
+                    .into(),
+                ));
+            }
+            data_size += array.data_size;
             children.push(array.array);
+            repdefs.push(array.repdef);
+        }
+
+        // Dense rep/def state can retain child-specific repetition information after a child
+        // decoder finishes, so comparing dense siblings is not meaningful. If any child carries
+        // sparse state, keep a sparse child as the canonical structural plan and compare it with
+        // every other sparse sibling so sparse metadata is never silently discarded.
+        let primary_repdef = repdefs
+            .iter()
+            .position(CompositeRepDefUnraveler::has_sparse)
+            .unwrap_or(0);
+        let mut repdef = repdefs.swap_remove(primary_repdef);
+        if repdef.has_sparse() {
+            for sibling in repdefs {
+                if sibling.has_sparse() {
+                    repdef.add_compatibility_check(sibling);
+                }
+            }
         }
 
         let validity = if self.is_root {
+            repdef.ensure_exhausted()?;
             None
         } else {
-            repdef.unravel_validity(length)
+            repdef.unravel_validity(length)?
         };
 
         let array = StructArray::try_new(self.child_fields, children, validity)
@@ -391,6 +432,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,
+            data_size,
         })
     }
 }
@@ -493,7 +535,6 @@ pub struct StructFieldEncoder {
 }
 
 impl StructFieldEncoder {
-    #[allow(dead_code)]
     pub fn new(children: Vec<Box<dyn FieldEncoder>>, column_index: u32) -> Self {
         Self {
             children,
@@ -591,16 +632,39 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Int32Array, ListArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::{
-        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
-    };
+    use super::StructuralStructDecoder;
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+
+    #[test]
+    fn test_zero_dimension_fsl_decoder_errors() {
+        // Simulates a stored schema declaring a zero-dimension FixedSizeList (writers reject
+        // it but old files may contain one).  Building the decoder must fail cleanly instead
+        // of letting the zero dimension reach the rep/def decimation.
+        let item_fields = Fields::from(vec![Field::new("x", DataType::Int32, true)]);
+        let fields = Fields::from(vec![Field::new(
+            "vecs",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Struct(item_fields), true)),
+                0,
+            ),
+            true,
+        )]);
+
+        let err = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap_err();
+        assert!(matches!(err, lance_core::Error::Schema { .. }));
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -659,7 +723,7 @@ mod tests {
             Some(rows_validity),
         );
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
     }
@@ -689,7 +753,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -720,7 +784,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -799,7 +863,89 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_all_null_child() {
+        use arrow_array::StringArray;
+
+        let a_array = StringArray::from(vec![Some("w"), Some("x"), Some("y"), Some("z")]);
+        let b_array = StringArray::from(vec![None::<&str>, None, None, None]);
+        let struct_fields = Fields::from(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(a_array), Arc::new(b_array)],
+            None,
+        );
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 4]));
+        let list_field = Field::new("item", DataType::Struct(struct_fields), true);
+        let list_array =
+            ListArray::new(Arc::new(list_field), offsets, Arc::new(struct_array), None);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array)],
+            &TestCases::default()
+                .with_range(0..1)
+                .with_range(1..2)
+                .with_indices(vec![0])
+                .with_indices(vec![1])
+                .with_structural_encodings(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_constant_child_and_empty_lists() {
+        let item_fields = Fields::from(vec![
+            Field::new("maneuver", DataType::Int64, true),
+            Field::new("remaining_dist", DataType::Float64, true),
+        ]);
+        let item_array = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(3), Some(3), Some(3)])),
+                Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), Some(3.0)])),
+            ],
+            None,
+        );
+
+        let list_field = Field::new("item", DataType::Struct(item_fields), true);
+        let list_array = ListArray::new(
+            Arc::new(list_field),
+            OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 1, 2, 3, 3, 3, 3])),
+            Arc::new(item_array),
+            None,
+        );
+
+        let data_fields = Fields::from(vec![Field::new(
+            "maneuvers",
+            list_array.data_type().clone(),
+            true,
+        )]);
+        let data_array = StructArray::new(data_fields.clone(), vec![Arc::new(list_array)], None);
+        let row_validity = NullBuffer::from(vec![true, true, true, true, true, false]);
+        let row_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "data",
+                DataType::Struct(data_fields),
+                true,
+            )]),
+            vec![Arc::new(data_array)],
+            Some(row_validity),
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(row_array)],
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;

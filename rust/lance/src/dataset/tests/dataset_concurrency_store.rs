@@ -8,12 +8,12 @@ use crate::dataset::WriteDestination;
 use crate::{Dataset, Error, Result};
 
 use crate::dataset::write::{WriteMode, WriteParams};
+use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance_core::utils::tempfile::TempStrDir;
-use lance_index::DatasetIndexExt;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
 
 #[tokio::test]

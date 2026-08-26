@@ -33,7 +33,7 @@ use crate::schema::logical_arrow_schema;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
-#[pyclass(name = "_Scanner", module = "_lib")]
+#[pyclass(name = "_Scanner", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct Scanner {
     scanner: Arc<LanceScanner>,
@@ -49,7 +49,7 @@ impl Scanner {
     }
 }
 
-#[pyclass(name = "ScanStatistics", module = "_lib", get_all)]
+#[pyclass(name = "ScanStatistics", module = "_lib", get_all, skip_from_py_object)]
 #[derive(Clone)]
 /// Statistics about the scan.
 pub struct ScanStatistics {
@@ -66,6 +66,10 @@ pub struct ScanStatistics {
     pub parts_loaded: usize,
     /// Number of index comparisons performed
     pub index_comparisons: usize,
+    /// Number of index cache page lookups that were served from memory
+    pub index_cache_hits: usize,
+    /// Number of index cache page lookups that had to load from storage
+    pub index_cache_misses: usize,
     /// Additional metrics for more detailed statistics. These are subject to change in the future
     /// and should only be used for debugging purposes.
     pub all_counts: HashMap<String, usize>,
@@ -80,6 +84,8 @@ impl ScanStatistics {
             indices_loaded: stats.indices_loaded,
             parts_loaded: stats.parts_loaded,
             index_comparisons: stats.index_comparisons,
+            index_cache_hits: stats.index_cache_hits(),
+            index_cache_misses: stats.index_cache_misses(),
             all_counts: stats.all_counts.clone(),
         }
     }
@@ -89,13 +95,15 @@ impl ScanStatistics {
 impl ScanStatistics {
     fn __repr__(&self) -> String {
         format!(
-            "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, all_counts={:?})",
+            "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, index_cache_hits={}, index_cache_misses={}, all_counts={:?})",
             self.iops,
             self.requests,
             self.bytes_read,
             self.indices_loaded,
             self.parts_loaded,
             self.index_comparisons,
+            self.index_cache_hits,
+            self.index_cache_misses,
             self.all_counts
         )
     }
@@ -125,14 +133,17 @@ impl Scanner {
         Ok(res)
     }
 
-    #[pyo3(signature = (*))]
-    fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
+    #[pyo3(signature = (*, count_rows = false))]
+    fn analyze_plan(self_: PyRef<'_, Self>, count_rows: bool) -> PyResult<String> {
         let scanner = self_.scanner.clone();
         let res = rt()
-            .spawn(
-                Some(self_.py()),
-                async move { scanner.analyze_plan().await },
-            )?
+            .spawn(Some(self_.py()), async move {
+                if count_rows {
+                    scanner.analyze_count_plan().await
+                } else {
+                    scanner.analyze_plan().await
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(res)

@@ -20,7 +20,8 @@ A Lance dataset in its basic form stores all files within the dataset root direc
     data/
         *.lance           -- Data files containing column data
     _versions/
-        *.manifest        -- Manifest files (one per version)
+        *.manifest                -- Manifest files (one per version)
+        latest_version_hint.json  -- Optional hint of the latest version (see below)
     _transactions/
         *.txn             -- Transaction files for commit coordination
     _deletions/
@@ -200,4 +201,16 @@ Example: `_transactions/5-550e8400-e29b-41d4-a716-446655440000.txn`
 Manifest files are stored in the `_versions/` directory with naming schemes that support atomic commits.
 
 See [Manifest Naming Schemes](transaction.md#manifest-naming-schemes) for details on the V1 and V2 patterns and their implications for version discovery.
+
+### Version Hint
+
+The optional file `_versions/latest_version_hint.json` records the latest committed version as JSON:
+
+```json
+{"version": 42}
+```
+
+It exists to accelerate latest-version discovery on stores where listing `_versions/` is expensive: a reader can read the hint and probe higher versions with HEAD requests instead of listing the whole directory, falling back to a full listing if the hint is missing or stale.
+
+The hint is purely an optimization. It is always safe to delete, never affects correctness, and can be ignored by readers that don't understand it. Writers may choose not to write it.
 

@@ -134,6 +134,9 @@
         <module name="CommentsIndentation"/>
         <module name="UnusedImports"/>
         <module name="RedundantImport"/>
+        <module name="AvoidStarImport">
+            <property name="allowStaticMemberImports" value="true"/>
+        </module>
         <module name="RedundantModifier"/>
         <module name="RegexpSinglelineJava">
             <property name="format" value="throw new \w+Error\("/>

@@ -6,6 +6,76 @@ stable and breaking changes should generally be communicated (via warnings) for 
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
 
+## 9.0.0
+
+* Unless overridden, newly created FTS indexes use format v2. The code analyzer
+  and `block_size=256` require format v3, so readers must support v3 before an
+  index using either option is created. `document_granularity="list_element"`
+  also requires v3 reader capability, independently of the posting format.
+
+* To keep new indexes readable by nodes that support at most format v1 or v2,
+  set `format_version` in the index creation parameters, or set
+  `LANCE_FTS_FORMAT_VERSION` for a rollout-wide override. Formats v1 and v2
+  require the text analyzer and `block_size=128`.
+
+* Operations that maintain an existing FTS index, including append, incremental
+  indexing, optimize, and mem-wal maintained-index flush, preserve its format
+  version.
+
+## 7.2.0
+
+* The `IndexSegmentBuilder` API has been removed from Rust, Python, and Java.
+  This API was deprecated by the distributed indexing flow based on
+  `create_index_uncommitted`, `merge_existing_index_segments`, and
+  `commit_existing_index_segments`, but remained in the codebase as a parallel
+  way to plan and publish staged index segments.
+
+* Callers should now publish staged segment outputs directly with
+  `commit_existing_index_segments(...)`. If multiple staged outputs should be
+  combined into a larger physical segment first, callers should explicitly group
+  those outputs and call `merge_existing_index_segments(...)` for each group
+  before committing the final segment list.
+
+* The old builder's `target_segment_bytes` automatic size-based grouping has no
+  direct replacement. Distributed index drivers that used it should choose
+  segment groups themselves, then pass each group to
+  `merge_existing_index_segments(...)`.
+
+## 5.0.0
+
+* The default data storage version changed from 2.0 to 2.1. This affects the `column_indices`
+  field in the `DataFile` protobuf message. In 2.0, every field (including non-leaf fields like
+  struct containers and list containers) was assigned a sequential column index. In 2.1, non-leaf
+  fields (unpacked structs, list containers) are assigned `-1` instead since their validity
+  information is now folded into repetition/definition levels. Only leaf fields and packed structs
+  are assigned column indices.
+
+    For example, given the schema:
+
+    ```
+    x: i32, y: [f32], z: { a: i32 }
+    ```
+
+    The fields (in depth-first order) are:
+
+    | Field ID | Field         |
+    |----------|---------------|
+    | 0        | `x` (i32)     |
+    | 1        | `y` (list)    |
+    | 2        | `y.item` (f32)|
+    | 3        | `z` (struct)  |
+    | 4        | `z.a` (i32)   |
+
+    In **2.0**, `column_indices` = `[0, 1, 2, 3, 4]` — every field gets a column.
+
+    In **2.1**, `column_indices` = `[0, -1, 1, -1, 2]` — non-leaf fields (`y` and `z`) get `-1`.
+
+* This change only affects advanced users who construct `DataFile` messages directly, for example
+  when building operations by hand for `Dataset.commit`. Normal read and write paths are
+  unaffected.
+
+* To opt back to 2.0 format, set `data_storage_version="2.0"` when creating a dataset.
+
 ## 1.0.0
 
 * The `SearchResult` returned by scalar indices must now output information about null values.

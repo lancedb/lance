@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::local::join_local_io;
+#[cfg(windows)]
+use crate::local::read_exact_at;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
+    stream::{self, StreamExt},
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError};
+use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
-use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
+use crate::{
+    object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+    traits::{ByteStream, Reader},
+};
 
 trait StaticGetRange {
     fn path(&self) -> &Path;
@@ -63,7 +75,7 @@ pub struct CloudObjectReader {
 }
 
 impl DeepSizeOf for CloudObjectReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skipping object_store because there is no easy way to do that and it shouldn't be too big
         self.path.as_ref().deep_size_of_children(context)
     }
@@ -166,7 +178,8 @@ impl Reader for CloudObjectReader {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
-                    let meta = do_with_retry(|| self.object_store.head(&self.path)).await?;
+                    let meta =
+                        do_with_retry(|| Box::pin(self.object_store.head(&self.path))).await?;
                     Ok(meta.size as usize)
                 })
                 .await
@@ -176,25 +189,29 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
-            path: self.path.clone(),
-            options: GetOptions {
-                range: Some(
-                    Range {
-                        start: range.start as u64,
-                        end: range.end as u64,
-                    }
-                    .into(),
-                ),
-                ..Default::default()
-            },
-        });
-        Box::pin(do_get_with_outer_retry(
-            self.download_retry_count,
-            get_request,
-            move || format!("range {:?}", range),
-        ))
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let get_range = Range {
+            start: range.start as u64,
+            end: range.end as u64,
+        };
+        Box::pin(async move {
+            let bytes = do_with_retry(move || {
+                let object_store = object_store.clone();
+                let path = path.clone();
+                let get_range = get_range.clone();
+                Box::pin(async move { object_store.get_ranges(&path, &[get_range]).await })
+            })
+            .await?;
+
+            bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "CloudObjectReader",
+                    source: "get_ranges returned no bytes".into(),
+                })
+        })
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -209,6 +226,41 @@ impl Reader for CloudObjectReader {
                 "read_all".to_string()
             })
             .await
+        })
+    }
+
+    fn get_stream(&self) -> BoxFuture<'_, OSResult<ByteStream>> {
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions::default(),
+        });
+        Box::pin(async move {
+            let get_request_clone = get_request.clone();
+            let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
+            Ok(get_result.into_stream())
+        })
+    }
+
+    fn get_range_stream(&self, range: Range<usize>) -> BoxFuture<'_, OSResult<ByteStream>> {
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions {
+                range: Some(
+                    Range {
+                        start: range.start as u64,
+                        end: range.end as u64,
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        });
+        Box::pin(async move {
+            let get_request_clone = get_request.clone();
+            let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
+            Ok(get_result.into_stream())
         })
     }
 }
@@ -350,8 +402,55 @@ impl Reader for SmallReader {
     }
 }
 
+pub(crate) fn stream_local_range(
+    file: Arc<File>,
+    path: Path,
+    io_tracker: Arc<crate::utils::tracking_store::IOTracker>,
+    range: Range<usize>,
+    chunk_size: usize,
+) -> ByteStream {
+    stream::try_unfold(
+        (file, path, io_tracker, range.start, range.end),
+        move |state| async move {
+            let (file, path, io_tracker, start, end) = state;
+            if start >= end {
+                return Ok(None);
+            }
+
+            let next = (start + chunk_size).min(end);
+            let file_clone = file.clone();
+            let path_clone = path.clone();
+            let num_bytes = (next - start) as u64;
+            let metrics = io_tracker.begin_io("get");
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
+                let mut buf = bytes::BytesMut::with_capacity(next - start);
+                // Safety: buffer capacity matches the exact number of bytes we read below.
+                unsafe { buf.set_len(next - start) };
+                #[cfg(unix)]
+                file_clone.read_exact_at(buf.as_mut(), start as u64)?;
+                #[cfg(windows)]
+                read_exact_at(file_clone, buf.as_mut(), start as u64)?;
+                Ok::<_, std::io::Error>(buf.freeze())
+            }))
+            .await;
+            metrics.record(&result, num_bytes);
+            let bytes = result?;
+
+            io_tracker.record_read(
+                "get_range_stream",
+                path_clone,
+                num_bytes,
+                Some(start as u64..next as u64),
+            );
+
+            Ok(Some((bytes, (file, path, io_tracker, next, end))))
+        },
+    )
+    .boxed()
+}
+
 impl DeepSizeOf for SmallReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
         if let Ok(guard) = self.inner.state.try_lock()

@@ -213,6 +213,58 @@ def test_s3_ddb_concurrent_commit_more_than_five(
 
 
 @pytest.mark.integration
+def test_s3_ddb_branches(s3_bucket: str, ddb_table: str):
+    """Branches on a table committed through the DynamoDB external manifest
+    store.
+
+    The DDB store keys version chains by base uri, so each branch chain must
+    get its own entries via its branch-qualified path. Both chains are given
+    the same version number with diverged data so a wrong-chain resolution
+    cannot pass silently.
+    """
+    storage_options = copy.deepcopy(CONFIG)
+    table_name = uuid.uuid4().hex
+    table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
+
+    # main: v1 (a=1), v2 (a=2)
+    lance.write_dataset(
+        pa.Table.from_pylist([{"a": 1}]), table_dir, storage_options=storage_options
+    )
+    ds = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 2}]),
+        table_dir,
+        mode="append",
+        storage_options=storage_options,
+    )
+
+    # Fork "dev" at v2 and commit on it, then diverge main to the same
+    # version number.
+    dev = ds.create_branch("dev", 2)
+    dev = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 3}]),
+        dev,
+        mode="append",
+        storage_options=storage_options,
+    )
+    ds = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 100}]),
+        table_dir,
+        mode="append",
+        storage_options=storage_options,
+    )
+
+    assert sorted(dev.to_table()["a"].to_pylist()) == [1, 2, 3]
+    assert sorted(ds.to_table()["a"].to_pylist()) == [1, 2, 100]
+
+    # Cross-branch checkout at the overlapping version number resolves each
+    # chain's own data.
+    on_dev = ds.checkout_version(("dev", 3))
+    assert sorted(on_dev.to_table()["a"].to_pylist()) == [1, 2, 3]
+    back_on_main = dev.checkout_version(("main", None))
+    assert sorted(back_on_main.to_table()["a"].to_pylist()) == [1, 2, 100]
+
+
+@pytest.mark.integration
 def test_s3_unsafe(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
     del storage_options["dynamodb_endpoint"]
@@ -262,6 +314,29 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
+
+    # The writer reports the size of the object it just wrote, so callers do not
+    # need a second client to stat it.
+    s3 = get_boto3_client("s3", endpoint_url=CONFIG["aws_endpoint"])
+    head = s3.head_object(Bucket=s3_bucket, Key="foo.lance")
+    assert writer.size_bytes == head["ContentLength"]
+
+
+@pytest.mark.integration
+def test_file_writer_size_bytes_multipart(s3_bucket: str):
+    # Large enough to exceed the single-PUT threshold, so the write goes through
+    # the multipart path where the reported size is filled in on completion.
+    storage_options = copy.deepcopy(CONFIG)
+    del storage_options["dynamodb_endpoint"]
+    table = pa.table({"a": pa.array(range(4 * 1024 * 1024), type=pa.int64())})
+    file_path = f"s3://{s3_bucket}/multipart.lance"
+    with LanceFileWriter(str(file_path), storage_options=storage_options) as writer:
+        writer.write_batch(table)
+
+    s3 = get_boto3_client("s3", endpoint_url=CONFIG["aws_endpoint"])
+    head = s3.head_object(Bucket=s3_bucket, Key="multipart.lance")
+    assert head["ContentLength"] > 5 * 1024 * 1024
+    assert writer.size_bytes == head["ContentLength"]
 
 
 @pytest.mark.integration

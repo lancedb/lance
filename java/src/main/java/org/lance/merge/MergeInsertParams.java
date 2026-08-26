@@ -13,10 +13,13 @@
  */
 package org.lance.merge;
 
+import org.lance.memwal.CompactedSsTable;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -35,6 +38,8 @@ public class MergeInsertParams {
   private int conflictRetries = 10;
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
+  private boolean useIndex = true;
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -223,8 +228,49 @@ public class MergeInsertParams {
     return this;
   }
 
+  /**
+   * Controls whether to use indices for the merge operation.
+   *
+   * <p>When set to false, forces a full table scan even if an index exists on the join key. This
+   * can be useful for benchmarking or when the optimizer chooses a suboptimal path.
+   *
+   * <p>Default is true (use index if available).
+   *
+   * @param useIndex Whether to use indices for the merge join
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withUseIndex(boolean useIndex) {
+    this.useIndex = useIndex;
+    return this;
+  }
+
+  /**
+   * Mark MemWAL SSTables as compacted into the base table.
+   *
+   * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
+   *
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
+   *
+   * @param sstables the SSTables being compacted
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.compactedSstables = sstables;
+    return this;
+  }
+
   public List<String> on() {
     return on;
+  }
+
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
   }
 
   public WhenMatched whenMatched() {
@@ -275,6 +321,10 @@ public class MergeInsertParams {
     return skipAutoCleanup;
   }
 
+  public boolean useIndex() {
+    return useIndex;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -292,6 +342,7 @@ public class MergeInsertParams {
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
+        .add("useIndex", useIndex)
         .toString();
   }
 

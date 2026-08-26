@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-mod sq;
-
 use arrow_array::Float32Array;
 use arrow_array::{FixedSizeListArray, types::Float32Type};
 use lance_arrow::FixedSizeListArrayExt;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_index::vector::ivf::IvfTransformer;
 use lance_linalg::distance::DistanceType;

@@ -15,22 +15,25 @@ tar xvf mecab-ipadic-2.7.0-20070801.tar.gz
 
 - Edit matrix.def, reset last column(weight) into zero, except first row.
 
+- Create `metadata.json` for the IPADIC schema. Lindera 3.x requires this file
+  when building and loading dictionaries.
+
 - build
 
 ```bash
-lindera build --dictionary-kind=ipadic mecab-ipadic-2.7.0-20070801 main
+lindera build --src mecab-ipadic-2.7.0-20070801 --dest main --metadata metadata.json
 ```
 
 - build user dict
 
 ```bash
-lindera build --build-user-dictionary --dictionary-kind=ipadic user_dict/userdict.csv user_dict2
+lindera build --user --src user_dict/userdic.csv --dest user_dict2 --metadata metadata.json
 ```
 
 ## Version Compatibility
 
 **Important**: The binary user dictionary format (`userdic.bin`) is version-specific and needs to be regenerated when upgrading lindera versions.
 
-- Current version: lindera 0.44.0
-- Last regenerated: 2025-09-09
+- Current version: lindera 3.0.7
+- Last regenerated: 2026-05-08
 - Binary format changes between versions will cause deserialization errors

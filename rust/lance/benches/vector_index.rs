@@ -11,14 +11,15 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::Rng;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams, builder::DatasetBuilder};
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::{FixedSizeListArrayExt, as_fixed_size_list_array};
 use lance_index::{
-    DatasetIndexExt, IndexType,
+    IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
 use lance_linalg::distance::MetricType;

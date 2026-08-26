@@ -5,10 +5,14 @@
 //!
 //! Used as storage backend for Graph based algorithms.
 
-use std::{cmp::min, collections::HashMap, sync::Arc};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::{
+    cmp::min,
+    sync::{Arc, OnceLock},
+};
 
 use arrow::datatypes::{self, UInt8Type};
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
@@ -17,14 +21,14 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+use lance_file::versions::v1::{
+    reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{object_store::ObjectStore, utils::read_message};
-use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -66,10 +70,10 @@ pub struct ProductQuantizationMetadata {
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook
             .as_ref()
-            .map(|codebook| codebook.get_array_memory_size())
+            .map(|codebook| (codebook as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }
@@ -107,14 +111,22 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        debug_assert!(self.codebook.is_some());
-        let codebook_tensor: pb::Tensor = pb::Tensor::try_from(self.codebook.as_ref().unwrap())?;
-        let mut bytes = BytesMut::new();
-        codebook_tensor.encode(&mut bytes)?;
-        Ok(Some(bytes.freeze()))
+        if let Some(codebook) = &self.codebook {
+            let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
+            let mut bytes = BytesMut::new();
+            codebook_tensor.encode(&mut bytes)?;
+            Ok(Some(bytes.freeze()))
+        } else if !self.codebook_tensor.is_empty() {
+            // Legacy format: codebook is stored inline in the metadata JSON.
+            // Return it as-is; it's already a protobuf-encoded Tensor that
+            // parse_buffer() can handle.
+            Ok(Some(Bytes::from(self.codebook_tensor.clone())))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
             .metadata
@@ -150,16 +162,24 @@ pub struct ProductQuantizationStorage {
     // For easy access
     pq_code: Arc<UInt8Array>,
     row_ids: Arc<UInt64Array>,
+    pairwise_distance_table: Arc<OnceLock<Vec<f32>>>,
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
             + self
                 .metadata
                 .codebook
                 .as_ref()
-                .map(|codebook| codebook.get_array_memory_size())
+                .map(|codebook| {
+                    (codebook as &dyn arrow_array::Array).deep_size_of_children(context)
+                })
+                .unwrap_or(0)
+            + self
+                .pairwise_distance_table
+                .get()
+                .map(|table| table.deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }
@@ -201,7 +221,7 @@ impl ProductQuantizationStorage {
                 "Row ID column not found from PQ storage".to_string(),
             ));
         };
-        let row_ids: Arc<UInt64Array> = row_ids
+        let mut row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::index(
                 "Row ID column is not of type UInt64".to_string(),
@@ -273,6 +293,11 @@ impl ProductQuantizationStorage {
                 .as_primitive::<UInt8Type>()
                 .clone()
                 .into();
+            // Refresh the stored row ids from the remapped batch. Without this
+            // the storage keeps the pre-remap (compacted-away) addresses while
+            // its codes are remapped, so search returns stale row ids and the
+            // take fails with "fragment ... does not exist".
+            row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone().into();
         }
 
         let distance_type = match distance_type {
@@ -294,6 +319,7 @@ impl ProductQuantizationStorage {
             batch,
             pq_code,
             row_ids,
+            pairwise_distance_table: Arc::new(OnceLock::new()),
         })
     }
 
@@ -360,7 +386,7 @@ impl ProductQuantizationStorage {
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -397,12 +423,53 @@ impl ProductQuantizationStorage {
             .collect()
     }
 
+    fn pairwise_distance_table(&self) -> &[f32] {
+        self.pairwise_distance_table
+            .get_or_init(|| {
+                let codebook = self.metadata.codebook.as_ref().unwrap();
+                match codebook.value_type() {
+                    DataType::Float16 => build_pairwise_distance_table(
+                        codebook
+                            .values()
+                            .as_primitive::<datatypes::Float16Type>()
+                            .values(),
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        self.metadata.dimension,
+                        self.distance_type,
+                    ),
+                    DataType::Float32 => build_pairwise_distance_table(
+                        codebook
+                            .values()
+                            .as_primitive::<datatypes::Float32Type>()
+                            .values(),
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        self.metadata.dimension,
+                        self.distance_type,
+                    ),
+                    DataType::Float64 => build_pairwise_distance_table(
+                        codebook
+                            .values()
+                            .as_primitive::<datatypes::Float64Type>()
+                            .values(),
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        self.metadata.dimension,
+                        self.distance_type,
+                    ),
+                    _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
+                }
+            })
+            .as_slice()
+    }
+
     /// Write the PQ storage as a Lance partition to disk,
     /// and returns the number of rows written.
     ///
     pub async fn write_partition(
         &self,
-        writer: &mut PreviousFileWriter<ManifestDescribing>,
+        writer: &mut V1FileWriter<ManifestDescribing>,
     ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
         for offset in (0..self.batch.num_rows()).step_by(batch_size) {
@@ -483,16 +550,16 @@ impl QuantizerStorage for ProductQuantizationStorage {
 
     // we can't use the default implementation of remap,
     // because PQ Storage transposed the PQ codes
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let transposed_codes = self.pq_code.values();
         let mut new_row_ids = Vec::with_capacity(self.len());
         let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         self.metadata.nbits,
@@ -538,6 +605,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             batch,
             pq_code: Arc::new(transposed_codes),
             row_ids: new_row_ids,
+            pairwise_distance_table: self.pairwise_distance_table.clone(),
         })
     }
 
@@ -545,9 +613,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// - *reader: &PreviousFileReader
+    /// - *reader: &V1FileReader
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
@@ -665,73 +733,14 @@ impl VectorStore for ProductQuantizationStorage {
             self.metadata.num_sub_vectors,
             id,
         );
-        let codebook = self.metadata.codebook.as_ref().unwrap();
-        match codebook.value_type() {
-            DataType::Float16 => {
-                let codebook = codebook
-                    .values()
-                    .as_primitive::<datatypes::Float16Type>()
-                    .values();
-                let query = get_centroids(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    codes,
-                );
-                PQDistCalculator::new(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.pq_code.clone(),
-                    &query,
-                    self.distance_type,
-                )
-            }
-            DataType::Float32 => {
-                let codebook = codebook
-                    .values()
-                    .as_primitive::<datatypes::Float32Type>()
-                    .values();
-                let query = get_centroids(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    codes,
-                );
-                PQDistCalculator::new(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.pq_code.clone(),
-                    &query,
-                    self.distance_type,
-                )
-            }
-            DataType::Float64 => {
-                let codebook = codebook
-                    .values()
-                    .as_primitive::<datatypes::Float64Type>()
-                    .values();
-                let query = get_centroids(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    codes,
-                );
-                PQDistCalculator::new(
-                    codebook,
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.pq_code.clone(),
-                    &query,
-                    self.distance_type,
-                )
-            }
-            _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
-        }
+        PQDistCalculator::new_from_codes(
+            self.pairwise_distance_table(),
+            self.metadata.nbits,
+            self.metadata.num_sub_vectors,
+            self.pq_code.clone(),
+            codes,
+            self.distance_type,
+        )
     }
 
     fn dist_between(&self, u: u32, v: u32) -> f32 {
@@ -750,80 +759,14 @@ impl VectorStore for ProductQuantizationStorage {
             self.metadata.num_sub_vectors,
             v,
         );
-        let codebook = self.metadata.codebook.as_ref().unwrap();
-
-        match codebook.value_type() {
-            DataType::Float16 => {
-                let qu = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float16Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    u_codes,
-                );
-                let qv = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float16Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    v_codes,
-                );
-                self.distance_type.func()(&qu, &qv)
-            }
-            DataType::Float32 => {
-                let qu = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float32Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    u_codes,
-                );
-                let qv = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float32Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    v_codes,
-                );
-                self.distance_type.func()(&qu, &qv)
-            }
-            DataType::Float64 => {
-                let qu = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float64Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    u_codes,
-                );
-                let qv = get_centroids(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float64Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.metadata.dimension,
-                    v_codes,
-                );
-                self.distance_type.func()(&qu, &qv)
-            }
-            _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
-        }
+        pq_code_distance(
+            self.pairwise_distance_table(),
+            self.metadata.nbits,
+            self.metadata.num_sub_vectors,
+            u_codes,
+            v_codes,
+            self.distance_type,
+        )
     }
 
     fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
@@ -860,6 +803,29 @@ impl PQDistCalculator {
             }
             _ => unimplemented!("DistanceType is not supported: {:?}", distance_type),
         };
+        Self {
+            distance_table,
+            num_sub_vectors,
+            pq_code,
+            num_bits,
+            distance_type,
+        }
+    }
+
+    fn new_from_codes(
+        pairwise_distance_table: &[f32],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        pq_code: Arc<UInt8Array>,
+        query_codes: impl Iterator<Item = u8>,
+        distance_type: DistanceType,
+    ) -> Self {
+        let distance_table = distance_table_from_codes(
+            pairwise_distance_table,
+            num_bits,
+            num_sub_vectors,
+            query_codes,
+        );
         Self {
             distance_table,
             num_sub_vectors,
@@ -954,6 +920,153 @@ impl DistCalculator for PQDistCalculator {
     }
 }
 
+fn build_pairwise_distance_table<T: L2 + Cosine + Dot>(
+    codebook: &[T],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    dimension: usize,
+    distance_type: DistanceType,
+) -> Vec<f32> {
+    let num_centroids = 2_usize.pow(num_bits);
+    let sub_vector_width = dimension / num_sub_vectors;
+    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids * num_centroids);
+    let distance_fn = distance_type.func();
+    for sub_vector_idx in 0..num_sub_vectors {
+        let sub_vector_offset = sub_vector_idx * num_centroids * sub_vector_width;
+        let centroids =
+            &codebook[sub_vector_offset..sub_vector_offset + num_centroids * sub_vector_width];
+        for query_centroid_idx in 0..num_centroids {
+            let query_offset = query_centroid_idx * sub_vector_width;
+            let query = &centroids[query_offset..query_offset + sub_vector_width];
+            for centroid_idx in 0..num_centroids {
+                let centroid_offset = centroid_idx * sub_vector_width;
+                let centroid = &centroids[centroid_offset..centroid_offset + sub_vector_width];
+                result.push(distance_fn(query, centroid));
+            }
+        }
+    }
+    result
+}
+
+fn distance_table_from_codes(
+    pairwise_distance_table: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    query_codes: impl Iterator<Item = u8>,
+) -> Vec<f32> {
+    let num_centroids = 2_usize.pow(num_bits);
+    let mut distance_table = Vec::with_capacity(num_sub_vectors * num_centroids);
+    if num_bits == 4 {
+        for (byte_idx, query_code) in query_codes.enumerate() {
+            let current_idx = (query_code & 0x0F) as usize;
+            let current_sub_vector_idx = 2 * byte_idx;
+            extend_pairwise_distance_row(
+                &mut distance_table,
+                pairwise_distance_table,
+                num_centroids,
+                current_sub_vector_idx,
+                current_idx,
+            );
+
+            let next_idx = (query_code >> 4) as usize;
+            let next_sub_vector_idx = current_sub_vector_idx + 1;
+            extend_pairwise_distance_row(
+                &mut distance_table,
+                pairwise_distance_table,
+                num_centroids,
+                next_sub_vector_idx,
+                next_idx,
+            );
+        }
+    } else {
+        for (sub_vector_idx, query_code) in query_codes.enumerate() {
+            extend_pairwise_distance_row(
+                &mut distance_table,
+                pairwise_distance_table,
+                num_centroids,
+                sub_vector_idx,
+                query_code as usize,
+            );
+        }
+    }
+    distance_table
+}
+
+fn extend_pairwise_distance_row(
+    distance_table: &mut Vec<f32>,
+    pairwise_distance_table: &[f32],
+    num_centroids: usize,
+    sub_vector_idx: usize,
+    query_centroid_idx: usize,
+) {
+    let start = (sub_vector_idx * num_centroids + query_centroid_idx) * num_centroids;
+    distance_table.extend_from_slice(&pairwise_distance_table[start..start + num_centroids]);
+}
+
+fn pq_code_distance(
+    pairwise_distance_table: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    lhs_codes: impl Iterator<Item = u8>,
+    rhs_codes: impl Iterator<Item = u8>,
+    distance_type: DistanceType,
+) -> f32 {
+    let num_centroids = 2_usize.pow(num_bits);
+    let dist = if num_bits == 4 {
+        lhs_codes
+            .zip(rhs_codes)
+            .enumerate()
+            .map(|(byte_idx, (lhs, rhs))| {
+                let current_sub_vector_idx = 2 * byte_idx;
+                pairwise_distance(
+                    pairwise_distance_table,
+                    num_centroids,
+                    current_sub_vector_idx,
+                    (lhs & 0x0F) as usize,
+                    (rhs & 0x0F) as usize,
+                ) + pairwise_distance(
+                    pairwise_distance_table,
+                    num_centroids,
+                    current_sub_vector_idx + 1,
+                    (lhs >> 4) as usize,
+                    (rhs >> 4) as usize,
+                )
+            })
+            .sum()
+    } else {
+        lhs_codes
+            .zip(rhs_codes)
+            .enumerate()
+            .map(|(sub_vector_idx, (lhs, rhs))| {
+                pairwise_distance(
+                    pairwise_distance_table,
+                    num_centroids,
+                    sub_vector_idx,
+                    lhs as usize,
+                    rhs as usize,
+                )
+            })
+            .sum()
+    };
+
+    if distance_type == DistanceType::Dot {
+        dist - (num_sub_vectors as f32 - 1.0)
+    } else {
+        dist
+    }
+}
+
+fn pairwise_distance(
+    pairwise_distance_table: &[f32],
+    num_centroids: usize,
+    sub_vector_idx: usize,
+    query_centroid_idx: usize,
+    centroid_idx: usize,
+) -> f32 {
+    pairwise_distance_table
+        [(sub_vector_idx * num_centroids + query_centroid_idx) * num_centroids + centroid_idx]
+}
+
 fn get_pq_code(
     pq_code: &[u8],
     num_bits: u32,
@@ -975,6 +1088,7 @@ fn get_pq_code(
         .exact_size(num_bytes)
 }
 
+#[cfg(test)]
 fn get_centroids<T: Clone>(
     codebook: &[T],
     num_bits: u32,
@@ -1003,6 +1117,7 @@ fn get_centroids<T: Clone>(
     centroids
 }
 
+#[cfg(test)]
 fn get_centroids_4bit<T: Clone>(
     codebook: &[T],
     num_sub_vectors: usize,
@@ -1039,6 +1154,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
     use rand::Rng;
+    use rstest::rstest;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;
@@ -1142,20 +1258,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remap_with_extra_column() {
+    async fn test_dist_calculator_from_id_matches_reconstructed_distance() {
+        let mut rng = rand::rng();
+        let storage = create_pq_storage().await;
+        let u = rng.random_range(0..storage.len() as u32);
+        let v = rng.random_range(0..storage.len() as u32);
+        let codebook = storage
+            .metadata
+            .codebook
+            .as_ref()
+            .unwrap()
+            .values()
+            .as_primitive::<datatypes::Float32Type>();
+        let pq_codes = storage.pq_code.values();
+        let qu = get_centroids(
+            codebook.values(),
+            storage.metadata.nbits,
+            storage.metadata.num_sub_vectors,
+            storage.metadata.dimension,
+            get_pq_code(
+                pq_codes,
+                storage.metadata.nbits,
+                storage.metadata.num_sub_vectors,
+                u,
+            ),
+        );
+        let qv = get_centroids(
+            codebook.values(),
+            storage.metadata.nbits,
+            storage.metadata.num_sub_vectors,
+            storage.metadata.dimension,
+            get_pq_code(
+                pq_codes,
+                storage.metadata.nbits,
+                storage.metadata.num_sub_vectors,
+                v,
+            ),
+        );
+        let expected = storage.distance_type.func()(&qu, &qv);
+        let dist_calc = storage.dist_calculator_from_id(u);
+        assert!((dist_calc.distance(v) - expected).abs() < 1e-4);
+        assert!((storage.dist_between(u, v) - expected).abs() < 1e-4);
+    }
+
+    // The first half of the rows is rewritten in order into frag 1; the second
+    // half is deleted. remap must behave the same in either RowAddrRemap mode.
+    fn pq_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter((0..TOTAL / 2).map(|i| i as u64)),
+            old_frag_ids: vec![0],
+            new_frags: vec![(1, (TOTAL / 2) as u32)],
+        }])
+        .unwrap()
+    }
+
+    fn pq_remap_explicit() -> RowAddrRemap {
+        RowAddrRemap::direct(
+            (0..TOTAL / 2)
+                .map(|i| (i as u64, Some((1u64 << 32) | i as u64)))
+                .chain((TOTAL / 2..TOTAL).map(|i| (i as u64, None)))
+                .collect(),
+        )
+    }
+
+    #[rstest]
+    #[case(pq_remap_compact())]
+    #[case(pq_remap_explicit())]
+    #[tokio::test]
+    async fn test_remap_with_extra_column(#[case] remap: RowAddrRemap) {
         let storage = create_pq_storage_with_extra_column().await;
-        let mut mapping = HashMap::new();
-        for i in 0..TOTAL / 2 {
-            mapping.insert(i as u64, Some((TOTAL + i) as u64));
-        }
-        for i in TOTAL / 2..TOTAL {
-            mapping.insert(i as u64, None);
-        }
-        let new_storage = storage.remap(&mapping).unwrap();
+        let new_storage = storage.remap(&remap).unwrap();
         assert_eq!(new_storage.len(), TOTAL / 2);
         assert_eq!(new_storage.row_ids.len(), TOTAL / 2);
         for (i, row_id) in new_storage.row_ids().enumerate() {
-            assert_eq!(*row_id, (TOTAL + i) as u64);
+            // Rewritten row i lands at offset i of frag 1.
+            assert_eq!(*row_id, (1u64 << 32) | i as u64);
         }
         assert_eq!(new_storage.batch.num_columns(), 2);
         assert!(new_storage.batch.column_by_name(ROW_ID).is_some());

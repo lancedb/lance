@@ -13,6 +13,10 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   forward-to-bench:
     # Only process comments on PRs that mention @bench-bot and contain 'benchmark'

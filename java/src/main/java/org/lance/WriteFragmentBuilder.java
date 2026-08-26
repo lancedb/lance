@@ -13,7 +13,8 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
+import org.lance.namespace.LanceNamespace;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
@@ -45,9 +46,12 @@ public class WriteFragmentBuilder {
   private BufferAllocator allocator;
   private VectorSchemaRoot vectorSchemaRoot;
   private ArrowArrayStream arrowArrayStream;
+  private LanceSchema schema;
   private WriteParams writeParams;
   private WriteParams.Builder writeParamsBuilder;
-  private StorageOptionsProvider storageOptionsProvider;
+  private LanceNamespace namespaceClient;
+  private List<String> tableId;
+  private Session session;
 
   WriteFragmentBuilder() {}
 
@@ -100,6 +104,22 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Set the Lance dataset schema to use when writing fragments.
+   *
+   * <p>This is useful for distributed writes where workers create uncommitted fragments and a
+   * coordinator commits them later. When this schema is supplied, lance-core does not need to open
+   * the existing dataset to infer the schema in APPEND mode. The schema should come from the target
+   * dataset so Lance field IDs are preserved.
+   *
+   * @param schema the target Lance dataset schema
+   * @return this builder
+   */
+  public WriteFragmentBuilder schema(LanceSchema schema) {
+    this.schema = schema;
+    return this;
+  }
+
+  /**
    * Set the write parameters.
    *
    * @param params the write parameters
@@ -123,13 +143,59 @@ public class WriteFragmentBuilder {
   }
 
   /**
-   * Set the storage options provider for dynamic credential refresh.
+   * Set runtime-only object store parameters for registered base paths.
    *
-   * @param provider the storage options provider
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is the storage options map used for that base. Bases without an explicit entry use
+   * {@link #storageOptions(Map)} as the fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
    * @return this builder
    */
-  public WriteFragmentBuilder storageOptionsProvider(StorageOptionsProvider provider) {
-    this.storageOptionsProvider = provider;
+  public WriteFragmentBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withBaseStoreParams(baseStoreParams);
+    return this;
+  }
+
+  /**
+   * Set the namespace client for automatic credential refresh.
+   *
+   * <p>When provided with `tableId`, a storage options provider will be created automatically to
+   * refresh credentials via the namespace client. Must be provided together with `tableId`. The
+   * caller should provide initial/merged storage options via the `storageOptions` method.
+   *
+   * @param namespaceClient the LanceNamespace client instance
+   * @return this builder
+   */
+  public WriteFragmentBuilder namespaceClient(LanceNamespace namespaceClient) {
+    this.namespaceClient = namespaceClient;
+    return this;
+  }
+
+  /**
+   * Set the table ID for namespace client-based credential refresh.
+   *
+   * <p>Must be provided together with `namespaceClient`.
+   *
+   * @param tableId the table identifier (e.g., ["workspace", "table_name"])
+   * @return this builder
+   */
+  public WriteFragmentBuilder tableId(List<String> tableId) {
+    this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Set a session to reuse across operations.
+   *
+   * <p>The session holds shared caches (metadata and index) and the object store registry.
+   *
+   * @param session the session to share
+   * @return this builder
+   */
+  public WriteFragmentBuilder session(Session session) {
+    this.session = session;
     return this;
   }
 
@@ -206,6 +272,30 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Register base paths when creating a new dataset from fragments.
+   *
+   * @param bases base paths to register
+   * @return this builder
+   */
+  public WriteFragmentBuilder initialBases(List<BasePath> bases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withInitialBases(bases);
+    return this;
+  }
+
+  /**
+   * Set base names or paths where new fragment files should be written.
+   *
+   * @param targetBases base names or exact paths
+   * @return this builder
+   */
+  public WriteFragmentBuilder targetBases(List<String> targetBases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withTargetBases(targetBases);
+    return this;
+  }
+
+  /**
    * Execute the fragment write operation.
    *
    * @return the list of fragment metadata for the created fragments
@@ -213,15 +303,31 @@ public class WriteFragmentBuilder {
   public List<FragmentMetadata> execute() {
     validate();
 
-    // Build the write params if builder was used
+    // Build the write params
     WriteParams finalWriteParams = buildWriteParams();
 
+    // Pass namespaceClient and tableId to JNI - Rust will automatically create a
+    // storage options provider when these are non-null for credential refresh
     if (vectorSchemaRoot != null) {
       return Fragment.create(
-          datasetUri, allocator, vectorSchemaRoot, finalWriteParams, storageOptionsProvider);
+          datasetUri,
+          allocator,
+          vectorSchemaRoot,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          schema,
+          session);
     } else {
       return Fragment.create(
-          datasetUri, arrowArrayStream, finalWriteParams, storageOptionsProvider);
+          datasetUri,
+          allocator,
+          arrowArrayStream,
+          finalWriteParams,
+          namespaceClient,
+          tableId,
+          schema,
+          session);
     }
   }
 
@@ -253,7 +359,13 @@ public class WriteFragmentBuilder {
         vectorSchemaRoot == null || allocator != null,
         "allocator is required when using VectorSchemaRoot");
     Preconditions.checkState(
+        schema == null || allocator != null, "allocator is required with schema");
+    Preconditions.checkState(
         writeParams == null || writeParamsBuilder == null,
         "Cannot use both writeParams() and individual parameter methods");
+    Preconditions.checkState(
+        (namespaceClient == null && tableId == null)
+            || (namespaceClient != null && tableId != null),
+        "Both 'namespaceClient' and 'tableId' must be provided together");
   }
 }

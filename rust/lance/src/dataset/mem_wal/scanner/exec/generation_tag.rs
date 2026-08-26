@@ -3,7 +3,6 @@
 
 //! MemTable generation tagging execution node.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,7 +43,7 @@ pub struct MemtableGenTagExec {
     /// Output schema (input schema + _gen column).
     schema: SchemaRef,
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MemtableGenTagExec {
@@ -62,12 +61,12 @@ impl MemtableGenTagExec {
         let schema = Arc::new(Schema::new(fields));
 
         // Preserve input properties
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
-        );
+        ));
 
         Self {
             input,
@@ -100,15 +99,11 @@ impl ExecutionPlan for MemtableGenTagExec {
         "MemtableGenTagExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

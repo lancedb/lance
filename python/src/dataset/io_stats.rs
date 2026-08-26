@@ -12,7 +12,7 @@ use pyo3::{pyclass, pymethods};
 ///
 /// Note: Calling `io_stats()` returns the statistics accumulated since the last call
 /// and resets the internal counters (incremental stats pattern).
-#[pyclass(name = "IOStats", module = "_lib", get_all)]
+#[pyclass(name = "IOStats", module = "_lib", get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct IoStats {
     /// Number of read IO operations performed

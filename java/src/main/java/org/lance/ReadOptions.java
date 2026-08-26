@@ -13,8 +13,6 @@
  */
 package org.lance;
 
-import org.lance.io.StorageOptionsProvider;
-
 import com.google.common.base.MoreObjects;
 
 import java.nio.ByteBuffer;
@@ -31,7 +29,7 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
-  private final Optional<StorageOptionsProvider> storageOptionsProvider;
+  private final Map<String, Map<String, String>> baseStoreParams;
   private final Optional<Session> session;
 
   private ReadOptions(Builder builder) {
@@ -40,8 +38,8 @@ public class ReadOptions {
     this.indexCacheSizeBytes = builder.indexCacheSizeBytes;
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
+    this.baseStoreParams = builder.baseStoreParams;
     this.serializedManifest = builder.serializedManifest;
-    this.storageOptionsProvider = builder.storageOptionsProvider;
     this.session = builder.session;
   }
 
@@ -65,12 +63,12 @@ public class ReadOptions {
     return storageOptions;
   }
 
-  public Optional<ByteBuffer> getSerializedManifest() {
-    return serializedManifest;
+  public Map<String, Map<String, String>> getBaseStoreParams() {
+    return baseStoreParams;
   }
 
-  public Optional<StorageOptionsProvider> getStorageOptionsProvider() {
-    return storageOptionsProvider;
+  public Optional<ByteBuffer> getSerializedManifest() {
+    return serializedManifest;
   }
 
   /**
@@ -103,8 +101,8 @@ public class ReadOptions {
     private long indexCacheSizeBytes = 6L * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
+    private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
-    private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
     private Optional<Session> session = Optional.empty();
 
     /**
@@ -191,11 +189,34 @@ public class ReadOptions {
      * Set storage options. Extra options that make sense for a particular storage connection. This
      * is used to store connection parameters like credentials, endpoint, etc.
      *
+     * <p>For datasets with additional registered base paths, a key of the form {@code
+     * base_<id>.<key>} applies {@code <key>} only to the base path with that manifest id,
+     * overriding the unscoped options that every base inherits. For example {@code
+     * base_1.account_key = abc} makes base 1 use {@code account_key = abc} while all other options
+     * are shared. Exact per-base bindings set via {@link #setBaseStoreParams(Map)} take precedence
+     * over base-scoped keys.
+     *
      * @param storageOptions the storage options
      * @return this builder
      */
     public Builder setStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
+      return this;
+    }
+
+    /**
+     * Set runtime-only object store parameters for registered base paths.
+     *
+     * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+     * Each value is the storage options map used as-is for that base. These params are not
+     * persisted in the manifest. If a base has no explicit entry, {@link #setStorageOptions(Map)}
+     * remains the fallback.
+     *
+     * @param baseStoreParams object store parameters keyed by base path URI
+     * @return this builder
+     */
+    public Builder setBaseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+      this.baseStoreParams = baseStoreParams;
       return this;
     }
 
@@ -208,21 +229,6 @@ public class ReadOptions {
      */
     public Builder setSerializedManifest(ByteBuffer serializedManifest) {
       this.serializedManifest = Optional.of(serializedManifest);
-      return this;
-    }
-
-    /**
-     * Set a custom storage options provider for automatic storage options refresh.
-     *
-     * <p>The storage options provider will be called automatically before storage options expire,
-     * enabling long-running operations on cloud storage without interruption. This is currently
-     * only used for refreshing AWS temporary access credentials.
-     *
-     * @param storageOptionsProvider the storage options provider implementation
-     * @return this builder
-     */
-    public Builder setStorageOptionsProvider(StorageOptionsProvider storageOptionsProvider) {
-      this.storageOptionsProvider = Optional.of(storageOptionsProvider);
       return this;
     }
 

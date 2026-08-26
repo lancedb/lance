@@ -9,6 +9,7 @@ BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
 and written by other versions.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from .compat_decorator import (
     UpgradeDowngradeTest,
     compat_test,
 )
+from .util import safe_data_storage_version
 
 
 @compat_test(min_version="0.30.0")
@@ -40,7 +42,12 @@ class BTreeIndex(UpgradeDowngradeTest):
                 "btree": pa.array(range(1000)),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("btree", "BTREE")
 
     def check_read(self):
@@ -92,7 +99,12 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
                 "label_list": pa.array([[f"label{i}"] for i in range(1000)]),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("bitmap", "BITMAP")
         dataset.create_scalar_index("label_list", "LABEL_LIST")
 
@@ -141,7 +153,12 @@ class NgramIndex(UpgradeDowngradeTest):
                 "ngram": pa.array([f"word{i}" for i in range(1000)]),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("ngram", "NGRAM")
 
     def check_read(self):
@@ -177,16 +194,26 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         self.path = path
 
     def create(self):
-        """Create dataset with ZONEMAP and BLOOMFILTER indices."""
+        """Create dataset with ZONEMAP and BLOOMFILTER indices.
+
+        The zonemap column contains nulls at rows 0 and 500 so that IS NULL
+        queries can be verified across version boundaries.
+        """
         shutil.rmtree(self.path, ignore_errors=True)
+        zonemap_values = [None if i in (0, 500) else i for i in range(1000)]
         data = pa.table(
             {
                 "idx": pa.array(range(1000)),
-                "zonemap": pa.array(range(1000)),
+                "zonemap": pa.array(zonemap_values, type=pa.int64()),
                 "bloomfilter": pa.array(range(1000)),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index("zonemap", "ZONEMAP")
         dataset.create_scalar_index("bloomfilter", "BLOOMFILTER")
 
@@ -194,10 +221,21 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         """Verify ZONEMAP and BLOOMFILTER indices can be queried."""
         ds = lance.dataset(self.path)
 
-        # Test ZONEMAP
+        # Test ZONEMAP equality
         table = ds.to_table(filter="zonemap == 7")
         assert table.num_rows == 1
         assert table.column("idx").to_pylist() == [7]
+
+        # Test ZONEMAP IS NULL — two nulls were inserted at rows 0 and 500.
+        # Older versions without a null bitmap fall back to a zone scan, which
+        # is still correct; newer versions may return an exact result.
+        table = ds.to_table(filter="zonemap IS NULL")
+        if 1000 in table.column("idx").to_pylist():
+            # After write, there are 3 NULLs
+            assert table.num_rows == 3
+        else:
+            # Before write, there are 2 NULLs
+            assert table.num_rows == 2
 
         # Test BLOOMFILTER
         table = ds.to_table(filter="bloomfilter == 7")
@@ -210,13 +248,23 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         data = pa.table(
             {
                 "idx": pa.array([1000]),
-                "zonemap": pa.array([1000]),
+                "zonemap": pa.array([None], type=pa.int64()),
                 "bloomfilter": pa.array([1000]),
             }
         )
         ds.insert(data)
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
+
+        # IS NULL must still return results after the index is updated and
+        # files are compacted.  The newly inserted null must be found
+        # regardless of which version handles the seed-based index update.
+        table = ds.to_table(filter="zonemap IS NULL")
+        assert table.num_rows >= 1
+
+    def skip_downgrade(self, version: str) -> bool:
+        # In 0.X the zonemap index did not properly handle NULL in filters
+        return version.startswith("0.")
 
 
 @compat_test(min_version="0.36.0")
@@ -237,7 +285,12 @@ class JsonIndex(UpgradeDowngradeTest):
                 "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
         dataset.create_scalar_index(
             "json",
             IndexConfig(
@@ -288,16 +341,27 @@ class FtsIndex(UpgradeDowngradeTest):
                 ),
             }
         )
-        dataset = lance.write_dataset(data, self.path, max_rows_per_file=100)
-        dataset.create_scalar_index("text", "INVERTED")
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
+        kwargs = {"with_position": True}
+        # Downgrade reads use older wheels, so current-created FTS indexes must
+        # stay on the legacy posting block layout.
+        if os.environ.get("LANCE_COMPAT_FTS_LEGACY_BLOCK_SIZE") == "1":
+            kwargs["block_size"] = 128
+        dataset.create_scalar_index("text", "INVERTED", format_version=1, **kwargs)
 
     def check_read(self):
         """Verify FTS index can be queried."""
         ds = lance.dataset(self.path)
-        # Search for documents containing "words" and "7"
-        # Note: Actual FTS query syntax may vary
-        table = ds.to_table(filter="text LIKE '%words 7 %'")
-        assert table.num_rows > 0
+        match_table = ds.to_table(
+            full_text_query={"query": "words 7", "columns": ["text"]}
+        )
+        assert match_table.num_rows > 0
+        assert 7 in match_table.column("idx").to_pylist()
 
     def check_write(self):
         """Verify can insert data with FTS index."""
@@ -313,3 +377,21 @@ class FtsIndex(UpgradeDowngradeTest):
         )
         ds.insert(data)
         ds.optimize.compact_files()
+
+    def skip_downgrade(self, version: str) -> bool:
+        return version.startswith("0.")
+
+    def current_env(self, method_name: str) -> dict[str, str]:
+        if method_name == "create":
+            return {
+                "LANCE_COMPAT_FTS_LEGACY_BLOCK_SIZE": "1",
+                "LANCE_FTS_FORMAT_VERSION": "1",
+            }
+        if method_name == "check_write":
+            return {"LANCE_FTS_FORMAT_VERSION": "2"}
+        return {}
+
+    def compat_env(self, version: str, method_name: str) -> dict[str, str]:
+        if method_name in {"create", "check_write"}:
+            return {"LANCE_FTS_FORMAT_VERSION": "1"}
+        return {}

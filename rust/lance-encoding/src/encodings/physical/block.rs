@@ -26,7 +26,7 @@ use lance_core::{Error, Result};
 
 use std::str::FromStr;
 
-use crate::compression::{BlockCompressor, BlockDecompressor};
+use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
     ProtobufUtils21,
@@ -46,8 +46,19 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub(crate) fn new(scheme: CompressionScheme, level: Option<i32>) -> Self {
+    /// Create a compression configuration for an encoding mechanism.
+    pub fn new(scheme: CompressionScheme, level: Option<i32>) -> Self {
         Self { scheme, level }
+    }
+
+    /// Return the selected compression scheme.
+    pub fn scheme(&self) -> CompressionScheme {
+        self.scheme
+    }
+
+    /// Return the optional compression level.
+    pub fn level(&self) -> Option<i32> {
+        self.level
     }
 }
 
@@ -439,11 +450,12 @@ impl GeneralBlockDecompressor {
 }
 
 impl BlockDecompressor for GeneralBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General block compression")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
         self.inner
-            .decompress(LanceBuffer::from(decompressed), num_values)
+            .decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
@@ -451,6 +463,9 @@ impl BlockDecompressor for GeneralBlockDecompressor {
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
     pub(crate) compressor: Box<dyn BufferCompressor>,
+    // Runtime compressors normalize levels that they default or ignore. Block descriptors must
+    // retain the selected configuration so stable writers preserve those present/absent values.
+    block_compression: CompressionConfig,
 }
 
 impl Default for CompressedBufferEncoder {
@@ -463,25 +478,33 @@ impl Default for CompressedBufferEncoder {
         #[cfg(not(any(feature = "zstd", feature = "lz4")))]
         let (scheme, level) = (CompressionScheme::None, None);
 
-        let compressor =
-            GeneralBufferCompressor::get_compressor(CompressionConfig { scheme, level }).unwrap();
-        Self { compressor }
+        let block_compression = CompressionConfig { scheme, level };
+        let compressor = GeneralBufferCompressor::get_compressor(block_compression).unwrap();
+        Self {
+            compressor,
+            block_compression,
+        }
     }
 }
 
 impl CompressedBufferEncoder {
     pub fn try_new(compression_config: CompressionConfig) -> Result<Self> {
         let compressor = GeneralBufferCompressor::get_compressor(compression_config)?;
-        Ok(Self { compressor })
+        Ok(Self {
+            compressor,
+            block_compression: compression_config,
+        })
     }
 
     pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
+        let block_compression = CompressionConfig {
+            scheme,
+            level: Some(0),
+        };
         Ok(Self {
-            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
-                scheme,
-                level: Some(0),
-            })?,
+            compressor: GeneralBufferCompressor::get_compressor(block_compression)?,
+            block_compression,
         })
     }
 }
@@ -603,13 +626,26 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
 }
 
 impl BlockCompressor for CompressedBufferEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let encoded = match data {
-            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let (encoded, inner_encoding) = match data {
+            DataBlock::FixedWidth(fixed_width) => (
+                fixed_width.data,
+                ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+            ),
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
                 let encoder = VariableEncoder::default();
-                BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+                let (payload, encoding) =
+                    BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?;
+                (
+                    payload.ok_or_else(|| {
+                        Error::internal(
+                            "VariableEncoder returned no payload for general compression"
+                                .to_string(),
+                        )
+                    })?,
+                    encoding,
+                )
             }
             _ => {
                 return Err(Error::invalid_input_source(
@@ -620,18 +656,22 @@ impl BlockCompressor for CompressedBufferEncoder {
 
         let mut compressed = Vec::new();
         self.compressor.compress(&encoded, &mut compressed)?;
-        Ok(LanceBuffer::from(compressed))
+        Ok((
+            Some(LanceBuffer::from(compressed)),
+            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
+        ))
     }
 }
 
 impl BlockDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Compressed variable block")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
 
         // Delegate to BinaryBlockDecompressor which handles the inline metadata
         let inner_decoder = BinaryBlockDecompressor::default();
-        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
+        inner_decoder.decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
@@ -765,7 +805,6 @@ mod tests {
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
             testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
-            version::LanceFileVersion,
         };
 
         #[test]
@@ -809,7 +848,7 @@ mod tests {
                     // Need to use large pages as small pages might be too small to compress
                     .with_page_sizes(vec![1024 * 1024])
                     .with_expected_encoding("zstd")
-                    .with_min_file_version(LanceFileVersion::V2_1);
+                    .with_structural_encodings();
 
                 // Can't use the default random provider because random data isn't compressible
                 // and we will fallback to uncompressed encoding

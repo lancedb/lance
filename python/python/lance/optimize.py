@@ -59,6 +59,14 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
+    io_buffer_size: Optional[int]
+    """
+    The number of bytes to allow to queue up in the I/O buffer when scanning
+    input fragments.  Increasing this can avoid a deadlock that occurs when a
+    single batch of data is larger than the I/O buffer size.
+
+    The default will use the same default from ``scanner``.
+    """
     compaction_mode: Optional[
         Literal["reencode", "try_binary_copy", "force_binary_copy"]
     ]
@@ -80,4 +88,36 @@ class CompactionOptions(TypedDict):
     defer_index_remap: Optional[bool]
     """
     Whether to defer index remapping during compaction (default: False).
+    """
+    max_source_fragments: Optional[int]
+    """
+    Maximum number of source fragments to compact in a single run. Tasks
+    are included until adding the next task would exceed this limit,
+    allowing for incremental compaction (e.g., compact 20 fragments at a
+    time). Fragments are processed oldest first.
+    (default: None, no limit)
+    """
+    max_source_rows: Optional[int]
+    """
+    Maximum number of source rows to compact in a single run. Rows are
+    counted as live rows (physical rows minus soft-deleted rows). Tasks
+    are included until adding the next task would exceed this limit.
+    (default: None, no limit)
+    """
+    max_source_bytes: Optional[int]
+    """
+    Maximum number of source bytes to compact in a single run, measured as
+    the total size of the source fragments' data and overlay files. Tasks
+    are included until adding the next task would exceed this limit.
+    Blob v2 payloads live in separate blob files and are not counted, so
+    this is not a cap on total compaction I/O for datasets with blob
+    columns.
+    (default: None, no limit)
+    """
+    excluded_fragment_ids: Optional[list[int]]
+    """
+    Fragment IDs to exclude from compaction planning. Excluded fragments
+    remain unchanged and act as boundaries, so fragments on opposite sides
+    are not combined into the same task. Duplicate and unknown IDs are
+    ignored. (default: None)
     """

@@ -2,22 +2,24 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow::{
-    array::AsArray,
+    array::{ArrayData, make_array},
+    buffer::Buffer,
     compute::cast,
-    datatypes::{Float16Type, Float32Type, Float64Type},
 };
-use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::{Error, Result};
-use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::dot_f16::amx_fp16_available;
 use prost::bytes;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+use crate::vector::flat::storage::FlatBinStorage;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::hnsw::HNSW;
 use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
@@ -43,27 +45,83 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
     }
 });
 
+/// Whether partition assignment is better served by the exact flat path than by
+/// an approximate lookup through this index.
+///
+/// The index turns one `M x N` problem -- every vector against every centroid --
+/// into `M` independent top-1 graph searches. Each search walks its own path, so
+/// no two vectors share a candidate set and the AMX-FP16 kernel behind them can
+/// only ever score one query against a handful of neighbors: 32 MAC/cycle, one
+/// of the tile's 16 output columns. Keeping the problem in its matrix shape lets
+/// [`crate::vector::kmeans::compute_partitions`] reach the AMX-FP16 GEMM, which
+/// fills all four accumulator tiles at 512 MAC/cycle.
+///
+/// Measured on 100M x 768 fp16 (dot, node-local, m=20, ef_construction=150), the
+/// flat path won on both build time and recall at every `k` tried:
+///
+/// | k     | flat        | indexed     |
+/// |-------|-------------|-------------|
+/// | 10000 | 1965s / .980 | 2011s / .976 |
+/// | 20000 | 2494s / .964 | 2588s / .832 |
+/// | 40000 | 3730s / .970 | 3976s / .940 |
+///
+/// The recall gap is the larger effect: the graph lookup runs at `ef = 15`, so
+/// some vectors land in a partition that is not their nearest and no `nprobes`
+/// setting recovers them. Flat assignment is exact.
+///
+/// The conditions below must stay in lockstep with the AMX gate in
+/// `compute_membership_and_dist`; without the GEMM the flat path is ~2.7x slower
+/// than the index (5361s vs 2011s at k=10000), so a mismatch here is expensive.
+/// That includes the `LANCE_DISABLE_AMX` kill switch, which both consult through
+/// [`amx_fp16_available`]: an operator turning AMX off has to move this decision
+/// too, or the build would take the exact-assignment path with no GEMM under it.
+fn prefers_flat_amx_assignment(
+    centroid_type: &DataType,
+    num_centroids: usize,
+    dimension: usize,
+    distance_type: DistanceType,
+) -> bool {
+    centroid_type == &DataType::Float16
+        && distance_type == DistanceType::Dot
+        && dimension >= 32
+        && num_centroids >= 32
+        && amx_fp16_available()
+}
+
 #[derive(Debug)]
 pub struct SimpleIndex {
-    store: FlatFloatStorage,
+    store: SimpleStore,
     index: HNSW,
 }
 
+#[derive(Debug)]
+enum SimpleStore {
+    Float(FlatFloatStorage),
+    Binary(FlatBinStorage),
+}
+
 impl SimpleIndex {
-    pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
-        let hnsw = HNSW::index_vectors(
-            &store,
-            HnswBuildParams::default().ef_construction(15).num_edges(12),
-        )?;
+    fn try_new(store: SimpleStore) -> Result<Self> {
+        let hnsw = match &store {
+            SimpleStore::Float(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
+            SimpleStore::Binary(store) => HNSW::index_vectors(
+                store,
+                HnswBuildParams::default().ef_construction(15).num_edges(12),
+            )?,
+        };
         Ok(Self { store, index: hnsw })
     }
 
     // train HNSW over the centroids to speed up finding the nearest clusters,
     // only train if all conditions are met:
-    //  - the centroids are float32s or uint8s
+    //  - the centroids are float16/float32 or uint8 with hamming distance
     //  - `num_centroids * dimension >= 1_000_000`
     //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
     //      so set the threshold to 1_000_000.
+    //  - the exact flat assignment is not already faster, see `prefers_flat_amx_assignment`
     pub fn may_train_index(
         centroids: ArrayRef,
         dimension: usize,
@@ -74,69 +132,54 @@ impl SimpleIndex {
                 if centroids.len() < 1_000_000 {
                     return Ok(None);
                 }
+                if prefers_flat_amx_assignment(
+                    centroids.data_type(),
+                    centroids.len() / dimension,
+                    dimension,
+                    distance_type,
+                ) {
+                    return Ok(None);
+                }
             }
             SimpleIndexStatus::Disabled => return Ok(None),
             _ => {}
         }
 
-        let f32_centroids = match centroids.data_type() {
-            DataType::Float16 | DataType::Float32 => {
-                cast(&centroids, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?
+        let store = match (centroids.data_type(), distance_type) {
+            (DataType::Float16 | DataType::Float32 | DataType::Float64, _) => {
+                let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
+                SimpleStore::Float(FlatFloatStorage::new(fsl, distance_type))
+            }
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
+                SimpleStore::Binary(FlatBinStorage::new(fsl, distance_type))
             }
             _ => return Ok(None),
         };
-        let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dimension as i32)?;
-        let store = FlatFloatStorage::new(fsl, distance_type);
         Self::try_new(store).map(Some)
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
-        let query = cast(&query, &DataType::Float32).map_err(|e| Error::index(e.to_string()))?;
-        let res = self.index.search_basic(
-            query,
-            1,
-            &HnswQueryParams {
-                ef: 15,
-                lower_bound: None,
-                upper_bound: None,
-                dist_q_c: 0.0,
-            },
-            None,
-            &self.store,
-        )?;
+        let params = HnswQueryParams {
+            ef: 15,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let res = match &self.store {
+            SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
+            SimpleStore::Binary(store) => {
+                let query = if query.data_type() == &DataType::UInt8 {
+                    query
+                } else {
+                    cast(&query, &DataType::UInt8).map_err(|e| Error::index(e.to_string()))?
+                };
+                self.index.search_basic(query, 1, &params, None, store)?
+            }
+        };
         Ok((res[0].id, res[0].dist.0))
     }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
-    match array.data_type() {
-        DataType::FixedSizeList(_, _) => {
-            let array = array.as_fixed_size_list();
-            return prefetch_arrow_array(array.values());
-        }
-        DataType::Float16 => {
-            let array = array.as_primitive::<Float16Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        DataType::Float32 => {
-            let array = array.as_primitive::<Float32Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        DataType::Float64 => {
-            let array = array.as_primitive::<Float64Type>();
-            do_prefetch(array.values().as_ptr_range())
-        }
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Unsupported data type for prefetch: {}",
-                array.data_type()
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 #[inline]
@@ -207,7 +250,7 @@ impl TryFrom<&FixedSizeListArray> for pb::Tensor {
     fn try_from(array: &FixedSizeListArray) -> Result<Self> {
         let mut tensor = Self::default();
         tensor.data_type = pb::tensor::DataType::try_from(array.value_type())? as i32;
-        tensor.shape = vec![array.len() as u32, array.value_length() as u32];
+        tensor.shape = vec![Array::len(array) as u32, array.value_length() as u32];
         let flat_array = array.values();
         tensor.data = flat_array.into_data().buffers()[0].to_vec();
         Ok(tensor)
@@ -226,23 +269,40 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
-
-        let data = bytes::Bytes::from(tensor.data.clone());
-        let flat_array = bytes_to_array(
-            &DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap()),
-            data,
-            dim * num_rows,
-            0,
-        )?;
-
-        if flat_array.len() != dim * num_rows {
+        let num_values = dim.checked_mul(num_rows).ok_or_else(|| {
+            Error::index(format!(
+                "Tensor shape {:?} exceeds the supported size",
+                tensor.shape
+            ))
+        })?;
+        let data_type = DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap());
+        let expected_data_len =
+            num_values
+                .checked_mul(data_type.byte_width())
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Tensor shape {:?} exceeds the supported byte length",
+                        tensor.shape
+                    ))
+                })?;
+        if tensor.data.len() != expected_data_len {
             return Err(Error::index(format!(
-                "Tensor shape {:?} does not match to data len: {}",
+                "Tensor shape {:?} with data type {data_type} requires {expected_data_len} bytes, got {}",
                 tensor.shape,
-                flat_array.len()
+                tensor.data.len()
             )));
         }
 
+        let buffer = Buffer::from_bytes_bytes(
+            bytes::Bytes::from(tensor.data.clone()),
+            data_type.byte_width() as u64,
+        );
+        let data = ArrayData::builder(data_type)
+            .len(num_values)
+            .null_count(0)
+            .add_buffer(buffer)
+            .build()?;
+        let flat_array = make_array(data);
         let field = Field::new("item", flat_array.data_type().clone(), true);
         Ok(Self::try_new(
             Arc::new(field),
@@ -265,17 +325,17 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
             Some(v) => match v.data_type() {
                 DataType::Float16 => {
                     let v = v.as_primitive::<Float16Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
                 DataType::Float32 => {
                     let v = v.as_primitive::<Float32Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
                 DataType::Float64 => {
                     let v = v.as_primitive::<Float64Type>();
-                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                    Array::null_count(v) == 0 && v.values().iter().all(|v| v.is_finite())
                 }
-                _ => v.null_count() == 0,
+                _ => Array::null_count(&v) == 0,
             },
             None => false,
         })
@@ -287,10 +347,11 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
 mod tests {
     use super::*;
 
-    use arrow_array::{Float16Array, Float32Array, Float64Array};
+    use arrow_array::{Float16Array, Float32Array, Float64Array, UInt8Array};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+    use rayon::ThreadPoolBuilder;
 
     use arrow::compute::cast;
     use rstest::rstest;
@@ -298,27 +359,61 @@ mod tests {
     fn build_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
         let f32_centroids = cast(&centroids, &DataType::Float32).unwrap();
         let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dim as i32).unwrap();
-        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let store = SimpleStore::Float(FlatFloatStorage::new(fsl, DistanceType::L2));
+        SimpleIndex::try_new(store).unwrap()
+    }
+
+    fn build_binary_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
+        let u8_centroids = if centroids.data_type() == &DataType::UInt8 {
+            centroids
+        } else {
+            cast(&centroids, &DataType::UInt8).unwrap()
+        };
+        let fsl = FixedSizeListArray::try_new_from_values(u8_centroids, dim as i32).unwrap();
+        let store = SimpleStore::Binary(FlatBinStorage::new(fsl, DistanceType::Hamming));
         SimpleIndex::try_new(store).unwrap()
     }
 
     #[rstest]
     #[case::f16(Arc::new(Float16Array::from(
         (0..100).flat_map(|i| std::iter::repeat_n(f16::from_f32(i as f32), 16)).collect::<Vec<_>>(),
-    )) as ArrayRef)]
+    )) as ArrayRef, 42.0f32)]
     #[case::f32(Arc::new(Float32Array::from(
         (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
-    )) as ArrayRef)]
-    fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef) {
-        let index = build_index(centroids, 16);
-        let query: ArrayRef = Arc::new(Float32Array::from(vec![42.1f32; 16]));
-        let (id, _) = index.search(query).unwrap();
+    )) as ArrayRef, 42.0f32)]
+    fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef, #[case] query_val: f32) {
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let index = thread_pool.install(|| build_index(centroids, 16));
+        let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
+        let (id, dist) = index.search(query).unwrap();
         assert_eq!(id, 42);
+        assert_eq!(dist, 0.0);
+    }
+
+    #[test]
+    fn test_simple_index_nearest_centroid_binary() {
+        let centroids: ArrayRef = Arc::new(UInt8Array::from(
+            (0..100)
+                .flat_map(|i| std::iter::repeat_n(i as u8, 16))
+                .collect::<Vec<_>>(),
+        ));
+        let index = build_binary_index(centroids, 16);
+        let query: ArrayRef = Arc::new(UInt8Array::from(vec![42u8; 16]));
+        let (id, dist) = index.search(query).unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(dist, 0.0);
     }
 
     #[test]
     fn test_simple_index_rejects_f64() {
         let centroids: ArrayRef = Arc::new(Float64Array::from(vec![0.0; 1600]));
+        let result = SimpleIndex::may_train_index(centroids, 16, DistanceType::L2).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_simple_index_rejects_uint8_non_hamming() {
+        let centroids: ArrayRef = Arc::new(UInt8Array::from(vec![0u8; 1600]));
         let result = SimpleIndex::may_train_index(centroids, 16, DistanceType::L2).unwrap();
         assert!(result.is_none());
     }
@@ -332,6 +427,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 2);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 20]), 5).unwrap();
@@ -339,6 +436,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float32 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 4);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float64Array::from(vec![0.0; 20]), 5).unwrap();
@@ -346,5 +445,57 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 8);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
+    }
+
+    #[rstest]
+    #[case::too_short(vec![0; 7])]
+    #[case::too_long(vec![0; 9])]
+    fn test_tensor_to_fsl_rejects_invalid_data_length(#[case] data: Vec<u8>) {
+        let tensor = pb::Tensor {
+            data_type: pb::tensor::DataType::Uint32 as i32,
+            shape: vec![1, 2],
+            data,
+        };
+
+        let error = FixedSizeListArray::try_from(&tensor).unwrap_err();
+        assert!(error.to_string().contains("requires 8 bytes"));
+    }
+
+    /// Every shape the AMX-FP16 GEMM cannot serve must keep the centroid index,
+    /// because without the GEMM the flat path it would fall back to is ~2.7x
+    /// slower than the index. These four are the exact complement of the gate in
+    /// `compute_membership_and_dist`.
+    #[rstest]
+    #[case::not_f16(&DataType::Float32, 10_000, 768, DistanceType::Dot)]
+    #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2)]
+    #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot)]
+    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot)]
+    fn test_flat_amx_assignment_declines_unsupported_shapes(
+        #[case] centroid_type: &DataType,
+        #[case] num_centroids: usize,
+        #[case] dimension: usize,
+        #[case] distance_type: DistanceType,
+    ) {
+        assert!(!prefers_flat_amx_assignment(
+            centroid_type,
+            num_centroids,
+            dimension,
+            distance_type
+        ));
+    }
+
+    /// On a supported shape the decision is exactly "is AMX-FP16 usable here",
+    /// which is a property of the build, the CPU and the `LANCE_DISABLE_AMX`
+    /// kill switch, so the expectation is derived rather than hardcoded -- the
+    /// same assertion has to hold with the switch set, on a machine without AMX,
+    /// and in a build whose toolchain could not compile the kernel.
+    #[test]
+    fn test_flat_amx_assignment_follows_amx_availability() {
+        assert_eq!(
+            prefers_flat_amx_assignment(&DataType::Float16, 10_000, 768, DistanceType::Dot),
+            amx_fp16_available()
+        );
     }
 }

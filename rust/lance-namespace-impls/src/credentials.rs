@@ -40,10 +40,13 @@
 //! # Note: GCP token duration cannot be configured; it's determined by the STS endpoint
 //! # To use a service account key file, set GOOGLE_APPLICATION_CREDENTIALS env var before starting
 //! credential_vendor.gcp_service_account = "my-sa@project.iam.gserviceaccount.com"
+//! credential_vendor.gcp_workload_identity_provider = "projects/123456/locations/global/workloadIdentityPools/pool/providers/provider"
+//! credential_vendor.gcp_impersonation_service_account = "my-sa@project.iam.gserviceaccount.com"
 //!
 //! # Azure-specific properties (for az:// locations)
 //! credential_vendor.azure_account_name = "mystorageaccount"  # required for Azure
 //! credential_vendor.azure_tenant_id = "my-tenant-id"
+//! credential_vendor.azure_federated_client_id = "my-app-client-id"
 //! credential_vendor.azure_duration_millis = "3600000"  # 1 hour (default, up to 7 days)
 //! ```
 //!
@@ -220,6 +223,14 @@ pub mod aws_props {
     /// AWS credential duration in milliseconds.
     /// Default: 3600000 (1 hour). Range: 900000 (15 min) to 43200000 (12 hours).
     pub const DURATION_MILLIS: &str = "aws_duration_millis";
+
+    /// When "true", the scoped assume is performed via `AssumeRoleWithWebIdentity`
+    /// using the pod's projected service-account OIDC token
+    pub const ASSUME_VIA_POD_WEB_IDENTITY: &str = "aws_assume_via_pod_web_identity";
+
+    /// Explicit path to the pod's projected SA OIDC token file. Overrides
+    /// `AWS_WEB_IDENTITY_TOKEN_FILE` when set.
+    pub const POD_WEB_IDENTITY_TOKEN_FILE: &str = "aws_pod_web_identity_token_file";
 }
 
 /// GCP-specific property keys (short form, without prefix)
@@ -440,7 +451,12 @@ pub async fn create_credential_vendor_for_location(
 }
 
 /// Parse permission from properties, defaulting to Read
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
     properties
         .get(PERMISSION)
@@ -449,7 +465,12 @@ fn parse_permission(properties: &HashMap<String, String>) -> VendedPermission {
 }
 
 /// Parse duration from properties using a vendor-specific key, defaulting to DEFAULT_CREDENTIAL_DURATION_MILLIS
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "credential-vendor-aws",
+    feature = "credential-vendor-azure",
+    feature = "credential-vendor-gcp"
+))]
 fn parse_duration_millis(properties: &HashMap<String, String>, key: &str) -> u64 {
     properties
         .get(key)
@@ -462,13 +483,14 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
     let role_arn = properties.get(aws_props::ROLE_ARN).ok_or_else(|| {
-        Error::invalid_input_source(
-            "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set".into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message: "AWS credential vending requires 'credential_vendor.aws_role_arn' to be set"
+                .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, aws_props::DURATION_MILLIS);
@@ -489,6 +511,43 @@ async fn create_aws_vendor(
         config = config.with_role_session_name(session_name);
     }
 
+    // Direct (non-chained) web-identity assume for the pod, when enabled. An
+    // explicit token-file path wins; otherwise, if opted in, resolve the
+    // EKS-injected `AWS_WEB_IDENTITY_TOKEN_FILE`. Falling back to the chained
+    // AssumeRole path when neither is present keeps existing behavior.
+    let assume_via_pod = properties
+        .get(aws_props::ASSUME_VIA_POD_WEB_IDENTITY)
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let pod_token_file = properties
+        .get(aws_props::POD_WEB_IDENTITY_TOKEN_FILE)
+        .cloned()
+        .or_else(|| {
+            assume_via_pod
+                .then(|| std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok())
+                .flatten()
+        });
+    // Log the resolved assume path once at vendor init so a deployment can
+    // confirm at runtime which branch `assume_scoped` will take.
+    match &pod_token_file {
+        Some(path) => log::info!(
+            "AWS credential vendor (role {role_arn}): direct AssumeRoleWithWebIdentity \
+             via pod token file '{path}'"
+        ),
+        None if assume_via_pod => log::warn!(
+            "AWS credential vendor (role {role_arn}): aws_assume_via_pod_web_identity=true \
+             but no token file resolved (aws_pod_web_identity_token_file unset and \
+             AWS_WEB_IDENTITY_TOKEN_FILE not in env); falling back to chained AssumeRole"
+        ),
+        None => log::info!(
+            "AWS credential vendor (role {role_arn}): chained AssumeRole \
+             (pod web-identity not enabled)"
+        ),
+    }
+    if let Some(path) = pod_token_file {
+        config = config.with_pod_web_identity_token_file(path);
+    }
+
     let vendor = AwsCredentialVendor::new(config).await?;
     Ok(Some(Box::new(vendor)))
 }
@@ -506,8 +565,14 @@ async fn create_gcp_vendor(
     if let Some(sa) = properties.get(gcp_props::SERVICE_ACCOUNT) {
         config = config.with_service_account(sa);
     }
+    if let Some(provider) = properties.get(gcp_props::WORKLOAD_IDENTITY_PROVIDER) {
+        config = config.with_workload_identity_provider(provider);
+    }
+    if let Some(service_account) = properties.get(gcp_props::IMPERSONATION_SERVICE_ACCOUNT) {
+        config = config.with_impersonation_service_account(service_account);
+    }
 
-    let vendor = GcpCredentialVendor::new(config).await?;
+    let vendor = GcpCredentialVendor::new(config)?;
     Ok(Some(Box::new(vendor)))
 }
 
@@ -516,14 +581,15 @@ fn create_azure_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use azure::{AzureCredentialVendor, AzureCredentialVendorConfig};
-    use lance_core::Error;
+    use lance_namespace::error::NamespaceError;
 
     // Azure requires account_name to be configured
     let account_name = properties.get(azure_props::ACCOUNT_NAME).ok_or_else(|| {
-        Error::invalid_input_source(
-            "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
-                .into(),
-        )
+        lance_core::Error::from(NamespaceError::InvalidInput {
+            message:
+                "Azure credential vending requires 'credential_vendor.azure_account_name' to be set"
+                    .to_string(),
+        })
     })?;
 
     let duration_millis = parse_duration_millis(properties, azure_props::DURATION_MILLIS);
@@ -536,6 +602,9 @@ fn create_azure_vendor(
 
     if let Some(tenant_id) = properties.get(azure_props::TENANT_ID) {
         config = config.with_tenant_id(tenant_id);
+    }
+    if let Some(client_id) = properties.get(azure_props::FEDERATED_CLIENT_ID) {
+        config = config.with_federated_client_id(client_id);
     }
 
     let vendor = AzureCredentialVendor::new(config);

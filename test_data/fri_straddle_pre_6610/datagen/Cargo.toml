@@ -1,0 +1,24 @@
+# Standalone — deliberately not part of the parent Cargo workspace. This
+# crate must compile against a pre-#6610 build of `lance`, where the conflict
+# resolver still has the buggy `(None, Some(_)) => Ok(())` arm. Pinning here
+# is intentional; do not bump unless you are pinning to another build that
+# also predates #6610.
+[workspace]
+
+[package]
+name = "fri-straddle-datagen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+arrow = "57"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+# Pin to v6.0.0-beta.3 — the last tag before PR #6610.
+lance = { git = "https://github.com/lance-format/lance.git", tag = "v6.0.0-beta.3" }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", tag = "v6.0.0-beta.3" }
+lance-index = { git = "https://github.com/lance-format/lance.git", tag = "v6.0.0-beta.3" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", tag = "v6.0.0-beta.3" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

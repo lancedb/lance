@@ -30,7 +30,7 @@
 //! ## Key Features
 //!
 //! - **MVCC Visibility**: All scans respect visibility sequence numbers
-//! - **Index Support**: BTree, IVF-PQ vector, and FTS indexes
+//! - **Index Support**: BTree, HNSW vector, and FTS indexes
 //! - **DataFusion Integration**: Full ExecutionPlan compatibility
 
 mod builder;

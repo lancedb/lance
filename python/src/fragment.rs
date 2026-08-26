@@ -23,9 +23,10 @@ use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform};
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
@@ -42,7 +43,7 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
-#[pyclass(name = "_Fragment", module = "_lib")]
+#[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
     fragment: LanceFragment,
@@ -97,6 +98,20 @@ impl FileFragment {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dataset, path, base_id=None))]
+    fn create_data_file(
+        dataset: &Dataset,
+        path: &str,
+        base_id: Option<u32>,
+    ) -> PyResult<PyLance<DataFile>> {
+        let ds = dataset.ds.clone();
+        let data_file = rt()
+            .block_on(None, ds.create_data_file(path, base_id))?
+            .infer_error()?;
+        Ok(PyLance(data_file))
+    }
+
+    #[staticmethod]
     #[pyo3(signature = (dataset_uri, fragment_id, reader, **kwargs))]
     fn create(
         dataset_uri: &str,
@@ -105,7 +120,7 @@ impl FileFragment {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
-            get_write_params(kw_params)?
+            get_write_params(kw_params, dataset_uri)?
         } else {
             None
         };
@@ -371,6 +386,38 @@ impl FileFragment {
         }
     }
 
+    /// Delete rows by their local (within-fragment) physical row offsets.
+    ///
+    /// Adds the given 0-based offsets to this fragment's deletion vector and
+    /// writes a new deletion file. Returns the updated fragment, or None if every
+    /// row is now deleted. Unlike `delete(predicate)`, this deletes exactly the
+    /// supplied rows without re-evaluating a filter -- useful when the caller
+    /// already knows which rows to delete (e.g. offsets collected from a prior
+    /// scan), avoiding a redundant predicate evaluation.
+    fn delete_rows(&self, offsets: Vec<u32>) -> PyResult<Option<Self>> {
+        let old_fragment = self.fragment.clone();
+        // The core deletion path only errors once the deletion count reaches
+        // physical_rows, so out-of-range offsets must be rejected here.
+        let updated_fragment = rt()
+            .block_on(None, async {
+                let physical_rows = old_fragment.physical_rows().await?;
+                if let Some(&offset) = offsets.iter().find(|&&o| o as usize >= physical_rows) {
+                    return Err(Error::invalid_input(format!(
+                        "delete_rows offset {offset} is out of range for fragment {} \
+                         with {physical_rows} rows",
+                        old_fragment.id()
+                    )));
+                }
+                old_fragment.extend_deletions(offsets).await
+            })?
+            .infer_error()?;
+
+        match updated_fragment {
+            Some(frag) => Ok(Some(Self::new(frag))),
+            None => Ok(None),
+        }
+    }
+
     fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
@@ -406,6 +453,11 @@ impl FileFragment {
         rt().block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn validate(&self) -> PyResult<()> {
+        rt().block_on(None, self.fragment.validate())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }
 
 impl From<FileFragment> for LanceFragment {
@@ -421,10 +473,10 @@ fn do_write_fragments(
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
-    let params = kwargs
-        .and_then(|params| get_write_params(params).transpose())
-        .transpose()?
-        .unwrap_or_default();
+    let params = match kwargs {
+        Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
+        None => WriteParams::default(),
+    };
 
     rt().block_on(
         Some(reader.py()),
@@ -627,10 +679,10 @@ pub struct PyRowDatasetVersionMeta(pub RowDatasetVersionMeta);
 
 #[pymethods]
 impl PyRowIdMeta {
-    fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
-        Err(PyNotImplementedError::new_err(
-            "PyRowIdMeta.asdict is not yet supported.s",
-        ))
+    fn asdict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        pythonize::pythonize(py, &self.0)
+            .map(|b| b.unbind())
+            .map_err(|err| PyValueError::new_err(format!("Could not convert RowIdMeta: {}", err)))
     }
 
     pub fn json(&self) -> PyResult<String> {
@@ -647,6 +699,13 @@ impl PyRowIdMeta {
         let row_id_meta = serde_json::from_str(&json).map_err(|err| {
             PyValueError::new_err(format!("Could not load RowIdMeta due to error: {}", err))
         })?;
+        Ok(Self(row_id_meta))
+    }
+
+    #[staticmethod]
+    pub fn from_dict(dict: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let row_id_meta: RowIdMeta = pythonize::depythonize(dict)
+            .map_err(|err| PyValueError::new_err(format!("Could not load RowIdMeta: {}", err)))?;
         Ok(Self(row_id_meta))
     }
 
@@ -720,7 +779,12 @@ impl PyRowDatasetVersionMeta {
     }
 }
 
-#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[pyclass(
+    name = "FragmentSession",
+    module = "_lib",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct FragmentSession {
     session: Arc<lance::dataset::fragment::session::FragmentSession>,
@@ -741,8 +805,9 @@ impl FragmentSession {
     }
 }
 
-impl FromPyObject<'_> for PyLance<Fragment> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<Fragment> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
 
         let deletion_file: Option<PyRef<PyDeletionFile>> =
@@ -766,6 +831,10 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            // Round-tripped so overlays survive operations that pass existing
+            // fragments back (a manual Delete/Update/Merge commit). Sorting
+            // newest-last is deferred to the manifest reload after commit.
+            overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
         }))
     }
 }
@@ -798,6 +867,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let overlays = export_vec(py, &self.0.overlays)?;
 
         cls.call1((
             self.0.id,
@@ -807,6 +877,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            overlays,
         ))
     }
 }
@@ -821,14 +892,17 @@ impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
     }
 }
 
-impl FromPyObject<'_> for PyLance<DataFile> {
-    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+impl FromPyObject<'_, '_> for PyLance<DataFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
+        let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
+        let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,
-            fields: ob.getattr("fields")?.extract()?,
-            column_indices: ob.getattr("column_indices")?.extract()?,
+            fields: fields.into(),
+            column_indices: column_indices.into(),
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
@@ -851,8 +925,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
         let file_size_bytes = self.0.file_size_bytes.get().map(u64::from);
         cls.call1((
             &self.0.path,
-            self.0.fields.clone(),
-            self.0.column_indices.clone(),
+            self.0.fields.to_vec(),
+            self.0.column_indices.to_vec(),
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,

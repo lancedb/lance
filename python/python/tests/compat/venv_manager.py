@@ -8,13 +8,153 @@ Manages creation and execution of test code in isolated virtual environments
 with specific Lance versions installed.
 """
 
+import contextlib
+import glob
 import os
 import pickle
+import re
+import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
+
+import pytest
+from packaging.version import InvalidVersion, Version
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
+
+@contextlib.contextmanager
+def _venv_lock(lock_path: Path):
+    """Hold an exclusive lock so parallel workers don't race creating the same venv."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+_PIP_INSTALL_ATTEMPTS = 3
+_PIP_RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _pip_install(python: Union[str, Path], args: list[str]) -> None:
+    """Run ``pip install`` with output captured, retrying transient failures.
+
+    pip installs hit the network (PyPI / fury.io) and a single flaky download
+    should not fail a whole test run, so retry a bounded number of times with a
+    short backoff. On final failure raise an error that includes pip's
+    stdout/stderr, which a bare CalledProcessError from ``capture_output=True``
+    would hide from the test log.
+    """
+    cmd = [str(python), "-m", "pip", "install", "--quiet", *args]
+    for attempt in range(1, _PIP_INSTALL_ATTEMPTS + 1):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as exc:  # noqa: PERF203
+            if attempt == _PIP_INSTALL_ATTEMPTS:
+                raise RuntimeError(
+                    f"pip install failed after {attempt} attempts "
+                    f"(exit status {exc.returncode}): {cmd}\n"
+                    f"stdout:\n{exc.stdout}\n"
+                    f"stderr:\n{exc.stderr}"
+                ) from exc
+            time.sleep(_PIP_RETRY_BACKOFF_SECONDS * attempt)
+
+
+NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
+NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
+NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
+
+
+def _lance_namespace_dependency(pylance_version: str) -> str:
+    if Version(pylance_version) >= Version("7.2.0b5"):
+        return NAMESPACE_0_8_DEPENDENCY
+    if Version(pylance_version) >= Version("6.0.0b0"):
+        return NAMESPACE_0_7_DEPENDENCY
+    return NAMESPACE_0_6_DEPENDENCY
+
+
+def _is_release_version(ref: str) -> bool:
+    """A ref is treated as a published release (install a wheel) if it parses as a
+    version; anything else (commit sha, branch, tag) is built from source."""
+    try:
+        Version(ref)
+        return True
+    except InvalidVersion:
+        return False
+
+
+def _prebuilt_wheel_for(ref: str) -> Optional[str]:
+    """A prebuilt wheel to install for `ref` instead of building it from source.
+
+    When CI has already built a ref (e.g. the PR head, built once by the Python build
+    job), COMPAT_PREBUILT_REF names that ref and COMPAT_PREBUILT_WHEEL points at the
+    wheel (a path or glob). Lets the PR workflow reuse that wheel rather than rebuilding
+    the reader. Returns None when no prebuilt wheel applies to `ref`.
+    """
+    if os.environ.get("COMPAT_PREBUILT_REF") != ref:
+        return None
+    pattern = os.environ.get("COMPAT_PREBUILT_WHEEL")
+    if not pattern:
+        return None
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(
+            f"COMPAT_PREBUILT_WHEEL={pattern!r} matched no wheel for ref {ref!r}"
+        )
+    return matches[0]
+
+
+def _repo_root() -> Path:
+    """Lance source checkout holding this test file (used to build refs from source)."""
+    # .../python/python/tests/compat/venv_manager.py -> repo root is parents[4]
+    return Path(__file__).resolve().parents[4]
+
+
+def _safe(ref: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", ref)
+
+
+# Explicit skip whitelist for known (lance_version, python_version) incompatibilities.
+# Each entry is (max_lance_version_inclusive, min_python_version_inclusive).
+# A test is skipped when the tested lance version <= max_lance AND the current
+# Python >= min_python.  Add entries here only after verifying the incompatibility
+# is a runtime/ABI issue rather than a format regression — anything NOT listed
+# will surface as a test failure so new problems are visible.
+_COMPAT_SKIP: list[tuple[str, tuple[int, int]]] = [
+    # lance 0.22.x abi3 wheel was built with old PyO3 (<0.23) that crashes on
+    # Python 3.14+ due to removed internal CPython APIs.
+    ("0.22.0", (3, 14)),
+]
+
+
+def _skip_reason(lance_version: str) -> Optional[str]:
+    """Return a skip reason if this lance/Python combo is whitelisted, else None."""
+    try:
+        ver = Version(lance_version)
+    except InvalidVersion:
+        return None
+    py = sys.version_info[:2]
+    for max_lance, min_python in _COMPAT_SKIP:
+        if ver <= Version(max_lance) and py >= min_python:
+            py_str = f"{py[0]}.{py[1]}"
+            return (
+                f"Lance {lance_version} + Python {py_str}: whitelisted skip "
+                f"(see _COMPAT_SKIP in venv_manager.py)"
+            )
+    return None
 
 
 class VenvExecutor:
@@ -38,6 +178,8 @@ class VenvExecutor:
         self.persistent = persistent
         self._created = False
         self._subprocess: Optional[subprocess.Popen] = None
+        self._stderr_path: Optional[Path] = None
+        self._stderr_file = None
 
     @property
     def python_path(self) -> Path:
@@ -45,74 +187,132 @@ class VenvExecutor:
             return self.venv_path / "Scripts" / "python.exe"
         return self.venv_path / "bin" / "python"
 
-    def _validate_venv(self) -> bool:
-        """Check if existing venv is valid and has correct Lance version."""
-        if not self.venv_path.exists():
-            return False
+    @property
+    def _marker_path(self) -> Path:
+        return self.venv_path / ".compat_ref"
 
+    @staticmethod
+    def _python_version_tag() -> str:
+        return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    def _validate_venv(self) -> bool:
+        """A cached venv is reusable if it exists, its recorded ref matches, and it was
+        built with the same Python major.minor as the current interpreter.
+
+        The marker file format is two lines: `<lance_ref>\\n<python_major.minor>`.
+        Old single-line markers (no Python version) are treated as stale so the venv
+        is rebuilt — this handles cached venvs from a different Python installation."""
         if not self.python_path.exists():
             return False
-
-        # Check if pylance is installed with correct version
         try:
-            result = subprocess.run(
-                [str(self.python_path), "-m", "pip", "show", "pylance"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return False
-
-            # Parse version from output
-            for line in result.stdout.splitlines():
-                if line.startswith("Version:"):
-                    installed_version = line.split(":", 1)[1].strip()
-                    return installed_version == self.version
-
-        except Exception:
+            lines = self._marker_path.read_text().strip().splitlines()
+        except OSError:
             return False
-
-        return False
+        if not lines or lines[0] != self.version:
+            return False
+        # Require a Python version line; single-line markers are stale.
+        if len(lines) < 2 or lines[1] != self._python_version_tag():
+            return False
+        return True
 
     def create(self):
         """Create the virtual environment and install the specified Lance version."""
         if self._created:
             return
-
-        # Check if persistent venv already exists and is valid
         if self.persistent and self._validate_venv():
             self._created = True
             return
 
-        # Create virtual environment
-        subprocess.run(
-            [sys.executable, "-m", "venv", str(self.venv_path)],
-            check=True,
-            capture_output=True,
-        )
+        # Lock so parallel workers don't build the same venv at once; re-check in the
+        # lock since another worker may have just finished it.
+        with _venv_lock(self.venv_path.parent / f".lock_{_safe(self.version)}"):
+            if not self._validate_venv():
+                if self.venv_path.exists():
+                    shutil.rmtree(self.venv_path)  # drop any partial build
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(self.venv_path)],
+                    check=True,
+                    capture_output=True,
+                )
+                # Prefer a wheel CI already built for this ref; else a published
+                # release installs its wheel; else build the ref (commit/branch/tag)
+                # from source -- so two arbitrary refs can be compared and only the
+                # ones without a wheel pay a build.
+                prebuilt = _prebuilt_wheel_for(self.version)
+                if prebuilt is not None:
+                    self._install_wheel(prebuilt)
+                elif _is_release_version(self.version):
+                    self._install_release_wheel()
+                else:
+                    self._build_from_source()
+                self._marker_path.write_text(
+                    f"{self.version}\n{self._python_version_tag()}"
+                )
+        self._created = True
 
-        # Install specific pylance version and pytest
-        subprocess.run(
+    def _install_wheel(self, wheel: str):
+        _pip_install(self.python_path, [wheel, "pytest"])
+
+    def _install_release_wheel(self):
+        _pip_install(
+            self.python_path,
             [
-                str(self.python_path),
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
                 "--pre",
                 "--extra-index-url",
                 "https://pypi.fury.io/lance-format/",
                 "--extra-index-url",
                 "https://pypi.fury.io/lancedb/",
                 f"pylance=={self.version}",
+                # Older Lance wheels (e.g. 2.0.1, 4.0.0b1) import
+                # CreateEmptyTableRequest from lance_namespace, which was
+                # removed in lance-namespace 0.7.0. Pin to <0.7 so old wheels
+                # resolve a compatible transitive dep.
+                _lance_namespace_dependency(self.version),
                 "pytest",
+            ],
+        )
+
+    def _build_from_source(self):
+        """Build a wheel for an arbitrary git ref via a worktree + maturin, then install
+        it. The worktree/build is cached by ref so it is paid at most once."""
+        py = str(self.python_path)
+        src = self.venv_path.parent / f"src_{_safe(self.version)}"
+        if not src.exists():
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(_repo_root()),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(src),
+                    self.version,
+                ],
+                check=True,
+                capture_output=True,
+            )
+        _pip_install(py, ["maturin", "pytest", "pyarrow"])
+        wheels = src / "target" / "compat-wheels"
+        subprocess.run(
+            [
+                py,
+                "-m",
+                "maturin",
+                "build",
+                "--release",
+                "--interpreter",
+                py,
+                "-m",
+                str(src / "python" / "Cargo.toml"),
+                "--out",
+                str(wheels),
             ],
             check=True,
             capture_output=True,
         )
-
-        self._created = True
+        wheel = next(wheels.glob("pylance-*.whl"))
+        _pip_install(py, [str(wheel)])
 
     def _ensure_subprocess(self):
         """Ensure the persistent subprocess is running."""
@@ -123,18 +323,42 @@ class VenvExecutor:
         # Start persistent subprocess
         runner_script = Path(__file__).parent / "venv_runner.py"
 
-        # Set PYTHONPATH to include the tests directory
+        # Set PYTHONPATH so the subprocess can import compat test modules.
+        # pytest adds the `tests/` directory (the first ancestor without __init__.py)
+        # to sys.path, so test modules are imported as `compat.<module>`.
         env = os.environ.copy()
         tests_dir = Path(__file__).parent.parent
         env["PYTHONPATH"] = str(tests_dir)
+        env.setdefault("RUST_BACKTRACE", "full")
 
+        # Capture stderr to a file so a Rust panic (which crashes the runner) can be
+        # surfaced in the error instead of an opaque "broken pipe".
+        self._stderr_path = self.venv_path / ".runner_stderr.log"
+        self._stderr_file = open(self._stderr_path, "w")
         self._subprocess = subprocess.Popen(
             [str(self.python_path), "-u", str(runner_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # Inherit stderr to see timing messages
+            stderr=self._stderr_file,
             env=env,
         )
+
+    def _last_panic(self) -> str:
+        """Pull the panic message from the runner's captured stderr, if any."""
+        try:
+            text = self._stderr_path.read_text()
+        except (OSError, AttributeError):
+            return ""
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "panicked at" in line:
+                # Compact the long path to just "builder.rs:962:57"
+                loc = line.split("panicked at", 1)[1].strip().rstrip(":")
+                loc = loc.rsplit("/", 1)[-1]
+                msg = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                return f"panic at {loc}: {msg}" if msg else f"panic at {loc}"
+        tail = [line.strip() for line in lines if line.strip()]
+        return tail[-1] if tail else ""
 
     def _send_message(self, obj: Any):
         """Send a length-prefixed pickled message to subprocess."""
@@ -146,23 +370,29 @@ class VenvExecutor:
 
     def _receive_message(self) -> Any:
         """Receive a length-prefixed pickled message from subprocess."""
-        # Read 4-byte length header
+        # Short reads mean the subprocess closed stdout (usually a crash); raise
+        # EOFError so the caller can surface the panic from captured stderr.
         length_bytes = self._subprocess.stdout.read(4)
         if len(length_bytes) < 4:
-            raise RuntimeError("Failed to read message length from subprocess")
+            raise EOFError("subprocess closed stdout before sending a message length")
 
         length = struct.unpack(">I", length_bytes)[0]
 
         # Read message data
         data = self._subprocess.stdout.read(length)
         if len(data) < length:
-            raise RuntimeError(
-                f"Incomplete message: expected {length} bytes, got {len(data)}"
+            raise EOFError(
+                f"incomplete message: expected {length} bytes, got {len(data)}"
             )
 
         return pickle.loads(data)
 
-    def execute_method(self, obj: Any, method_name: str) -> Any:
+    def execute_method(
+        self,
+        obj: Any,
+        method_name: str,
+        env_overrides: Optional[dict[str, str]] = None,
+    ) -> Any:
         """
         Execute a method on a pickled object in the virtual environment.
 
@@ -189,11 +419,15 @@ class VenvExecutor:
         if not self._created:
             raise RuntimeError("Virtual environment not created. Call create() first.")
 
+        reason = _skip_reason(self.version)
+        if reason:
+            pytest.skip(reason)
+
         # Ensure subprocess is running
         self._ensure_subprocess()
         try:
-            # Send request: (obj, method_name)
-            self._send_message((obj, method_name))
+            # Send request: (obj, method_name, env_overrides)
+            self._send_message((obj, method_name, env_overrides or {}))
 
             # Receive response
             response = self._receive_message()
@@ -210,11 +444,17 @@ class VenvExecutor:
                 raise RuntimeError(error_msg)
 
         except (BrokenPipeError, EOFError, struct.error) as e:
-            # Subprocess died or communication failed
-            raise RuntimeError(
-                f"Communication with venv subprocess failed (Lance {self.version}):\n"
-                f"Error: {e}"
-            )
+            # Subprocess died (usually a Rust panic); flush it, then surface that.
+            returncode = "unknown"
+            if self._subprocess is not None:
+                try:
+                    self._subprocess.wait(timeout=2)
+                    returncode = str(self._subprocess.returncode)
+                except Exception:
+                    pass
+            panic = self._last_panic()
+            detail = panic or f"subprocess communication failed: {e}"
+            raise RuntimeError(f"Lance {self.version} (exit={returncode}): {detail}")
 
     def cleanup(self):
         """Remove the virtual environment directory and terminate subprocess."""
@@ -232,8 +472,6 @@ class VenvExecutor:
 
         # Remove venv directory
         if self.venv_path.exists():
-            import shutil
-
             shutil.rmtree(self.venv_path)
         self._created = False
 
@@ -271,7 +509,7 @@ class VenvFactory:
             Executor for the specified version
         """
         if version not in self.venvs:
-            venv_path = self.base_path / f"venv_{version}"
+            venv_path = self.base_path / f"venv_{_safe(version)}"
             executor = VenvExecutor(version, venv_path, persistent=self.persistent)
             executor.create()
             self.venvs[version] = executor

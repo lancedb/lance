@@ -8,11 +8,47 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, Literal, Optional
 
 if TYPE_CHECKING:
     # We don't import directly because of circular import
     from .fragment import FragmentMetadata
+
+
+@dataclass(frozen=True)
+class IndexProgress:
+    """Progress event emitted while creating or merging an index.
+
+    Parameters
+    ----------
+    event : str
+        The type of event. One of ``"start"``, ``"progress"``, or ``"complete"``.
+    stage : str
+        The stage name. Stage names are index-type-specific.
+    completed : int, optional
+        The amount of work completed so far, if known.
+    total : int, optional
+        The total amount of work for the stage, if known.
+    unit : str
+        The unit of work for ``completed`` / ``total``.
+    """
+
+    event: Literal["start", "progress", "complete"]
+    stage: str
+    completed: Optional[int] = None
+    total: Optional[int] = None
+    unit: str = ""
+
+    @property
+    def fraction(self) -> Optional[float]:
+        """Return fractional progress if both ``completed`` and ``total`` are known.
+
+        Returns ``None`` when ``total`` is ``None`` or ``0`` (treated as unknown).
+        """
+        if self.completed is None or self.total in (None, 0):
+            return None
+        return min(self.completed / self.total, 1.0)
 
 
 class FragmentWriteProgress(ABC):

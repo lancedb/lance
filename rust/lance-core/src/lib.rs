@@ -2,18 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
+// Allow the derive macro to reference `lance_core::deepsize` from within this crate.
+extern crate self as lance_core;
+
 use arrow_schema::{DataType, Field as ArrowField};
 use std::sync::LazyLock;
 
 pub mod cache;
 pub mod container;
 pub mod datatypes;
+pub mod deepsize;
 pub mod error;
 pub mod levenshtein;
 pub mod traits;
 pub mod utils;
 
-pub use error::{ArrowResult, Error, Result, box_error};
+pub use error::{ArrowResult, Error, FenceReason, Result, box_error};
 
 /// Wildcard to indicate all non-system columns
 pub const WILDCARD: &str = "*";
@@ -56,6 +60,9 @@ pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 /// - `_rowoffset`: The row offset
 /// - `_row_last_updated_at_version`: The version when the row was last updated
 /// - `_row_created_at_version`: The version when the row was created
+///
+/// Write paths must reject a stored column named for one: the scanner injects
+/// these itself, so a stored copy collides with the injected one on read.
 pub fn is_system_column(column_name: &str) -> bool {
     matches!(
         column_name,
