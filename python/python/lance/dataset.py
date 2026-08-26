@@ -643,9 +643,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         Generate the execution plan for the merge insert operation.
 
-        This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and
-        analysis purposes.
+        This reports the plan a *streaming* source of the given schema would run.
+        It takes a schema rather than data, so it cannot know how ``execute`` would
+        wrap the source; see the note under the example.
 
         Parameters
         ----------
@@ -689,11 +689,10 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         This is always the streaming shape. `explain_plan` receives a schema rather
         than data, so it cannot know how `execute` would wrap the source, and a
-        materialized source such as a `pa.Table` reports statistics that can put the
-        source on the collected side of the join instead of the target. Use
-        `analyze_plan`, which receives the real source, when the collected side
-        matters. Note that `analyze_plan` runs the merge to collect metrics and may
-        write data files, whereas `explain_plan` writes nothing.
+        source that reports statistics, such as a `pa.Table`, can change which side
+        of the join is collected. Use `analyze_plan`, which receives the real source,
+        when that side matters. Note that `analyze_plan` runs the merge to collect
+        metrics and may write data files, whereas `explain_plan` writes nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([

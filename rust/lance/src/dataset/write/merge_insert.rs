@@ -2933,11 +2933,13 @@ impl MergeInsertJob {
     ///
     /// A schema says nothing about how the source would be wrapped, so this always
     /// reports the streaming shape: the source is stood in for by an empty one-shot
-    /// stream, which reports no statistics. A materialized or re-scannable source
-    /// reports statistics that can move the collected side of the join, so use
-    /// [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`] when that
-    /// side matters. Those execute the merge to collect metrics and may write data
-    /// files; this method writes nothing.
+    /// stream, which reports no statistics. A source that does report them, such as
+    /// an in-memory table or a file-backed provider, can move the collected side of
+    /// the join, so use [`Self::analyze_plan_batches`] or
+    /// [`Self::analyze_plan_provider`] when that side matters. Those execute the
+    /// merge to collect metrics and may write data files; this method writes
+    /// nothing. Note that a one-shot stream buffered for retries still reports no
+    /// statistics, so it plans like the stream it is.
     ///
     /// # Errors
     ///
@@ -2988,14 +2990,13 @@ impl MergeInsertJob {
     /// * `source` - The source data stream that would be used in the merge insert
     ///
     /// A stream reports no statistics, so the plan this returns is the streaming
-    /// one. Callers holding materialized data or a re-scannable provider should
-    /// use [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`],
+    /// one. Callers holding materialized data or a source that reports statistics
+    /// should use [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`],
     /// which report the plan those sources actually run.
     ///
     /// # Errors
     ///
-    /// Returns Error::NotSupported if the merge insert configuration doesn't support
-    /// the fast path required for plan generation.
+    /// See [`Self::analyze_plan_provider`], which this delegates to.
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
         self.analyze_plan_provider(one_shot_provider(source)?).await
     }
@@ -3007,11 +3008,13 @@ impl MergeInsertJob {
     /// runs. That plan can differ from the streaming one, because the join picks
     /// its collected side from the statistics each source reports.
     ///
-    /// Two cases where the plan reported here is the streaming one anyway:
-    /// [`SourceDedupeBehavior::FirstSeen`] deduplicates the source ahead of the
-    /// join and re-wraps it in a stream, hiding the in-memory node; and an empty
-    /// `batches` carries no schema, so the provider falls back to the dataset's
-    /// (see [`Self::analyze_plan_provider`]).
+    /// Under [`SourceDedupeBehavior::FirstSeen`] the source is deduplicated ahead
+    /// of the join and re-wrapped in a stream, so the reported plan is the
+    /// streaming one and the in-memory node does not appear in it.
+    ///
+    /// An empty `batches` still reports an in-memory source, but it carries no
+    /// schema for the provider to use, so the support check runs against the
+    /// dataset's; see [`Self::analyze_plan_provider`].
     ///
     /// [`MemTable`]: datafusion::datasource::MemTable
     pub async fn analyze_plan_batches(&self, batches: Vec<RecordBatch>) -> Result<String> {
@@ -8997,12 +9000,12 @@ mod tests {
     ///
     /// The target here is one row past DataFusion's
     /// `hash_join_single_partition_threshold_rows`, and `FilteredReadExec`
-    /// reports no `total_byte_size`, so the target can never be the collected
-    /// side. That leaves the source: a materialized one reports exact statistics
-    /// and fits under the threshold, so `JoinSelection` swaps it onto the build
-    /// side and rewrites `Right` into `Left`. A one-shot stream reports `Absent`
-    /// for everything, neither side qualifies, and the plan falls back to a
-    /// partitioned join that still buffers the whole target.
+    /// reports no `total_byte_size`, so the target cannot pass the collect
+    /// threshold. That leaves the source: a materialized one reports exact
+    /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
+    /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
+    /// `Absent` for everything, neither side qualifies for `CollectLeft`, and the
+    /// plan falls back to a partitioned join whose build side is still the target.
     ///
     /// The one-shot provider used below stands in for every non-materialized
     /// source: `stream_source_to_provider` sends the default path through
@@ -9054,8 +9057,10 @@ mod tests {
             .into_reader_rows(RowCount::from(TARGET_ROWS), BatchCount::from(1));
         let ds = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
 
-        // Partial schema: the source omits `other`, so on the RewriteRows path
-        // whichever side is collected carries `other` for every row it holds.
+        // Partial schema: the source omits `other`, so on the RewriteRows path the
+        // target scan has to read it, and the build side holds it for every row it
+        // buffers. This test asserts which side is the build side, not the
+        // projection, so the reading itself is background rather than a claim.
         let source = record_batch!(
             ("key", UInt32, [0, 1, 2, 3]),
             ("value", UInt32, [10, 11, 12, 13])
@@ -9111,8 +9116,8 @@ mod tests {
         );
         assert!(
             build.contains("LanceRead"),
-            "the target stays the collected side, so it buffers `other` for every one of its \
-             rows:\n{build}"
+            "the target stays the build side, so every one of its rows is \
+             buffered:\n{build}"
         );
         assert!(
             probe.contains("StreamingTableExec"),

@@ -3602,10 +3602,11 @@ def test_merge_insert_analyze_plan_matches_execute_routing():
     """analyze_plan must report the plan the given source would actually run.
 
     execute() wraps a materialized source in an in-memory table, which reports
-    exact statistics, so DataFusion collects the source as the join's build side
-    and rewrites the join type. A stream reports no statistics, so the target is
-    collected instead. analyze_plan used to coerce every input to a stream, and
-    therefore reported a plan that pointed at the wrong side.
+    exact statistics; a stream reports none. DataFusion picks the collected side of
+    the join from those statistics and from the two sides' sizes, so the same merge
+    plans differently depending on which one it is handed. analyze_plan used to
+    coerce every input to a stream, so it reported the stream's plan whatever it
+    was given.
     """
     data = pa.table({"id": range(64), "value": [i * 10 for i in range(64)]})
     dataset = lance.write_dataset(data, "memory://test-merge-analyze-routing")
