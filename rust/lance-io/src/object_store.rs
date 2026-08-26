@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ::tracing::{Span, field::Empty, instrument};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -1098,21 +1099,22 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    #[tracing::instrument(
+    #[instrument(
         name = "multipart_stream_copy",
         level = "info",
         skip(self, destination_store),
         fields(
             source = %source_path,
             destination = %destination_path,
-            source_size = tracing::field::Empty,
+            source_size = Empty,
+            read_chunk_size = Empty,
             multipart_part_size = crate::object_writer::initial_upload_size(),
             multipart_concurrency = crate::object_writer::max_upload_parallelism(),
             part_count = 1_u64,
-            bytes_transferred = tracing::field::Empty,
-            destination_size = tracing::field::Empty,
-            validation = tracing::field::Empty,
-            elapsed_ms = tracing::field::Empty,
+            bytes_transferred = Empty,
+            destination_size = Empty,
+            validation = Empty,
+            elapsed_ms = Empty,
         ),
         err
     )]
@@ -1129,7 +1131,7 @@ impl ObjectStore {
         let source_size = reader.size().await.map_err(|source| {
             stream_copy_error("source metadata", source_path, destination_path, source)
         })?;
-        tracing::Span::current().record("source_size", source_size as u64);
+        Span::current().record("source_size", source_size as u64);
 
         let mut writer = destination_store
             .create(destination_path)
@@ -1142,19 +1144,30 @@ impl ObjectStore {
                     source,
                 )
             })?;
-        let mut stream = reader.get_stream().await.map_err(|source| {
-            stream_copy_error(
-                "source read initialization",
-                source_path,
-                destination_path,
-                source,
-            )
-        })?;
+        let read_chunk_size = usize::try_from(self.max_iop_size())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        Span::current().record("read_chunk_size", read_chunk_size as u64);
         let mut bytes_transferred = 0usize;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|source| {
+        while bytes_transferred < source_size {
+            let range_end = bytes_transferred
+                .checked_add(read_chunk_size)
+                .unwrap_or(source_size)
+                .min(source_size);
+            let range = bytes_transferred..range_end;
+            let expected_bytes = range.len();
+            let bytes = reader.get_range(range.clone()).await.map_err(|source| {
                 stream_copy_error("source read", source_path, destination_path, source)
             })?;
+            if bytes.len() != expected_bytes {
+                Span::current().record("validation", "failed");
+                return Err(Error::io(format!(
+                    "multipart_stream_copy source range size mismatch from {source_path} to \
+                     {destination_path}: range={range:?}, expected_bytes={expected_bytes}, \
+                     actual_bytes={}",
+                    bytes.len()
+                )));
+            }
             bytes_transferred = bytes_transferred.checked_add(bytes.len()).ok_or_else(|| {
                 Error::io(format!(
                     "multipart_stream_copy byte count overflow from {source_path} to \
@@ -1164,11 +1177,11 @@ impl ObjectStore {
             writer.write_all(&bytes).await.map_err(|source| {
                 stream_copy_error("destination write", source_path, destination_path, source)
             })?;
-            tracing::Span::current().record("bytes_transferred", bytes_transferred as u64);
+            Span::current().record("bytes_transferred", bytes_transferred as u64);
         }
 
         if bytes_transferred != source_size {
-            tracing::Span::current().record("validation", "failed");
+            Span::current().record("validation", "failed");
             return Err(Error::io(format!(
                 "multipart_stream_copy source size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
@@ -1185,7 +1198,7 @@ impl ObjectStore {
             )
         })?;
         if write_result.size != source_size {
-            tracing::Span::current().record("validation", "failed");
+            Span::current().record("validation", "failed");
             return Err(Error::io(format!(
                 "multipart_stream_copy writer size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
@@ -1206,9 +1219,9 @@ impl ObjectStore {
                         source,
                     )
                 })?;
-        tracing::Span::current().record("destination_size", destination_size);
+        Span::current().record("destination_size", destination_size);
         if destination_size != source_size as u64 {
-            tracing::Span::current().record("validation", "failed");
+            Span::current().record("validation", "failed");
             return Err(Error::io(format!(
                 "multipart_stream_copy destination size mismatch from {source_path} to \
                  {destination_path}: source_size={source_size}, \
@@ -1216,8 +1229,8 @@ impl ObjectStore {
             )));
         }
 
-        tracing::Span::current().record("validation", "passed");
-        tracing::Span::current().record("elapsed_ms", started_at.elapsed().as_millis() as u64);
+        Span::current().record("validation", "passed");
+        Span::current().record("elapsed_ms", started_at.elapsed().as_millis() as u64);
         Ok(write_result)
     }
 
