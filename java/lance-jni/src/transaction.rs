@@ -535,6 +535,7 @@ fn convert_to_java_operation_inner<'local>(
             groups,
             rewritten_indices,
             frag_reuse_index,
+            ..
         } => {
             let java_groups = export_vec(env, &groups)?;
             let java_indices = export_vec(env, &rewritten_indices)?;
@@ -1273,6 +1274,7 @@ fn convert_to_rust_operation(
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+                config_upsert_values: None,
             }
         }
         "Update" => {

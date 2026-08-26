@@ -560,6 +560,7 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             read_version,
             original_fragments,
             row_addrs,
+            row_addr_order: None,
         })
     }
 }
