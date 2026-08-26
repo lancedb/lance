@@ -10385,8 +10385,8 @@ mod tests {
     }
 
     /// A length prefix whose value runs past the end of the page must surface a
-    /// corrupt-file error rather than slicing out of bounds. This is the panic seen
-    /// in production: `range end index 2903552 out of range for slice of length 38469`.
+    /// corrupt-file error rather than slicing out of bounds, which panicked on the
+    /// decode task and reached the caller as an opaque aborted-task error.
     #[test]
     fn variable_full_zip_value_length_past_page_end_is_corrupt_file() {
         // The prefix claims 64 bytes of value data but only 4 follow it.
