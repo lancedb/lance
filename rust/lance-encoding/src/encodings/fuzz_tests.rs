@@ -268,7 +268,10 @@ fn test_encoding_round_trip(
     )]
     _shard: usize,
 ) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let strategy = (encoding_config_strategy(), 100..=1000usize, any::<u64>());
     let mut runner = TestRunner::new(Config {
         cases: 1,
@@ -373,7 +376,10 @@ fn test_fixed_size_list_encoding(
     )]
     encoding: TestEncoding,
 ) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let strategy = (1..=100i32, 10..=1000usize, any::<u64>());
     let mut runner = TestRunner::new(Config::default());
     runner
