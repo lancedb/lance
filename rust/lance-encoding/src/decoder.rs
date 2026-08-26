@@ -324,21 +324,6 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
 
     fn data_type(&self) -> &DataType;
-
-    /// Returns a byte-count estimate for each of [`CANDIDATE_BATCH_SIZES`]
-    /// row counts, clamped to `rows_remaining`.
-    ///
-    /// The default implementation is schema-based. v2.0 decoders keep this
-    /// default; the exact path is only engaged for v2.1+ structural decoders.
-    fn plan_decoded_bytes(&self, rows_remaining: u64) -> Result<[u64; 8]> {
-        let bpr = estimate_bytes_per_row(self.data_type()) as u64;
-        let mut out = [0u64; 8];
-        for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
-            let rows = (c as u64).min(rows_remaining);
-            out[i] = rows * bpr;
-        }
-        Ok(out)
-    }
 }
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
@@ -2972,14 +2957,10 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     /// The default implementation uses a schema-based estimate via
     /// [`estimate_bytes_per_row`]. Concrete implementations override this
     /// with exact computation.
-    fn plan_decoded_bytes(&self, rows_remaining: u64) -> Result<[u64; 8]> {
-        let bpr = estimate_bytes_per_row(self.data_type()) as u64;
-        let mut out = [0u64; 8];
-        for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
-            let rows = (c as u64).min(rows_remaining);
-            out[i] = rows * bpr;
-        }
-        Ok(out)
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> Result<[u64; 8]> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this field decoder".to_string(),
+        ))
     }
 }
 
