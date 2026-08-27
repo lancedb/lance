@@ -67,6 +67,7 @@ use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+use lance_table::format::BasePath;
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
 use roaring::RoaringBitmap;
@@ -1327,6 +1328,12 @@ async fn compound_fts_results(
         .iter()
         .copied()
         .zip(scores.iter().copied())
+        .collect()
+}
+
+fn scored_row_bits(rows: &[(u64, f32)]) -> Vec<(u64, u32)> {
+    rows.iter()
+        .map(|(row_id, score)| (*row_id, score.to_bits()))
         .collect()
 }
 
@@ -2841,19 +2848,14 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
         .unwrap();
     let rebuilt_boost = compound_fts_results(&dataset, boost_query, Some(10)).await;
     let rebuilt_multimatch = compound_fts_results(&dataset, multimatch_query, Some(3)).await;
-    let score_bits = |rows: &[(u64, f32)]| {
-        rows.iter()
-            .map(|(row_id, score)| (*row_id, score.to_bits()))
-            .collect::<Vec<_>>()
-    };
     assert_eq!(
-        score_bits(&partial_boost),
-        score_bits(&rebuilt_boost),
+        scored_row_bits(&partial_boost),
+        scored_row_bits(&rebuilt_boost),
         "hybrid Boost scores must be bit-identical to a rebuilt index"
     );
     assert_eq!(
-        score_bits(&partial_multimatch),
-        score_bits(&rebuilt_multimatch),
+        scored_row_bits(&partial_multimatch),
+        scored_row_bits(&rebuilt_multimatch),
         "hybrid MultiMatch scores must be bit-identical to a rebuilt index"
     );
 }
@@ -2964,6 +2966,186 @@ async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
     assert_eq!(
         actual, flat_oracle,
         "bounded fallback must preserve the flat path's ordered row ids and scores"
+    );
+
+    let exact_oracle_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("common", "text", 0.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
+        (Occur::Should, compound_match_query("beta", "text", 0.0)),
+        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
+    ])
+    .into();
+    let exact_actual = compound_fts_results(&dataset, exact_oracle_query.clone(), Some(3)).await;
+    let mut rebuilt = dataset.clone();
+    rebuilt
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".to_string()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+    let exact_expected = compound_fts_results(&rebuilt, exact_oracle_query, Some(3)).await;
+    assert_eq!(
+        scored_row_bits(&exact_actual),
+        scored_row_bits(&exact_expected),
+        "same-id rewrite fallback must match a rebuilt index exactly"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite() {
+    let primary = TempStrDir::default();
+    let base_one = TempStrDir::default();
+    let base_two = TempStrDir::default();
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["stable alpha common", "stale alpha common"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema.clone()),
+        &primary,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            initial_bases: Some(vec![
+                BasePath::new(1, base_one.to_string(), Some("base-one".to_string()), false),
+                BasePath::new(2, base_two.to_string(), Some("base-two".to_string()), false),
+            ]),
+            target_bases: Some(vec![1]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragments().iter().all(|fragment| {
+        fragment
+            .metadata()
+            .files
+            .iter()
+            .all(|file| file.base_id == Some(1))
+    }));
+
+    let columns = ["text"];
+    let params = InvertedIndexParams::default().with_position(true);
+    let segment = dataset
+        .create_index_builder(&columns, IndexType::Inverted, &params)
+        .name("text_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let rewritten_fragment = dataset.get_fragment(1).unwrap();
+    let relative_path = rewritten_fragment.metadata().files[0].path.clone();
+    let replacement = arrow_array::record_batch!(
+        ("text", Utf8, ["replacement beta common"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let replacement_path = dataset
+        .data_file_dir_for_base(Some(2))
+        .unwrap()
+        .join(&relative_path);
+    let object_writer = dataset
+        .object_store(Some(2))
+        .await
+        .unwrap()
+        .create(&replacement_path)
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_1::create_writer(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+    let replacement_file = dataset
+        .create_data_file(&relative_path, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(replacement_file.path, relative_path);
+    assert_eq!(replacement_file.base_id, Some(2));
+
+    let read_version = dataset.manifest.version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(1, replacement_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    let rewritten_file = &dataset.get_fragment(1).unwrap().metadata().files[0];
+    assert_eq!(rewritten_file.path, relative_path);
+    assert_eq!(rewritten_file.base_id, Some(2));
+
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![segment])
+        .await
+        .unwrap();
+    let committed = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    let coverage = committed.fragment_bitmap.as_ref().unwrap();
+    assert!(coverage.contains(0));
+    assert!(
+        !coverage.contains(1),
+        "changing only the registered base must prune stale logical coverage"
+    );
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [2]))
+            .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("common", "text", 0.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
+        (Occur::Should, compound_match_query("beta", "text", 0.0)),
+        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
+    ])
+    .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), 3).await;
+    assert!(
+        !plan.contains("HybridCompoundFtsScorer"),
+        "same-path files from different bases make physical BM25 stats unsafe:\n{plan}"
+    );
+    let actual = compound_fts_results(&dataset, query.clone(), Some(3)).await;
+
+    let mut rebuilt = dataset.clone();
+    rebuilt
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let expected = compound_fts_results(&rebuilt, query, Some(3)).await;
+    assert_eq!(
+        scored_row_bits(&actual),
+        scored_row_bits(&expected),
+        "different-base rewrite fallback must match a rebuilt index exactly"
     );
 }
 

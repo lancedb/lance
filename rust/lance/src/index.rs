@@ -58,7 +58,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::{Fragment, SelfDescribingFileReader};
+use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
@@ -142,10 +142,37 @@ fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     }
 }
 
-fn fragment_field_paths<'a>(
+/// Stable identity fields for a physical data file.
+///
+/// This mirrors transaction rewrite validation and deliberately excludes
+/// `file_size_bytes`, which is a mutable cache rather than file identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicalDataFileIdentity<'a> {
+    base_id: Option<u32>,
+    path: &'a str,
+    fields: &'a [i32],
+    column_indices: &'a [i32],
+    file_major_version: u32,
+    file_minor_version: u32,
+}
+
+impl<'a> From<&'a DataFile> for PhysicalDataFileIdentity<'a> {
+    fn from(file: &'a DataFile) -> Self {
+        Self {
+            base_id: file.base_id,
+            path: &file.path,
+            fields: file.fields.as_ref(),
+            column_indices: file.column_indices.as_ref(),
+            file_major_version: file.file_major_version,
+            file_minor_version: file.file_minor_version,
+        }
+    }
+}
+
+fn fragment_field_files<'a>(
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
-) -> HashMap<i32, &'a str> {
+) -> HashMap<i32, PhysicalDataFileIdentity<'a>> {
     fragment
         .files
         .iter()
@@ -153,7 +180,7 @@ fn fragment_field_paths<'a>(
             file.fields
                 .iter()
                 .filter(|field_id| indexed_field_ids.contains(field_id))
-                .map(|field_id| (*field_id, file.path.as_str()))
+                .map(|field_id| (*field_id, file.into()))
         })
         .collect()
 }
@@ -244,8 +271,8 @@ pub(crate) async fn has_append_only_indexed_field_history(
             let Some(current_fragment) = current_fragments.get(&fragment_id) else {
                 return false;
             };
-            if fragment_field_paths(historical_fragment, &indexed_field_ids_at_version)
-                != fragment_field_paths(current_fragment, &indexed_field_ids_at_version)
+            if fragment_field_files(historical_fragment, &indexed_field_ids_at_version)
+                != fragment_field_files(current_fragment, &indexed_field_ids_at_version)
             {
                 return false;
             }
@@ -299,8 +326,8 @@ async fn prune_stale_segment_coverage(
                         return true;
                     };
                     let changed_files =
-                        fragment_field_paths(historical_fragment, &indexed_field_ids)
-                            != fragment_field_paths(current_fragment, &indexed_field_ids);
+                        fragment_field_files(historical_fragment, &indexed_field_ids)
+                            != fragment_field_files(current_fragment, &indexed_field_ids);
                     let changed_overlays = prune_newer_overlays
                         && current_fragment.overlays.iter().any(|overlay| {
                             overlay.committed_version > version
