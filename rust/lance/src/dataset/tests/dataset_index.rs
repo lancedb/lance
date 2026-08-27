@@ -2649,7 +2649,7 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     let unindexed_fragment = dataset.get_fragments().last().unwrap().clone();
     let mut unindexed_only_scanner = dataset.scan();
     unindexed_only_scanner
-        .with_fragments(vec![unindexed_fragment])
+        .with_fragments(vec![unindexed_fragment.into()])
         .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .fast_search();
