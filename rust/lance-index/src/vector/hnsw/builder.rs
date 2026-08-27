@@ -307,6 +307,35 @@ impl HNSW {
         }
     }
 
+    /// Refuse a graph whose nodes outrun the vectors behind them.
+    ///
+    /// Node ids are row numbers into `storage`, so a graph with more nodes than
+    /// storage has rows holds ids no vector backs. Scoring one indexes past the
+    /// storage buffer and panics, which takes the worker rather than the query,
+    /// and the entry point is scored before any traversal decision -- so this has
+    /// to run first.
+    ///
+    /// Only that direction is refused. Storage with rows the graph never reached
+    /// is safe and common: those rows are simply unreachable by traversal, and a
+    /// sparse-prefilter search still brute-forces them.
+    ///
+    /// Written before the export bounded the pair, such an index cannot be
+    /// searched at all -- the vectors are not on disk -- so it is refused with a
+    /// message naming it rather than left to fault.
+    fn ensure_storage_covers_graph(&self, storage: &impl VectorStore) -> Result<()> {
+        let nodes = self.len();
+        let rows = storage.len();
+        if nodes > rows {
+            return Err(Error::index(format!(
+                "HNSW graph has {nodes} nodes but its vector storage has {rows} \
+                 rows, so {} node(s) have no vector to score; the index predates \
+                 the export bound and has to be rebuilt",
+                nodes - rows
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn search_inner(
         &self,
@@ -318,6 +347,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
@@ -501,6 +531,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
@@ -2626,6 +2657,64 @@ mod tests {
             HNSW::load(corrupted).is_err(),
             "load() must reject a misaligned level-0 __vector_id"
         );
+    }
+
+    /// A graph whose nodes outrun its storage must be refused, not faulted.
+    ///
+    /// Node ids are storage row numbers, so scoring a node past the last row
+    /// indexes out of bounds and panics the worker rather than failing the
+    /// query. The entry point is scored before any traversal decision, so the
+    /// refusal has to come first. Storage with rows the graph never reached is
+    /// left alone -- that direction is safe and ordinary.
+    #[test]
+    fn search_refuses_a_graph_its_storage_cannot_cover() {
+        const DIM: usize = 16;
+        const NODES: usize = 256;
+        let build_store = |rows: usize| {
+            let fsl = FixedSizeListArray::try_new_from_values(
+                generate_random_array(rows * DIM),
+                DIM as i32,
+            )
+            .unwrap();
+            Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2))
+        };
+
+        let full = build_store(NODES);
+        let hnsw = HNSW::index_vectors(
+            full.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert_eq!(hnsw.len(), NODES);
+
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+
+        // Storage short of the graph: refused with a message, never scored.
+        let short = build_store(NODES / 4);
+        let refused = hnsw.search_basic(query.clone(), 10, &params, None, short.as_ref());
+        let message = refused
+            .expect_err("a graph its storage cannot cover must be refused")
+            .to_string();
+        assert!(
+            message.contains("no vector to score"),
+            "the error has to name the defect, got: {message}"
+        );
+
+        // The safe direction, and the matching one, both still search.
+        let over = build_store(NODES * 2);
+        for storage in [full.as_ref(), over.as_ref()] {
+            let results = hnsw
+                .search_basic(query.clone(), 10, &params, None, storage)
+                .expect("storage that covers the graph must search");
+            assert!(!results.is_empty());
+        }
     }
 
     /// The domain scan must see only the rows it was handed.
