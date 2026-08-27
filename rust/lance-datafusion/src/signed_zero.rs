@@ -32,8 +32,7 @@ use lance_core::Result;
 ///
 /// Both encodings have to be spelled out because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
-/// bloom filter hashes the value. The approximate indices recheck, so widening
-/// can only cost them a candidate, never a row.
+/// bloom filter hashes the value.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -101,8 +100,7 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                 Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
                     // Spelled with `IS [NOT] NULL` around the list rather than as
                     // a pair of distinct-from probes, so that a second pass finds
-                    // both encodings already listed and leaves this alone. A pair
-                    // of probes would expand again on every pass.
+                    // both encodings already listed and leaves this alone.
                     let covered = Expr::InList(InList {
                         expr: Box::new(other.clone()),
                         list: vec![
@@ -132,10 +130,9 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
         }) => {
             // A zero literal on the probe side needs the same treatment. The list
             // elements are arbitrary expressions there, so expand into the
-            // equality form the binary arm already covers. A probe that is a
-            // literal but not a zero returns here rather than falling through to
-            // the list, which costs nothing: it compares the same way against
-            // either encoding.
+            // equality form the binary arm already covers. A literal probe that is
+            // not a zero compares the same way against either encoding, so it
+            // needs no widening either.
             if let Expr::Literal(value, metadata) = expr.as_ref() {
                 let (negative, positive) = zero_encodings(value)?;
                 let matches_any = list
@@ -172,8 +169,7 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
 /// Returns `None` when the list holds no zero, or already spells out both
 /// encodings of each zero it holds.
 fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
-    // Lists of thousands of values are common and most hold no zero at all, so
-    // collect what is missing before copying anything.
+    // Most lists hold no zero, so collect what is missing before copying anything.
     let mut missing: Vec<Expr> = Vec::new();
     for item in list {
         let Expr::Literal(value, metadata) = item else {
@@ -392,10 +388,9 @@ mod tests {
 
     #[test]
     fn scalar_value_keeps_the_two_zero_encodings_apart() {
-        // Widening an `IN` list decides "already listed" with this comparison, and
-        // the scalar indices order candidates by the matching total order. A
-        // DataFusion release that made these equal would silently stop the
-        // widening while leaving the ordering alone.
+        // The `IN` list widening decides "already listed" with this comparison. A
+        // DataFusion release that made the two encodings equal would silently stop
+        // it.
         assert_ne!(Float64(Some(-0.0)), Float64(Some(0.0)));
         assert_ne!(Float32(Some(-0.0)), Float32(Some(0.0)));
         assert_ne!(Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO)));
