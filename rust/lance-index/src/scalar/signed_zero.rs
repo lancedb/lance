@@ -26,8 +26,8 @@ use lance_core::Result;
 /// | `x = 0`              | `x IN (-0.0, 0.0)`     |
 /// | `x != 0`             | `x NOT IN (-0.0, 0.0)` |
 ///
-/// The scalar indices order candidates by the same total order, so a rewritten
-/// predicate is served exactly by an index search and needs no recheck.
+/// The scalar indices select candidates by the same total order, so they answer
+/// a rewritten predicate the same way a scan does.
 ///
 /// NaN is out of scope. Arrow sorts it above every other value, so `x >= -0.0`
 /// admits NaN where IEEE would not, and that holds for every comparison rather
