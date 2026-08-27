@@ -470,6 +470,10 @@ impl InvertedIndex {
         .await
     }
 
+    // This is the boundary between query preparation and final document search;
+    // each argument is an independent prepared input consumed by both legacy and
+    // modern implementations.
+    #[allow(clippy::too_many_arguments)]
     async fn bm25_search_final_documents(
         &self,
         tokens: Arc<Tokens>,

@@ -4821,7 +4821,7 @@ mod tests {
     use lance_core::{ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datafusion::utils::{MetricsExt, PARTITIONS_SEARCHED_METRIC};
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
     use lance_index::scalar::inverted::builder::ScoredDoc;

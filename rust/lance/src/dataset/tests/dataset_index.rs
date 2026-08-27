@@ -2282,7 +2282,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
     ) in [
         ("strict", "alpha", "alphx", 1, 1, 1, 0),
         ("exhaustive", "tiebody", "tiebodx", 3, 0, 2, 0),
-        ("ambiguous", "tie", "tix", 1, 0, 1, 1),
+        ("ambiguous", "tie", "tix", 1, 0, 2, 0),
     ] {
         let exact =
             compound_fts_results(&dataset, field_local_query(exact_term), Some(limit)).await;

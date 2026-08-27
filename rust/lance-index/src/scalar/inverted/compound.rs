@@ -4044,6 +4044,10 @@ pub async fn compound_search_prepared_match_with_score_floor(
     .await
 }
 
+// These arguments keep the public entry points explicit while centralizing the
+// shared search loop; bundling them would only move the same independent inputs
+// into an internal forwarding struct.
+#[allow(clippy::too_many_arguments)]
 async fn compound_search_impl(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,

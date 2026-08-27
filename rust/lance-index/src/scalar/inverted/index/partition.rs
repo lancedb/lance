@@ -47,7 +47,7 @@ impl std::fmt::Display for UnicodeLevenshteinError {
 #[derive(Default)]
 struct ExactUtf8Trie {
     target: Option<usize>,
-    children: BTreeMap<u8, ExactUtf8Trie>,
+    children: BTreeMap<u8, Self>,
 }
 
 impl ExactUtf8Trie {
@@ -1567,9 +1567,8 @@ mod tests {
 
     #[test]
     fn unicode_levenshtein_enforces_construction_state_limit() {
-        let error = match UnicodeLevenshtein::new_with_limit("بسرع", "", 1, 1) {
-            Ok(_) => panic!("a one-state limit must reject the Unicode fuzzy DFA"),
-            Err(error) => error,
+        let Err(error) = UnicodeLevenshtein::new_with_limit("بسرع", "", 1, 1) else {
+            panic!("a one-state limit must reject the Unicode fuzzy DFA");
         };
 
         assert_eq!(error.state_limit, 1);
