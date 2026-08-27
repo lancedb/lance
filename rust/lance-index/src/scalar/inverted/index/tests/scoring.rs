@@ -133,6 +133,32 @@ async fn write_test_partition_with_optional_impacts(
     doc_writer.finish().await.unwrap();
 }
 
+async fn load_single_partition_test_index(
+    builder: InnerBuilder,
+    with_impacts: bool,
+) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_test_partition_with_optional_impacts(
+        &store,
+        0,
+        builder,
+        TokenSetFormat::default(),
+        with_impacts,
+    )
+    .await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = Arc::new(LanceCache::with_capacity(4096));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+    (tmpdir, cache, index)
+}
+
 async fn load_global_scoring_test_index(
     first_partition_has_impacts: bool,
     second_partition_has_impacts: bool,
@@ -192,6 +218,130 @@ async fn load_global_scoring_test_index(
         .await
         .unwrap();
     (tmpdir, cache, index)
+}
+
+#[tokio::test]
+async fn test_wand_exactness_certificate_support_requires_all_impact_postings() {
+    let (_tmpdir, _cache, mixed_impact_index) = load_global_scoring_test_index(true, false).await;
+    assert!(!mixed_impact_index.is_legacy());
+    assert!(!mixed_impact_index.supports_wand_exactness_certificate());
+
+    let (_tmpdir, _cache, all_impact_index) = load_global_scoring_test_index(true, true).await;
+    assert!(!all_impact_index.is_legacy());
+    assert!(all_impact_index.supports_wand_exactness_certificate());
+}
+
+#[tokio::test]
+async fn test_no_impact_segments_cannot_certify_strict_bounded_candidates() {
+    // Segment-local BM25 strongly favors beta in the first segment, while
+    // corpus-wide IDF makes every alpha row the true global winner.
+    let mut first_segment = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    first_segment.tokens.add("alpha".to_owned());
+    first_segment.tokens.add("beta".to_owned());
+    first_segment
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    first_segment
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    for doc_id in 0_u32..98 {
+        first_segment.posting_lists[0].add(doc_id, PositionRecorder::Count(1));
+        first_segment.docs.append(u64::from(doc_id), 1);
+    }
+    first_segment.posting_lists[1].add(98, PositionRecorder::Count(10));
+    first_segment.docs.append(98, 10);
+    first_segment.posting_lists[1].add(99, PositionRecorder::Count(5));
+    first_segment.docs.append(99, 10);
+
+    let mut second_segment = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    second_segment.tokens.add("beta".to_owned());
+    second_segment
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    for doc_id in 0_u32..10_000 {
+        second_segment.posting_lists[0].add(doc_id, PositionRecorder::Count(1));
+        second_segment.docs.append(1_001 + u64::from(doc_id), 1);
+    }
+
+    let (_first_tmpdir, _first_cache, first_index) =
+        load_single_partition_test_index(first_segment, false).await;
+    let (_second_tmpdir, _second_cache, second_index) =
+        load_single_partition_test_index(second_segment, false).await;
+    for index in [&first_index, &second_index] {
+        assert!(!index.is_legacy());
+        assert!(!index.supports_wand_exactness_certificate());
+    }
+
+    let scorer = MemBM25Scorer::new(
+        10_118,
+        10_100,
+        HashMap::from([("alpha".to_owned(), 98), ("beta".to_owned(), 10_002)]),
+    );
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        DocType::Text,
+    ));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+    let mut candidates = Vec::new();
+    for index in [first_index, second_index] {
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                Some(&scorer),
+            )
+            .await
+            .unwrap();
+        candidates.extend(row_ids.into_iter().zip(scores));
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.truncate(2);
+
+    // A k=1 certificate would see this strict returned gap and accept row 98,
+    // even though the omitted alpha tie group has the much larger exact score
+    // and row 0 wins its global `(score DESC, row_id ASC)` tie.
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.0)
+            .collect::<Vec<_>>(),
+        vec![98, 1_001]
+    );
+    assert!(candidates[0].1.total_cmp(&candidates[1].1).is_gt());
+    assert!((candidates[0].1 - 0.011_179_519).abs() < 1e-6);
+    assert!((candidates[1].1 - 0.009_806_488).abs() < 1e-6);
+
+    let exact_winner_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1);
+    assert!((exact_winner_score - 4.633_705).abs() < 1e-5);
+    assert!(exact_winner_score > candidates[0].1);
+    assert!(!candidates.iter().any(|candidate| candidate.0 == 0));
 }
 
 #[tokio::test]

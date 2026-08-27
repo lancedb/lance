@@ -3,10 +3,10 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
-use arrow_array::FixedSizeListArray;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_schema::DataType;
+use arrow_array::{FixedSizeListArray, Float32Array};
+use arrow_schema::{ArrowError, DataType};
 use half::{bf16, f16};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
@@ -403,6 +403,42 @@ pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
     T::norm_l2(vector)
 }
 
+/// L2 norm of every vector in a [FixedSizeListArray], Returns one norm per row.
+pub fn norm_l2_fsl(fsl: &FixedSizeListArray) -> crate::Result<Float32Array> {
+    let dim = fsl.value_length() as usize;
+    if dim == 0 {
+        return Err(ArrowError::InvalidArgumentError(
+            "cannot compute L2 norms of a FixedSizeListArray with value_length 0".into(),
+        ));
+    }
+    let values = fsl.values();
+    Ok(match fsl.value_type() {
+        DataType::Float16 => values
+            .as_primitive::<Float16Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(<f16 as Normalize>::norm_l2)
+            .collect(),
+        DataType::Float32 => values
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(<f32 as Normalize>::norm_l2)
+            .collect(),
+        DataType::Float64 => values
+            .as_primitive::<Float64Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(<f64 as Normalize>::norm_l2)
+            .collect(),
+        value_type => {
+            return Err(ArrowError::SchemaError(format!(
+                "norm_l2_fsl only supports float16/float32/float64 vectors, got: {value_type}"
+            )));
+        }
+    })
+}
+
 pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
     let dim = fsl.value_length() as usize;
     match fsl.value_type() {
@@ -436,7 +472,12 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, dimension_shard,
+        run_vector_proptest,
+    };
+    use arrow_array::{Float16Array, Float64Array, UInt8Array};
+    use lance_arrow::FixedSizeListArrayExt;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
@@ -460,6 +501,36 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn test_l2_norm_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
+            let simd = <f32 as Normalize>::norm_l2(&data);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     proptest::proptest! {
         #[test]
         fn test_l2_norm_f16(data in prop::collection::vec(arbitrary_f16(), 4..4048)) {
@@ -468,16 +539,6 @@ mod tests {
 
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f32(data in prop::collection::vec(arbitrary_f32(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f64(data in prop::collection::vec(arbitrary_f64(), 4..4048)){
             do_norm_l2_test(&data)?;
         }
 
@@ -493,21 +554,6 @@ mod tests {
             let scalar = norm_l2_f64_scalar(&data);
             let simd = norm_l2_f64_simd(&data);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// Parity check for `norm_l2_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar L2-norm path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep this
-        /// test architecture-agnostic (the x86_64-only `norm_l2_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_l2_norm_f32_scalar_simd_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
-            let simd = <f32 as Normalize>::norm_l2(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback
@@ -608,5 +654,63 @@ mod tests {
             let avx = unsafe { x86::norm_l2_f32_avx(&data) };
             prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-3));
         }
+    }
+
+    #[test]
+    fn test_norm_l2_fsl_f32() {
+        let values = Float32Array::from(vec![3.0, 4.0, 6.0, 8.0]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+
+        let norms = norm_l2_fsl(&fsl).unwrap();
+        assert_eq!(norms.len(), 2);
+        assert!(approx::relative_eq!(
+            norms.value(0),
+            5.0,
+            max_relative = 1e-6
+        ));
+        assert!(approx::relative_eq!(
+            norms.value(1),
+            10.0,
+            max_relative = 1e-6
+        ));
+    }
+
+    #[test]
+    fn test_norm_l2_fsl_f16_and_f64_match_norm_l2() {
+        // The FSL helper must agree with the per-vector `norm_l2` kernel for
+        // every supported value type, since callers cache these norms and feed
+        // them to `cosine_with_norms`.
+        let f16_vals: Vec<f16> = [3.0f32, 4.0, 6.0, 8.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
+        let f16_fsl =
+            FixedSizeListArray::try_new_from_values(Float16Array::from(f16_vals), 2).unwrap();
+        let f16_norms = norm_l2_fsl(&f16_fsl).unwrap();
+        assert_eq!(
+            f16_norms.value(0),
+            norm_l2(&[f16::from_f32(3.0), f16::from_f32(4.0)])
+        );
+        assert_eq!(
+            f16_norms.value(1),
+            norm_l2(&[f16::from_f32(6.0), f16::from_f32(8.0)])
+        );
+
+        let f64_fsl = FixedSizeListArray::try_new_from_values(
+            Float64Array::from(vec![3.0, 4.0, 6.0, 8.0]),
+            2,
+        )
+        .unwrap();
+        let f64_norms = norm_l2_fsl(&f64_fsl).unwrap();
+        assert_eq!(f64_norms.value(0), norm_l2(&[3.0f64, 4.0]));
+        assert_eq!(f64_norms.value(1), norm_l2(&[6.0f64, 8.0]));
+    }
+
+    #[test]
+    fn test_norm_l2_fsl_rejects_unsupported_value_type() {
+        let fsl = FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![1u8, 2, 3, 4]), 2)
+            .unwrap();
+        let err = norm_l2_fsl(&fsl).unwrap_err().to_string();
+        assert!(err.contains("float16/float32/float64"), "got: {err}");
     }
 }
