@@ -176,6 +176,12 @@ struct FlatFuzzyPreparationScope {
     current_values_only: bool,
 }
 
+#[derive(Default)]
+struct SharedFlatMatchPreparation {
+    scorer: Option<Arc<SharedFtsScorer>>,
+    prepared: Option<Arc<SharedPreparedMatch>>,
+}
+
 fn fts_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
     match query {
         FtsQuery::Match(query) => uses_fuzzy_expansion(query.fuzziness),
@@ -216,7 +222,9 @@ async fn has_post_index_deletions(dataset: &Dataset, segments: &[IndexMetadata])
             // newer index. Prove freshness by checking that the exact deletion
             // file was already present in the segment's dataset snapshot;
             // otherwise fail closed to all-current execution.
-            if !deletion_files_by_version.contains_key(&segment.dataset_version) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                deletion_files_by_version.entry(segment.dataset_version)
+            {
                 let snapshot = match dataset.checkout_version(segment.dataset_version).await {
                     Ok(snapshot) => snapshot,
                     Err(Error::NotFound { .. } | Error::VersionNotFound { .. }) => {
@@ -224,8 +232,7 @@ async fn has_post_index_deletions(dataset: &Dataset, segments: &[IndexMetadata])
                     }
                     Err(error) => return Err(error),
                 };
-                deletion_files_by_version.insert(
-                    segment.dataset_version,
+                entry.insert(
                     snapshot
                         .fragments()
                         .iter()
@@ -4355,17 +4362,17 @@ impl Scanner {
                     },
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
-                if fts_query_uses_fuzzy_expansion(query) && !self.fast_search {
-                    if has_post_index_deletions(&self.dataset, &segments).await?
+                let has_stale_fuzzy_postings = fts_query_uses_fuzzy_expansion(query)
+                    && !self.fast_search
+                    && (has_post_index_deletions(&self.dataset, &segments).await?
                         || fts_segments_have_deleted_fragments(
                             &self.dataset,
                             &column,
                             &segments,
                         )
-                        .await?
-                    {
-                        return Ok(None);
-                    }
+                        .await?);
+                if has_stale_fuzzy_postings {
+                    return Ok(None);
                 }
 
                 if cross_column {
@@ -4732,8 +4739,7 @@ impl Scanner {
                             &flat_query,
                             &flat_params,
                             filter_plan,
-                            None,
-                            None,
+                            SharedFlatMatchPreparation::default(),
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4759,8 +4765,7 @@ impl Scanner {
                                 &flat_query,
                                 &flat_params,
                                 filter_plan,
-                                None,
-                                None,
+                                SharedFlatMatchPreparation::default(),
                             )
                             .await?;
                         return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4811,8 +4816,10 @@ impl Scanner {
                             &flat_query,
                             &flat_params,
                             filter_plan,
-                            shared_scorer,
-                            None,
+                            SharedFlatMatchPreparation {
+                                scorer: shared_scorer,
+                                prepared: None,
+                            },
                         )
                         .await?,
                     )
@@ -4835,8 +4842,7 @@ impl Scanner {
                         &flat_query,
                         &flat_params,
                         filter_plan,
-                        None,
-                        None,
+                        SharedFlatMatchPreparation::default(),
                     )
                     .await?;
                 (None, Some(flat_phrase_plan))
@@ -4942,8 +4948,7 @@ impl Scanner {
                             query,
                             params,
                             filter_plan,
-                            None,
-                            None,
+                            SharedFlatMatchPreparation::default(),
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
@@ -4974,8 +4979,7 @@ impl Scanner {
                                 query,
                                 params,
                                 filter_plan,
-                                None,
-                                None,
+                                SharedFlatMatchPreparation::default(),
                             )
                             .await?;
                         return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
@@ -4995,7 +4999,7 @@ impl Scanner {
                         })?,
                 };
                 if let Some(full_fuzzy_segments) = full_fuzzy_segments.as_deref() {
-                    if !stale_rows.is_empty()
+                    let requires_flat_fuzzy = !stale_rows.is_empty()
                         || has_post_index_deletions(&self.dataset, full_fuzzy_segments).await?
                         // Current writers physically filter retired postings;
                         // retain this defensive gate for legacy persisted segments.
@@ -5004,8 +5008,8 @@ impl Scanner {
                             &column,
                             full_fuzzy_segments,
                         )
-                        .await?
-                    {
+                        .await?;
+                    if requires_flat_fuzzy {
                         return self
                             .plan_target_flat_match_leaf_query(query, params, filter_plan)
                             .await;
@@ -5070,8 +5074,10 @@ impl Scanner {
                             query,
                             params,
                             filter_plan,
-                            shared_scorer,
-                            shared_prepared,
+                            SharedFlatMatchPreparation {
+                                scorer: shared_scorer,
+                                prepared: shared_prepared,
+                            },
                         )
                         .await?,
                     )
@@ -5095,8 +5101,7 @@ impl Scanner {
                         query,
                         params,
                         filter_plan,
-                        None,
-                        None,
+                        SharedFlatMatchPreparation::default(),
                     )
                     .await?;
                 (None, Some(flat_match_plan))
@@ -5284,9 +5289,12 @@ impl Scanner {
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
-        shared_scorer: Option<Arc<SharedFtsScorer>>,
-        shared_prepared: Option<Arc<SharedPreparedMatch>>,
+        shared: SharedFlatMatchPreparation,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let SharedFlatMatchPreparation {
+            scorer: shared_scorer,
+            prepared: shared_prepared,
+        } = shared;
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::internal("FTS Match query granularity was not resolved".to_string())
         })?;
@@ -14709,7 +14717,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+      SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
@@ -14718,7 +14726,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
@@ -14771,7 +14779,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+      SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
@@ -14793,7 +14801,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
