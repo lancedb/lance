@@ -1012,10 +1012,19 @@ enum LevelLookup {
 /// retained batch verbatim, so a filtered edge is dropped for this reader
 /// without rewriting what is on disk.
 fn neighbors_within_domain(neighbors: &ListArray, node_count: usize) -> (ListArray, usize) {
-    let node_count = node_count as u32;
+    // Ids are `u32` on the wire, so a node count past `u32::MAX` cannot be
+    // addressed by one; clamping keeps every id in domain rather than wrapping.
+    let node_count = u32::try_from(node_count).unwrap_or(u32::MAX);
     let values = neighbors.values().as_primitive::<UInt32Type>();
-    let dropped = values
-        .values()
+    // Each level is a slice of the concatenated batch and `values()` hands back
+    // the whole child array regardless, so bound the scan to this array's own
+    // offset window. Scanning all of it would count another level's ids, put a
+    // clean level on the rebuild path, and report a count that is not this
+    // level's.
+    let offsets = neighbors.offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[offsets.len() - 1] as usize;
+    let dropped = values.values()[start..end]
         .iter()
         .filter(|&&id| id >= node_count)
         .count();
@@ -2603,6 +2612,40 @@ mod tests {
             HNSW::load(corrupted).is_err(),
             "load() must reject a misaligned level-0 __vector_id"
         );
+    }
+
+    /// The domain scan must see only the rows it was handed.
+    ///
+    /// Each level is a slice of the concatenated batch, and `ListArray::values()`
+    /// hands back the whole child array regardless of the slice, so a scan over
+    /// it would count another level's ids.
+    #[test]
+    fn neighbors_within_domain_counts_only_the_sliced_rows() {
+        use arrow::array::{ListBuilder, UInt32Builder};
+        use arrow_array::Array;
+
+        use super::neighbors_within_domain;
+
+        const NODE_COUNT: usize = 4;
+        let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), 4);
+        // Rows 0..2 stay inside the domain; rows 2..4 do not.
+        builder.append_value([Some(0u32), Some(1)]);
+        builder.append_value([Some(2u32), Some(3)]);
+        builder.append_value([Some(99u32)]);
+        builder.append_value([Some(100u32)]);
+        let all = builder.finish();
+
+        let clean = all.slice(0, 2);
+        let (out, dropped) = neighbors_within_domain(&clean, NODE_COUNT);
+        assert_eq!(dropped, 0, "a clean slice must report no dropped ids");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.value(0).len(), 2, "a clean slice keeps its ids");
+
+        let dirty = all.slice(2, 2);
+        let (out, dropped) = neighbors_within_domain(&dirty, NODE_COUNT);
+        assert_eq!(dropped, 2, "both out-of-domain ids are counted");
+        assert_eq!(out.value(0).len(), 0, "the bad id is gone");
+        assert_eq!(out.value(1).len(), 0);
     }
 
     /// A dangling neighbor id must be gone before search, not caught at lookup.
