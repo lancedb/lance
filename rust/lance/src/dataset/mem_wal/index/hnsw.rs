@@ -432,14 +432,18 @@ impl HnswMemIndex {
         if state.graph.is_empty() {
             return Ok(None);
         }
-        // One boundary for both artifacts. Storage is captured first, so an
-        // insert completing in between leaves the graph ahead of it, and a node
-        // the storage batch has no vector for gets scored on read. The storage
-        // batch holds one row per id from 0, so its row count is that boundary.
-        let storage_batch = state.storage.to_record_batch(total_rows)?;
-        let hnsw_batch = state
-            .graph
-            .to_lance_hnsw_batch(Some(storage_batch.num_rows()))?;
+        // One exact prefix for both artifacts, because either can be ahead:
+        // storage is appended before the graph is built and published, so a
+        // graph past storage names rows with no vector, and storage past the
+        // graph writes rows no traversal can reach. Both lengths are read
+        // before either artifact is materialized, and both only grow, so the
+        // prefix they share is available to both.
+        let prefix = state.storage.committed_len().min(state.graph.len());
+        if prefix == 0 {
+            return Ok(None);
+        }
+        let storage_batch = state.storage.to_record_batch_upto(prefix, total_rows)?;
+        let hnsw_batch = state.graph.to_lance_hnsw_batch(Some(prefix))?;
         let hnsw = HNSW::load(hnsw_batch)?;
         Ok(Some((hnsw, storage_batch)))
     }
@@ -663,6 +667,56 @@ mod tests {
         let query = FixedSizeListArray::try_new_from_values(inner, 4).unwrap();
         let results = index.search(&query, 5, None, u64::MAX).unwrap();
         assert!(results.is_empty());
+    }
+
+    /// The exported graph and storage must cover the same rows.
+    ///
+    /// `insert_batches` appends storage before it builds and publishes the
+    /// graph, so storage can lead. Exporting that interval writes storage rows
+    /// no traversal can reach, which makes them silently unsearchable in the
+    /// index that claims to hold them.
+    #[test]
+    fn to_lance_hnsw_exports_one_prefix_when_storage_leads_the_graph() {
+        let dim = 8;
+        let n = 32;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+            n * 2,
+            4,
+        );
+        index.insert(&make_batch(0, n, dim), 0).unwrap();
+
+        // Reproduce the interval: storage takes the next batch, the graph does
+        // not see it yet.
+        let state = index.state.get().expect("state is initialized");
+        let extra = make_batch(n as i32, n, dim);
+        let vectors = extra
+            .column_by_name("vector")
+            .unwrap()
+            .as_fixed_size_list_opt()
+            .unwrap()
+            .clone();
+        state
+            .storage
+            .append_batch(Arc::new(vectors), n as u64)
+            .unwrap();
+        assert!(
+            state.storage.committed_len() > state.graph.len(),
+            "the test needs storage ahead of the graph"
+        );
+
+        let Some((hnsw, storage_batch)) = index.to_lance_hnsw(None).unwrap() else {
+            panic!("expected HNSW snapshot");
+        };
+        assert_eq!(
+            storage_batch.num_rows(),
+            hnsw.len(),
+            "storage rows beyond the graph would be unreachable"
+        );
+        assert_eq!(hnsw.len(), n, "the shared prefix is what the graph reached");
     }
 
     #[test]
