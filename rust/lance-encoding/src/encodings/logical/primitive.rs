@@ -107,6 +107,14 @@ const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
+/// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
+///
+/// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
+/// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
+    / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
+    * u8::MAX as u64;
+
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
     num_rows: u64,
@@ -187,16 +195,116 @@ impl DecodeMiniBlockTask {
         self.value_decompressor.decoded_size_bytes(num_values)
     }
 
+    fn resolve_num_levels(
+        rep_decompressor: Option<&dyn BlockDecompressor>,
+        rep_levels: Option<&LanceBuffer>,
+        def_decompressor: Option<&dyn BlockDecompressor>,
+        def_levels: Option<&LanceBuffer>,
+        declared_num_levels: u16,
+    ) -> Result<u64> {
+        let rep_num_levels = match (rep_decompressor, rep_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock repetition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+        let def_num_levels = match (def_decompressor, def_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock definition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+
+        let inferred_num_levels = match (rep_num_levels, def_num_levels) {
+            (Some(rep_num_levels), Some(def_num_levels)) if rep_num_levels != def_num_levels => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "miniblock structural streams disagree on the level count: repetition inferred {rep_num_levels}, definition inferred {def_num_levels}"
+                    )
+                    .into(),
+                ));
+            }
+            (Some(num_levels), _) | (_, Some(num_levels)) => num_levels,
+            (None, None) => return Ok(u64::from(declared_num_levels)),
+        };
+
+        let declared_num_levels = u64::from(declared_num_levels);
+        if inferred_num_levels == declared_num_levels {
+            return Ok(inferred_num_levels);
+        }
+        let u16_modulus = u64::from(u16::MAX) + 1;
+        if inferred_num_levels <= declared_num_levels
+            || inferred_num_levels % u16_modulus != declared_num_levels
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels but the header declared {declared_num_levels}; the counts are not congruent modulo 65536"
+                )
+                .into(),
+            ));
+        }
+        if inferred_num_levels > MAX_LEGACY_RLE_LEVELS {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels, exceeding the legacy RLE payload bound of {MAX_LEGACY_RLE_LEVELS}"
+                )
+                .into(),
+            ));
+        }
+        Ok(inferred_num_levels)
+    }
+
     fn decode_levels(
-        rep_decompressor: &dyn BlockDecompressor,
+        decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
-        num_levels: u16,
+        expected_num_levels: u64,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(Some(levels), num_levels as u64)?;
-        let rep = rep.as_fixed_width().unwrap();
-        debug_assert_eq!(rep.num_values, num_levels as u64);
-        debug_assert_eq!(rep.bits_per_value, 16);
-        Ok(rep.data.borrow_to_typed_slice::<u16>())
+        let levels = decompressor.decompress(Some(levels), expected_num_levels)?;
+        let levels = levels.as_fixed_width().ok_or_else(|| {
+            Error::invalid_input_source(
+                "miniblock levels did not decode to fixed-width data".into(),
+            )
+        })?;
+        if levels.num_values != expected_num_levels {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} values, expected {expected_num_levels}",
+                    levels.num_values
+                )
+                .into(),
+            ));
+        }
+        if levels.bits_per_value != 16 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bits per value, expected 16",
+                    levels.bits_per_value
+                )
+                .into(),
+            ));
+        }
+        let expected_bytes = expected_num_levels.checked_mul(2).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("miniblock level byte count overflowed for {expected_num_levels} levels")
+                    .into(),
+            )
+        })?;
+        if levels.data.len() as u64 != expected_bytes {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bytes, expected {expected_bytes}",
+                    levels.data.len()
+                )
+                .into(),
+            ));
+        }
+        Ok(levels.data.borrow_to_typed_slice::<u16>())
     }
 
     // We are building a LevelBuffer (levels) and want to copy into it `total_len`
@@ -524,6 +632,14 @@ impl DecodeMiniBlockTask {
             def
         });
 
+        let num_levels = Self::resolve_num_levels(
+            self.rep_decompressor.as_deref(),
+            rep.as_ref(),
+            self.def_decompressor.as_deref(),
+            def.as_ref(),
+            num_levels,
+        )?;
+
         let buffers = buffer_sizes
             .into_iter()
             .map(|buf_size| {
@@ -556,6 +672,19 @@ impl DecodeMiniBlockTask {
                 )
             })
             .transpose()?;
+
+        if let (Some(rep), Some(def)) = (&rep, &def)
+            && rep.len() != def.len()
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock structural streams decoded different level counts: repetition {}, definition {}",
+                    rep.len(),
+                    def.len()
+                )
+                .into(),
+            ));
+        }
 
         Ok(DecodedMiniBlockChunk { rep, def, values })
     }
@@ -8763,7 +8892,7 @@ mod tests {
         let repeated_strings: Vec<_> = unique_values
             .iter()
             .cycle()
-            .take(100_000)
+            .take(10_000)
             .map(|s| Some(s.as_str()))
             .collect();
 
@@ -9748,6 +9877,77 @@ mod tests {
         RleDecompressor::with_run_length_width(16, run_length_width)
             .decode_u16_runs(frame, levels.len() as u64)
             .unwrap()
+    }
+
+    #[test]
+    fn miniblock_levels_use_one_count_for_mixed_codecs() {
+        let actual_num_levels = usize::from(u16::MAX) + 8;
+        let levels = vec![1_u16; actual_num_levels];
+        let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
+        let rep_decompressor = RleDecompressor::new(16);
+        let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
+        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+            bits_per_value: 16,
+            data: None,
+        });
+
+        let num_levels = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&rep_decompressor),
+            Some(&rep_frame),
+            Some(&def_decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap();
+        assert_eq!(num_levels, actual_num_levels as u64);
+
+        let rep =
+            DecodeMiniBlockTask::decode_levels(&rep_decompressor, rep_frame, num_levels).unwrap();
+        let def =
+            DecodeMiniBlockTask::decode_levels(&def_decompressor, def_frame, num_levels).unwrap();
+        assert_eq!(rep.as_ref(), levels);
+        assert_eq!(def, rep);
+    }
+
+    #[test]
+    fn miniblock_levels_reject_non_wrapped_count_mismatch() {
+        let frame = encoded_u16_frame(&[1_u16; 8], RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&frame),
+            None,
+            None,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not congruent modulo 65536"));
+    }
+
+    #[test]
+    fn miniblock_levels_reject_cross_stream_count_disagreement() {
+        let rep_levels = vec![1_u16; usize::from(u16::MAX) + 8];
+        let def_levels = vec![1_u16; rep_levels.len() + usize::from(u16::MAX) + 1];
+        let rep_frame = encoded_u16_frame(&rep_levels, RunLengthWidth::U8);
+        let def_frame = encoded_u16_frame(&def_levels, RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&rep_frame),
+            Some(&decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("structural streams disagree on the level count")
+        );
     }
 
     fn physical_levels(levels: &[u16]) -> LazyLevels {

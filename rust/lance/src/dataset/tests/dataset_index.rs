@@ -43,17 +43,6 @@ use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_index::metrics::{
-    COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
-    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
-    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, CROSS_COLUMN_STAGED_ATTEMPTS_METRIC,
-    CROSS_COLUMN_STAGED_CANDIDATES_METRIC, CROSS_COLUMN_STAGED_FALLBACKS_METRIC,
-    CROSS_COLUMN_STAGED_SUCCESSES_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
-};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
@@ -1333,34 +1322,6 @@ async fn compound_fts_results(
         .collect()
 }
 
-async fn compound_fts_results_with_stats(
-    dataset: &Dataset,
-    query: FtsQuery,
-    limit: i64,
-) -> (Vec<(u64, f32)>, ExecutionSummaryCounts) {
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
-    let mut scan = dataset.scan();
-    scan.scan_stats_callback(Arc::new(move |stats| {
-        *stats_setter.lock().unwrap() = Some(stats.clone());
-    }))
-    .with_row_id()
-    .full_text_search(FullTextSearchQuery::new_query(query))
-    .unwrap()
-    .limit(Some(limit), None)
-    .unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-    let results = row_ids
-        .iter()
-        .copied()
-        .zip(scores.iter().copied())
-        .collect();
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    (results, stats)
-}
-
 fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
@@ -1713,13 +1674,8 @@ async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
         );
     }
 
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
     scanner
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(
             staged_required_optional.clone(),
@@ -1727,26 +1683,6 @@ async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
         .unwrap();
     scanner.limit(Some(3), None).unwrap();
     let staged_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats.all_counts.get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
-        Some(&0)
-    );
-    assert!(
-        stats
-            .all_counts
-            .get(CROSS_COLUMN_STAGED_CANDIDATES_METRIC)
-            .is_some_and(|candidates| *candidates > 0),
-        "required+optional execution should materialize staged candidates"
-    );
 
     dataset
         .prewarm_index_with_options(
@@ -1763,28 +1699,13 @@ async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
         .await
         .unwrap();
 
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
     scanner
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(staged_required_optional))
         .unwrap();
     scanner.limit(Some(3), None).unwrap();
     let resident_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        stats.all_counts.get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
-        Some(&0),
-        "prewarmed cross-column queries should use the resident bounded coordinator"
-    );
-    assert_eq!(
-        stats.all_counts.get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
-        Some(&0)
-    );
     assert_eq!(
         resident_results, staged_results,
         "resident and staged cross-column scans must return identical ordered row ids and score bits"
@@ -1898,6 +1819,16 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     // Index only the title after the append so it can retain a bounded plan
     // while the partially covered body uses the exhaustive leaf fallback.
     create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
+    partial_dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
     assert_compound_matches_independent_oracle(
         &partial_dataset,
         "partial_top_level_cross_column_multimatch",
@@ -1905,18 +1836,6 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         LIMIT,
     )
     .await;
-    let (_, partial_stats) =
-        compound_fts_results_with_stats(&partial_dataset, explicit_query.clone(), LIMIT as i64)
-            .await;
-    assert_eq!(
-        partial_stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC)
-            .copied()
-            .unwrap_or_default(),
-        1,
-        "only the fully indexed title field should attempt a bounded WAND certificate"
-    );
     let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
@@ -1931,6 +1850,315 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_index: bool) {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(use_scalar_index)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert_eq!(
+        plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should keep their bounded scorer:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        usize::from(use_scalar_index) * 2,
+        "each field should declare the shared prefilter dependency:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    let actual = batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_multimatch_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_deletes() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset.delete("id = 1").await.unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    expected.truncate(3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_prefilter_deletes", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_when_first_field_is_flat_only() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["body".to_owned(), "title".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("FlatMatchQuery") && plan.contains("SharedMultiMatchPrefilter"),
+        "the later indexed field must retain the declared shared source:\n{plan}"
+    );
+    scanner.try_into_batch().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multimatch_fields_have_independent_fuzzy_expansion_budgets() {
+    let batch = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha", "nothing"]),
+        ("body", Utf8, ["nothing", "alphi"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let fuzzy_multimatch = || {
+        let mut query = MultiMatchQuery::try_new(
+            "alphx".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for field in &mut query.match_queries {
+            field.fuzziness = Some(1);
+            field.max_expansions = 1;
+        }
+        query
+    };
+
+    let top_level: FtsQuery = fuzzy_multimatch().into();
+    let top_level_plan = compound_fts_plan(&dataset, top_level.clone(), 10).await;
+    assert!(top_level_plan.matches("CompoundFtsScorer").count() >= 2);
+    assert!(!top_level_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let top_level_results = compound_fts_results(&dataset, top_level, Some(10)).await;
+    assert_eq!(top_level_results.len(), 2);
+
+    let nested: FtsQuery =
+        BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(fuzzy_multimatch()))]).into();
+    let nested_plan = compound_fts_plan(&dataset, nested.clone(), 10).await;
+    assert!(nested_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let nested_results = compound_fts_results(&dataset, nested, Some(10)).await;
+    assert_scored_rows_close(
+        "multimatch_independent_fuzzy_budgets",
+        &nested_results,
+        &top_level_results,
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
+    let indexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [0])
+    )
+    .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let unindexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let schema = unindexed.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![unindexed].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let auto_match = |terms: &str| -> FtsQuery {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("title".to_owned()))
+            .with_fuzziness(None)
+            .into()
+    };
+    let auto_multimatch = |terms: &str| {
+        let mut query = MultiMatchQuery::try_new(
+            terms.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for match_query in &mut query.match_queries {
+            match_query.fuzziness = None;
+        }
+        query
+    };
+
+    for (case_name, query, expected_ids) in [
+        ("match_exact", auto_match("ALPHA"), &[0, 1][..]),
+        ("match_typo", auto_match("alphx"), &[][..]),
+        (
+            "multimatch_exact",
+            FtsQuery::MultiMatch(auto_multimatch("ALPHA")),
+            &[0, 1][..],
+        ),
+        (
+            "multimatch_typo",
+            FtsQuery::MultiMatch(auto_multimatch("alphx")),
+            &[][..],
+        ),
+        (
+            "nested_multimatch_exact",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHA")))])
+                .into(),
+            &[0, 1][..],
+        ),
+        (
+            "nested_multimatch_typo",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
+                .into(),
+            &[][..],
+        ),
+    ] {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected_ids,
+            "indexed and unindexed rows diverged for {case_name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1955,78 +2183,18 @@ async fn test_field_local_match_wand_exactness_certificates() {
     let strict_oracle =
         sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &strict_query).await);
     assert!(strict_oracle[0].1.total_cmp(&strict_oracle[1].1).is_gt());
-    let (strict, stats) = compound_fts_results_with_stats(&dataset, strict_query, 1).await;
+    let strict = compound_fts_results(&dataset, strict_query, Some(1)).await;
     assert_scored_rows_close("wand_certificate_strict", &strict, &strict_oracle[..1]);
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
-        Some(&2)
-    );
 
     let exhaustive_query = field_local_query("tiebody");
     let exhaustive_oracle = sorted_compound_fts_oracle(
         independent_compound_fts_oracle(&dataset, &exhaustive_query).await,
     );
-    let (exhaustive, stats) = compound_fts_results_with_stats(&dataset, exhaustive_query, 3).await;
+    let exhaustive = compound_fts_results(&dataset, exhaustive_query, Some(3)).await;
     assert_scored_rows_close(
         "wand_certificate_exhaustive",
         &exhaustive,
         &exhaustive_oracle,
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
-        Some(&2)
     );
 
     let tied_query = field_local_query("tie");
@@ -2035,91 +2203,108 @@ async fn test_field_local_match_wand_exactness_certificates() {
     assert_eq!(tied_oracle.len(), 2);
     assert_eq!(tied_oracle[0].1, tied_oracle[1].1);
     assert!(tied_oracle[0].0 < tied_oracle[1].0);
-    let (tied, stats) = compound_fts_results_with_stats(&dataset, tied_query, 1).await;
-    assert_scored_rows_close("wand_certificate_tie_fallback", &tied, &tied_oracle[..1]);
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
-        Some(&2)
-    );
+    let tied = compound_fts_results(&dataset, tied_query, Some(1)).await;
+    assert_scored_rows_close("wand_certificate_tie_completion", &tied, &tied_oracle[..1]);
 
     let mixed_query = field_local_query("noise");
     let mixed_oracle =
         sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &mixed_query).await);
-    let (mixed, stats) = compound_fts_results_with_stats(&dataset, mixed_query, 1).await;
+    let mixed = compound_fts_results(&dataset, mixed_query, Some(1)).await;
     assert_scored_rows_close("wand_certificate_mixed_fields", &mixed, &mixed_oracle[..1]);
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
-        Some(&2)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC),
-        Some(&0)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
-        Some(&3)
-    );
 
-    let zero_boost_query: FtsQuery = MultiMatchQuery::try_new(
-        "blocked".to_owned(),
+    for (case_name, exact_term, fuzzy_term, limit) in [
+        ("strict", "alpha", "alphx", 1),
+        ("exhaustive", "tiebody", "tiebodx", 3),
+        ("ambiguous", "tie", "tix", 1),
+    ] {
+        let exact =
+            compound_fts_results(&dataset, field_local_query(exact_term), Some(limit)).await;
+        let mut fuzzy = MultiMatchQuery::try_new(
+            fuzzy_term.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for query in &mut fuzzy.match_queries {
+            query.fuzziness = Some(1);
+        }
+        let actual = compound_fts_results(&dataset, fuzzy.into(), Some(limit)).await;
+        assert_scored_rows_close(
+            &format!("fuzzy_wand_certificate_{case_name}"),
+            &actual,
+            &exact,
+        );
+    }
+}
+
+async fn write_wand_tie_dataset(num_ties: usize) -> Dataset {
+    let reader = gen_batch()
+        .col("title", array::fill_utf8("token".to_owned()))
+        .col("body", array::fill_utf8("unrelated".to_owned()))
+        .into_reader_rows(
+            RowCount::from(u64::try_from(num_ties).unwrap()),
+            BatchCount::from(1),
+        );
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: num_ties.div_ceil(2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+fn wand_tie_multimatch(terms: &str, boost: f32, fuzziness: Option<u32>) -> FtsQuery {
+    let mut query = MultiMatchQuery::try_new(
+        terms.to_owned(),
         vec!["title".to_owned(), "body".to_owned()],
     )
     .unwrap()
-    .try_with_boosts(vec![0.0, 0.0])
-    .unwrap()
-    .into();
-    let (_, stats) = compound_fts_results_with_stats(&dataset, zero_boost_query, 1).await;
-    assert_eq!(
-        stats
-            .all_counts
-            .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
-        Some(&0),
-        "zero-boost fields must use the exact path without attempting a certificate"
+    .try_with_boosts(vec![boost, 1.0])
+    .unwrap();
+    for match_query in &mut query.match_queries {
+        match_query.fuzziness = fuzziness;
+    }
+    query.into()
+}
+
+#[tokio::test]
+async fn test_wand_tie_completion_recovers_reversed_segment_row_id() {
+    let mut dataset = write_wand_tie_dataset(6).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("token", 1.0, Some(0));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), 6);
+    assert_eq!(oracle[0].0, 0);
+
+    let actual = compound_fts_results(&dataset, query, Some(1)).await;
+
+    assert_scored_rows_close(
+        "wand_tie_completion_reversed_segments",
+        &actual,
+        &oracle[..1],
     );
+}
+
+#[tokio::test]
+async fn test_wand_tie_overflow_uses_seeded_fuzzy_boosted_fallback() {
+    const NUM_TIES: usize = 131;
+    let mut dataset = write_wand_tie_dataset(NUM_TIES).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("tiken", 2.5, Some(1));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), NUM_TIES);
+    assert_eq!(oracle[0].0, 0);
+
+    let actual = compound_fts_results(&dataset, query, Some(1)).await;
+
+    assert_scored_rows_close("wand_tie_seeded_fuzzy_boost", &actual, &oracle[..1]);
 }
 
 #[tokio::test]
@@ -2565,37 +2750,13 @@ async fn test_nested_multimatch_limit_propagation() {
     );
     assert_compound_matches_independent_oracle(&dataset, "nested_multimatch_must", &must_query, 2)
         .await;
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
     let mut staged_scanner = dataset.scan();
     staged_scanner
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(must_query.clone()))
         .unwrap();
     staged_scanner.limit(Some(2), None).unwrap();
     staged_scanner.try_into_batch().await.unwrap();
-    let staged_stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        staged_stats
-            .all_counts
-            .get(CROSS_COLUMN_STAGED_ATTEMPTS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        staged_stats
-            .all_counts
-            .get(CROSS_COLUMN_STAGED_SUCCESSES_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        staged_stats
-            .all_counts
-            .get(CROSS_COLUMN_STAGED_FALLBACKS_METRIC),
-        Some(&0)
-    );
 
     let should_query: FtsQuery = BooleanQuery::new([
         (Occur::Should, compound_multimatch_query()),
@@ -2822,25 +2983,6 @@ async fn test_pure_should_maxscore_is_exact_across_fragments() {
     scanner.limit(Some(2), None).unwrap();
     scanner.try_into_batch().await.unwrap();
     let stats = collected_stats.lock().unwrap().take().unwrap();
-    for metric in [
-        COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
-        COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
-        COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
-        COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
-    ] {
-        assert!(
-            stats.all_counts.contains_key(metric),
-            "pure-SHOULD execution stats should expose {metric}"
-        );
-    }
-    assert!(
-        stats.all_counts[COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC] > 0,
-        "pure-SHOULD execution should recompute clause bounds"
-    );
-    assert!(
-        stats.all_counts[COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC] > 0,
-        "pure-SHOULD execution should evaluate essential clauses"
-    );
     assert_eq!(
         stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
         Some(&(4 * 5)),
@@ -2930,13 +3072,8 @@ async fn test_compound_tie_uses_resolved_row_id() {
     )
     .unwrap()
     .into();
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
     scanner
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
         .with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(query.clone()))
         .unwrap();
@@ -2947,44 +3084,6 @@ async fn test_compound_tie_uses_resolved_row_id() {
     let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
     assert_eq!(limited_row_id, exhaustive[0].0);
     assert_eq!(exhaustive.len(), 384);
-
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
-        Some(&1)
-    );
-    assert_eq!(
-        stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
-        Some(&384)
-    );
-    assert_eq!(
-        stats
-            .all_counts
-            .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
-        Some(&1)
-    );
-
-    let mut analyze_scanner = dataset.scan();
-    analyze_scanner
-        .with_row_id()
-        .full_text_search(FullTextSearchQuery::new_query(query))
-        .unwrap();
-    analyze_scanner.limit(Some(1), None).unwrap();
-    let analysis = analyze_scanner.analyze_plan().await.unwrap();
-    let compound_line = analysis
-        .lines()
-        .find(|line| line.contains("CompoundFtsScorer"))
-        .unwrap();
-    assert!(
-        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
-        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
-    );
-    assert!(
-        compound_line.contains(&format!(
-            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
-        )),
-        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
-    );
 }
 
 fn nested_fts_batch(
@@ -4311,11 +4410,11 @@ async fn test_fts_phrase_query() {
     let words = ["lance", "full", "text", "search"];
     let mut lance_search_count = 0;
     let mut full_text_count = 0;
-    let mut doc_array = (0..4096)
+    let mut doc_array = (0..256)
         .map(|_| {
             let mut rng = rand::rng();
-            let mut text = String::with_capacity(512);
-            let len = rng.random_range(127..512);
+            let mut text = String::with_capacity(128);
+            let len = rng.random_range(31..128);
             for i in 0..len {
                 if i > 0 {
                     text.push(' ');

@@ -50,6 +50,7 @@ use lance_namespace::models::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
@@ -290,13 +291,13 @@ impl RestNamespaceBuilder {
         let ssl_ca_cert = properties.get("tls.ssl_ca_cert").cloned();
         let assert_hostname = properties
             .get("tls.assert_hostname")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {

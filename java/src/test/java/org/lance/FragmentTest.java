@@ -504,6 +504,9 @@ public class FragmentTest {
             stats.getDataFileNums());
 
         assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
+
+        dataset.delete("id < 5");
+        assertArrayEquals(new long[] {16, 4}, dataset.getFragmentStatistics().getRowCounts());
       }
     }
   }
@@ -517,6 +520,22 @@ public class FragmentTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(0, dataset.getFragmentStatistics().size());
       }
+    }
+  }
+
+  @Test
+  void testFragmentStatisticsPreservesLegacyMissingRowCount() {
+    String historicalPath =
+        Path.of("..", "test_data", "v0.7.5", "with_deletions")
+            .toAbsolutePath()
+            .normalize()
+            .toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = Dataset.open(historicalPath, allocator)) {
+      FragmentStatistics stats = dataset.getFragmentStatistics();
+      assertArrayEquals(new int[] {0}, stats.getIds());
+      assertArrayEquals(new long[] {0}, stats.getRowCounts());
+      assertArrayEquals(new int[] {1}, stats.getDataFileNums());
     }
   }
 

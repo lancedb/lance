@@ -34,6 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
+use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
     is_detached_version, list_index_files_with_sizes, pb,
@@ -358,18 +359,9 @@ async fn do_commit_new_dataset(
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
-    let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &pb_transaction).await?
-    } else {
-        String::new()
-    };
-
-    let (mut manifest, indices) = if let Operation::Clone {
-        is_shallow,
-        ref_name,
+    let clone_source = if let Operation::Clone {
         ref_version,
         ref_path,
-        branch_name,
         ..
     } = &transaction.operation
     {
@@ -389,7 +381,29 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
+        ensure_can_write_manifest(&source_manifest)?;
+        Some((source_store, source_manifest_location, source_manifest))
+    } else {
+        None
+    };
 
+    let transaction_file = if !write_config.disable_transaction_file() {
+        write_transaction_file(object_store, base_path, &pb_transaction).await?
+    } else {
+        String::new()
+    };
+
+    let (mut manifest, indices) = if let (
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_path,
+            branch_name,
+            ..
+        },
+        Some((source_store, source_manifest_location, source_manifest)),
+    ) = (&transaction.operation, clone_source)
+    {
         if *is_shallow {
             let new_base_id = source_manifest
                 .base_paths
@@ -1050,6 +1064,7 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    ensure_can_write_manifest(&dataset.manifest)?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1382,6 +1397,8 @@ pub(crate) async fn commit_transaction(
         if !strict_overwrite {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
+            ensure_can_write_manifest(&dataset.manifest)?;
+
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
@@ -1395,6 +1412,8 @@ pub(crate) async fn commit_transaction(
             }
 
             transaction = rebase.finish(&dataset).await?;
+        } else {
+            ensure_can_write_manifest(&dataset.manifest)?;
         }
 
         // Recomputed every attempt: the rebase above may have rewritten the

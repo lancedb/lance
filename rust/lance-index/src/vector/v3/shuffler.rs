@@ -17,6 +17,7 @@ use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::{
     Error, Result,
     cache::LanceCache,
+    utils::parse::str_is_truthy,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -318,7 +319,7 @@ pub fn create_ivf_shuffler(
     progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
 ) -> Box<dyn Shuffler> {
     let use_legacy = std::env::var("LANCE_LEGACY_SHUFFLER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| str_is_truthy(&v))
         .unwrap_or(false);
     if use_legacy {
         let mut shuffler =
