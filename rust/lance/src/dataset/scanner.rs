@@ -100,7 +100,6 @@ use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_f
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
-use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segment_params, load_segments,
@@ -110,6 +109,7 @@ use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_frag
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::{DatasetIndexInternalExt, has_append_only_indexed_field_history};
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
@@ -346,18 +346,20 @@ fn has_exact_hybrid_fts_coverage(
 
 fn has_compatible_hybrid_physical_segments(
     params: &[InvertedIndexParams],
+    details: &[InvertedIndexDetails],
     has_deleted_fragments: &[bool],
 ) -> bool {
     let Some(first) = params.first() else {
         return false;
     };
-    params.len() == has_deleted_fragments.len()
+    params.len() == details.len()
+        && params.len() == has_deleted_fragments.len()
         && first.posting_block_size() == 128
         && params.iter().all(|params| params == first)
-        && params.iter().all(|params| {
+        && details.iter().all(|details| {
             matches!(
-                params.resolved_format_version().index_version(),
-                INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3
+                details.posting_format_version,
+                Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
             )
         })
         && has_deleted_fragments.iter().all(|has_deleted| !has_deleted)
@@ -4377,6 +4379,18 @@ impl Scanner {
                     // Preserve the established semantic mismatch error before
                     // applying the narrower physical fast-path gate.
                     load_segment_details(&self.dataset, &column, &segments).await?;
+                    if !has_append_only_indexed_field_history(&self.dataset, &segments).await {
+                        // Logical coverage can prune a same-id field rewrite
+                        // while the physical segment still contributes the
+                        // obsolete document to BM25 corpus statistics.
+                        return Ok(None);
+                    }
+                    let physical_details = futures::future::try_join_all(
+                        segments.iter().map(|segment| {
+                            load_physical_fts_details(&self.dataset, &column, segment)
+                        }),
+                    )
+                    .await?;
                     let segment_params = futures::future::try_join_all(
                         segments
                             .iter()
@@ -4411,6 +4425,7 @@ impl Scanner {
                     .await?;
                     if !has_compatible_hybrid_physical_segments(
                         &segment_params,
+                        &physical_details,
                         &has_deleted_fragments,
                     ) {
                         // Larger posting blocks quantize document lengths, and
@@ -7374,7 +7389,6 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::InvertedListFormatVersion;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
@@ -7593,27 +7607,48 @@ mod test {
     #[test]
     fn test_hybrid_compound_requires_compatible_live_physical_segments() {
         let params = InvertedIndexParams::default();
+        let modern_details = InvertedIndexDetails {
+            posting_format_version: Some(INVERTED_INDEX_VERSION_V3),
+            ..Default::default()
+        };
         assert!(has_compatible_hybrid_physical_segments(
             &[params.clone(), params.clone()],
+            &[modern_details.clone(), modern_details.clone()],
             &[false, false]
         ));
         assert!(!has_compatible_hybrid_physical_segments(
             &[params.clone(), params.clone()],
+            &[modern_details.clone(), modern_details.clone()],
             &[false, true]
         ));
         assert!(!has_compatible_hybrid_physical_segments(
             &[params.clone(), params.clone().with_position(true)],
+            &[modern_details.clone(), modern_details.clone()],
             &[false, false]
         ));
         assert!(!has_compatible_hybrid_physical_segments(
             &[params.clone().block_size(256).unwrap()],
+            std::slice::from_ref(&modern_details),
             &[false]
         ));
         assert!(!has_compatible_hybrid_physical_segments(
-            &[params.clone().format_version(InvertedListFormatVersion::V1)],
+            std::slice::from_ref(&params),
+            &[InvertedIndexDetails {
+                posting_format_version: Some(1),
+                ..Default::default()
+            }],
             &[false]
         ));
-        assert!(!has_compatible_hybrid_physical_segments(&[params], &[]));
+        assert!(!has_compatible_hybrid_physical_segments(
+            std::slice::from_ref(&params),
+            &[InvertedIndexDetails::default()],
+            &[false]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(
+            &[params],
+            &[modern_details],
+            &[]
+        ));
     }
 
     #[test]

@@ -164,9 +164,9 @@ fn fragment_field_paths<'a>(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in segment.fields() {
+    for field_id in fields {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -175,6 +175,83 @@ fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Resul
         collect_subtree_field_ids(field, &mut indexed_field_ids);
     }
     Ok(indexed_field_ids)
+}
+
+fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
+    indexed_field_ids(dataset, segment.fields())
+}
+
+/// Prove that every indexed-field file present at a segment's build version is
+/// still the current file for the same fragment id.
+///
+/// A committed segment's logical bitmap may already have pruned a rewritten
+/// fragment even though its physical postings and corpus statistics still
+/// contain that fragment. Since the original per-segment coverage is no longer
+/// available after that pruning, this check deliberately considers every
+/// fragment present at each build version. That is conservative, but it makes
+/// the hybrid scorer available only when the history can be proven to be a
+/// pure append with respect to the indexed field subtrees.
+pub(crate) async fn has_append_only_indexed_field_history(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> bool {
+    let current_version = dataset.manifest.version;
+    let current_fragments = dataset
+        .fragments()
+        .iter()
+        .filter_map(|fragment| u32::try_from(fragment.id).ok().map(|id| (id, fragment)))
+        .collect::<HashMap<_, _>>();
+    if current_fragments.len() != dataset.fragments().len() {
+        return false;
+    }
+
+    let build_versions = segments
+        .iter()
+        .map(|segment| segment.dataset_version)
+        .collect::<HashSet<_>>();
+    for build_version in build_versions {
+        if build_version > current_version {
+            return false;
+        }
+        if build_version == current_version {
+            continue;
+        }
+        let historical = match dataset.checkout_version(build_version).await {
+            Ok(historical) => historical,
+            Err(_) => return false,
+        };
+        let mut indexed_field_ids_at_version = HashSet::new();
+        for segment in segments
+            .iter()
+            .filter(|segment| segment.dataset_version == build_version)
+        {
+            let Ok(historical_field_ids) = indexed_field_ids(&historical, &segment.fields) else {
+                return false;
+            };
+            let Ok(current_field_ids) = indexed_field_ids(dataset, &segment.fields) else {
+                return false;
+            };
+            if historical_field_ids != current_field_ids {
+                return false;
+            }
+            indexed_field_ids_at_version.extend(historical_field_ids);
+        }
+
+        for historical_fragment in historical.fragments() {
+            let Ok(fragment_id) = u32::try_from(historical_fragment.id) else {
+                return false;
+            };
+            let Some(current_fragment) = current_fragments.get(&fragment_id) else {
+                return false;
+            };
+            if fragment_field_paths(historical_fragment, &indexed_field_ids_at_version)
+                != fragment_field_paths(current_fragment, &indexed_field_ids_at_version)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 async fn prune_stale_segment_coverage(
