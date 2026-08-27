@@ -16,13 +16,14 @@ use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
-    InvertedIndex, build_global_bm25_scorer,
+    InvertedIndex, PreparedBm25Query,
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
         PartitionDocuments, ResidentAddressProjection, RowAddressProjectionOrderError,
     },
     index::{DocSet, InvertedPartition},
+    prepare_bm25_query,
     query::{
         FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
     },
@@ -3470,10 +3471,9 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
 }
 
 struct PreparedLeaf {
-    tokens_by_segment: Vec<Arc<Tokens>>,
+    query: Arc<PreparedBm25Query>,
     params: Arc<FtsSearchParams>,
     operator: Operator,
-    scorer: Arc<MemBM25Scorer>,
 }
 
 pub(super) fn tokenize_leaf(
@@ -3481,9 +3481,12 @@ pub(super) fn tokenize_leaf(
     leaf: &LeafQuery,
     params: &FtsSearchParams,
 ) -> Tokens {
-    let is_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
-        && matches!(params.fuzziness, Some(distance) if distance != 0);
-    let mut tokenizer = if is_fuzzy_match {
+    // Keep the legacy explicit-fuzzy rewrite independent of index analysis.
+    // AUTO fuzziness still expands later, but its source terms must first use
+    // the same normalization and filtering as the indexed vocabulary.
+    let is_explicit_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
+        && matches!(params.fuzziness, Some(distance) if distance > 0);
+    let mut tokenizer = if is_explicit_fuzzy_match {
         let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
         match index.tokenizer().doc_type() {
             DocType::Text => Box::new(TextTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
@@ -3495,48 +3498,13 @@ pub(super) fn tokenize_leaf(
     collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
-pub(super) fn expanded_leaf_tokens(
-    index: &InvertedIndex,
-    tokens: &Tokens,
-    params: &FtsSearchParams,
-    operator: Operator,
-) -> Result<Tokens> {
-    if !matches!(params.fuzziness, Some(distance) if distance != 0) {
-        return Ok(tokens.clone());
-    }
-    let expanded = index.expand_fuzzy_tokens(tokens, params)?;
-    if operator == Operator::And || params.phrase_slop.is_some() {
-        let surviving = (0..expanded.len())
-            .map(|index| expanded.position(index))
-            .collect::<HashSet<_>>();
-        if (0..tokens.len()).any(|index| !surviving.contains(&tokens.position(index))) {
-            return Ok(Tokens::with_positions(
-                Vec::new(),
-                Vec::new(),
-                tokens.token_type().clone(),
-            ));
-        }
-    }
-    Ok(expanded)
-}
-
-fn validate_injected_scorer_tokens(scorer: &MemBM25Scorer, tokens: &Tokens) -> Result<()> {
-    for token in tokens {
-        if !scorer.token_docs.contains_key(token) {
-            return Err(Error::invalid_input(format!(
-                "injected BM25 scorer is missing compound FTS token '{token}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
 async fn prepare_compound_query(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
     params: &FtsSearchParams,
     metrics: &dyn MetricsCollector,
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    prepared_match: Option<Arc<PreparedBm25Query>>,
 ) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
     let first_index = indices
         .first()
@@ -3553,30 +3521,31 @@ async fn prepare_compound_query(
     }
 
     let mut leaves = Vec::with_capacity(leaf_queries.len());
+    if prepared_match.is_some() && leaf_queries.len() != 1 {
+        return Err(Error::internal(
+            "prepared Match replay requires exactly one compound FTS leaf",
+        ));
+    }
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        let scorer = match &base_scorer {
-            Some(scorer) => scorer.clone(),
+        let prepared = match &prepared_match {
+            Some(prepared) => prepared.clone(),
             None => Arc::new(
-                build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
-                    .await?,
+                prepare_bm25_query(
+                    indices,
+                    tokens,
+                    &effective_params,
+                    Some(metrics),
+                    base_scorer.clone(),
+                )
+                .await?,
             ),
         };
-        let mut tokens_by_segment = Vec::with_capacity(indices.len());
-        for index in indices {
-            let expanded_tokens =
-                expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())?;
-            if base_scorer.is_some() {
-                validate_injected_scorer_tokens(&scorer, &expanded_tokens)?;
-            }
-            tokens_by_segment.push(Arc::new(expanded_tokens));
-        }
         leaves.push(PreparedLeaf {
-            tokens_by_segment,
+            query: prepared,
             params: Arc::new(effective_params),
             operator: leaf.operator(),
-            scorer,
         });
     }
     Ok((plan, leaves))
@@ -3617,13 +3586,17 @@ async fn load_compound_partition(
 ) -> Result<Option<LoadedPartition>> {
     let leaf_loads = leaves.iter().map(|leaf| {
         let partition = partition.clone();
-        let tokens = leaf.tokens_by_segment[segment_ordinal].clone();
+        let tokens = leaf.query.tokens().clone();
         let params = leaf.params.clone();
-        let scorer = leaf.scorer.clone();
+        let scorer = leaf.query.scorer().clone();
         let metrics = metrics.clone();
         let operator = leaf.operator;
+        let has_all_query_positions = leaf.query.has_all_query_positions();
         async move {
-            let postings = if tokens.is_empty() {
+            let postings = if tokens.is_empty()
+                || ((operator == Operator::And || params.phrase_slop.is_some())
+                    && !has_all_query_positions)
+            {
                 Vec::new()
             } else {
                 partition
@@ -3956,7 +3929,7 @@ pub async fn compound_search(
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
-    compound_search_impl(indices, query, params, prefilter, metrics, None, None).await
+    compound_search_impl(indices, query, params, prefilter, metrics, None, None, None).await
 }
 
 /// Search one-column compound FTS with caller-supplied corpus-wide BM25 statistics.
@@ -3979,6 +3952,7 @@ pub async fn compound_search_with_base_scorer(
         prefilter,
         metrics,
         Some(base_scorer),
+        None,
         None,
     )
     .await
@@ -4006,10 +3980,74 @@ pub async fn compound_search_with_base_scorer_and_score_floor(
         metrics,
         Some(base_scorer),
         Some(score_floor),
+        None,
     )
     .await
 }
 
+/// Replay one root Match query with the exact vocabulary/scorer pair used by
+/// an earlier bounded WAND probe.
+#[doc(hidden)]
+pub async fn compound_search_prepared_match(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_match: Arc<PreparedBm25Query>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    if !matches!(query, FtsQuery::Match(_)) {
+        return Err(Error::invalid_input(
+            "prepared Match replay requires a root Match query",
+        ));
+    }
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        None,
+        Some(prepared_match),
+    )
+    .await
+}
+
+/// Replay one root Match query with a prepared vocabulary/scorer pair and an
+/// inclusive initial score floor.
+#[doc(hidden)]
+pub async fn compound_search_prepared_match_with_score_floor(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_match: Arc<PreparedBm25Query>,
+    score_floor: f32,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    if !matches!(query, FtsQuery::Match(_)) {
+        return Err(Error::invalid_input(
+            "prepared Match replay requires a root Match query",
+        ));
+    }
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        Some(score_floor),
+        Some(prepared_match),
+    )
+    .await
+}
+
+// These arguments keep the public entry points explicit while centralizing the
+// shared search loop; bundling them would only move the same independent inputs
+// into an internal forwarding struct.
+#[allow(clippy::too_many_arguments)]
 async fn compound_search_impl(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -4018,13 +4056,21 @@ async fn compound_search_impl(
     metrics: Arc<dyn MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
     initial_score_floor: Option<f32>,
+    prepared_match: Option<Arc<PreparedBm25Query>>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    let (plan, leaves) =
-        prepare_compound_query(indices, query, params, metrics.as_ref(), base_scorer).await?;
+    let (plan, leaves) = prepare_compound_query(
+        indices,
+        query,
+        params,
+        metrics.as_ref(),
+        base_scorer,
+        prepared_match,
+    )
+    .await?;
     prefilter.wait_for_ready().await?;
     let mask = prefilter.mask();
     let competitive_score = Arc::new(CompetitiveScore::default());
