@@ -84,72 +84,11 @@ pub fn create_replay_spill(
     (sender, receiver)
 }
 
-/// Wrap a one-shot [`SendableRecordBatchStream`] in a re-scannable [`TableProvider`].
-///
-/// The source is drained in the background into a replayable spill. Two properties
-/// keep this cheap for the common case:
-///
-/// - **Memory-first.** Up to `memory_limit` bytes are buffered in memory; the spill
-///   only touches disk once that budget is exceeded. A source that fits under the
-///   limit never hits the filesystem.
-/// - **Streaming replay.** A scan can start consuming batches as soon as they land,
-///   before the source has finished draining — the first reader is not blocked
-///   waiting for the whole source to buffer.
-///
-/// Each scan of the returned provider replays the full source, which is what makes a
-/// one-shot stream usable in the write retry loop.
-///
-/// The provider reports no statistics — the source size is not known until it has
-/// been fully drained — so callers that need source statistics (e.g. to drive join
-/// ordering) should prefer a materialized or file-backed provider instead.
-///
-/// # Examples
-///
-/// ```
-/// # use std::sync::Arc;
-/// # use arrow_array::{Int32Array, RecordBatch};
-/// # use arrow_schema::{DataType, Field, Schema};
-/// # use datafusion::execution::SendableRecordBatchStream;
-/// # use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-/// # use futures::TryStreamExt;
-/// # use lance_datafusion::exec::provider_to_stream;
-/// # use lance_datafusion::spill::spilling_table_provider;
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-/// let batch =
-///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
-/// // A one-shot stream can only be consumed once.
-/// let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-///     schema.clone(),
-///     futures::stream::iter(vec![Ok(batch)]),
-/// ));
-///
-/// // Wrapping it makes it re-scannable: each scan replays the full source.
-/// let provider = spilling_table_provider(source, 100 * 1024 * 1024).await?;
-/// let first: Vec<RecordBatch> = provider_to_stream(provider.clone()).await?.try_collect().await?;
-/// let second: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
-/// assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
-/// assert_eq!(second.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
-/// # Ok(())
-/// # }
-/// ```
-pub async fn spilling_table_provider(
-    source: SendableRecordBatchStream,
-    memory_limit: usize,
-) -> Result<Arc<dyn TableProvider>, DataFusionError> {
-    let disk_manager = Arc::new(
-        DiskManager::builder()
-            .with_max_temp_directory_size(u64::MAX)
-            .build()?,
-    );
-    spilling_table_provider_with_job_disk_manager(source, memory_limit, disk_manager).await
-}
-
 /// Wrap a one-shot stream in a replayable provider using a job-local disk manager.
 ///
-/// This has the same memory-first and streaming-replay behavior as
-/// [`spilling_table_provider`], but charges its spill file to `disk_manager`.
+/// Up to `memory_limit` bytes are buffered before spilling, and scans can start
+/// replaying batches while the source is still draining. Every spill file is
+/// charged to `disk_manager`.
 /// Sharing that manager with DataFusion execution enforces one aggregate quota
 /// across replay and operator spill files. Dropping the provider aborts an
 /// unfinished background drain of the source.

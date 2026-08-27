@@ -599,10 +599,17 @@ fn merge_insert_execution_options() -> LanceExecutionOptions {
         batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
         ..Default::default()
     };
+    // Size the operation-scoped pool with the same CPU ceiling used by the
+    // fragment updater, without setting target_partition on the actual job and
+    // thereby changing plan parallelism everywhere.
+    let pool_sizing_options = LanceExecutionOptions {
+        target_partition: Some(get_num_compute_intensive_cpus().min(8)),
+        ..options.clone()
+    };
     // Resolve environment-backed limits once so the held context and every
     // execution attempt use exactly the same resource configuration.
     LanceExecutionOptions {
-        mem_pool_size: Some(options.mem_pool_size()),
+        mem_pool_size: Some(pool_sizing_options.mem_pool_size()),
         max_temp_directory_size: Some(options.max_temp_directory_size()),
         ..options
     }
@@ -1375,7 +1382,7 @@ impl MergeInsertJob {
             let index_scan = SequentialSourcePartitionStream::from_provider_scan(
                 &source_provider,
                 session_ctx,
-                ordinal_field,
+                None,
             )
             .await?;
             (
@@ -1586,6 +1593,12 @@ impl MergeInsertJob {
             .ok_or_else(|| Error::internal("merge-insert source join ordering is empty"))?;
         let target_ordering = LexOrdering::new(target_ordering)
             .ok_or_else(|| Error::internal("merge-insert target join ordering is empty"))?;
+        let target_partition_count = target.properties().output_partitioning().partition_count();
+        if target_partition_count != 1 {
+            return Err(Error::internal(format!(
+                "indexed merge-insert target must have exactly one partition before sorting, got {target_partition_count}"
+            )));
+        }
         let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
         let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
         let source_input = Arc::new(SortExec::new(source_ordering, source_input));
@@ -3991,6 +4004,21 @@ mod tests {
             1,
             "a 150 MiB pool has room for one merge reservation and two capped working batches"
         );
+    }
+
+    #[test]
+    fn test_merge_insert_pool_scales_without_changing_plan_parallelism() {
+        let options = merge_insert_execution_options();
+        let expected_pool_size = LanceExecutionOptions {
+            use_spilling: true,
+            batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
+            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
+            ..Default::default()
+        }
+        .mem_pool_size();
+
+        assert_eq!(options.mem_pool_size(), expected_pool_size);
+        assert_eq!(options.target_partition, None);
     }
 
     #[tokio::test]
@@ -11542,7 +11570,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 ],
             )
             .unwrap();
-            (vec![Ok(source)], 63, 1, 4096 - 64)
+            let source_batches = (0..source.num_rows())
+                .step_by(40)
+                .map(|offset| Ok(source.slice(offset, (source.num_rows() - offset).min(40))))
+                .collect();
+            (source_batches, 63, 1, 4096 - 64)
         } else {
             let first = record_batch!(
                 ("id", Int32, [Some(108), None]),
