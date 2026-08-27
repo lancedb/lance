@@ -58,6 +58,7 @@ use lance_index::scalar::{
 };
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
@@ -3146,6 +3147,169 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
         scored_row_bits(&actual),
         scored_row_bits(&expected),
         "different-base rewrite fallback must match a rebuilt index exactly"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_rejects_rebound_registered_base() {
+    let primary = TempStrDir::default();
+    let base_a = TempStrDir::default();
+    let base_b = TempStrDir::default();
+    let stable =
+        arrow_array::record_batch!(("text", Utf8, ["stable alpha common"]), ("id", Int32, [0]))
+            .unwrap();
+    let schema = stable.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![stable].into_iter().map(Ok), schema.clone()),
+        &primary,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            initial_bases: Some(vec![BasePath::new(
+                1,
+                base_a.to_string(),
+                Some("base-a".to_string()),
+                false,
+            )]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let indexed_on_base =
+        arrow_array::record_batch!(("text", Utf8, ["stale alpha common"]), ("id", Int32, [1]))
+            .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed_on_base].into_iter().map(Ok), schema.clone()),
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            target_bases: Some(vec![1]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().files[0].base_id,
+        None
+    );
+    assert_eq!(
+        dataset.get_fragment(1).unwrap().metadata().files[0].base_id,
+        Some(1)
+    );
+
+    let columns = ["text"];
+    let params = InvertedIndexParams::default().with_position(true);
+    let segment = dataset
+        .create_index_builder(&columns, IndexType::Inverted, &params)
+        .name("text_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let fragment_before = dataset.get_fragment(1).unwrap().metadata().clone();
+    let relative_path = fragment_before.files[0].path.clone();
+    let replacement = arrow_array::record_batch!(
+        ("text", Utf8, ["replacement beta common"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let (base_b_store, base_b_root) = ObjectStore::from_uri(&base_b).await.unwrap();
+    let object_writer = base_b_store
+        .create(&base_b_root.join(&relative_path))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_1::create_writer(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let binding_before = dataset.manifest.base_paths.get(&1).unwrap().clone();
+    dataset = Arc::new(dataset)
+        .add_bases(
+            vec![BasePath::new(
+                1,
+                base_b.to_string(),
+                Some("base-b".to_string()),
+                false,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    let binding_after = dataset.manifest.base_paths.get(&1).unwrap();
+    assert_eq!(binding_before.path, base_a.to_string());
+    assert_eq!(binding_after.path, base_b.to_string());
+    assert_eq!(
+        binding_before.is_dataset_root,
+        binding_after.is_dataset_root
+    );
+    assert_eq!(
+        dataset.get_fragment(1).unwrap().metadata(),
+        &fragment_before,
+        "UpdateBases must leave the DataFile identity unchanged"
+    );
+
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![segment])
+        .await
+        .unwrap();
+    let committed = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    let coverage = committed.fragment_bitmap.as_ref().unwrap();
+    assert!(coverage.contains(0));
+    assert!(
+        !coverage.contains(1),
+        "rebinding a referenced base must prune stale logical coverage"
+    );
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [2]))
+            .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("common", "text", 0.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
+        (Occur::Should, compound_match_query("beta", "text", 0.0)),
+        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
+    ])
+    .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), 3).await;
+    assert!(
+        !plan.contains("HybridCompoundFtsScorer"),
+        "a rebound registered base makes physical BM25 stats unsafe:\n{plan}"
+    );
+    let actual = compound_fts_results(&dataset, query.clone(), Some(3)).await;
+
+    let mut rebuilt = dataset.clone();
+    rebuilt
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let expected = compound_fts_results(&rebuilt, query, Some(3)).await;
+    assert_eq!(
+        scored_row_bits(&actual),
+        scored_row_bits(&expected),
+        "rebound-base fallback must match a rebuilt index exactly"
     );
 }
 

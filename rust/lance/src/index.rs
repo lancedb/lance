@@ -144,11 +144,22 @@ fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
 
 /// Stable identity fields for a physical data file.
 ///
-/// This mirrors transaction rewrite validation and deliberately excludes
+/// This mirrors transaction rewrite validation, additionally resolves a
+/// registered base to its physical binding, and deliberately excludes
 /// `file_size_bytes`, which is a mutable cache rather than file identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalBaseBinding<'a> {
+    Primary,
+    Registered {
+        path: &'a str,
+        is_dataset_root: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PhysicalDataFileIdentity<'a> {
     base_id: Option<u32>,
+    base_binding: PhysicalBaseBinding<'a>,
     path: &'a str,
     fields: &'a [i32],
     column_indices: &'a [i32],
@@ -156,23 +167,35 @@ struct PhysicalDataFileIdentity<'a> {
     file_minor_version: u32,
 }
 
-impl<'a> From<&'a DataFile> for PhysicalDataFileIdentity<'a> {
-    fn from(file: &'a DataFile) -> Self {
-        Self {
+impl<'a> PhysicalDataFileIdentity<'a> {
+    fn try_new(dataset: &'a Dataset, file: &'a DataFile) -> Option<Self> {
+        let base_binding = match file.base_id {
+            Some(base_id) => {
+                let base = dataset.manifest.base_paths.get(&base_id)?;
+                PhysicalBaseBinding::Registered {
+                    path: &base.path,
+                    is_dataset_root: base.is_dataset_root,
+                }
+            }
+            None => PhysicalBaseBinding::Primary,
+        };
+        Some(Self {
             base_id: file.base_id,
+            base_binding,
             path: &file.path,
             fields: file.fields.as_ref(),
             column_indices: file.column_indices.as_ref(),
             file_major_version: file.file_major_version,
             file_minor_version: file.file_minor_version,
-        }
+        })
     }
 }
 
 fn fragment_field_files<'a>(
+    dataset: &'a Dataset,
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
-) -> HashMap<i32, PhysicalDataFileIdentity<'a>> {
+) -> Option<HashMap<i32, PhysicalDataFileIdentity<'a>>> {
     fragment
         .files
         .iter()
@@ -180,7 +203,10 @@ fn fragment_field_files<'a>(
             file.fields
                 .iter()
                 .filter(|field_id| indexed_field_ids.contains(field_id))
-                .map(|field_id| (*field_id, file.into()))
+                .map(|field_id| {
+                    PhysicalDataFileIdentity::try_new(dataset, file)
+                        .map(|identity| (*field_id, identity))
+                })
         })
         .collect()
 }
@@ -271,9 +297,14 @@ pub(crate) async fn has_append_only_indexed_field_history(
             let Some(current_fragment) = current_fragments.get(&fragment_id) else {
                 return false;
             };
-            if fragment_field_files(historical_fragment, &indexed_field_ids_at_version)
-                != fragment_field_files(current_fragment, &indexed_field_ids_at_version)
-            {
+            let historical_files = fragment_field_files(
+                &historical,
+                historical_fragment,
+                &indexed_field_ids_at_version,
+            );
+            let current_files =
+                fragment_field_files(dataset, current_fragment, &indexed_field_ids_at_version);
+            if historical_files.is_none() || historical_files != current_files {
                 return false;
             }
         }
@@ -325,9 +356,12 @@ async fn prune_stale_segment_coverage(
                     let Some(current_fragment) = current_fragments.get(fragment_id) else {
                         return true;
                     };
+                    let historical_files =
+                        fragment_field_files(&historical, historical_fragment, &indexed_field_ids);
+                    let current_files =
+                        fragment_field_files(dataset, current_fragment, &indexed_field_ids);
                     let changed_files =
-                        fragment_field_files(historical_fragment, &indexed_field_ids)
-                            != fragment_field_files(current_fragment, &indexed_field_ids);
+                        historical_files.is_none() || historical_files != current_files;
                     let changed_overlays = prune_newer_overlays
                         && current_fragment.overlays.iter().any(|overlay| {
                             overlay.committed_version > version
