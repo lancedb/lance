@@ -19,6 +19,8 @@ pub(super) struct ModernSearchRequest<'a> {
     pub(super) scorer: &'a MemBM25Scorer,
     pub(super) impact_scorer: Arc<MemBM25Scorer>,
     pub(super) limit: usize,
+    /// Exclusive raw-score floor used to seed standalone Match WAND.
+    pub(super) initial_score_floor: Option<f32>,
 }
 
 /// Typed identity for one modern candidate after partition-local scoring.
@@ -199,6 +201,7 @@ pub(in super::super) struct LoadedPostings {
     pub(super) grouped_expansions: Vec<GroupedExpansionTerms>,
     pub(super) impact_safe: bool,
     pub(super) exact_scoring_required: bool,
+    pub(super) no_impact_fallback: bool,
 }
 
 pub(super) enum LoadedDocLengths {
@@ -229,6 +232,7 @@ impl LoadedPostings {
             grouped_expansions: Vec::new(),
             impact_safe: false,
             exact_scoring_required: false,
+            no_impact_fallback: false,
         }
     }
 }

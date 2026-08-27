@@ -20,6 +20,17 @@ pub const COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_essential_evaluations";
 pub const COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_non_essential_evaluations";
+pub const COMPOUND_PHRASE_EXACT_APPROXIMATIONS_METRIC: &str =
+    "compound_phrase_exact_approximations";
+pub const COMPOUND_PHRASE_SLOPPY_APPROXIMATIONS_METRIC: &str =
+    "compound_phrase_sloppy_approximations";
+pub const COMPOUND_PHRASE_EXACT_CONFIRMATIONS_METRIC: &str = "compound_phrase_exact_confirmations";
+pub const COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_METRIC: &str =
+    "compound_phrase_sloppy_confirmations";
+pub const COMPOUND_PHRASE_EXACT_CONFIRMATIONS_AVOIDED_METRIC: &str =
+    "compound_phrase_exact_confirmations_avoided";
+pub const COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_AVOIDED_METRIC: &str =
+    "compound_phrase_sloppy_confirmations_avoided";
 pub const CROSS_COLUMN_STAGED_ATTEMPTS_METRIC: &str = "cross_column_staged_attempts";
 pub const CROSS_COLUMN_STAGED_SUCCESSES_METRIC: &str = "cross_column_staged_successes";
 pub const CROSS_COLUMN_STAGED_FALLBACKS_METRIC: &str = "cross_column_staged_fallbacks";
@@ -32,7 +43,20 @@ pub const WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC: &str =
     "wand_exactness_certificate_fallbacks";
 pub const WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC: &str =
     "wand_exactness_certificate_candidates";
-
+pub const WAND_EXACTNESS_PROBE_MS_METRIC: &str = "wand_exactness_probe_ms";
+pub const WAND_EXACTNESS_PROBE_COMPARISONS_METRIC: &str = "wand_exactness_probe_comparisons";
+pub const WAND_TIE_COMPLETION_ATTEMPTS_METRIC: &str = "wand_tie_completion_attempts";
+pub const WAND_TIE_COMPLETION_SUCCESSES_METRIC: &str = "wand_tie_completion_successes";
+pub const WAND_TIE_COMPLETION_OVERFLOWS_METRIC: &str = "wand_tie_completion_overflows";
+pub const WAND_TIE_COMPLETION_CANDIDATES_METRIC: &str = "wand_tie_completion_candidates";
+pub const WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC: &str =
+    "wand_tie_completion_row_id_replacements";
+pub const WAND_TIE_COMPLETION_MS_METRIC: &str = "wand_tie_completion_ms";
+pub const WAND_TIE_COMPLETION_COMPARISONS_METRIC: &str = "wand_tie_completion_comparisons";
+pub const WAND_SEEDED_FALLBACKS_METRIC: &str = "wand_seeded_fallbacks";
+pub const WAND_SEEDED_FALLBACK_MS_METRIC: &str = "wand_seeded_fallback_ms";
+pub const WAND_SEEDED_FALLBACK_COMPARISONS_METRIC: &str = "wand_seeded_fallback_comparisons";
+pub const NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC: &str = "no_impact_global_scorer_fallbacks";
 /// A trait used by the index to report metrics
 ///
 /// Callers can implement this trait to collect metrics
@@ -137,6 +161,24 @@ pub trait MetricsCollector: Send + Sync {
     /// Record non-essential-clause evaluations for pure-SHOULD compound FTS.
     fn record_compound_should_non_essential_evaluations(&self, _num_evaluations: usize) {}
 
+    /// Record exact-phrase documents produced by the posting approximation.
+    fn record_compound_phrase_exact_approximations(&self, _num_approximations: usize) {}
+
+    /// Record sloppy-phrase documents produced by the posting approximation.
+    fn record_compound_phrase_sloppy_approximations(&self, _num_approximations: usize) {}
+
+    /// Record exact-phrase position confirmations.
+    fn record_compound_phrase_exact_confirmations(&self, _num_confirmations: usize) {}
+
+    /// Record sloppy-phrase position confirmations.
+    fn record_compound_phrase_sloppy_confirmations(&self, _num_confirmations: usize) {}
+
+    /// Record exact-phrase position confirmations avoided by a score bound.
+    fn record_compound_phrase_exact_confirmations_avoided(&self, _num_confirmations: usize) {}
+
+    /// Record sloppy-phrase position confirmations avoided by a score bound.
+    fn record_compound_phrase_sloppy_confirmations_avoided(&self, _num_confirmations: usize) {}
+
     /// Record cross-column queries that attempted candidate-driven staging.
     fn record_cross_column_staged_attempts(&self, _num_attempts: usize) {}
 
@@ -163,6 +205,24 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record WAND candidates returned to the certificate classifier.
     fn record_wand_exactness_certificate_candidates(&self, _num_candidates: usize) {}
+
+    /// Record bounded WAND attempts to complete an ambiguous kth-score tie.
+    fn record_wand_tie_completion_attempts(&self, _num_attempts: usize) {}
+
+    /// Record kth-score ties completed without exact replay.
+    fn record_wand_tie_completion_successes(&self, _num_successes: usize) {}
+
+    /// Record kth-score ties that exceeded the bounded completion budget.
+    fn record_wand_tie_completion_overflows(&self, _num_overflows: usize) {}
+
+    /// Record candidates returned by bounded kth-score tie completion.
+    fn record_wand_tie_completion_candidates(&self, _num_candidates: usize) {}
+
+    /// Record exact replays seeded with an inclusive kth-score floor.
+    fn record_wand_seeded_fallbacks(&self, _num_fallbacks: usize) {}
+
+    /// Record partitions whose no-impact postings use scorer-derived bounds.
+    fn record_no_impact_global_scorer_fallbacks(&self, _num_fallbacks: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.

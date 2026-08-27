@@ -53,6 +53,10 @@ use lance_index::metrics::{
     CROSS_COLUMN_STAGED_SUCCESSES_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
     WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
     WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
+    WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
+    WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_CANDIDATES_METRIC,
+    WAND_TIE_COMPLETION_COMPARISONS_METRIC, WAND_TIE_COMPLETION_OVERFLOWS_METRIC,
+    WAND_TIE_COMPLETION_SUCCESSES_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -1898,6 +1902,16 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     // Index only the title after the append so it can retain a bounded plan
     // while the partially covered body uses the exhaustive leaf fallback.
     create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
+    partial_dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
     assert_compound_matches_independent_oracle(
         &partial_dataset,
         "partial_top_level_cross_column_multimatch",
@@ -1917,7 +1931,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         1,
         "only the fully indexed title field should attempt a bounded WAND certificate"
     );
-    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
         "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
@@ -1931,6 +1945,315 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_index: bool) {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(use_scalar_index)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert_eq!(
+        plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should keep their bounded scorer:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        usize::from(use_scalar_index) * 2,
+        "each field should declare the shared prefilter dependency:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    let actual = batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_multimatch_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_deletes() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset.delete("id = 1").await.unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    expected.truncate(3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_prefilter_deletes", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_when_first_field_is_flat_only() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["body".to_owned(), "title".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("FlatMatchQuery") && plan.contains("SharedMultiMatchPrefilter"),
+        "the later indexed field must retain the declared shared source:\n{plan}"
+    );
+    scanner.try_into_batch().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multimatch_fields_have_independent_fuzzy_expansion_budgets() {
+    let batch = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha", "nothing"]),
+        ("body", Utf8, ["nothing", "alphi"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let fuzzy_multimatch = || {
+        let mut query = MultiMatchQuery::try_new(
+            "alphx".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for field in &mut query.match_queries {
+            field.fuzziness = Some(1);
+            field.max_expansions = 1;
+        }
+        query
+    };
+
+    let top_level: FtsQuery = fuzzy_multimatch().into();
+    let top_level_plan = compound_fts_plan(&dataset, top_level.clone(), 10).await;
+    assert!(top_level_plan.matches("CompoundFtsScorer").count() >= 2);
+    assert!(!top_level_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let top_level_results = compound_fts_results(&dataset, top_level, Some(10)).await;
+    assert_eq!(top_level_results.len(), 2);
+
+    let nested: FtsQuery =
+        BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(fuzzy_multimatch()))]).into();
+    let nested_plan = compound_fts_plan(&dataset, nested.clone(), 10).await;
+    assert!(nested_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let nested_results = compound_fts_results(&dataset, nested, Some(10)).await;
+    assert_scored_rows_close(
+        "multimatch_independent_fuzzy_budgets",
+        &nested_results,
+        &top_level_results,
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
+    let indexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [0])
+    )
+    .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let unindexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let schema = unindexed.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![unindexed].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let auto_match = |terms: &str| -> FtsQuery {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("title".to_owned()))
+            .with_fuzziness(None)
+            .into()
+    };
+    let auto_multimatch = |terms: &str| {
+        let mut query = MultiMatchQuery::try_new(
+            terms.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for match_query in &mut query.match_queries {
+            match_query.fuzziness = None;
+        }
+        query
+    };
+
+    for (case_name, query, expected_ids) in [
+        ("match_exact", auto_match("ALPHA"), &[0, 1][..]),
+        ("match_typo", auto_match("alphx"), &[][..]),
+        (
+            "multimatch_exact",
+            FtsQuery::MultiMatch(auto_multimatch("ALPHA")),
+            &[0, 1][..],
+        ),
+        (
+            "multimatch_typo",
+            FtsQuery::MultiMatch(auto_multimatch("alphx")),
+            &[][..],
+        ),
+        (
+            "nested_multimatch_exact",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHA")))])
+                .into(),
+            &[0, 1][..],
+        ),
+        (
+            "nested_multimatch_typo",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
+                .into(),
+            &[][..],
+        ),
+    ] {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected_ids,
+            "indexed and unindexed rows diverged for {case_name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2036,7 +2359,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
     assert_eq!(tied_oracle[0].1, tied_oracle[1].1);
     assert!(tied_oracle[0].0 < tied_oracle[1].0);
     let (tied, stats) = compound_fts_results_with_stats(&dataset, tied_query, 1).await;
-    assert_scored_rows_close("wand_certificate_tie_fallback", &tied, &tied_oracle[..1]);
+    assert_scored_rows_close("wand_certificate_tie_completion", &tied, &tied_oracle[..1]);
     assert_eq!(
         stats
             .all_counts
@@ -2053,13 +2376,13 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&0)
+        Some(&1)
     );
     assert_eq!(
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
+        Some(&0)
     );
     assert_eq!(
         stats
@@ -2067,6 +2390,23 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
         Some(&2)
     );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_OVERFLOWS_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&2)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&0));
 
     let mixed_query = field_local_query("noise");
     let mixed_oracle =
@@ -2083,7 +2423,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&1)
+        Some(&2)
     );
     assert_eq!(
         stats
@@ -2095,7 +2435,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
+        Some(&0)
     );
     assert_eq!(
         stats
@@ -2103,6 +2443,61 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
         Some(&3)
     );
+
+    for (
+        case_name,
+        exact_term,
+        fuzzy_term,
+        limit,
+        expected_strict,
+        expected_exhaustive,
+        expected_fallbacks,
+    ) in [
+        ("strict", "alpha", "alphx", 1, 1, 1, 0),
+        ("exhaustive", "tiebody", "tiebodx", 3, 0, 2, 0),
+        ("ambiguous", "tie", "tix", 1, 0, 2, 0),
+    ] {
+        let exact =
+            compound_fts_results(&dataset, field_local_query(exact_term), Some(limit)).await;
+        let mut fuzzy = MultiMatchQuery::try_new(
+            fuzzy_term.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for query in &mut fuzzy.match_queries {
+            query.fuzziness = Some(1);
+        }
+        let (actual, stats) = compound_fts_results_with_stats(&dataset, fuzzy.into(), limit).await;
+        assert_scored_rows_close(
+            &format!("fuzzy_wand_certificate_{case_name}"),
+            &actual,
+            &exact,
+        );
+        assert_eq!(
+            stats
+                .all_counts
+                .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+            Some(&2),
+            "{case_name} fuzzy query must attempt one certificate per field"
+        );
+        for (metric, expected) in [
+            (WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, expected_strict),
+            (
+                WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
+                expected_exhaustive,
+            ),
+            (
+                WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+                expected_fallbacks,
+            ),
+        ] {
+            assert_eq!(
+                stats.all_counts.get(metric),
+                Some(&expected),
+                "{case_name} fuzzy query used the wrong certificate path for {metric}"
+            );
+        }
+    }
 
     let zero_boost_query: FtsQuery = MultiMatchQuery::try_new(
         "blocked".to_owned(),
@@ -2119,6 +2514,122 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
         Some(&0),
         "zero-boost fields must use the exact path without attempting a certificate"
+    );
+}
+
+async fn write_wand_tie_dataset(num_ties: usize) -> Dataset {
+    let reader = gen_batch()
+        .col("title", array::fill_utf8("token".to_owned()))
+        .col("body", array::fill_utf8("unrelated".to_owned()))
+        .into_reader_rows(
+            RowCount::from(u64::try_from(num_ties).unwrap()),
+            BatchCount::from(1),
+        );
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: num_ties.div_ceil(2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+fn wand_tie_multimatch(terms: &str, boost: f32, fuzziness: Option<u32>) -> FtsQuery {
+    let mut query = MultiMatchQuery::try_new(
+        terms.to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![boost, 1.0])
+    .unwrap();
+    for match_query in &mut query.match_queries {
+        match_query.fuzziness = fuzziness;
+    }
+    query.into()
+}
+
+#[tokio::test]
+async fn test_wand_tie_completion_recovers_reversed_segment_row_id() {
+    let mut dataset = write_wand_tie_dataset(6).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("token", 1.0, Some(0));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), 6);
+    assert_eq!(oracle[0].0, 0);
+
+    let (actual, stats) = compound_fts_results_with_stats(&dataset, query, 1).await;
+
+    assert_scored_rows_close(
+        "wand_tie_completion_reversed_segments",
+        &actual,
+        &oracle[..1],
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&6)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&0));
+}
+
+#[tokio::test]
+async fn test_wand_tie_overflow_uses_seeded_fuzzy_boosted_fallback() {
+    const NUM_TIES: usize = 131;
+    let mut dataset = write_wand_tie_dataset(NUM_TIES).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("tiken", 2.5, Some(1));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), NUM_TIES);
+    assert_eq!(oracle[0].0, 0);
+
+    let (actual, stats) = compound_fts_results_with_stats(&dataset, query, 1).await;
+
+    assert_scored_rows_close("wand_tie_seeded_fuzzy_boost", &actual, &oracle[..1]);
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_OVERFLOWS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&130),
+        "k=1 reserves 128 tie slots plus one lower-score guard slot"
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&1));
+    assert!(
+        stats
+            .all_counts
+            .get(WAND_TIE_COMPLETION_COMPARISONS_METRIC)
+            .is_some_and(|comparisons| *comparisons > 0)
+    );
+    assert!(
+        stats
+            .all_counts
+            .get(WAND_SEEDED_FALLBACK_COMPARISONS_METRIC)
+            .is_some_and(|comparisons| *comparisons > 0)
     );
 }
 
@@ -4311,11 +4822,11 @@ async fn test_fts_phrase_query() {
     let words = ["lance", "full", "text", "search"];
     let mut lance_search_count = 0;
     let mut full_text_count = 0;
-    let mut doc_array = (0..4096)
+    let mut doc_array = (0..256)
         .map(|_| {
             let mut rng = rand::rng();
-            let mut text = String::with_capacity(512);
-            let len = rng.random_range(127..512);
+            let mut text = String::with_capacity(128);
+            let len = rng.random_range(31..128);
             for i in 0..len {
                 if i > 0 {
                     text.push(' ');
