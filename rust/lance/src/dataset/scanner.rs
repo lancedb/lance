@@ -4242,10 +4242,16 @@ impl Scanner {
                     self.fts_overlay_plan(&column, document_granularity, target_fragments),
                 )
                 .await?;
-                if !self.retain_target_fragments(unindexed_fragments).is_empty() {
+                let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
+                if !unindexed_fragments.is_empty()
+                    && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
+                {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
-                    // coverage.
+                    // coverage. Fast search deliberately excludes unindexed
+                    // fragments, so its indexed-only domain remains valid for
+                    // the compound scorer when at least one target fragment is
+                    // indexed.
                     return Ok(None);
                 }
                 let segments = match overlay_plan {

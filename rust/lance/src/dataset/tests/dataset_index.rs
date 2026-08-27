@@ -1850,6 +1850,28 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         partial_plan.contains("FlatMatchQuery"),
         "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
     );
+
+    let mut fast_scanner = partial_dataset.scan();
+    fast_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{fast_plan}"
+    );
+    assert_eq!(
+        fast_plan.matches("CompoundFtsScorer").count(),
+        2,
+        "fast search should use a field-local compound scorer for both fields:\n{fast_plan}"
+    );
+    assert!(
+        !fast_plan.contains("FlatMatchQuery"),
+        "fast search must skip the partially covered body's flat path:\n{fast_plan}"
+    );
 }
 
 #[rstest]
@@ -2523,7 +2545,7 @@ async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
     let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
     assert_scored_rows_close("incomplete_coverage", &actual, &expected);
 
-    let plan = compound_fts_plan(&dataset, query, 1).await;
+    let plan = compound_fts_plan(&dataset, query.clone(), 1).await;
     assert!(
         !plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
         "incomplete column coverage must not use the cross-column scorer:\n{plan}"
@@ -2531,6 +2553,119 @@ async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
     assert!(
         plan.contains("BooleanQuery"),
         "incomplete column coverage should retain the exact fallback:\n{plan}"
+    );
+
+    let mut fast_scanner = dataset.scan();
+    fast_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(1), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "fast search should use indexed-only cross-column scoring:\n{fast_plan}"
+    );
+    assert_eq!(
+        fast_scanner.try_into_batch().await.unwrap().num_rows(),
+        0,
+        "the only hit is unindexed in body and must be excluded by fast search"
+    );
+}
+
+#[tokio::test]
+async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["fresh alpha", "old noise"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["fresh alpha"]), ("id", Int32, [2])).unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+        (Occur::Must, compound_match_query("alpha", "text", 1.0)),
+    ])
+    .into();
+
+    let mut exact_scanner = dataset.scan();
+    exact_scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    exact_scanner.limit(Some(2), None).unwrap();
+    let exact = exact_scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        exact["id"].as_primitive::<Int32Type>().values(),
+        &[0, 2],
+        "exact search should include the appended hit"
+    );
+
+    let mut fast_scanner = dataset.scan();
+    fast_scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(2), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fast_plan.contains("CompoundFtsScorer"),
+        "fast search should keep the same-column compound scorer:\n{fast_plan}"
+    );
+    assert!(
+        !fast_plan.contains("FlatMatchQuery"),
+        "fast search must not plan a flat scan for unindexed rows:\n{fast_plan}"
+    );
+    let fast = fast_scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        fast["id"].as_primitive::<Int32Type>().values(),
+        &[0],
+        "fast search should return only the indexed hit"
+    );
+
+    let unindexed_fragment = dataset.get_fragments().last().unwrap().clone();
+    let mut unindexed_only_scanner = dataset.scan();
+    unindexed_only_scanner
+        .with_fragments(vec![unindexed_fragment])
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .fast_search();
+    unindexed_only_scanner.limit(Some(2), None).unwrap();
+    let unindexed_only_plan = unindexed_only_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !unindexed_only_plan.contains("CompoundFtsScorer"),
+        "an entirely unindexed target must not build a compound scorer:\n{unindexed_only_plan}"
+    );
+    assert_eq!(
+        unindexed_only_scanner
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        0
     );
 }
 

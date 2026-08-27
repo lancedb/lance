@@ -19,7 +19,9 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
+};
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
@@ -1267,6 +1269,34 @@ async fn test_fts_overlay_row_level_masking_under_fast_search(
     assert_eq!(
         new_phrase_scan.try_into_batch().await.unwrap().num_rows(),
         0
+    );
+
+    let match_query = |terms: &str| {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let compound_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("apple")),
+        (Occur::Should, match_query("pie")),
+    ])
+    .into();
+    let mut compound_scan = dataset.scan();
+    compound_scan
+        .full_text_search(FullTextSearchQuery::new_query(compound_query))
+        .unwrap();
+    compound_scan.project(&["id"]).unwrap();
+    compound_scan.fast_search();
+    compound_scan.limit(Some(10), None).unwrap();
+    let compound_plan = compound_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !compound_plan.contains("CompoundFtsScorer"),
+        "overlay-stale rows must keep compound fast search on the masked fallback:\n{compound_plan}"
+    );
+    let compound_result = compound_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&compound_result)),
+        vec![0]
     );
 }
 
