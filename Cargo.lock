@@ -4937,6 +4937,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "test-log",
  "tokio",
