@@ -4408,6 +4408,9 @@ impl Scanner {
                         // obsolete document to BM25 corpus statistics.
                         return Ok(None);
                     }
+                    // `load_segment_params` reads root params JSON, whose
+                    // format_version is intentionally not serialized. Use the
+                    // normalized physical details for the legacy boundary.
                     let physical_details = futures::future::try_join_all(
                         segments.iter().map(|segment| {
                             load_physical_fts_details(&self.dataset, &column, segment)
@@ -7532,6 +7535,9 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::inverted::{
+        INVERTED_INDEX_VERSION_V1, InvertedListFormatVersion,
+    };
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
@@ -7813,6 +7819,53 @@ mod test {
             &[modern_details],
             &[]
         ));
+    }
+
+    #[tokio::test]
+    async fn cached_residual_rejects_physically_written_v1_segment() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false)
+            .format_version(InvertedListFormatVersion::V1);
+        test_ds
+            .dataset
+            .create_index(&["s"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        test_ds.append_new_data().await.unwrap();
+
+        let segments = load_segments(&test_ds.dataset, "s", DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+        let details = load_physical_fts_details(&test_ds.dataset, "s", &segments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            details.posting_format_version,
+            Some(INVERTED_INDEX_VERSION_V1),
+            "the fixture must exercise a physically written v1 segment"
+        );
+
+        let query: FtsQuery = BooleanQuery::new([(
+            Occur::Should,
+            MatchQuery::new("409".to_string())
+                .with_column(Some("s".to_string()))
+                .into(),
+        )])
+        .into();
+        let mut scan = test_ds.dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("CachedResidualCompoundFtsScorer"),
+            "v1 postings must retain the exact fallback:\n{plan}"
+        );
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
     }
 
     #[test]
