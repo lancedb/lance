@@ -519,6 +519,27 @@ fn summarize_position_matches(mut positions: SmallVec<[(u32, bool); 8]>) -> Posi
     }
 }
 
+pub(super) fn validate_no_impact_scorer_upper_bound(
+    token: &str,
+    scorer: &MemBM25Scorer,
+) -> Result<()> {
+    let query_weight = scorer.query_weight(token);
+    if !query_weight.is_finite() || query_weight < 0.0 {
+        return Err(Error::invalid_input(format!(
+            "global BM25 query weight for token {token:?} must be finite and non-negative, got {query_weight}"
+        )));
+    }
+    let has_finite_bound = scorer.doc_weight_upper_bound().is_some_and(|bound| {
+        bound.is_finite() && bound >= 0.0 && (query_weight * bound).is_finite()
+    });
+    if !has_finite_bound {
+        return Err(Error::invalid_input(format!(
+            "global BM25 scorer cannot provide a finite no-impact upper bound for token {token:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn token_dictionary_may_match(
     dictionary: &TokenSet,
     tokens: &Tokens,
@@ -1093,8 +1114,8 @@ impl InvertedPartition {
     //
     // `force_global_scorer` is used by compound search, where leaf scores and
     // bounds must share corpus-level statistics before the global collector
-    // can safely propagate its threshold. Old posting formats without impacts
-    // fall back to a scorer-derived global upper bound in that mode.
+    // can safely propagate its threshold. Standard leaf search also routes
+    // no-impact postings through scorer-derived corpus-global upper bounds.
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -1214,13 +1235,20 @@ impl InvertedPartition {
             let impact_safe = loaded_postings
                 .iter()
                 .all(|(_, _, _, posting)| posting.has_impacts());
+            let no_impact_fallback = !impact_safe;
+            if no_impact_fallback {
+                for (_, token, _, posting) in &loaded_postings {
+                    if !posting.has_impacts() {
+                        validate_no_impact_scorer_upper_bound(token, impact_scorer)?;
+                    }
+                }
+            }
+            let exact_scoring_required = exact_scoring_required || no_impact_fallback;
             return Ok(LoadedPostings {
                 postings: loaded_postings
                     .into_iter()
                     .map(|(token_id, token, position, posting)| {
-                        let needs_scorer_upper_bound = (exact_scoring_required
-                            || force_global_scorer)
-                            && !posting.has_impacts();
+                        let needs_scorer_upper_bound = !posting.has_impacts();
                         let query_weight =
                             if impact_safe || exact_scoring_required || force_global_scorer {
                                 impact_scorer.query_weight(&token)
@@ -1245,7 +1273,19 @@ impl InvertedPartition {
                 grouped_expansions: Vec::new(),
                 impact_safe,
                 exact_scoring_required,
+                no_impact_fallback,
             });
+        }
+
+        let no_impact_fallback = loaded_postings
+            .iter()
+            .any(|(_, _, _, posting)| !posting.has_impacts());
+        if no_impact_fallback {
+            for (_, token, _, posting) in &loaded_postings {
+                if !posting.has_impacts() {
+                    validate_no_impact_scorer_upper_bound(token, impact_scorer)?;
+                }
+            }
         }
 
         let docs_for_union = if needs_union {
@@ -1350,6 +1390,7 @@ impl InvertedPartition {
             grouped_expansions,
             impact_safe: false,
             exact_scoring_required: true,
+            no_impact_fallback,
         })
     }
 

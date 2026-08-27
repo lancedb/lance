@@ -927,6 +927,19 @@ impl PostingIterator {
         self.approximate_upper_bound
     }
 
+    /// Upper bound for the frequency clamp used by bulk conjunction search.
+    /// No-impact postings scored in a corpus-global scorer space cannot reuse
+    /// their persisted partition-local maximum. Impact-backed postings retain
+    /// their existing fast path.
+    #[inline]
+    fn frequency_clamp_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
+        if self.use_scorer_upper_bound {
+            scorer_upper_bound(self.query_weight, scorer)
+        } else {
+            self.approximate_upper_bound
+        }
+    }
+
     /// Tightest known list-wide score bound. Impact lists answer from the
     /// baked doc-weight slab (the data-driven equivalent of the max_score the
     /// non-impact format bakes at build time); everything else falls back to
@@ -3514,7 +3527,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         // The clamp bucket must bound every frequency it absorbs; the
         // clause-wide sup does.
-        freq_bound_lut[FREQ_LUT_BUCKETS - 1] = self.lead[0].approximate_upper_bound();
+        freq_bound_lut[FREQ_LUT_BUCKETS - 1] =
+            self.lead[0].frequency_clamp_upper_bound(&self.scorer);
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;

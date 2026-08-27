@@ -567,6 +567,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                no_impact_fallback,
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
@@ -579,6 +580,9 @@ impl InvertedIndex {
                                 .await?;
                             if postings.is_empty() {
                                 return Result::Ok(None);
+                            }
+                            if no_impact_fallback {
+                                metrics.record_no_impact_global_scorer_fallbacks(1);
                             }
                             let max_position = postings
                                 .iter()
@@ -823,6 +827,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                no_impact_fallback,
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
@@ -835,6 +840,9 @@ impl InvertedIndex {
                                 .await?;
                             if postings.is_empty() {
                                 return Result::Ok(None);
+                            }
+                            if no_impact_fallback {
+                                metrics.record_no_impact_global_scorer_fallbacks(1);
                             }
                             let documents = part.docs.modern().cloned().ok_or_else(|| {
                                 Error::internal("modern index contains legacy partition documents")
