@@ -183,18 +183,31 @@ fn parse_disable_value(raw: &str) -> Option<bool> {
 
 /// Pick the `ObjectStoreRegistry` for the JNI default-open path.
 ///
-/// When sharing is enabled (the default), every default-open call reuses the
+/// When sharing is enabled (the default), a default-open call reuses the
 /// process-wide [`crate::GLOBAL_OBJECT_STORE_REGISTRY`] so concurrent cold
 /// builds for the same URI coalesce on its single-flight. When the
 /// `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING` escape hatch is set, each call
 /// gets a fresh registry — pre-PR isolation at the cost of single-flight.
 ///
+/// An open that carries a storage-options **provider** never shares, whatever
+/// the flag says. The registry keys cached stores on
+/// `StorageOptionsAccessor::accessor_id()`, which for a provider-backed
+/// accessor is just `provider.provider_id()` — the static options that may sit
+/// alongside it are not part of the key. A namespace provider derives that id
+/// from the namespace id plus table id, and a REST namespace id carries only
+/// the endpoint and delimiter, so two principals opening the same table
+/// collapse onto one key: the second caller would receive the first caller's
+/// credential-bearing `Arc<ObjectStore>` and its own provider would never be
+/// asked. Dynamic credentials therefore stay per-call until the registry can
+/// key on an authoritative credential domain.
+///
 /// Extracted into a pure helper so the selection logic is unit-testable
 /// without spinning up a JVM.
 fn select_default_open_registry(
     disable_sharing: bool,
+    has_dynamic_credentials: bool,
 ) -> Arc<lance_io::object_store::ObjectStoreRegistry> {
-    if disable_sharing {
+    if disable_sharing || has_dynamic_credentials {
         Arc::new(lance_io::object_store::ObjectStoreRegistry::default())
     } else {
         crate::GLOBAL_OBJECT_STORE_REGISTRY.clone()
@@ -348,6 +361,11 @@ impl BlockingDataset {
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
     ) -> Result<Self> {
+        // A provider supplies credentials per principal, and the registry keys
+        // only on `provider_id()`, so provider-backed opens must not share a
+        // registry across calls. Captured before the accessor consumes it.
+        let has_dynamic_credentials = storage_options_provider.is_some();
+
         // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
             (false, Some(provider)) => Some(Arc::new(
@@ -373,11 +391,15 @@ impl BlockingDataset {
 
         // Default-open path: share the process-wide registry so concurrent
         // opens for the same URI coalesce on single-flight; each call still
-        // gets its own `Session`. Tenant-isolation contract is documented on
-        // [`crate::GLOBAL_OBJECT_STORE_REGISTRY`]; opt out via
-        // `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING=1`.
+        // gets its own `Session`. Provider-backed opens keep a per-call
+        // registry, see [`select_default_open_registry`]. Tenant-isolation
+        // contract is documented on [`crate::GLOBAL_OBJECT_STORE_REGISTRY`];
+        // opt out via `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING=1`.
         let session = session.or_else(|| {
-            let registry = select_default_open_registry(disable_default_registry_sharing());
+            let registry = select_default_open_registry(
+                disable_default_registry_sharing(),
+                has_dynamic_credentials,
+            );
             Some(Arc::new(LanceSession::new(
                 index_cache_size_bytes as usize,
                 metadata_cache_size_bytes as usize,
@@ -4217,7 +4239,7 @@ mod default_open_registry_tests {
     /// a distinct allocation.
     #[test]
     fn select_default_open_registry_reuses_global_when_sharing_enabled() {
-        let registry = select_default_open_registry(false);
+        let registry = select_default_open_registry(false, false);
         assert!(
             Arc::ptr_eq(&registry, &crate::GLOBAL_OBJECT_STORE_REGISTRY),
             "sharing-enabled path must hand back the GLOBAL_OBJECT_STORE_REGISTRY Arc"
@@ -4228,8 +4250,8 @@ mod default_open_registry_tests {
     /// pre-PR isolation behavior is preserved when an operator opts out.
     #[test]
     fn select_default_open_registry_returns_fresh_when_disabled() {
-        let r1 = select_default_open_registry(true);
-        let r2 = select_default_open_registry(true);
+        let r1 = select_default_open_registry(true, false);
+        let r2 = select_default_open_registry(true, false);
         assert!(
             !Arc::ptr_eq(&r1, &crate::GLOBAL_OBJECT_STORE_REGISTRY),
             "disabled path must NOT alias the global registry"
@@ -4237,6 +4259,29 @@ mod default_open_registry_tests {
         assert!(
             !Arc::ptr_eq(&r1, &r2),
             "disabled path must allocate a new registry per call"
+        );
+    }
+
+    /// An open carrying a storage-options provider must never share the
+    /// process-wide registry, even with sharing enabled.
+    ///
+    /// The registry keys cached stores on `accessor_id()`, which for a
+    /// provider-backed accessor is only `provider.provider_id()`. A namespace
+    /// provider derives that from the namespace id plus table id, and a REST
+    /// namespace id carries just the endpoint and delimiter, so two principals
+    /// opening the same table would share one key and the second caller would
+    /// receive the first caller's credential-bearing store.
+    #[test]
+    fn select_default_open_registry_isolates_provider_backed_opens() {
+        let r1 = select_default_open_registry(false, true);
+        let r2 = select_default_open_registry(false, true);
+        assert!(
+            !Arc::ptr_eq(&r1, &crate::GLOBAL_OBJECT_STORE_REGISTRY),
+            "a provider-backed open must NOT alias the global registry"
+        );
+        assert!(
+            !Arc::ptr_eq(&r1, &r2),
+            "each provider-backed open must get its own registry"
         );
     }
 

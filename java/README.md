@@ -220,7 +220,9 @@ Environment variables read by the JNI layer at runtime:
 |---|---|---|
 | `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING` | unset (sharing on) | Set to `1`/`true`/`yes` to give every default `Dataset.open` (no explicit `Session`) a fresh `ObjectStoreRegistry`. Disables the process-wide registry that coalesces concurrent cold builds for the same URI. |
 
-Default-open paths share an `ObjectStoreRegistry` so concurrent opens against the same URI reuse one `ObjectStore` instead of each rebuilding the credential chain and HTTP client. Bare-URI opens (empty storage options, no provider, no namespace commit handler) collapse onto a single cache entry per URI: the first caller's resolved default credentials become the credentials used by every subsequent caller for the lifetime of that `ObjectStore`. Callers that need cross-tenant isolation under bare URIs should either pass an explicit `Session`, supply tenant-distinguishing storage options, or set the variable above to opt out entirely.
+Default-open paths share an `ObjectStoreRegistry` so concurrent opens against the same URI reuse one `ObjectStore` instead of each rebuilding the credential chain and HTTP client. An open that supplies a storage-options provider is excluded: the registry keys cached stores on the provider's id, which for a namespace provider carries only the namespace and table, so sharing it across principals would hand the second caller the first caller's credentials. Those opens keep a per-call registry.
+
+Bare-URI opens (empty storage options, no provider, no namespace commit handler) do collapse onto a single cache entry per URI: the first caller's resolved default credentials become the credentials used by every subsequent caller for the lifetime of that `ObjectStore`. Callers that need cross-tenant isolation under bare URIs should either pass an explicit `Session`, supply tenant-distinguishing static storage options, or set the variable above to opt out entirely.
 
 ## Contributing
 

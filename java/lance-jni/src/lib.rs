@@ -133,10 +133,18 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
 ///   fields of `ObjectStoreParams` (block size, dynamic
 ///   `storage_options_accessor`'s `provider_id()`, etc.). It does **not**
 ///   incorporate auth headers, STS tokens, namespace identity, or any
-///   bearer credentials. Tenant isolation under sharing therefore relies
-///   entirely on callers providing a key-distinguishing input — typically
-///   non-empty `storage_options`, a `storage_options_provider` whose
-///   `provider_id()` carries tenant identity, or an explicit `session`.
+///   bearer credentials.
+///
+///   A `provider_id()` cannot be assumed to carry principal identity, so
+///   provider-backed default opens do not use this registry at all: they get
+///   a per-call one. `StorageOptionsAccessor::accessor_id()` returns just the
+///   `provider_id()` when a provider is present, and a namespace provider
+///   derives that from the namespace id plus table id while a REST namespace
+///   id holds only the endpoint and delimiter, so two principals opening the
+///   same table would otherwise share one entry and the second would receive
+///   the first's credential-bearing store. Static `storage_options` are safe
+///   to key on: with no provider, `accessor_id()` hashes the option values
+///   themselves. See `blocking_dataset::select_default_open_registry`.
 ///
 ///   Bare-URI opens (empty `storage_options`, no provider, no namespace
 ///   commit-handler) collapse onto a single cache entry per URI: the first
