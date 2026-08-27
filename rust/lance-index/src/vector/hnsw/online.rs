@@ -460,34 +460,45 @@ impl OnlineHnswBuilder {
     ///
     /// # Self-containment under concurrent insert
     ///
-    /// This used to require the caller to keep inserts out while it ran, and
-    /// nothing enforced it. The node *count* is snapshotted
-    /// (`inserted_len`) but each node's adjacency is read live, so an insert
-    /// racing this freeze can add itself to an already-visited node's
-    /// neighbor list. The frozen graph then carries edges to ids >=
-    /// `inserted` -- nodes it does not contain.
-    ///
-    /// That corruption is silent until read: `HNSW::load` slices level 0 to
-    /// `level_count[0]` rows and validates only `__vector_id == row`, which a
-    /// truncated-but-aligned level 0 passes. The dangling edge then indexes
-    /// past the level-0 offsets buffer and panics in
-    /// `LoadedHnswGraph::neighbors_at`, taking down every fresh-tier vector
-    /// query on the shard until the tier drains.
-    ///
-    /// So the snapshot drops edges pointing outside itself. An edge to a node
-    /// the snapshot excludes has no meaning in the snapshot, so nothing is
-    /// lost that was ever representable, and the frozen graph is
+    /// The node *count* is snapshotted (`inserted_len`) but each node's
+    /// adjacency is read live, so an insert racing this freeze can append
+    /// itself to an already-visited node's neighbor list. The snapshot
+    /// therefore drops references to ids it does not contain -- edges and the
+    /// entry point alike. An edge to an excluded node has no meaning in the
+    /// snapshot, so nothing representable is lost, and the frozen graph is
     /// self-contained by construction rather than by convention.
+    ///
+    /// Ids must be dense and ascending from 0: `id` indexes the pre-allocated
+    /// node array and the first `inserted_len` slots are taken as the completed
+    /// nodes.
+    ///
     pub fn to_hnsw(&self) -> HNSW {
         let inserted = self.inserted_len.load(Ordering::Acquire);
-        let entry_point = self.entry_point.load(Ordering::Acquire);
+        // Ids are dense and ascending from 0, so the count bounds them.
+        let inserted_u32 = u32::try_from(inserted).unwrap_or(u32::MAX);
+        // The entry point is promoted before `inserted_len` is bumped, so a
+        // racing insert can publish itself here while this snapshot excludes
+        // it. An entry point outside the snapshot dangles exactly as an edge to
+        // one does, and search starting from an absent node finds nothing at
+        // all -- so fall back to the deepest node the snapshot does hold.
+        let published_entry = self.entry_point.load(Ordering::Acquire);
+        let entry_point = if published_entry < inserted_u32 {
+            published_entry
+        } else {
+            self.nodes
+                .iter()
+                .take(inserted)
+                .enumerate()
+                .max_by_key(|(_, node)| node.level_neighbors.len())
+                .map(|(id, _)| id as u32)
+                .unwrap_or(0)
+        };
         let actual_levels = if inserted == 0 {
             0
         } else {
             self.nodes[entry_point as usize].level_neighbors.len()
         };
 
-        let inserted_u32 = u32::try_from(inserted).unwrap_or(u32::MAX);
         // Retains the common case's `Arc` without copying: only a list that
         // actually contains an out-of-snapshot id is rebuilt.
         let keep_in_snapshot = |list: Arc<Vec<u32>>| -> Arc<Vec<u32>> {
@@ -519,12 +530,7 @@ impl OnlineHnswBuilder {
             // rank, or a reader pairing the two columns sees a mismatch.
             let level_neighbors_ranked: Vec<Vec<_>> = level_neighbors_ranked
                 .into_iter()
-                .map(|ranked| {
-                    ranked
-                        .into_iter()
-                        .filter(|n| n.id < inserted_u32)
-                        .collect()
-                })
+                .map(|ranked| ranked.into_iter().filter(|n| n.id < inserted_u32).collect())
                 .collect();
 
             let bottom_neighbors = level_neighbors
@@ -609,7 +615,10 @@ impl Graph for OnlineHnswBottomView<'_> {
 mod tests {
     use super::*;
     use crate::vector::flat::storage::FlatFloatStorage;
-    use crate::vector::v3::subindex::IvfSubIndex;   // `to_batch` lives on the trait
+    use std::sync::atomic::AtomicBool;
+
+    // `to_batch` lives on the trait.
+    use crate::vector::v3::subindex::IvfSubIndex;
     use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
@@ -846,12 +855,10 @@ mod tests {
     /// A freeze racing inserts must still produce a self-contained graph.
     ///
     /// `to_hnsw` snapshots the node *count* but reads adjacency live, so an
-    /// insert landing mid-freeze can append itself to an already-visited
-    /// node's neighbor list. Those edges point at ids the snapshot excludes;
-    /// persisted, they make `HNSW::load` slice level 0 short and then panic in
-    /// `LoadedHnswGraph::neighbors_at` on the first query that walks one --
-    /// which took out every fresh-tier vector query on a shard until the tier
-    /// drained.
+    /// insert landing mid-freeze can append itself to an already-visited node's
+    /// neighbor list -- or promote itself to entry point. Either reference points
+    /// outside the snapshot; persisted, `HNSW::load` slices level 0 short and the
+    /// first query that walks one addresses past the level's rows.
     #[test]
     fn test_to_hnsw_snapshot_is_self_contained_under_concurrent_insert() {
         const N: usize = 1200;
@@ -865,19 +872,25 @@ mod tests {
             builder.insert(id, storage.as_ref());
         }
 
-        // Keep inserting while freezing, repeatedly, to hit the window.
+        let writing = Arc::new(AtomicBool::new(true));
         let writer = {
-            let b = Arc::clone(&builder);
-            let s = Arc::clone(&storage);
+            let builder = Arc::clone(&builder);
+            let storage = Arc::clone(&storage);
+            let writing = Arc::clone(&writing);
             std::thread::spawn(move || {
                 for id in (N / 2) as u32..N as u32 {
-                    b.insert(id, s.as_ref());
+                    builder.insert(id, storage.as_ref());
                 }
+                writing.store(false, Ordering::Release);
             })
         };
 
-        let mut checked = 0;
-        for _ in 0..40 {
+        // Freeze for as long as the writer runs rather than a fixed count, so the
+        // overlap does not depend on how fast this machine inserts; the floor
+        // covers the writer finishing first.
+        let mut freezes = 0;
+        let mut edges_checked = 0;
+        while writing.load(Ordering::Acquire) || freezes < 5 {
             let hnsw = builder.to_hnsw();
             let nodes = hnsw.nodes().expect("freshly built graph exposes nodes");
             let n = nodes.len() as u32;
@@ -889,21 +902,29 @@ mod tests {
                             "frozen graph has a dangling edge: node {id} level {level} \
                              points at {nid}, but the snapshot holds only {n} nodes"
                         );
-                        checked += 1;
+                        edges_checked += 1;
                     }
                 }
             }
-            // The serialized form must agree with its own metadata, or a
-            // reader slices level 0 short and the dangling edge comes back.
-            let batch = hnsw.to_batch().unwrap();
             let meta = hnsw.metadata();
+            // Search starts here, so an entry point outside the snapshot finds
+            // nothing at all rather than merely losing one edge.
+            assert!(
+                n == 0 || meta.entry_point < n,
+                "frozen graph entry point {} is outside its {n} nodes",
+                meta.entry_point
+            );
+            // The serialized form must agree with its own metadata, or a reader
+            // slices level 0 short and the dangling edge comes back.
+            let batch = hnsw.to_batch().unwrap();
             assert_eq!(
                 *meta.level_offsets.last().unwrap(),
                 batch.num_rows(),
                 "level offsets must cover exactly the serialized rows"
             );
+            freezes += 1;
         }
         writer.join().unwrap();
-        assert!(checked > 0, "test never inspected an edge");
+        assert!(edges_checked > 0, "test never inspected an edge");
     }
 }

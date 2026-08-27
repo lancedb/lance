@@ -631,13 +631,45 @@ impl HnswGraph {
                 }
                 let ranked = node.ranked(level as u16)?;
                 vector_id_builder.append_value(id as u32);
-                neighbors_builder.append_value(ranked.iter().map(|point| Some(point.id)));
-                distances_builder.append_value(ranked.iter().map(|point| Some(point.distance)));
+                // `visible_len` is snapshotted but adjacency is read live, so a
+                // batch landing mid-export can append itself to a node already
+                // emitted. Those ids are not rows in this batch: `HNSW::load`
+                // slices level 0 to the rows below, and `neighbors_at` would
+                // address past them. `search` caps in-memory traversal the same
+                // way; the export has to persist the bound. Both columns filter
+                // together so a reader pairing them sees equal lengths.
+                neighbors_builder.append_value(
+                    ranked
+                        .iter()
+                        .filter(|point| (point.id as usize) < visible_len)
+                        .map(|point| Some(point.id)),
+                );
+                distances_builder.append_value(
+                    ranked
+                        .iter()
+                        .filter(|point| (point.id as usize) < visible_len)
+                        .map(|point| Some(point.distance)),
+                );
             }
         }
 
+        // `publish_visible` stores the entry point before `visible_len`, so it
+        // can name a node outside this prefix. `search` returns no results in
+        // that case; an exported index cannot, so fall back to the deepest node
+        // the prefix does hold.
+        let entry_point = {
+            let published = self.visible_entry_point.load(Ordering::Acquire);
+            if (published as usize) < visible_len {
+                published
+            } else {
+                (0..visible_len)
+                    .max_by_key(|&id| self.nodes[id].levels.len())
+                    .map(|id| id as u32)
+                    .unwrap_or(0)
+            }
+        };
         let metadata = LanceHnswMetadata {
-            entry_point: self.visible_entry_point.load(Ordering::Acquire),
+            entry_point,
             params: self.params.clone(),
             level_offsets: level_counts
                 .iter()
@@ -1221,6 +1253,7 @@ impl VisitedList {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field};
@@ -1276,6 +1309,104 @@ mod tests {
             .search(query, SearchParams::new(5, 32), &snapshot)
             .unwrap();
         assert!(result.iter().any(|point| point.id == 42));
+    }
+
+    /// An export racing inserts must persist only edges inside the prefix it
+    /// publishes.
+    ///
+    /// `to_lance_hnsw_batch` snapshots `visible_len` but reads each node's ranked
+    /// list live, so a batch landing mid-export can append itself to a node
+    /// already emitted. `HNSW::load` then slices level 0 to the exported rows and
+    /// a walk over that edge addresses past them. `search` bounds in-memory
+    /// traversal by `visible_len` for the same reason.
+    #[test]
+    fn test_lance_hnsw_batch_edges_stay_inside_the_exported_prefix() {
+        const ROWS: usize = 1024;
+        const DIM: usize = 16;
+        const CHUNK: usize = 32;
+        let store = Arc::new(
+            ArrowFixedSizeListVectorStore::try_new(2048, 8, DIM, DistanceType::L2).unwrap(),
+        );
+        let ids = store.append_batch(fsl(ROWS, DIM), 0).unwrap();
+        let snapshot = store.snapshot();
+        let graph = Arc::new(
+            HnswGraph::try_new(
+                2048,
+                BuildParams::mem_wal_default()
+                    .num_edges(8)
+                    .ef_construction(32)
+                    .seed(13),
+            )
+            .unwrap(),
+        );
+
+        // Seed a prefix so an export has real adjacency to walk.
+        let chunk = CHUNK as u32;
+        graph
+            .insert_batch(ids.start..ids.start + chunk, &snapshot)
+            .unwrap();
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let writer = {
+            let graph = Arc::clone(&graph);
+            let writing = Arc::clone(&writing);
+            std::thread::spawn(move || {
+                let mut next = ids.start + chunk;
+                while next < ids.end {
+                    let stop = (next + chunk).min(ids.end);
+                    graph.insert_batch(next..stop, &snapshot).unwrap();
+                    next = stop;
+                }
+                writing.store(false, Ordering::Release);
+            })
+        };
+
+        // Export while the writer runs rather than a fixed count, so the overlap
+        // does not depend on how fast this machine inserts.
+        let mut exports = 0;
+        let mut edges_checked = 0;
+        while writing.load(Ordering::Acquire) || exports < 5 {
+            let batch = graph.to_lance_hnsw_batch().unwrap();
+            let rows = batch.num_rows();
+            let neighbors = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .expect("neighbors column is a list");
+            let distances = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .expect("distances column is a list");
+            // Level 0 holds every visible node, so its row count is the prefix.
+            let prefix = HNSW::load(batch.clone()).unwrap().len() as u32;
+            for row in 0..rows {
+                let ids = neighbors.value(row);
+                let ids = ids
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .expect("neighbor ids are u32");
+                assert_eq!(
+                    ids.len(),
+                    distances.value(row).len(),
+                    "row {row} pairs {} ids with {} distances",
+                    ids.len(),
+                    distances.value(row).len()
+                );
+                for i in 0..ids.len() {
+                    let nid = ids.value(i);
+                    assert!(
+                        nid < prefix,
+                        "exported row {row} points at {nid}, outside the \
+                         {prefix}-node prefix it was exported with"
+                    );
+                    edges_checked += 1;
+                }
+            }
+            exports += 1;
+        }
+        writer.join().unwrap();
+        assert!(edges_checked > 0, "test never inspected an edge");
     }
 
     #[test]
