@@ -6,7 +6,7 @@
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, UInt32Type};
-use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
@@ -998,6 +998,51 @@ enum LevelLookup {
     Sparse(HashMap<u32, u32>),
 }
 
+/// Drop neighbor ids that name no node in this graph.
+///
+/// A writer that read adjacency live while snapshotting a node count could
+/// persist edges past its own node count, and those indices are already on
+/// disk. Traversal scores a neighbor id before it is ever looked up as a node,
+/// so a guard at the lookup is too late -- the id has to be gone before search
+/// begins.
+///
+/// Returns the original array untouched when every id is in domain, which is
+/// the only case that matters for cost: the ids stay zero-copy views of the
+/// loaded batch and nothing is allocated. `to_batch()` still returns the
+/// retained batch verbatim, so a filtered edge is dropped for this reader
+/// without rewriting what is on disk.
+fn neighbors_within_domain(neighbors: &ListArray, node_count: usize) -> (ListArray, usize) {
+    let node_count = node_count as u32;
+    let values = neighbors.values().as_primitive::<UInt32Type>();
+    let dropped = values
+        .values()
+        .iter()
+        .filter(|&&id| id >= node_count)
+        .count();
+    if dropped == 0 {
+        return (neighbors.clone(), 0);
+    }
+
+    let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+    for row in 0..neighbors.len() {
+        if neighbors.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let row_ids = neighbors.value(row);
+        let row_ids = row_ids.as_primitive::<UInt32Type>();
+        builder.append_value(
+            row_ids
+                .values()
+                .iter()
+                .copied()
+                .filter(|&id| id < node_count)
+                .map(Some),
+        );
+    }
+    (builder.finish(), dropped)
+}
+
 /// A search-only HNSW graph backed directly by the Arrow buffers of the
 /// on-disk `RecordBatch`.
 ///
@@ -1223,10 +1268,13 @@ impl IvfSubIndex for HNSW {
         // need it, and `to_batch()` returns the retained `data` verbatim.
         let mut level_neighbors = Vec::with_capacity(level_batches.len());
         let mut level_lookup = Vec::with_capacity(level_batches.len());
+        let mut dropped_edges = 0usize;
         for (level, batch) in level_batches.iter().enumerate() {
             // `.clone()` on an Arrow array bumps a refcount; buffers stay
             // shared with `data` (zero copy).
             let neighbors = batch[NEIGHBORS_COL].as_list::<i32>().clone();
+            let (neighbors, dropped) = neighbors_within_domain(&neighbors, level_count[0]);
+            dropped_edges += dropped;
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             if level == 0 {
                 // `to_batch` writes every node at level 0 exactly once in
@@ -1265,6 +1313,17 @@ impl IvfSubIndex for HNSW {
                 level_lookup.push(LevelLookup::Sparse(id_to_row));
             }
             level_neighbors.push(neighbors);
+        }
+
+        if dropped_edges > 0 {
+            // Dropped, not rejected: an edge to a node this graph does not hold
+            // costs one edge, where refusing the batch costs every query over
+            // it. The entry point below is refused instead, because search
+            // cannot start without it.
+            log::warn!(
+                "HNSW batch carried {dropped_edges} neighbor id(s) outside its                  {} nodes; dropping them for this reader",
+                level_count[0]
+            );
         }
 
         // `entry_point` is read from untrusted metadata and indexes the `Dense`
@@ -2544,6 +2603,68 @@ mod tests {
             HNSW::load(corrupted).is_err(),
             "load() must reject a misaligned level-0 __vector_id"
         );
+    }
+
+    /// A dangling neighbor id must be gone before search, not caught at lookup.
+    ///
+    /// Traversal scores a neighbor before it is ever looked up as a node, so a
+    /// guard inside the node lookup runs too late -- the id has already reached
+    /// the distance calculator. Indices written before the writer bounded its
+    /// own snapshot carry such edges, so `load()` drops them and the query
+    /// still answers.
+    #[tokio::test]
+    async fn test_load_drops_neighbor_ids_outside_the_graph() {
+        use arrow::array::{AsArray, ListBuilder, UInt32Builder};
+        use arrow::datatypes::UInt32Type;
+        use arrow_array::Array;
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+
+        // Put an out-of-domain edge on every node, the shape a writer that
+        // snapshotted a node count while reading adjacency live would persist.
+        // Every node, so whichever ones traversal expands, it scores the bad id
+        // -- `FlatFloatStorage::dist_calculator` panics on an id past its rows.
+        let neighbors = batch.column(1).as_list::<i32>();
+        let mut rebuilt = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+        for row in 0..neighbors.len() {
+            let ids = neighbors.value(row);
+            let ids = ids.as_primitive::<UInt32Type>();
+            let mut ids: Vec<u32> = ids.values().to_vec();
+            ids.insert(0, TOTAL as u32 + 7);
+            rebuilt.append_value(ids.into_iter().map(Some));
+        }
+        let mut columns = batch.columns().to_vec();
+        columns[1] = Arc::new(rebuilt.finish());
+        // `__distance` is now shorter than `__neighbors` per row, which search
+        // does not read; the ids are what traversal follows.
+        let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        let loaded = HNSW::load(corrupted).expect("a dangling edge must not fail the load");
+        assert_eq!(loaded.len(), TOTAL);
+        // Searching has to answer rather than panic on the out-of-domain id.
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let results = loaded
+            .search_basic(query, 10, &params, None, store.as_ref())
+            .expect("search must survive a dropped edge");
+        assert!(!results.is_empty(), "the query still returns neighbors");
     }
 
     /// `load()` must reject metadata whose `entry_point` is out of range for
