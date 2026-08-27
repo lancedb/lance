@@ -453,11 +453,31 @@ impl OnlineHnswBuilder {
 
     /// Snapshot the current graph as an immutable on-disk Lance HNSW.
     ///
-    /// Only nodes whose insert has fully completed are included. Caller must
-    /// ensure no concurrent inserts while this runs.
+    /// Only nodes whose insert has fully completed are included.
     ///
     /// `level_count` is recomputed from the actual per-level emissions so the
     /// serialized batch and metadata stay in sync.
+    ///
+    /// # Self-containment under concurrent insert
+    ///
+    /// This used to require the caller to keep inserts out while it ran, and
+    /// nothing enforced it. The node *count* is snapshotted
+    /// (`inserted_len`) but each node's adjacency is read live, so an insert
+    /// racing this freeze can add itself to an already-visited node's
+    /// neighbor list. The frozen graph then carries edges to ids >=
+    /// `inserted` -- nodes it does not contain.
+    ///
+    /// That corruption is silent until read: `HNSW::load` slices level 0 to
+    /// `level_count[0]` rows and validates only `__vector_id == row`, which a
+    /// truncated-but-aligned level 0 passes. The dangling edge then indexes
+    /// past the level-0 offsets buffer and panics in
+    /// `LoadedHnswGraph::neighbors_at`, taking down every fresh-tier vector
+    /// query on the shard until the tier drains.
+    ///
+    /// So the snapshot drops edges pointing outside itself. An edge to a node
+    /// the snapshot excludes has no meaning in the snapshot, so nothing is
+    /// lost that was ever representable, and the frozen graph is
+    /// self-contained by construction rather than by convention.
     pub fn to_hnsw(&self) -> HNSW {
         let inserted = self.inserted_len.load(Ordering::Acquire);
         let entry_point = self.entry_point.load(Ordering::Acquire);
@@ -467,18 +487,45 @@ impl OnlineHnswBuilder {
             self.nodes[entry_point as usize].level_neighbors.len()
         };
 
+        let inserted_u32 = u32::try_from(inserted).unwrap_or(u32::MAX);
+        // Retains the common case's `Arc` without copying: only a list that
+        // actually contains an out-of-snapshot id is rebuilt.
+        let keep_in_snapshot = |list: Arc<Vec<u32>>| -> Arc<Vec<u32>> {
+            if list.iter().all(|&id| id < inserted_u32) {
+                list
+            } else {
+                Arc::new(
+                    list.iter()
+                        .copied()
+                        .filter(|&id| id < inserted_u32)
+                        .collect(),
+                )
+            }
+        };
+
         let mut frozen_nodes: Vec<GraphBuilderNode> = Vec::with_capacity(inserted);
         for node in self.nodes.iter().take(inserted) {
             let level_neighbors: Vec<Arc<Vec<u32>>> = node
                 .level_neighbors
                 .iter()
-                .map(|sl| sl.load_full())
+                .map(|sl| keep_in_snapshot(sl.load_full()))
                 .collect();
             let level_neighbors_ranked = node
                 .level_neighbors_ranked
                 .lock()
                 .expect("level_neighbors_ranked mutex poisoned")
                 .clone();
+            // Ranked lists feed `__distance` and must not outlive the ids they
+            // rank, or a reader pairing the two columns sees a mismatch.
+            let level_neighbors_ranked: Vec<Vec<_>> = level_neighbors_ranked
+                .into_iter()
+                .map(|ranked| {
+                    ranked
+                        .into_iter()
+                        .filter(|n| n.id < inserted_u32)
+                        .collect()
+                })
+                .collect();
 
             let bottom_neighbors = level_neighbors
                 .first()
@@ -562,6 +609,7 @@ impl Graph for OnlineHnswBottomView<'_> {
 mod tests {
     use super::*;
     use crate::vector::flat::storage::FlatFloatStorage;
+    use crate::vector::v3::subindex::IvfSubIndex;   // `to_batch` lives on the trait
     use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
@@ -793,5 +841,69 @@ mod tests {
             .position(|level| *level == highest_level)
             .unwrap() as u32;
         assert_eq!(builder.entry_point.load(Ordering::Acquire), expected_entry);
+    }
+
+    /// A freeze racing inserts must still produce a self-contained graph.
+    ///
+    /// `to_hnsw` snapshots the node *count* but reads adjacency live, so an
+    /// insert landing mid-freeze can append itself to an already-visited
+    /// node's neighbor list. Those edges point at ids the snapshot excludes;
+    /// persisted, they make `HNSW::load` slice level 0 short and then panic in
+    /// `LoadedHnswGraph::neighbors_at` on the first query that walks one --
+    /// which took out every fresh-tier vector query on a shard until the tier
+    /// drained.
+    #[test]
+    fn test_to_hnsw_snapshot_is_self_contained_under_concurrent_insert() {
+        const N: usize = 1200;
+        const DIM: usize = 16;
+        let (storage, _fsl) = build_storage(N, DIM);
+        let params = HnswBuildParams::default().num_edges(12).ef_construction(30);
+        let builder = Arc::new(OnlineHnswBuilder::new(N, params));
+
+        // Seed enough that a freeze has real adjacency to walk.
+        for id in 0..(N / 2) as u32 {
+            builder.insert(id, storage.as_ref());
+        }
+
+        // Keep inserting while freezing, repeatedly, to hit the window.
+        let writer = {
+            let b = Arc::clone(&builder);
+            let s = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                for id in (N / 2) as u32..N as u32 {
+                    b.insert(id, s.as_ref());
+                }
+            })
+        };
+
+        let mut checked = 0;
+        for _ in 0..40 {
+            let hnsw = builder.to_hnsw();
+            let nodes = hnsw.nodes().expect("freshly built graph exposes nodes");
+            let n = nodes.len() as u32;
+            for (id, node) in nodes.iter().enumerate() {
+                for (level, neighbors) in node.level_neighbors.iter().enumerate() {
+                    for &nid in neighbors.iter() {
+                        assert!(
+                            nid < n,
+                            "frozen graph has a dangling edge: node {id} level {level} \
+                             points at {nid}, but the snapshot holds only {n} nodes"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            // The serialized form must agree with its own metadata, or a
+            // reader slices level 0 short and the dangling edge comes back.
+            let batch = hnsw.to_batch().unwrap();
+            let meta = hnsw.metadata();
+            assert_eq!(
+                *meta.level_offsets.last().unwrap(),
+                batch.num_rows(),
+                "level offsets must cover exactly the serialized rows"
+            );
+        }
+        writer.join().unwrap();
+        assert!(checked > 0, "test never inspected an edge");
     }
 }

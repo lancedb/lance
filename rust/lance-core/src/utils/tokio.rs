@@ -192,7 +192,22 @@ pub fn spawn_cpu<
         let result = func();
         let _ = send.send(result);
     });
-    recv.map(|res| res.unwrap())
+    // A panic inside `func` drops `send` without sending, so `recv` resolves to
+    // `RecvError` -- and unwrapping *that* re-panics here with the original
+    // message, location and backtrace gone. Every panic in any `spawn_cpu`
+    // closure then surfaces identically as
+    // `called \`Result::unwrap()\` on an \`Err\` value: RecvError(())`,
+    // pointing at this line rather than at the fault. Diagnosing one such bug
+    // took reading a pod log and separating 103 of these from 113 real panics.
+    //
+    // Re-panic with a message that says what actually happened instead.
+    recv.map(|res| {
+        res.expect(
+            "spawn_cpu task did not send a result; its closure panicked \
+             (the original panic was logged by the panic hook on the \
+             `lance-cpu` thread -- look there, not here)",
+        )
+    })
 }
 
 #[cfg(test)]
