@@ -1219,10 +1219,21 @@ fn inner_create_index<'local>(
                     skip_commit,
                     initial_version,
                     working_dataset.version().version,
-                ) && let Ok(mut dataset_guard) =
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                {
-                    dataset_guard.inner = working_dataset.clone();
+                ) {
+                    match unsafe {
+                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                    } {
+                        Ok(mut dataset_guard) => {
+                            dataset_guard.inner = working_dataset.clone();
+                        }
+                        Err(publish_error) => {
+                            log::warn!(
+                                "Failed to publish committed dataset version {} after create-index failure: {}",
+                                working_dataset.version().version,
+                                publish_error
+                            );
+                        }
+                    }
                 }
             })?;
 
@@ -2014,26 +2025,6 @@ fn inner_list_versions<'local>(
             Ok(())
         })?;
     Ok(array_list)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_publish_working_dataset_on_error;
-
-    #[test]
-    fn post_commit_failure_publishes_advanced_dataset() {
-        assert!(should_publish_working_dataset_on_error(false, 1, 2));
-    }
-
-    #[test]
-    fn pre_commit_failure_keeps_original_dataset() {
-        assert!(!should_publish_working_dataset_on_error(false, 1, 1));
-    }
-
-    #[test]
-    fn uncommitted_failure_keeps_original_dataset() {
-        assert!(!should_publish_working_dataset_on_error(true, 1, 2));
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -4225,4 +4216,24 @@ fn inner_get_zonemap_stats<'local>(
     }
 
     Ok(array_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_publish_working_dataset_on_error;
+
+    #[test]
+    fn post_commit_failure_publishes_advanced_dataset() {
+        assert!(should_publish_working_dataset_on_error(false, 1, 2));
+    }
+
+    #[test]
+    fn pre_commit_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(false, 1, 1));
+    }
+
+    #[test]
+    fn uncommitted_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(true, 1, 2));
+    }
 }

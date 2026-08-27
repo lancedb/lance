@@ -13,20 +13,19 @@
  */
 package org.lance;
 
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /** The LockManager class provides a way to manage read and write locks. */
 public class LockManager {
   private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-  private final AtomicBoolean rejectWriteLocks;
+  private final Dataset dataset;
 
   public LockManager() {
-    this(new AtomicBoolean(false));
+    this(null);
   }
 
-  LockManager(AtomicBoolean rejectWriteLocks) {
-    this.rejectWriteLocks = rejectWriteLocks;
+  LockManager(Dataset dataset) {
+    this.dataset = dataset;
   }
 
   /**
@@ -49,8 +48,8 @@ public class LockManager {
   public class WriteLock implements AutoCloseable {
     /** Constructs a new WriteLock and acquires the write lock. */
     public WriteLock() {
-      if (rejectWriteLocks.get()) {
-        throw new IllegalStateException("Dataset is already creating an index");
+      if (dataset != null && ContextIndexBuildProgress.isCurrent(dataset)) {
+        throw new IllegalStateException("Dataset is busy in an index progress callback");
       }
       lock.writeLock().lock();
     }

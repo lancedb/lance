@@ -70,7 +70,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -91,9 +90,8 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  private final AtomicBoolean createIndexInProgress = new AtomicBoolean();
-  private final AtomicBoolean progressCallbacksActive = new AtomicBoolean();
-  private final LockManager lockManager = new LockManager(progressCallbacksActive);
+  private final Object createIndexLock = new Object();
+  private final LockManager lockManager = new LockManager(this);
 
   private Dataset() {}
 
@@ -1052,7 +1050,7 @@ public class Dataset implements Closeable {
    * @return the latest version of the dataset.
    */
   public long latestVersion() {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeGetLatestVersionId();
     }
@@ -1205,8 +1203,8 @@ public class Dataset implements Closeable {
    *
    * <p>Stage names, work units, and whether a total is available depend on the index type. The
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
-   * threads. Callbacks may re-enter read-only methods on this Dataset; write operations are
-   * rejected while the index operation is in progress.
+   * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
+   * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1227,13 +1225,10 @@ public class Dataset implements Closeable {
   }
 
   private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
-    if (!createIndexInProgress.compareAndSet(false, true)) {
-      throw new IllegalStateException("Dataset is already creating an index");
+    if (ContextIndexBuildProgress.isCurrent(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
-    try {
-      if (progress != null) {
-        progressCallbacksActive.set(true);
-      }
+    synchronized (createIndexLock) {
       try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         if (progress == null) {
@@ -1258,13 +1253,8 @@ public class Dataset implements Closeable {
             options.getFragmentIds(),
             options.getIndexUUID(),
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
-            progress);
+            new ContextIndexBuildProgress(this, progress));
       }
-    } finally {
-      if (progress != null) {
-        progressCallbacksActive.set(false);
-      }
-      createIndexInProgress.set(false);
     }
   }
 
