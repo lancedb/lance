@@ -106,6 +106,40 @@ impl DatasetPreFilter {
         }
     }
 
+    /// Build a prefilter for an exact, caller-proven fragment coverage set.
+    ///
+    /// This is used when some searchable segments are query-time immutable
+    /// segments and therefore do not have fabricated [`IndexMetadata`].
+    pub(crate) fn new_with_fragment_bitmap(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        filter: Option<Box<dyn FilterLoader>>,
+    ) -> Self {
+        let filter = filter.map(|filter| {
+            async move { filter.load().await.map(Arc::new) }
+                .in_current_span()
+                .boxed()
+        });
+        Self::new_with_fragment_bitmap_and_filter_future(dataset, fragments, filter)
+    }
+
+    pub(crate) fn new_with_fragment_bitmap_and_filter_future(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+    ) -> Self {
+        let deleted_ids = Self::create_restricted_deletion_mask(dataset, fragments)
+            .map(SharedPrerequisite::spawn);
+        let filtered_ids = filter.map(SharedPrerequisite::spawn);
+        Self {
+            deleted_ids,
+            filtered_ids,
+            deleted_fragments: None,
+            overlay_block: None,
+            final_mask: Mutex::new(OnceCell::new()),
+        }
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn do_create_deletion_mask(
         dataset: Arc<Dataset>,

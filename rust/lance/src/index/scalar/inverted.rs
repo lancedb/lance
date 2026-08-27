@@ -38,6 +38,8 @@ use crate::{
     index::{DatasetIndexExt, scalar::fetch_index_details},
 };
 
+pub(crate) mod residual;
+
 #[derive(Debug, Clone)]
 enum FtsTraversal {
     Text,

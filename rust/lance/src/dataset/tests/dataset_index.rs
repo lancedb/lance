@@ -2609,7 +2609,19 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     )
     .await
     .unwrap();
-    create_fragmented_fts_index(&mut dataset, "text", true).await;
+    let physical_params = InvertedIndexParams::default()
+        .with_position(true)
+        .custom_stop_words(Some(vec!["unused-custom-stop-word".to_string()]));
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".to_string()),
+            &physical_params,
+            true,
+        )
+        .await
+        .unwrap();
 
     let appended =
         arrow_array::record_batch!(("text", Utf8, ["fresh alpha"]), ("id", Int32, [2])).unwrap();
@@ -2637,18 +2649,85 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     exact_scanner.limit(Some(2), None).unwrap();
     let exact_plan = exact_scanner.explain_plan(false).await.unwrap();
     assert!(
-        exact_plan.contains("HybridCompoundFtsScorer"),
-        "exact partial coverage should build one query-local residual index:\n{exact_plan}"
+        exact_plan.contains("CachedResidualCompoundFtsScorer"),
+        "exact partial coverage should build one cached immutable residual segment:\n{exact_plan}"
     );
-    assert!(
-        !exact_plan.contains("FlatMatchQuery"),
-        "hybrid compound scoring must not scan the residual once per leaf:\n{exact_plan}"
-    );
+    // The lazy node intentionally carries the exact fallback as a child. A
+    // one-off cold query uses it without paying the posting-build cost.
     let exact = exact_scanner.try_into_batch().await.unwrap();
     assert_eq!(
         exact["id"].as_primitive::<Int32Type>().values(),
         &[0, 2],
         "exact search should include the appended hit"
+    );
+    let mut residual_row_scan = dataset.scan();
+    residual_row_scan.with_row_id().filter("id = 2").unwrap();
+    let residual_row_id = residual_row_scan.try_into_batch().await.unwrap()[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .value(0);
+    let (built_results, exact_stats) =
+        compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    assert!(
+        built_results
+            .iter()
+            .any(|(row_id, _)| *row_id == residual_row_id),
+        "the cached compound prefilter must include the residual fragment"
+    );
+    assert_eq!(
+        exact_stats.all_counts.get("residual_cache_loader_runs"),
+        Some(&1)
+    );
+    assert_eq!(exact_stats.all_counts.get("residual_cache_rows"), Some(&1));
+    assert_eq!(
+        exact_stats.all_counts.get("residual_cache_documents"),
+        Some(&1)
+    );
+    let serialized_bytes = exact_stats
+        .all_counts
+        .get("residual_cache_serialized_bytes")
+        .copied()
+        .unwrap_or_default();
+    let resident_bytes = exact_stats
+        .all_counts
+        .get("residual_cache_resident_bytes")
+        .copied()
+        .unwrap_or_default();
+    assert!(serialized_bytes > 0);
+    assert!(resident_bytes >= serialized_bytes);
+
+    let (reused_results, reused_stats) =
+        compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    assert_eq!(reused_results, built_results);
+    assert_eq!(
+        reused_stats
+            .all_counts
+            .get("residual_cache_reuse_or_coalesced"),
+        Some(&1)
+    );
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["new noise"]), ("id", Int32, [3])).unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    // The new working set is first observed without a build. On the next use,
+    // the old fragment is reused and only the newly appended fragment loads.
+    compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    let (_, appended_stats) = compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    assert_eq!(
+        appended_stats.all_counts.get("residual_cache_loader_runs"),
+        Some(&1)
+    );
+    assert_eq!(
+        appended_stats
+            .all_counts
+            .get("residual_cache_reuse_or_coalesced"),
+        Some(&1)
     );
 
     let empty_terms_query: FtsQuery = BooleanQuery::new([
@@ -2658,8 +2737,8 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     .into();
     let empty_terms_plan = compound_fts_plan(&dataset, empty_terms_query.clone(), 2).await;
     assert!(
-        empty_terms_plan.contains("HybridCompoundFtsScorer"),
-        "the empty analyzed-term case must exercise the hybrid short circuit:\n{empty_terms_plan}"
+        empty_terms_plan.contains("CachedResidualCompoundFtsScorer"),
+        "the warm residual cache should retain the compound short circuit:\n{empty_terms_plan}"
     );
     let empty_results = compound_fts_results(&dataset, empty_terms_query, Some(2)).await;
     assert!(empty_results.is_empty());
@@ -2675,7 +2754,8 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     filtered_scanner.limit(Some(2), None).unwrap();
     let filtered_plan = filtered_scanner.explain_plan(false).await.unwrap();
     assert!(
-        !filtered_plan.contains("HybridCompoundFtsScorer"),
+        !filtered_plan.contains("CachedResidualCompoundFtsScorer")
+            && !filtered_plan.contains("HybridCompoundFtsScorer"),
         "prefiltered residual scoring must retain the exact fallback:\n{filtered_plan}"
     );
 
@@ -2691,8 +2771,8 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     .into();
     let phrase_plan = compound_fts_plan(&dataset, phrase_query, 2).await;
     assert!(
-        !phrase_plan.contains("HybridCompoundFtsScorer"),
-        "phrase position gaps are not yet supported by the residual index:\n{phrase_plan}"
+        phrase_plan.contains("CachedResidualCompoundFtsScorer"),
+        "standard residual postings should preserve phrase positions:\n{phrase_plan}"
     );
 
     let mut fast_scanner = dataset.scan();
@@ -2743,7 +2823,7 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
 }
 
 #[tokio::test]
-async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
+async fn test_partial_compound_cached_residual_matches_rebuilt_scores_and_ties() {
     let initial = arrow_array::record_batch!(
         ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
         ("id", Int32, [0, 1])
@@ -2823,12 +2903,12 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
     assert_eq!(
         scored_row_bits(&partial_boost),
         scored_row_bits(&rebuilt_boost),
-        "hybrid Boost scores must be bit-identical to a rebuilt index"
+        "cached residual Boost scores must be bit-identical to a rebuilt index"
     );
     assert_eq!(
         scored_row_bits(&partial_multimatch),
         scored_row_bits(&rebuilt_multimatch),
-        "hybrid MultiMatch scores must be bit-identical to a rebuilt index"
+        "cached residual MultiMatch scores must be bit-identical to a rebuilt index"
     );
 }
 

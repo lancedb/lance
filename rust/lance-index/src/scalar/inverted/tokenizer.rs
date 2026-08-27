@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_core::{Error, Result};
+use lance_core::{
+    Error, Result,
+    deepsize::{Context, DeepSizeOf},
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{env, path::PathBuf};
 
@@ -233,6 +236,14 @@ pub struct InvertedIndexParams {
         deserialize_with = "deserialize_format_version"
     )]
     pub(crate) format_version: Option<InvertedListFormatVersion>,
+}
+
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.lance_tokenizer.deep_size_of_children(context)
+            + self.base_tokenizer.deep_size_of_children(context)
+            + self.custom_stop_words.deep_size_of_children(context)
+    }
 }
 
 // Unknown fields must remain ignored because these params are persisted across Lance versions.
@@ -615,6 +626,15 @@ impl Default for InvertedIndexParams {
 }
 
 impl InvertedIndexParams {
+    /// Whether this analyzer loads an opaque external language model whose
+    /// retained heap cannot currently be measured by `DeepSizeOf`.
+    #[doc(hidden)]
+    pub fn uses_external_language_model(&self) -> bool {
+        self.base_tokenizer.starts_with("lindera/")
+            || self.base_tokenizer.starts_with("jieba/")
+            || self.base_tokenizer == "jieba"
+    }
+
     /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
     ///
     /// The `base_tokenizer` can be one of the following:
@@ -1674,6 +1694,16 @@ mod tests {
             tokens.push(token.text.clone());
         }
         assert_eq!(tokens, vec!["the".to_string(), "data".to_string()]);
+    }
+
+    #[test]
+    fn params_deep_size_charges_dynamic_tokenizer_configuration() {
+        let params = InvertedIndexParams::default().custom_stop_words(Some(vec![
+            "a deliberately heap allocated custom stop word".repeat(8),
+            "another custom stop word".repeat(8),
+        ]));
+        let empty = InvertedIndexParams::default();
+        assert!(params.deep_size_of() > empty.deep_size_of() + 256);
     }
 
     #[rstest]

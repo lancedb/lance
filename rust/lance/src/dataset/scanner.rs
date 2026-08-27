@@ -91,7 +91,7 @@ pub use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
-use tracing::{Span, info_span, instrument};
+use tracing::{Span, info_span, instrument, warn};
 use uuid::Uuid;
 
 use super::Dataset;
@@ -103,7 +103,8 @@ use crate::dataset::utils::SchemaAdapter;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segment_params, load_segments,
-    normalize_inverted_details, resolve_fts_field, resolve_query_document_granularity,
+    normalize_inverted_details, residual::ResidualFtsSpec, resolve_fts_field,
+    resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
@@ -114,9 +115,9 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
-    FlatMatchQueryExec, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
-    SharedFtsScorer,
+    BoostQueryExec, CachedResidualCompoundQueryExec, CompoundQueryExec,
+    CrossColumnCompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, FtsDocumentExec,
+    HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -285,13 +286,13 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
 }
 
+/// The residual segment MVP avoids fuzzy vocabulary expansion while its cache
+/// admission and invalidation contract is being established. Exact matches,
+/// phrase queries, and their compound parents use the standard posting scorer.
 fn supports_exact_residual_compound(query: &FtsQuery) -> bool {
     match query {
         FtsQuery::Match(query) => query.fuzziness == Some(0),
-        // MemWAL phrase matching currently collapses tokenizer position gaps.
-        // Keep phrase queries on the established fallback until it can retain
-        // those gaps exactly (notably when stop words are configured).
-        FtsQuery::Phrase(_) => false,
+        FtsQuery::Phrase(_) => true,
         FtsQuery::Boost(query) => {
             supports_exact_residual_compound(&query.positive)
                 && supports_exact_residual_compound(&query.negative)
@@ -344,17 +345,14 @@ fn has_exact_hybrid_fts_coverage(
     indexed | residual == target
 }
 
-fn has_compatible_hybrid_physical_segments(
-    params: &[InvertedIndexParams],
+fn compatible_live_physical_params<'a>(
+    params: &'a [InvertedIndexParams],
     details: &[InvertedIndexDetails],
     has_deleted_fragments: &[bool],
-) -> bool {
-    let Some(first) = params.first() else {
-        return false;
-    };
-    params.len() == details.len()
+) -> Option<&'a InvertedIndexParams> {
+    let first = params.first()?;
+    (params.len() == details.len()
         && params.len() == has_deleted_fragments.len()
-        && first.posting_block_size() == 128
         && params.iter().all(|params| params == first)
         && details.iter().all(|details| {
             matches!(
@@ -362,7 +360,28 @@ fn has_compatible_hybrid_physical_segments(
                 Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
             )
         })
-        && has_deleted_fragments.iter().all(|has_deleted| !has_deleted)
+        && has_deleted_fragments.iter().all(|has_deleted| !has_deleted))
+    .then_some(first)
+}
+
+fn has_compatible_hybrid_physical_segments(
+    params: &[InvertedIndexParams],
+    details: &[InvertedIndexDetails],
+    has_deleted_fragments: &[bool],
+) -> bool {
+    compatible_live_physical_params(params, details, has_deleted_fragments)
+        .is_some_and(|params| params.posting_block_size() == 128)
+}
+
+fn can_use_query_local_residual_fallback(
+    compatible_hybrid_segments: bool,
+    residual_fragment_count: usize,
+    target_fragment_count: usize,
+    requires_positions: bool,
+) -> bool {
+    compatible_hybrid_segments
+        && !requires_positions
+        && residual_fragment_count < target_fragment_count
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -4312,7 +4331,7 @@ impl Scanner {
             && document_granularity == DocumentGranularity::Row
             && target_fragments
                 .iter()
-                .all(|fragment| fragment.deletion_file.is_none())
+                .all(|fragment| fragment.deletion_file.is_none() && fragment.overlays.is_empty())
             && supports_exact_residual_compound(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
@@ -4339,8 +4358,7 @@ impl Scanner {
                 let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
                 if !unindexed_fragments.is_empty()
                     && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
-                    && !(allow_exact_residual
-                        && unindexed_fragments.len() < target_fragments.len())
+                    && !allow_exact_residual
                 {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
@@ -4363,6 +4381,9 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
+                let mut cached_residual_params = None;
+                let mut query_local_residual_compatible = false;
+                let mut validated_segment_details = None;
                 if allow_exact_residual && !unindexed_fragments.is_empty() {
                     if !has_exact_hybrid_fts_coverage(
                         &segments,
@@ -4372,13 +4393,15 @@ impl Scanner {
                         return Ok(None);
                     }
                     if segments.is_empty() {
-                        return Err(Error::internal(
-                            "hybrid compound FTS requires one indexed segment",
-                        ));
+                        // Current logical metadata omits custom stop words, so an
+                        // all-residual snapshot cannot prove the complete tokenizer
+                        // identity needed to build a compatible posting segment.
+                        return Ok(None);
                     }
                     // Preserve the established semantic mismatch error before
-                    // applying the narrower physical fast-path gate.
-                    load_segment_details(&self.dataset, &column, &segments).await?;
+                    // applying the physical fast-path gates.
+                    let details =
+                        load_segment_details(&self.dataset, &column, &segments).await?;
                     if !has_append_only_indexed_field_history(&self.dataset, &segments).await {
                         // Logical coverage can prune a same-id field rewrite
                         // while the physical segment still contributes the
@@ -4423,17 +4446,36 @@ impl Scanner {
                         }),
                     )
                     .await?;
-                    if !has_compatible_hybrid_physical_segments(
+                    let Some(params) = compatible_live_physical_params(
                         &segment_params,
                         &physical_details,
                         &has_deleted_fragments,
-                    ) {
-                        // Larger posting blocks quantize document lengths, and
-                        // retired physical documents remain in corpus stats.
-                        // Either would make the two arms incomparable.
+                    ) else {
+                        // Retired physical documents remain in corpus stats, and
+                        // incompatible tokenizers cannot share one residual writer.
                         return Ok(None);
-                    }
+                    };
+                    query_local_residual_compatible =
+                        has_compatible_hybrid_physical_segments(
+                            &segment_params,
+                            &physical_details,
+                            &has_deleted_fragments,
+                        );
+                    let format_version = InvertedIndexParams::try_from(
+                        physical_details.first().ok_or_else(|| {
+                            Error::internal(
+                                "cached residual FTS requires one physical segment detail"
+                                    .to_string(),
+                            )
+                        })?,
+                    )?
+                    .resolved_format_version();
+                    cached_residual_params = Some(params.clone().format_version(format_version));
+                    validated_segment_details = Some(details);
                 }
+
+                let mut residual_spec = None;
+                let mut use_query_local_residual = false;
 
                 if cross_column {
                     let details = futures::future::try_join_all(
@@ -4459,17 +4501,76 @@ impl Scanner {
                     if !all_modern {
                         return Ok(None);
                     }
-                } else if phrase_columns.contains(&column) {
-                    let details = load_segment_details(&self.dataset, &column, &segments).await?;
-                    if !details.with_position {
-                        return Err(Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position"
-                                .to_string(),
-                        ));
+                } else {
+                    if phrase_columns.contains(&column) {
+                        let details = if let Some(details) = validated_segment_details.take() {
+                            details
+                        } else {
+                            load_segment_details(&self.dataset, &column, &segments).await?
+                        };
+                        if !details.with_position {
+                            return Err(Error::invalid_input(
+                                "position is not found but required for phrase queries, try recreating the index with position"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    if allow_exact_residual && !unindexed_fragments.is_empty() {
+                        let Some(params) = cached_residual_params else {
+                            return Ok(None);
+                        };
+                        let resolved = resolve_fts_field(
+                            self.dataset.schema(),
+                            &column,
+                            document_granularity,
+                        )?;
+                        let committed_segment_uuid = segments
+                            .first()
+                            .ok_or_else(|| {
+                                Error::internal(
+                                    "cached residual FTS lost its validated committed segment"
+                                        .to_string(),
+                                )
+                            })?
+                            .uuid;
+                        match ResidualFtsSpec::try_new(
+                            &self.dataset,
+                            &index,
+                            &column,
+                            committed_segment_uuid,
+                            &unindexed_fragments,
+                            resolved,
+                            params,
+                        )? {
+                            Ok(spec) => {
+                                residual_spec = Some(spec);
+                                use_query_local_residual =
+                                    can_use_query_local_residual_fallback(
+                                        query_local_residual_compatible,
+                                        unindexed_fragments.len(),
+                                        target_fragments.len(),
+                                        phrase_columns.contains(&column),
+                                    );
+                            }
+                            Err(reason) => {
+                                tracing::debug!(
+                                    column,
+                                    reason,
+                                    "cached residual FTS segment admission rejected"
+                                );
+                                return Ok(None);
+                            }
+                        }
                     }
                 }
 
-                Ok(Some((column, segments, unindexed_fragments)))
+                Ok(Some((
+                    column,
+                    segments,
+                    unindexed_fragments,
+                    residual_spec,
+                    use_query_local_residual,
+                )))
             }
         }))
         .await?;
@@ -4478,11 +4579,11 @@ impl Scanner {
         };
 
         if !cross_column {
-            let (column, segments, unindexed_fragments) =
+            let (column, segments, unindexed_fragments, residual_spec, use_query_local_residual) =
                 segment_groups.into_iter().next().ok_or_else(|| {
                     Error::internal("compound scorer requires one column".to_string())
                 })?;
-            if allow_exact_residual && !unindexed_fragments.is_empty() {
+            let hybrid_fallback = if use_query_local_residual {
                 let resolved =
                     resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
                 let scan_column = if resolved.has_lists() {
@@ -4506,25 +4607,49 @@ impl Scanner {
                         None,
                     )
                     .await?;
-                return Ok(Some(Arc::new(HybridCompoundQueryExec::new(
+                Some(Arc::new(HybridCompoundQueryExec::new(
                     self.dataset.clone(),
                     query.clone(),
                     params.clone(),
                     column,
-                    segments,
+                    segments.clone(),
                     plan,
-                ))));
-            }
-            return Ok(Some(Arc::new(
-                CompoundQueryExec::new_with_segments(
+                )) as Arc<dyn ExecutionPlan>)
+            } else {
+                None
+            };
+            if let Some(residual_spec) = residual_spec {
+                let fallback = if let Some(hybrid_fallback) = hybrid_fallback {
+                    hybrid_fallback
+                } else {
+                    Box::pin(self.plan_fts_inner(
+                        query,
+                        params,
+                        filter_plan,
+                        prefilter_source,
+                        false,
+                    ))
+                    .await?
+                };
+                return Ok(Some(Arc::new(CachedResidualCompoundQueryExec::new(
                     self.dataset.clone(),
                     query.clone(),
                     params.clone(),
                     prefilter_source.clone(),
                     segments,
-                )
-                .with_external_mask(self.external_row_mask.clone()),
-            )));
+                    residual_spec,
+                    fallback,
+                ))));
+            }
+            let exec = CompoundQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+                segments,
+            )
+            .with_external_mask(self.external_row_mask.clone());
+            return Ok(Some(Arc::new(exec)));
         }
 
         let mut coverage_groups = segment_groups.iter();
@@ -4551,7 +4676,7 @@ impl Scanner {
         }
         let segment_groups = segment_groups
             .into_iter()
-            .map(|(column, segments, _)| (column, segments))
+            .map(|(column, segments, _, _, _)| (column, segments))
             .collect();
         let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
@@ -4571,8 +4696,21 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.plan_fts_inner(query, params, filter_plan, prefilter_source, true)
+            .await
+    }
+
+    async fn plan_fts_inner(
+        &self,
+        query: &FtsQuery,
+        params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
+        prefilter_source: &PreFilterSource,
+        allow_compound: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let document_granularity = self.fts_document_granularity(query)?;
-        if !document_granularity.is_list_element()
+        if allow_compound
+            && !document_granularity.is_list_element()
             && supports_compound_scorer(query)
             && let Some(plan) = self
                 .plan_compound_scorer(
@@ -4604,17 +4742,19 @@ impl Scanner {
                 // the documents that are not in the top-k results of the positive query,
                 // but in the final top-k results.
                 let unlimited_params = params.clone().with_limit(None);
-                let positive_exec = Box::pin(self.plan_fts(
+                let positive_exec = Box::pin(self.plan_fts_inner(
                     &query.positive,
                     &unlimited_params,
                     filter_plan,
                     prefilter_source,
+                    allow_compound,
                 ));
-                let negative_exec = Box::pin(self.plan_fts(
+                let negative_exec = Box::pin(self.plan_fts_inner(
                     &query.negative,
                     &unlimited_params,
                     filter_plan,
                     prefilter_source,
+                    allow_compound,
                 ));
                 let (positive_exec, negative_exec) =
                     futures::future::try_join(positive_exec, negative_exec).await?;
@@ -4645,7 +4785,7 @@ impl Scanner {
                         .map(|(match_query, field_prefilter_source)| {
                             let unlimited_params = &unlimited_params;
                             async move {
-                                if can_use_bounded_compound {
+                                if allow_compound && can_use_bounded_compound {
                                     let child_query = FtsQuery::Match(match_query.clone());
                                     if let Some(plan) = self
                                         .plan_compound_scorer(
@@ -4732,11 +4872,12 @@ impl Scanner {
                 let mut should = Vec::with_capacity(query.should.len());
                 for subquery in &query.should {
                     should.push(
-                        Box::pin(self.plan_fts(
+                        Box::pin(self.plan_fts_inner(
                             subquery,
                             &unlimited_params,
                             filter_plan,
                             prefilter_source,
+                            allow_compound,
                         ))
                         .await?,
                     );
@@ -4744,11 +4885,12 @@ impl Scanner {
                 let mut must = Vec::with_capacity(query.must.len());
                 for subquery in &query.must {
                     must.push(
-                        Box::pin(self.plan_fts(
+                        Box::pin(self.plan_fts_inner(
                             subquery,
                             &unlimited_params,
                             filter_plan,
                             prefilter_source,
+                            allow_compound,
                         ))
                         .await?,
                     );
@@ -4756,11 +4898,12 @@ impl Scanner {
                 let mut must_not = Vec::with_capacity(query.must_not.len());
                 for subquery in &query.must_not {
                     must_not.push(
-                        Box::pin(self.plan_fts(
+                        Box::pin(self.plan_fts_inner(
                             subquery,
                             &unlimited_params,
                             filter_plan,
                             prefilter_source,
+                            allow_compound,
                         ))
                         .await?,
                     );
@@ -7644,10 +7787,116 @@ mod test {
             &[InvertedIndexDetails::default()],
             &[false]
         ));
+        assert!(
+            compatible_live_physical_params(
+                &[params.clone().block_size(256).unwrap()],
+                std::slice::from_ref(&modern_details),
+                &[false]
+            )
+            .is_some(),
+            "cached standard segments support the committed 256-doc encoding"
+        );
+        assert!(
+            compatible_live_physical_params(
+                std::slice::from_ref(&params),
+                &[InvertedIndexDetails {
+                    posting_format_version: Some(1),
+                    ..Default::default()
+                }],
+                &[false]
+            )
+            .is_none(),
+            "cached residual segments must not extend the legacy v1 format"
+        );
         assert!(!has_compatible_hybrid_physical_segments(
             &[params],
             &[modern_details],
             &[]
+        ));
+    }
+
+    #[test]
+    fn test_cached_residual_scorer_accepts_exact_compounds_only() {
+        let exact: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("alpha".to_string())
+                    .with_column(Some("body".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                PhraseQuery::new("beta gamma".to_string())
+                    .with_column(Some("body".to_string()))
+                    .into(),
+            ),
+        ])
+        .into();
+        let fuzzy: FtsQuery = BooleanQuery::new([(
+            Occur::Must,
+            MatchQuery::new("alpha".to_string())
+                .with_column(Some("body".to_string()))
+                .with_fuzziness(Some(1))
+                .into(),
+        )])
+        .into();
+        let automatic_fuzzy: FtsQuery = BooleanQuery::new([(
+            Occur::Must,
+            MatchQuery::new("alpha".to_string())
+                .with_column(Some("body".to_string()))
+                .with_fuzziness(None)
+                .into(),
+        )])
+        .into();
+
+        assert!(supports_exact_residual_compound(&exact));
+        assert!(!supports_exact_residual_compound(&fuzzy));
+        assert!(!supports_exact_residual_compound(&automatic_fuzzy));
+    }
+
+    #[test]
+    fn test_cached_residual_requires_exact_disjoint_coverage() {
+        fn segment(coverage: Option<RoaringBitmap>) -> IndexMetadata {
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                fields: vec![0],
+                covering_fields: Vec::new(),
+                name: "fts".to_string(),
+                dataset_version: 1,
+                fragment_bitmap: coverage,
+                index_details: None,
+                index_version: 3,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+        let targets = [Fragment::new(1), Fragment::new(2)];
+        let all_residual = [Fragment::new(1), Fragment::new(2)];
+        assert!(has_exact_hybrid_fts_coverage(&[], &all_residual, &targets,));
+        assert!(has_exact_hybrid_fts_coverage(
+            &[segment(Some(RoaringBitmap::new()))],
+            &all_residual,
+            &targets,
+        ));
+
+        assert!(!has_exact_hybrid_fts_coverage(
+            &[
+                segment(Some(RoaringBitmap::from_iter([1]))),
+                segment(Some(RoaringBitmap::from_iter([1]))),
+            ],
+            &[Fragment::new(2)],
+            &targets,
+        ));
+        assert!(!has_exact_hybrid_fts_coverage(
+            &[segment(Some(RoaringBitmap::from_iter([1, 99])))],
+            &[Fragment::new(2)],
+            &targets,
+        ));
+        assert!(!has_exact_hybrid_fts_coverage(
+            &[segment(None)],
+            &all_residual,
+            &targets,
         ));
     }
 
@@ -8144,6 +8393,164 @@ mod test {
             batch_row_ids(&scan.try_into_batch().await.unwrap()),
             vec![keep]
         );
+    }
+
+    #[tokio::test]
+    async fn cached_residual_compound_fts_matches_exact_flat_fallback() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        test_ds.append_data_with_range(0, 10).await.unwrap();
+        test_ds.append_data_with_range(10, 20).await.unwrap();
+
+        let query = || {
+            FullTextSearchQuery::new_query(FtsQuery::Boolean(BooleanQuery::new([
+                (
+                    Occur::Should,
+                    MatchQuery::new("4".to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ),
+                (
+                    Occur::Should,
+                    PhraseQuery::new("s 9".to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ),
+            ])))
+            .limit(Some(20))
+        };
+
+        let mut cached_scan = test_ds.dataset.scan();
+        cached_scan.full_text_search(query()).unwrap().with_row_id();
+        let logical_index = test_ds
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column("s")
+                    .supports_fts()
+                    .with_fts_document_granularity(DocumentGranularity::Row),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let residual_cache = test_ds
+            .dataset
+            .index_cache
+            .for_index(&logical_index.uuid, None)
+            .with_key_prefix("residual-fts");
+        let committed_segments = load_segments(&test_ds.dataset, "s", DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+        for segment in committed_segments {
+            test_ds
+                .dataset
+                .open_scalar_index("s", &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        }
+        let before = residual_cache.stats().await;
+        let mut coalesced_scan = test_ds.dataset.scan();
+        coalesced_scan
+            .full_text_search(query())
+            .unwrap()
+            .with_row_id();
+        let (plan, coalesced_plan) = tokio::join!(
+            cached_scan.explain_plan(true),
+            coalesced_scan.explain_plan(true)
+        );
+        let plan = plan.unwrap();
+        let coalesced_plan = coalesced_plan.unwrap();
+        assert!(
+            plan.contains("CachedResidualCompoundFtsScorer"),
+            "expected cached residual scorer, got:\n{plan}"
+        );
+        assert!(coalesced_plan.contains("CachedResidualCompoundFtsScorer"));
+        let after_explain = residual_cache.stats().await;
+        assert_eq!(after_explain.misses, before.misses);
+
+        // First use only records the exact working set and runs the fallback.
+        cached_scan.try_into_batch().await.unwrap();
+        let after_seen = residual_cache.stats().await;
+        assert!(after_seen.misses > after_explain.misses);
+
+        // Repeated concurrent uses build each standard immutable segment once;
+        // same-key cache single-flight coalesces the peer execution.
+        let mut coalesced_peer = test_ds.dataset.scan();
+        coalesced_peer
+            .full_text_search(query())
+            .unwrap()
+            .with_row_id();
+        let (built, peer) = tokio::join!(
+            coalesced_scan.try_into_batch(),
+            coalesced_peer.try_into_batch()
+        );
+        let built = built.unwrap();
+        assert_eq!(batch_row_ids(&built), batch_row_ids(&peer.unwrap()));
+        let after_cold_build = residual_cache.stats().await;
+        assert!(after_cold_build.misses > after_seen.misses);
+
+        let mut reused_scan = test_ds.dataset.scan();
+        reused_scan.full_text_search(query()).unwrap();
+        let reused_plan = reused_scan.explain_plan(true).await.unwrap();
+        assert!(reused_plan.contains("CachedResidualCompoundFtsScorer"));
+        let cached = reused_scan.try_into_batch().await.unwrap();
+        let after_reuse = residual_cache.stats().await;
+        assert_eq!(after_reuse.misses, after_cold_build.misses);
+        assert!(after_reuse.hits > after_cold_build.hits);
+        assert_eq!(batch_row_ids(&cached), batch_row_ids(&built));
+
+        let mut all_rows_scan = test_ds.dataset.scan();
+        all_rows_scan.with_row_id();
+        let all_rows = batch_row_ids(&all_rows_scan.try_into_batch().await.unwrap());
+        let mut fallback_scan = test_ds.dataset.scan();
+        fallback_scan
+            .full_text_search(query())
+            .unwrap()
+            .with_row_id()
+            .with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                all_rows,
+            )));
+        let fallback_plan = fallback_scan.explain_plan(true).await.unwrap();
+        assert!(
+            !fallback_plan.contains("CachedResidualCompoundFtsScorer"),
+            "external masks must retain the established fallback, got:\n{fallback_plan}"
+        );
+        let fallback = fallback_scan.try_into_batch().await.unwrap();
+
+        assert_eq!(
+            batch_row_ids(&cached),
+            batch_row_ids(&fallback),
+            "cached residual scorer changed ordered top-k membership"
+        );
+        assert_eq!(
+            cached
+                .column_by_name(SCORE_COL)
+                .unwrap()
+                .as_primitive::<Float32Type>()
+                .values(),
+            fallback
+                .column_by_name(SCORE_COL)
+                .unwrap()
+                .as_primitive::<Float32Type>()
+                .values(),
+            "cached residual scorer changed BM25 scores"
+        );
+
+        test_ds.append_data_with_range(20, 30).await.unwrap();
+        let mut appended_scan = test_ds.dataset.scan();
+        appended_scan.full_text_search(query()).unwrap();
+        let appended_plan = appended_scan.explain_plan(true).await.unwrap();
+        assert!(appended_plan.contains("CachedResidualCompoundFtsScorer"));
+        appended_scan.try_into_batch().await.unwrap();
+        let mut appended_reuse_scan = test_ds.dataset.scan();
+        appended_reuse_scan.full_text_search(query()).unwrap();
+        appended_reuse_scan.try_into_batch().await.unwrap();
+        let after_append = residual_cache.stats().await;
+        assert!(after_append.misses > after_reuse.misses);
+        assert!(after_append.hits > after_reuse.hits);
     }
 
     /// A cross-column boolean query plans into CrossColumnCompoundFtsScorer,

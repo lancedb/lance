@@ -11,6 +11,7 @@ use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use std::collections::HashMap;
+use roaring::RoaringBitmap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -435,6 +436,79 @@ pub(crate) fn build_prefilter(
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
+}
+
+pub(crate) fn build_prefilter_with_fragment_bitmap(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+    external_mask: Option<Arc<RowAddrMask>>,
+) -> Result<Arc<DatasetPreFilter>> {
+    let mut shared_filter = None;
+    let prefilter_loader = match prefilter_source {
+        PreFilterSource::FilteredRowIds(src_node) => {
+            if let Some(shared) = src_node.downcast_ref::<SharedPreFilterExec>() {
+                shared_filter = Some(shared_prefilter_future(
+                    shared.materialization.clone(),
+                    shared.source.clone(),
+                    false,
+                    context,
+                    partition,
+                ));
+                None
+            } else {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+        }
+        PreFilterSource::ScalarIndexQuery(src_node) => {
+            if let Some(shared) = src_node.downcast_ref::<SharedPreFilterExec>() {
+                shared_filter = Some(shared_prefilter_future(
+                    shared.materialization.clone(),
+                    shared.source.clone(),
+                    true,
+                    context,
+                    partition,
+                ));
+                None
+            } else {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+        }
+        PreFilterSource::None => None,
+    };
+    if let Some(shared_filter) = shared_filter {
+        let shared_filter = match external_mask {
+            Some(mask) => async move {
+                Ok(Arc::new(
+                    mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
+                ))
+            }
+            .boxed(),
+            None => shared_filter,
+        };
+        return Ok(Arc::new(
+            DatasetPreFilter::new_with_fragment_bitmap_and_filter_future(
+                ds,
+                fragments,
+                Some(shared_filter),
+            ),
+        ));
+    }
+    let prefilter_loader = match external_mask {
+        Some(mask) => {
+            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+        }
+        None => prefilter_loader,
+    };
+    Ok(Arc::new(DatasetPreFilter::new_with_fragment_bitmap(
+        ds,
+        fragments,
+        prefilter_loader,
+    )))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter

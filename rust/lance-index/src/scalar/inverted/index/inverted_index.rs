@@ -19,7 +19,7 @@ impl InvertedPrewarmState {
 pub struct InvertedIndex {
     pub(super) params: InvertedIndexParams,
     pub(super) store: Arc<dyn IndexStore>,
-    pub(super) tokenizer: Box<dyn LanceTokenizer>,
+    pub(super) tokenizer: Arc<dyn LanceTokenizer>,
     pub(super) token_set_format: TokenSetFormat,
     pub(super) format_version: InvertedListFormatVersion,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
@@ -47,7 +47,7 @@ impl Debug for InvertedIndex {
 
 impl DeepSizeOf for InvertedIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.partitions.deep_size_of_children(context)
+        self.params.deep_size_of_children(context) + self.partitions.deep_size_of_children(context)
     }
 }
 
@@ -123,6 +123,13 @@ impl InvertedIndex {
     }
 
     pub fn tokenizer(&self) -> Box<dyn LanceTokenizer> {
+        self.tokenizer.box_clone()
+    }
+
+    /// Return the immutable analyzer shared by this index. Callers still clone
+    /// it before tokenization because token streams require mutable state.
+    #[doc(hidden)]
+    pub fn shared_tokenizer(&self) -> Arc<dyn LanceTokenizer> {
         self.tokenizer.clone()
     }
 
@@ -201,6 +208,20 @@ impl InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Materialize the lazily owned query state used by cache weight accounting.
+    ///
+    /// This does not prewarm posting payloads into the supplied index cache.
+    /// It only fills state owned by this `InvertedIndex`, making its
+    /// [`DeepSizeOf`] value stable before a long-lived cache admits it.
+    #[doc(hidden)]
+    pub async fn materialize_cache_weight(&self) -> Result<()> {
+        for partition in &self.partitions {
+            partition.inverted_list.ensure_metadata_loaded().await?;
+            partition.docs.prewarm().await?;
+        }
+        Ok(())
+    }
+
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -245,7 +266,7 @@ impl InvertedIndex {
         let inverted_list = invert_list_fut.await??;
         let docs = docs_fut.await??;
 
-        let tokenizer = tokenizer_config.build()?;
+        let tokenizer = Arc::from(tokenizer_config.build()?);
 
         Ok(Arc::new(Self {
             params: tokenizer_config,
@@ -321,6 +342,34 @@ impl InvertedIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        Self::load_inner(store, frag_reuse_index, index_cache, None).await
+    }
+
+    /// Load an immutable segment while sharing an already validated analyzer.
+    /// This avoids retaining one language model or custom stop-word set per
+    /// cached residual fragment.
+    #[doc(hidden)]
+    pub async fn load_with_shared_tokenizer(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        tokenizer: Arc<dyn LanceTokenizer>,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        Self::load_inner(store, frag_reuse_index, index_cache, Some(tokenizer)).await
+    }
+
+    async fn load_inner(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        shared_tokenizer: Option<Arc<dyn LanceTokenizer>>,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -408,7 +457,11 @@ impl InvertedIndex {
                     DocumentGranularity::ListElement
                 };
 
-                let tokenizer = params.build()?;
+                let tokenizer = if let Some(tokenizer) = shared_tokenizer {
+                    tokenizer
+                } else {
+                    Arc::from(params.build()?)
+                };
                 Ok(Arc::new(Self {
                     params,
                     store,
@@ -422,10 +475,11 @@ impl InvertedIndex {
                     deleted_fragments,
                 }))
             }
-            Err(_) => {
+            Err(_) if shared_tokenizer.is_none() => {
                 // old index format
                 Self::load_legacy_index(store, frag_reuse_index, index_cache).await
             }
+            Err(error) => Err(error),
         }
     }
 }
@@ -638,7 +692,7 @@ impl InvertedIndex {
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
-        let mut tokenizer = self.tokenizer.clone();
+        let mut tokenizer = self.tokenizer();
         let tokens = collect_query_tokens(text, &mut tokenizer);
 
         let (doc_ids, _) = self

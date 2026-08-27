@@ -40,10 +40,15 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
+use super::utils::{
+    IndexMetrics, PreFilterMasks, build_prefilter, build_prefilter_with_fragment_bitmap,
+};
 use crate::dataset::mem_wal::index::QueryLocalFtsIndex;
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
+    residual::{
+        ResidualFtsAdmission, ResidualFtsCacheStats, ResidualFtsSpec, load_residual_fts_segments,
+    },
     transform_fts_document_stream,
 };
 use crate::{Dataset, index::DatasetIndexInternalExt};
@@ -673,6 +678,10 @@ pub struct CompoundQueryExec {
     /// subset.
     prepared_match: Option<Arc<PreparedBm25Query>>,
     segment_selection: FtsSegmentSelection,
+    /// Query-time immutable posting segments for append-only fragments.
+    residual_indices: Arc<[Arc<InvertedIndex>]>,
+    residual_fragment_bitmap: roaring::RoaringBitmap,
+    residual_cache_stats: ResidualFtsCacheStats,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
     /// [`MatchQueryExec::with_external_mask`]).
@@ -730,6 +739,9 @@ impl CompoundQueryExec {
             base_scorer: None,
             prepared_match: None,
             segment_selection,
+            residual_indices: Arc::from([]),
+            residual_fragment_bitmap: roaring::RoaringBitmap::new(),
+            residual_cache_stats: ResidualFtsCacheStats::default(),
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -766,6 +778,24 @@ impl CompoundQueryExec {
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
         self.prepared_match = Some(prepared);
         self.base_scorer = None;
+        self
+    }
+
+    /// Add cached immutable posting segments covering append-only fragments.
+    pub(crate) fn with_cached_residual_segments(
+        mut self,
+        indices: Vec<Arc<InvertedIndex>>,
+        fragment_bitmap: roaring::RoaringBitmap,
+        stats: ResidualFtsCacheStats,
+    ) -> Self {
+        self.residual_indices = Arc::from(indices);
+        self.residual_fragment_bitmap = fragment_bitmap;
+        self.residual_cache_stats = stats;
+        self
+    }
+
+    fn with_metrics(mut self, metrics: ExecutionPlanMetricsSet) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -815,6 +845,172 @@ async fn index_query_local_residual_batch(
     .await
 }
 
+/// Lazily activates immutable residual postings after the working set has
+/// demonstrated reuse. Cold, busy, rejected, and failed builds execute the
+/// supplied exact fallback instead.
+#[derive(Debug)]
+pub(crate) struct CachedResidualCompoundQueryExec {
+    dataset: Arc<Dataset>,
+    query: FtsQuery,
+    params: FtsSearchParams,
+    prefilter_source: PreFilterSource,
+    segments: Arc<[IndexMetadata]>,
+    residual_spec: ResidualFtsSpec,
+    fallback: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl CachedResidualCompoundQueryExec {
+    pub(crate) fn new(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segments: Vec<IndexMetadata>,
+        residual_spec: ResidualFtsSpec,
+        fallback: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            segments: Arc::from(segments),
+            residual_spec,
+            fallback,
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(FTS_SCHEMA.clone()),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl DisplayAs for CachedResidualCompoundQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                f,
+                "CachedResidualCompoundFtsScorer: state=lazy, query={}",
+                self.query
+            ),
+            DisplayFormatType::TreeRender => write!(
+                f,
+                "CachedResidualCompoundFtsScorer\nstate=lazy\nquery={}",
+                self.query
+            ),
+        }
+    }
+}
+
+impl ExecutionPlan for CachedResidualCompoundQueryExec {
+    fn name(&self) -> &str {
+        "CachedResidualCompoundQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.fallback]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "cached residual compound FTS expected one fallback child, got {}",
+                children.len()
+            )));
+        }
+        let fallback = children.pop().ok_or_else(|| {
+            DataFusionError::Internal(
+                "cached residual compound FTS lost its fallback child".to_string(),
+            )
+        })?;
+        Ok(Arc::new(Self::new(
+            self.dataset.clone(),
+            self.query.clone(),
+            self.params.clone(),
+            self.prefilter_source.clone(),
+            self.segments.to_vec(),
+            self.residual_spec.clone(),
+            fallback,
+        )))
+    }
+
+    #[instrument(name = "cached_residual_compound_fts_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let dataset = self.dataset.clone();
+        let query = self.query.clone();
+        let params = self.params.clone();
+        let prefilter_source = self.prefilter_source.clone();
+        let segments = self.segments.clone();
+        let residual_spec = self.residual_spec.clone();
+        let fallback = self.fallback.clone();
+        let metrics_set = self.metrics.clone();
+        let context_for_choice = context.clone();
+
+        let chosen = async move {
+            match load_residual_fts_segments(&dataset, &residual_spec).await {
+                Ok(ResidualFtsAdmission::Eligible(loaded)) => CompoundQueryExec::new_with_segments(
+                    dataset,
+                    query,
+                    params,
+                    prefilter_source,
+                    segments.to_vec(),
+                )
+                .with_cached_residual_segments(
+                    loaded.segments,
+                    loaded.fragment_bitmap,
+                    loaded.stats,
+                )
+                .with_metrics(metrics_set)
+                .execute(partition, context_for_choice),
+                Ok(ResidualFtsAdmission::Deferred(reason))
+                | Ok(ResidualFtsAdmission::Rejected(reason)) => {
+                    tracing::debug!(reason, "using exact residual FTS fallback");
+                    fallback.execute(partition, context_for_choice)
+                }
+                Err(error) => {
+                    FtsIndexMetrics::new(&metrics_set, partition).record_residual_cache(
+                        &ResidualFtsCacheStats {
+                            build_failures: 1,
+                            ..Default::default()
+                        },
+                    );
+                    tracing::warn!(error = %error, "cached residual FTS build failed; using exact fallback");
+                    fallback.execute(partition, context_for_choice)
+                }
+            }
+        };
+        let stream = stream::once(chosen).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+}
+
 /// Exact compound FTS over committed postings plus an append-only residual
 /// scan. The residual documents are tokenized once into query-local postings,
 /// rather than once for every compound leaf.
@@ -826,6 +1022,7 @@ pub(crate) struct HybridCompoundQueryExec {
     column: String,
     segments: Arc<[IndexMetadata]>,
     residual_input: Arc<dyn ExecutionPlan>,
+    residual_cache_build_failures: usize,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -846,6 +1043,7 @@ impl HybridCompoundQueryExec {
             column,
             segments: Arc::from(segments),
             residual_input,
+            residual_cache_build_failures: 0,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -854,6 +1052,11 @@ impl HybridCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub(crate) fn with_residual_cache_build_failures(mut self, failures: usize) -> Self {
+        self.residual_cache_build_failures = failures;
+        self
     }
 }
 
@@ -893,14 +1096,17 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let residual_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("hybrid compound FTS lost its residual child".to_string())
         })?;
-        Ok(Arc::new(Self::new(
-            self.dataset.clone(),
-            self.query.clone(),
-            self.params.clone(),
-            self.column.clone(),
-            self.segments.to_vec(),
-            residual_input,
-        )))
+        Ok(Arc::new(
+            Self::new(
+                self.dataset.clone(),
+                self.query.clone(),
+                self.params.clone(),
+                self.column.clone(),
+                self.segments.to_vec(),
+                residual_input,
+            )
+            .with_residual_cache_build_failures(self.residual_cache_build_failures),
+        ))
     }
 
     #[instrument(name = "hybrid_compound_fts_exec", level = "debug", skip_all)]
@@ -915,11 +1121,18 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let residual_cache_build_failures = self.residual_cache_build_failures;
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            if residual_cache_build_failures != 0 {
+                metrics.record_residual_cache(&ResidualFtsCacheStats {
+                    build_failures: residual_cache_build_failures,
+                    ..Default::default()
+                });
+            }
             let indices =
                 open_fts_segments(&dataset, &column, &segments, &metrics.index_metrics).await?;
             let first_index = indices.first().ok_or_else(|| {
@@ -1151,11 +1364,29 @@ impl DisplayAs for CompoundQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "CompoundFtsScorer: query={}", self.query)?;
+                if self.residual_indices.is_empty() {
+                    write!(f, "CompoundFtsScorer: query={}", self.query)?;
+                } else {
+                    write!(
+                        f,
+                        "CachedResidualCompoundFtsScorer: query={}, residual_segments={}",
+                        self.query,
+                        self.residual_indices.len()
+                    )?;
+                }
                 fmt_tokenized_compound_query(&self.tokenized_query, ", ", f)
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "CompoundFtsScorer\nquery={}", self.query)?;
+                if self.residual_indices.is_empty() {
+                    write!(f, "CompoundFtsScorer\nquery={}", self.query)?;
+                } else {
+                    write!(
+                        f,
+                        "CachedResidualCompoundFtsScorer\nquery={}\nresidual_segments={}",
+                        self.query,
+                        self.residual_indices.len()
+                    )?;
+                }
                 fmt_tokenized_compound_query(&self.tokenized_query, "\n", f)
             }
         }
@@ -1207,6 +1438,9 @@ impl ExecutionPlan for CompoundQueryExec {
             base_scorer: self.base_scorer.clone(),
             prepared_match: self.prepared_match.clone(),
             segment_selection: self.segment_selection.clone(),
+            residual_indices: self.residual_indices.clone(),
+            residual_fragment_bitmap: self.residual_fragment_bitmap.clone(),
+            residual_cache_stats: self.residual_cache_stats.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1227,6 +1461,9 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
+        let residual_indices = self.residual_indices.clone();
+        let residual_fragment_bitmap = self.residual_fragment_bitmap.clone();
+        let residual_cache_stats = self.residual_cache_stats.clone();
         let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
@@ -1266,24 +1503,53 @@ impl ExecutionPlan for CompoundQueryExec {
             } else {
                 true
             };
-            let _details = load_segment_details(&dataset, column, &segments).await?;
-            let indices =
+            if !segments.is_empty() {
+                let _details = load_segment_details(&dataset, column, &segments).await?;
+            } else if residual_indices.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "FTS index for column {column} has no searchable segments"
+                )));
+            }
+            let mut indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            indices.extend(residual_indices.iter().cloned());
+            metrics.record_residual_cache(&residual_cache_stats);
             if let Some(first_index) = indices.first() {
                 tokenized_query
                     .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
             }
-            let mut prefilter = build_prefilter(
-                context,
-                partition,
-                &prefilter_source,
-                dataset,
-                &segments,
-                PreFilterMasks {
-                    overlay_block: None,
+            let mut prefilter = if residual_fragment_bitmap.is_empty() {
+                build_prefilter(
+                    context,
+                    partition,
+                    &prefilter_source,
+                    dataset,
+                    &segments,
+                    PreFilterMasks {
+                        overlay_block: None,
+                        external_mask,
+                    },
+                )?
+            } else {
+                let mut coverage = residual_fragment_bitmap;
+                for segment in segments.iter() {
+                    let Some(bitmap) = &segment.fragment_bitmap else {
+                        return Err(DataFusionError::Execution(
+                            "cached residual FTS requires exact committed fragment coverage"
+                                .to_string(),
+                        ));
+                    };
+                    coverage |= bitmap;
+                }
+                build_prefilter_with_fragment_bitmap(
+                    context,
+                    partition,
+                    &prefilter_source,
+                    dataset,
+                    coverage,
                     external_mask,
-                },
-            )?;
+                )?
+            };
             let deleted_fragments =
                 indices
                     .iter()
