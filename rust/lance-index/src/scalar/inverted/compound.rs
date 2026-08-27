@@ -2172,7 +2172,6 @@ pub fn materialized_compound_top_k(
     query: &FtsQuery,
     leaves: Vec<Vec<(u64, f32)>>,
     limit: usize,
-    metrics: &dyn MetricsCollector,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let mut leaf_count = 0;
     let plan = CompoundScorerPlan::from_query(query, &mut leaf_count)?;
@@ -2192,7 +2191,7 @@ pub fn materialized_compound_top_k(
             MaterializedScorer::try_new(rows).map(|scorer| Some(Box::new(scorer) as BoxScorer<'_>))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut scorer = plan.build(&mut scorers, metrics)?;
+    let mut scorer = plan.build(&mut scorers)?;
     let rows = TopKCollector::new(limit).collect(scorer.as_mut())?;
     Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
 }
@@ -4470,12 +4469,10 @@ mod tests {
                 MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
             ],
         });
-        let metrics = NoOpMetricsCollector;
         let (row_ids, scores) = materialized_compound_top_k(
             &query,
             vec![vec![(7, 1.0), (3, 2.0)], vec![(7, 3.0), (5, 3.0)]],
             2,
-            &metrics,
         )
         .unwrap();
 

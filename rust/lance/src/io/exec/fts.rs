@@ -1022,16 +1022,10 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             .await?;
             let residual_query = query.clone();
             let residual_scorer = scorer.clone();
-            let residual_metrics = metrics.clone();
             let (residual_row_ids, residual_scores) = spawn_cpu(move || {
                 let residual_leaves =
                     residual.exact_leaf_results(&residual_query, residual_scorer.as_ref())?;
-                materialized_compound_top_k(
-                    &residual_query,
-                    residual_leaves,
-                    limit,
-                    residual_metrics.as_ref(),
-                )
+                materialized_compound_top_k(&residual_query, residual_leaves, limit)
             })
             .await?;
 
