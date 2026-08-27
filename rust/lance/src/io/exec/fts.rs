@@ -56,15 +56,16 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
     CROSS_COLUMN_STAGED_ATTEMPTS_METRIC, CROSS_COLUMN_STAGED_CANDIDATES_METRIC,
     CROSS_COLUMN_STAGED_FALLBACKS_METRIC, CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
-    FREQS_COLLECTED_METRIC, MetricsCollector, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
-    WAND_EXACTNESS_PROBE_COMPARISONS_METRIC, WAND_EXACTNESS_PROBE_MS_METRIC,
-    WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, WAND_SEEDED_FALLBACK_MS_METRIC,
-    WAND_SEEDED_FALLBACKS_METRIC, WAND_TIE_COMPLETION_ATTEMPTS_METRIC,
-    WAND_TIE_COMPLETION_CANDIDATES_METRIC, WAND_TIE_COMPLETION_COMPARISONS_METRIC,
-    WAND_TIE_COMPLETION_MS_METRIC, WAND_TIE_COMPLETION_OVERFLOWS_METRIC,
-    WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC, WAND_TIE_COMPLETION_SUCCESSES_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector, NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, WAND_EXACTNESS_PROBE_COMPARISONS_METRIC,
+    WAND_EXACTNESS_PROBE_MS_METRIC, WAND_SEEDED_FALLBACK_COMPARISONS_METRIC,
+    WAND_SEEDED_FALLBACK_MS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
+    WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_CANDIDATES_METRIC,
+    WAND_TIE_COMPLETION_COMPARISONS_METRIC, WAND_TIE_COMPLETION_MS_METRIC,
+    WAND_TIE_COMPLETION_OVERFLOWS_METRIC, WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC,
+    WAND_TIE_COMPLETION_SUCCESSES_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -2195,6 +2196,7 @@ pub struct FtsIndexMetrics {
     wand_seeded_fallbacks: Count,
     wand_seeded_fallback_ms: Gauge,
     wand_seeded_fallback_comparisons: Count,
+    no_impact_global_scorer_fallbacks: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -2286,6 +2288,8 @@ impl FtsIndexMetrics {
             wand_seeded_fallback_ms: metrics.new_gauge(WAND_SEEDED_FALLBACK_MS_METRIC, partition),
             wand_seeded_fallback_comparisons: metrics
                 .new_count(WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, partition),
+            no_impact_global_scorer_fallbacks: metrics
+                .new_count(NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -2497,6 +2501,10 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_wand_seeded_fallbacks(&self, num_fallbacks: usize) {
         self.wand_seeded_fallbacks.add(num_fallbacks);
+    }
+
+    fn record_no_impact_global_scorer_fallbacks(&self, num_fallbacks: usize) {
+        self.no_impact_global_scorer_fallbacks.add(num_fallbacks);
     }
 }
 
@@ -5138,6 +5146,15 @@ mod tests {
         assert_eq!(metrics.wand_tie_completion_comparisons.value(), 47);
         assert_eq!(metrics.wand_seeded_fallback_comparisons.value(), 53);
         assert_eq!(metrics.wand_tie_completion_row_id_replacements.value(), 59);
+    }
+
+    #[test]
+    fn test_no_impact_fallback_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_no_impact_global_scorer_fallbacks(3);
+        assert_eq!(metrics.no_impact_global_scorer_fallbacks.value(), 3);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {

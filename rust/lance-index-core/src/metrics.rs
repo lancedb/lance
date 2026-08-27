@@ -56,6 +56,7 @@ pub const WAND_TIE_COMPLETION_COMPARISONS_METRIC: &str = "wand_tie_completion_co
 pub const WAND_SEEDED_FALLBACKS_METRIC: &str = "wand_seeded_fallbacks";
 pub const WAND_SEEDED_FALLBACK_MS_METRIC: &str = "wand_seeded_fallback_ms";
 pub const WAND_SEEDED_FALLBACK_COMPARISONS_METRIC: &str = "wand_seeded_fallback_comparisons";
+pub const NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC: &str = "no_impact_global_scorer_fallbacks";
 
 /// A trait used by the index to report metrics
 ///
@@ -220,6 +221,9 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record exact replays seeded with an inclusive kth-score floor.
     fn record_wand_seeded_fallbacks(&self, _num_fallbacks: usize) {}
+
+    /// Record partitions whose no-impact postings use scorer-derived bounds.
+    fn record_no_impact_global_scorer_fallbacks(&self, _num_fallbacks: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
