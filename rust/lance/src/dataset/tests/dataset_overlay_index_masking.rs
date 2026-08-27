@@ -5,7 +5,7 @@
 //! queries stay correct while overlays remain (stale index hits are dropped and new
 //! matches are added by re-evaluating overlay-covered rows on the flat path).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
 
@@ -15,7 +15,6 @@ use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
-use lance_index::metrics::MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
@@ -39,7 +38,6 @@ use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
-use lance_datafusion::exec::ExecutionSummaryCounts;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -1088,15 +1086,10 @@ async fn test_multimatch_shared_prefilter_preserves_field_overlay_masks() {
     )
     .unwrap()
     .into();
-    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
-    let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
     scanner
         .prefilter(true)
         .use_scalar_index(false)
-        .scan_stats_callback(Arc::new(move |stats| {
-            *stats_setter.lock().unwrap() = Some(stats.clone());
-        }))
         .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .filter("id >= 0")
@@ -1107,13 +1100,6 @@ async fn test_multimatch_shared_prefilter_preserves_field_overlay_masks() {
     let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1]);
-    let stats = collected_stats.lock().unwrap().take().unwrap();
-    assert_eq!(
-        stats
-            .all_counts
-            .get(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC),
-        Some(&1)
-    );
 }
 
 /// A phrase query must drop stale indexed positions and re-evaluate the current

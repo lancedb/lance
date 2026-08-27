@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, Time,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
@@ -201,12 +201,6 @@ impl ExecutionPlan for SharedPreFilterExec {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct SharedPreFilterMetrics {
-    pub source_executions: Count,
-    pub materialization_duration: Time,
-}
-
 pub(crate) struct PreFilterMasks {
     pub overlay_block: Option<RowAddrMask>,
     pub external_mask: Option<Arc<RowAddrMask>>,
@@ -307,7 +301,6 @@ fn shared_prefilter_future(
     is_scalar_index_query: bool,
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
-    metrics: SharedPreFilterMetrics,
 ) -> BoxFuture<'static, Result<Arc<RowAddrMask>>> {
     async move {
         let context_id = Arc::as_ptr(&context) as usize;
@@ -337,8 +330,6 @@ fn shared_prefilter_future(
                     context: Arc::downgrade(&context),
                     future: {
                         async move {
-                            metrics.source_executions.add(1);
-                            let _timer = metrics.materialization_duration.timer();
                             let result = async move {
                                 let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
@@ -381,7 +372,6 @@ pub(crate) fn build_prefilter(
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
     masks: PreFilterMasks,
-    shared_metrics: SharedPreFilterMetrics,
 ) -> Result<Arc<DatasetPreFilter>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -393,7 +383,6 @@ pub(crate) fn build_prefilter(
                     false,
                     context,
                     partition,
-                    shared_metrics,
                 ));
                 None
             } else {
@@ -409,7 +398,6 @@ pub(crate) fn build_prefilter(
                     true,
                     context,
                     partition,
-                    shared_metrics,
                 ));
                 None
             } else {
@@ -963,7 +951,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SortOptions};
     use datafusion::common::NullEquality;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
-    use datafusion::physical_plan::metrics::{Count, Time};
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -982,15 +969,8 @@ mod tests {
 
     use super::{
         InstrumentedChildInputStream, PreFilterSource, ReplayExec, SharedPreFilterExec,
-        SharedPreFilterMaterialization, SharedPreFilterMetrics, shared_prefilter_future,
+        SharedPreFilterMaterialization, shared_prefilter_future,
     };
-
-    fn prefilter_metrics() -> SharedPreFilterMetrics {
-        SharedPreFilterMetrics {
-            source_executions: Count::new(),
-            materialization_duration: Time::new(),
-        }
-    }
 
     fn prefilter_source(is_scalar_index_query: bool, is_empty: bool) -> PreFilterSource {
         let mask = if is_empty {
@@ -1021,6 +1001,8 @@ mod tests {
             )
             .unwrap()
         };
+        // A duplicate source execution fails, so successful concurrent
+        // materialization verifies sharing without production metrics.
         let source = Arc::new(OneShotExec::from_batch(batch));
         if is_scalar_index_query {
             PreFilterSource::ScalarIndexQuery(source)
@@ -1075,7 +1057,6 @@ mod tests {
             field_count,
             "every field must declare its shared source dependency"
         );
-        let metrics = prefilter_metrics();
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let masks = futures::future::try_join_all(shared_sources.iter().map(|source| {
             shared_prefilter_future(
@@ -1084,13 +1065,11 @@ mod tests {
                 is_scalar_index_query,
                 context.clone(),
                 0,
-                metrics.clone(),
             )
         }))
         .await
         .unwrap();
 
-        assert_eq!(metrics.source_executions.value(), 1);
         assert!(masks.windows(2).all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
         assert_eq!(masks[0].allow_list().unwrap().is_empty(), is_empty);
     }
@@ -1126,7 +1105,6 @@ mod tests {
         ));
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_multimatch_fields(2);
-        let metrics = prefilter_metrics();
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let left = shared_prefilter_future(
             shared_materialization(&shared_sources[0]),
@@ -1134,7 +1112,6 @@ mod tests {
             false,
             context.clone(),
             0,
-            metrics.clone(),
         );
         let right = shared_prefilter_future(
             shared_materialization(&shared_sources[1]),
@@ -1142,7 +1119,6 @@ mod tests {
             false,
             context,
             0,
-            metrics.clone(),
         );
         let (left, right) = tokio::join!(left, right);
 
@@ -1157,7 +1133,6 @@ mod tests {
                 .to_string()
                 .contains("shared prefilter failure")
         );
-        assert_eq!(metrics.source_executions.value(), 1);
     }
 
     #[tokio::test]
@@ -1172,10 +1147,16 @@ mod tests {
         )
         .unwrap();
         let schema = batch.schema();
+        let (started, has_started) = tokio::sync::oneshot::channel::<()>();
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(async move {
+                started.send(()).map_err(|_| {
+                    DataFusionError::Execution(
+                        "shared prefilter startup receiver dropped".to_string(),
+                    )
+                })?;
                 wait.await.map_err(|error| {
                     DataFusionError::Execution(format!(
                         "shared prefilter release sender dropped: {error}"
@@ -1187,7 +1168,6 @@ mod tests {
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_multimatch_fields(2);
         let materialization = shared_materialization(&shared_sources[0]);
-        let metrics = prefilter_metrics();
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let first = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
@@ -1195,18 +1175,17 @@ mod tests {
             false,
             context.clone(),
             0,
-            metrics.clone(),
         ));
-        while metrics.source_executions.value() == 0 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
+            .await
+            .expect("shared prefilter source should start")
+            .expect("shared prefilter startup sender should remain alive");
         let second = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
             shared_source(&shared_sources[1]),
             false,
             context,
             0,
-            metrics.clone(),
         ));
         loop {
             let waiters = materialization
@@ -1229,7 +1208,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(mask.allow_list().unwrap().len(), Some(4));
-        assert_eq!(metrics.source_executions.value(), 1);
     }
 
     #[tokio::test]
@@ -1239,25 +1217,32 @@ mod tests {
             DataType::UInt64,
             false,
         )]));
+        let (started, has_started) = tokio::sync::oneshot::channel::<()>();
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            stream::pending::<DataFusionResult<RecordBatch>>(),
+            stream::once(async move {
+                started.send(()).map_err(|_| {
+                    DataFusionError::Execution(
+                        "shared prefilter startup receiver dropped".to_string(),
+                    )
+                })?;
+                std::future::pending::<DataFusionResult<RecordBatch>>().await
+            }),
         ));
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_multimatch_fields(2);
         let materialization = shared_materialization(&shared_sources[0]);
-        let metrics = prefilter_metrics();
         let waiter = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
             shared_source(&shared_sources[0]),
             false,
             Arc::new(datafusion::execution::TaskContext::default()),
             0,
-            metrics.clone(),
         ));
-        while metrics.source_executions.value() == 0 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
+            .await
+            .expect("shared prefilter source should start")
+            .expect("shared prefilter startup sender should remain alive");
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         assert!(materialization.queries.lock().unwrap().is_empty());

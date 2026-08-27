@@ -37,7 +37,7 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, PreFilterMasks, SharedPreFilterMetrics, build_prefilter};
+use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -56,9 +56,7 @@ use lance_index::metrics::{
     COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
     CROSS_COLUMN_STAGED_ATTEMPTS_METRIC, CROSS_COLUMN_STAGED_CANDIDATES_METRIC,
     CROSS_COLUMN_STAGED_FALLBACKS_METRIC, CROSS_COLUMN_STAGED_SUCCESSES_METRIC,
-    FREQS_COLLECTED_METRIC, MULTIMATCH_PREFILTER_MATERIALIZATION_DURATION_METRIC,
-    MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC, MetricsCollector,
-    NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector, NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC,
     WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
     WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
     WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, WAND_EXACTNESS_PROBE_COMPARISONS_METRIC,
@@ -1050,7 +1048,6 @@ impl ExecutionPlan for CompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
-                metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =
                 indices
@@ -1637,7 +1634,6 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
-                metrics.shared_prefilter_metrics(),
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2174,8 +2170,6 @@ pub struct FtsIndexMetrics {
     wand_seeded_fallback_ms: Gauge,
     wand_seeded_fallback_comparisons: Count,
     no_impact_global_scorer_fallbacks: Count,
-    multimatch_prefilter_source_executions: Count,
-    multimatch_prefilter_materialization_duration: Time,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -2269,12 +2263,6 @@ impl FtsIndexMetrics {
                 .new_count(WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, partition),
             no_impact_global_scorer_fallbacks: metrics
                 .new_count(NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC, partition),
-            multimatch_prefilter_source_executions: metrics
-                .new_count(MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC, partition),
-            multimatch_prefilter_materialization_duration: metrics.new_time(
-                MULTIMATCH_PREFILTER_MATERIALIZATION_DURATION_METRIC,
-                partition,
-            ),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -2319,13 +2307,6 @@ impl FtsIndexMetrics {
 
     fn record_wand_seeded_fallback_comparisons(&self, comparisons: usize) {
         self.wand_seeded_fallback_comparisons.add(comparisons);
-    }
-
-    fn shared_prefilter_metrics(&self) -> SharedPreFilterMetrics {
-        SharedPreFilterMetrics {
-            source_executions: self.multimatch_prefilter_source_executions.clone(),
-            materialization_duration: self.multimatch_prefilter_materialization_duration.clone(),
-        }
     }
 }
 
@@ -2946,7 +2927,6 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block,
                     external_mask,
                 },
-                metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =
                 indices
@@ -4246,7 +4226,6 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block,
                     external_mask,
                 },
-                metrics.shared_prefilter_metrics(),
             )?;
             let deleted_fragments =
                 indices

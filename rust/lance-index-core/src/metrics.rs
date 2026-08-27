@@ -57,11 +57,6 @@ pub const WAND_SEEDED_FALLBACKS_METRIC: &str = "wand_seeded_fallbacks";
 pub const WAND_SEEDED_FALLBACK_MS_METRIC: &str = "wand_seeded_fallback_ms";
 pub const WAND_SEEDED_FALLBACK_COMPARISONS_METRIC: &str = "wand_seeded_fallback_comparisons";
 pub const NO_IMPACT_GLOBAL_SCORER_FALLBACKS_METRIC: &str = "no_impact_global_scorer_fallbacks";
-pub const MULTIMATCH_PREFILTER_SOURCE_EXECUTIONS_METRIC: &str =
-    "multimatch_prefilter_source_executions";
-pub const MULTIMATCH_PREFILTER_MATERIALIZATION_DURATION_METRIC: &str =
-    "multimatch_prefilter_materialization_duration";
-
 /// A trait used by the index to report metrics
 ///
 /// Callers can implement this trait to collect metrics
