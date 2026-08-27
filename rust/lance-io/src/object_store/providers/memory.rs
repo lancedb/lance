@@ -12,6 +12,22 @@ use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
 /// Provides a fresh in-memory object store for each call to `new_store`.
+///
+/// The bytes written through a store live in that store's `InMemory` backend and
+/// nowhere else. An [`ObjectStoreRegistry`](crate::object_store::ObjectStoreRegistry)
+/// reuses one backend for every `memory://` URL it resolves — the prefix is the
+/// constant `"memory"` — but only while some caller still holds the store, and only
+/// within that one registry.
+///
+/// So a `memory://` dataset is readable exactly as long as the reader goes through
+/// the same registry and store instance as the writer did. That does not hold for a
+/// dataset with additional base paths: a write resolves its base stores through a
+/// registry of its own unless a `Session` is supplied, while reads resolve them
+/// through the dataset's session, and data written into a base is then unreachable.
+/// Use `shared-memory://<authority>/...`
+/// ([`SharedMemoryStoreProvider`](super::shared_memory::SharedMemoryStoreProvider))
+/// for those tests: its backends are process-global and keyed by authority, so every
+/// registry in the process sees the same bytes.
 #[derive(Default, Debug)]
 pub struct MemoryStoreProvider;
 

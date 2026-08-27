@@ -2860,7 +2860,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create dataset with multi-base configuration
-        let test_uri = "memory://multi_base_test";
+        let test_uri = "shared-memory://multi_base_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -2926,6 +2926,39 @@ mod tests {
                     .any(|file| file.base_id == Some(1))
             );
         }
+
+        // Read the fragment back through the base store. This only works on a
+        // scheme whose bytes outlive a single `ObjectStore` instance: a write
+        // resolves its base stores through a different `ObjectStoreRegistry`
+        // than the reader uses, so `memory://` would mint an empty store here.
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            5
+        );
+
+        // Same through a freshly opened dataset, which shares nothing with the
+        // writer but the URI.
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        let batches = reopened
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            5
+        );
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
         let mut data_gen2 =
@@ -3037,7 +3070,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset
-        let test_uri = "memory://overwrite_test";
+        let test_uri = "shared-memory://overwrite_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3155,7 +3188,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset with multi-base configuration
-        let test_uri = "memory://append_test";
+        let test_uri = "shared-memory://append_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4266,7 +4299,7 @@ mod tests {
     async fn test_multi_base_target_primary_and_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://primary_slot_test";
+        let test_uri = "shared-memory://primary_slot_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4358,6 +4391,24 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(2)]);
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
+
+        // count_rows is served from manifest metadata; scan the reopened
+        // dataset so the rows actually come off primary, base1
+        // (is_dataset_root) and base2 (not a dataset root), resolved through a
+        // registry that shares nothing with the writer.
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        let batches = reopened
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            21
+        );
     }
 
     /// `target_all_bases` resolves to every registered base at execution
@@ -4366,7 +4417,7 @@ mod tests {
     async fn test_multi_base_target_all_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://all_bases_test";
+        let test_uri = "shared-memory://all_bases_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4473,7 +4524,7 @@ mod tests {
 
         // On a dataset with no registered bases: include_primary=true is a
         // no-op rotation over primary, false is rejected.
-        let plain_uri = "memory://all_bases_plain";
+        let plain_uri = "shared-memory://all_bases_plain/primary";
         let mut data_gen5 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let plain = Dataset::write(data_gen5.batch(3), plain_uri, None)
@@ -4524,12 +4575,13 @@ mod tests {
 
         // CREATE mode: initial_bases join the rotation before their ids are
         // committed to a manifest.
-        let create_uri = "memory://all_bases_create";
+        let create_root = "shared-memory://all_bases_create";
+        let create_uri = format!("{}/primary", create_root);
         let mut data_gen8 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let dataset = Dataset::write(
             data_gen8.batch(9),
-            create_uri,
+            &create_uri,
             Some(
                 WriteParams {
                     mode: WriteMode::Create,
@@ -4539,13 +4591,13 @@ mod tests {
                             id: 0,
                             name: Some("base1".to_string()),
                             is_dataset_root: true,
-                            path: format!("{}/base1", create_uri),
+                            path: format!("{}/base1", create_root),
                         },
                         BasePath {
                             id: 0,
                             name: Some("base2".to_string()),
                             is_dataset_root: false,
-                            path: format!("{}/base2", create_uri),
+                            path: format!("{}/base2", create_root),
                         },
                     ]),
                     ..Default::default()
