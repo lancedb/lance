@@ -44,7 +44,6 @@ pub mod registry;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;
-mod signed_zero;
 pub mod zoned;
 pub mod zonemap;
 

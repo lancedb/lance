@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::signed_zero::rewrite_signed_zero_comparisons;
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -1024,6 +1025,12 @@ impl Planner {
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
         let expr = simplifier.simplify(expr)?;
+
+        // Last, so the rewrite sees literals already coerced to the column's type
+        // and BETWEEN already expanded into two comparisons. Every caller that
+        // compiles an expression for evaluation goes through here, which is what
+        // keeps a filter and a projected copy of the same predicate in agreement.
+        let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
     }

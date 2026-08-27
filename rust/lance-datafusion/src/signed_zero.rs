@@ -86,6 +86,22 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                         negated: op == Operator::NotEq,
                     }));
                 }
+                Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
+                    // These are `=` and `!=` extended to NULL, so widening them
+                    // into a pair keeps the NULL handling that `IN` would drop.
+                    let probe = |zero| {
+                        Expr::BinaryExpr(BinaryExpr {
+                            left: Box::new(other.clone()),
+                            op,
+                            right: Box::new(Expr::Literal(zero, metadata.clone())),
+                        })
+                    };
+                    return Some(if op == Operator::IsNotDistinctFrom {
+                        probe(negative).or(probe(positive))
+                    } else {
+                        probe(negative).and(probe(positive))
+                    });
+                }
                 _ => return None,
             };
             Some(Expr::BinaryExpr(BinaryExpr {
@@ -98,11 +114,37 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             expr,
             list,
             negated,
-        }) => Some(Expr::InList(InList {
-            expr: expr.clone(),
-            list: widen_zero_list(list)?,
-            negated: *negated,
-        })),
+        }) => {
+            // A zero literal on the probe side needs the same treatment. The list
+            // elements are arbitrary expressions there, so expand into the
+            // equality form the binary arm already covers.
+            if let Expr::Literal(value, metadata) = expr.as_ref() {
+                let (negative, positive) = zero_encodings(value)?;
+                let matches_any = list
+                    .iter()
+                    .map(|item| {
+                        Expr::InList(InList {
+                            expr: Box::new(item.clone()),
+                            list: vec![
+                                Expr::Literal(negative.clone(), metadata.clone()),
+                                Expr::Literal(positive.clone(), metadata.clone()),
+                            ],
+                            negated: false,
+                        })
+                    })
+                    .reduce(Expr::or)?;
+                return Some(if *negated {
+                    Expr::Not(Box::new(matches_any))
+                } else {
+                    matches_any
+                });
+            }
+            Some(Expr::InList(InList {
+                expr: expr.clone(),
+                list: widen_zero_list(list)?,
+                negated: *negated,
+            }))
+        }
         _ => None,
     }
 }
@@ -112,8 +154,9 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
 /// Returns `None` when the list holds no zero, or already spells out both
 /// encodings of each zero it holds.
 fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
-    let mut widened = list.to_vec();
-    let original_len = widened.len();
+    // Lists of thousands of values are common and most hold no zero at all, so
+    // collect what is missing before copying anything.
+    let mut missing: Vec<Expr> = Vec::new();
     for item in list {
         let Expr::Literal(value, metadata) = item else {
             continue;
@@ -128,14 +171,20 @@ fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
         };
         // `ScalarValue` compares floats by bit pattern, so this distinguishes
         // the two encodings rather than collapsing them.
-        let present = widened
-            .iter()
-            .any(|other| matches!(other, Expr::Literal(v, _) if *v == counterpart));
-        if !present {
-            widened.push(Expr::Literal(counterpart, metadata.clone()));
+        let is_counterpart =
+            |other: &Expr| matches!(other, Expr::Literal(v, _) if *v == counterpart);
+        if list.iter().any(is_counterpart) || missing.iter().any(is_counterpart) {
+            continue;
         }
+        missing.push(Expr::Literal(counterpart, metadata.clone()));
     }
-    (widened.len() > original_len).then_some(widened)
+    if missing.is_empty() {
+        return None;
+    }
+    let mut widened = Vec::with_capacity(list.len() + missing.len());
+    widened.extend(list.iter().cloned());
+    widened.append(&mut missing);
+    Some(widened)
 }
 
 #[cfg(test)]
@@ -254,5 +303,55 @@ mod tests {
     }))]
     fn unrelated_comparisons_are_left_alone(#[case] expr: Expr) {
         assert_eq!(rewrite(expr.clone()), expr);
+    }
+
+    #[rstest]
+    #[case::is_not_distinct_from(Operator::IsNotDistinctFrom)]
+    #[case::is_distinct_from(Operator::IsDistinctFrom)]
+    fn distinct_from_keeps_its_null_handling(#[case] op: Operator) {
+        let probe = |zero| compare(col("x"), op, lit(zero));
+        let expected = if op == Operator::IsNotDistinctFrom {
+            probe(-0.0).or(probe(0.0))
+        } else {
+            probe(-0.0).and(probe(0.0))
+        };
+        assert_eq!(rewrite(compare(col("x"), op, lit(0.0))), expected);
+    }
+
+    #[rstest]
+    #[case::probe(false)]
+    #[case::negated_probe(true)]
+    fn a_zero_probe_expands_into_equalities(#[case] negated: bool) {
+        let covers = |column| {
+            Expr::InList(InList {
+                expr: Box::new(col(column)),
+                list: vec![lit(-0.0), lit(0.0)],
+                negated: false,
+            })
+        };
+        let matches_any = covers("a").or(covers("b"));
+        assert_eq!(
+            rewrite(Expr::InList(InList {
+                expr: Box::new(lit(0.0)),
+                list: vec![col("a"), col("b")],
+                negated,
+            })),
+            if negated {
+                Expr::Not(Box::new(matches_any))
+            } else {
+                matches_any
+            }
+        );
+    }
+
+    #[test]
+    fn scalar_value_keeps_the_two_zero_encodings_apart() {
+        // Widening an `IN` list decides "already listed" with this comparison, and
+        // the scalar indices order candidates by the matching total order. A
+        // DataFusion release that made these equal would silently stop the
+        // widening while leaving the ordering alone.
+        assert_ne!(Float64(Some(-0.0)), Float64(Some(0.0)));
+        assert_ne!(Float32(Some(-0.0)), Float32(Some(0.0)));
+        assert_ne!(Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO)));
     }
 }

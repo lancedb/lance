@@ -5080,14 +5080,15 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
-    /// The merge_insert key lookup builds its index query straight from the
-    /// source values and treats the result as the answer, panicking on a
-    /// non-exact one, so it stays on arrow's total order. This pins that the
-    /// signed-zero rewrite, which sits in filter planning, does not reach it.
-    /// The indexed path is selected here because the single join key is indexed
-    /// and nothing forces the full-scan path.
+    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
+    /// hash join behind it alike, so a source key of `+0.0` updates only the
+    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
+    /// pins that the two are still allowed to disagree: making key matching agree
+    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
+    /// raw bits. Both paths are covered so neither can drift alone.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_indexed_merge_insert_on_float_zero_key() {
+    async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -5120,15 +5121,15 @@ mod tests {
             .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
             .try_build()
             .unwrap()
             .execute_reader(source)
             .await
             .unwrap();
 
-        // Only the +0.0 row is updated, because the index matches keys in arrow's
-        // total order. Checking both sides pins which row was replaced, not just
-        // how many.
+        // Only the +0.0 row is updated. Checking both sides pins which row was
+        // replaced, not just how many; `value = 20` is the -0.0 row.
         assert_eq!(ds.count_rows(None).await.unwrap(), 4);
         for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
             assert_eq!(

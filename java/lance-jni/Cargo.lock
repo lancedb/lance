@@ -3859,6 +3859,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-substrait",
  "futures",
+ "half",
  "jsonb",
  "lance-arrow",
  "lance-core",

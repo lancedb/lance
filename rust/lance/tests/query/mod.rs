@@ -114,8 +114,14 @@ async fn assert_filter_ids(ds: &Dataset, predicate: &str, expected_ids: &[i32]) 
         )]))
         .unwrap();
     let scanned = scanner.try_into_batch().await.unwrap();
-    let ids = scanned["id"].as_primitive::<Int32Type>().values();
-    assert_eq!(&ids[..], expected_ids, "predicate: {predicate}");
+    // Collected as options so a NULL id cannot read back as a real id, and so a
+    // length mismatch fails here rather than silently comparing a prefix.
+    let ids = scanned["id"]
+        .as_primitive::<Int32Type>()
+        .iter()
+        .collect::<Vec<_>>();
+    let expected = expected_ids.iter().copied().map(Some).collect::<Vec<_>>();
+    assert_eq!(ids, expected, "predicate: {predicate}");
 }
 
 // Rebuild a batch using only columns present in the schema (drops _score from FTS results).

@@ -21,7 +21,6 @@ use tokio::try_join;
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
-    signed_zero::rewrite_signed_zero_comparisons,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1838,14 +1837,19 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
-                    search.exact_sargable_query_key()
-                }
+                Self::Query(search) => match search.exact_sargable_query() {
+                    // Neither shape can match NULL, so `IS NOT NULL` adds nothing.
+                    // The signed-zero rewrite turns `x != 0.0` into the second one.
+                    Some(SargableQuery::Equals(value)) if !value.is_null() => {
+                        search.exact_sargable_query_key()
+                    }
+                    Some(SargableQuery::IsIn(values))
+                        if !values.is_empty() && values.iter().all(|value| !value.is_null()) =>
+                    {
+                        search.exact_sargable_query_key()
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
@@ -2627,10 +2631,7 @@ impl PlannerIndexExt for Planner {
         index_info: &dyn IndexInformationProvider,
         use_scalar_index: bool,
     ) -> Result<FilterPlan> {
-        // Runs after `optimize_expr`, which coerces the literal to the column's
-        // type and expands BETWEEN into two comparisons, so the rewrite sees
-        // every zero comparison in one shape.
-        let logical_expr = rewrite_signed_zero_comparisons(self.optimize_expr(filter)?)?;
+        let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
             let mut skip_recheck = false;
@@ -5051,6 +5052,25 @@ mod tests {
                 if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
                     if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
                         if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
         ));
     }
 
