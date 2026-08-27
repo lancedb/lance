@@ -17,7 +17,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use futures::{lock::Mutex, stream::StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
 use lance_io::stream::RecordBatchStream;
@@ -35,11 +35,13 @@ enum ReaderMessage {
 ///
 /// The async scan is driven by one background producer for the lifetime of the
 /// reader. The synchronous Arrow C stream consumer receives batches through a
-/// bounded channel, avoiding a runtime task spawn and cross-thread rendezvous
-/// for every batch while preserving backpressure.
+/// channel with capacity two, avoiding a runtime task spawn and cross-thread
+/// rendezvous for every batch while preserving backpressure. The channel can
+/// queue two batches while the producer holds at most one more pending send.
 pub struct LanceReader {
     schema: SchemaRef,
     receiver: std::sync::Arc<Mutex<mpsc::Receiver<ReaderMessage>>>,
+    cancel_sender: Option<oneshot::Sender<()>>,
     finished: bool,
 }
 
@@ -54,21 +56,28 @@ impl LanceReader {
     pub fn from_stream(mut stream: DatasetRecordBatchStream) -> Self {
         let schema = stream.schema();
         let (sender, receiver) = mpsc::channel(READER_CHANNEL_CAPACITY);
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
         rt().spawn_background(None, async move {
             loop {
                 let next = tokio::select! {
+                    biased;
+                    _ = &mut cancel_receiver => break,
                     _ = sender.closed() => break,
                     next = stream.next() => next,
                 };
-                let Some(batch) = next else {
-                    let _ = sender.send(ReaderMessage::Finished).await;
-                    break;
+                let (message, terminal) = match next {
+                    Some(Ok(batch)) => (ReaderMessage::Batch(Ok(batch)), false),
+                    Some(Err(error)) => (ReaderMessage::Batch(Err(ArrowError::from(error))), true),
+                    None => (ReaderMessage::Finished, true),
                 };
-                if sender
-                    .send(ReaderMessage::Batch(batch.map_err(ArrowError::from)))
-                    .await
-                    .is_err()
-                {
+
+                let sent = tokio::select! {
+                    biased;
+                    _ = &mut cancel_receiver => false,
+                    _ = sender.closed() => false,
+                    result = sender.send(message) => result.is_ok(),
+                };
+                if !sent || terminal {
                     break;
                 }
             }
@@ -76,8 +85,54 @@ impl LanceReader {
         Self {
             schema,
             receiver: std::sync::Arc::new(Mutex::new(receiver)),
+            cancel_sender: Some(cancel_sender),
             finished: false,
         }
+    }
+
+    fn finish(&mut self) {
+        self.cancel_sender.take();
+        self.finished = true;
+    }
+
+    fn cancel_producer(&mut self) {
+        if let Some(cancel_sender) = self.cancel_sender.take() {
+            let _ = cancel_sender.send(());
+        }
+        self.finished = true;
+    }
+
+    fn handle_receive_result(
+        &mut self,
+        result: pyo3::PyResult<Option<ReaderMessage>>,
+    ) -> Option<Result<RecordBatch, ArrowError>> {
+        match result {
+            Ok(Some(ReaderMessage::Batch(Ok(batch)))) => Some(Ok(batch)),
+            Ok(Some(ReaderMessage::Batch(Err(error)))) => {
+                self.finish();
+                Some(Err(error))
+            }
+            Ok(Some(ReaderMessage::Finished)) => {
+                self.finish();
+                None
+            }
+            Ok(None) => {
+                self.finish();
+                Some(Err(ArrowError::ExternalError(Box::new(
+                    std::io::Error::other("Lance reader producer terminated before end of stream"),
+                ))))
+            }
+            Err(error) => {
+                self.cancel_producer();
+                Some(Err(ArrowError::ExternalError(Box::new(error))))
+            }
+        }
+    }
+}
+
+impl Drop for LanceReader {
+    fn drop(&mut self) {
+        self.cancel_producer();
     }
 }
 
@@ -90,27 +145,21 @@ impl Iterator for LanceReader {
         }
         let receiver = self.receiver.clone();
         let recv = async move { receiver.lock().await.recv().await };
-        let result = if tokio::runtime::Handle::try_current().is_ok() {
-            // Blocking this thread's active Tokio runtime can panic or deadlock.
-            // Keep the previous cross-thread rendezvous for this uncommon path.
-            rt().spawn(None, recv)
-        } else {
-            rt().block_on(None, recv)
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                // Tell Tokio that this worker will block before using the
+                // signal-aware cross-thread rendezvous. Without this, a task
+                // spawned onto the same runtime can remain in this worker's
+                // local queue and deadlock.
+                tokio::task::block_in_place(|| rt().spawn(None, recv))
+            }
+            // A current-thread runtime cannot be the multi-threaded Lance
+            // runtime. Hand the receive to Lance's runtime instead of nesting
+            // block_on on the caller's runtime.
+            Ok(_) => rt().spawn(None, recv),
+            Err(_) => rt().block_on(None, recv),
         };
-        match result {
-            Ok(Some(ReaderMessage::Batch(batch))) => Some(batch),
-            Ok(Some(ReaderMessage::Finished)) => {
-                self.finished = true;
-                None
-            }
-            Ok(None) => {
-                self.finished = true;
-                Some(Err(ArrowError::ExternalError(Box::new(
-                    std::io::Error::other("Lance reader producer terminated before end of stream"),
-                ))))
-            }
-            Err(err) => Some(Err(ArrowError::ExternalError(Box::new(err)))),
-        }
+        self.handle_receive_result(result)
     }
 }
 
@@ -177,13 +226,47 @@ mod tests {
     #[test]
     fn test_reader_propagates_stream_errors() {
         let schema = Arc::new(Schema::empty());
-        let batches = stream::iter([Err(DataFusionError::Execution(
-            "expected reader error".to_string(),
-        ))]);
+        let batches = stream::once(async {
+            Err(DataFusionError::Execution(
+                "expected reader error".to_string(),
+            ))
+        })
+        .chain(stream::poll_fn(|_| {
+            panic!("the stream must not be polled after its first error");
+        }));
         let mut reader = make_reader(schema, batches);
 
         let error = reader.next().unwrap().unwrap_err();
         assert!(error.to_string().contains("expected reader error"));
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn test_reader_receive_error_cancels_producer_without_drop() {
+        pyo3::Python::initialize();
+        let schema = Arc::new(Schema::empty());
+        let (drop_sender, drop_receiver) = std::sync::mpsc::channel();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let batches = stream::once(async move {
+            let _drop_notify = DropNotify(drop_sender);
+            started_sender.send(()).ok();
+            std::future::pending::<Result<RecordBatch, DataFusionError>>().await
+        });
+        let mut reader = make_reader(schema, batches);
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the producer should poll the stream");
+        let error = reader
+            .handle_receive_result(Err(pyo3::exceptions::PyKeyboardInterrupt::new_err(
+                "expected interrupt",
+            )))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("expected interrupt"));
+        drop_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("an interrupted receive should cancel the producer");
         assert!(reader.next().is_none());
     }
 
@@ -309,6 +392,29 @@ mod tests {
         let actual = rt()
             .spawn(None, async move { reader.next().unwrap().unwrap() })
             .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_reader_can_be_consumed_from_current_thread_runtime() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = stream::iter([Ok(expected.clone())]);
+        let mut reader = make_reader(schema, batches);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let actual = runtime.block_on(async move { reader.next().unwrap().unwrap() });
         assert_eq!(actual, expected);
     }
 }

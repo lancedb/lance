@@ -77,6 +77,8 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
           tool: protoc
+      - name: Test Rust reader concurrency
+        run: cargo test --profile ci --locked --no-default-features reader::tests
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
