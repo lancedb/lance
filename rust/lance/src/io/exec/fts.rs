@@ -60,8 +60,7 @@ use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
     MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
-    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
-    cross_column_compound_search, exclusive_scaled_score_floor,
+    compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
     flat_bm25_search_stream_with_options_and_scorer, fts_schema, materialized_compound_top_k,
     prepare_bm25_query,
 };
@@ -1007,8 +1006,10 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 &PreFilterSource::None,
                 dataset,
                 &segments,
-                None,
-                None,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask: None,
+                },
             )?;
             let (indexed_row_ids, indexed_scores) = compound_search_with_base_scorer(
                 &indices,

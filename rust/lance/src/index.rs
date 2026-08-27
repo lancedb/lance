@@ -290,7 +290,7 @@ pub(crate) async fn has_append_only_indexed_field_history(
             indexed_field_ids_at_version.extend(historical_field_ids);
         }
 
-        for historical_fragment in historical.fragments() {
+        for historical_fragment in historical.fragments().iter() {
             let Ok(fragment_id) = u32::try_from(historical_fragment.id) else {
                 return false;
             };
