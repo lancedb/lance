@@ -1039,14 +1039,12 @@ impl LoadedHnswGraph {
     fn neighbors_at(&self, level: usize, key: u32) -> &[u32] {
         let row = match &self.level_lookup[level] {
             // `Dense` means row == id, so an id at or beyond the level's row
-            // count addresses nothing. That should be impossible -- the writer
-            // now drops edges outside its own snapshot
-            // (`OnlineHnswBuilder::to_hnsw`) -- but indices written before that
-            // fix are already on disk, and a dangling edge here used to panic
-            // the tokio worker and fail every fresh-tier vector query on the
-            // shard with an unrelated `RecvError`. Treat it exactly like an
-            // absent node: no neighbors, so greedy search stays put and
-            // descends, losing one edge instead of the whole query.
+            // count addresses nothing. The writers now bound what they emit to
+            // the prefix they publish, but indices written before that are
+            // already on disk, and following such an edge panicked the search
+            // instead of degrading it. Treat it exactly like an absent node: no
+            // neighbors, so greedy search stays put and descends, losing one
+            // edge rather than the whole query.
             LevelLookup::Dense if key as usize >= self.level_count[level] => return &[],
             LevelLookup::Dense => key as usize,
             LevelLookup::Sparse(id_to_row) => match id_to_row.get(&key) {
