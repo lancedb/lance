@@ -1724,10 +1724,16 @@ impl Scanner {
                 columns.len()
             )));
         }
-        let column = columns.into_iter().next().ok_or_else(|| {
+        let requested_column = columns.into_iter().next().ok_or_else(|| {
             Error::invalid_input("fts_global_statistics query does not reference a column")
         })?;
         let document_granularity = self.fts_document_granularity(&query.query)?;
+        let column = resolve_fts_field(
+            self.dataset.schema(),
+            &requested_column,
+            document_granularity,
+        )?
+        .canonical_path;
         let segments = load_segments(&self.dataset, &column, document_granularity)
             .await?
             .ok_or_else(|| {
@@ -16724,7 +16730,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         let mut scanner = test_ds.dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new("s-5".into()))
+            .full_text_search(
+                FullTextSearchQuery::new("s-5".into())
+                    .with_column("S".into())
+                    .unwrap(),
+            )
             .unwrap();
         let encoded = scanner.fts_global_statistics().await.unwrap();
         let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
