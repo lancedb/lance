@@ -77,7 +77,8 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
+    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, build_global_bm25_scorer_for_query,
+    fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -115,7 +116,7 @@ use crate::io::exec::filtered_read::{
 use crate::io::exec::fts::{
     BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
     FlatMatchQueryExec, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
-    SharedFtsScorer,
+    SharedFtsScorer, open_fts_segments,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -1681,6 +1682,115 @@ impl Scanner {
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
         self.full_text_query = Some(query);
         Ok(self)
+    }
+
+    /// Return opaque protobuf-encoded global BM25 statistics for this scanner's
+    /// full-text query.
+    ///
+    /// Statistics are aggregated across every committed physical segment of
+    /// the selected logical FTS index. The payload is bound to the current
+    /// dataset version, exact segment UUIDs, indexed column, document
+    /// granularity, and all query terms including fuzzy expansions. It does not
+    /// include documents in unindexed fragments.
+    ///
+    /// The query must resolve to exactly one indexed column. The returned bytes
+    /// are an opaque transport handle intended for Lance bindings and
+    /// distributed query planning.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::scalar::FullTextSearchQuery;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.full_text_search(
+    ///     FullTextSearchQuery::new("hello".to_string()).with_column("text".to_string())?,
+    /// )?;
+    /// let statistics = scanner.fts_global_statistics().await?;
+    /// assert!(!statistics.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fts_global_statistics(&self) -> Result<Vec<u8>> {
+        let query = self.full_text_query.as_ref().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics requires a full-text query")
+        })?;
+        let query = self.resolve_full_text_search_query(query).await?;
+        validate_fts_query_contract(&query.query)?;
+
+        let columns = query.columns();
+        if columns.len() != 1 {
+            return Err(Error::not_supported(format!(
+                "fts_global_statistics requires exactly one indexed column, got {}",
+                columns.len()
+            )));
+        }
+        let column = columns.into_iter().next().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics query does not reference a column")
+        })?;
+        let document_granularity = self.fts_document_granularity(&query.query)?;
+        let segments = load_segments(&self.dataset, &column, document_granularity)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "No Inverted index found for column {column} and document granularity {document_granularity:?}"
+                ))
+            })?;
+        load_segment_details(&self.dataset, &column, &segments).await?;
+        let indices =
+            open_fts_segments(&self.dataset, &column, &segments, &NoOpMetricsCollector).await?;
+        let params = query.params();
+        let scorer =
+            build_global_bm25_scorer_for_query(&indices, &query.query, &params, None).await?;
+
+        let num_docs = u64::try_from(scorer.num_docs).map_err(|_| {
+            Error::internal(format!(
+                "FTS document count {} exceeds u64::MAX",
+                scorer.num_docs
+            ))
+        })?;
+        let total_tokens = scorer.total_tokens;
+        let mut terms = scorer.token_docs.into_iter().collect::<Vec<_>>();
+        terms.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let terms = terms
+            .into_iter()
+            .map(|(term, document_frequency)| {
+                let document_frequency = u64::try_from(document_frequency).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS document frequency for term '{term}' exceeds u64::MAX"
+                    ))
+                })?;
+                Ok(crate::pb::FtsTermStatisticsProto {
+                    term,
+                    document_frequency,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index_name = segments
+            .first()
+            .ok_or_else(|| Error::internal("FTS index has no committed segments"))?
+            .name
+            .clone();
+        let document_granularity = match document_granularity {
+            DocumentGranularity::Row => "row",
+            DocumentGranularity::ListElement => "list_element",
+        };
+        let mut segment_uuids = segments
+            .into_iter()
+            .map(|segment| segment.uuid.to_string())
+            .collect::<Vec<_>>();
+        segment_uuids.sort_unstable();
+        Ok(crate::pb::FtsGlobalStatisticsProto {
+            format_version: crate::pb::FtsGlobalStatisticsFormatVersion::V1 as i32,
+            dataset_version: self.dataset.version_id(),
+            index_name,
+            column,
+            segment_uuids,
+            total_tokens,
+            num_docs,
+            terms,
+            document_granularity: document_granularity.to_string(),
+        }
+        .encode_to_vec())
     }
 
     /// Set a filter using a Substrait ExtendedExpression message
@@ -7356,7 +7466,7 @@ pub mod test_dataset {
 #[cfg(test)]
 mod test {
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
     use std::vec;
 
@@ -16603,5 +16713,50 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .as_primitive::<Int32Type>();
             assert_eq!(i_array.values(), &[expected_i]);
         }
+    }
+
+    #[tokio::test]
+    async fn test_fts_global_statistics_cover_all_committed_segments() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_segmented_fts_index().await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s-5".into()))
+            .unwrap();
+        let encoded = scanner.fts_global_statistics().await.unwrap();
+        let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
+
+        assert_eq!(
+            statistics.format_version,
+            crate::pb::FtsGlobalStatisticsFormatVersion::V1 as i32
+        );
+        assert_eq!(statistics.dataset_version, test_ds.dataset.version_id());
+        assert_eq!(statistics.index_name, "s_idx");
+        assert_eq!(statistics.column, "s");
+        assert_eq!(statistics.document_granularity, "row");
+        assert_eq!(statistics.segment_uuids.len(), 2);
+        assert_eq!(statistics.num_docs, 400);
+        assert!(statistics.total_tokens > 0);
+        let term_document_frequencies = statistics
+            .terms
+            .iter()
+            .map(|term| (term.term.as_str(), term.document_frequency))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(term_document_frequencies.get("s"), Some(&400));
+        assert_eq!(term_document_frequencies.get("5"), Some(&1));
+        assert!(
+            statistics
+                .terms
+                .windows(2)
+                .all(|terms| terms[0].term < terms[1].term)
+        );
+        assert_eq!(
+            scanner.fts_global_statistics().await.unwrap(),
+            encoded,
+            "opaque statistics serialization must be deterministic"
+        );
     }
 }

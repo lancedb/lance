@@ -41,6 +41,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -53,6 +54,15 @@ class LanceScannerFullTextSearchTest {
         "memory://fts_java_match",
         FullTextQuery.match("hello", "doc", DocumentGranularity.ROW),
         2L);
+  }
+
+  @Test
+  void testGetFtsGlobalStatistics() throws Exception {
+    runFtsQuery(
+        "memory://fts_java_global_statistics",
+        FullTextQuery.match("hello", "doc", DocumentGranularity.ROW),
+        2L,
+        true);
   }
 
   @Test
@@ -108,6 +118,12 @@ class LanceScannerFullTextSearchTest {
   }
 
   private void runFtsQuery(String uri, FullTextQuery query, long expectedTotal) throws Exception {
+    runFtsQuery(uri, query, expectedTotal, false);
+  }
+
+  private void runFtsQuery(
+      String uri, FullTextQuery query, long expectedTotal, boolean verifyGlobalStatistics)
+      throws Exception {
 
     Schema schema =
         new Schema(
@@ -168,6 +184,13 @@ class LanceScannerFullTextSearchTest {
                         Collections.singletonList("title"), IndexType.INVERTED, indexParams)
                     .withIndexName("title_idx")
                     .build());
+
+            if (verifyGlobalStatistics) {
+              FtsGlobalStatistics statistics = dataset.getFtsGlobalStatistics(query);
+              byte[] encoded = statistics.toBytes();
+              assertTrue(encoded.length > 0);
+              assertArrayEquals(encoded, FtsGlobalStatistics.fromBytes(encoded).toBytes());
+            }
 
             ScanOptions scanOptions = new ScanOptions.Builder().fullTextQuery(query).build();
 

@@ -3773,6 +3773,91 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
     Ok(())
 }
 
+/// Build one corpus-wide BM25 scorer containing every term required by a
+/// one-column FTS query.
+///
+/// Compound queries can contain multiple leaves with different fuzzy and
+/// phrase parameters. This helper applies each leaf's effective parameters,
+/// collects fuzzy expansions across every supplied segment, and returns one
+/// scorer whose term table is complete for later injection into any subset of
+/// those segments.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use lance_core::Result;
+/// # use lance_index::scalar::inverted::{
+/// #     InvertedIndex, build_global_bm25_scorer_for_query,
+/// #     query::{FtsQuery, FtsSearchParams},
+/// # };
+/// # async fn example(
+/// #     indices: &[Arc<InvertedIndex>],
+/// #     query: &FtsQuery,
+/// #     params: &FtsSearchParams,
+/// # ) -> Result<()> {
+/// let scorer = build_global_bm25_scorer_for_query(indices, query, params, None).await?;
+/// assert!(scorer.num_docs() > 0);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn build_global_bm25_scorer_for_query(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    metrics: Option<&dyn MetricsCollector>,
+) -> Result<MemBM25Scorer> {
+    let first_index = indices
+        .first()
+        .ok_or_else(|| Error::invalid_input("FTS index requires at least one segment"))?;
+    let mut leaf_queries = Vec::new();
+    collect_leaf_queries(query, &mut leaf_queries)?;
+    if leaf_queries.is_empty() {
+        return Err(Error::invalid_input(
+            "FTS query must contain at least one scoring leaf",
+        ));
+    }
+
+    let mut combined: Option<MemBM25Scorer> = None;
+    for leaf in leaf_queries {
+        let effective_params = leaf.effective_params(params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let prepared =
+            prepare_bm25_query(indices, tokens, &effective_params, metrics, None).await?;
+        let leaf_scorer = prepared.scorer().as_ref().clone();
+        match &mut combined {
+            None => combined = Some(leaf_scorer),
+            Some(combined) => {
+                if combined.total_tokens != leaf_scorer.total_tokens
+                    || combined.num_docs != leaf_scorer.num_docs
+                {
+                    return Err(Error::internal(
+                        "FTS query leaves produced inconsistent corpus statistics",
+                    ));
+                }
+                for (term, document_frequency) in leaf_scorer.token_docs {
+                    match combined.token_docs.entry(term) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(document_frequency);
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry)
+                            if *entry.get() != document_frequency =>
+                        {
+                            return Err(Error::internal(format!(
+                                "FTS term '{}' produced inconsistent document frequencies {} and {}",
+                                entry.key(),
+                                entry.get(),
+                                document_frequency
+                            )));
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    combined.ok_or_else(|| Error::internal("FTS global scorer was not initialized"))
+}
+
 struct PreparedLeaf {
     query: Arc<PreparedBm25Query>,
     params: Arc<FtsSearchParams>,

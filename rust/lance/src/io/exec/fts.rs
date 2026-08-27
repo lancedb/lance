@@ -261,7 +261,7 @@ async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
-    metrics: &IndexMetrics,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Arc<InvertedIndex>> {
     let index = dataset
         .open_scalar_index(column, &segment.uuid, metrics)
@@ -282,11 +282,11 @@ async fn open_fts_segment(
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
-async fn open_fts_segments(
+pub(crate) async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
-    metrics: &IndexMetrics,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
     try_join_all(
         segments

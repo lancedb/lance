@@ -24,7 +24,7 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 pub use compound::{
-    compound_search, compound_search_prepared_match,
+    build_global_bm25_scorer_for_query, compound_search, compound_search_prepared_match,
     compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
     compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
     materialized_compound_top_k,
