@@ -1362,14 +1362,19 @@ impl MemTableScanner {
         // so run it here to pick the plan from the same expression the full scan
         // would evaluate. Coercion has to happen before the signed-zero rewrite
         // inside it, otherwise `value = 0` keeps its integer literal and gets a
-        // bit-exact lookup while the scan beside it answers per IEEE 754.
-        // Skipping the fast path on the error branch is the safe direction.
+        // bit-exact lookup while the scan beside it answers per IEEE 754. An
+        // expression `optimize_expr` rejects is reported by `plan_full_scan`,
+        // which runs the same pass, so there is nothing to report here.
         let planner = Planner::new(self.schema.clone());
-        let filter = planner.optimize_expr(self.filter.clone()?).ok()?;
-        let filter = &filter;
+        let filter = planner
+            .optimize_expr(self.filter.clone()?)
+            .inspect_err(|error| {
+                log::debug!("memtable index fast path skipped: {error}");
+            })
+            .ok()?;
 
         // Simple pattern matching for common predicates
-        match filter {
+        match &filter {
             // `simplify` turns an `IN` list of three or fewer values back into an
             // OR chain of equalities, and the signed-zero rewrite then turns any
             // zero among them into a two-element list of its own, so the fast path
@@ -1377,7 +1382,7 @@ impl MemTableScanner {
             Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
                 let mut column = None;
                 let mut values = Vec::new();
-                if self.collect_or_equalities(filter, &mut column, &mut values) {
+                if self.collect_or_equalities(&filter, &mut column, &mut values) {
                     return Some(ScalarPredicate::In {
                         column: column?,
                         values,

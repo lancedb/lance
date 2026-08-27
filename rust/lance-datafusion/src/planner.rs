@@ -1027,9 +1027,7 @@ impl Planner {
         let expr = simplifier.simplify(expr)?;
 
         // Last, so the rewrite sees literals already coerced to the column's type
-        // and BETWEEN already expanded into two comparisons. Every caller that
-        // compiles an expression for evaluation goes through here, which is what
-        // keeps a filter and a projected copy of the same predicate in agreement.
+        // and BETWEEN already expanded into two comparisons.
         let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)

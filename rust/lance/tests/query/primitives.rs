@@ -280,9 +280,12 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         .await
 }
 
-/// A rewritten zero predicate still has to reach the scalar index. Without this,
-/// the five index configurations above could all quietly fall back to a full scan
-/// plus refine and keep returning the right rows.
+/// A rewritten zero predicate still has to reach a scalar index. Without this,
+/// the rewrite could reshape the predicate into something `maybe_indexed_column`
+/// no longer recognizes, and every zero filter would quietly fall back to a full
+/// scan plus refine while still returning the right rows. Only the default BTree
+/// index is covered here; the other index types are exercised for row equality by
+/// `test_query_float_special_values`, not for pushdown.
 #[tokio::test]
 async fn test_float_zero_predicate_uses_scalar_index() {
     let batch = RecordBatch::try_from_iter(vec![

@@ -5085,7 +5085,8 @@ mod tests {
     /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
     /// pins that the two are still allowed to disagree: making key matching agree
     /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
-    /// raw bits. Both paths are covered so neither can drift alone.
+    /// raw bits. Both settings of `use_index` are exercised; which one the planner
+    /// picks for a one-row source is not asserted.
     #[rstest::rstest]
     #[tokio::test]
     async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {

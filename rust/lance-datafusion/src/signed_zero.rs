@@ -27,11 +27,13 @@ use lance_core::Result;
 /// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
 /// | `x IN (0, ..)`               | the missing encoding is added |
 /// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
-/// | `x IS NOT DISTINCT FROM 0`   | the same against each encoding, or'd |
-/// | `x IS DISTINCT FROM 0`       | the same against each encoding, and'd |
+/// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
+/// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
 ///
-/// The scalar indices select candidates by the same total order, so they answer
-/// a rewritten predicate the same way a scan does.
+/// Both encodings have to be spelled out because a scalar index keys on the bit
+/// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
+/// bloom filter hashes the value. The approximate indices recheck, so widening
+/// can only cost them a candidate, never a row.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -130,7 +132,10 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
         }) => {
             // A zero literal on the probe side needs the same treatment. The list
             // elements are arbitrary expressions there, so expand into the
-            // equality form the binary arm already covers.
+            // equality form the binary arm already covers. A probe that is a
+            // literal but not a zero returns here rather than falling through to
+            // the list, which costs nothing: it compares the same way against
+            // either encoding.
             if let Expr::Literal(value, metadata) = expr.as_ref() {
                 let (negative, positive) = zero_encodings(value)?;
                 let matches_any = list
