@@ -1332,6 +1332,11 @@ impl MemTableScanner {
                     let Expr::Literal(lit, _) = item else {
                         return false;
                     };
+                    // A NULL among the values makes `IN` return NULL rather than
+                    // false, which a key lookup does not reproduce; fall back.
+                    if lit.is_null() {
+                        return false;
+                    }
                     let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
                         return false;
                     };
