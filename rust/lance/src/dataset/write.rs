@@ -1913,6 +1913,32 @@ mod tests {
         .await
     }
 
+    async fn scan_sorted_ids(dataset: &Dataset) -> Vec<i32> {
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
     fn test_auto_cleanup_disabled_by_default() {
         // Auto-cleanup must be off by default: the cleanup hook is expensive on
@@ -2927,38 +2953,9 @@ mod tests {
             );
         }
 
-        // Read the fragment back through the base store. This only works on a
-        // scheme whose bytes outlive a single `ObjectStore` instance: a write
-        // resolves its base stores through a different `ObjectStoreRegistry`
-        // than the reader uses, so `memory://` would mint an empty store here.
-        let batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            5
-        );
-
-        // Same through a freshly opened dataset, which shares nothing with the
-        // writer but the URI.
+        assert_eq!(scan_sorted_ids(&dataset).await, (0..5).collect::<Vec<_>>());
         let reopened = Dataset::open(&primary_uri).await.unwrap();
-        let batches = reopened
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            5
-        );
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..5).collect::<Vec<_>>());
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
         let mut data_gen2 =
@@ -3153,6 +3150,9 @@ mod tests {
                 .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
         );
 
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..2).collect::<Vec<_>>());
+
         // Test validation: cannot specify initial_bases in OVERWRITE mode
         let mut data_gen3 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
@@ -3274,6 +3274,11 @@ mod tests {
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
+
+        let mut expected: Vec<i32> = (0..3).chain(0..2).chain(0..4).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
 
         // Test validation: cannot specify initial_bases in APPEND mode
         let mut data_gen4 =
@@ -4392,23 +4397,10 @@ mod tests {
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
 
-        // count_rows is served from manifest metadata; scan the reopened
-        // dataset so the rows actually come off primary, base1
-        // (is_dataset_root) and base2 (not a dataset root), resolved through a
-        // registry that shares nothing with the writer.
+        let mut expected: Vec<i32> = (0..6).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
         let reopened = Dataset::open(&primary_uri).await.unwrap();
-        let batches = reopened
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            21
-        );
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
     }
 
     /// `target_all_bases` resolves to every registered base at execution
@@ -4498,6 +4490,11 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![Some(1), Some(2)]);
+
+        let mut expected: Vec<i32> = (0..3).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
 
         // Cannot be combined with explicit target bases.
         let mut data_gen4 =
@@ -4614,6 +4611,8 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+        let reopened = Dataset::open(&create_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..9).collect::<Vec<_>>());
     }
 
     #[tokio::test]
