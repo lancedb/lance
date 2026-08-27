@@ -1282,10 +1282,6 @@ impl MemTableScanner {
         }
     }
 
-    /// Extract a BTree-compatible predicate from the filter.
-    ///
-    /// This method also coerces literal values to match the column's data type
-    /// (e.g., Int64 literal -> Int32 when the column is Int32).
     /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
     /// values, or return false and leave the caller to fall back to a full scan.
     fn collect_or_equalities(
@@ -1357,6 +1353,10 @@ impl MemTableScanner {
         }
     }
 
+    /// Extract a BTree-compatible predicate from the filter.
+    ///
+    /// This method also coerces literal values to match the column's data type
+    /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
         // `filter()` stores the parsed expression without running `optimize_expr`,
         // so run it here to pick the plan from the same expression the full scan
