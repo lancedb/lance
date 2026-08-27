@@ -48,11 +48,12 @@ read and write APIs by default. This avoids requiring a provider-native copy
 operation and works across different object stores.
 
 Set `LANCE_IO_SERVER_SIDE_COPY_ENABLED` to a truthy value (`1`, `true`, `on`,
-`yes`, or `y`, case-insensitive) to opt same-store cloud copies into the
-provider-native server-side copy operation. Cross-store and local copies do not
-use this setting. Native copy can reduce client bandwidth and transfer cost, but
-it requires copy support from the object-store integration and is subject to the
-provider request's timeout and retry behavior.
+`yes`, or `y`, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.
 
 ## Per-Base Configuration
 

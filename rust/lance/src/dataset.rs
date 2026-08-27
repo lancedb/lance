@@ -3338,9 +3338,10 @@ impl Dataset {
         };
 
         let configured_io_parallelism = src_ds.object_store.io_parallelism();
-        let uses_streaming_copy = !src_ds.object_store.uses_server_side_copy(&target_store)
-            && !(src_ds.object_store.has_direct_local_paths()
-                && target_store.has_direct_local_paths());
+        // Provider-native copy can fall back to streaming for large objects, so every
+        // non-direct-local transfer stays within the bounded file-copy window.
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
         let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
             Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
             Err(std::env::VarError::NotPresent) => None,

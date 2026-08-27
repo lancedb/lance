@@ -87,7 +87,7 @@ fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
 }
 
 #[rstest]
-#[case::server_side_copy(64, false, None, 64)]
+#[case::direct_local_copy(64, false, None, 64)]
 #[case::streaming_default_cap(64, true, None, 4)]
 #[case::streaming_configured_below_cap(2, true, None, 2)]
 #[case::streaming_override(64, true, Some(17), 17)]
