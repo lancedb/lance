@@ -29,6 +29,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
 
@@ -228,6 +230,7 @@ impl GcsStoreProvider {
 
         let operator = Operator::from_iter::<Gcs>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
