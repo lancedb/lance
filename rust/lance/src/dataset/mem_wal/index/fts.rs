@@ -1023,7 +1023,7 @@ pub struct FtsMemIndex {
 /// starts a detached tiered merge; dropping the query drops all residual
 /// postings.
 #[derive(Debug)]
-pub(crate) struct QueryLocalFtsIndex {
+pub struct QueryLocalFtsIndex {
     inner: FtsMemIndex,
 }
 
@@ -1057,7 +1057,8 @@ impl QueryLocalFtsIndex {
             .insert_with_row_ids_for_terms(batch, row_ids, terms)
     }
 
-    pub(crate) fn doc_count(&self) -> usize {
+    #[cfg(test)]
+    fn doc_count(&self) -> usize {
         self.inner.doc_count()
     }
 

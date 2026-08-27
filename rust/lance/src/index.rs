@@ -269,9 +269,8 @@ pub(crate) async fn has_append_only_indexed_field_history(
         if build_version == current_version {
             continue;
         }
-        let historical = match dataset.checkout_version(build_version).await {
-            Ok(historical) => historical,
-            Err(_) => return false,
+        let Ok(historical) = dataset.checkout_version(build_version).await else {
+            return false;
         };
         let mut indexed_field_ids_at_version = HashSet::new();
         for segment in segments

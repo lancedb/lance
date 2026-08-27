@@ -2872,7 +2872,7 @@ async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
     .unwrap();
     let object_writer = dataset
         .object_store
-        .create(&dataset.data_dir().join(&replacement_file.path))
+        .create(&dataset.data_dir().join(replacement_file.path.as_str()))
         .await
         .unwrap();
     let mut writer = lance_file::versions::v2_1::create_writer(
@@ -3020,7 +3020,7 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
     let replacement_path = dataset
         .data_file_dir_for_base(Some(2))
         .unwrap()
-        .join(&relative_path);
+        .join(relative_path.as_str());
     let object_writer = dataset
         .object_store(Some(2))
         .await
@@ -3187,7 +3187,7 @@ async fn test_partial_compound_hybrid_rejects_rebound_registered_base() {
     .unwrap();
     let (base_b_store, base_b_root) = ObjectStore::from_uri(&base_b).await.unwrap();
     let object_writer = base_b_store
-        .create(&base_b_root.join(&relative_path))
+        .create(&base_b_root.join(relative_path.as_str()))
         .await
         .unwrap();
     let mut writer = lance_file::versions::v2_1::create_writer(
