@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
+use lance_datafusion::signed_zero::rewrite_signed_zero_comparisons;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
@@ -1287,7 +1288,13 @@ impl MemTableScanner {
     /// This method also coerces literal values to match the column's data type
     /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
-        let filter = self.filter.as_ref()?;
+        // `filter()` stores the parsed expression without running `optimize_expr`,
+        // so the zero rewrite has to be applied here as well. Otherwise a float
+        // zero predicate gets a bit-exact index lookup while the scan beside it
+        // answers per IEEE 754, and the index's presence decides the row set.
+        // Skipping the fast path on the error branch is the safe direction.
+        let filter = rewrite_signed_zero_comparisons(self.filter.clone()?).ok()?;
+        let filter = &filter;
 
         // Simple pattern matching for common predicates
         match filter {
@@ -1497,6 +1504,50 @@ mod tests {
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.schema().field(0).name(), "id");
+    }
+
+    /// The index fast path is chosen from the filter the caller set, which has not
+    /// been through `optimize_expr`. Without the rewrite in
+    /// `extract_btree_predicate`, a float zero would get a bit-exact lookup while
+    /// the full scan beside it answers per IEEE 754.
+    #[test]
+    fn test_extract_btree_predicate_covers_both_zero_encodings() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        let mut scanner = MemTableScanner::new(
+            batch_store,
+            Arc::new(IndexStore::new()),
+            schema as SchemaRef,
+        );
+
+        scanner.filter("value = 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate over both encodings, got {other:?}"),
+        }
+
+        // `<` has to compare against the negative encoding, or the lookup admits a
+        // row the predicate excludes.
+        scanner.filter("value < 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::Range { upper, .. }) => {
+                assert_eq!(upper, Some(ScalarValue::Float64(Some(-0.0))));
+            }
+            other => panic!("expected a Range predicate, got {other:?}"),
+        }
     }
 
     #[tokio::test]

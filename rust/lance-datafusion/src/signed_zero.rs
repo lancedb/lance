@@ -97,19 +97,22 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                     }));
                 }
                 Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
-                    // These are `=` and `!=` extended to NULL, so widening them
-                    // into a pair keeps the NULL handling that `IN` would drop.
-                    let probe = |zero| {
-                        Expr::BinaryExpr(BinaryExpr {
-                            left: Box::new(other.clone()),
-                            op,
-                            right: Box::new(Expr::Literal(zero, metadata.clone())),
-                        })
-                    };
-                    return Some(if op == Operator::IsNotDistinctFrom {
-                        probe(negative).or(probe(positive))
+                    // Spelled with `IS [NOT] NULL` around the list rather than as
+                    // a pair of distinct-from probes, so that a second pass finds
+                    // both encodings already listed and leaves this alone. A pair
+                    // of probes would expand again on every pass.
+                    let covered = Expr::InList(InList {
+                        expr: Box::new(other.clone()),
+                        list: vec![
+                            Expr::Literal(negative, metadata.clone()),
+                            Expr::Literal(positive, metadata.clone()),
+                        ],
+                        negated: op == Operator::IsDistinctFrom,
+                    });
+                    return Some(if op == Operator::IsDistinctFrom {
+                        other.clone().is_null().or(covered)
                     } else {
-                        probe(negative).and(probe(positive))
+                        other.clone().is_not_null().and(covered)
                     });
                 }
                 _ => return None,
@@ -319,13 +322,41 @@ mod tests {
     #[case::is_not_distinct_from(Operator::IsNotDistinctFrom)]
     #[case::is_distinct_from(Operator::IsDistinctFrom)]
     fn distinct_from_keeps_its_null_handling(#[case] op: Operator) {
-        let probe = |zero| compare(col("x"), op, lit(zero));
-        let expected = if op == Operator::IsNotDistinctFrom {
-            probe(-0.0).or(probe(0.0))
+        let covered = Expr::InList(InList {
+            expr: Box::new(col("x")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: op == Operator::IsDistinctFrom,
+        });
+        let expected = if op == Operator::IsDistinctFrom {
+            col("x").is_null().or(covered)
         } else {
-            probe(-0.0).and(probe(0.0))
+            col("x").is_not_null().and(covered)
         };
         assert_eq!(rewrite(compare(col("x"), op, lit(0.0))), expected);
+    }
+
+    /// Several paths optimize the same expression more than once, so every shape
+    /// the rewrite emits has to be a fixed point.
+    #[rstest]
+    #[case::lt(col("x").lt(lit(0.0)))]
+    #[case::gt_eq(col("x").gt_eq(lit(0.0)))]
+    #[case::eq(col("x").eq(lit(0.0)))]
+    #[case::not_eq(col("x").not_eq(lit(0.0)))]
+    #[case::in_list(Expr::InList(InList {
+        expr: Box::new(col("x")),
+        list: vec![lit(0.0), lit(5.0)],
+        negated: false,
+    }))]
+    #[case::zero_probe(Expr::InList(InList {
+        expr: Box::new(lit(0.0)),
+        list: vec![col("a"), col("b")],
+        negated: false,
+    }))]
+    #[case::is_not_distinct_from(compare(col("x"), Operator::IsNotDistinctFrom, lit(0.0)))]
+    #[case::is_distinct_from(compare(col("x"), Operator::IsDistinctFrom, lit(0.0)))]
+    fn rewriting_twice_changes_nothing(#[case] expr: Expr) {
+        let once = rewrite(expr);
+        assert_eq!(rewrite(once.clone()), once);
     }
 
     #[rstest]
