@@ -7535,12 +7535,10 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::{
-        INVERTED_INDEX_VERSION_V1, InvertedListFormatVersion,
-    };
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
+    use lance_index::scalar::inverted::{INVERTED_INDEX_VERSION_V1, InvertedListFormatVersion};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;

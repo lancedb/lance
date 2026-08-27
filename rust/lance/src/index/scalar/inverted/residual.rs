@@ -15,7 +15,7 @@ use std::{
     fmt::Display,
     ops::Range,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -76,6 +76,7 @@ struct BudgetedMemoryStore {
     uploaded_bytes: Arc<AtomicUsize>,
     budget_exceeded: Arc<AtomicBool>,
     max_uploaded_bytes: usize,
+    build_lifetime: Option<Weak<ResidualFtsBuildLifetime>>,
 }
 
 impl BudgetedMemoryStore {
@@ -98,7 +99,13 @@ impl BudgetedMemoryStore {
             uploaded_bytes,
             budget_exceeded,
             max_uploaded_bytes,
+            build_lifetime: None,
         }
+    }
+
+    fn with_build_lifetime(mut self, build_lifetime: Weak<ResidualFtsBuildLifetime>) -> Self {
+        self.build_lifetime = Some(build_lifetime);
+        self
     }
 
     fn reserve(&self, bytes: usize) -> OsResult<()> {
@@ -173,12 +180,27 @@ impl OsObjectStore for BudgetedMemoryStore {
         opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
         let inner = self.inner.put_multipart_opts(location, opts).await?;
+        let build_lifetime = match &self.build_lifetime {
+            Some(build_lifetime) => {
+                Some(
+                    build_lifetime
+                        .upgrade()
+                        .ok_or_else(|| object_store::Error::Generic {
+                            store: "BudgetedMemoryStore",
+                            source: "residual FTS build lifetime ended before multipart creation"
+                                .into(),
+                        })?,
+                )
+            }
+            None => None,
+        };
         Ok(Box::new(BudgetedMultipartUpload {
             inner: Some(inner),
             uploaded_bytes: self.uploaded_bytes.clone(),
             budget_exceeded: self.budget_exceeded.clone(),
             max_uploaded_bytes: self.max_uploaded_bytes,
             part_bytes: 0,
+            build_lifetime,
         }))
     }
 
@@ -237,6 +259,9 @@ struct BudgetedMultipartUpload {
     budget_exceeded: Arc<AtomicBool>,
     max_uploaded_bytes: usize,
     part_bytes: usize,
+    // Keep this field last: implicit struct drop must destroy the inner upload
+    // and its retained parts before releasing group admission.
+    build_lifetime: Option<Arc<ResidualFtsBuildLifetime>>,
 }
 
 struct TransientBudgetReservation {
@@ -308,6 +333,7 @@ impl MultipartUpload for BudgetedMultipartUpload {
         let result = inner.complete().await;
         if result.is_ok() {
             drop(self.inner.take());
+            drop(self.build_lifetime.take());
         }
         result
     }
@@ -319,7 +345,12 @@ impl MultipartUpload for BudgetedMultipartUpload {
                 source: "residual FTS multipart upload is already completed".into(),
             });
         };
-        inner.abort().await
+        let result = inner.abort().await;
+        if result.is_ok() {
+            drop(self.inner.take());
+            drop(self.build_lifetime.take());
+        }
+        result
     }
 }
 
@@ -390,6 +421,7 @@ struct ActiveResidualFtsBuilds {
 static ACTIVE_RESIDUAL_FTS_BUILDS: LazyLock<Mutex<ActiveResidualFtsBuilds>> =
     LazyLock::new(|| Mutex::new(ActiveResidualFtsBuilds::default()));
 
+#[derive(Debug)]
 struct ResidualFtsBuildClaim {
     group: ResidualFtsGroupKey,
     fragments: Vec<ResidualFtsFragmentKey>,
@@ -431,6 +463,7 @@ impl Drop for ResidualFtsBuildClaim {
     }
 }
 
+#[derive(Debug)]
 struct ResidualFtsBuildLifetime {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _claim: ResidualFtsBuildClaim,
@@ -791,20 +824,6 @@ async fn build_residual_segment(
     )
     .await?;
 
-    let mut object_store = LanceObjectStore::memory();
-    object_store.inner = Arc::new(BudgetedMemoryStore::with_counter(
-        group_accounted_bytes.clone(),
-        group_budget_exceeded.clone(),
-        MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
-    ));
-    let object_store = Arc::new(object_store);
-    let index_dir = Path::from(format!("residual-{fragment_id}"));
-    let private_cache = Arc::new(LanceCache::no_cache());
-    let store = Arc::new(LanceIndexStore::new(
-        object_store.clone(),
-        index_dir.clone(),
-        private_cache.clone(),
-    ));
     // Bound the builder's working set in addition to the row admission limit.
     // The serialized store is checked before the value can enter the cache.
     let params = params
@@ -819,6 +838,7 @@ async fn build_residual_segment(
         MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
         MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
     )?;
+    let weak_build_lifetime = Arc::downgrade(&build_lifetime);
     let fragment_build_lifetime = Arc::new(ResidualFtsFragmentBuildLifetime {
         _group: build_lifetime,
         _working_set: TransientBudgetReservation {
@@ -826,6 +846,23 @@ async fn build_residual_segment(
             bytes: MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
         },
     });
+    let mut object_store = LanceObjectStore::memory();
+    object_store.inner = Arc::new(
+        BudgetedMemoryStore::with_counter(
+            group_accounted_bytes.clone(),
+            group_budget_exceeded.clone(),
+            MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+        )
+        .with_build_lifetime(weak_build_lifetime),
+    );
+    let object_store = Arc::new(object_store);
+    let index_dir = Path::from(format!("residual-{fragment_id}"));
+    let private_cache = Arc::new(LanceCache::no_cache());
+    let store = Arc::new(LanceIndexStore::new(
+        object_store.clone(),
+        index_dir.clone(),
+        private_cache.clone(),
+    ));
     let mut builder =
         InvertedIndexBuilder::new_with_fragment_mask(params, Some(u64::from(fragment_id) << 32))
             .with_build_lifetime(fragment_build_lifetime.clone());
@@ -1287,6 +1324,35 @@ mod tests {
         }
     }
 
+    async fn test_build_lifetime(
+        uuid: u128,
+    ) -> (
+        Arc<ResidualFtsBuildLifetime>,
+        Arc<Semaphore>,
+        ResidualFtsGroupKey,
+        Vec<ResidualFtsFragmentKey>,
+    ) {
+        let group = group_key_with_uuid(uuid);
+        let fragments = group.members.to_vec();
+        let claim = ResidualFtsBuildClaim::try_acquire(&group, &fragments)
+            .expect("build should own the working set");
+        let resources = Arc::new(Semaphore::new(1));
+        let permit = resources
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("build resource semaphore closed");
+        (
+            Arc::new(ResidualFtsBuildLifetime {
+                _permit: permit,
+                _claim: claim,
+            }),
+            resources,
+            group,
+            fragments,
+        )
+    }
+
     struct PressureKey(&'static str);
 
     impl CacheKey for PressureKey {
@@ -1305,6 +1371,32 @@ mod tests {
     struct DropObservedUpload {
         accounted_bytes: Arc<AtomicUsize>,
         accounted_at_drop: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct BlockingAbortUpload {
+        abort_started: Arc<tokio::sync::Notify>,
+        release_abort: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for BlockingAbortUpload {
+        fn put_part(&mut self, _payload: PutPayload) -> UploadPart {
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> OsResult<PutResult> {
+            Ok(PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+
+        async fn abort(&mut self) -> OsResult<()> {
+            self.abort_started.notify_one();
+            self.release_abort.notified().await;
+            Ok(())
+        }
     }
 
     impl Drop for DropObservedUpload {
@@ -1380,20 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_work_retains_group_claim_and_permit() {
-        let group = group_key_with_uuid(5);
-        let fragments = group.members.to_vec();
-        let claim = ResidualFtsBuildClaim::try_acquire(&group, &fragments)
-            .expect("build should own the working set");
-        let resources = Arc::new(Semaphore::new(1));
-        let permit = resources
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("build resource semaphore closed");
-        let lifetime = Arc::new(ResidualFtsBuildLifetime {
-            _permit: permit,
-            _claim: claim,
-        });
+        let (lifetime, resources, group, fragments) = test_build_lifetime(5).await;
         let detached_work = lifetime.clone();
         drop(lifetime);
 
@@ -1628,6 +1707,7 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_success_drops_parts_before_copy_reservation() {
+        let (build_lifetime, resources, group, fragments) = test_build_lifetime(7).await;
         let accounted_bytes = Arc::new(AtomicUsize::new(0));
         let exceeded = Arc::new(AtomicBool::new(false));
         let accounted_at_drop = Arc::new(AtomicUsize::new(0));
@@ -1640,13 +1720,16 @@ mod tests {
             budget_exceeded: exceeded,
             max_uploaded_bytes: 8,
             part_bytes: 0,
+            build_lifetime: Some(build_lifetime.clone()),
         };
+        drop(build_lifetime);
 
         upload
             .put_part(PutPayload::from_static(b"1234"))
             .await
             .unwrap();
         upload.complete().await.unwrap();
+        assert!(upload.build_lifetime.is_none());
         assert_eq!(accounted_at_drop.load(Ordering::SeqCst), 8);
         assert_eq!(accounted_bytes.load(Ordering::SeqCst), 4);
         assert!(upload.complete().await.is_err());
@@ -1657,6 +1740,44 @@ mod tests {
                 .is_err()
         );
         assert_eq!(accounted_bytes.load(Ordering::SeqCst), 4);
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_some());
+        assert!(resources.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn detached_multipart_abort_retains_group_admission() {
+        let (build_lifetime, resources, group, fragments) = test_build_lifetime(6).await;
+        let abort_started = Arc::new(tokio::sync::Notify::new());
+        let release_abort = Arc::new(tokio::sync::Notify::new());
+        let mut upload = BudgetedMultipartUpload {
+            inner: Some(Box::new(BlockingAbortUpload {
+                abort_started: abort_started.clone(),
+                release_abort: release_abort.clone(),
+            })),
+            uploaded_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_exceeded: Arc::new(AtomicBool::new(false)),
+            max_uploaded_bytes: 8,
+            part_bytes: 0,
+            build_lifetime: Some(build_lifetime.clone()),
+        };
+        drop(build_lifetime);
+
+        let abort_task = tokio::spawn(async move {
+            let result = upload.abort().await;
+            (result, upload)
+        });
+        tokio::time::timeout(Duration::from_secs(5), abort_started.notified())
+            .await
+            .expect("detached multipart abort did not start");
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_none());
+        assert!(resources.clone().try_acquire_owned().is_err());
+
+        release_abort.notify_one();
+        let (result, upload) = abort_task.await.expect("abort task panicked");
+        result.unwrap();
+        assert!(upload.build_lifetime.is_none());
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_some());
+        assert!(resources.try_acquire_owned().is_ok());
     }
 
     #[tokio::test]
