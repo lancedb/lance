@@ -105,6 +105,19 @@ impl BudgetedMemoryStore {
             bytes,
         )
     }
+
+    async fn reserve_source(&self, source: &Path) -> OsResult<()> {
+        let source_size = self.inner.head(source).await?.size;
+        let source_size =
+            usize::try_from(source_size).map_err(|_| object_store::Error::Generic {
+                store: "BudgetedMemoryStore",
+                source: format!(
+                    "source object {source} has size {source_size}, which does not fit usize"
+                )
+                .into(),
+            })?;
+        self.reserve(source_size)
+    }
 }
 
 fn reserve_upload_bytes(
@@ -196,10 +209,18 @@ impl OsObjectStore for BudgetedMemoryStore {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OsResult<()> {
+        // `InMemory::copy_opts` creates another logical object and is used by
+        // `merge_index_files` to publish staged partitions. Charge the source
+        // before the copy so this path cannot bypass the group-wide hard cap.
+        self.reserve_source(from).await?;
         self.inner.copy_opts(from, to, opts).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OsResult<()> {
+        // `InMemory` inherits ObjectStore's copy-then-delete rename. Its Bytes
+        // payload is shared, but the operation is not an atomic map move, so
+        // conservatively charge the source just like copy.
+        self.reserve_source(from).await?;
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -1071,6 +1092,42 @@ mod tests {
         assert!(error.to_string().contains("7 byte build budget"));
         assert!(exceeded.load(Ordering::Relaxed));
         assert!(second.list(None).next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn object_copy_cannot_bypass_upload_budget() {
+        use object_store::ObjectStoreExt;
+
+        let store = BudgetedMemoryStore::new(7);
+        let source = Path::from("source");
+        let destination = Path::from("destination");
+        store
+            .put(&source, PutPayload::from_static(b"1234"))
+            .await
+            .unwrap();
+
+        let error = store.copy(&source, &destination).await.unwrap_err();
+        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(store.head(&source).await.is_ok());
+        assert!(store.head(&destination).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn object_rename_is_conservatively_charged() {
+        use object_store::ObjectStoreExt;
+
+        let store = BudgetedMemoryStore::new(7);
+        let source = Path::from("source");
+        let destination = Path::from("destination");
+        store
+            .put(&source, PutPayload::from_static(b"1234"))
+            .await
+            .unwrap();
+
+        let error = store.rename(&source, &destination).await.unwrap_err();
+        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(store.head(&source).await.is_ok());
+        assert!(store.head(&destination).await.is_err());
     }
 
     #[tokio::test]
