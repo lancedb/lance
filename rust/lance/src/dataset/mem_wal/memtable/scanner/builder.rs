@@ -16,7 +16,6 @@ use futures::TryStreamExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
-use lance_datafusion::signed_zero::rewrite_signed_zero_comparisons;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
@@ -1289,11 +1288,13 @@ impl MemTableScanner {
     /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
         // `filter()` stores the parsed expression without running `optimize_expr`,
-        // so the zero rewrite has to be applied here as well. Otherwise a float
-        // zero predicate gets a bit-exact index lookup while the scan beside it
-        // answers per IEEE 754, and the index's presence decides the row set.
+        // so run it here to pick the plan from the same expression the full scan
+        // would evaluate. Coercion has to happen before the signed-zero rewrite
+        // inside it, otherwise `value = 0` keeps its integer literal and gets a
+        // bit-exact lookup while the scan beside it answers per IEEE 754.
         // Skipping the fast path on the error branch is the safe direction.
-        let filter = rewrite_signed_zero_comparisons(self.filter.clone()?).ok()?;
+        let planner = Planner::new(self.schema.clone());
+        let filter = planner.optimize_expr(self.filter.clone()?).ok()?;
         let filter = &filter;
 
         // Simple pattern matching for common predicates
@@ -1507,11 +1508,14 @@ mod tests {
     }
 
     /// The index fast path is chosen from the filter the caller set, which has not
-    /// been through `optimize_expr`. Without the rewrite in
-    /// `extract_btree_predicate`, a float zero would get a bit-exact lookup while
-    /// the full scan beside it answers per IEEE 754.
-    #[test]
-    fn test_extract_btree_predicate_covers_both_zero_encodings() {
+    /// been through `optimize_expr`. Running it there is what keeps a float zero
+    /// from getting a bit-exact lookup while the full scan beside it answers per
+    /// IEEE 754. The integer spelling matters too: the rewrite only fires once
+    /// coercion has given the literal the column's type.
+    #[rstest::rstest]
+    #[case::float_literal("value = 0.0")]
+    #[case::integer_literal("value = 0")]
+    fn test_extract_btree_predicate_covers_both_zero_encodings(#[case] equality: &str) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Float64,
@@ -1524,7 +1528,7 @@ mod tests {
             schema as SchemaRef,
         );
 
-        scanner.filter("value = 0.0").unwrap();
+        scanner.filter(equality).unwrap();
         match scanner.extract_btree_predicate() {
             Some(ScalarPredicate::In { column, values }) => {
                 assert_eq!(column, "value");
