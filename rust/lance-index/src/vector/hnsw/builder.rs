@@ -1073,6 +1073,10 @@ struct LoadedHnswGraph {
     level_lookup: Vec<LevelLookup>,
     /// Number of nodes present at each level (`level_count[0]` == total).
     level_count: Vec<usize>,
+    /// Bytes in `level_neighbors` that are *not* views into `batch`, from a
+    /// level rebuilt to drop out-of-domain ids. Zero for a clean index, which
+    /// keeps every level zero-copy.
+    owned_neighbor_bytes: usize,
 }
 
 impl DeepSizeOf for LoadedHnswGraph {
@@ -1082,7 +1086,11 @@ impl DeepSizeOf for LoadedHnswGraph {
         // `vector/flat/storage.rs`). The upper-level `level_lookup` maps are
         // sized to the geometrically-shrinking node counts above level 0 --
         // negligible next to the batch and not separately accounted here.
-        self.batch.get_array_memory_size()
+        //
+        // A level rebuilt to drop out-of-domain ids owns its buffers instead,
+        // so those bytes are counted on top: they are real and the cache sizes
+        // itself from this number.
+        self.batch.get_array_memory_size() + self.owned_neighbor_bytes
     }
 }
 
@@ -1278,11 +1286,16 @@ impl IvfSubIndex for HNSW {
         let mut level_neighbors = Vec::with_capacity(level_batches.len());
         let mut level_lookup = Vec::with_capacity(level_batches.len());
         let mut dropped_edges = 0usize;
+        let mut owned_neighbor_bytes = 0usize;
         for (level, batch) in level_batches.iter().enumerate() {
             // `.clone()` on an Arrow array bumps a refcount; buffers stay
             // shared with `data` (zero copy).
             let neighbors = batch[NEIGHBORS_COL].as_list::<i32>().clone();
             let (neighbors, dropped) = neighbors_within_domain(&neighbors, level_count[0]);
+            if dropped > 0 {
+                // Rebuilt, so it no longer borrows `batch`; see `DeepSizeOf`.
+                owned_neighbor_bytes += neighbors.get_array_memory_size();
+            }
             dropped_edges += dropped;
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             if level == 0 {
@@ -1362,6 +1375,7 @@ impl IvfSubIndex for HNSW {
             level_neighbors,
             level_lookup,
             level_count: level_count.clone(),
+            owned_neighbor_bytes,
         };
         let inner = HnswCore {
             params: hnsw_metadata.params,
