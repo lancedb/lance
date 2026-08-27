@@ -917,21 +917,6 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let residual_rows_scanned = self
-            .metrics
-            .new_count(HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC, partition);
-        let residual_docs_indexed = self
-            .metrics
-            .new_count(HYBRID_COMPOUND_RESIDUAL_DOCS_INDEXED_METRIC, partition);
-        let index_candidates = self
-            .metrics
-            .new_count(HYBRID_COMPOUND_INDEX_CANDIDATES_METRIC, partition);
-        let residual_candidates = self
-            .metrics
-            .new_count(HYBRID_COMPOUND_RESIDUAL_CANDIDATES_METRIC, partition);
-        let merged_candidates = self
-            .metrics
-            .new_count(HYBRID_COMPOUND_MERGED_CANDIDATES_METRIC, partition);
         let schema = self.schema();
 
         let stream = stream::once(async move {
@@ -958,11 +943,9 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let mut residual_input = residual_input.execute(partition, context.clone())?;
 
             while let Some(batch) = residual_input.try_next().await? {
-                residual_rows_scanned.add(batch.num_rows());
                 residual = index_query_local_residual_batch(residual, batch, allowed_terms.clone())
                     .await?;
             }
-            residual_docs_indexed.add(residual.doc_count());
 
             let query_tokens = Tokens::new(terms.clone(), first_index.tokenizer().doc_type());
             let exact_params = params
@@ -1036,7 +1019,6 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 scorer.clone(),
             )
             .await?;
-            index_candidates.add(indexed_row_ids.len());
             let residual_query = query.clone();
             let residual_scorer = scorer.clone();
             let residual_metrics = metrics.clone();
@@ -1051,7 +1033,6 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 )
             })
             .await?;
-            residual_candidates.add(residual_row_ids.len());
 
             let mut documents = indexed_row_ids
                 .into_iter()
@@ -1059,7 +1040,6 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 .chain(residual_row_ids.into_iter().zip(residual_scores))
                 .map(|(row_id, score)| ScoredDoc::new(row_id, score))
                 .collect::<Vec<_>>();
-            merged_candidates.add(documents.len());
             documents.sort_unstable_by(|left, right| {
                 right
                     .score
@@ -2170,15 +2150,6 @@ impl Drop for SharedFtsScorerProducer {
 
 /// Time spent resolving an exact ordered UUID selection to committed FTS segments.
 pub const FTS_SEGMENT_BIND_DURATION_METRIC: &str = "fts_segment_bind_duration";
-pub(crate) const HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC: &str =
-    "hybrid_compound_residual_rows_scanned";
-pub(crate) const HYBRID_COMPOUND_RESIDUAL_DOCS_INDEXED_METRIC: &str =
-    "hybrid_compound_residual_docs_indexed";
-pub(crate) const HYBRID_COMPOUND_INDEX_CANDIDATES_METRIC: &str = "hybrid_compound_index_candidates";
-pub(crate) const HYBRID_COMPOUND_RESIDUAL_CANDIDATES_METRIC: &str =
-    "hybrid_compound_residual_candidates";
-pub(crate) const HYBRID_COMPOUND_MERGED_CANDIDATES_METRIC: &str =
-    "hybrid_compound_merged_candidates";
 
 #[derive(Debug, Clone)]
 enum FtsSegmentSelection {
