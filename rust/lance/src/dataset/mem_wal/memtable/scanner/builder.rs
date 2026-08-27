@@ -1286,6 +1286,63 @@ impl MemTableScanner {
     ///
     /// This method also coerces literal values to match the column's data type
     /// (e.g., Int64 literal -> Int32 when the column is Int32).
+    /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
+    /// values, or return false and leave the caller to fall back to a full scan.
+    fn collect_or_equalities(
+        &self,
+        expr: &Expr,
+        column: &mut Option<String>,
+        values: &mut Vec<ScalarValue>,
+    ) -> bool {
+        let mut same_column = |name: &str| match column {
+            Some(existing) => existing == name,
+            None => {
+                *column = Some(name.to_string());
+                true
+            }
+        };
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                self.collect_or_equalities(&binary.left, column, values)
+                    && self.collect_or_equalities(&binary.right, column, values)
+            }
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                let (Expr::Column(col), Expr::Literal(lit, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                else {
+                    return false;
+                };
+                let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                values.push(value);
+                true
+            }
+            Expr::InList(in_list) if !in_list.negated => {
+                let Expr::Column(col) = in_list.expr.as_ref() else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                for item in &in_list.list {
+                    let Expr::Literal(lit, _) = item else {
+                        return false;
+                    };
+                    let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                        return false;
+                    };
+                    values.push(value);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
         // `filter()` stores the parsed expression without running `optimize_expr`,
         // so run it here to pick the plan from the same expression the full scan
@@ -1299,6 +1356,20 @@ impl MemTableScanner {
 
         // Simple pattern matching for common predicates
         match filter {
+            // `simplify` turns an `IN` list of three or fewer values back into an
+            // OR chain of equalities, and the signed-zero rewrite then turns any
+            // zero among them into a two-element list of its own, so the fast path
+            // has to accept the chain to keep covering `IN`.
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                let mut column = None;
+                let mut values = Vec::new();
+                if self.collect_or_equalities(filter, &mut column, &mut values) {
+                    return Some(ScalarPredicate::In {
+                        column: column?,
+                        values,
+                    });
+                }
+            }
             Expr::BinaryExpr(binary) => {
                 if let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
@@ -1541,6 +1612,41 @@ mod tests {
                 );
             }
             other => panic!("expected an In predicate over both encodings, got {other:?}"),
+        }
+
+        // `simplify` shortens a two-value `IN` list into an OR chain, and the
+        // rewrite then replaces the zero with a list of its own. Both spellings
+        // still have to reach the index.
+        scanner.filter("value IN (0.0, 1.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                        ScalarValue::Float64(Some(1.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate covering the list, got {other:?}"),
+        }
+
+        // A short list with no zero in it is shortened just the same, so this is
+        // what keeps the pre-existing `IN` fast path from being lost.
+        scanner.filter("value IN (1.0, 2.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(1.0)),
+                        ScalarValue::Float64(Some(2.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate, got {other:?}"),
         }
 
         // `<` has to compare against the negative encoding, or the lookup admits a
