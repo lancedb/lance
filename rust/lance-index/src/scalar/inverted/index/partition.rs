@@ -1273,6 +1273,7 @@ impl InvertedPartition {
                 grouped_expansions: Vec::new(),
                 impact_safe,
                 exact_scoring_required,
+                #[cfg(test)]
                 no_impact_fallback,
             });
         }
@@ -1390,6 +1391,7 @@ impl InvertedPartition {
             grouped_expansions,
             impact_safe: false,
             exact_scoring_required: true,
+            #[cfg(test)]
             no_impact_fallback,
         })
     }
