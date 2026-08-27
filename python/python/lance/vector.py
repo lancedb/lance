@@ -198,6 +198,49 @@ def train_pq_codebook_on_accelerator(
     return pq_codebook, kmeans_list
 
 
+def _sample_finite_vectors(
+    ds: Iterable[Union[dict[str, "torch.Tensor"], "torch.Tensor"]],
+    column: str,
+    k: int,
+) -> "torch.Tensor":
+    """Draw `k` vectors with no NaN/inf values from a TorchDataset stream.
+
+    A vector containing non-finite values is invalid kmeans input: chosen as an
+    initial centroid it makes every distance NaN, so training "converges" on
+    the first epoch without ever updating the centroids, and partition
+    assignment then drops every row (id -1) — downstream stages see an empty
+    dataset. Skip such rows instead of letting them become centroids.
+
+    Raises
+    ------
+    ValueError
+        If the stream yields fewer than `k` finite vectors, with the counts
+        needed to diagnose why (e.g. an all-NaN column).
+    """
+    import torch
+
+    valid: list["torch.Tensor"] = []
+    num_valid = 0
+    num_scanned = 0
+    for batch in ds:
+        vecs = batch[column] if isinstance(batch, dict) else batch
+        finite_rows = vecs.reshape(vecs.shape[0], -1).isfinite().all(dim=1)
+        kept = vecs[finite_rows] if not bool(finite_rows.all()) else vecs
+        valid.append(kept)
+        num_valid += kept.shape[0]
+        num_scanned += vecs.shape[0]
+        if num_valid >= k:
+            break
+
+    if num_valid < k:
+        raise ValueError(
+            f"only {num_valid} finite vectors available to initialize "
+            f"{k} centroids after scanning {num_scanned} rows; column "
+            f"'{column}' contains too many NaN/inf vectors"
+        )
+    return torch.cat(valid, dim=0)[:k]
+
+
 def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
@@ -245,7 +288,10 @@ def train_ivf_centroids_on_accelerator(
         filter=filt,
     )
 
-    init_centroids = next(iter(ds))
+    if filter_nan:
+        init_centroids = _sample_finite_vectors(ds, column, k)
+    else:
+        init_centroids = next(iter(ds))
     LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(

@@ -568,6 +568,76 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
     validate_vector_index(dataset, "vector", sample_size=16)
 
 
+def test_torch_ivf_init_skips_nan_vectors(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    from lance.vector import train_ivf_centroids_on_accelerator
+
+    # The first init batch in storage order is all-NaN, so an unfiltered init
+    # draw deterministically produces NaN centroids: every distance is NaN,
+    # kmeans "converges" on the first epoch without ever updating them, and
+    # partition assignment drops every row. The sampler must skip non-finite
+    # rows instead.
+    mat = np.concatenate(
+        [
+            np.full((4, 16), np.nan, dtype=np.float32),
+            np.random.randn(8, 16).astype(np.float32),
+        ]
+    )
+    dataset = lance.write_dataset(vec_to_table(data=mat), tmp_path)
+
+    centroids, _ = train_ivf_centroids_on_accelerator(
+        dataset,
+        "vector",
+        4,
+        "l2",
+        torch.device("cpu"),
+        max_iters=2,
+    )
+    assert centroids.shape == (4, 16)
+    assert np.isfinite(centroids).all()
+
+
+def test_torch_ivf_init_rejects_all_nan_column(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    from lance.vector import train_ivf_centroids_on_accelerator
+
+    tbl = create_table(nvec=0, ndim=16, nans=50)
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with pytest.raises(ValueError, match="finite vectors"):
+        train_ivf_centroids_on_accelerator(
+            dataset,
+            "vector",
+            4,
+            "l2",
+            torch.device("cpu"),
+            max_iters=2,
+        )
+
+
+def test_sample_finite_vectors_skips_nan_rows():
+    torch = pytest.importorskip("torch")
+
+    from lance.vector import _sample_finite_vectors
+
+    valid = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    nans = torch.full((3, 2), float("nan"))
+
+    # Tensor batches (single-column stream) and dict batches (multi-column
+    # stream) must both skip non-finite rows and preserve order.
+    out = _sample_finite_vectors(iter([nans, valid[:2], nans, valid[2:]]), "vector", 4)
+    assert torch.equal(out, valid)
+    out = _sample_finite_vectors(
+        iter([{"vector": nans}, {"vector": valid}]), "vector", 4
+    )
+    assert torch.equal(out, valid)
+
+    with pytest.raises(ValueError, match="finite vectors"):
+        _sample_finite_vectors(iter([nans]), "vector", 1)
+
+
 def test_index_with_no_centroid_movement(tmp_path):
     torch = pytest.importorskip("torch")
 
