@@ -160,6 +160,13 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                     }));
                 }
                 Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
+                    // This is the one shape whose rewrite has to name `other`
+                    // twice, so restrict it to a bare column: duplicating an
+                    // arbitrary expression would evaluate it twice per row, and
+                    // twice is wrong outright for a volatile one.
+                    if !matches!(other, Expr::Column(_)) {
+                        return None;
+                    }
                     // Spelled with `IS [NOT] NULL` around the list rather than as
                     // a pair of distinct-from probes, so that a second pass finds
                     // both encodings already listed and leaves this alone.

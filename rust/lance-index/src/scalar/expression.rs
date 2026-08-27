@@ -1837,19 +1837,11 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search) => match search.exact_sargable_query() {
-                    // Neither shape can match NULL, so `IS NOT NULL` adds nothing.
-                    // The signed-zero rewrite turns `x != 0.0` into the second one.
-                    Some(SargableQuery::Equals(value)) if !value.is_null() => {
-                        search.exact_sargable_query_key()
-                    }
-                    Some(SargableQuery::IsIn(values))
-                        if !values.is_empty() && values.iter().all(|value| !value.is_null()) =>
-                    {
-                        search.exact_sargable_query_key()
-                    }
-                    _ => None,
-                },
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
+                    search.exact_sargable_query_key()
+                }
                 _ => None,
             },
             _ => None,
