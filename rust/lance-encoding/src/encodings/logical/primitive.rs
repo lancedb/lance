@@ -6650,6 +6650,7 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 array = dict::normalize_dict_nulls(array)?;
+                array = dict::clear_out_of_range_null_keys(array)?;
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -9626,6 +9627,43 @@ mod tests {
             .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    fn hand_built_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{DictionaryArray, Int32Array, types::Int32Type};
+        use arrow_buffer::NullBuffer;
+
+        let keys = Int32Array::new(
+            vec![0, 7, 7].into(),
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef
+    }
+
+    fn concatenated_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{builder::StringDictionaryBuilder, new_null_array, types::Int32Type};
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("a");
+        for _ in 0..7 {
+            builder.append_null();
+        }
+        let valued = Arc::new(builder.finish()) as ArrayRef;
+        let all_null = new_null_array(valued.data_type(), 8);
+        arrow_select::concat::concat(&[valued.as_ref(), all_null.as_ref()]).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys())]
+    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys())]
+    #[tokio::test]
+    async fn test_dictionary_out_of_range_null_keys_round_trip(#[case] dictionary: ArrayRef) {
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_page_sizes(vec![4096]);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &test_cases, HashMap::new()).await;
     }
 
     #[test]
