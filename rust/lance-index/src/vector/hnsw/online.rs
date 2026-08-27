@@ -501,36 +501,30 @@ impl OnlineHnswBuilder {
 
         // Retains the common case's `Arc` without copying: only a list that
         // actually contains an out-of-snapshot id is rebuilt.
-        let keep_in_snapshot = |list: Arc<Vec<u32>>| -> Arc<Vec<u32>> {
-            if list.iter().all(|&id| id < inserted_u32) {
-                list
-            } else {
-                Arc::new(
-                    list.iter()
-                        .copied()
-                        .filter(|&id| id < inserted_u32)
-                        .collect(),
-                )
-            }
-        };
-
         let mut frozen_nodes: Vec<GraphBuilderNode> = Vec::with_capacity(inserted);
         for node in self.nodes.iter().take(inserted) {
-            let level_neighbors: Vec<Arc<Vec<u32>>> = node
-                .level_neighbors
-                .iter()
-                .map(|sl| keep_in_snapshot(sl.load_full()))
-                .collect();
-            let level_neighbors_ranked = node
+            // Both serialized columns come from this one snapshot. Reading the
+            // published id lists separately pairs `__neighbors` with a
+            // `__distance` captured at a different moment: `level_neighbors` is
+            // a cache `publish_from_ranked` rebuilds, so a prune landing between
+            // the two reads drops ids the snapshot filter cannot restore and the
+            // columns disagree.
+            let level_neighbors_ranked: Vec<Vec<_>> = node
                 .level_neighbors_ranked
                 .lock()
                 .expect("level_neighbors_ranked mutex poisoned")
-                .clone();
-            // Ranked lists feed `__distance` and must not outlive the ids they
-            // rank, or a reader pairing the two columns sees a mismatch.
-            let level_neighbors_ranked: Vec<Vec<_>> = level_neighbors_ranked
-                .into_iter()
-                .map(|ranked| ranked.into_iter().filter(|n| n.id < inserted_u32).collect())
+                .iter()
+                .map(|ranked| {
+                    ranked
+                        .iter()
+                        .filter(|n| n.id < inserted_u32)
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            let level_neighbors: Vec<Arc<Vec<u32>>> = level_neighbors_ranked
+                .iter()
+                .map(|ranked| Arc::new(ranked.iter().map(|n| n.id).collect()))
                 .collect();
 
             let bottom_neighbors = level_neighbors

@@ -601,11 +601,19 @@ impl HnswGraph {
     /// The resulting batch uses the same schema and `lance:hnsw` metadata
     /// expected by `lance-index`'s `HNSW::load`.
     ///
-    /// Call this when no writer batch is in flight. Ordinary search readers
-    /// can run concurrently with insertion, but flush export should snapshot a
-    /// completed graph prefix.
-    pub fn to_lance_hnsw_batch(&self) -> Result<RecordBatch> {
+    /// `max_nodes` caps the prefix, for a caller that has already captured a
+    /// companion artifact and needs this one to agree with it: vector storage
+    /// is materialized separately, and a graph that advanced past it would name
+    /// rows the storage batch has no vector for.
+    ///
+    /// Ordinary search readers can run concurrently with insertion; a flush
+    /// export snapshots a completed prefix.
+    pub fn to_lance_hnsw_batch(&self, max_nodes: Option<usize>) -> Result<RecordBatch> {
         let visible_len = self.visible_len.load(Ordering::Acquire);
+        let visible_len = match max_nodes {
+            Some(max_nodes) => visible_len.min(max_nodes),
+            None => visible_len,
+        };
         let max_level = self.params.max_level as usize;
         let mut level_counts = vec![0usize; max_level];
         for id in 0..visible_len {
@@ -1311,6 +1319,61 @@ mod tests {
         assert!(result.iter().any(|point| point.id == 42));
     }
 
+    /// The graph must be exportable to a boundary its caller chose, because the
+    /// companion vector storage is captured separately: a graph that advanced
+    /// past it would name rows the storage batch has no vector for, and a search
+    /// would score them.
+    #[test]
+    fn to_lance_hnsw_batch_honors_a_caller_supplied_prefix() {
+        const ROWS: usize = 256;
+        const DIM: usize = 8;
+        const PREFIX: usize = 64;
+        let store = Arc::new(
+            ArrowFixedSizeListVectorStore::try_new(512, 4, DIM, DistanceType::L2).unwrap(),
+        );
+        let ids = store.append_batch(fsl(ROWS, DIM), 0).unwrap();
+        let snapshot = store.snapshot();
+        let graph = HnswGraph::try_new(
+            512,
+            BuildParams::mem_wal_default()
+                .num_edges(8)
+                .ef_construction(32)
+                .seed(17),
+        )
+        .unwrap();
+        graph.insert_batch(ids, &snapshot).unwrap();
+
+        let full = graph.to_lance_hnsw_batch(None).unwrap();
+        let bounded = graph.to_lance_hnsw_batch(Some(PREFIX)).unwrap();
+        assert!(
+            bounded.num_rows() < full.num_rows(),
+            "the cap has to actually bound the export"
+        );
+        assert_eq!(HNSW::load(bounded.clone()).unwrap().len(), PREFIX);
+
+        // Every edge must stay inside the requested prefix, not merely inside
+        // whatever the graph had published.
+        let neighbors = bounded
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .expect("neighbors column is a list");
+        for row in 0..bounded.num_rows() {
+            let ids = neighbors.value(row);
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .expect("neighbor ids are u32");
+            for i in 0..ids.len() {
+                assert!(
+                    (ids.value(i) as usize) < PREFIX,
+                    "row {row} points at {} outside the {PREFIX}-node prefix",
+                    ids.value(i)
+                );
+            }
+        }
+    }
+
     /// An export racing inserts must persist only edges inside the prefix it
     /// publishes.
     ///
@@ -1366,7 +1429,7 @@ mod tests {
         let mut exports = 0;
         let mut edges_checked = 0;
         while writing.load(Ordering::Acquire) || exports < 5 {
-            let batch = graph.to_lance_hnsw_batch().unwrap();
+            let batch = graph.to_lance_hnsw_batch(None).unwrap();
             let rows = batch.num_rows();
             let neighbors = batch
                 .column(1)
@@ -1428,7 +1491,7 @@ mod tests {
         .unwrap();
         graph.insert_batch(ids, &snapshot).unwrap();
 
-        let batch = graph.to_lance_hnsw_batch().unwrap();
+        let batch = graph.to_lance_hnsw_batch(None).unwrap();
         let loaded = HNSW::load(batch).unwrap();
         assert_eq!(loaded.len(), rows);
     }
