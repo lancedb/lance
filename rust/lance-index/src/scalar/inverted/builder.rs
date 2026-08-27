@@ -32,6 +32,7 @@ use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+use std::any::Any;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -145,6 +146,17 @@ fn merge_all_tail_partitions(
     Ok(merged_builders)
 }
 
+#[derive(Clone)]
+struct BuildLifetimeGuard(Arc<dyn Any + Send + Sync>);
+
+impl Debug for BuildLifetimeGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildLifetimeGuard")
+            .field("strong_count", &Arc::strong_count(&self.0))
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
@@ -157,6 +169,7 @@ pub struct InvertedIndexBuilder {
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
     deleted_fragments: RoaringBitmap,
+    build_lifetime: Option<BuildLifetimeGuard>,
 }
 
 impl InvertedIndexBuilder {
@@ -201,6 +214,7 @@ impl InvertedIndexBuilder {
             posting_tail_codec: format_version.posting_tail_codec(),
             progress: noop_progress(),
             deleted_fragments,
+            build_lifetime: None,
         }
     }
 
@@ -227,6 +241,14 @@ impl InvertedIndexBuilder {
 
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// Retain a caller-owned resource guard until all asynchronously spawned
+    /// build work, including CPU compression tasks, has finished.
+    #[doc(hidden)]
+    pub fn with_build_lifetime<T: Send + Sync + 'static>(mut self, guard: Arc<T>) -> Self {
+        self.build_lifetime = Some(BuildLifetimeGuard(guard));
         self
     }
 
@@ -344,12 +366,14 @@ impl InvertedIndexBuilder {
                             // upload's whole-request timeout keeps running while
                             // its task waits to be polled. The builder is moved
                             // in and handed back so ownership survives the hop.
-                            accumulated = spawn_cpu(move || {
-                                accumulated.merge_from(partition_builder)?;
-                                Result::Ok(accumulated)
-                            })
-                            .await?;
-                            merged = Some(accumulated);
+                            let build_lifetime = self.build_lifetime.clone();
+                            let (next_accumulated, _completed_build_lifetime) =
+                                spawn_cpu(move || {
+                                    accumulated.merge_from(partition_builder)?;
+                                    Result::Ok((accumulated, build_lifetime))
+                                })
+                                .await?;
+                            merged = Some(next_accumulated);
                         }
                     }
                     None => merged = Some(partition_builder),
@@ -371,7 +395,11 @@ impl InvertedIndexBuilder {
         let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
         builder.set_id(partition_id);
         let files = builder
-            .write_to(dest_store, self.partition_write_target())
+            .write_to_with_lifetime(
+                dest_store,
+                self.partition_write_target(),
+                self.build_lifetime.clone(),
+            )
             .await?;
         self.new_partitions.push(partition_id);
         Ok(files)
@@ -417,6 +445,7 @@ impl InvertedIndexBuilder {
         let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
+        let build_lifetime = self.build_lifetime.clone();
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
         // JoinSet aborts all still-running workers when update_index is
@@ -430,9 +459,16 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
+            let build_lifetime = build_lifetime.clone();
             index_tasks.spawn(async move {
-                let mut worker =
-                    IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
+                let mut worker = IndexWorker::new(
+                    tokenizer,
+                    dest_store,
+                    id_alloc,
+                    worker_config,
+                    build_lifetime,
+                )
+                .await?;
                 while let Ok(batch) = receiver.recv().await {
                     let num_rows = batch.num_rows();
                     worker.process_batch(batch).await?;
@@ -503,10 +539,14 @@ impl InvertedIndexBuilder {
                 // memory budget when the outer query is cancelled.
                 merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)?
             } else {
-                spawn_cpu(move || {
-                    merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+                let build_lifetime = build_lifetime.clone();
+                let (merged, _completed_build_lifetime) = spawn_cpu(move || {
+                    let merged =
+                        merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)?;
+                    Result::Ok((merged, build_lifetime))
                 })
-                .await?
+                .await?;
+                merged
             };
             // Tail partitions hold most of the data when workers rarely hit the
             // flush threshold; writing them one at a time serializes the
@@ -516,9 +556,16 @@ impl InvertedIndexBuilder {
             let mut tail_writes =
                 futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
                     let dest_store = dest_store.clone();
+                    let build_lifetime = build_lifetime.clone();
                     async move {
                         let partition_id = builder.id();
-                        let files = builder.write_to(dest_store.as_ref(), write_target).await?;
+                        let files = builder
+                            .write_to_with_lifetime(
+                                dest_store.as_ref(),
+                                write_target,
+                                build_lifetime,
+                            )
+                            .await?;
                         Result::Ok((partition_id, files))
                     }
                 }))
@@ -554,7 +601,11 @@ impl InvertedIndexBuilder {
             builder.remap(mapping).await?;
             files.extend(
                 builder
-                    .write_to(dest_store, self.partition_write_target())
+                    .write_to_with_lifetime(
+                        dest_store,
+                        self.partition_write_target(),
+                        self.build_lifetime.clone(),
+                    )
                     .await?,
             );
         }
@@ -1121,10 +1172,24 @@ impl InnerBuilder {
         store: &dyn IndexStore,
         target: PartitionWriteTarget,
     ) -> Result<Vec<IndexFile>> {
+        self.write_to_with_lifetime(store, target, None).await
+    }
+
+    async fn write_to_with_lifetime(
+        &mut self,
+        store: &dyn IndexStore,
+        target: PartitionWriteTarget,
+        build_lifetime: Option<BuildLifetimeGuard>,
+    ) -> Result<Vec<IndexFile>> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
         let files = vec![
-            self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id))
-                .await?,
+            self.write_posting_lists(
+                store,
+                docs.clone(),
+                &target.posting_path(self.id),
+                build_lifetime,
+            )
+            .await?,
             self.write_tokens(store, &target.token_path(self.id))
                 .await?,
             self.write_docs(store, docs, &target.doc_path(self.id))
@@ -1139,6 +1204,7 @@ impl InnerBuilder {
         store: &dyn IndexStore,
         docs: Arc<DocSet>,
         path: &str,
+        build_lifetime: Option<BuildLifetimeGuard>,
     ) -> Result<IndexFile> {
         let id = self.id;
         let mut writer = store
@@ -1179,7 +1245,9 @@ impl InnerBuilder {
         // accumulates enough data to flush an encoded column, the flush also needs
         // that pool. The parked producer and the starved consumer would then wait
         // on each other forever.
-        let producer = tokio::spawn(async move {
+        let mut producer = tokio::task::JoinSet::new();
+        producer.spawn(async move {
+            let _build_lifetime = build_lifetime.clone();
             let mut batch_builder = PostingListBatchBuilder::new(
                 schema_for_batches,
                 with_position,
@@ -1190,31 +1258,33 @@ impl InnerBuilder {
             let mut encode_elapsed = Duration::ZERO;
             loop {
                 let docs_for_batches = docs_for_batches.clone();
+                let build_lifetime = build_lifetime.clone();
                 let encode_started = Instant::now();
                 // Build the next batch on the CPU pool. The builder and the
                 // remaining posting lists are moved in and handed back so state
                 // persists across batches.
-                let (next_builder, next_posting_lists, batch) = spawn_cpu(move || {
-                    let mut batch_builder = batch_builder;
-                    let mut posting_lists = posting_lists;
-                    let mut batch = None;
-                    for posting_list in posting_lists.by_ref() {
-                        posting_list.append_to_batch_with_docs(
-                            &docs_for_batches,
-                            &mut batch_builder,
-                            format_version,
-                        )?;
-                        if batch_builder.len() >= batch_rows {
-                            batch = Some(batch_builder.finish()?);
-                            break;
+                let (next_builder, next_posting_lists, batch, _completed_batch_lifetime) =
+                    spawn_cpu(move || {
+                        let mut batch_builder = batch_builder;
+                        let mut posting_lists = posting_lists;
+                        let mut batch = None;
+                        for posting_list in posting_lists.by_ref() {
+                            posting_list.append_to_batch_with_docs(
+                                &docs_for_batches,
+                                &mut batch_builder,
+                                format_version,
+                            )?;
+                            if batch_builder.len() >= batch_rows {
+                                batch = Some(batch_builder.finish()?);
+                                break;
+                            }
                         }
-                    }
-                    if batch.is_none() && !batch_builder.is_empty() {
-                        batch = Some(batch_builder.finish()?);
-                    }
-                    Result::Ok((batch_builder, posting_lists, batch))
-                })
-                .await?;
+                        if batch.is_none() && !batch_builder.is_empty() {
+                            batch = Some(batch_builder.finish()?);
+                        }
+                        Result::Ok((batch_builder, posting_lists, batch, build_lifetime))
+                    })
+                    .await?;
                 encode_elapsed += encode_started.elapsed();
                 batch_builder = next_builder;
                 posting_lists = next_posting_lists;
@@ -1240,13 +1310,20 @@ impl InnerBuilder {
             write_elapsed += write_started.elapsed();
             if let Err(err) = result {
                 drop(rx);
-                // Wait for producer to stop; preserve the write error as the primary failure.
-                let _ = producer.await;
+                // Cancel production promptly, then wait for its async task to
+                // stop while preserving the writer error as the primary one.
+                // Any in-flight CPU batch retains the build lifetime itself.
+                producer.abort_all();
+                let _ = producer.join_next().await;
                 return Err(err);
             }
         }
         drop(rx);
-        let encode_elapsed = producer.await??;
+        let producer_result = producer
+            .join_next()
+            .await
+            .ok_or_else(|| Error::internal("posting producer exited without a result"))?;
+        let encode_elapsed = producer_result??;
         let finish_started = Instant::now();
         let file = writer.finish().await?;
         write_elapsed += finish_started.elapsed();
@@ -1336,6 +1413,7 @@ struct IndexWorker {
     token_ids: Vec<u32>,
     last_token_count: usize,
     coordinate_rank: usize,
+    build_lifetime: Option<BuildLifetimeGuard>,
 }
 
 struct TailPartition {
@@ -1404,6 +1482,7 @@ impl IndexWorker {
         dest_store: Arc<dyn IndexStore>,
         id_alloc: Arc<AtomicU64>,
         config: IndexWorkerConfig,
+        build_lifetime: Option<BuildLifetimeGuard>,
     ) -> Result<Self> {
         let schema = inverted_list_schema_for_version_with_block_size(
             config.with_position,
@@ -1437,6 +1516,7 @@ impl IndexWorker {
             token_ids: Vec::new(),
             last_token_count: 0,
             coordinate_rank: config.coordinate_rank,
+            build_lifetime,
         })
     }
 
@@ -1820,7 +1900,11 @@ impl IndexWorker {
             PartitionWriteTarget::Final
         };
         let files = builder
-            .write_to(self.dest_store.as_ref(), target)
+            .write_to_with_lifetime(
+                self.dest_store.as_ref(),
+                target,
+                self.build_lifetime.clone(),
+            )
             .await
             .map_err(|err| {
                 Error::execution(format!(
@@ -2925,6 +3009,140 @@ mod tests {
         write_count: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum GatedWriteBehavior {
+        Pending,
+        Fail,
+    }
+
+    #[derive(Clone, Debug)]
+    struct GatedWriteStore {
+        entered: Arc<tokio::sync::Notify>,
+        behavior: GatedWriteBehavior,
+    }
+
+    impl GatedWriteStore {
+        fn new(behavior: GatedWriteBehavior) -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                behavior,
+            }
+        }
+    }
+
+    impl DeepSizeOf for GatedWriteStore {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedWriter {
+        entered: Arc<tokio::sync::Notify>,
+        behavior: GatedWriteBehavior,
+    }
+
+    #[async_trait]
+    impl IndexWriter for GatedWriter {
+        async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
+            self.entered.notify_one();
+            match self.behavior {
+                GatedWriteBehavior::Pending => std::future::pending().await,
+                GatedWriteBehavior::Fail => Err(Error::internal("injected posting write failure")),
+            }
+        }
+
+        async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+            Ok(1)
+        }
+
+        async fn finish(&mut self) -> Result<IndexFile> {
+            Err(Error::internal("gated writer unexpectedly finished"))
+        }
+
+        async fn finish_with_metadata(
+            &mut self,
+            _metadata: HashMap<String, String>,
+        ) -> Result<IndexFile> {
+            Err(Error::internal("gated writer unexpectedly finished"))
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for GatedWriteStore {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(self.clone())
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
+            self.clone_arc()
+        }
+
+        async fn new_index_file(
+            &self,
+            _name: &str,
+            _schema: Arc<Schema>,
+        ) -> Result<Box<dyn IndexWriter>> {
+            Ok(Box::new(GatedWriter {
+                entered: self.entered.clone(),
+                behavior: self.behavior,
+            }))
+        }
+
+        async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn IndexReader>> {
+            Err(Error::not_supported(
+                "GatedWriteStore does not support reading",
+            ))
+        }
+
+        async fn copy_index_file(
+            &self,
+            _name: &str,
+            _dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
+            Err(Error::not_supported(
+                "GatedWriteStore does not support copying",
+            ))
+        }
+
+        async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<IndexFile> {
+            Err(Error::not_supported(
+                "GatedWriteStore does not support renaming",
+            ))
+        }
+
+        async fn delete_index_file(&self, _name: &str) -> Result<()> {
+            Err(Error::not_supported(
+                "GatedWriteStore does not support deleting",
+            ))
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            Ok(vec![])
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedBuildLifetime {
+        stopped: Arc<tokio::sync::Notify>,
+        resource: Option<tokio::sync::OwnedSemaphorePermit>,
+    }
+
+    impl Drop for ObservedBuildLifetime {
+        fn drop(&mut self) {
+            drop(self.resource.take());
+            self.stopped.notify_one();
+        }
+    }
+
     #[async_trait]
     impl IndexWriter for CountingWriter {
         async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
@@ -3033,11 +3251,95 @@ mod tests {
         let store = CountingStore::new();
         let docs = Arc::new(std::mem::take(&mut builder.docs));
         builder
-            .write_posting_lists(&store, docs, &posting_file_path(0))
+            .write_posting_lists(&store, docs, &posting_file_path(0), None)
             .await?;
 
         assert_eq!(store.write_count(), 1);
         Ok(())
+    }
+
+    fn posting_builder_with_multiple_batches() -> (InnerBuilder, Arc<DocSet>) {
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        let doc_id = builder.docs.append(0, 1);
+        for _ in 0..(*LANCE_FTS_POSTING_BATCH_ROWS * 3) {
+            let mut posting_list = PostingListBuilder::new(false);
+            posting_list.add(doc_id, PositionRecorder::Count(1));
+            builder.posting_lists.push(posting_list);
+        }
+        let docs = Arc::new(std::mem::take(&mut builder.docs));
+        (builder, docs)
+    }
+
+    async fn observed_build_lifetime() -> (
+        BuildLifetimeGuard,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let resource = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = resource
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("build lifetime semaphore closed");
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let lifetime = Arc::new(ObservedBuildLifetime {
+            stopped: stopped.clone(),
+            resource: Some(permit),
+        });
+        (BuildLifetimeGuard(lifetime), resource, stopped)
+    }
+
+    #[tokio::test]
+    async fn test_write_posting_lists_cancellation_stops_producer() {
+        let (mut builder, docs) = posting_builder_with_multiple_batches();
+        let store = GatedWriteStore::new(GatedWriteBehavior::Pending);
+        let entered = store.entered.clone();
+        let (build_lifetime, resource, stopped) = observed_build_lifetime().await;
+        let write_task = tokio::spawn(async move {
+            builder
+                .write_posting_lists(&store, docs, &posting_file_path(0), Some(build_lifetime))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("posting writer did not receive a batch");
+        let stopped = stopped.notified();
+        tokio::pin!(stopped);
+        write_task.abort();
+        let join_error = write_task
+            .await
+            .expect_err("cancelled posting write unexpectedly completed");
+        assert!(join_error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("posting producer retained the build lifetime after cancellation");
+        assert!(
+            resource.try_acquire_owned().is_ok(),
+            "build resource should be reusable after producer cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_posting_lists_preserves_writer_error_during_cleanup() {
+        let (mut builder, docs) = posting_builder_with_multiple_batches();
+        let store = GatedWriteStore::new(GatedWriteBehavior::Fail);
+        let (build_lifetime, resource, stopped) = observed_build_lifetime().await;
+        let error = builder
+            .write_posting_lists(&store, docs, &posting_file_path(0), Some(build_lifetime))
+            .await
+            .expect_err("injected posting write failure should surface");
+        assert!(
+            error.to_string().contains("injected posting write failure"),
+            "unexpected posting write error: {error}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), stopped.notified())
+            .await
+            .expect("posting producer retained the build lifetime after writer failure");
+        assert!(
+            resource.try_acquire_owned().is_ok(),
+            "build resource should be reusable after writer failure"
+        );
     }
 
     async fn write_partition_file_marker(
@@ -3676,6 +3978,7 @@ mod tests {
                 block_size: params.block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
         worker1
@@ -3701,6 +4004,7 @@ mod tests {
                 block_size: params.block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
         worker2
@@ -4085,6 +4389,7 @@ mod tests {
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
 
@@ -4443,6 +4748,7 @@ mod tests {
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
 
@@ -4476,6 +4782,7 @@ mod tests {
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
 
@@ -4516,6 +4823,7 @@ mod tests {
                 block_size: InvertedIndexParams::default().block_size,
                 coordinate_rank: 0,
             },
+            None,
         )
         .await?;
         worker
