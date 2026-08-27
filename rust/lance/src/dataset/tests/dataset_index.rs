@@ -2691,11 +2691,12 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query.clone()))
         .unwrap();
+    filtered_scanner.prefilter(true);
     filtered_scanner.limit(Some(2), None).unwrap();
     let filtered_plan = filtered_scanner.explain_plan(false).await.unwrap();
     assert!(
         !filtered_plan.contains("HybridCompoundFtsScorer"),
-        "filtered residual scoring must retain the exact fallback:\n{filtered_plan}"
+        "prefiltered residual scoring must retain the exact fallback:\n{filtered_plan}"
     );
 
     let phrase_query: FtsQuery = BooleanQuery::new([
