@@ -2707,7 +2707,25 @@ mod tests {
         // does not read; the ids are what traversal follows.
         let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
 
+        let corrupted_bytes = corrupted.get_array_memory_size();
+        let clean_loaded = HNSW::load(batch.clone()).expect("the clean batch loads");
         let loaded = HNSW::load(corrupted).expect("a dangling edge must not fail the load");
+        // A clean load borrows every level from its batch, so it charges little
+        // beyond it. A repaired level owns its buffers, and they have to be
+        // charged too or the index cache sizes itself from memory it is not
+        // holding. Measured: ~0.3 KiB over for clean, ~38 KiB for repaired.
+        let clean_over = clean_loaded.deep_size_of() - batch.get_array_memory_size();
+        let repaired_over = loaded.deep_size_of() - corrupted_bytes;
+        assert!(
+            clean_over < 1024,
+            "a clean load keeps its levels zero-copy, but charged {clean_over} bytes over its batch"
+        );
+        assert!(
+            repaired_over > 16 * 1024,
+            "a repaired load must charge the buffers it owns, but charged only \
+             {repaired_over} bytes over its batch"
+        );
+
         assert_eq!(loaded.len(), TOTAL);
         // Searching has to answer rather than panic on the out-of-domain id.
         let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
