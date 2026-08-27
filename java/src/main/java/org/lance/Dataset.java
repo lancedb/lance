@@ -70,6 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -90,8 +91,9 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  private final LockManager lockManager = new LockManager();
-  private final Object createIndexLock = new Object();
+  private final AtomicBoolean createIndexInProgress = new AtomicBoolean();
+  private final AtomicBoolean progressCallbacksActive = new AtomicBoolean();
+  private final LockManager lockManager = new LockManager(progressCallbacksActive);
 
   private Dataset() {}
 
@@ -1203,7 +1205,8 @@ public class Dataset implements Closeable {
    *
    * <p>Stage names, work units, and whether a total is available depend on the index type. The
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
-   * threads.
+   * threads. Callbacks may re-enter read-only methods on this Dataset; write operations are
+   * rejected while the index operation is in progress.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1224,7 +1227,13 @@ public class Dataset implements Closeable {
   }
 
   private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
-    synchronized (createIndexLock) {
+    if (!createIndexInProgress.compareAndSet(false, true)) {
+      throw new IllegalStateException("Dataset is already creating an index");
+    }
+    try {
+      if (progress != null) {
+        progressCallbacksActive.set(true);
+      }
       try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         if (progress == null) {
@@ -1251,6 +1260,11 @@ public class Dataset implements Closeable {
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
             progress);
       }
+    } finally {
+      if (progress != null) {
+        progressCallbacksActive.set(false);
+      }
+      createIndexInProgress.set(false);
     }
   }
 

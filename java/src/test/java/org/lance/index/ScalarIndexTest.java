@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -167,6 +168,75 @@ public class ScalarIndexTest {
       assertFalse(dataset.getFragments().isEmpty());
       assertFalse(dataset.memWalIndexDetails().isPresent());
       reentries.incrementAndGet();
+    }
+  }
+
+  private static final class WriteReentrantIndexBuildProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+    private final AtomicInteger reentries = new AtomicInteger();
+    private final AtomicReference<RuntimeException> writeFailure = new AtomicReference<>();
+
+    private WriteReentrantIndexBuildProgress(Dataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+      if (reentries.getAndIncrement() == 0) {
+        try {
+          dataset.checkoutLatest();
+        } catch (RuntimeException failure) {
+          writeFailure.set(failure);
+        }
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+    }
+  }
+
+  private static final class NestedCreateIndexBuildProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final IndexOptions segmentOptions;
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+    private final AtomicReference<RuntimeException> nestedFailure = new AtomicReference<>();
+    private boolean attempted;
+
+    private NestedCreateIndexBuildProgress(Dataset dataset, IndexOptions segmentOptions) {
+      this.dataset = dataset;
+      this.segmentOptions = segmentOptions;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+      if (!attempted) {
+        attempted = true;
+        try {
+          dataset.createIndex(segmentOptions);
+        } catch (RuntimeException failure) {
+          nestedFailure.set(failure);
+        }
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
     }
   }
 
@@ -504,6 +574,60 @@ public class ScalarIndexTest {
             progress.recorder.snapshot().contains("complete:write_metadata"),
             "Expected create to finish after re-entrant Dataset access, got: "
                 + progress.recorder.snapshot());
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testCreateInvertedIndexRejectsWriteReentryPromptly(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_create_write_reentry").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 20)) {
+        Fragment fragment = dataset.getFragments().get(0);
+        WriteReentrantIndexBuildProgress progress = new WriteReentrantIndexBuildProgress(dataset);
+
+        Index segment =
+            dataset.createIndex(createInvertedSegmentOptions(fragment.getId()), progress);
+
+        assertNotNull(segment);
+        RuntimeException failure = progress.writeFailure.get();
+        assertNotNull(failure, "Expected write re-entry to be rejected");
+        assertTrue(
+            failure.getMessage().contains("already creating an index"),
+            "Unexpected write re-entry failure: " + failure.getMessage());
+        assertTrue(progress.reentries.get() > 0, "Expected callback to attempt a write lock");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testCreateInvertedIndexRejectsNestedCreatePromptly(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_create_nested_reentry").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 20)) {
+        Fragment fragment = dataset.getFragments().get(0);
+        IndexOptions segmentOptions = createInvertedSegmentOptions(fragment.getId());
+        NestedCreateIndexBuildProgress progress =
+            new NestedCreateIndexBuildProgress(dataset, segmentOptions);
+
+        Index segment = dataset.createIndex(segmentOptions, progress);
+
+        assertNotNull(segment);
+        RuntimeException failure = progress.nestedFailure.get();
+        assertNotNull(failure, "Expected nested create to be rejected");
+        assertTrue(
+            failure.getMessage().contains("already creating an index"),
+            "Unexpected nested create failure: " + failure.getMessage());
       }
     }
   }

@@ -1197,6 +1197,7 @@ fn inner_create_index<'local>(
                 }?;
                 dataset_guard.inner.clone()
             };
+            let initial_version = working_dataset.version().version;
             let index_metadata = execute_create_index(
                 &mut working_dataset,
                 &columns_slice,
@@ -1210,7 +1211,20 @@ fn inner_create_index<'local>(
                 batch_reader,
                 Some(progress),
                 skip_commit,
-            )?;
+            )
+            .inspect_err(|_| {
+                // A committed build may fail while materializing its return metadata. The clone
+                // has already observed the durable commit, so publish it before propagating.
+                if should_publish_working_dataset_on_error(
+                    skip_commit,
+                    initial_version,
+                    working_dataset.version().version,
+                ) && let Ok(mut dataset_guard) =
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                {
+                    dataset_guard.inner = working_dataset.clone();
+                }
+            })?;
 
             if !skip_commit {
                 let mut dataset_guard = unsafe {
@@ -1243,6 +1257,14 @@ fn inner_create_index<'local>(
     };
 
     (&index_metadata).into_java(env)
+}
+
+fn should_publish_working_dataset_on_error(
+    skip_commit: bool,
+    initial_version: u64,
+    current_version: u64,
+) -> bool {
+    !skip_commit && current_version != initial_version
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1992,6 +2014,26 @@ fn inner_list_versions<'local>(
             Ok(())
         })?;
     Ok(array_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_publish_working_dataset_on_error;
+
+    #[test]
+    fn post_commit_failure_publishes_advanced_dataset() {
+        assert!(should_publish_working_dataset_on_error(false, 1, 2));
+    }
+
+    #[test]
+    fn pre_commit_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(false, 1, 1));
+    }
+
+    #[test]
+    fn uncommitted_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(true, 1, 2));
+    }
 }
 
 #[unsafe(no_mangle)]
