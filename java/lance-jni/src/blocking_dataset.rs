@@ -51,7 +51,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::noop_progress;
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -1029,7 +1029,74 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
             fragments_jobj,
             index_uuid_jobj,
             arrow_stream_addr_jobj,
+            None,
         )
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndexWithProgress<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>, // List<String>
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,              // Optional<String>
+    params_jobj: JObject<'local>,            // IndexParams
+    replace_jobj: jboolean,                  // replace
+    train_jobj: jboolean,                    // train
+    fragments_jobj: JObject<'local>,         // List<Integer>
+    index_uuid_jobj: JObject<'local>,        // String
+    arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress_jobj: JObject<'local>,          // IndexBuildProgress
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_index_with_progress(
+            &mut env,
+            java_dataset,
+            columns_jobj,
+            index_type_code_jobj,
+            name_jobj,
+            params_jobj,
+            replace_jobj,
+            train_jobj,
+            fragments_jobj,
+            index_uuid_jobj,
+            arrow_stream_addr_jobj,
+            progress_jobj,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_create_index_with_progress<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>,
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,
+    params_jobj: JObject<'local>,
+    replace_jobj: jboolean,
+    train_jobj: jboolean,
+    fragments_jobj: JObject<'local>,
+    index_uuid_jobj: JObject<'local>,
+    arrow_stream_addr_jobj: JObject<'local>,
+    progress_jobj: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
+    inner_create_index(
+        env,
+        java_dataset,
+        columns_jobj,
+        index_type_code_jobj,
+        name_jobj,
+        params_jobj,
+        replace_jobj,
+        train_jobj,
+        fragments_jobj,
+        index_uuid_jobj,
+        arrow_stream_addr_jobj,
+        Some(progress),
     )
 }
 
@@ -1046,6 +1113,7 @@ fn inner_create_index<'local>(
     fragments_jobj: JObject<'local>,         // Optional<List<String>>
     index_uuid_jobj: JObject<'local>,        // Optional<String>
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress: Option<Arc<dyn IndexBuildProgress>>,
 ) -> Result<JObject<'local>> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -1118,42 +1186,110 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    // Execute index creation in a block to ensure dataset_guard is dropped
-    // before we call into_java (which needs to borrow env again)
-    let index_metadata = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let index_metadata = match progress {
+        Some(progress) => {
+            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+            // and release the native field guard before the long-running build so those callbacks
+            // do not deadlock on the field mutex.
+            let mut working_dataset = {
+                let dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner.clone()
+            };
+            let index_metadata = execute_create_index(
+                &mut working_dataset,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                Some(progress),
+                skip_commit,
+            )?;
 
-        let mut index_builder = dataset_guard
-            .inner
-            .create_index_builder(&columns_slice, index_type, params.as_ref())
-            .replace(replace)
-            .train(train);
-
-        if let Some(name) = name {
-            index_builder = index_builder.name(name);
+            if !skip_commit {
+                let mut dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner = working_dataset;
+            }
+            index_metadata
         }
-
-        if let Some(fragment_ids) = fragment_ids {
-            index_builder = index_builder.fragments(fragment_ids);
-        }
-
-        if let Some(index_uuid) = index_uuid {
-            index_builder = index_builder.index_uuid(index_uuid);
-        }
-
-        if let Some(reader) = batch_reader {
-            index_builder = index_builder.preprocessed_data(Box::new(reader));
-        }
-
-        if skip_commit {
-            block_on(index_builder.execute_uncommitted())?
-        } else {
-            block_on(index_builder.into_future())?
+        None => {
+            // Preserve the existing no-progress path, including its native-field locking behavior.
+            let mut dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+            }?;
+            execute_create_index(
+                &mut dataset_guard.inner,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                None,
+                skip_commit,
+            )?
         }
     };
 
     (&index_metadata).into_java(env)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_create_index(
+    dataset: &mut Dataset,
+    columns: &[&str],
+    index_type: IndexType,
+    params: &dyn IndexParams,
+    replace: bool,
+    train: bool,
+    name: Option<String>,
+    fragment_ids: Option<Vec<u32>>,
+    index_uuid: Option<Uuid>,
+    batch_reader: Option<ArrowArrayStreamReader>,
+    progress: Option<Arc<dyn IndexBuildProgress>>,
+    skip_commit: bool,
+) -> Result<IndexMetadata> {
+    let mut index_builder = dataset
+        .create_index_builder(columns, index_type, params)
+        .replace(replace)
+        .train(train);
+
+    if let Some(name) = name {
+        index_builder = index_builder.name(name);
+    }
+
+    if let Some(fragment_ids) = fragment_ids {
+        index_builder = index_builder.fragments(fragment_ids);
+    }
+
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
+    }
+
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if let Some(progress) = progress {
+        index_builder = index_builder.progress(progress);
+    }
+
+    if skip_commit {
+        block_on(index_builder.execute_uncommitted())
+    } else {
+        block_on(index_builder.into_future())
+    }
 }
 
 #[unsafe(no_mangle)]

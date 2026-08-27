@@ -91,6 +91,7 @@ public class Dataset implements Closeable {
   private boolean ownsSession = false;
 
   private final LockManager lockManager = new LockManager();
+  private final Object createIndexLock = new Object();
 
   private Dataset() {}
 
@@ -1193,18 +1194,63 @@ public class Dataset implements Closeable {
    * @return the metadata of the created index
    */
   public Index createIndex(IndexOptions options) {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCreateIndex(
-          options.getColumns(),
-          options.getIndexType().getValue(),
-          options.getIndexName(),
-          options.getIndexParams(),
-          options.isReplace(),
-          options.isTrain(),
-          options.getFragmentIds(),
-          options.getIndexUUID(),
-          options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+    Preconditions.checkNotNull(options, "options cannot be null");
+    return createIndexInternal(options, null);
+  }
+
+  /**
+   * Creates a new index on the dataset while reporting stage-level progress.
+   *
+   * <p>Stage names, work units, and whether a total is available depend on the index type. The
+   * callback must be thread-safe because Lance may invoke it concurrently from native runtime
+   * threads.
+   *
+   * <pre>{@code
+   * Index index = dataset.createIndex(options, new IndexBuildProgress() {
+   *   public void stageStart(String stage, Optional<Long> total, String unit) { }
+   *   public void stageProgress(String stage, long completed) { }
+   *   public void stageComplete(String stage) { }
+   * });
+   * }</pre>
+   *
+   * @param options options for building index
+   * @param progress thread-safe progress callback
+   * @return the metadata of the created index
+   */
+  public Index createIndex(IndexOptions options, IndexBuildProgress progress) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    return createIndexInternal(options, progress);
+  }
+
+  private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
+    synchronized (createIndexLock) {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        if (progress == null) {
+          return nativeCreateIndex(
+              options.getColumns(),
+              options.getIndexType().getValue(),
+              options.getIndexName(),
+              options.getIndexParams(),
+              options.isReplace(),
+              options.isTrain(),
+              options.getFragmentIds(),
+              options.getIndexUUID(),
+              options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+        }
+        return nativeCreateIndexWithProgress(
+            options.getColumns(),
+            options.getIndexType().getValue(),
+            options.getIndexName(),
+            options.getIndexParams(),
+            options.isReplace(),
+            options.isTrain(),
+            options.getFragmentIds(),
+            options.getIndexUUID(),
+            options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
+            progress);
+      }
     }
   }
 
@@ -1218,6 +1264,18 @@ public class Dataset implements Closeable {
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
+
+  private native Index nativeCreateIndexWithProgress(
+      List<String> columns,
+      int indexTypeCode,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace,
+      boolean train,
+      Optional<List<Integer>> fragments,
+      Optional<String> indexUUID,
+      Optional<Long> arrowStreamMemoryAddress,
+      IndexBuildProgress progress);
 
   /**
    * Drop an index by name.
