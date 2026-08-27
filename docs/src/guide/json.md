@@ -28,6 +28,11 @@ Lance stores JSON data internally as JSONB (binary JSON) using the `lance.json` 
 
 When you read JSON data back from Lance, it's automatically converted to Arrow's JSON type for seamless integration with your data processing pipelines.
 
+JSON numbers are stored exactly when written in non-exponent decimal notation with at
+most 76 digits. Exponent notation and longer numbers are rejected at write time instead
+of being silently rounded. Convert exponent-form inputs to an equivalent plain decimal
+string before writing them.
+
 ## JSON Functions
 
 Lance provides a comprehensive set of JSON functions for querying and filtering JSON data. These functions can be used in filter expressions with methods like `to_table()`, `scanner()`, and SQL queries through DataFusion integration.

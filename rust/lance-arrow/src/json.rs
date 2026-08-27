@@ -4,6 +4,7 @@
 //! JSON support for Apache Arrow.
 
 use std::convert::TryFrom;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
@@ -280,9 +281,34 @@ impl TryFrom<ArrayRef> for JsonArray {
     }
 }
 
-/// Encode JSON string to JSONB format
+#[derive(Debug)]
+struct InexactJsonNumberError;
+
+impl Display for InexactJsonNumberError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("JSON numbers must use non-exponent decimal notation with at most 76 digits")
+    }
+}
+
+impl std::error::Error for InexactJsonNumberError {}
+
+fn ensure_exact_json_numbers(value: &jsonb::Value<'_>) -> Result<(), InexactJsonNumberError> {
+    match value {
+        jsonb::Value::Number(jsonb::Number::Float64(_)) => Err(InexactJsonNumberError),
+        jsonb::Value::Array(values) => values.iter().try_for_each(ensure_exact_json_numbers),
+        jsonb::Value::Object(values) => values.values().try_for_each(ensure_exact_json_numbers),
+        _ => Ok(()),
+    }
+}
+
+/// Encode a JSON string to JSONB without silently rounding numeric values.
+///
+/// Numbers must use non-exponent decimal notation and contain at most 76 digits,
+/// which is the exact domain supported by the JSONB Decimal256 representation.
 pub fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let value = jsonb::parse_value(json_str.as_bytes())?;
+    ensure_exact_json_numbers(&value)?;
     Ok(value.to_vec())
 }
 
@@ -761,6 +787,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(values.iter().flatten().collect::<Vec<_>>(), json_strings);
+    }
+
+    #[test]
+    fn test_encode_json_rejects_numbers_outside_exact_domain() {
+        for json in [
+            r#"{"value":1.234567890123456789e-20}"#,
+            r#"{"value":11111111111111111111111111111111111111111111111111111111111111111111111111111}"#,
+        ] {
+            let error = encode_json(json).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "JSON numbers must use non-exponent decimal notation with at most 76 digits"
+                ),
+                "unexpected error for {json}: {error}"
+            );
+        }
+
+        let encoded = encode_json(r#"{"value":"1.234567890123456789e-20"}"#).unwrap();
+        assert_eq!(
+            decode_json(&encoded),
+            r#"{"value":"1.234567890123456789e-20"}"#
+        );
     }
 
     #[test]

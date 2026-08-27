@@ -6047,6 +6047,64 @@ async fn test_json_btree_nested_path_bypasses_direct_accessor() {
 }
 
 #[rstest]
+#[case::zonemap(
+    "zonemap",
+    &[r#"{"val": 1}"#, r#"{"val": 7}"#, r#"{"val": 9}"#],
+    "json_get_int(json, 'val') = 7",
+    "ZoneMap"
+)]
+#[case::fm(
+    "fm",
+    &[
+        r#"{"val": "unique-alpha"}"#,
+        r#"{"val": "unique-bravo"}"#,
+        r#"{"val": "unique-charlie"}"#,
+    ],
+    "contains(json_get_string(json, 'val'), 'bravo')",
+    "Fm"
+)]
+#[tokio::test]
+async fn test_json_wrapped_index_preserves_query_admission(
+    #[case] target_index_type: &str,
+    #[case] values: &[&str],
+    #[case] predicate: &str,
+    #[case] expected_index_type: &str,
+) {
+    let initial = json_batch(values.to_vec());
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": target_index_type,
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.filter(predicate).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains(expected_index_type),
+        "expected JSON {expected_index_type} query for {predicate}:\n{plan}"
+    );
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+}
+
+#[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
 #[tokio::test]

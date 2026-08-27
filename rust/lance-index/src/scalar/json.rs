@@ -39,7 +39,7 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
+        AnyQuery, CreatedIndex, IndexFile, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
         SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
@@ -50,6 +50,8 @@ use crate::{
 };
 
 const JSON_INDEX_VERSION: u32 = 1;
+/// Metadata-only index file whose value field records the wrapped index's input type.
+const JSON_TARGET_TYPE_FILENAME: &str = "json_target_type.lance";
 /// Maximum extracted JSON data kept in memory while inferring an index type.
 const JSON_TYPE_INFERENCE_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
 
@@ -60,11 +62,20 @@ const JSON_TYPE_INFERENCE_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
 pub struct JsonIndex {
     target_index: Arc<dyn ScalarIndex>,
     path: String,
+    target_type: Option<DataType>,
 }
 
 impl JsonIndex {
-    pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
-        Self { target_index, path }
+    pub fn new(
+        target_index: Arc<dyn ScalarIndex>,
+        path: String,
+        target_type: Option<DataType>,
+    ) -> Self {
+        Self {
+            target_index,
+            path,
+            target_type,
+        }
     }
 }
 
@@ -135,16 +146,24 @@ impl ScalarIndex for JsonIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        let target_type = self.training_data_type().ok_or_else(|| {
+            Error::not_supported(format!(
+                "JSON index remapping for path '{}' requires a durable target data type",
+                self.path
+            ))
+        })?;
         let target_created = self.target_index.remap(mapping, dest_store).await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
         };
+        let mut files = target_created.files;
+        files.push(write_json_target_type(dest_store, &target_type).await?);
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
+            files,
         })
     }
 
@@ -163,8 +182,11 @@ impl ScalarIndex for JsonIndex {
             ))
         })?;
         let new_data = JsonIndexPlugin::extract_json(new_data, self.path.clone())?;
-        let new_data =
-            JsonIndexPlugin::convert_stream_by_type(new_data, target_type, self.path.clone())?;
+        let new_data = JsonIndexPlugin::convert_stream_by_type(
+            new_data,
+            target_type.clone(),
+            self.path.clone(),
+        )?;
         let new_data = if target_criteria.ordering == TrainingOrdering::Values {
             JsonIndexPlugin::sort_stream_by_value(new_data).await?
         } else {
@@ -178,11 +200,13 @@ impl ScalarIndex for JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
         };
+        let mut files = target_created.files;
+        files.push(write_json_target_type(dest_store, &target_type).await?);
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
+            files,
         })
     }
 
@@ -212,7 +236,9 @@ impl ScalarIndex for JsonIndex {
     }
 
     fn training_data_type(&self) -> Option<DataType> {
-        self.target_index.training_data_type()
+        self.target_type
+            .clone()
+            .or_else(|| self.target_index.training_data_type())
     }
 }
 
@@ -279,6 +305,52 @@ impl From<JsonIndexTargetType> for DataType {
             JsonIndexTargetType::LargeBinary => Self::LargeBinary,
         }
     }
+}
+
+async fn write_json_target_type(
+    index_store: &dyn IndexStore,
+    target_type: &DataType,
+) -> Result<IndexFile> {
+    JsonIndexTargetType::try_from(target_type)?;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        VALUE_COLUMN_NAME,
+        target_type.clone(),
+        true,
+    )]));
+    let mut writer = index_store
+        .new_index_file(JSON_TARGET_TYPE_FILENAME, schema)
+        .await?;
+    writer.finish().await
+}
+
+async fn read_json_target_type(index_store: &dyn IndexStore) -> Result<Option<DataType>> {
+    let has_metadata = index_store
+        .list_files_with_sizes()
+        .await?
+        .iter()
+        .any(|file| file.path == JSON_TARGET_TYPE_FILENAME);
+    if !has_metadata {
+        return Ok(None);
+    }
+
+    let reader = index_store
+        .open_index_file(JSON_TARGET_TYPE_FILENAME)
+        .await?;
+    let schema = reader.schema();
+    let field = schema.field(VALUE_COLUMN_NAME).ok_or_else(|| {
+        Error::corrupt_file_named(
+            JSON_TARGET_TYPE_FILENAME,
+            format!("missing JSON target type field '{VALUE_COLUMN_NAME}'"),
+        )
+    })?;
+    let target_type = field.data_type();
+    JsonIndexTargetType::try_from(&target_type).map_err(|error| {
+        Error::corrupt_file_named(
+            JSON_TARGET_TYPE_FILENAME,
+            format!("invalid JSON target data type {target_type}: {error}"),
+        )
+    })?;
+    Ok(Some(target_type))
 }
 
 // TODO: Do we really need to wrap the query or could we just return the target query directly?
@@ -1155,10 +1227,12 @@ impl BasicTrainer for JsonIndexPlugin {
             path,
             target_details: Some(target_index.index_details),
         };
+        let mut files = target_index.files;
+        files.push(write_json_target_type(index_store, &target_type).await?);
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
             index_version: JSON_INDEX_VERSION,
-            files: target_index.files,
+            files,
         })
     }
 }
@@ -1233,10 +1307,15 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        let target_type = read_json_target_type(index_store.as_ref()).await?;
         let target_index = target_plugin
             .load_index(index_store, target_details, frag_reuse_index, cache)
             .await?;
-        Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
+        Ok(Arc::new(JsonIndex::new(
+            target_index,
+            json_details.path,
+            target_type,
+        )))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -1824,6 +1903,8 @@ mod tests {
             ],
         )
         .await;
+
+        assert_eq!(index.training_data_type(), Some(DataType::Utf8));
 
         assert_eq!(
             index.calculate_included_frags().await.unwrap(),
