@@ -77,7 +77,8 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
+    INVERTED_INDEX_VERSION_V3, InvertedIndex, InvertedIndexParams, SCORE_COL, SCORE_FIELD,
+    fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -341,6 +342,19 @@ fn has_exact_hybrid_fts_coverage(
         return false;
     }
     indexed | residual == target
+}
+
+fn has_compatible_hybrid_physical_segments(
+    params: &[InvertedIndexParams],
+    has_deleted_fragments: &[bool],
+) -> bool {
+    let Some(first) = params.first() else {
+        return false;
+    };
+    params.len() == has_deleted_fragments.len()
+        && first.posting_block_size() == 128
+        && params.iter().all(|params| params == first)
+        && has_deleted_fragments.iter().all(|has_deleted| !has_deleted)
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -4349,18 +4363,53 @@ impl Scanner {
                     ) {
                         return Ok(None);
                     }
-                    let first_segment = segments.first().ok_or_else(|| {
-                        Error::internal("hybrid compound FTS requires one indexed segment")
-                    })?;
-                    if load_segment_params(&self.dataset, first_segment)
-                        .await?
-                        .posting_block_size()
-                        != 128
-                    {
-                        // Larger posting blocks quantize document lengths. The
-                        // query-local residual index currently retains exact
-                        // lengths, so the two arms would not have bit-identical
-                        // scores.
+                    if segments.is_empty() {
+                        return Err(Error::internal(
+                            "hybrid compound FTS requires one indexed segment",
+                        ));
+                    }
+                    // Preserve the established semantic mismatch error before
+                    // applying the narrower physical fast-path gate.
+                    load_segment_details(&self.dataset, &column, &segments).await?;
+                    let segment_params = futures::future::try_join_all(
+                        segments
+                            .iter()
+                            .map(|segment| load_segment_params(&self.dataset, segment)),
+                    )
+                    .await?;
+                    let has_deleted_fragments = futures::future::try_join_all(
+                        segments.iter().map(|segment| {
+                            let column = &column;
+                            async move {
+                                let index = self
+                                    .dataset
+                                    .open_scalar_index(
+                                        column,
+                                        &segment.uuid,
+                                        &NoOpMetricsCollector,
+                                    )
+                                    .await?;
+                                let index = index
+                                    .as_any()
+                                    .downcast_ref::<InvertedIndex>()
+                                    .ok_or_else(|| {
+                                        Error::internal(format!(
+                                            "hybrid compound FTS segment {} is not an inverted index",
+                                            segment.uuid
+                                        ))
+                                    })?;
+                                Ok::<_, Error>(!index.deleted_fragments().is_empty())
+                            }
+                        }),
+                    )
+                    .await?;
+                    if !has_compatible_hybrid_physical_segments(
+                        &segment_params,
+                        &has_deleted_fragments,
+                    ) {
+                        // Larger posting blocks quantize document lengths, and
+                        // retired physical documents remain in corpus stats.
+                        // Either would make the two arms incomparable.
                         return Ok(None);
                     }
                 }
@@ -7532,6 +7581,28 @@ mod test {
 
         assert!(supports_compound_scorer(&single_column));
         assert!(!supports_compound_scorer(&cross_column));
+    }
+
+    #[test]
+    fn test_hybrid_compound_requires_compatible_live_physical_segments() {
+        let params = InvertedIndexParams::default();
+        assert!(has_compatible_hybrid_physical_segments(
+            &[params.clone(), params.clone()],
+            &[false, false]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(
+            &[params.clone(), params.clone()],
+            &[false, true]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(
+            &[params.clone(), params.clone().with_position(true)],
+            &[false, false]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(
+            &[params.clone().block_size(256).unwrap()],
+            &[false]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(&[params], &[]));
     }
 
     #[test]

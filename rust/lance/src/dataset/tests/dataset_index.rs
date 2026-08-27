@@ -10,6 +10,8 @@ use std::vec;
 
 use crate::dataset::ROW_ID;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{Operation, Transaction};
@@ -20,7 +22,7 @@ use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
-use crate::index::DatasetIndexExt;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -49,7 +51,10 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{
+    FullTextSearchQuery, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -63,7 +68,9 @@ use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
+use roaring::RoaringBitmap;
 use rstest::rstest;
+use uuid::Uuid;
 
 #[rstest]
 #[tokio::test]
@@ -2809,11 +2816,185 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
         .unwrap();
     let rebuilt_boost = compound_fts_results(&dataset, boost_query, Some(10)).await;
     let rebuilt_multimatch = compound_fts_results(&dataset, multimatch_query, Some(3)).await;
-    assert_scored_rows_close("partial_hybrid_boost", &partial_boost, &rebuilt_boost);
-    assert_scored_rows_close(
-        "partial_hybrid_multimatch",
-        &partial_multimatch,
-        &rebuilt_multimatch,
+    let score_bits = |rows: &[(u64, f32)]| {
+        rows.iter()
+            .map(|(row_id, score)| (*row_id, score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        score_bits(&partial_boost),
+        score_bits(&rebuilt_boost),
+        "hybrid Boost scores must be bit-identical to a rebuilt index"
+    );
+    assert_eq!(
+        score_bits(&partial_multimatch),
+        score_bits(&rebuilt_multimatch),
+        "hybrid MultiMatch scores must be bit-identical to a rebuilt index"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_rejects_retired_physical_fragments() {
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["retired alpha", "live alpha"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let initial_segment = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    let retired_fragments = initial_segment.fragment_bitmap.clone().unwrap();
+    let initial_index = dataset
+        .open_scalar_index(
+            "text",
+            &initial_segment.uuid,
+            &lance_index::metrics::NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+    dataset.delete("id = 0").await.unwrap();
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 10,
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().deletion_file.is_none())
+    );
+    let indexed_fragments = dataset.fragment_bitmap.as_ref().clone();
+    assert!(indexed_fragments.is_disjoint(&retired_fragments));
+
+    // Model an incremental FTS replacement that retains the old postings and
+    // records their now-retired fragment ids for merge-on-read filtering.
+    let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
+        dataset.schema(),
+        initial_segment.fields[0],
+        DocumentGranularity::Row,
+    )
+    .unwrap();
+    let current_fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().clone())
+        .collect();
+    let update_criteria = initial_index.update_criteria();
+    let new_data = crate::index::scalar::load_fts_training_data(
+        &dataset,
+        &resolved,
+        &update_criteria.data_criteria,
+        Some(current_fragments),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let updated_uuid = Uuid::new_v4();
+    let updated_store = LanceIndexStore::from_dataset_for_new(&dataset, &updated_uuid).unwrap();
+    let created = initial_index
+        .update(
+            new_data,
+            &updated_store,
+            Some(OldIndexDataFilter::Fragments {
+                to_keep: RoaringBitmap::new(),
+                to_remove: retired_fragments.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let updated_segment = lance_table::format::IndexMetadata {
+        uuid: updated_uuid,
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(indexed_fragments),
+        index_details: Some(Arc::new(created.index_details)),
+        index_version: created.index_version as i32,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(index_files_to_table(created.files)),
+        ..initial_segment
+    };
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![updated_segment])
+        .await
+        .unwrap();
+
+    let committed = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    let committed_index = dataset
+        .open_scalar_index(
+            "text",
+            &committed.uuid,
+            &lance_index::metrics::NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+    let committed_index = committed_index
+        .as_any()
+        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        .unwrap();
+    assert_eq!(committed_index.deleted_fragments(), &retired_fragments);
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["tail alpha"]), ("id", Int32, [2])).unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("retired", "text", 1.0)),
+        (Occur::Should, compound_match_query("tail", "text", 1.0)),
+    ])
+    .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), 10).await;
+    assert!(
+        !plan.contains("HybridCompoundFtsScorer"),
+        "retired physical docs make unified hybrid BM25 stats unsafe:\n{plan}"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(10), None)
+        .unwrap();
+    let results = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        results["id"].as_primitive::<Int32Type>().values(),
+        &[2],
+        "fallback must prune stale postings from the retired fragment"
     );
 }
 
