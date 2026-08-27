@@ -31,6 +31,7 @@ public class VectorIndexParams {
   private final Optional<SQBuildParams> sqParams;
   private final Optional<RQBuildParams> rqParams;
   private final List<String> coveringColumns;
+  private final boolean storeVectorsForRefine;
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -43,6 +44,7 @@ public class VectorIndexParams {
         builder.coveringColumns == null
             ? Collections.emptyList()
             : Collections.unmodifiableList(new ArrayList<>(builder.coveringColumns));
+    this.storeVectorsForRefine = builder.storeVectorsForRefine;
     validate();
   }
 
@@ -188,6 +190,7 @@ public class VectorIndexParams {
     private Optional<SQBuildParams> sqParams = Optional.empty();
     private Optional<RQBuildParams> rqParams = Optional.empty();
     private List<String> coveringColumns = Collections.emptyList();
+    private boolean storeVectorsForRefine = false;
 
     /**
      * Create a new builder to create a vector index.
@@ -258,6 +261,33 @@ public class VectorIndexParams {
       return this;
     }
 
+    /**
+     * Carry full-precision vectors in the index storage so a query using {@code refineFactor}
+     * re-ranks from the index instead of taking the vectors from the base table. Off by default: it
+     * stores a second copy of the vector column, which is the largest column in most datasets.
+     *
+     * <p>Not expressible through {@link #setCoveringColumns}: the build pipeline rewrites the
+     * indexed column in place, so a covering column under that name would serve values that are not
+     * the user's vectors. The copy taken here predates those transforms.
+     *
+     * <p>Requires the V3 index file format, and is rejected on flat quantizers (which already store
+     * the vectors), on multivector columns, on a nested indexed column, and when precomputed
+     * shuffle buffers are used. The core validates this when the index is built.
+     *
+     * <p>While such an index exists the indexed column can no longer be renamed, nor have its
+     * nullability changed: the carried copy lives in index storage under that column's name and
+     * nothing renames it, so altering the column is refused rather than leaving an index whose
+     * optimize and compaction paths are permanently broken. Drop the index, alter the column, then
+     * rebuild. Dropping the column itself stays allowed -- that removes the index along with it.
+     *
+     * @param storeVectorsForRefine whether to carry full-precision vectors for refine
+     * @return Builder
+     */
+    public Builder setStoreVectorsForRefine(boolean storeVectorsForRefine) {
+      this.storeVectorsForRefine = storeVectorsForRefine;
+      return this;
+    }
+
     public VectorIndexParams build() {
       return new VectorIndexParams(this);
     }
@@ -301,6 +331,16 @@ public class VectorIndexParams {
     return coveringColumns;
   }
 
+  /**
+   * Whether the index carries full-precision vectors for {@code refine}. See {@link
+   * Builder#setStoreVectorsForRefine(boolean)}.
+   *
+   * @return true when carried refine vectors were requested
+   */
+  public boolean isStoreVectorsForRefine() {
+    return storeVectorsForRefine;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -311,6 +351,7 @@ public class VectorIndexParams {
         .add("sqParams", sqParams.orElse(null))
         .add("rqParams", rqParams.orElse(null))
         .add("coveringColumns", coveringColumns)
+        .add("storeVectorsForRefine", storeVectorsForRefine)
         .toString();
   }
 }

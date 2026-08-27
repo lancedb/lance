@@ -792,7 +792,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_covering_columns(covering_columns.to_vec())
+                .with_covering_payload(covering_columns.to_vec(), false)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -811,7 +811,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_covering_columns(covering_columns.to_vec())
+                .with_covering_payload(covering_columns.to_vec(), false)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -835,7 +835,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -856,7 +856,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -877,7 +877,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -897,7 +897,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -917,7 +917,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_covering_columns(covering_columns.to_vec())
+                .with_covering_payload(covering_columns.to_vec(), false)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -936,7 +936,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_covering_columns(covering_columns.to_vec())
+                .with_covering_payload(covering_columns.to_vec(), false)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -960,7 +960,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -981,7 +981,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
-            .with_covering_columns(covering_columns.to_vec())
+            .with_covering_payload(covering_columns.to_vec(), false)
             .shuffle_data_input(unindexed)
             .build()
             .await?

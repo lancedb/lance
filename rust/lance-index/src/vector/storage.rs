@@ -168,6 +168,20 @@ pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
 /// Absent when the storage has no covering columns.
 pub const COVERING_FIELD_IDS_KEY: &str = "covering_field_ids";
 
+/// Full-precision vectors carried in index storage so `refine` can re-rank without
+/// taking them from the base table.
+pub const REFINE_VECTOR_COLUMN: &str = "__refine_vector";
+
+/// Names the build pipeline uses in flight that must never be a user column.
+///
+/// [`REFINE_VECTOR_COLUMN`] carries the copy of the indexed column past the transform
+/// chain, which consumes a column of that column's own name. The copy takes the real name
+/// back before it is written, so this never appears in a stored schema -- but a *user*
+/// covering column of the same name would collide with the copy mid-flight, so the name is
+/// reserved. Reservation is all this is for: it is chained into `RESERVED_STORAGE_COLUMNS`
+/// at index-create time and rejected there.
+pub const DEFERRED_INTERNAL_COLUMNS: &[&str] = &[REFINE_VECTOR_COLUMN];
+
 #[derive(Debug)]
 pub struct QueryScratch {
     pub distances: Vec<f32>,

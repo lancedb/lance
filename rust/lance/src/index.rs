@@ -279,6 +279,14 @@ async fn prune_stale_segment_coverage(
             // `fields` -- so no separate expansion over `covering_fields()` is needed here.
             let relevant_field_ids = segment_indexed_field_ids(dataset, segment)?;
             for included_id in segment.covering_fields() {
+                // No exemption for a field the segment is also keyed on: carried refine
+                // vectors declare the indexed column here, and index storage holds that copy
+                // under its build-time name, so a rename leaves storage the rebuild paths
+                // cannot resolve. The `alter_columns` preflight (`schema_evolution`) and the
+                // commit-boundary guard (`reject_covered_field_subtree_change`) refuse it for
+                // the same reason; all three must agree or one of them forbids what another
+                // accepts.
+                //
                 // A covered field whose subtree changed between the segment's build version
                 // and now -- e.g. a struct that gained a child via `add_columns` (which
                 // commits while this segment is still uncommitted, so the Merge-commit guard

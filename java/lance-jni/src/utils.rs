@@ -528,6 +528,19 @@ pub fn get_vector_index_params(
                 |env, elem| Ok(env.get_string(&JString::from(elem))?.into()),
             )?;
 
+            // Carry full-precision vectors in the index so `refine` re-ranks from index
+            // storage instead of taking them from the base table. Deliberately not part of
+            // the covering columns above: the core records it by naming the indexed column
+            // itself, which the covering setter rejects. The core validates it at build.
+            let store_vectors_for_refine = env
+                .call_method(
+                    &vector_index_params_obj,
+                    "isStoreVectorsForRefine",
+                    "()Z",
+                    &[],
+                )?
+                .z()?;
+
             Ok(VectorIndexParams {
                 metric_type: distance_type,
                 stages,
@@ -535,6 +548,7 @@ pub fn get_vector_index_params(
                 skip_transpose: false,
                 runtime_hints: Default::default(),
                 covering_columns,
+                store_vectors_for_refine,
             })
         },
     )?;

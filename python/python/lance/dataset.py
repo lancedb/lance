@@ -3849,6 +3849,7 @@ class LanceDataset(pa.dataset.Dataset):
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
         covering_columns: Optional[List[str]] = None,
+        store_vectors_for_refine: bool = False,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -4180,6 +4181,9 @@ class LanceDataset(pa.dataset.Dataset):
         if covering_columns is not None:
             kwargs["covering_columns"] = covering_columns
 
+        if store_vectors_for_refine:
+            kwargs["store_vectors_for_refine"] = True
+
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
         if fragment_ids is not None:
@@ -4241,6 +4245,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         covering_columns: Optional[List[str]] = None,
+        store_vectors_for_refine: bool = False,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -4317,6 +4322,26 @@ class LanceDataset(pa.dataset.Dataset):
             name a top-level, non-key column of the dataset; the columns are
             validated by the core when the index is built. Vector indexes only.
             None by default (no covering).
+        store_vectors_for_refine : bool, default False
+            Carry full-precision vectors in the index storage so a query using
+            ``refine_factor`` re-ranks from the index instead of taking the vectors
+            from the base table. Off by default: it stores a second copy of the
+            vector column, which is the largest column in most datasets.
+
+            Not expressible through ``covering_columns``: the build pipeline
+            rewrites the indexed column in place, so a covering column under that
+            name would serve values that are not the vectors you wrote. Requires the
+            V3 index file format, and is rejected on flat quantizers (which already
+            store the vectors), on multivector columns, on a nested indexed column,
+            and with precomputed shuffle buffers.
+
+            While such an index exists the indexed column can no longer be renamed,
+            nor have its nullability changed: the carried copy lives in index storage
+            under that column's name and nothing renames it, so ``alter_columns``
+            refuses rather than leave an index whose ``optimize_indices`` and
+            ``compact_files`` are permanently broken. Drop the index, alter the
+            column, then rebuild. Dropping the column itself stays allowed -- that
+            removes the index along with it.
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
@@ -4484,6 +4509,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             covering_columns=covering_columns,
+            store_vectors_for_refine=store_vectors_for_refine,
             require_commit=True,
             **kwargs,
         )
@@ -4523,6 +4549,7 @@ class LanceDataset(pa.dataset.Dataset):
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
         covering_columns: Optional[List[str]] = None,
+        store_vectors_for_refine: bool = False,
         **kwargs,
     ) -> Index:
         """
@@ -4595,6 +4622,13 @@ class LanceDataset(pa.dataset.Dataset):
                     f"index_type={index_type!r} builds a scalar index segment; "
                     f"got covering_columns={covering_columns!r}"
                 )
+            # Same reasoning: carried refine vectors are stored by the vector build
+            # pipeline, which this branch never reaches.
+            if store_vectors_for_refine:
+                raise ValueError(
+                    "store_vectors_for_refine is only supported for vector indexes, "
+                    f"but index_type={index_type!r} builds a scalar index segment"
+                )
 
             kwargs = dict(kwargs)
             column, rust_index_type, _ = self._prepare_scalar_index_request(
@@ -4642,6 +4676,7 @@ class LanceDataset(pa.dataset.Dataset):
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
             covering_columns=covering_columns,
+            store_vectors_for_refine=store_vectors_for_refine,
             require_commit=False,
             **kwargs,
         )

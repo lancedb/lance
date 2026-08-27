@@ -4969,6 +4969,7 @@ fn prepare_vector_index_params(
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
     let mut covering_columns: Vec<String> = Vec::new();
+    let mut store_vectors_for_refine = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -5138,6 +5139,16 @@ fn prepare_vector_index_params(
         {
             covering_columns = cols.extract()?;
         }
+
+        // Carry full-precision vectors in the index so `refine` re-ranks from index
+        // storage rather than taking them from the base table. Deliberately separate
+        // from `covering_columns`: the core records it by naming the indexed column
+        // itself, which the covering setter rejects. Validated by the core at build.
+        if let Some(value) = kwargs.get_item("store_vectors_for_refine")?
+            && !value.is_none()
+        {
+            store_vectors_for_refine = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -5184,6 +5195,7 @@ fn prepare_vector_index_params(
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
     params.covering_columns(covering_columns);
+    params.store_vectors_for_refine(store_vectors_for_refine);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {

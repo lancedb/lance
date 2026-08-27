@@ -44,7 +44,7 @@ use lance_index::vector::quantizer::{
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::{
-    COVERING_FIELD_IDS_KEY, PartitionColumns, STORAGE_METADATA_KEY,
+    COVERING_FIELD_IDS_KEY, PartitionColumns, REFINE_VECTOR_COLUMN, STORAGE_METADATA_KEY,
 };
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{
@@ -303,6 +303,10 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     /// Columns to co-locate ("include") in the index storage alongside the row
     /// id and quantization code, so covered queries can avoid a take.
     covering_columns: Vec<String>,
+    /// Carry full-precision vectors in storage for `refine` (see
+    /// [`REFINE_VECTOR_COLUMN`]). Copied off the batch *before* the IVF/quantizer
+    /// transforms, which rewrite the indexed column in place.
+    store_refine_vectors: bool,
     _temp_dir: TempStdDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
@@ -433,6 +437,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             merged_num: 0,
             transpose_codes: true,
             covering_columns: Vec::new(),
+            store_refine_vectors: false,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
@@ -503,6 +508,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )));
         }
 
+        // Storage cannot tell the two apart -- the carried vectors sit under the indexed
+        // column's own name, exactly like an ordinary covering column -- so split them back
+        // into the pair every other construction path holds: covering columns proper, plus
+        // the flag. Leaving the indexed column in `covering_columns` would be the one state
+        // `split_carried_refine` exists to prevent, and it reads identically from the two
+        // consumers a remap reaches (`covering_arrow_fields` and `covering_field_ids` both
+        // append the carried vectors after the covering columns).
+        let (covering_columns, store_refine_vectors) =
+            crate::index::vector::split_carried_refine(covering_columns, &column);
+
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
@@ -516,6 +531,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ivf_params: None,
             quantizer_params: None,
             sub_index_params: None,
+            store_refine_vectors,
             _temp_dir: temp_dir,
             temp_dir: temp_dir_path,
             ivf: Some(ivf_index.ivf_model().clone()),
@@ -669,10 +685,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
-    /// Set columns to co-locate ("include") in the index storage so covered
-    /// queries can avoid a take from the base table.
-    pub fn with_covering_columns(&mut self, columns: Vec<String>) -> &mut Self {
+    /// Set the whole covering payload: the columns to co-locate ("include") in index
+    /// storage so covered queries skip the base-table take, and whether full-precision
+    /// vectors ride along for `refine`.
+    ///
+    /// **One setter on purpose.** These are two halves of a single declaration, and when
+    /// they were settable separately the flag depended on the order the two were called in
+    /// -- an assignment in one and an or-assignment in the other, so whichever ran last won.
+    /// Setting both here makes that unrepresentable.
+    ///
+    /// The two sources of a declaration disagree about how the flag is spelled, so both are
+    /// accepted: [`VectorIndexParams`] passes it as `store_refine_vectors` alongside columns
+    /// that never name the indexed column (`validate_covering_columns` rejects that), while a
+    /// rebuild reading committed metadata gets one list in which naming the indexed column
+    /// *is* how carried vectors are recorded -- retrain, merge, split, join and append all
+    /// take that path and pass `false`. Carried vectors are not an ordinary covering column:
+    /// the transform chain consumes the indexed column, so they are copied aside rather than
+    /// projected from the table, and leaving the name in this list would ask the scan to
+    /// project the same column twice.
+    pub fn with_covering_payload(
+        &mut self,
+        columns: Vec<String>,
+        store_refine_vectors: bool,
+    ) -> &mut Self {
+        let (columns, carries_refine) =
+            crate::index::vector::split_carried_refine(columns, &self.column);
         self.covering_columns = columns;
+        self.store_refine_vectors = store_refine_vectors || carries_refine;
         self
     }
 
@@ -867,6 +906,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 log::info!("shuffle column {} over dataset", self.column);
                 // Read the vector column plus any included ("covering") columns
                 // so they flow through the shuffle into the partition storage.
+                // `covering_columns` never names the indexed column -- every constructor
+                // routes its declaration through `split_carried_refine`, which moves that
+                // name into `store_refine_vectors` -- so this cannot repeat a name (which
+                // the projection builder would reject outright).
                 let mut projection: Vec<&str> = Vec::with_capacity(1 + self.covering_columns.len());
                 projection.push(self.column.as_str());
                 projection.extend(self.covering_columns.iter().map(String::as_str));
@@ -965,6 +1008,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let code_column = quantizer.column();
+        let refine_vector_column = self.column.clone();
+        let refine_field = self.refine_vector_field()?;
 
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
@@ -989,6 +1034,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             data.map(move |batch| {
                 let partition_map = partition_map.clone();
                 let ivf_transformer = transformer.clone();
+                let refine_vector_column = refine_vector_column.clone();
+                let refine_field = refine_field.clone();
                 tokio::spawn(async move {
                     let mut batch = batch?;
                     if !partition_map.is_empty() {
@@ -1026,7 +1073,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             // this batch is already transformed (in case of GPU training)
                             Ok(batch)
                         }
-                        None => ivf_transformer.transform(&batch),
+                        None => {
+                            let batch = add_refine_vectors(
+                                batch,
+                                &refine_vector_column,
+                                refine_field.as_ref(),
+                            )?;
+                            ivf_transformer.transform(&batch)
+                        }
                     }
                 })
             })
@@ -1199,6 +1253,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // `drop_undeclared_covering`); narrow it so every batch handed to
         // `StorageBuilder::build` agrees on width.
         let declared_covering = Arc::new(self.covering_columns.clone());
+        // Set only while this build carries refine vectors: it names the column whose
+        // stored copy has to go back under the scratch name before existing and fresh
+        // rows meet (see [`stash_refine_vectors`]).
+        let carried_vector_column: Option<Arc<str>> = self
+            .store_refine_vectors
+            .then(|| Arc::from(self.column.as_str()));
         let partition_adjustment = Arc::new(partition_adjustment);
         let build_iter =
             assign_batches
@@ -1215,6 +1275,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let frag_reuse_index = frag_reuse_index.clone();
                     let dedup_existing = dedup_existing;
                     let declared_covering = declared_covering.clone();
+                    let carried_vector_column = carried_vector_column.clone();
                     let partition_adjustment = partition_adjustment.clone();
                     async move {
                         let (is_affected, split_reader) = match partition_adjustment.as_ref() {
@@ -1240,12 +1301,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         // all data (existing + new), re-assigned with updated
                         // centroids. For other partitions, read from existing
                         // indices + original shuffle reader as normal.
+                        let carried = carried_vector_column.as_deref();
                         let (mut batches, mut loss) = if is_affected {
                             Self::take_partition_batches(
                                 partition,
                                 &[],
                                 Some(split_reader.as_ref().unwrap().as_ref()),
                                 dedup_existing,
+                                carried,
                             )
                             .await?
                         } else {
@@ -1254,6 +1317,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 indices.as_ref(),
                                 Some(reader.as_ref()),
                                 dedup_existing,
+                                carried,
                             )
                             .await?
                         };
@@ -1266,6 +1330,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 &[],
                                 Some(sr.as_ref()),
                                 dedup_existing,
+                                carried,
                             )
                             .await?;
                             batches.extend(extra);
@@ -1568,6 +1633,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         existing_indices: &[ExistingIndex],
         reader: Option<&dyn ShuffleReader>,
         dedup_by_row_id: bool,
+        carried_vector_column: Option<&str>,
     ) -> Result<(Vec<RecordBatch>, f64)> {
         let mut batches = Vec::new();
         for source in existing_indices.iter() {
@@ -1643,6 +1709,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     if keep.true_count() < batch.num_rows() {
                         *batch = arrow::compute::filter_record_batch(batch, &keep)?;
                     }
+                }
+            }
+
+            // Stored rows carry the refine vectors under the indexed column's own name,
+            // while the freshly shuffled rows appended below still have them under the
+            // scratch name. Both go into one `StorageBuilder::build`, so normalise the
+            // stored side now -- see [`stash_refine_vectors`] for why that direction.
+            if let Some(column) = carried_vector_column {
+                for batch in part_batches.iter_mut() {
+                    *batch = stash_refine_vectors(batch.clone(), column)?;
                 }
             }
 
@@ -1726,7 +1802,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// the code-storage schema and the empty-flat fallback schema append these so covered
     /// storage is written consistently regardless of whether any partition held data.
     fn covering_arrow_fields(&self) -> Result<Vec<arrow_schema::Field>> {
-        if self.covering_columns.is_empty() {
+        if self.covering_columns.is_empty() && !self.store_refine_vectors {
             return Ok(Vec::new());
         }
         let Some(ds) = self.dataset.as_ref() else {
@@ -1740,7 +1816,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
         let ds_schema = arrow_schema::Schema::from(ds.schema());
-        self.covering_columns
+        let mut fields = self
+            .covering_columns
             .iter()
             .map(|name| {
                 ds_schema.field_with_name(name).cloned().map_err(|e| {
@@ -1749,7 +1826,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ))
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // Carried vectors are an ordinary covering column under the dataset column's own
+        // name: the copy is taken before the transform chain, so its values *are* that
+        // column's values, and the shapes match (multivector, where they would not, is
+        // refused at create time). Being covering rather than storage-internal is what lets
+        // the search emit it, the exec declare it, and `refine` find it by name.
+        if let Some(field) = self.refine_vector_field()? {
+            fields.push(field);
+        }
+        Ok(fields)
     }
 
     /// Refuse to re-stamp a covering payload onto a different logical field.
@@ -1806,6 +1892,48 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(())
     }
 
+    /// The declared field for [`REFINE_VECTOR_COLUMN`], or `None` when refine vectors are
+    /// not being carried.
+    ///
+    /// The type is the *flattened* vector type: a multivector column is `List<FixedSizeList>`
+    /// in the dataset but is flattened to one `FixedSizeList` per sub-vector before the copy
+    /// is taken, so the stored column matches what `Flatten` produces, not the source column.
+    fn refine_vector_field(&self) -> Result<Option<arrow_schema::Field>> {
+        if !self.store_refine_vectors {
+            return Ok(None);
+        }
+        let Some(ds) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before resolving the refine vector column".to_string(),
+            ));
+        };
+        // Cloned from the dataset schema, not constructed: the read path's capability check
+        // compares name, data type, nullability AND metadata against the dataset's field
+        // (`covering_fields_match`), so anything synthesised here that differs in any of
+        // those makes the column fail to match and silently withdraws it.
+        //
+        // Safe to take the dataset field verbatim because multivector -- the one case where
+        // the stored shape differs from the column's (per sub-vector, not per row) -- is
+        // refused at create time.
+        // Convert just this field. `arrow_schema::Schema::from(ds.schema())` is exactly this
+        // conversion mapped over every field, but it walks the whole table (including nested
+        // structs) -- and `covering_arrow_fields`, this method's main caller, has already
+        // paid for that walk four lines before calling it. Top-level lookup only, which is
+        // what the indexed column is (a dotted name is refused at create time).
+        let field = ds
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.name == self.column)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "indexed column '{}' not found in dataset schema",
+                    self.column
+                ))
+            })?;
+        Ok(Some(arrow_schema::Field::from(field)))
+    }
+
     /// The *source dataset* field ids of the covering columns, in declaration order.
     /// Stamped into the storage file (see [`COVERING_FIELD_IDS_KEY`]) so a distributed
     /// merge can tell shards that cover the same logical fields from shards whose
@@ -1816,7 +1944,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// of a different length, which makes `physical_covering_fields_from_schema` withdraw
     /// covering for that index permanently and silently.
     fn covering_field_ids(&self) -> Result<Vec<i32>> {
-        if self.covering_columns.is_empty() {
+        if self.covering_columns.is_empty() && !self.store_refine_vectors {
             return Ok(Vec::new());
         }
         let Some(ds) = self.dataset.as_ref() else {
@@ -1824,7 +1952,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 "dataset not set before resolving covering field ids".to_string(),
             ));
         };
-        self.covering_columns
+        let mut ids = self
+            .covering_columns
             .iter()
             .map(|name| {
                 ds.schema()
@@ -1836,7 +1965,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         ))
                     })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if self.store_refine_vectors {
+            let field = ds.schema().field(&self.column).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "indexed column '{}' not found in dataset schema",
+                    self.column
+                ))
+            })?;
+            ids.push(field.id);
+        }
+        Ok(ids)
     }
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
@@ -2017,6 +2156,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         // value. The pre-covering code derived the writer schema from the batch
                         // and so could not disagree; declaring it instead -- which is what stops a
                         // positional row-id read corrupting row ids -- is what made this necessary.
+                        // The carried vectors travelled under an internal name so they would
+                        // not collide with the indexed column the transform chain consumes.
+                        // At rest they are that column, so restore its name before the
+                        // declared-order projection selects columns by name.
+                        batch = rename_refine_vectors(batch, &self.column)?;
                         if let Some(schema) = storage_arrow_schema.as_ref() {
                             batch = batch.project_by_schema(schema)?;
                         }
@@ -2262,14 +2406,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // non-partition column across a multivector row's expansion, so taking them
         // afterwards would yield one copy per sub-vector; the pre-flatten batch has one
         // row per row id, which is what the later gather-by-row-id expects.
-        let covering = if self.covering_columns.is_empty() {
+        // Carried refine vectors ride along as one more covering column, under the
+        // in-flight scratch name. The reassignment below rebuilds its rows from the base
+        // table and never runs the transform chain, so without this the reassigned rows
+        // rejoin the untouched partitions' stored copies simply missing the column, and
+        // the storage build has nothing to align them against.
+        let carried_vector_idx = self
+            .store_refine_vectors
+            .then(|| batch.schema().index_of(&self.column))
+            .transpose()?;
+        let covering = if self.covering_columns.is_empty() && carried_vector_idx.is_none() {
             None
         } else {
             let mut indices = vec![batch.schema().index_of(ROW_ID)?];
             for name in &self.covering_columns {
                 indices.push(batch.schema().index_of(name)?);
             }
-            Some(batch.project(&indices)?)
+            indices.extend(carried_vector_idx);
+            let projected = batch.project(&indices)?;
+            Some(match carried_vector_idx {
+                Some(_) => stash_refine_vectors(projected, &self.column)?,
+                None => projected,
+            })
         };
         // Narrow to `[_rowid, vector]` first: `Flatten` replicates every remaining column
         // across the multivector expansion, so leaving the covering columns in would
@@ -2488,13 +2646,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         all_row_ids.dedup();
 
         // Stream raw vectors plus any covering ("included") columns so a
-        // partition split preserves them in the re-quantized storage.
+        // partition split preserves them in the re-quantized storage. As in the shuffle
+        // projection above, `covering_columns` cannot name the indexed column.
         let mut split_projection: Vec<&str> = vec![self.column.as_str()];
         split_projection.extend(self.covering_columns.iter().map(String::as_str));
         let projection = Arc::new(dataset.schema().project(&split_projection)?);
         let row_ids = dataset.filter_deleted_ids(&all_row_ids).await?;
         let block_size = self.store.block_size();
         let column = self.column.clone();
+        let refine_field = self.refine_vector_field()?;
 
         let dataset_clone = dataset.clone();
         let projection_clone = projection.clone();
@@ -2508,6 +2668,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let dataset = dataset_clone.clone();
             let projection = projection_clone.clone();
             let column = column.clone();
+            let refine_field = refine_field.clone();
             async move {
                 let batch = dataset
                     .take_rows(&chunk, ProjectionRequest::Schema(projection))
@@ -2515,7 +2676,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let batch = batch
                     .try_with_column(ROW_ID_FIELD.clone(), Arc::new(UInt64Array::from(chunk)))?;
                 // For multivector, flatten
-                Flatten::new(&column).transform(&batch)
+                let batch = Flatten::new(&column).transform(&batch)?;
+                // Carry the vectors on this path too. A split re-streams the affected rows
+                // through the transform chain, which consumes the indexed column, so without
+                // this the rebuilt partitions come back missing a column the declared storage
+                // schema still names.
+                add_refine_vectors(batch, &column, refine_field.as_ref())
             }
         })
         .boxed();
@@ -2745,8 +2911,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         row_ids: &UInt64Array,
         vectors: &FixedSizeListArray,
-        // `[_rowid, <included cols...>]` for the reassigned rows, or None when the
-        // index has no covering columns. Re-attached to each assign batch by row id.
+        // `[_rowid, <included cols...>]` for the reassigned rows, plus the carried refine
+        // vectors when the index has them, or None when it has neither. Re-attached to
+        // each assign batch by row id.
         covering: Option<&RecordBatch>,
         new_centroids: FixedSizeListArray,
     ) -> Result<AssignResult>
@@ -3121,6 +3288,96 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
     }
 }
 
+/// Copy the vector column aside as [`REFINE_VECTOR_COLUMN`] before the IVF/quantizer
+/// transforms run, so `refine` can re-rank against full-precision vectors read from index
+/// storage rather than taken from the base table.
+///
+/// **Order matters twice.** It must run *before* the transform chain, which rewrites the
+/// indexed column in place -- residual for L2 and cosine, normalized first for cosine --
+/// so a copy taken afterwards would not hold the user's vectors. And it must run *after*
+/// `Flatten`, or a multivector row's copy would be the whole `List`, replicated once per
+/// sub-vector; `Flatten` is idempotent on `FixedSizeList`, so the chain's own copy of it
+/// is then a no-op.
+///
+/// Every transform in the chain leaves an unrecognised column alone: the two that filter
+/// rows (`KeepFiniteVectors`, `PartitionFilter`) use `batch.take`, so the copy stays
+/// row-aligned, and the rest touch only the columns they name.
+/// `refine_field` is the declared field for the carried copy (see
+/// [`IvfIndexBuilder::refine_vector_field`]), and `None` when the copy is not being carried
+/// at all -- the two are the same decision, so they travel as one value rather than as a
+/// field plus a flag that could disagree.
+fn add_refine_vectors(
+    batch: RecordBatch,
+    vector_column: &str,
+    refine_field: Option<&arrow_schema::Field>,
+) -> Result<RecordBatch> {
+    let Some(refine_field) = refine_field else {
+        return Ok(batch);
+    };
+    let batch = Flatten::new(vector_column).transform(&batch)?;
+    let Some(vectors) = batch.column_by_name(vector_column) else {
+        // Every source that reaches here carries the indexed column: the one build input
+        // that does not -- precomputed shuffle buffers -- is refused at the API boundary by
+        // `validate_store_vectors_for_refine`. Returning the batch unchanged would let an
+        // upstream defect surface much later as `project_by_schema` complaining that the
+        // indexed column is missing from a partition, which never mentions refine at all.
+        return Err(Error::index(format!(
+            "store_vectors_for_refine: the indexed column '{vector_column}' is missing from \
+             a batch reaching the transform chain, so the full-precision copy cannot be taken"
+        )));
+    };
+    // Nullability comes from the declaration, never from `Array::is_nullable()` -- that is
+    // `logical_null_count() != 0`, so it would answer "this batch has a null" and make
+    // consecutive batches of one column declare different schemas.
+    let field = Field::new(
+        REFINE_VECTOR_COLUMN,
+        vectors.data_type().clone(),
+        refine_field.is_nullable(),
+    );
+    Ok(batch.try_with_column(field, vectors.clone())?)
+}
+
+/// Rename `from` to `to`, or return the batch untouched when it has no such column.
+fn rename_column(batch: RecordBatch, from: &str, to: &str) -> Result<RecordBatch> {
+    let Ok(idx) = batch.schema().index_of(from) else {
+        return Ok(batch);
+    };
+    let mut fields: Vec<Arc<Field>> = batch.schema().fields().to_vec();
+    // Rename in place rather than rebuild: hardcoding a nullability here would disagree
+    // with what `add_refine_vectors` declared on the way in and with the storage schema
+    // resolved from the dataset field, and the carried copy round-trips through both
+    // directions of this rename.
+    fields[idx] = Arc::new(fields[idx].as_ref().clone().with_name(to));
+    let schema = Arc::new(arrow_schema::Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+}
+
+/// Restore the indexed column's name on the carried full-precision vectors.
+///
+/// They are copied aside as [`REFINE_VECTOR_COLUMN`] before the transform chain, because
+/// the chain consumes a column of the indexed column's own name. Once the chain has run,
+/// the collision is gone and the copy is exactly that column's values, so it takes the
+/// name back and becomes an ordinary covering column.
+fn rename_refine_vectors(batch: RecordBatch, column: &str) -> Result<RecordBatch> {
+    rename_column(batch, REFINE_VECTOR_COLUMN, column)
+}
+
+/// Put carried vectors read back out of storage under the in-flight scratch name.
+///
+/// The inverse of [`rename_refine_vectors`], and the reason both directions exist. Storage
+/// holds the copy under the indexed column's own name, while freshly shuffled rows still
+/// have it under [`REFINE_VECTOR_COLUMN`]; an optimize that merges the two hands both to
+/// one `StorageBuilder::build`, which concatenates by column name and rejects sources that
+/// disagree.
+///
+/// The scratch name is the one they have to agree on, not the stored one: `StorageBuilder`
+/// quantizes from a column of the indexed column's own name and drops it whenever a batch
+/// reaches it without codes, so normalising the other way would feed the carried copy to
+/// the quantizer and consume it instead of preserving it.
+fn stash_refine_vectors(batch: RecordBatch, column: &str) -> Result<RecordBatch> {
+    rename_column(batch, column, REFINE_VECTOR_COLUMN)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3131,6 +3388,79 @@ mod tests {
     use lance_index::vector::v3::shuffler::{
         ShufflePartition, ShufflePartitionWindow, ShufflePartitionWindowPlan,
     };
+
+    /// The carried copy's declared nullability must come from the *schema*, not from
+    /// whether the batch in hand happens to hold a null.
+    ///
+    /// `Array::is_nullable()` is `logical_null_count() != 0` -- "contains nulls", not "is
+    /// nullable". Deriving the field from it makes a nullable vector column declare a
+    /// non-nullable copy for every batch that happens to have no nulls, and a nullable one
+    /// for the next batch that does. The shuffle stream fixes the file schema from the
+    /// first batch it peeks and builds every partition writer from that, so the later
+    /// batches disagree with the schema their own file was declared with.
+    #[test]
+    fn test_add_refine_vectors_declares_nullability_from_the_schema() {
+        let vectors = arrow_array::FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]),
+            2,
+        )
+        .unwrap();
+        // Declared nullable, but this batch carries no nulls -- the case that makes
+        // reading nullability off the data disagree with the schema.
+        let declared = Field::new("vector", vectors.data_type().clone(), true);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![declared.clone()]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors)]).unwrap();
+        assert_eq!(
+            batch.column(0).logical_null_count(),
+            0,
+            "precondition: the batch must hold no nulls, or the bug cannot show"
+        );
+
+        let carried = add_refine_vectors(batch, "vector", Some(&declared)).unwrap();
+
+        let field = carried
+            .schema()
+            .field_with_name(REFINE_VECTOR_COLUMN)
+            .expect("the carried copy must be present")
+            .clone();
+        assert!(
+            field.is_nullable(),
+            "the carried copy must inherit the column's declared nullability, not the \
+             null count of the batch in hand"
+        );
+    }
+
+    /// A batch that reaches the transform chain without the indexed column is an upstream
+    /// defect, not a configuration: the one input that legitimately arrives without it --
+    /// precomputed shuffle buffers -- is refused at the API boundary by
+    /// `validate_store_vectors_for_refine`. Skipping silently would surface it much later
+    /// as `project_by_schema` reporting a missing column, with nothing tying it to refine.
+    #[test]
+    fn test_add_refine_vectors_errors_when_the_indexed_column_is_absent() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "payload",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let declared = Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        );
+
+        let err = add_refine_vectors(batch, "vector", Some(&declared))
+            .expect_err("a missing indexed column must be reported, not skipped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("vector"),
+            "the error must name the option and the column; got: {msg}"
+        );
+    }
 
     struct SingleBatchReader {
         batch: RecordBatch,
@@ -3568,6 +3898,7 @@ mod tests {
             &[],
             Some(&reader),
             false,
+            None,
         )
         .await
         .unwrap();

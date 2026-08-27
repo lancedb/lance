@@ -677,7 +677,7 @@ async fn build_fresh_vector_segment(
     // ("included") columns -- otherwise the fresh files omit the payload while the
     // committed metadata still advertises `covering_fields`, and covered queries
     // then expect columns the storage cannot emit.
-    params.covering_columns(covering_columns.to_vec());
+    crate::index::vector::redeclare_covering(&mut params, covering_columns.to_vec(), field_path);
     let mut build_dataset = dataset.clone();
     CreateIndexBuilder::new(
         &mut build_dataset,
@@ -703,8 +703,17 @@ async fn scan_vector_fragments(
     let mut scanner = dataset.scan();
     // Project the vector column plus any covering ("included") columns so rows from the
     // newly-indexed fragments carry the same columns as the existing partitions.
+    // The indexed column is already the first entry, and can also appear in
+    // `covering_columns`: carried refine vectors live in storage under that column's own
+    // name, so a rebuild reads it back as covering. The projection builder rejects a
+    // repeated name outright.
     let mut projection: Vec<&str> = vec![field_path];
-    projection.extend(covering_columns.iter().map(String::as_str));
+    projection.extend(
+        covering_columns
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != field_path),
+    );
     scanner
         .with_fragments(fragments.to_vec())
         .with_row_id()

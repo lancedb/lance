@@ -420,6 +420,68 @@ public class VectorIndexTest {
   }
 
   /**
+   * The Java builder must be able to request carried refine vectors, and the JNI must forward the
+   * flag: the core records them by appending the *indexed* column's own field id to the index's
+   * covering fields, so a build that dropped the flag still succeeds but commits an index whose
+   * covering declaration is empty and whose {@code refine} queries fall back to the base table.
+   *
+   * <p>This guards the {@code store_vectors_for_refine} read in {@code
+   * java/lance-jni/src/utils.rs}: restoring it to a hardcoded {@code false} leaves the index
+   * buildable and the field-id assertions below fail.
+   */
+  @Test
+  public void testCreateIndexWithStoreVectorsForRefine(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("refine_vectors"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(4).build();
+        // IVF_PQ, not IVF_FLAT: a flat quantizer already stores the full-precision vectors, so
+        // the core refuses to carry a second copy of them.
+        PQBuildParams pq = new PQBuildParams.Builder().setNumSubVectors(2).build();
+
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivf)
+                .setDistanceType(DistanceType.L2)
+                .setPqParams(pq)
+                .setStoreVectorsForRefine(true)
+                .build();
+        assertTrue(
+            vectorIndexParams.isStoreVectorsForRefine(),
+            "the builder must round-trip the requested flag");
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_PQ,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        Index carried =
+            dataset.getIndexes().stream()
+                .filter(idx -> TestVectorDataset.indexName.equals(idx.name()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(carried, "Expected the index to be present");
+
+        int vectorFieldId = fieldId(dataset, TestVectorDataset.vectorColumnName);
+        assertEquals(
+            Collections.singletonList(vectorFieldId),
+            carried.coveringFields(),
+            "carried refine vectors are declared as the indexed column's own field id");
+        // Covering fields are the trailing entries of fields; here the carried field is the
+        // keyed field itself, so it appears in both positions.
+        assertEquals(
+            Arrays.asList(vectorFieldId, vectorFieldId),
+            carried.fields(),
+            "the carried field must be appended after the keyed vector field");
+      }
+    }
+  }
+
+  /**
    * A covered ("included") column set on {@link VectorIndexParams} must be threaded through the JNI
    * create path into the built index's metadata, so the committed index reports the covered field
    * id. Without the wiring the index would build but silently carry no covering columns.

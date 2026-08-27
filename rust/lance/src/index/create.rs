@@ -604,21 +604,32 @@ impl<'a> CreateIndexBuilder<'a> {
         // index whose `fields` under-declare the payload its storage actually carries,
         // leaving that column out of every invalidation rule keyed on `fields`.
         let covering_fields = match self.params.as_any().downcast_ref::<VectorIndexParams>() {
-            Some(vp) => vp
-                .covering_columns
-                .iter()
-                .map(|name| {
-                    self.dataset
-                        .schema()
-                        .field(name)
-                        .map(|f| f.id)
-                        .ok_or_else(|| {
-                            Error::index(format!(
-                                "covering column '{name}' is not present in the dataset schema"
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<i32>>>()?,
+            Some(vp) => {
+                let mut ids = vp
+                    .covering_columns
+                    .iter()
+                    .map(|name| {
+                        self.dataset
+                            .schema()
+                            .field(name)
+                            .map(|f| f.id)
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "covering column '{name}' is not present in the dataset schema"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<i32>>>()?;
+                // Carried refine vectors are the indexed column, stored a second time in
+                // full precision. Declaring them makes the search emit them and `refine`
+                // re-rank from the index; leaving the declaration off would store the copy
+                // and never read it. Appended last on purpose: the covering ids come first
+                // and the carried vectors close the list (see the `fields` contract below).
+                if vp.store_vectors_for_refine {
+                    ids.push(field.id);
+                }
+                ids
+            }
             None => Vec::new(),
         };
         // `covering_fields` must be the trailing entries of `fields` (see

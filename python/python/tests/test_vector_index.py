@@ -424,6 +424,66 @@ def _covered_query_table(nvec=1000, ndim=128, k=10, id_offset=1_000_000, seed=0)
     return tbl, mat
 
 
+def test_create_index_with_store_vectors_for_refine(tmp_path):
+    """`store_vectors_for_refine` must reach the core through the PyO3 boundary. It is
+    not expressible as a covering column -- the core records it by appending the
+    *indexed* column's own field id to `covering_fields` -- so a build that dropped the
+    flag still succeeds and still answers queries, just from the base table. The field
+    ids below are what separate the two."""
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    vector_id = _field_id(dataset, "vector")
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        store_vectors_for_refine=True,
+    )
+
+    desc = dataset.describe_indices()[0]
+    assert desc.covering_fields == [vector_id]
+    assert desc.covering_field_names == ["vector"]
+    # The carried vectors are the keyed column itself, so unlike an ordinary covering
+    # column the name shows up on both sides.
+    assert desc.field_names == ["vector"]
+
+    # And the option is honoured end to end: a refine query is answered without the
+    # base-table read it exists to remove.
+    query = np.random.randn(128).astype(np.float32)
+    scanner = dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "nprobes": 4,
+            "refine_factor": 2,
+        },
+        columns=["vector"],
+    )
+    assert "LanceRead" not in scanner.explain_plan(True)
+    assert scanner.to_table().num_rows == 10
+
+
+def test_create_index_store_vectors_for_refine_rejected_by_core(tmp_path):
+    """Validation lives in the core, not the binding: the option is refused on a
+    multivector column, and that refusal has to surface as a Python error rather than
+    an index that silently carries nothing."""
+    tbl = create_multivec_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with pytest.raises(ValueError, match="store_vectors_for_refine"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            metric="cosine",
+            store_vectors_for_refine=True,
+        )
+
+
 def test_create_index_covering_columns_serve_the_query_from_the_index(tmp_path):
     """The payoff of the whole create-side wiring: an index built *through the Python
     binding* with covering columns must answer a query for those columns out of index

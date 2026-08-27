@@ -8305,6 +8305,63 @@ mod tests {
         (schema, vec![batch])
     }
 
+    /// Assert `refine` is still served out of index storage rather than a base-table take.
+    ///
+    /// The index under test must cover `payload`, so the projection is served from the index
+    /// too and the only thing that could still read the base table is refine's own fetch of
+    /// full-precision vectors. Works for every index type, unlike inspecting partition
+    /// storage, which needs the concrete index struct.
+    async fn assert_refine_served_from_index(dataset: &Dataset, query: &dyn Array, what: &str) {
+        let mut scan = dataset.scan();
+        scan.nearest("vector", query, 10).unwrap();
+        scan.nprobes(TWO_FRAG_NUM_PARTITIONS);
+        scan.refine(2);
+        scan.project(&["payload"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("LanceRead"),
+            "{what}: refine must still be served from the index; plan:\n{plan}"
+        );
+        let rows = scan.try_into_batch().await.unwrap().num_rows();
+        assert_eq!(
+            rows, 10,
+            "{what}: the query must still return its k neighbours"
+        );
+    }
+
+    /// Append rows in the schema `make_covered_test_batches` writes, laid out over the same
+    /// clusters, so every partition ends up holding existing *and* freshly indexed rows.
+    async fn append_covered_rows(dataset: &mut Dataset, rows: usize) {
+        const CLUSTER_SIZE: usize = 8;
+        let start = dataset.count_all_rows().await.unwrap() as u64;
+        let ids = Arc::new(UInt64Array::from_iter_values(start..start + rows as u64));
+        let payload = Arc::new(UInt64Array::from_iter(
+            (0..rows as u64).map(|v| if v % 3 == 0 { None } else { Some(v + 5000) }),
+        ));
+        let mut flat = Vec::with_capacity(rows * COVERED_DIM);
+        for row in 0..rows {
+            let center = (row / CLUSTER_SIZE) as f32 * 4.0;
+            let within = (row % CLUSTER_SIZE) as f32;
+            for d in 0..COVERED_DIM {
+                flat.push(center + within * 0.002 + d as f32 * 0.00001);
+            }
+        }
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(flat), COVERED_DIM as i32)
+                .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("payload", DataType::UInt64, true),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, payload, vectors]).unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
     async fn write_dataset_from_batches(
         test_uri: &str,
         schema: Arc<Schema>,
@@ -8461,6 +8518,53 @@ mod tests {
         ivf_params.max_iters = COVERED_MAX_ITERS as usize;
         ivf_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
         ivf_params
+    }
+
+    /// Params for `index_type` over the covering fixture, with IVF (and PQ, where the type
+    /// needs it) trained from `dataset`. Shared by the covering and carried-vector lifecycle
+    /// tests so each of them parametrizes over the same quantizer families.
+    async fn params_for_index_type(dataset: &Dataset, index_type: &str) -> VectorIndexParams {
+        match index_type {
+            "IVF_PQ" => {
+                let (ivf_params, pq_params) = prepare_covered_ivf_pq(dataset, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            "IVF_SQ" => VectorIndexParams::with_ivf_sq_params(
+                DistanceType::L2,
+                prepare_covered_ivf(dataset, "vector").await,
+                SQBuildParams::default(),
+            ),
+            "IVF_RQ" => VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                prepare_covered_ivf(dataset, "vector").await,
+                RQBuildParams::new(1),
+            ),
+            "IVF_FLAT" => VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                prepare_covered_ivf(dataset, "vector").await,
+            ),
+            "IVF_HNSW_PQ" => {
+                let (ivf_params, pq_params) = prepare_covered_ivf_pq(dataset, "vector").await;
+                VectorIndexParams::with_ivf_hnsw_pq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    lightweight_hnsw_params(),
+                    pq_params,
+                )
+            }
+            "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
+                DistanceType::L2,
+                prepare_covered_ivf(dataset, "vector").await,
+                lightweight_hnsw_params(),
+            ),
+            "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::L2,
+                prepare_covered_ivf(dataset, "vector").await,
+                lightweight_hnsw_params(),
+                SQBuildParams::default(),
+            ),
+            other => panic!("unexpected index type {other}"),
+        }
     }
 
     async fn prepare_global_ivf(dataset: &Dataset, vector_column: &str) -> IvfBuildParams {
@@ -9363,42 +9467,7 @@ mod tests {
         let id_field_id = dataset.schema().field("id").unwrap().id;
         let payload_field_id = dataset.schema().field("payload").unwrap().id;
 
-        let mut params = match index_type {
-            "IVF_PQ" => {
-                let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
-                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
-            }
-            "IVF_SQ" => VectorIndexParams::with_ivf_sq_params(
-                DistanceType::L2,
-                prepare_covered_ivf(&dataset, "vector").await,
-                SQBuildParams::default(),
-            ),
-            "IVF_FLAT" => VectorIndexParams::with_ivf_flat_params(
-                DistanceType::L2,
-                prepare_covered_ivf(&dataset, "vector").await,
-            ),
-            "IVF_HNSW_PQ" => {
-                let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
-                VectorIndexParams::with_ivf_hnsw_pq_params(
-                    DistanceType::L2,
-                    ivf_params,
-                    lightweight_hnsw_params(),
-                    pq_params,
-                )
-            }
-            "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
-                DistanceType::L2,
-                prepare_covered_ivf(&dataset, "vector").await,
-                lightweight_hnsw_params(),
-            ),
-            "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
-                DistanceType::L2,
-                prepare_covered_ivf(&dataset, "vector").await,
-                lightweight_hnsw_params(),
-                SQBuildParams::default(),
-            ),
-            other => panic!("unexpected index type {other}"),
-        };
+        let mut params = params_for_index_type(&dataset, index_type).await;
         params.covering_columns(vec!["id".to_string(), "payload".to_string()]);
 
         // All fragments, so the merged index gives full coverage (no uncovered delta scan).
@@ -9505,6 +9574,86 @@ mod tests {
             recall >= 0.5,
             "covered merged {index_type} recall {recall} < 0.5 (returned {returned:?}, truth {truth:?})"
         );
+    }
+
+    /// Distributed builds must carry refine vectors too, on both shapes: committing one
+    /// segment per shard, and merging the shards into one unified segment first.
+    ///
+    /// The merge shape is the one with its own machinery: the cross-shard merger classifies
+    /// a shard's carried columns by *excluding* the storage's internal names, so carried
+    /// vectors -- which sit under the indexed column's own name at rest -- are only picked
+    /// up because that name is not internal. `payload` is covered alongside so the
+    /// projection is served from the index and any base-table read the plan shows can only
+    /// be refine's own.
+    #[rstest]
+    #[case::per_segment_commit(false)]
+    #[case::cross_shard_merge(true)]
+    #[tokio::test]
+    async fn test_distributed_build_carries_refine_vectors(#[case] merge_shards: bool) {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let query = batches[0]["vector"].as_fixed_size_list().value(0);
+        let uri = format!(
+            "{}/distributed_refine_{}",
+            test_dir.as_str(),
+            if merge_shards { "merged" } else { "segments" }
+        );
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 2,
+            "need several shards to distribute over"
+        );
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let payload_field_id = dataset.schema().field("payload").unwrap().id;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+
+        // One shard per fragment, over every fragment, so the committed index gives full
+        // coverage and no uncovered delta scan can mask a defect.
+        let mut segments = Vec::new();
+        for fragment in fragments.iter() {
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vec_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            assert_eq!(
+                segment.covering_fields,
+                vec![payload_field_id, vector_field_id],
+                "each shard must declare the covering column and the carried vectors"
+            );
+            segments.push(segment);
+        }
+
+        let to_commit = match merge_shards {
+            true => {
+                let merged = dataset
+                    .merge_existing_index_segments(segments)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    merged.covering_fields,
+                    vec![payload_field_id, vector_field_id],
+                    "the unified segment must retain the carried vectors"
+                );
+                vec![merged]
+            }
+            false => segments,
+        };
+        dataset
+            .commit_existing_index_segments("vec_idx", "vector", to_commit)
+            .await
+            .unwrap();
+
+        assert_refine_served_from_index(&dataset, query.as_ref(), "distributed").await;
     }
 
     /// A merged covered segment must itself be usable as an input to a later merge --
@@ -9774,9 +9923,975 @@ mod tests {
         );
     }
 
-    /// The single-segment counterpart to the merge test above, and the case name and type
-    /// cannot see. A driver rebinds a segment built for a dropped `payload` onto a re-added
-    /// field with the same name and type but a fresh id.
+    /// Refine vectors are as wide as the vector column itself, so reading them with every
+    /// partition probed would undo the bound that reading covering per survivor exists to
+    /// give: codes are scanned for every row on every probe, refine values are needed for
+    /// at most `k`. They are storage-owned but deliberately NOT part of the per-partition
+    /// read set -- the distinction `DEFERRED_INTERNAL_COLUMNS` exists to draw.
+    #[tokio::test]
+    async fn test_refine_vectors_are_not_read_with_every_partition() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/refine_not_per_partition", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", "vec_idx").await;
+        let storage = ctx
+            .ivf()
+            .load_partition_storage(0, PartitionColumns::Internal, None)
+            .await
+            .unwrap();
+        let loaded: Vec<String> = storage
+            .batch()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            !loaded.iter().any(|n| n == "vector"),
+            "a per-partition load must leave the carried vectors on disk; loaded {loaded:?}"
+        );
+
+        // They are covering, so they are read for survivors instead -- which is the whole
+        // point: codes are scanned for every row on every probe, carried vectors are needed
+        // for at most `k`.
+        let physical: Vec<String> = ctx
+            .ivf()
+            .physical_covering_fields()
+            .unwrap()
+            .iter()
+            .map(|(_, f)| f.name().clone())
+            .collect();
+        assert_eq!(
+            physical,
+            vec!["vector".to_string()],
+            "carried vectors must be servable as covering, just not per partition"
+        );
+    }
+
+    /// Covering columns and refine vectors must coexist. Covering is classified by
+    /// name-exclusion against the storage's own internal set and then matched against the
+    /// `covering_field_ids` stamp by *arity*; a refine column counted as covering makes the
+    /// two disagree, and `physical_covering_fields_from_schema` answers "no covering at all"
+    /// on a mismatch -- silently withdrawing a payload the index really does carry.
+    #[tokio::test]
+    async fn test_refine_vectors_do_not_withdraw_covering_columns() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/refine_plus_covering", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", "vec_idx").await;
+        let physical = ctx.ivf().physical_covering_fields().unwrap();
+        let names: Vec<String> = physical.iter().map(|(_, f)| f.name().clone()).collect();
+        assert_eq!(
+            names,
+            vec!["payload".to_string(), "vector".to_string()],
+            "both the declared covering column and the carried vectors must be servable"
+        );
+    }
+
+    /// The point of carrying refine vectors: `refine` re-ranks from index storage instead
+    /// of taking full-precision vectors from the base table.
+    ///
+    /// Asserted against a control rather than on its own. "No base-table read" is only
+    /// meaningful if the same query *does* read the base table without the option -- a bare
+    /// absence assertion passes for any number of unrelated reasons.
+    #[tokio::test]
+    async fn test_refine_reads_vectors_from_the_index_not_the_base_table() {
+        async fn plan_for(store_vectors: bool, dir: &TempStrDir, name: &str) -> (String, usize) {
+            let (schema, batches) = make_covered_test_batches();
+            let uri = format!("{}/{}", dir.as_str(), name);
+            let query = batches[0]["vector"].as_fixed_size_list().value(0);
+            let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+            let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+            let mut params =
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+            // `payload` is covered so the index can serve the user's projection; the only
+            // thing that could still need the base table is refine's own vector fetch.
+            params.covering_columns(vec!["payload".to_string()]);
+            params.store_vectors_for_refine(store_vectors);
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("vec_idx".into()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut scan = dataset.scan();
+            scan.nearest("vector", query.as_ref(), 10).unwrap();
+            scan.nprobes(TWO_FRAG_NUM_PARTITIONS);
+            scan.refine(2);
+            // Project only `payload`: the user never asks for the vector column, so nothing
+            // but refine itself needs it. This is the shape the narrowing would strip.
+            scan.project(&["payload"]).unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            let rows = scan.try_into_batch().await.unwrap().num_rows();
+            (plan, rows)
+        }
+
+        let test_dir = TempStrDir::default();
+        let (plain_plan, plain_rows) = plan_for(false, &test_dir, "refine_plain").await;
+        let (carried_plan, carried_rows) = plan_for(true, &test_dir, "refine_carried").await;
+
+        // Control: without the option, refine must fetch vectors from the base table. The
+        // covered `payload` is served from the index in both variants, so a base-table read
+        // here can only be refine's.
+        assert!(
+            plain_plan.contains("LanceRead"),
+            "control: refine without carried vectors must read the base table; plan:\n{plain_plan}"
+        );
+        assert!(
+            !carried_plan.contains("LanceRead"),
+            "refine must be served from the index when vectors are carried; plan:\n{carried_plan}"
+        );
+        assert_eq!(
+            plain_rows, carried_rows,
+            "carrying vectors must not change the result count"
+        );
+    }
+
+    /// Carrying vectors buys nothing on a multivector index, so it is refused rather than
+    /// silently doubling the index.
+    ///
+    /// The refine step runs *after* `MultivectorScoringExec` has re-grouped sub-vectors back
+    /// to rows, so it scores the row-shaped `List` column. Index storage holds one
+    /// `FixedSizeList` per sub-vector -- the shape the search itself needs -- which cannot
+    /// substitute for it. A second copy of the widest column in the table, readable by
+    /// nothing, is worth an error rather than a surprise.
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_is_rejected_on_multivector() {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) =
+            generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+
+        // Multivector requires cosine.
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::Cosine, 2);
+        params.store_vectors_for_refine(true);
+
+        let err = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err("carrying vectors on a multivector index must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("multivector"),
+            "the error must name the option and why it does not apply; got: {msg}"
+        );
+    }
+
+    /// Only the V3 covering-aware storages keep an extra column row-aligned with the code.
+    /// A legacy build ignores the option outright, but `CreateIndexBuilder` still records
+    /// the vector in `covering_fields`, so the index would advertise a payload its storage
+    /// never wrote and every query would quietly fall back to the base table.
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_requires_v3() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/refine_requires_v3", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.store_vectors_for_refine(true);
+        params.version(IndexFileVersion::Legacy);
+
+        let err = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err("a legacy build cannot carry refine vectors");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("V3"),
+            "the error must name the option and the version it needs; got: {msg}"
+        );
+    }
+
+    /// A flat quantizer is an identity copy of the vector column, and the flat IVF
+    /// transformer adds no residual step, so under L2 the carried copy is byte-identical to
+    /// the `FLAT_COLUMN` the index already stores -- and `refine` re-ranking flat distances
+    /// is a no-op, since those distances are already exact. Carrying vectors there doubles
+    /// the index for nothing, so it joins the other unproductive configurations the
+    /// validator refuses rather than being silently accepted.
+    #[rstest]
+    #[case::flat("IVF_FLAT")]
+    #[case::hnsw_flat("IVF_HNSW_FLAT")]
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_rejects_flat_quantizers(#[case] index_type: &str) {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/refine_rejects_{index_type}", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let mut params = params_for_index_type(&dataset, index_type).await;
+        params.store_vectors_for_refine(true);
+
+        let err = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err(
+                "a flat quantizer already stores the vectors; carrying them again \
+                         must be refused",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("flat"),
+            "the error must name the option and the quantizer; got: {msg}"
+        );
+    }
+
+    /// Carried vectors are stored as a top-level covering column and read back through the
+    /// same top-level-only resolution every other covering column uses, so a nested
+    /// indexed column has nowhere to put them. Plain indexing of such a column still works,
+    /// so the refusal has to be the option's, not the column's.
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_rejects_nested_column() {
+        use arrow_array::StructArray;
+
+        const ROWS: usize = 512;
+        const NDIM: usize = 32;
+        let test_dir = TempStrDir::default();
+
+        let values = generate_random_array_with_range::<Float32Type>(ROWS * NDIM, 0.0..1.0);
+        let vectors =
+            Arc::new(FixedSizeListArray::try_new_from_values(values, NDIM as i32).unwrap());
+        let inner = Field::new("embedding", vectors.data_type().clone(), false);
+        let data = Arc::new(StructArray::from(vec![(
+            Arc::new(inner),
+            vectors as ArrayRef,
+        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            data.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![data]).unwrap();
+        let uri = format!("{}/refine_nested_column", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, vec![batch]).await;
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::L2, 2);
+        dataset
+            .create_index(
+                &["data.embedding"],
+                IndexType::Vector,
+                Some("plain_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect("precondition: a nested vector column indexes normally");
+
+        params.store_vectors_for_refine(true);
+        let err = dataset
+            .create_index(
+                &["data.embedding"],
+                IndexType::Vector,
+                Some("refine_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err("carrying vectors for a nested indexed column must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("data.embedding"),
+            "the error must name the option and the column; got: {msg}"
+        );
+    }
+
+    /// The carried copy travels under a reserved internal name until the transform chain
+    /// has consumed the indexed column. An indexed column already using that name collides
+    /// with the copy mid-flight, and the classifier that decides what storage carries as
+    /// covering payload never counts it either.
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_rejects_reserved_column_name() {
+        use lance_index::vector::storage::REFINE_VECTOR_COLUMN;
+
+        const ROWS: usize = 512;
+        const NDIM: usize = 32;
+        let test_dir = TempStrDir::default();
+
+        let values = generate_random_array_with_range::<Float32Type>(ROWS * NDIM, 0.0..1.0);
+        let vectors =
+            Arc::new(FixedSizeListArray::try_new_from_values(values, NDIM as i32).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            REFINE_VECTOR_COLUMN,
+            vectors.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap();
+        let uri = format!("{}/refine_reserved_name", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, vec![batch]).await;
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::L2, 2);
+        params.store_vectors_for_refine(true);
+        let err = dataset
+            .create_index(
+                &[REFINE_VECTOR_COLUMN],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err("an indexed column using the scratch name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains(REFINE_VECTOR_COLUMN),
+            "the error must name the option and the reserved name; got: {msg}"
+        );
+    }
+
+    /// Precomputed shuffle buffers arrive already quantized and without the raw vector
+    /// column, so there is nothing left to copy aside by the time the build reads them --
+    /// exactly the reason covering columns are refused with them.
+    #[tokio::test]
+    async fn test_store_vectors_for_refine_rejects_precomputed_shuffle_buffers() {
+        use object_store::path::Path;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/refine_precomputed_buffers", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (mut ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        ivf_params.precomputed_shuffle_buffers =
+            Some((Path::from("shuffle/data"), vec!["part0".to_string()]));
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.store_vectors_for_refine(true);
+
+        let err = dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .expect_err("carrying vectors from precomputed buffers must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store_vectors_for_refine") && msg.contains("precomputed shuffle"),
+            "the error must name the option and the incompatible source; got: {msg}"
+        );
+    }
+
+    /// Optimize can split an oversized partition, which re-streams the affected rows
+    /// through the transform chain on a different path from the initial build. That path
+    /// must carry the vectors too, or the rebuilt partitions lose them while the declared
+    /// storage schema still names the column.
+    #[tokio::test]
+    async fn test_partition_split_preserves_carried_vectors() {
+        const INDEX_NAME: &str = "vector_idx";
+        // IVF_PQ splits above MAX_PARTITION_SIZE_FACTOR * 8192 = 32_768 rows.
+        const BASE_ROWS: usize = 512;
+        const APPEND_ROWS: usize = 33_000;
+        // Two clusters, but only one is grown past the split threshold.
+        let offsets = [-50.0, 50.0];
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = generate_clustered_batch(BASE_ROWS, offsets);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids = build_centroids_for_offsets(&offsets);
+        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        let pq_params = PQBuildParams::new(4, 8);
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Grow only the first cluster, so exactly one partition crosses the threshold.
+        let mut template = vec![0.0; DIM];
+        template[0] = offsets[0];
+        append_partition_templates(&mut dataset, APPEND_ROWS, &[template]).await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert!(
+            ctx.num_partitions() > 2,
+            "precondition: the partition must actually have split, stats: {}",
+            ctx.stats_json()
+        );
+        for p in 0..ctx.num_partitions() {
+            let storage = ctx
+                .ivf()
+                .load_partition_storage(p, PartitionColumns::All, None)
+                .await
+                .unwrap();
+            assert!(
+                storage.batch().column_by_name("vector").is_some(),
+                "partition {p} lost its carried vectors across the split"
+            );
+        }
+    }
+
+    /// An explicit merge hands `StorageBuilder::build` two sources at once: batches read
+    /// back from existing storage, where the carried vectors sit under the indexed column's
+    /// own name, and freshly shuffled batches, where they are still under the in-flight
+    /// scratch name. The two must agree on one name, or the merge fails outright.
+    ///
+    /// The split test above cannot catch this: it grows a single cluster, so the affected
+    /// partition is served entirely by the split shuffle reader and the untouched
+    /// partitions receive no fresh rows -- the two sources never meet in one build.
+    #[rstest]
+    #[case::pq("IVF_PQ")]
+    #[case::sq("IVF_SQ")]
+    #[case::rq("IVF_RQ")]
+    #[case::hnsw_pq("IVF_HNSW_PQ")]
+    #[case::hnsw_sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_merge_keeps_carried_vectors(#[case] index_type: &str) {
+        const INDEX_NAME: &str = "vec_idx";
+        const APPENDED_ROWS: usize = 800;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let query = batches[0]["vector"].as_fixed_size_list().value(0);
+        let uri = format!(
+            "{}/merge_keeps_carried_vectors_{index_type}",
+            test_dir.as_str()
+        );
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let mut params = params_for_index_type(&dataset, index_type).await;
+        // `payload` is covered so the projection is served from the index too, which is what
+        // lets the plan assertion attribute any base-table read to refine alone.
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        append_covered_rows(&mut dataset, APPENDED_ROWS).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        // Both preconditions matter: one segment means the appended rows were folded into
+        // the segment the merge read from, rather than left as a fresh delta -- which is the
+        // only arrangement that puts stored and freshly shuffled batches in one storage
+        // build, the thing this test exists to exercise.
+        assert_eq!(
+            ctx.stats()["num_indices"].as_u64().unwrap(),
+            1,
+            "precondition: the merge must leave a single segment; stats: {}",
+            ctx.stats_json()
+        );
+        assert_eq!(
+            ctx.stats()["num_indexed_rows"].as_u64().unwrap() as usize,
+            TWO_FRAG_NUM_ROWS + APPENDED_ROWS,
+            "precondition: the merged segment must cover every row; stats: {}",
+            ctx.stats_json()
+        );
+        assert_refine_served_from_index(&dataset, query.as_ref(), index_type).await;
+    }
+
+    /// The counterpart to the split test above. Joining an undersized partition takes its
+    /// rows from the *base table* and reassigns them, on a path that never runs the
+    /// transform chain and so never sees the carried vectors. Those reassigned rows still
+    /// meet the untouched partitions' stored copies in one storage build, so they have to
+    /// arrive carrying the vectors too.
+    #[rstest]
+    #[case::pq("IVF_PQ")]
+    #[case::sq("IVF_SQ")]
+    #[case::rq("IVF_RQ")]
+    #[case::hnsw_pq("IVF_HNSW_PQ")]
+    #[case::hnsw_sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_partition_join_keeps_carried_vectors(#[case] index_type: &str) {
+        const INDEX_NAME: &str = "vec_idx";
+        const APPENDED_ROWS: usize = 200;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let query = batches[0]["vector"].as_fixed_size_list().value(0);
+        let uri = format!(
+            "{}/join_keeps_carried_vectors_{index_type}",
+            test_dir.as_str()
+        );
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let mut params = params_for_index_type(&dataset, index_type).await;
+        // `payload` is covered so the projection is served from the index too, which is what
+        // lets the plan assertion attribute any base-table read to refine alone.
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Every partition holds far fewer than `MIN_PARTITION_SIZE_PERCENT` of IVF_PQ's
+        // target partition size, so the optimize below joins one away.
+        append_covered_rows(&mut dataset, APPENDED_ROWS).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert!(
+            ctx.num_partitions() < TWO_FRAG_NUM_PARTITIONS,
+            "precondition: a partition must actually have been joined away, stats: {}",
+            ctx.stats_json()
+        );
+        assert_eq!(
+            ctx.stats()["num_indexed_rows"].as_u64().unwrap() as usize,
+            TWO_FRAG_NUM_ROWS + APPENDED_ROWS,
+            "the reassigned rows must all survive the join; stats: {}",
+            ctx.stats_json()
+        );
+        assert_refine_served_from_index(&dataset, query.as_ref(), index_type).await;
+    }
+
+    /// A retrain rebuilds every segment from scratch and re-declares the covering payload
+    /// from committed metadata, where carried refine vectors appear as the indexed column
+    /// itself. That declaration travels back through `VectorIndexParams`, whose covering
+    /// setter is the user-facing one and rejects the indexed column outright, so it has to
+    /// be split back out into the flag before validation ever sees it.
+    #[rstest]
+    #[case::pq("IVF_PQ")]
+    #[case::sq("IVF_SQ")]
+    #[case::rq("IVF_RQ")]
+    #[case::hnsw_pq("IVF_HNSW_PQ")]
+    #[case::hnsw_sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_retrain_keeps_carried_vectors(#[case] index_type: &str) {
+        const INDEX_NAME: &str = "vec_idx";
+        const APPENDED_ROWS: usize = 200;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let query = batches[0]["vector"].as_fixed_size_list().value(0);
+        let uri = format!(
+            "{}/retrain_keeps_carried_vectors_{index_type}",
+            test_dir.as_str()
+        );
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let mut params = params_for_index_type(&dataset, index_type).await;
+        // `payload` is covered so the projection is served from the index too, which is what
+        // lets the plan assertion attribute any base-table read to refine alone.
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        append_covered_rows(&mut dataset, APPENDED_ROWS).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+
+        let ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            ctx.stats()["num_indexed_rows"].as_u64().unwrap() as usize,
+            TWO_FRAG_NUM_ROWS + APPENDED_ROWS,
+            "a retrain must rebuild over the whole dataset; stats: {}",
+            ctx.stats_json()
+        );
+
+        // The declaration has to survive too: dropping it would leave storage carrying a
+        // payload no query can reach.
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|idx| idx.name == INDEX_NAME)
+            .expect("index must still exist");
+        let payload_field_id = dataset.schema().field("payload").unwrap().id;
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        assert_eq!(
+            index.covering_fields,
+            vec![payload_field_id, vector_field_id],
+            "the rebuilt segment must still declare both the covering column and the \
+             carried vectors"
+        );
+
+        assert_refine_served_from_index(&dataset, query.as_ref(), index_type).await;
+    }
+
+    /// The carried copy must be the user's RAW vectors -- the whole design rests on the copy
+    /// being taken *before* the IVF/quantizer transform chain, which rewrites the indexed
+    /// column in place (residual under L2 and cosine, normalized first under cosine).
+    ///
+    /// Every other refine test asserts plan shape and row count, which a copy taken one step
+    /// too late would satisfy perfectly while `refine` re-ranked against residuals. This one
+    /// reads the values back and compares them to the source data. Because `id` is covered
+    /// too, the whole projection is served from index storage -- the absent `LanceRead` is
+    /// what proves the vectors came from the index rather than the base table, so the
+    /// equality below is an assertion about what the *index* holds.
+    ///
+    /// Cosine is the case with no positive coverage at all until now, and the one the design
+    /// note calls irrecoverable: normalization discards magnitude, so if the copy were taken
+    /// after it, these vectors would come back unit-length. Recall is asserted only for L2 --
+    /// this fixture's rows are near-constant across dimensions, so every row points in
+    /// almost the same direction and cosine ranking on it would be meaningless.
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[tokio::test]
+    async fn test_carried_vectors_are_the_raw_source_values(#[case] distance_type: DistanceType) {
+        const INDEX_NAME: &str = "vec_idx";
+        const K: usize = 10;
+        const CLUSTER_SIZE: u64 = 8;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let source = batches[0]["vector"].as_fixed_size_list().clone();
+        let query = source.value(0);
+        let uri = format!("{}/carried_raw_{distance_type}", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        // `id` covered so the projection below needs no base-table take either; without it
+        // the plan reads the base table for `id` and proves nothing about the vectors.
+        params.covering_columns(vec!["id".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vector", query.as_ref(), K).unwrap();
+        scan.nprobes(TWO_FRAG_NUM_PARTITIONS);
+        scan.refine(2);
+        scan.project(&["vector", "id"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("LanceRead"),
+            "precondition: the projection must be served from the index, or the values \
+             below say nothing about what the index carries; plan:\n{plan}"
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            K,
+            "the query must return its k neighbours"
+        );
+        let ids = batch["id"].as_primitive::<UInt64Type>();
+        let got = batch["vector"].as_fixed_size_list();
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row) as usize;
+            let expected = source.value(id);
+            let expected = expected.as_primitive::<Float32Type>();
+            let actual = got.value(row);
+            let actual = actual.as_primitive::<Float32Type>();
+            assert_eq!(
+                actual.values(),
+                expected.values(),
+                "carried vector for id {id} is not the source vector -- the copy was taken \
+                 after the transform chain (residual, or normalized under cosine)"
+            );
+        }
+
+        if distance_type == DistanceType::L2 {
+            // The query is row 0, whose true neighbours are its own cluster.
+            let hits = (0..batch.num_rows())
+                .filter(|row| ids.value(*row) < CLUSTER_SIZE)
+                .count();
+            assert!(
+                hits * 2 >= CLUSTER_SIZE as usize,
+                "recall below 0.5: only {hits} of the query's {CLUSTER_SIZE}-row cluster came \
+                 back in the top {K}"
+            );
+        }
+    }
+
+    /// Renaming an indexed column stays legal wherever the index stores no copy of it
+    /// *by name*, and the renamed index must still survive both maintenance paths.
+    ///
+    /// This is the counterpart to
+    /// `test_alter_of_indexed_column_refused_with_carried_refine`: that one pins the refusal
+    /// for a refine-carrying index, this one pins that the refusal did not spread to indexes
+    /// it must not cover. A plain index stores only `_rowid`/codes/part-id, and a covering
+    /// index adds the *covered* columns -- in neither case is the indexed column present
+    /// under its own name, so a rename leaves nothing stale and the field id the index is
+    /// keyed on survives it.
+    #[rstest]
+    #[case::plain(false)]
+    #[case::covering_payload(true)]
+    #[tokio::test]
+    async fn test_rename_indexed_column_survives_maintenance(#[case] covered: bool) {
+        use crate::dataset::ColumnAlteration;
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/rename_survives_{covered}", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        if covered {
+            params.covering_columns(vec!["payload".to_string()]);
+        }
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("ix".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("vector".into()).rename("embedding".into())])
+            .await
+            .expect("renaming an indexed column stays legal when no copy is stored by name");
+
+        // The index must still be usable, and -- the part the refine bug broke -- both
+        // maintenance paths must still run against it.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .expect("optimize must still work after the rename");
+        dataset.delete("id < 16").await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .expect("compaction must still work after the rename");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "the index must survive the rename");
+        assert_eq!(
+            indices[0].keyed_field(),
+            Some(dataset.schema().field("embedding").unwrap().id),
+            "the index must stay keyed on the renamed column's (unchanged) field id"
+        );
+    }
+
+    /// An inline remap (`compact_files` without `defer_index_remap`) rebuilds the index
+    /// through `new_remapper`, which reads its covering set back out of *storage* -- where
+    /// the carried vectors sit under the indexed column's own name, indistinguishable from
+    /// an ordinary covering column. That set has to be split back into covering columns
+    /// proper plus the carried-refine flag, or the rebuilt index disagrees with every other
+    /// build path about what it is carrying.
+    #[tokio::test]
+    async fn test_remap_preserves_carried_vectors() {
+        const INDEX_NAME: &str = "vec_idx";
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let query = batches[0]["vector"].as_fixed_size_list().value(0);
+        let uri = format!("{}/remap_keeps_carried_vectors", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.covering_columns(vec!["payload".to_string()]);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Deleting rows gives compaction something to rewrite, which is what triggers the
+        // remap of the index built above.
+        dataset.delete("id < 16").await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|idx| idx.name == INDEX_NAME)
+            .expect("the index must survive compaction");
+        let payload_id = dataset.schema().field("payload").unwrap().id;
+        let vector_id = dataset.schema().field("vector").unwrap().id;
+        assert_eq!(
+            index.covering_fields,
+            vec![payload_id, vector_id],
+            "the remapped index must still declare the covering column and the carried \
+             vectors, in that order"
+        );
+
+        assert_refine_served_from_index(&dataset, query.as_ref(), "remap").await;
+    }
+
+    /// PQ keeps only lossy codes, so `refine` re-ranks by taking full-precision vectors
+    /// from the base table. Storing them in the index removes that take. They are carried
+    /// as a storage-internal column, NOT via `covering_columns`: the transform chain
+    /// rewrites the indexed column in place (residual, and normalization under cosine), so
+    /// a user-visible copy under the column's own name would hand back values that are not
+    /// the user's vectors -- and under cosine the magnitude is gone for good.
+    #[tokio::test]
+    async fn test_refine_vectors_are_stored_in_index_storage() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_covered_test_batches();
+        let uri = format!("{}/store_refine_vectors", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&uri, schema, batches).await;
+
+        let (ivf_params, pq_params) = prepare_covered_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.store_vectors_for_refine(true);
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Physically present under the indexed column's own name -- the copy is taken
+        // before the transform chain, so its values are that column's values -- and stamped
+        // with that column's source id, which is what makes it servable rather than merely
+        // present.
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let physical = index.physical_covering_fields().unwrap();
+        assert!(
+            physical
+                .iter()
+                .any(|(id, field)| *id == vector_field_id && field.name() == "vector"),
+            "index storage must carry the vector column stamped with its source field id; \
+             got {physical:?}"
+        );
+
+        // And declared, so the search emits it and `refine` can find it by name.
+        assert_eq!(
+            indices[0].covering_fields,
+            vec![vector_field_id],
+            "carried vectors must be declared covering, or nothing will read them"
+        );
+    }
+
+    /// The single-segment counterpart to the merge test above, and the case a name-and-type
+    /// check cannot see. A driver rebinds a segment built for a dropped `payload` onto a
+    /// re-added field with the same name and type but a fresh id.
     ///
     /// The declaration/payload contract permits the commit. At read time, however, the
     /// storage's stamped source id must prevent those old values from being served under the

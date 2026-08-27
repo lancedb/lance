@@ -369,6 +369,14 @@ impl Transaction {
             if !index.keyed_fields().iter().all(|id| new_ids.contains(id)) {
                 continue;
             }
+            // A field the index is also KEYED on gets NO exemption: carried refine vectors
+            // (`store_vectors_for_refine`) declare the indexed column in `covering_fields`,
+            // and index storage holds that copy under the column's build-time name. A rename
+            // preserves the field id but not that name, leaving storage the rebuild paths
+            // cannot resolve, so it is refused here exactly as it is in the `schema_evolution`
+            // preflight and in `prune_stale_segment_coverage`. A change that *removes* the id
+            // (a drop, or a cast, which reassigns a fresh one) never reaches this loop: the
+            // keyed-field check above skipped the index and `retain_relevant_indices` drops it.
             for &covered_id in index.covering_fields.iter() {
                 let changed = match old_schema {
                     Some(old) => Self::covered_field_subtree_changed(old, new_schema, covered_id),

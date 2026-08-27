@@ -5472,6 +5472,14 @@ impl Scanner {
             filter_plan.expr_filter_plan.all_columns()
         };
         columns.extend_from_slice(also_read);
+        // `refine` re-ranks against the indexed column, reading it out of the search output
+        // like the FTS scorers above. The narrowing below is computed from the projection,
+        // ordering and aggregates -- none of which name the vector column for the common
+        // `SELECT payload ORDER BY vector` shape -- so without this it would be narrowed
+        // away and refine would silently fall back to a base-table take.
+        if query.refine_factor.is_some() {
+            columns.push(query.column.clone());
+        }
         // `Some`, unconditionally: an empty list means "materialize no covering column",
         // and folding it into `None` restores full materialization with every result
         // still correct. See `Query::covering_projection`.
@@ -5680,6 +5688,11 @@ impl Scanner {
             };
 
             let mut knn_node = if q.refine_factor.is_some() {
+                // No guard here on whether the index already carries the vectors: `take`
+                // subtracts its input's schema and returns the input untouched when nothing
+                // new is needed, so an index that emitted them makes this a no-op. A second
+                // check would be a redundant mechanism, and a regression in `take`'s
+                // elision would then go unnoticed.
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -15293,6 +15306,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     skip_transpose: false,
                     runtime_hints: Default::default(),
                     covering_columns: Default::default(),
+                    store_vectors_for_refine: false,
                 },
                 false,
             )
