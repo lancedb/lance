@@ -4964,8 +4964,8 @@ mod tests {
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
         PhraseQueryExec, SharedFtsScorer, SharedFtsScorerProducer, SharedPreparedMatch,
-        SharedPreparedMatchProducer, SharedPreparedState,
-        WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate, build_boolean_query_children,
+        SharedPreparedMatchProducer, SharedPreparedState, WAND_TIE_COMPLETION_BUDGET,
+        WandExactnessCertificate, build_boolean_query_children,
         classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
         tokenizer_for_match_query,
     };
