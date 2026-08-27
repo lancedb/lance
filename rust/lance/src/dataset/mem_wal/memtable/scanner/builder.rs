@@ -1301,6 +1301,15 @@ impl MemTableScanner {
                 true
             }
         };
+        // The exec answers `In` by concatenating a lookup per value, so a value
+        // listed twice would emit its rows twice. Two disjuncts can easily name
+        // the same value: the signed-zero rewrite turns both sides of
+        // `x = -0.0 OR x = 0.0` into the same two-element list.
+        fn push_once(values: &mut Vec<ScalarValue>, value: ScalarValue) {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
         match expr {
             Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
                 self.collect_or_equalities(&binary.left, column, values)
@@ -1318,7 +1327,7 @@ impl MemTableScanner {
                 if !same_column(&col.name) {
                     return false;
                 }
-                values.push(value);
+                push_once(values, value);
                 true
             }
             Expr::InList(in_list) if !in_list.negated => {
@@ -1340,7 +1349,7 @@ impl MemTableScanner {
                     let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
                         return false;
                     };
-                    values.push(value);
+                    push_once(values, value);
                 }
                 true
             }
@@ -1652,6 +1661,23 @@ mod tests {
                 );
             }
             other => panic!("expected an In predicate, got {other:?}"),
+        }
+
+        // Both disjuncts rewrite to the same two-element list. The exec answers
+        // `In` with one lookup per value and concatenates, so a value listed twice
+        // would return its rows twice.
+        scanner.filter("value = -0.0 OR value = 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected a deduplicated In predicate, got {other:?}"),
         }
 
         // `<` has to compare against the negative encoding, or the lookup admits a
