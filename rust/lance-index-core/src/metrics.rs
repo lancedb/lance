@@ -20,6 +20,17 @@ pub const COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_essential_evaluations";
 pub const COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC: &str =
     "compound_should_non_essential_evaluations";
+pub const COMPOUND_PHRASE_EXACT_APPROXIMATIONS_METRIC: &str =
+    "compound_phrase_exact_approximations";
+pub const COMPOUND_PHRASE_SLOPPY_APPROXIMATIONS_METRIC: &str =
+    "compound_phrase_sloppy_approximations";
+pub const COMPOUND_PHRASE_EXACT_CONFIRMATIONS_METRIC: &str = "compound_phrase_exact_confirmations";
+pub const COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_METRIC: &str =
+    "compound_phrase_sloppy_confirmations";
+pub const COMPOUND_PHRASE_EXACT_CONFIRMATIONS_AVOIDED_METRIC: &str =
+    "compound_phrase_exact_confirmations_avoided";
+pub const COMPOUND_PHRASE_SLOPPY_CONFIRMATIONS_AVOIDED_METRIC: &str =
+    "compound_phrase_sloppy_confirmations_avoided";
 pub const CROSS_COLUMN_STAGED_ATTEMPTS_METRIC: &str = "cross_column_staged_attempts";
 pub const CROSS_COLUMN_STAGED_SUCCESSES_METRIC: &str = "cross_column_staged_successes";
 pub const CROSS_COLUMN_STAGED_FALLBACKS_METRIC: &str = "cross_column_staged_fallbacks";
@@ -149,6 +160,24 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record non-essential-clause evaluations for pure-SHOULD compound FTS.
     fn record_compound_should_non_essential_evaluations(&self, _num_evaluations: usize) {}
+
+    /// Record exact-phrase documents produced by the posting approximation.
+    fn record_compound_phrase_exact_approximations(&self, _num_approximations: usize) {}
+
+    /// Record sloppy-phrase documents produced by the posting approximation.
+    fn record_compound_phrase_sloppy_approximations(&self, _num_approximations: usize) {}
+
+    /// Record exact-phrase position confirmations.
+    fn record_compound_phrase_exact_confirmations(&self, _num_confirmations: usize) {}
+
+    /// Record sloppy-phrase position confirmations.
+    fn record_compound_phrase_sloppy_confirmations(&self, _num_confirmations: usize) {}
+
+    /// Record exact-phrase position confirmations avoided by a score bound.
+    fn record_compound_phrase_exact_confirmations_avoided(&self, _num_confirmations: usize) {}
+
+    /// Record sloppy-phrase position confirmations avoided by a score bound.
+    fn record_compound_phrase_sloppy_confirmations_avoided(&self, _num_confirmations: usize) {}
 
     /// Record cross-column queries that attempted candidate-driven staging.
     fn record_cross_column_staged_attempts(&self, _num_attempts: usize) {}

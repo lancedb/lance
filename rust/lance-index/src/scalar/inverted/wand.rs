@@ -4755,6 +4755,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.current_document_key = Some(document_key);
             self.current_score = score;
             self.confirmation = self.phrase_slop.is_none().then_some(true);
+            match self.phrase_slop {
+                Some(0) => self.metrics.record_compound_phrase_exact_approximations(1),
+                Some(_) => self.metrics.record_compound_phrase_sloppy_approximations(1),
+                None => {}
+            }
             self.shallow = None;
             return Ok(Some(doc_id));
         }
@@ -4805,9 +4810,29 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         let phrase_slop = self.phrase_slop.ok_or_else(|| {
             Error::internal("posting FTS scorer requires phrase slop for position confirmation")
         })?;
+        if phrase_slop == 0 {
+            self.metrics.record_compound_phrase_exact_confirmations(1);
+        } else {
+            self.metrics.record_compound_phrase_sloppy_confirmations(1);
+        }
         let confirmed = self.wand.check_positions(phrase_slop as i32)?;
         self.confirmation = Some(confirmed);
         Ok(confirmed)
+    }
+
+    pub(super) fn record_confirmation_avoided(&self) {
+        if self.confirmation.is_some() {
+            return;
+        }
+        match self.phrase_slop {
+            Some(0) => self
+                .metrics
+                .record_compound_phrase_exact_confirmations_avoided(1),
+            Some(_) => self
+                .metrics
+                .record_compound_phrase_sloppy_confirmations_avoided(1),
+            None => {}
+        }
     }
 
     pub(super) fn match_cost(&self) -> Option<f32> {
