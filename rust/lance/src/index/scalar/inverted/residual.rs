@@ -18,7 +18,6 @@ use std::{
         Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -566,27 +565,12 @@ impl DeepSizeOf for CachedResidualFtsEntry {
 #[derive(Debug)]
 pub(crate) struct CachedResidualFtsSegment {
     index: Arc<InvertedIndex>,
-    rows: usize,
-    documents: usize,
-    serialized_bytes: usize,
     resident_bytes: usize,
 }
 
 impl CachedResidualFtsSegment {
     pub fn index(&self) -> Arc<InvertedIndex> {
         self.index.clone()
-    }
-
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    pub fn documents(&self) -> usize {
-        self.documents
-    }
-
-    pub fn serialized_bytes(&self) -> usize {
-        self.serialized_bytes
     }
 
     pub fn resident_bytes(&self) -> usize {
@@ -600,23 +584,10 @@ impl DeepSizeOf for CachedResidualFtsSegment {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ResidualFtsCacheStats {
-    pub loader_runs: usize,
-    pub reuse_or_coalesced: usize,
-    pub build_failures: usize,
-    pub build_duration: Duration,
-    pub rows: usize,
-    pub documents: usize,
-    pub serialized_bytes: usize,
-    pub resident_bytes: usize,
-}
-
 #[derive(Debug)]
 pub(crate) struct LoadedResidualFtsSegments {
     pub segments: Vec<Arc<InvertedIndex>>,
     pub fragment_bitmap: roaring::RoaringBitmap,
-    pub stats: ResidualFtsCacheStats,
 }
 
 #[derive(Debug)]
@@ -808,12 +779,6 @@ async fn build_residual_segment(
             fragment.id
         ))
     })?;
-    let rows = fragment.physical_rows.ok_or_else(|| {
-        lance_core::Error::invalid_input(format!(
-            "residual FTS fragment {} has unknown physical row count",
-            fragment.id
-        ))
-    })?;
     let stream = load_fts_training_data(
         dataset,
         resolved,
@@ -897,12 +862,11 @@ async fn build_residual_segment(
     // lazy metadata and document state that the index itself does retain before
     // DSIndexCache computes its fixed admission weight.
     index.materialize_cache_weight().await?;
-    let (_, documents, _) = index.bm25_stats_for_terms(&[], None).await?;
     // `InvertedIndex` intentionally does not charge its object store. The
     // store is private to this cache value, so account its serialized files
     // explicitly in addition to decoded partition state. Cache this traversal
-    // before admission: DSIndexCache and every warm-query metric read can then
-    // use the fixed weight in O(1).
+    // before admission so DSIndexCache and aggregate group admission can use
+    // the fixed weight in O(1).
     let mut size_context = Context::default();
     let resident_bytes = index
         .deep_size_of_children(&mut size_context)
@@ -925,9 +889,6 @@ async fn build_residual_segment(
     )?;
     Ok(CachedResidualFtsSegment {
         index,
-        rows,
-        documents,
-        serialized_bytes,
         resident_bytes,
     })
 }
@@ -999,9 +960,6 @@ pub(crate) async fn load_residual_fts_segments(
         return Ok(ResidualFtsAdmission::Eligible(loaded_segments(
             warm_entries,
             spec.fragment_bitmap(),
-            spec.keys.len(),
-            0,
-            Duration::default(),
         )));
     }
 
@@ -1089,7 +1047,6 @@ pub(crate) async fn load_residual_fts_segments(
         }
     }
 
-    let warm_count = cached_entries.iter().flatten().count();
     let baseline_resident_bytes =
         checked_resident_sum(cached_entries.iter().flatten().map(|entry| {
             let CachedResidualFtsEntry::Ready(segment) = entry.as_ref();
@@ -1116,9 +1073,6 @@ pub(crate) async fn load_residual_fts_segments(
         return Ok(ResidualFtsAdmission::Eligible(loaded_segments(
             retained,
             spec.fragment_bitmap(),
-            spec.keys.len(),
-            0,
-            Duration::default(),
         )));
     }
 
@@ -1145,7 +1099,6 @@ pub(crate) async fn load_residual_fts_segments(
     let group_accounted_bytes = Arc::new(AtomicUsize::new(baseline_resident_bytes));
     let group_budget_exceeded = Arc::new(AtomicBool::new(false));
 
-    let started = std::time::Instant::now();
     let built_entries = futures::stream::iter(missing.into_iter().map(|(key, fragment)| {
         let resolved = spec.resolved.clone();
         let params = spec.params.clone();
@@ -1205,7 +1158,6 @@ pub(crate) async fn load_residual_fts_segments(
     // fixed weight passed admission. Cancellation during a retry cannot use
     // partial prior builds to escape the group cap because those entries are
     // included in the next baseline above.
-    let loader_runs = built_entries.len();
     for (key, entry) in built_entries {
         cache.insert_with_key(&key, Arc::new(entry)).await;
     }
@@ -1240,9 +1192,6 @@ pub(crate) async fn load_residual_fts_segments(
     Ok(ResidualFtsAdmission::Eligible(loaded_segments(
         retained,
         spec.fragment_bitmap(),
-        warm_count,
-        loader_runs,
-        started.elapsed(),
     )))
 }
 
@@ -1255,26 +1204,13 @@ fn checked_resident_sum(bytes: impl IntoIterator<Item = usize>) -> Option<usize>
 fn loaded_segments(
     entries: Vec<Arc<CachedResidualFtsEntry>>,
     fragment_bitmap: roaring::RoaringBitmap,
-    reuse_or_coalesced: usize,
-    loader_runs: usize,
-    build_duration: Duration,
 ) -> LoadedResidualFtsSegments {
     let mut loaded = LoadedResidualFtsSegments {
         segments: Vec::with_capacity(entries.len()),
         fragment_bitmap,
-        stats: ResidualFtsCacheStats::default(),
     };
-    loaded.stats.reuse_or_coalesced = reuse_or_coalesced;
-    loaded.stats.loader_runs = loader_runs;
-    if loader_runs != 0 {
-        loaded.stats.build_duration = build_duration;
-    }
     for entry in entries {
         let CachedResidualFtsEntry::Ready(segment) = entry.as_ref();
-        loaded.stats.rows += segment.rows();
-        loaded.stats.documents += segment.documents();
-        loaded.stats.serialized_bytes += segment.serialized_bytes();
-        loaded.stats.resident_bytes += segment.resident_bytes();
         loaded.segments.push(segment.index());
     }
     loaded
@@ -1282,7 +1218,7 @@ fn loaded_segments(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{sync::atomic::AtomicUsize, time::Duration};
 
     use lance_core::cache::{CacheNamespace, KeyBuilder, recommended_cache_shards};
 

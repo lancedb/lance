@@ -2665,45 +2665,15 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     let residual_row_id = residual_row_scan.try_into_batch().await.unwrap()[ROW_ID]
         .as_primitive::<UInt64Type>()
         .value(0);
-    let (built_results, exact_stats) =
-        compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    let built_results = compound_fts_results(&dataset, query.clone(), Some(2)).await;
     assert!(
         built_results
             .iter()
             .any(|(row_id, _)| *row_id == residual_row_id),
         "the cached compound prefilter must include the residual fragment"
     );
-    assert_eq!(
-        exact_stats.all_counts.get("residual_cache_loader_runs"),
-        Some(&1)
-    );
-    assert_eq!(exact_stats.all_counts.get("residual_cache_rows"), Some(&1));
-    assert_eq!(
-        exact_stats.all_counts.get("residual_cache_documents"),
-        Some(&1)
-    );
-    let serialized_bytes = exact_stats
-        .all_counts
-        .get("residual_cache_serialized_bytes")
-        .copied()
-        .unwrap_or_default();
-    let resident_bytes = exact_stats
-        .all_counts
-        .get("residual_cache_resident_bytes")
-        .copied()
-        .unwrap_or_default();
-    assert!(serialized_bytes > 0);
-    assert!(resident_bytes >= serialized_bytes);
-
-    let (reused_results, reused_stats) =
-        compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    let reused_results = compound_fts_results(&dataset, query.clone(), Some(2)).await;
     assert_eq!(reused_results, built_results);
-    assert_eq!(
-        reused_stats
-            .all_counts
-            .get("residual_cache_reuse_or_coalesced"),
-        Some(&1)
-    );
 
     let appended =
         arrow_array::record_batch!(("text", Utf8, ["new noise"]), ("id", Int32, [3])).unwrap();
@@ -2717,18 +2687,9 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
         .unwrap();
     // The new working set is first observed without a build. On the next use,
     // the old fragment is reused and only the newly appended fragment loads.
-    compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
-    let (_, appended_stats) = compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
-    assert_eq!(
-        appended_stats.all_counts.get("residual_cache_loader_runs"),
-        Some(&1)
-    );
-    assert_eq!(
-        appended_stats
-            .all_counts
-            .get("residual_cache_reuse_or_coalesced"),
-        Some(&1)
-    );
+    compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    let appended_results = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(appended_results, built_results);
 
     let empty_terms_query: FtsQuery = BooleanQuery::new([
         (Occur::Must, compound_match_query("", "text", 1.0)),
