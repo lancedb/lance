@@ -1938,6 +1938,152 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
 }
 
 #[tokio::test]
+async fn test_multimatch_fields_have_independent_fuzzy_expansion_budgets() {
+    let batch = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha", "nothing"]),
+        ("body", Utf8, ["nothing", "alphi"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let fuzzy_multimatch = || {
+        let mut query = MultiMatchQuery::try_new(
+            "alphx".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for field in &mut query.match_queries {
+            field.fuzziness = Some(1);
+            field.max_expansions = 1;
+        }
+        query
+    };
+
+    let top_level: FtsQuery = fuzzy_multimatch().into();
+    let top_level_plan = compound_fts_plan(&dataset, top_level.clone(), 10).await;
+    assert!(top_level_plan.matches("CompoundFtsScorer").count() >= 2);
+    assert!(!top_level_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let top_level_results = compound_fts_results(&dataset, top_level, Some(10)).await;
+    assert_eq!(top_level_results.len(), 2);
+
+    let nested: FtsQuery =
+        BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(fuzzy_multimatch()))]).into();
+    let nested_plan = compound_fts_plan(&dataset, nested.clone(), 10).await;
+    assert!(nested_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let nested_results = compound_fts_results(&dataset, nested, Some(10)).await;
+    assert_scored_rows_close(
+        "multimatch_independent_fuzzy_budgets",
+        &nested_results,
+        &top_level_results,
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
+    let indexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [0])
+    )
+    .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let unindexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let schema = unindexed.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![unindexed].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let auto_match = |terms: &str| -> FtsQuery {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("title".to_owned()))
+            .with_fuzziness(None)
+            .into()
+    };
+    let auto_multimatch = |terms: &str| {
+        let mut query = MultiMatchQuery::try_new(
+            terms.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for match_query in &mut query.match_queries {
+            match_query.fuzziness = None;
+        }
+        query
+    };
+
+    for (case_name, query, expected_ids) in [
+        ("match_exact", auto_match("ALPHA"), &[0, 1][..]),
+        ("match_typo", auto_match("alphx"), &[][..]),
+        (
+            "multimatch_exact",
+            FtsQuery::MultiMatch(auto_multimatch("ALPHA")),
+            &[0, 1][..],
+        ),
+        (
+            "multimatch_typo",
+            FtsQuery::MultiMatch(auto_multimatch("alphx")),
+            &[][..],
+        ),
+        (
+            "nested_multimatch_exact",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHA")))])
+                .into(),
+            &[0, 1][..],
+        ),
+        (
+            "nested_multimatch_typo",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
+                .into(),
+            &[][..],
+        ),
+    ] {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected_ids,
+            "indexed and unindexed rows diverged for {case_name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_field_local_match_wand_exactness_certificates() {
     let mut dataset = write_cross_column_compound_dataset().await;
     create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
@@ -2124,6 +2270,61 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
         Some(&3)
     );
+
+    for (
+        case_name,
+        exact_term,
+        fuzzy_term,
+        limit,
+        expected_strict,
+        expected_exhaustive,
+        expected_fallbacks,
+    ) in [
+        ("strict", "alpha", "alphx", 1, 1, 1, 0),
+        ("exhaustive", "tiebody", "tiebodx", 3, 0, 2, 0),
+        ("ambiguous", "tie", "tix", 1, 0, 1, 1),
+    ] {
+        let exact =
+            compound_fts_results(&dataset, field_local_query(exact_term), Some(limit)).await;
+        let mut fuzzy = MultiMatchQuery::try_new(
+            fuzzy_term.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for query in &mut fuzzy.match_queries {
+            query.fuzziness = Some(1);
+        }
+        let (actual, stats) = compound_fts_results_with_stats(&dataset, fuzzy.into(), limit).await;
+        assert_scored_rows_close(
+            &format!("fuzzy_wand_certificate_{case_name}"),
+            &actual,
+            &exact,
+        );
+        assert_eq!(
+            stats
+                .all_counts
+                .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
+            Some(&2),
+            "{case_name} fuzzy query must attempt one certificate per field"
+        );
+        for (metric, expected) in [
+            (WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, expected_strict),
+            (
+                WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
+                expected_exhaustive,
+            ),
+            (
+                WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+                expected_fallbacks,
+            ),
+        ] {
+            assert_eq!(
+                stats.all_counts.get(metric),
+                Some(&expected),
+                "{case_name} fuzzy query used the wrong certificate path for {metric}"
+            );
+        }
+    }
 
     let zero_boost_query: FtsQuery = MultiMatchQuery::try_new(
         "blocked".to_owned(),
