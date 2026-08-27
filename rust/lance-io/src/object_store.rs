@@ -1112,9 +1112,27 @@ impl ObjectStore {
             source_path,
             destination_store,
             destination_path,
-            parse_env_as_bool(SERVER_SIDE_COPY_ENABLED_ENV, false),
+            self.uses_server_side_copy(destination_store),
         )
         .await
+    }
+
+    /// Return whether bulk movement to `destination_store` currently selects
+    /// provider-native server-side copy.
+    ///
+    /// This is true only when `LANCE_IO_SERVER_SIDE_COPY_ENABLED` is truthy and
+    /// both stores identify the same cloud backend.
+    ///
+    /// ```no_run
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn policy(source: &ObjectStore, destination: &ObjectStore) {
+    /// let uses_server_side_copy = source.uses_server_side_copy(destination);
+    /// # let _ = uses_server_side_copy;
+    /// # }
+    /// ```
+    pub fn uses_server_side_copy(&self, destination_store: &Self) -> bool {
+        parse_env_as_bool(SERVER_SIDE_COPY_ENABLED_ENV, false)
+            && self.can_server_side_copy_to(destination_store)
     }
 
     async fn copy_bulk_with_server_side_copy(
@@ -1137,7 +1155,9 @@ impl ObjectStore {
                  {destination_path}: source_size={source_size}, error={source}"
             ))
         })?;
-        self.copy(source_path, destination_path).await?;
+        destination_store
+            .copy(source_path, destination_path)
+            .await?;
         let destination_size = destination_store.size(destination_path).await?;
         if destination_size != source_size {
             return Err(Error::io(format!(
@@ -1154,14 +1174,10 @@ impl ObjectStore {
     }
 
     fn can_server_side_copy_to(&self, destination_store: &Self) -> bool {
-        if self.is_local() || destination_store.is_local() {
-            return false;
-        }
-
-        Arc::ptr_eq(&self.inner, &destination_store.inner)
-            || (self.is_cloud()
-                && destination_store.is_cloud()
-                && self.store_prefix == destination_store.store_prefix)
+        self.is_cloud()
+            && destination_store.is_cloud()
+            && (Arc::ptr_eq(&self.inner, &destination_store.inner)
+                || self.store_prefix == destination_store.store_prefix)
     }
 
     /// Copy an object by streaming its bytes through Lance's multipart-aware writer.
@@ -2846,11 +2862,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_bulk_copy_uses_server_side_copy_when_enabled_for_same_store() {
-        let observations = Arc::new(MultipartObservations::default());
-        let mut store = ObjectStore::memory();
-        store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
+        let shared_inner = InMemory::new();
+        let source_observations = Arc::new(MultipartObservations::default());
+        let mut source_store = ObjectStore::memory();
+        source_store.scheme = "test-cloud".to_string();
+        source_store.store_prefix = "test-cloud$bucket".to_string();
+        source_store.inner = Arc::new(ObservedMultipartStore {
+            inner: shared_inner.clone(),
+            observations: source_observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+        let destination_observations = Arc::new(MultipartObservations::default());
+        let mut destination_store = ObjectStore::memory();
+        destination_store.scheme = "test-cloud".to_string();
+        destination_store.store_prefix = "test-cloud$bucket".to_string();
+        destination_store.inner = Arc::new(ObservedMultipartStore {
+            inner: shared_inner,
+            observations: destination_observations.clone(),
             fail_parts: false,
             destination_size_adjustment: 0,
         });
@@ -2858,18 +2887,78 @@ mod tests {
         let source = Path::from("source.bin");
         let destination = Path::from("destination.bin");
         let contents = b"use native copy when explicitly enabled";
-        store.put(&source, contents).await.unwrap();
+        source_store.put(&source, contents).await.unwrap();
 
-        let result = store
-            .copy_bulk_with_server_side_copy(&source, &store, &destination, true)
+        let result = source_store
+            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
             .await
             .unwrap();
 
         assert_eq!(result.size, contents.len());
-        assert_eq!(observations.native_copy_count.load(Ordering::SeqCst), 1);
         assert_eq!(
-            store.read_one_all(&destination).await.unwrap().as_ref(),
+            source_observations.native_copy_count.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            destination_observations
+                .native_copy_count
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            destination_store
+                .read_one_all(&destination)
+                .await
+                .unwrap()
+                .as_ref(),
             contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bulk_copy_rejects_server_side_destination_size_mismatch() {
+        let shared_inner = InMemory::new();
+        let mut source_store = ObjectStore::memory();
+        source_store.scheme = "test-cloud".to_string();
+        source_store.store_prefix = "test-cloud$bucket".to_string();
+        source_store.inner = Arc::new(ObservedMultipartStore {
+            inner: shared_inner.clone(),
+            observations: Arc::new(MultipartObservations::default()),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+        let destination_observations = Arc::new(MultipartObservations::default());
+        let mut destination_store = ObjectStore::memory();
+        destination_store.scheme = "test-cloud".to_string();
+        destination_store.store_prefix = "test-cloud$bucket".to_string();
+        destination_store.inner = Arc::new(ObservedMultipartStore {
+            inner: shared_inner,
+            observations: destination_observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 1,
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        source_store
+            .put(&source, b"validate native copy")
+            .await
+            .unwrap();
+
+        let error = source_store
+            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("destination size mismatch"),
+            "expected validation failure, got: {error}"
+        );
+        assert_eq!(
+            destination_observations
+                .native_copy_count
+                .load(Ordering::SeqCst),
+            1
         );
     }
 

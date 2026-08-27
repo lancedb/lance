@@ -175,6 +175,7 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
 
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
     value
@@ -185,6 +186,20 @@ fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
                 "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
             ))
         })
+}
+
+fn deep_clone_copy_parallelism(
+    configured_io_parallelism: usize,
+    uses_streaming_copy: bool,
+    stream_copy_parallelism: Option<usize>,
+) -> usize {
+    if !uses_streaming_copy {
+        configured_io_parallelism
+    } else if let Some(value) = stream_copy_parallelism {
+        value
+    } else {
+        configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+    }
 }
 
 // We default to 6GB for the index cache, since indices are often large but
@@ -3322,10 +3337,10 @@ impl Dataset {
             path
         };
 
-        const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
         let configured_io_parallelism = src_ds.object_store.io_parallelism();
-        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
-            && target_store.has_direct_local_paths());
+        let uses_streaming_copy = !src_ds.object_store.uses_server_side_copy(&target_store)
+            && !(src_ds.object_store.has_direct_local_paths()
+                && target_store.has_direct_local_paths());
         let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
             Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
             Err(std::env::VarError::NotPresent) => None,
@@ -3338,13 +3353,11 @@ impl Dataset {
         };
         // Limit the number of concurrently buffered transfers by default while
         // preserving efficient local copies and the operation-specific override.
-        let io_parallelism = if !uses_streaming_copy {
-            configured_io_parallelism
-        } else if let Some(value) = stream_copy_parallelism {
-            value
-        } else {
-            configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
-        };
+        let io_parallelism = deep_clone_copy_parallelism(
+            configured_io_parallelism,
+            uses_streaming_copy,
+            stream_copy_parallelism,
+        );
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {

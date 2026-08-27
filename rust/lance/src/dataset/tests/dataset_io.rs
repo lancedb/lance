@@ -15,8 +15,8 @@ use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, parse_deep_clone_stream_concurrency, validate_dataset_root_for_drop,
-    write_manifest_file,
+    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
+    validate_dataset_root_for_drop, write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -84,6 +84,23 @@ fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value
 #[test]
 fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
     assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
+}
+
+#[rstest]
+#[case::server_side_copy(64, false, None, 64)]
+#[case::streaming_default_cap(64, true, None, 4)]
+#[case::streaming_configured_below_cap(2, true, None, 2)]
+#[case::streaming_override(64, true, Some(17), 17)]
+fn test_deep_clone_copy_parallelism(
+    #[case] configured: usize,
+    #[case] uses_streaming_copy: bool,
+    #[case] stream_override: Option<usize>,
+    #[case] expected: usize,
+) {
+    assert_eq!(
+        deep_clone_copy_parallelism(configured, uses_streaming_copy, stream_override),
+        expected
+    );
 }
 
 #[tokio::test]
