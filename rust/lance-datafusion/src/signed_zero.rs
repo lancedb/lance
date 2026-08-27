@@ -15,9 +15,7 @@ use lance_core::Result;
 ///
 /// Arrow sorts `-0.0` strictly below `+0.0` and compares the two encodings for
 /// equality by bit pattern, while IEEE 754 and SQL treat them as one number.
-/// Each comparison against a zero literal has an equivalent total-order form,
-/// reached by moving the literal to whichever encoding sits on the correct side
-/// of the pair:
+/// Each comparison against a zero literal has an equivalent total-order form:
 ///
 /// | written                      | evaluated                    |
 /// |------------------------------|------------------------------|
@@ -30,7 +28,7 @@ use lance_core::Result;
 /// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
 /// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
 ///
-/// Both encodings have to be spelled out because a scalar index keys on the bit
+/// Equality has to name both encodings because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
 /// bloom filter hashes the value.
 ///
