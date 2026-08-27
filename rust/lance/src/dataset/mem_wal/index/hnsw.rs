@@ -432,8 +432,14 @@ impl HnswMemIndex {
         if state.graph.is_empty() {
             return Ok(None);
         }
+        // One boundary for both artifacts. Storage is captured first, so an
+        // insert completing in between leaves the graph ahead of it, and a node
+        // the storage batch has no vector for gets scored on read. The storage
+        // batch holds one row per id from 0, so its row count is that boundary.
         let storage_batch = state.storage.to_record_batch(total_rows)?;
-        let hnsw_batch = state.graph.to_lance_hnsw_batch()?;
+        let hnsw_batch = state
+            .graph
+            .to_lance_hnsw_batch(Some(storage_batch.num_rows()))?;
         let hnsw = HNSW::load(hnsw_batch)?;
         Ok(Some((hnsw, storage_batch)))
     }
