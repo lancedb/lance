@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -101,5 +102,47 @@ class InvertedIndexParamsTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> InvertedIndexParams.builder().baseTokenizer("code").formatVersion(2).build());
+  }
+
+  @Test
+  void additionalBuildParametersAreSerialized() {
+    ScalarIndexParams params =
+        InvertedIndexParams.builder()
+            .analyzer("code")
+            .lanceTokenizer("text")
+            .splitIdentifiers(true)
+            .splitOnNumerics(false)
+            .preserveOriginal(true)
+            .indexOperators(true)
+            .memoryLimit(4096)
+            .numWorkers(4)
+            .formatVersion(3)
+            .build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals("code", json.get("analyzer"));
+    assertEquals("text", json.get("lance_tokenizer"));
+    assertEquals(true, json.get("split_identifiers"));
+    assertEquals(false, json.get("split_on_numerics"));
+    assertEquals(true, json.get("preserve_original"));
+    assertEquals(true, json.get("index_operators"));
+    assertEquals(4096L, ((Number) json.get("memory_limit")).longValue());
+    assertEquals(4, ((Number) json.get("num_workers")).intValue());
+  }
+
+  @Test
+  void unlimitedTokenLengthIsSerializedAsNull() {
+    ScalarIndexParams params = InvertedIndexParams.builder().unlimitedTokenLength().build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertTrue(json.containsKey("max_token_length"));
+    assertNull(json.get("max_token_length"));
+  }
+
+  @Test
+  void invalidResourceParametersAreRejected() {
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().memoryLimit(0));
+    assertThrows(IllegalArgumentException.class, () -> InvertedIndexParams.builder().numWorkers(0));
   }
 }
