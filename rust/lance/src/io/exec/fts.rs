@@ -67,15 +67,15 @@ use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
-    has_query_token, try_collect_query_tokens,
+    has_query_token, try_collect_query_tokens, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
-    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
-    cross_column_compound_search, exclusive_scaled_score_floor,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
+    compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
+    compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema, prepare_bm25_query,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -308,12 +308,75 @@ async fn open_fts_segments(
     .await
 }
 
+async fn search_prepared_segments(
+    indices: &[Arc<InvertedIndex>],
+    prepared: Arc<PreparedMatch>,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    initial_score_floor: Option<f32>,
+) -> Result<Vec<ScoredDoc>> {
+    let limit = prepared.params.limit.unwrap_or(usize::MAX);
+    let mut candidates = std::collections::BinaryHeap::new();
+    let searches = indices
+        .iter()
+        .map(|index| {
+            let index = Arc::clone(index);
+            let prepared = prepared.clone();
+            let pre_filter = pre_filter.clone();
+            let metrics = metrics.clone();
+            async move {
+                if let Some(initial_score_floor) = initial_score_floor {
+                    index
+                        .bm25_search_prepared_documents_with_score_floor(
+                            prepared.query.clone(),
+                            prepared.params.clone(),
+                            prepared.operator,
+                            pre_filter,
+                            metrics,
+                            initial_score_floor,
+                        )
+                        .await
+                } else {
+                    index
+                        .bm25_search_prepared_documents(
+                            prepared.query.clone(),
+                            prepared.params.clone(),
+                            prepared.operator,
+                            pre_filter,
+                            metrics,
+                        )
+                        .await
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let searches = stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus());
+    let mut searches = searches;
+
+    while let Some(documents) = searches.try_next().await? {
+        for document in documents {
+            if candidates.len() < limit {
+                candidates.push(std::cmp::Reverse(document));
+            } else if candidates.peek().unwrap().0.score < document.score {
+                candidates.pop();
+                candidates.push(std::cmp::Reverse(document));
+            }
+        }
+    }
+
+    Ok(candidates
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse(document)| document)
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,
     params: Arc<FtsSearchParams>,
-    operator: lance_index::scalar::inverted::query::Operator,
+    operator: Operator,
     pre_filter: Arc<dyn PreFilter>,
     metrics: Arc<FtsIndexMetrics>,
     base_scorer: Arc<MemBM25Scorer>,
@@ -377,6 +440,33 @@ async fn search_segments(
         .into_iter()
         .map(|std::cmp::Reverse(document)| document)
         .collect())
+}
+
+#[derive(Clone)]
+struct PreparedMatch {
+    query: Arc<PreparedBm25Query>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+}
+
+impl PreparedMatch {
+    async fn new(
+        indices: &[Arc<InvertedIndex>],
+        tokens: Tokens,
+        params: FtsSearchParams,
+        operator: Operator,
+        metrics: &FtsIndexMetrics,
+        base_scorer: Option<Arc<MemBM25Scorer>>,
+    ) -> Result<Self> {
+        let query = Arc::new(
+            prepare_bm25_query(indices, tokens, &params, Some(metrics), base_scorer).await?,
+        );
+        Ok(Self {
+            query,
+            params: Arc::new(params),
+            operator,
+        })
+    }
 }
 
 fn scored_documents_batch(schema: SchemaRef, documents: Vec<ScoredDoc>) -> Result<RecordBatch> {
@@ -559,6 +649,27 @@ fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
     Ok(columns)
 }
 
+fn compound_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Match(query) => uses_fuzzy_expansion(query.fuzziness),
+        FtsQuery::Phrase(_) => false,
+        FtsQuery::Boost(query) => {
+            compound_query_uses_fuzzy_expansion(&query.positive)
+                || compound_query_uses_fuzzy_expansion(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => query
+            .match_queries
+            .iter()
+            .any(|query| uses_fuzzy_expansion(query.fuzziness)),
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .any(compound_query_uses_fuzzy_expansion),
+    }
+}
+
 /// One DataFusion boundary around a posting-backed compound scorer tree.
 #[derive(Debug)]
 pub struct CompoundQueryExec {
@@ -570,6 +681,10 @@ pub struct CompoundQueryExec {
     /// When set, leaf scorers use this instead of building one from the
     /// searched segments — see [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Canonical vocabulary/scorer pair for a root Match query prepared over
+    /// the complete corpus before this exec was restricted to a segment
+    /// subset.
+    prepared_match: Option<Arc<PreparedBm25Query>>,
     segment_selection: FtsSegmentSelection,
     /// Caller-supplied row-address mask, intersected into the prefilter so the
     /// compound scorer ranks only surviving rows (see
@@ -626,6 +741,7 @@ impl CompoundQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            prepared_match: None,
             segment_selection,
             external_mask: None,
             properties: Arc::new(PlanProperties::new(
@@ -650,6 +766,19 @@ impl CompoundQueryExec {
     /// expansions. Execution returns an error when any required token is absent.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self.prepared_match = None;
+        self
+    }
+
+    /// Override root-Match preparation with one canonical vocabulary/scorer
+    /// pair built against the complete corpus.
+    ///
+    /// This is required for distributed fuzzy execution over a segment subset;
+    /// a scorer alone cannot preserve the globally capped rewrite.
+    #[doc(hidden)]
+    pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
+        self.prepared_match = Some(prepared);
+        self.base_scorer = None;
         self
     }
 
@@ -752,28 +881,28 @@ fn count_smaller_row_id_replacements(
         .count()
 }
 
-async fn exact_match_fallback(
+async fn exact_prepared_match_fallback(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
     params: &FtsSearchParams,
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<FtsIndexMetrics>,
-    base_scorer: Arc<MemBM25Scorer>,
+    prepared_match: Arc<PreparedBm25Query>,
     score_floor: Option<f32>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     if let Some(score_floor) = score_floor {
-        compound_search_with_base_scorer_and_score_floor(
+        compound_search_prepared_match_with_score_floor(
             indices,
             query,
             params,
             prefilter,
             metrics,
-            base_scorer,
+            prepared_match,
             score_floor,
         )
         .await
     } else {
-        compound_search_with_base_scorer(indices, query, params, prefilter, metrics, base_scorer)
+        compound_search_prepared_match(indices, query, params, prefilter, metrics, prepared_match)
             .await
     }
 }
@@ -851,6 +980,7 @@ impl ExecutionPlan for CompoundQueryExec {
             params: self.params.clone(),
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
             segment_selection: self.segment_selection.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
@@ -869,7 +999,8 @@ impl ExecutionPlan for CompoundQueryExec {
         let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
-        let base_scorer = self.base_scorer.clone();
+        let preset_base_scorer = self.base_scorer.clone();
+        let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -895,6 +1026,21 @@ impl ExecutionPlan for CompoundQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
+            if preset_prepared_match.is_some() && !matches!(&query, FtsQuery::Match(_)) {
+                return Err(DataFusionError::Execution(
+                    "CompoundQueryExec prepared vocabulary requires a root Match query".to_string(),
+                ));
+            }
+            let scorer_only_fuzzy = preset_prepared_match.is_none()
+                && compound_query_uses_fuzzy_expansion(&query)
+                && preset_base_scorer.is_some();
+            let scorer_override_covers_all = if scorer_only_fuzzy {
+                segment_selection
+                    .covers_all_committed(&dataset, column, DocumentGranularity::Row, &segments)
+                    .await?
+            } else {
+                true
+            };
             let _details = load_segment_details(&dataset, column, &segments).await?;
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
@@ -934,6 +1080,16 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
+            let base_scorer = match (preset_prepared_match.is_some(), preset_base_scorer) {
+                (true, _) => None,
+                (false, scorer) => scorer,
+            };
+            if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
+                return Err(DataFusionError::Execution(
+                    "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
+                    .to_string(),
+                ));
+            }
             let certificate_limit = match (&query, params.limit) {
                 (FtsQuery::Match(match_query), Some(limit))
                     if limit > 0
@@ -954,48 +1110,55 @@ impl ExecutionPlan for CompoundQueryExec {
             let (row_ids, scores) = if let Some((match_query, limit, wand_limit)) =
                 certificate_limit
             {
-                let first_index = indices.first().ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "FTS index for column {column} has no segments"
-                    ))
-                })?;
-                let mut tokenizer =
-                    tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
-                let tokens = Arc::new(try_collect_query_tokens(
-                    &match_query.terms,
-                    &mut tokenizer,
-                )?);
-                let base_wand_params =
-                    MatchQueryExec::effective_params(&match_query, params.clone())
-                        .with_phrase_slop(None)
-                        .with_limit(Some(wand_limit));
-                let scorer_start = std::time::Instant::now();
-                let base_scorer = Arc::new(
-                    build_global_bm25_scorer(
-                        &indices,
-                        tokens.as_ref(),
-                        &base_wand_params,
-                        Some(metrics.as_ref()),
-                    )
-                    .await?,
-                );
-                metrics.record_scorer_build(scorer_start.elapsed());
+                let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
+                    .with_phrase_slop(None)
+                    .with_limit(Some(wand_limit));
+                let prepared = if let Some(prepared_match) = preset_prepared_match.clone() {
+                    Arc::new(PreparedMatch {
+                        query: prepared_match,
+                        params: Arc::new(wand_params),
+                        operator: match_query.operator,
+                    })
+                } else {
+                    let first_index = indices.first().ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "FTS index for column {column} has no segments"
+                        ))
+                    })?;
+                    let mut tokenizer =
+                        tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
+                    let tokens = try_collect_query_tokens(&match_query.terms, &mut tokenizer)?;
+                    let scorer_start = std::time::Instant::now();
+                    let prepared = Arc::new(
+                        PreparedMatch::new(
+                            &indices,
+                            tokens,
+                            wand_params,
+                            match_query.operator,
+                            metrics.as_ref(),
+                            None,
+                        )
+                        .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    prepared
+                };
 
                 // Zero-weight terms can match documents without contributing a
                 // positive score. A short score-only WAND result therefore does
                 // not prove exhaustion. Preserve exact membership semantics for
                 // those rare corpora without recording a certificate attempt.
-                if base_scorer.token_docs.keys().any(|token| {
-                    let weight = base_scorer.query_weight(token);
+                if prepared.query.scorer().token_docs.keys().any(|token| {
+                    let weight = prepared.query.scorer().query_weight(token);
                     !weight.is_finite() || weight <= 0.0
                 }) {
-                    compound_search_with_base_scorer(
+                    compound_search_prepared_match(
                         &indices,
                         &query,
                         &params,
                         prefilter,
                         metrics.clone(),
-                        base_scorer,
+                        prepared.query.clone(),
                     )
                     .await?
                 } else {
@@ -1003,14 +1166,11 @@ impl ExecutionPlan for CompoundQueryExec {
                     prefilter.wait_for_ready().await?;
                     let probe_start = std::time::Instant::now();
                     let probe_comparisons = metrics.index_metrics.comparisons();
-                    let mut documents = search_segments(
+                    let mut documents = search_prepared_segments(
                         &indices,
-                        tokens.clone(),
-                        Arc::new(base_wand_params.clone()),
-                        match_query.operator,
+                        prepared.clone(),
                         prefilter.clone(),
                         metrics.clone(),
-                        base_scorer.clone(),
                         None,
                     )
                     .await?;
@@ -1046,21 +1206,26 @@ impl ExecutionPlan for CompoundQueryExec {
                                 (score_floor, completion_limit)
                             {
                                 metrics.record_wand_tie_completion_attempts(1);
-                                let completion_params = Arc::new(
-                                    base_wand_params.clone().with_limit(Some(completion_limit)),
-                                );
+                                let completion_prepared = Arc::new(PreparedMatch {
+                                    query: prepared.query.clone(),
+                                    params: Arc::new(
+                                        prepared
+                                            .params
+                                            .as_ref()
+                                            .clone()
+                                            .with_limit(Some(completion_limit)),
+                                    ),
+                                    operator: prepared.operator,
+                                });
                                 let completion_start = std::time::Instant::now();
                                 let completion_comparisons = metrics.index_metrics.comparisons();
                                 let raw_score_floor =
                                     exclusive_scaled_score_floor(score_floor, match_query.boost);
-                                let mut completion = search_segments(
+                                let mut completion = search_prepared_segments(
                                     &indices,
-                                    tokens,
-                                    completion_params,
-                                    match_query.operator,
+                                    completion_prepared,
                                     prefilter.clone(),
                                     metrics.clone(),
-                                    base_scorer.clone(),
                                     raw_score_floor,
                                 )
                                 .await?;
@@ -1117,13 +1282,13 @@ impl ExecutionPlan for CompoundQueryExec {
                                         let fallback_start = std::time::Instant::now();
                                         let fallback_comparisons =
                                             metrics.index_metrics.comparisons();
-                                        let results = exact_match_fallback(
+                                        let results = exact_prepared_match_fallback(
                                             &indices,
                                             &query,
                                             &params,
                                             prefilter,
                                             metrics.clone(),
-                                            base_scorer,
+                                            prepared.query.clone(),
                                             seeded_floor,
                                         )
                                         .await?;
@@ -1148,13 +1313,13 @@ impl ExecutionPlan for CompoundQueryExec {
                                 }
                                 let fallback_start = std::time::Instant::now();
                                 let fallback_comparisons = metrics.index_metrics.comparisons();
-                                let results = exact_match_fallback(
+                                let results = exact_prepared_match_fallback(
                                     &indices,
                                     &query,
                                     &params,
                                     prefilter,
                                     metrics.clone(),
-                                    base_scorer,
+                                    prepared.query.clone(),
                                     score_floor,
                                 )
                                 .await?;
@@ -1173,8 +1338,19 @@ impl ExecutionPlan for CompoundQueryExec {
                     }
                 }
             } else {
-                match base_scorer {
-                    Some(base_scorer) => {
+                match (preset_prepared_match, base_scorer) {
+                    (Some(prepared_match), _) => {
+                        compound_search_prepared_match(
+                            &indices,
+                            &query,
+                            &params,
+                            prefilter,
+                            metrics.clone(),
+                            prepared_match,
+                        )
+                        .await?
+                    }
+                    (None, Some(base_scorer)) => {
                         compound_search_with_base_scorer(
                             &indices,
                             &query,
@@ -1185,7 +1361,7 @@ impl ExecutionPlan for CompoundQueryExec {
                         )
                         .await?
                     }
-                    None => {
+                    (None, None) => {
                         compound_search(&indices, &query, &params, prefilter, metrics.clone())
                             .await?
                     }
@@ -1606,7 +1782,10 @@ fn tokenizer_for_match_query(
     index: &InvertedIndex,
     fuzziness: Option<u32>,
 ) -> Box<dyn LanceTokenizer> {
-    if !matches!(fuzziness, Some(distance) if distance != 0) {
+    // Preserve the legacy explicit-fuzzy behavior, while AUTO fuzziness uses
+    // the index analyzer so its source terms share the indexed vocabulary's
+    // normalization and filtering.
+    if !matches!(fuzziness, Some(distance) if distance > 0) {
         return index.tokenizer();
     }
 
@@ -1861,6 +2040,34 @@ impl FtsSegmentSelection {
             Self::ExactResolved(segments) => Some(segments),
             Self::AllCommitted | Self::ExactUuids(_) => None,
         }
+    }
+
+    fn searches_all_committed(&self) -> bool {
+        matches!(self, Self::AllCommitted)
+    }
+
+    async fn covers_all_committed(
+        &self,
+        dataset: &Dataset,
+        column: &str,
+        document_granularity: DocumentGranularity,
+        resolved: &[IndexMetadata],
+    ) -> DataFusionResult<bool> {
+        if self.searches_all_committed() {
+            return Ok(true);
+        }
+        let Some(committed) = load_segments(dataset, column, document_granularity).await? else {
+            return Ok(false);
+        };
+        let selected = resolved
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        let committed = committed
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        Ok(selected == committed)
     }
 
     fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
@@ -2255,6 +2462,10 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `build_global_bm25_scorer` and threads this
     /// scorer down to `InvertedIndex::bm25_search`.
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Canonical fuzzy vocabulary and corpus-wide scorer prepared against the
+    /// complete distributed corpus. Unlike `base_scorer`, this is safe to
+    /// forward to an exec that searches only a segment subset.
+    prepared_query: Option<Arc<PreparedBm25Query>>,
     /// Corpus-wide scorer published by the flat branch of a mixed search.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
     segment_selection: FtsSegmentSelection,
@@ -2345,6 +2556,7 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            prepared_query: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::AllCommitted,
             overlay_block: None,
@@ -2408,6 +2620,7 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            prepared_query: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
             overlay_block: None,
@@ -2451,6 +2664,7 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            prepared_query: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             overlay_block: None,
@@ -2473,9 +2687,25 @@ impl MatchQueryExec {
     /// routes per-segment work to multiple hosts and aggregates stats
     /// out-of-band, so each per-host leaf scores against the full corpus
     /// rather than its local segment subset. See [`build_global_bm25_scorer`]
-    /// for constructing one.
+    /// for constructing one. For a fuzzy query over an explicit segment
+    /// subset, use [`Self::with_prepared_query`] so the globally selected
+    /// vocabulary travels with the scorer.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self.prepared_query = None;
+        self
+    }
+
+    /// Override local query preparation with one canonical vocabulary/scorer
+    /// pair built against the complete corpus.
+    ///
+    /// Distributed fuzzy callers must use this instead of
+    /// [`Self::with_base_scorer`], because worker-local expansion can select a
+    /// different capped vocabulary from the one used to build the scorer.
+    #[doc(hidden)]
+    pub fn with_prepared_query(mut self, query: Arc<PreparedBm25Query>) -> Self {
+        self.prepared_query = Some(query);
+        self.base_scorer = None;
         self
     }
 
@@ -2573,6 +2803,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
+                    prepared_query: self.prepared_query.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     segment_selection: self.segment_selection.clone(),
                     overlay_block: self.overlay_block.clone(),
@@ -2606,6 +2837,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
+                    prepared_query: self.prepared_query.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     segment_selection: self.segment_selection.clone(),
                     overlay_block: self.overlay_block.clone(),
@@ -2638,6 +2870,7 @@ impl ExecutionPlan for MatchQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let preset_prepared_query = self.prepared_query.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
         let overlay_block = self.overlay_block.clone();
@@ -2658,6 +2891,16 @@ impl ExecutionPlan for MatchQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
+            let scorer_only_fuzzy = preset_prepared_query.is_none()
+                && uses_fuzzy_expansion(params.fuzziness)
+                && (preset_base_scorer.is_some() || shared_scorer.is_some());
+            let scorer_override_covers_all = if scorer_only_fuzzy {
+                segment_selection
+                    .covers_all_committed(&ds, &column, document_granularity, &segments)
+                    .await?
+            } else {
+                true
+            };
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
@@ -2692,40 +2935,47 @@ impl ExecutionPlan for MatchQueryExec {
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
             let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
-            let base_scorer = match (preset_base_scorer, shared_scorer) {
-                (Some(scorer), _) => scorer,
-                (None, Some(shared_scorer)) => shared_scorer.wait().await?,
-                (None, None) => {
-                    let scorer_start = std::time::Instant::now();
-                    let scorer = Arc::new(
-                        build_global_bm25_scorer(
-                            &indices,
-                            &tokens,
-                            &params,
-                            Some(metrics.as_ref()),
-                        )
-                        .boxed()
-                        .await?,
-                    );
-                    metrics.record_scorer_build(scorer_start.elapsed());
-                    scorer
+            let prepared = if let Some(prepared_query) = preset_prepared_query {
+                Arc::new(PreparedMatch {
+                    query: prepared_query,
+                    params: Arc::new(params),
+                    operator: query.operator,
+                })
+            } else {
+                let base_scorer = match (preset_base_scorer, shared_scorer) {
+                    (Some(scorer), _) => Some(scorer),
+                    (None, Some(shared_scorer)) => Some(shared_scorer.wait().await?),
+                    (None, None) => None,
+                };
+                if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
+                    return Err(DataFusionError::Execution(
+                        "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
+                            .to_string(),
+                    ));
                 }
+                let builds_local_scorer = base_scorer.is_none();
+                let scorer_start = std::time::Instant::now();
+                let prepared = Arc::new(
+                    PreparedMatch::new(
+                        &indices,
+                        tokens,
+                        params,
+                        query.operator,
+                        metrics.as_ref(),
+                        base_scorer,
+                    )
+                    .await?,
+                );
+                if builds_local_scorer {
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                }
+                prepared
             };
 
             pre_filter.wait_for_ready().await?;
-            let tokens = Arc::new(tokens);
-            let params = Arc::new(params);
-            let mut documents = search_segments(
-                &indices,
-                tokens,
-                params,
-                query.operator,
-                pre_filter,
-                metrics.clone(),
-                base_scorer,
-                None,
-            )
-            .await?;
+            let mut documents =
+                search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
+                    .await?;
             documents.iter_mut().for_each(|document| {
                 document.score.0 *= query.boost;
             });
@@ -3009,7 +3259,7 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
-        if query.fuzziness != Some(0) {
+        if uses_fuzzy_expansion(query.fuzziness) {
             return Err(DataFusionError::NotImplemented(format!(
                 "Fuzzy MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}",
                 column, query.fuzziness
@@ -4585,11 +4835,11 @@ mod tests {
     use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
-        PhraseQuery, has_query_token, try_collect_query_tokens,
+        PhraseQuery, collect_query_tokens, has_query_token, try_collect_query_tokens,
     };
     use lance_index::scalar::inverted::{
         DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
-        build_global_bm25_scorer,
+        build_global_bm25_scorer, prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -4608,9 +4858,12 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
+        PhraseQueryExec, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+        WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_BUDGET,
+        WAND_TIE_COMPLETION_SUCCESSES_METRIC, WandExactnessCertificate,
         build_boolean_query_children, classify_wand_exactness_certificate,
         count_smaller_row_id_replacements, default_text_tokenizer, open_fts_segments,
+        tokenizer_for_match_query,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -5850,8 +6103,8 @@ mod tests {
                 (
                     "text",
                     Arc::new(StringArray::from(vec![
-                        Some("alpha beta"),
-                        Some("gamma lance"),
+                        Some("lancd alpha"),
+                        Some("lancd lance"),
                     ])) as ArrayRef,
                 ),
             ])
@@ -5875,7 +6128,7 @@ mod tests {
             .with_position(false)
             .lower_case(true)
             .stem(false)
-            .remove_stop_words(false)
+            .remove_stop_words(true)
             .ascii_folding(false)
             .max_token_length(None);
         let fragment_ids = ds
@@ -5952,6 +6205,46 @@ mod tests {
             "expected >= 2 segments to exercise global IDF, got {}",
             indices.len()
         );
+
+        let mut auto_tokenizer = tokenizer_for_match_query(&indices[0], None);
+        let auto_tokens = collect_query_tokens("THE LANCE", &mut auto_tokenizer);
+        assert_eq!(auto_tokens.len(), 1);
+        assert_eq!(auto_tokens.get_token(0), "lance");
+        let mut explicit_fuzzy_tokenizer = tokenizer_for_match_query(&indices[0], Some(1));
+        let explicit_fuzzy_tokens =
+            collect_query_tokens("THE LANCE", &mut explicit_fuzzy_tokenizer);
+        assert_eq!(explicit_fuzzy_tokens.len(), 2);
+        assert_eq!(explicit_fuzzy_tokens.get_token(0), "THE");
+        assert_eq!(explicit_fuzzy_tokens.get_token(1), "LANCE");
+
+        let auto_query = |terms: &str| {
+            MatchQuery::new(terms.to_owned())
+                .with_column(Some("text".to_owned()))
+                .with_fuzziness(None)
+                .with_document_granularity(DocumentGranularity::Row)
+        };
+        let lowercase_auto_exec = MatchQueryExec::new(
+            dataset.clone(),
+            auto_query("lance"),
+            search_params.clone(),
+            PreFilterSource::None,
+        )
+        .unwrap();
+        let lowercase_auto_results = execute_results(&lowercase_auto_exec).await.unwrap();
+        assert!(!lowercase_auto_results.is_empty());
+        let normalized_auto_exec = MatchQueryExec::new(
+            dataset.clone(),
+            auto_query("THE LANCE"),
+            search_params.clone(),
+            PreFilterSource::None,
+        )
+        .unwrap();
+        assert_eq!(
+            execute_results(&normalized_auto_exec).await.unwrap(),
+            lowercase_auto_results,
+            "AUTO fuzzy Match must preserve index lowercase and stop-word analysis"
+        );
+
         let mut tokenizer = indices[0].tokenizer();
         let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer).unwrap();
         let global_scorer = Arc::new(
@@ -5965,7 +6258,7 @@ mod tests {
             query.clone(),
             search_params.clone(),
             PreFilterSource::None,
-            preset_segments,
+            preset_segments.clone(),
         )
         .unwrap()
         .with_base_scorer(global_scorer);
@@ -6009,6 +6302,164 @@ mod tests {
                 "FTS score column should be Float32"
             );
         }
+
+        // A distributed fuzzy subset must receive the canonical vocabulary
+        // together with its scorer. A scorer-only override cannot reproduce a
+        // globally capped rewrite from worker-local segment vocabularies.
+        let fuzzy_query = MatchQuery::new("lancx".to_string())
+            .with_column(Some("text".to_string()))
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1)
+            .with_document_granularity(DocumentGranularity::Row);
+        let fuzzy_params = search_params
+            .clone()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(1);
+        let mut tokenizer = tokenizer_for_match_query(&indices[0], fuzzy_query.fuzziness);
+        let fuzzy_tokens = collect_query_tokens(&fuzzy_query.terms, &mut tokenizer);
+        let prepared = Arc::new(
+            prepare_bm25_query(&indices, fuzzy_tokens, &fuzzy_params, None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(prepared.tokens().len(), 1);
+        assert_eq!(prepared.tokens().get_token(0), "lancd");
+
+        let prepared_full_exec = MatchQueryExec::new_with_segments(
+            dataset.clone(),
+            fuzzy_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            preset_segments.clone(),
+        )
+        .unwrap()
+        .with_prepared_query(prepared.clone());
+        let prepared_full_results = execute_row_ids(&prepared_full_exec).await.unwrap();
+        assert_eq!(prepared_full_results.len(), 2);
+
+        let all_committed_scorer_exec = MatchQueryExec::new(
+            dataset.clone(),
+            fuzzy_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+        )
+        .unwrap()
+        .with_base_scorer(prepared.scorer().clone());
+        assert_eq!(
+            execute_row_ids(&all_committed_scorer_exec).await.unwrap(),
+            prepared_full_results
+        );
+
+        let explicit_full_scorer_exec = MatchQueryExec::new_with_segments(
+            dataset.clone(),
+            fuzzy_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            preset_segments.clone(),
+        )
+        .unwrap()
+        .with_base_scorer(prepared.scorer().clone());
+        assert_eq!(
+            execute_row_ids(&explicit_full_scorer_exec).await.unwrap(),
+            prepared_full_results
+        );
+
+        let subset_exec = MatchQueryExec::new_with_segments(
+            dataset.clone(),
+            fuzzy_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            vec![preset_segments[0].clone()],
+        )
+        .unwrap()
+        .with_prepared_query(prepared.clone());
+        assert!(execute_row_ids(&subset_exec).await.unwrap().is_empty());
+
+        let scorer_only_exec = MatchQueryExec::new_with_segments(
+            dataset.clone(),
+            fuzzy_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            vec![preset_segments[0].clone()],
+        )
+        .unwrap()
+        .with_base_scorer(prepared.scorer().clone());
+        assert_execution_error(
+            execute_row_ids(&scorer_only_exec).await.unwrap_err(),
+            "fuzzy MatchQuery cannot use a scorer-only override",
+        );
+
+        let compound_query = FtsQuery::Match(fuzzy_query.clone());
+        let compound_subset = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            compound_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            vec![preset_segments[0].clone()],
+        )
+        .with_prepared_match(prepared.clone());
+        assert!(execute_row_ids(&compound_subset).await.unwrap().is_empty());
+
+        let compound_scorer_only_subset = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            compound_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            vec![preset_segments[0].clone()],
+        )
+        .with_base_scorer(prepared.scorer().clone());
+        assert_execution_error(
+            execute_row_ids(&compound_scorer_only_subset)
+                .await
+                .unwrap_err(),
+            "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset",
+        );
+
+        let compound_full_scorer = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            compound_query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            preset_segments.clone(),
+        )
+        .with_base_scorer(prepared.scorer().clone());
+        assert_eq!(
+            execute_row_ids(&compound_full_scorer).await.unwrap(),
+            prepared_full_results
+        );
+
+        // With limit=1 the two globally selected `lancd` documents tie. The
+        // WAND probe is ambiguous, so bounded tie completion must retain the
+        // same prepared vocabulary instead of rewriting against this exec's
+        // segments.
+        let compound_wand_replay = CompoundQueryExec::new_with_segments(
+            dataset,
+            compound_query,
+            search_params.with_limit(Some(1)),
+            PreFilterSource::None,
+            preset_segments,
+        )
+        .with_prepared_match(prepared);
+        assert_eq!(
+            execute_row_ids(&compound_wand_replay).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            metric_value(
+                &compound_wand_replay,
+                WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
+            ),
+            0,
+            "the bounded prepared-vocabulary tie completion should avoid exact replay"
+        );
+        assert_eq!(
+            metric_value(&compound_wand_replay, WAND_TIE_COMPLETION_ATTEMPTS_METRIC,),
+            1
+        );
+        assert_eq!(
+            metric_value(&compound_wand_replay, WAND_TIE_COMPLETION_SUCCESSES_METRIC,),
+            1
+        );
 
         // Locally-bound helper: collect (row_id, score) pairs sorted by score desc.
         fn concat_score_batches(batches: &[RecordBatch]) -> Vec<(u64, f32)> {
