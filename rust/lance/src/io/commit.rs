@@ -1107,9 +1107,10 @@ pub(crate) async fn do_commit_detached_transaction(
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
         migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
-        // fix_schema is just for sanity-checking and consistency. The final
-        // storage contract is checked immediately before the manifest write.
+        // Validate before the fragment-id check to preserve legacy migration
+        // diagnostics. Finalization repeats this at the manifest write boundary.
         fix_schema(&mut manifest)?;
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -1462,6 +1463,7 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -2910,6 +2912,13 @@ mod tests {
 
         assert_eq!(
             manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+
+        assert_eq!(
+            manifest.data_storage_format.lance_file_format(),
             ConcreteFileVersion::V2_1
         );
     }
@@ -2920,13 +2929,12 @@ mod tests {
             ConcreteFileVersion::V1,
             &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_1],
         );
-        enable_mixed_file_versions(&mut manifest);
 
         let err = check_storage_version(&mut manifest).unwrap_err();
 
-        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(matches!(err, Error::Internal { .. }));
         assert!(
-            err.to_string().contains("do not have a single version"),
+            err.to_string().contains("mixture of file versions"),
             "{err}"
         );
     }
@@ -2934,12 +2942,23 @@ mod tests {
     #[test]
     fn storage_contract_rejects_v1_files_with_capability() {
         let mut manifest =
-            make_storage_contract_manifest(ConcreteFileVersion::V1, &[ConcreteFileVersion::V1]);
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V1]);
         enable_mixed_file_versions(&mut manifest);
 
         let err = check_storage_version(&mut manifest).unwrap_err();
 
         assert!(err.to_string().contains("references V1"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_rejects_empty_v1_fallback_with_capability() {
+        let mut manifest = make_storage_contract_manifest(ConcreteFileVersion::V1, &[]);
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("requires a V2 fallback"), "{err}");
     }
 
     #[test]

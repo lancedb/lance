@@ -1719,6 +1719,31 @@ async fn test_serialized_manifest_rejects_unsupported_reader() {
 }
 
 #[tokio::test]
+async fn test_serialized_manifest_rejects_missing_mixed_version_capability() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.data_storage_format = DataStorageFormat::new(ConcreteFileVersion::V2_0);
+    let serialized_manifest = pb::Manifest::from(&manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("not enabled"),
+        "unexpected message: {error}"
+    );
+}
+
+#[tokio::test]
 async fn test_rle_v2_v23_write_and_append() {
     let test_uri = TempStrDir::default();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

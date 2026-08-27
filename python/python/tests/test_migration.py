@@ -51,15 +51,18 @@ def test_fix_data_storage_version(tmp_path: Path):
     and the latter we can at least detect and advise the user rollback their dataset.
     """
     ds = prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_can_fix.lance")
-    assert ds.data_storage_version == "2.0"
+    assert ds.data_storage_version == "0.1"
 
     ds.delete("false")
     assert ds.data_storage_version == "2.0"
 
+    ds = prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_no_fix.lance")
+    assert ds.data_storage_version == "0.1"
+
     with pytest.raises(
-        ValueError, match="referenced data files do not have a single version"
+        OSError, match="The dataset contains a mixture of file versions"
     ):
-        prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_no_fix.lance")
+        ds.delete("false")
 
 
 def test_old_btree_bitmap_indices(tmp_path: Path):

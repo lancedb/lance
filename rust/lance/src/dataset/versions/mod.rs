@@ -262,7 +262,11 @@ pub async fn rewrite_files_binary_copy(
 }
 
 pub fn check_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
-    check_manifest_storage_contract(manifest, StorageContractMode::Validate)
+    check_manifest_storage_contract(manifest, StorageContractMode::Read)
+}
+
+pub fn check_manifest_storage_version_for_commit(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Commit)
 }
 
 pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
@@ -271,7 +275,8 @@ pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> 
 
 #[derive(Clone, Copy)]
 enum StorageContractMode {
-    Validate,
+    Read,
+    Commit,
     Finalize,
 }
 
@@ -279,19 +284,20 @@ fn check_manifest_storage_contract(
     manifest: &mut Manifest,
     mode: StorageContractMode,
 ) -> Result<()> {
-    let version = manifest.data_storage_format.lance_file_format();
-    if version == ConcreteFileVersion::V1 {
-        repair_legacy_manifest_storage(manifest)?;
-    }
-    validate_storage_contract(manifest, mode)
-}
-
-fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode) -> Result<()> {
-    let fallback = manifest.data_storage_format.lance_file_format();
+    let declared_fallback = manifest.data_storage_format.lance_file_format();
     let mixed_enabled = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0
         && manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+
+    if mixed_enabled && declared_fallback == ConcreteFileVersion::V1 {
+        return Err(Error::invalid_input(
+            "Dataset has mixed data-file-version capability enabled, which requires a V2 fallback, but the manifest fallback is V1",
+        ));
+    }
+
     let mut saw_v1 = false;
     let mut saw_v2 = false;
+    let mut first_file_version = None;
+    let mut first_mismatch = None;
     let mut first_non_fallback = None;
 
     for fragment in manifest.fragments.iter() {
@@ -305,19 +311,63 @@ fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode)
                 | ConcreteFileVersion::V2_3 => saw_v2 = true,
             }
 
-            if saw_v1 && saw_v2 {
-                return Err(Error::invalid_input(format!(
-                    "Dataset snapshot mixes V1 and V2 data files; file '{}' in fragment {} has version {}",
-                    data_file.path, fragment.id, file_version
-                )));
+            match first_file_version {
+                None => first_file_version = Some(file_version),
+                Some(first_version)
+                    if first_version != file_version && first_mismatch.is_none() =>
+                {
+                    first_mismatch = Some((first_version, file_version));
+                }
+                Some(_) => {}
             }
 
-            if !mixed_enabled && file_version != fallback && first_non_fallback.is_none() {
+            if !mixed_enabled && file_version != declared_fallback && first_non_fallback.is_none() {
                 first_non_fallback = Some((data_file.path.clone(), fragment.id, file_version));
             }
 
             validate_file_column_indices(manifest, fragment.id, data_file, file_version)?;
         }
+    }
+
+    // Released Lance 0.16 could persist a V1 fallback while referencing both V1
+    // and V2 files. Keep those snapshots readable, but never publish a new
+    // manifest with that state.
+    if matches!(mode, StorageContractMode::Read)
+        && declared_fallback == ConcreteFileVersion::V1
+        && !mixed_enabled
+        && saw_v1
+        && saw_v2
+    {
+        return Ok(());
+    }
+
+    let mut fallback = declared_fallback;
+    if declared_fallback == ConcreteFileVersion::V1 {
+        if let Some((first_version, other_version)) = first_mismatch {
+            return Err(Error::internal(format!(
+                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: All data files must have the same version. Detected both {first_version} and {other_version}"
+            )));
+        }
+        if let Some(actual) = first_file_version
+            && actual != ConcreteFileVersion::V1
+        {
+            fallback = actual;
+            first_non_fallback = None;
+            if matches!(mode, StorageContractMode::Finalize) {
+                log::warn!(
+                    "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
+                    declared_fallback,
+                    actual
+                );
+                manifest.data_storage_format = DataStorageFormat::new(actual);
+            }
+        }
+    }
+
+    if saw_v1 && saw_v2 {
+        return Err(Error::invalid_input(
+            "Dataset snapshot mixes V1 and V2 data files",
+        ));
     }
 
     if mixed_enabled && saw_v1 {
@@ -332,11 +382,12 @@ fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode)
             )));
         }
         match mode {
-            StorageContractMode::Validate => {
+            StorageContractMode::Read => {
                 return Err(Error::invalid_input(format!(
                     "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback} and mixed data-file-version capability is not enabled"
                 )));
             }
+            StorageContractMode::Commit => {}
             StorageContractMode::Finalize => {
                 manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
                 manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -901,24 +952,4 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => Ok(()),
     }
-}
-
-fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
-    let declared = manifest.data_storage_format.lance_file_format();
-    let actual = Fragment::try_infer_version(&manifest.fragments).map_err(|error| {
-        Error::invalid_input(format!(
-            "Dataset declares V1 storage but its referenced data files do not have a single version: {error}"
-        ))
-    })?;
-    if let Some(actual) = actual
-        && actual != ConcreteFileVersion::V1
-    {
-        log::warn!(
-            "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
-            declared,
-            actual
-        );
-        manifest.data_storage_format = DataStorageFormat::new(actual);
-    }
-    Ok(())
 }
