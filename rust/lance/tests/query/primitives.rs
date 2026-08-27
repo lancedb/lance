@@ -326,6 +326,13 @@ async fn test_float_zero_predicate_uses_scalar_index() {
             plan.contains("ScalarIndexQuery"),
             "`{predicate}` should use the scalar index, got plan:\n{plan}"
         );
+        // The rewrite's output survives a second `optimize_expr`, which the scan
+        // path does run, so the predicate must not appear twice.
+        assert_eq!(
+            plan.matches("value_idx").count(),
+            1,
+            "`{predicate}` should search the index once, got plan:\n{plan}"
+        );
     }
 
     // Rows appended after the index is built are answered by the unindexed scan

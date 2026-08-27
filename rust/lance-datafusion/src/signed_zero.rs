@@ -66,10 +66,66 @@ fn zero_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
     }
 }
 
+/// Collect the terms of an `AND`/`OR` chain, in order, ignoring nesting.
+fn flatten_chain<'a>(expr: &'a Expr, op: Operator, terms: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: inner,
+        right,
+    }) = expr
+        && *inner == op
+    {
+        flatten_chain(left, op, terms);
+        flatten_chain(right, op, terms);
+        return;
+    }
+    terms.push(expr);
+}
+
+/// True for the shape this rewrite emits for an equality: a column tested against
+/// both encodings of a floating point zero. Only these terms are deduplicated, so
+/// an expression the caller wrote twice is left alone.
+fn is_zero_pair_over_column(expr: &Expr) -> bool {
+    let Expr::InList(InList { expr, list, .. }) = expr else {
+        return false;
+    };
+    if !matches!(expr.as_ref(), Expr::Column(_)) || list.len() != 2 {
+        return false;
+    }
+    let [Expr::Literal(first, _), Expr::Literal(second, _)] = list.as_slice() else {
+        return false;
+    };
+    zero_encodings(first)
+        .is_some_and(|(negative, positive)| *first == negative && *second == positive)
+}
+
 /// The rewritten expression, or `None` when `expr` is not a comparison against a
 /// floating point zero.
 fn rewrite_node(expr: &Expr) -> Option<Expr> {
     match expr {
+        // DataFusion's simplifier expands an `IN` list of three or fewer values
+        // over a bare column back into an OR chain of equalities, so a second
+        // `optimize_expr` splits this rewrite's own output and re-runs it on each
+        // half. Both halves then produce the same list, and dropping the repeat is
+        // what makes the rewrite survive that round trip.
+        Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
+            let mut kept: Vec<&Expr> = Vec::new();
+            flatten_chain(expr, *op, &mut kept);
+            let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
+            for term in kept.iter() {
+                if is_zero_pair_over_column(term) && deduped.contains(term) {
+                    continue;
+                }
+                deduped.push(term);
+            }
+            if deduped.len() == kept.len() {
+                return None;
+            }
+            deduped.into_iter().cloned().reduce(|left, right| match op {
+                Operator::Or => left.or(right),
+                _ => left.and(right),
+            })
+        }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             // `resolve_expr` accepts the literal on either side, and the
             // operator mirrors when it sits on the left.
@@ -392,5 +448,32 @@ mod tests {
         assert_ne!(Float64(Some(-0.0)), Float64(Some(0.0)));
         assert_ne!(Float32(Some(-0.0)), Float32(Some(0.0)));
         assert_ne!(Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO)));
+    }
+
+    /// The scan path optimizes the same expression twice, and the simplifier
+    /// expands a short `IN` list over a column back into an OR chain in between,
+    /// so a fixed point of the rewrite alone would not be enough.
+    #[rstest]
+    #[case::eq("value = 0.0")]
+    #[case::not_eq("value != 0.0")]
+    #[case::in_list("value IN (0.0, 1.0)")]
+    #[case::lt("value < 0.0")]
+    #[case::gt_eq("value >= 0.0")]
+    #[case::between("value BETWEEN -0.0 AND 0.0")]
+    // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
+    // it as unsupported SQL; that arm is reachable only from a programmatically
+    // built expression, and `rewriting_twice_changes_nothing` covers it there.
+    fn optimizing_twice_changes_nothing(#[case] filter: &str) {
+        let schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Float64,
+                true,
+            )]));
+        let planner = crate::planner::Planner::new(schema);
+        let once = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        assert_eq!(planner.optimize_expr(once.clone()).unwrap(), once);
     }
 }
