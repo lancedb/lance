@@ -19,15 +19,25 @@ use lance_core::Result;
 /// reached by moving the literal to whichever encoding sits on the correct side
 /// of the pair:
 ///
-/// | written              | evaluated              |
-/// |----------------------|------------------------|
-/// | `x < 0`, `x >= 0`    | literal becomes `-0.0` |
-/// | `x <= 0`, `x > 0`    | literal becomes `+0.0` |
-/// | `x = 0`              | `x IN (-0.0, 0.0)`     |
-/// | `x != 0`             | `x NOT IN (-0.0, 0.0)` |
+/// | written                      | evaluated                    |
+/// |------------------------------|------------------------------|
+/// | `x < 0`, `x >= 0`            | literal becomes `-0.0`       |
+/// | `x <= 0`, `x > 0`            | literal becomes `+0.0`       |
+/// | `x = 0`                      | `x IN (-0.0, 0.0)`           |
+/// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
+/// | `x IN (0, ..)`               | the missing encoding is added |
+/// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
+/// | `x IS NOT DISTINCT FROM 0`   | the same against each encoding, or'd |
+/// | `x IS DISTINCT FROM 0`       | the same against each encoding, and'd |
 ///
 /// The scalar indices select candidates by the same total order, so they answer
 /// a rewritten predicate the same way a scan does.
+///
+/// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
+/// coercion has given the literal the column's type and the simplifier has
+/// expanded `BETWEEN` into two comparisons. Filters, computed output columns and
+/// update expressions all compile through there, which is what keeps a filter and
+/// a projected copy of the same predicate in agreement.
 ///
 /// NaN is out of scope. Arrow sorts it above every other value, so `x >= -0.0`
 /// admits NaN where IEEE would not, and that holds for every comparison rather
