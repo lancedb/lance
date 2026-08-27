@@ -56,7 +56,6 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 256;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 512;
-
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (128).

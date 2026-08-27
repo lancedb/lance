@@ -44,8 +44,9 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::{BasePath, Fragment};
+use lance_table::format::{BasePath, Fragment, pb};
 use object_store::ObjectStoreExt;
+use prost::Message;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
@@ -548,6 +549,16 @@ impl WrappingObjectStore for CountingObjectStoreWrapper {
     ) -> Arc<dyn object_store::ObjectStore> {
         self.wraps.fetch_add(1, Ordering::Relaxed);
         original
+    }
+
+    // Passes requests straight through, so a listing may keep going around it. Only `wrap` is
+    // counted, since the count is what the caching assertions are written against.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
     }
 }
 
@@ -1641,6 +1652,73 @@ async fn test_restore_rejects_unknown_target_flags() {
 }
 
 #[tokio::test]
+async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let original_version = dataset.version().version;
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let location = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = dataset.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert_eq!(dataset.version().version, original_version);
+    assert!(
+        dataset
+            .metadata_cache
+            .get_with_key(&ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_none(),
+        "unsupported manifest must not be cached"
+    );
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_unsupported_reader() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let serialized_manifest = pb::Manifest::from(&unsupported_manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
 async fn test_rle_v2_v23_write_and_append() {
     let test_uri = TempStrDir::default();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2018,6 +2096,98 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+}
+
+#[tokio::test]
+async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .deep_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .shallow_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(!target_dir.exists());
 }
 
 #[tokio::test]

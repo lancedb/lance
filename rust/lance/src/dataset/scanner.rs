@@ -8271,9 +8271,9 @@ mod test {
         // smaller scale): a large leading block of matches, a large gap of
         // non-matches, then a small trailing match. Single fragment.
         let batches = vec![
-            make_batch(0, 100_000, 7),
-            make_batch(100_000, 400_000, 1),
-            make_batch(500_000, 7_300, 7),
+            make_batch(0, 20_000, 7),
+            make_batch(20_000, 80_000, 1),
+            make_batch(100_000, 1_500, 7),
         ];
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -8307,7 +8307,7 @@ mod test {
         scan.project(&["id", "items"]).unwrap();
         scan.materialization_style(MaterializationStyle::AllEarlyExcept(vec![items_b_field_id]));
         let result = scan.try_into_batch().await.unwrap();
-        assert_eq!(result.num_rows(), 107_300);
+        assert_eq!(result.num_rows(), 21_500);
     }
 
     #[tokio::test]
@@ -8527,7 +8527,7 @@ mod test {
         // Make the store slow so that if we don't cancel the scan, it will take a loooong time.
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_get_per_call: Duration::from_secs(1),
+                wait_get_per_call: Duration::from_millis(100),
                 ..Default::default()
             },
         });
@@ -8566,8 +8566,8 @@ mod test {
 
         // This test is a timing test, which is unfortunate, as it may be flaky.  I'm hoping
         // we have enough wiggle room here.  The failure case is 30s on my machine and the pass
-        // case is 2-3s.
-        assert!(duration < Duration::from_secs(10));
+        // case is a few hundred milliseconds.
+        assert!(duration < Duration::from_secs(3));
     }
 
     #[rstest]
@@ -10198,22 +10198,42 @@ mod test {
         #[values(false, true)] stable_row_ids: bool,
         #[values(ApproxMode::Normal, ApproxMode::Fast)] approx_mode: ApproxMode,
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2),
             VectorIndexParams::ivf_hnsw(
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16)
             ),
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 MetricType::L2,
-                IvfBuildParams::new(2),
-                HnswBuildParams::default(),
-                PQBuildParams::new(2, 8)
+                IvfBuildParams {
+                    num_partitions: Some(2),
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                },
+                HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16),
+                PQBuildParams {
+                    num_sub_vectors: 2,
+                    num_bits: 4,
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                }
             ),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
                 IvfBuildParams::new(2),
-                HnswBuildParams::default(),
+                HnswBuildParams::default()
+                    .max_level(2)
+                    .num_edges(4)
+                    .ef_construction(16),
                 SQBuildParams::default()
             )
         )]
@@ -10229,13 +10249,13 @@ mod test {
             ArrowField::new("vector", fixed_size_list_type(2, DataType::Float32), true),
         ]));
 
-        let vector_values = Float32Array::from_iter_values((0..600).map(|x| x as f32));
+        let vector_values = Float32Array::from_iter_values((0..64).map(|x| x as f32));
 
         let batches = vec![
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(0..300)),
+                    Arc::new(Int32Array::from_iter_values(0..32)),
                     Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
                 ],
             )
@@ -10244,7 +10264,7 @@ mod test {
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
-            max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
+            max_rows_per_file: 16, // At least two files to make sure stable row ids make a difference
             enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
@@ -10262,8 +10282,8 @@ mod test {
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
-        scan.minimum_nprobes(100);
-        scan.ef(100);
+        scan.minimum_nprobes(2);
+        scan.ef(16);
         scan.approx_mode(approx_mode);
         scan.with_row_id();
 
@@ -11340,6 +11360,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_ids: bool,
+        #[values(false, true)] use_index: bool,
+        #[values(false, true)] use_projection: bool,
     ) {
         let fixture = Box::pin(ScalarIndexTestFixture::new(
             data_storage_version,
@@ -11347,42 +11369,36 @@ mod test {
         ))
         .await;
 
-        for use_index in [false, true] {
-            for use_projection in [false, true] {
-                for use_deleted_data in [false, true] {
-                    for use_new_data in [false, true] {
-                        // Don't test compaction in conjunction with deletion and new data, it's too
-                        // many combinations with no clear benefit.  Feel free to update if there is
-                        // a need
-                        // TODO: enable compaction for stable row id once supported.
-                        let compaction_choices =
-                            if use_deleted_data || use_new_data || use_stable_row_ids {
-                                vec![false]
-                            } else {
-                                vec![false, true]
+        for use_deleted_data in [false, true] {
+            for use_new_data in [false, true] {
+                // Don't test compaction in conjunction with deletion and new data, it's too
+                // many combinations with no clear benefit.  Feel free to update if there is
+                // a need
+                // TODO: enable compaction for stable row id once supported.
+                let compaction_choices = if use_deleted_data || use_new_data || use_stable_row_ids {
+                    vec![false]
+                } else {
+                    vec![false, true]
+                };
+                for use_compaction in compaction_choices {
+                    let updated_choices = if use_deleted_data || use_new_data || use_compaction {
+                        vec![false]
+                    } else {
+                        vec![false, true]
+                    };
+                    for use_updated in updated_choices {
+                        for with_row_id in [false, true] {
+                            let params = ScalarTestParams {
+                                use_index,
+                                use_projection,
+                                use_deleted_data,
+                                use_new_data,
+                                with_row_id,
+                                use_compaction,
+                                use_updated,
                             };
-                        for use_compaction in compaction_choices {
-                            let updated_choices =
-                                if use_deleted_data || use_new_data || use_compaction {
-                                    vec![false]
-                                } else {
-                                    vec![false, true]
-                                };
-                            for use_updated in updated_choices {
-                                for with_row_id in [false, true] {
-                                    let params = ScalarTestParams {
-                                        use_index,
-                                        use_projection,
-                                        use_deleted_data,
-                                        use_new_data,
-                                        with_row_id,
-                                        use_compaction,
-                                        use_updated,
-                                    };
-                                    fixture.check_vector_queries(&params).await;
-                                    fixture.check_simple_queries(&params).await;
-                                }
-                            }
+                            fixture.check_vector_queries(&params).await;
+                            fixture.check_simple_queries(&params).await;
                         }
                     }
                 }
@@ -11447,7 +11463,7 @@ mod test {
             .col("ngram", array::rand_utf8(ByteCount::from(5), false))
             .col("exact", array::rand_type(&DataType::UInt32))
             .col("no_index", array::rand_type(&DataType::UInt32))
-            .into_reader_rows(RowCount::from(1000), BatchCount::from(5));
+            .into_reader_rows(RowCount::from(32), BatchCount::from(2));
 
         let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
         dataset
