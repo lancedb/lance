@@ -64,6 +64,8 @@ static RESIDUAL_FTS_BUILD_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(||
 pub(crate) const MAX_RESIDUAL_FTS_FRAGMENTS: usize = 16;
 pub(crate) const MAX_RESIDUAL_FTS_ROWS: usize = 1_000_000;
 const MAX_RESIDUAL_FTS_BUILD_MEMORY_MB: u64 = 256;
+const MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES: usize =
+    (MAX_RESIDUAL_FTS_BUILD_MEMORY_MB as usize) << 20;
 const MAX_RESIDUAL_FTS_SERIALIZED_BYTES: usize = 1 << 30;
 const MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES: usize = 2 << 30;
 const RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY: usize = 2;
@@ -172,7 +174,7 @@ impl OsObjectStore for BudgetedMemoryStore {
     ) -> OsResult<Box<dyn MultipartUpload>> {
         let inner = self.inner.put_multipart_opts(location, opts).await?;
         Ok(Box::new(BudgetedMultipartUpload {
-            inner,
+            inner: Some(inner),
             uploaded_bytes: self.uploaded_bytes.clone(),
             budget_exceeded: self.budget_exceeded.clone(),
             max_uploaded_bytes: self.max_uploaded_bytes,
@@ -230,19 +232,19 @@ impl OsObjectStore for BudgetedMemoryStore {
 
 #[derive(Debug)]
 struct BudgetedMultipartUpload {
-    inner: Box<dyn MultipartUpload>,
+    inner: Option<Box<dyn MultipartUpload>>,
     uploaded_bytes: Arc<AtomicUsize>,
     budget_exceeded: Arc<AtomicBool>,
     max_uploaded_bytes: usize,
     part_bytes: usize,
 }
 
-struct TransientUploadReservation {
+struct TransientBudgetReservation {
     uploaded_bytes: Arc<AtomicUsize>,
     bytes: usize,
 }
 
-impl Drop for TransientUploadReservation {
+impl Drop for TransientBudgetReservation {
     fn drop(&mut self) {
         self.uploaded_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
     }
@@ -251,6 +253,14 @@ impl Drop for TransientUploadReservation {
 #[async_trait]
 impl MultipartUpload for BudgetedMultipartUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
+        let Some(inner) = self.inner.as_mut() else {
+            return Box::pin(async {
+                Err(object_store::Error::Generic {
+                    store: "BudgetedMemoryStore",
+                    source: "residual FTS multipart upload is already completed".into(),
+                })
+            });
+        };
         let payload_bytes = payload.content_length();
         let Some(part_bytes) = self.part_bytes.checked_add(payload_bytes) else {
             self.budget_exceeded.store(true, Ordering::Relaxed);
@@ -270,29 +280,46 @@ impl MultipartUpload for BudgetedMultipartUpload {
             return Box::pin(async move { Err(error) });
         }
         self.part_bytes = part_bytes;
-        self.inner.put_part(payload)
+        inner.put_part(payload)
     }
 
     async fn complete(&mut self) -> OsResult<PutResult> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(object_store::Error::Generic {
+                store: "BudgetedMemoryStore",
+                source: "residual FTS multipart upload is already completed".into(),
+            });
+        };
         // InMemory concatenates all parts into a newly allocated buffer before
         // the upload handle releases them. Reserve that full-copy peak across
-        // every concurrently building residual fragment, then release only the
-        // transient reservation when complete returns or is cancelled.
+        // every concurrently building residual fragment. On success, drop the
+        // inner upload (and its retained parts) before releasing the transient
+        // reservation for the final concatenated object.
         reserve_upload_bytes(
             &self.uploaded_bytes,
             &self.budget_exceeded,
             self.max_uploaded_bytes,
             self.part_bytes,
         )?;
-        let _transient_reservation = TransientUploadReservation {
+        let _transient_reservation = TransientBudgetReservation {
             uploaded_bytes: self.uploaded_bytes.clone(),
             bytes: self.part_bytes,
         };
-        self.inner.complete().await
+        let result = inner.complete().await;
+        if result.is_ok() {
+            drop(self.inner.take());
+        }
+        result
     }
 
     async fn abort(&mut self) -> OsResult<()> {
-        self.inner.abort().await
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(object_store::Error::Generic {
+                store: "BudgetedMemoryStore",
+                source: "residual FTS multipart upload is already completed".into(),
+            });
+        };
+        inner.abort().await
     }
 }
 
@@ -402,6 +429,16 @@ impl Drop for ResidualFtsBuildClaim {
             active.fragments.remove(fragment);
         }
     }
+}
+
+struct ResidualFtsBuildLifetime {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _claim: ResidualFtsBuildClaim,
+}
+
+struct ResidualFtsFragmentBuildLifetime {
+    _group: Arc<ResidualFtsBuildLifetime>,
+    _working_set: TransientBudgetReservation,
 }
 
 impl CacheKey for ResidualFtsGroupKey {
@@ -728,7 +765,7 @@ async fn build_residual_segment(
     resolved: &ResolvedFtsField,
     params: InvertedIndexParams,
     shared_tokenizer: Arc<dyn lance_index::scalar::inverted::document_tokenizer::LanceTokenizer>,
-    build_lifetime: Arc<tokio::sync::OwnedSemaphorePermit>,
+    build_lifetime: Arc<ResidualFtsBuildLifetime>,
     group_accounted_bytes: Arc<AtomicUsize>,
     group_budget_exceeded: Arc<AtomicBool>,
 ) -> Result<CachedResidualFtsSegment> {
@@ -773,10 +810,29 @@ async fn build_residual_segment(
     let params = params
         .memory_limit_mb(MAX_RESIDUAL_FTS_BUILD_MEMORY_MB)
         .num_workers(1);
+    // The builder's per-worker memory is temporary but overlaps the immutable
+    // store as files are emitted. Reserve it from the same group hard cap and
+    // let detached CPU work retain the reservation after query cancellation.
+    reserve_upload_bytes(
+        group_accounted_bytes.as_ref(),
+        group_budget_exceeded.as_ref(),
+        MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+        MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
+    )?;
+    let fragment_build_lifetime = Arc::new(ResidualFtsFragmentBuildLifetime {
+        _group: build_lifetime,
+        _working_set: TransientBudgetReservation {
+            uploaded_bytes: group_accounted_bytes.clone(),
+            bytes: MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
+        },
+    });
     let mut builder =
         InvertedIndexBuilder::new_with_fragment_mask(params, Some(u64::from(fragment_id) << 32))
-            .with_build_lifetime(build_lifetime);
-    builder.update(stream, store.as_ref(), None).await?;
+            .with_build_lifetime(fragment_build_lifetime.clone());
+    let update_result = builder.update(stream, store.as_ref(), None).await;
+    drop(builder);
+    drop(fragment_build_lifetime);
+    update_result?;
     lance_index::scalar::inverted::builder::merge_index_files(
         object_store.as_ref(),
         &index_dir,
@@ -949,14 +1005,6 @@ pub(crate) async fn load_residual_fts_segments(
         ));
     }
 
-    // Busy means exact fallback, not head-of-line blocking across datasets.
-    let Ok(build_lifetime) = RESIDUAL_FTS_BUILD_SEMAPHORE.clone().try_acquire_owned() else {
-        return Ok(ResidualFtsAdmission::Deferred(
-            "residual build resources are busy",
-        ));
-    };
-    let build_lifetime = Arc::new(build_lifetime);
-
     // Claim the complete working set before building anything. This prevents
     // concurrent invocations (including overlapping append snapshots) from
     // each winning different fragment loaders under independent byte budgets.
@@ -967,11 +1015,24 @@ pub(crate) async fn load_residual_fts_segments(
             None => cached_entries.push(None),
         }
     }
-    let Some(_build_claim) = ResidualFtsBuildClaim::try_acquire(&spec.group_key, &spec.keys) else {
+    let Some(build_claim) = ResidualFtsBuildClaim::try_acquire(&spec.group_key, &spec.keys) else {
         return Ok(ResidualFtsAdmission::Deferred(
             "residual working set is already building",
         ));
     };
+    // Busy means exact fallback, not head-of-line blocking across datasets.
+    let Ok(build_permit) = RESIDUAL_FTS_BUILD_SEMAPHORE.clone().try_acquire_owned() else {
+        return Ok(ResidualFtsAdmission::Deferred(
+            "residual build resources are busy",
+        ));
+    };
+    // Claim and permit share one lifetime. Detached builder CPU output keeps
+    // both until its heavy state is destroyed, so cancellation cannot admit a
+    // retry of the same group under an independent resident counter.
+    let build_lifetime = Arc::new(ResidualFtsBuildLifetime {
+        _permit: build_permit,
+        _claim: build_claim,
+    });
 
     // A different append snapshot may have committed one of the missing keys
     // immediately before this claim. Re-probe while the overlapping-fragment
@@ -1240,6 +1301,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DropObservedUpload {
+        accounted_bytes: Arc<AtomicUsize>,
+        accounted_at_drop: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropObservedUpload {
+        fn drop(&mut self) {
+            self.accounted_at_drop.store(
+                self.accounted_bytes.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[async_trait]
+    impl MultipartUpload for DropObservedUpload {
+        fn put_part(&mut self, _payload: PutPayload) -> UploadPart {
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> OsResult<PutResult> {
+            Ok(PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+
+        async fn abort(&mut self) -> OsResult<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn residual_key_reuses_identical_fragment() {
         assert_eq!(internal_key(&key()), internal_key(&key()));
@@ -1282,6 +1376,33 @@ mod tests {
             .filter(|result| *result.as_ref().expect("claim task panicked"))
             .count();
         assert_eq!(acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn detached_work_retains_group_claim_and_permit() {
+        let group = group_key_with_uuid(5);
+        let fragments = group.members.to_vec();
+        let claim = ResidualFtsBuildClaim::try_acquire(&group, &fragments)
+            .expect("build should own the working set");
+        let resources = Arc::new(Semaphore::new(1));
+        let permit = resources
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("build resource semaphore closed");
+        let lifetime = Arc::new(ResidualFtsBuildLifetime {
+            _permit: permit,
+            _claim: claim,
+        });
+        let detached_work = lifetime.clone();
+        drop(lifetime);
+
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_none());
+        assert!(resources.clone().try_acquire_owned().is_err());
+
+        drop(detached_work);
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_some());
+        assert!(resources.try_acquire_owned().is_ok());
     }
 
     #[test]
@@ -1328,6 +1449,55 @@ mod tests {
             .is_err()
         );
         assert!(exceeded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn concurrent_builder_working_sets_consume_resident_budget() {
+        let accounted_bytes = Arc::new(AtomicUsize::new(0));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let mut reservations = Vec::new();
+        for _ in 0..RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY {
+            reserve_upload_bytes(
+                accounted_bytes.as_ref(),
+                exceeded.as_ref(),
+                MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+                MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
+            )
+            .unwrap();
+            reservations.push(TransientBudgetReservation {
+                uploaded_bytes: accounted_bytes.clone(),
+                bytes: MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES,
+            });
+        }
+        assert_eq!(
+            accounted_bytes.load(Ordering::Relaxed),
+            MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES * RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY
+        );
+        let remaining =
+            MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES - accounted_bytes.load(Ordering::Relaxed);
+        reserve_upload_bytes(
+            accounted_bytes.as_ref(),
+            exceeded.as_ref(),
+            MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+            remaining,
+        )
+        .unwrap();
+        assert!(
+            reserve_upload_bytes(
+                accounted_bytes.as_ref(),
+                exceeded.as_ref(),
+                MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+                1,
+            )
+            .is_err()
+        );
+
+        drop(reservations);
+        assert_eq!(
+            accounted_bytes.load(Ordering::Relaxed),
+            MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES
+                - MAX_RESIDUAL_FTS_BUILD_MEMORY_BYTES * RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY
+        );
     }
 
     #[test]
@@ -1454,6 +1624,39 @@ mod tests {
         let error = upload.complete().await.unwrap_err();
         assert!(error.to_string().contains("7 byte resident budget"));
         assert!(store.head(&destination).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn multipart_success_drops_parts_before_copy_reservation() {
+        let accounted_bytes = Arc::new(AtomicUsize::new(0));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let accounted_at_drop = Arc::new(AtomicUsize::new(0));
+        let mut upload = BudgetedMultipartUpload {
+            inner: Some(Box::new(DropObservedUpload {
+                accounted_bytes: accounted_bytes.clone(),
+                accounted_at_drop: accounted_at_drop.clone(),
+            })),
+            uploaded_bytes: accounted_bytes.clone(),
+            budget_exceeded: exceeded,
+            max_uploaded_bytes: 8,
+            part_bytes: 0,
+        };
+
+        upload
+            .put_part(PutPayload::from_static(b"1234"))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+        assert_eq!(accounted_at_drop.load(Ordering::SeqCst), 8);
+        assert_eq!(accounted_bytes.load(Ordering::SeqCst), 4);
+        assert!(upload.complete().await.is_err());
+        assert!(
+            upload
+                .put_part(PutPayload::from_static(b"5678"))
+                .await
+                .is_err()
+        );
+        assert_eq!(accounted_bytes.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
