@@ -1788,8 +1788,8 @@ mod tests {
     #[tokio::test]
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, region_id, 1);
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));

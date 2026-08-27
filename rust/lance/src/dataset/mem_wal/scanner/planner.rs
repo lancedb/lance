@@ -818,7 +818,7 @@ mod integration_tests {
         assert_eq!(results.get(&6), Some(&"active_6".to_string()));
     }
 
-    /// Regression for the concurrent-read-vs-flush hole: a sealed
+    /// Regression for the concurrent-read-vs-flush hole: a frozen
     /// (frozen-awaiting-flush) memtable is not yet recorded as an
     /// SSTable, but its rows must still be in the scan's read union and
     /// dedup correctly by generation across the active/frozen seam.
@@ -855,7 +855,7 @@ mod integration_tests {
             .with_sstable(1, "gen_1".to_string())
             .with_sstable(2, "gen_2".to_string());
 
-        // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
+        // Frozen gen3 (NOT in the manifest) and active gen4.
         let (frozen_store, frozen_index) =
             pk_indexed(&[create_test_batch(&schema, &[6, 7], "frozen")]);
         let frozen = InMemoryMemTableRef {

@@ -640,12 +640,12 @@ impl BatchMeta {
 /// the tail's term map. An estimate — the node layout is crossbeam-internal.
 const SKIPMAP_ENTRY_OVERHEAD: usize = 32;
 
-/// Size of a sealed batch block. Small enough that copying the partial tail
-/// block on append stays cheap; large enough that sealing (which clones the
+/// Size of a frozen batch block. Small enough that copying the partial tail
+/// block on append stays cheap; large enough that freezing (which clones the
 /// block-pointer vec) is rare.
 const BATCH_BLOCK: usize = 64;
 
-/// Append-only, structurally-shared log of visible batch metadata. Sealed full
+/// Append-only, structurally-shared log of visible batch metadata. Frozen full
 /// blocks are immutable and shared across snapshots; only the current partial
 /// block is copied on append, so publishing a batch is amortized O(1) (instead
 /// of copying every batch pointer per publish — O(batches²) per generation)
@@ -653,7 +653,7 @@ const BATCH_BLOCK: usize = 64;
 #[derive(Debug, Clone)]
 struct BatchLog {
     /// Immutable full blocks (each `BATCH_BLOCK` long), shared across snapshots.
-    sealed: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
+    frozen: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
     /// The current partial block (`< BATCH_BLOCK` entries).
     tail: Arc<[Arc<BatchMeta>]>,
     len: usize,
@@ -662,28 +662,28 @@ struct BatchLog {
 impl BatchLog {
     fn empty() -> Self {
         Self {
-            sealed: Arc::new(Vec::new()),
+            frozen: Arc::new(Vec::new()),
             tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
             len: 0,
         }
     }
 
-    /// A new log with `meta` appended; shares every sealed block with `self`,
+    /// A new log with `meta` appended; shares every frozen block with `self`,
     /// copying only the partial tail block.
     fn pushed(&self, meta: Arc<BatchMeta>) -> Self {
         let mut tail: Vec<Arc<BatchMeta>> = self.tail.to_vec();
         tail.push(meta);
         if tail.len() == BATCH_BLOCK {
-            let mut sealed = (*self.sealed).clone();
-            sealed.push(Arc::from(tail.into_boxed_slice()));
+            let mut frozen = (*self.frozen).clone();
+            frozen.push(Arc::from(tail.into_boxed_slice()));
             Self {
-                sealed: Arc::new(sealed),
+                frozen: Arc::new(frozen),
                 tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
                 len: self.len + 1,
             }
         } else {
             Self {
-                sealed: Arc::clone(&self.sealed),
+                frozen: Arc::clone(&self.frozen),
                 tail: Arc::from(tail.into_boxed_slice()),
                 len: self.len + 1,
             }
@@ -693,15 +693,15 @@ impl BatchLog {
     fn get(&self, i: usize) -> Option<&Arc<BatchMeta>> {
         let block = i / BATCH_BLOCK;
         let off = i % BATCH_BLOCK;
-        match self.sealed.get(block) {
+        match self.frozen.get(block) {
             Some(b) => b.get(off),
-            None if block == self.sealed.len() => self.tail.get(off),
+            None if block == self.frozen.len() => self.tail.get(off),
             None => None,
         }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Arc<BatchMeta>> {
-        self.sealed
+        self.frozen
             .iter()
             .flat_map(|b| b.iter())
             .chain(self.tail.iter())

@@ -3350,7 +3350,7 @@ mod tests {
         assert_eq!(
             id1.len(),
             1,
-            "newest-wins: id=1 must appear exactly once after a same-L0 override, got {:?}",
+            "newest-wins: id=1 must appear exactly once after a same-generation override, got {:?}",
             rows
         );
         assert!(

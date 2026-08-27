@@ -1254,7 +1254,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Nothing is durable yet, so the L0 flush must refuse.
+        // Nothing is durable yet, so the SSTable flush must refuse.
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
