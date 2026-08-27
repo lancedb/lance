@@ -2661,6 +2661,29 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
         Some(&2)
     );
 
+    let empty_terms_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("", "text", 1.0)),
+        (Occur::Should, compound_match_query("   ", "text", 1.0)),
+    ])
+    .into();
+    let empty_terms_plan = compound_fts_plan(&dataset, empty_terms_query.clone(), 2).await;
+    assert!(
+        empty_terms_plan.contains("HybridCompoundFtsScorer"),
+        "the empty analyzed-term case must exercise the hybrid short circuit:\n{empty_terms_plan}"
+    );
+    let (empty_results, empty_stats) =
+        compound_fts_results_with_stats(&dataset, empty_terms_query, 2).await;
+    assert!(empty_results.is_empty());
+    assert_eq!(
+        empty_stats
+            .all_counts
+            .get(crate::io::exec::fts::HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "an empty analyzed query must not poll the residual scan"
+    );
+
     let mut filtered_scanner = dataset.scan();
     filtered_scanner
         .with_row_id()

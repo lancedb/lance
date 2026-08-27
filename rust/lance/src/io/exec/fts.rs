@@ -30,7 +30,10 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
-    utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
+    utils::{
+        tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+        tracing::StreamTracingExt,
+    },
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 use lance_select::RowAddrMask;
@@ -38,7 +41,7 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
-use crate::dataset::mem_wal::index::FtsMemIndex;
+use crate::dataset::mem_wal::index::QueryLocalFtsIndex;
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -793,6 +796,26 @@ impl CompoundQueryExec {
     }
 }
 
+async fn index_query_local_residual_batch(
+    residual: QueryLocalFtsIndex,
+    batch: RecordBatch,
+    allowed_terms: Arc<HashSet<String>>,
+) -> Result<QueryLocalFtsIndex> {
+    spawn_cpu(move || {
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "hybrid compound FTS residual input is missing _rowid".to_string(),
+                )
+            })?
+            .as_primitive::<UInt64Type>();
+        residual.insert_with_row_ids_for_terms(&batch, row_ids, allowed_terms.as_ref())?;
+        Ok(residual)
+    })
+    .await
+}
+
 /// Exact compound FTS over committed postings plus an append-only residual
 /// scan. The residual documents are tokenized once into query-local postings,
 /// rather than once for every compound leaf.
@@ -892,7 +915,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let params = self.params.clone();
         let column = self.column.clone();
         let segments = self.segments.clone();
-        let mut residual_input = self.residual_input.execute(partition, context.clone())?;
+        let residual_input = self.residual_input.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let residual_rows_scanned = self
             .metrics
@@ -921,25 +944,23 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 ))
             })?;
             let field_id = dataset.schema().field_id(&column)?;
-            let residual = FtsMemIndex::try_with_params(
+            let mut residual = QueryLocalFtsIndex::try_with_params(
                 field_id,
                 column.clone(),
                 first_index.params().clone(),
             )?;
             let terms = residual.exact_query_terms(&query)?;
-            let allowed_terms = terms.iter().cloned().collect::<HashSet<_>>();
+            if terms.is_empty() {
+                metrics.baseline_metrics.record_output(0);
+                return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
+            }
+            let allowed_terms = Arc::new(terms.iter().cloned().collect::<HashSet<_>>());
+            let mut residual_input = residual_input.execute(partition, context.clone())?;
 
             while let Some(batch) = residual_input.try_next().await? {
                 residual_rows_scanned.add(batch.num_rows());
-                let row_ids = batch
-                    .column_by_name(ROW_ID)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "hybrid compound FTS residual input is missing _rowid".to_string(),
-                        )
-                    })?
-                    .as_primitive::<UInt64Type>();
-                residual.insert_with_row_ids_for_terms(&batch, row_ids, &allowed_terms)?;
+                residual = index_query_local_residual_batch(residual, batch, allowed_terms.clone())
+                    .await?;
             }
             residual_docs_indexed.add(residual.doc_count());
 
@@ -955,7 +976,12 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 Some(metrics.as_ref()),
             )
             .await?;
-            let residual_stats = residual.bm25_stats_for_terms(&terms);
+            let stats_terms = terms.clone();
+            let (residual, residual_stats) = spawn_cpu(move || {
+                let stats = residual.bm25_stats_for_terms(&stats_terms);
+                Ok::<_, Error>((residual, stats))
+            })
+            .await?;
             scorer.total_tokens = scorer
                 .total_tokens
                 .checked_add(residual_stats.total_tokens)
@@ -1011,9 +1037,20 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             )
             .await?;
             index_candidates.add(indexed_row_ids.len());
-            let residual_leaves = residual.exact_leaf_results(&query, scorer.as_ref())?;
-            let (residual_row_ids, residual_scores) =
-                materialized_compound_top_k(&query, residual_leaves, limit, metrics.as_ref())?;
+            let residual_query = query.clone();
+            let residual_scorer = scorer.clone();
+            let residual_metrics = metrics.clone();
+            let (residual_row_ids, residual_scores) = spawn_cpu(move || {
+                let residual_leaves =
+                    residual.exact_leaf_results(&residual_query, residual_scorer.as_ref())?;
+                materialized_compound_top_k(
+                    &residual_query,
+                    residual_leaves,
+                    limit,
+                    residual_metrics.as_ref(),
+                )
+            })
+            .await?;
             residual_candidates.add(residual_row_ids.len());
 
             let mut documents = indexed_row_ids

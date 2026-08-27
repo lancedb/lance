@@ -1003,12 +1003,75 @@ pub struct FtsMemIndex {
     /// The tail freezes into a partition once it reaches this many docs.
     freeze_threshold_rows: usize,
 
+    /// Query-local materializations disable freezes and tiered merges. Their
+    /// lifetime is bounded by one query, so background maintenance would only
+    /// outlive cancellation without providing reuse.
+    background_maintenance: bool,
+
     /// Background tiered-merge slot. `None` = idle; `Some` with `result: None`
     /// = a merge is running on a worker thread; `Some` with `result: Some` =
     /// the merged partition is ready for the writer to install. Only the
     /// writer mutates `state`; the worker is read-only and just fills `result`,
     /// so the single-writer / lock-free-reader contract is preserved.
     merge: Arc<Mutex<Option<PendingMerge>>>,
+}
+
+/// Query-owned exact postings for one residual scan.
+///
+/// This deliberately exposes only the immutable feature-materialization API
+/// needed by hybrid execution. Unlike [`FtsMemIndex`], it never freezes or
+/// starts a detached tiered merge; dropping the query drops all residual
+/// postings.
+#[derive(Debug)]
+pub(crate) struct QueryLocalFtsIndex {
+    inner: FtsMemIndex,
+}
+
+impl QueryLocalFtsIndex {
+    pub(crate) fn try_with_params(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: FtsMemIndex::try_with_params_and_maintenance(
+                field_id,
+                column_name,
+                params,
+                false,
+            )?,
+        })
+    }
+
+    pub(crate) fn exact_query_terms(&self, query: &FtsQuery) -> Result<Vec<String>> {
+        self.inner.exact_query_terms(query)
+    }
+
+    pub(crate) fn insert_with_row_ids_for_terms(
+        &self,
+        batch: &RecordBatch,
+        row_ids: &UInt64Array,
+        terms: &HashSet<String>,
+    ) -> Result<()> {
+        self.inner
+            .insert_with_row_ids_for_terms(batch, row_ids, terms)
+    }
+
+    pub(crate) fn doc_count(&self) -> usize {
+        self.inner.doc_count()
+    }
+
+    pub(crate) fn bm25_stats_for_terms(&self, terms: &[String]) -> MemBM25Scorer {
+        self.inner.bm25_stats_for_terms(terms)
+    }
+
+    pub(crate) fn exact_leaf_results(
+        &self,
+        query: &FtsQuery,
+        scorer: &MemBM25Scorer,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        self.inner.exact_leaf_results(query, scorer)
+    }
 }
 
 /// A tiered merge dispatched to a background worker.
@@ -1091,6 +1154,15 @@ impl FtsMemIndex {
         column_name: String,
         params: InvertedIndexParams,
     ) -> Result<Self> {
+        Self::try_with_params_and_maintenance(field_id, column_name, params, true)
+    }
+
+    fn try_with_params_and_maintenance(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        background_maintenance: bool,
+    ) -> Result<Self> {
         params.validate_format_version()?;
         let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
         let writer_tokenizer = pool.template.box_clone();
@@ -1103,6 +1175,7 @@ impl FtsMemIndex {
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
+            background_maintenance,
             merge: Arc::new(Mutex::new(None)),
         })
     }
@@ -1370,7 +1443,7 @@ impl FtsMemIndex {
             self.params.has_positions(),
         );
 
-        if st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
+        if self.background_maintenance && st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
             self.freeze(&st)?;
         }
         Ok(())
@@ -4460,6 +4533,31 @@ mod tests {
             .collect::<Vec<_>>();
         actual.sort_unstable();
         assert_eq!(actual, vec![777, 900]);
+    }
+
+    #[test]
+    fn query_local_materialization_never_starts_background_maintenance() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.as_ref());
+        let row_ids = UInt64Array::from(vec![900, 42, 777]);
+        let terms = HashSet::from(["hello".to_string()]);
+        let mut index = QueryLocalFtsIndex::try_with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default(),
+        )
+        .unwrap();
+        // Crossing the normal freeze threshold would create a partition and
+        // may launch a detached tiered merge. Query-local materialization must
+        // remain entirely in its query-owned tail instead.
+        index.inner.freeze_threshold_rows = 1;
+        index
+            .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
+            .unwrap();
+
+        assert!(index.inner.state.load().partitions.is_empty());
+        assert!(index.inner.merge.lock().unwrap().is_none());
+        assert_eq!(index.doc_count(), 3);
     }
 
     fn create_element_test_batch() -> RecordBatch {

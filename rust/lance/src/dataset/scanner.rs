@@ -354,6 +354,12 @@ fn has_compatible_hybrid_physical_segments(
     params.len() == has_deleted_fragments.len()
         && first.posting_block_size() == 128
         && params.iter().all(|params| params == first)
+        && params.iter().all(|params| {
+            matches!(
+                params.resolved_format_version().index_version(),
+                INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3
+            )
+        })
         && has_deleted_fragments.iter().all(|has_deleted| !has_deleted)
 }
 
@@ -7368,6 +7374,7 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::inverted::InvertedListFormatVersion;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
@@ -7600,6 +7607,10 @@ mod test {
         ));
         assert!(!has_compatible_hybrid_physical_segments(
             &[params.clone().block_size(256).unwrap()],
+            &[false]
+        ));
+        assert!(!has_compatible_hybrid_physical_segments(
+            &[params.clone().format_version(InvertedListFormatVersion::V1)],
             &[false]
         ));
         assert!(!has_compatible_hybrid_physical_segments(&[params], &[]));
