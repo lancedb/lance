@@ -2619,11 +2619,69 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
         .full_text_search(FullTextSearchQuery::new_query(query.clone()))
         .unwrap();
     exact_scanner.limit(Some(2), None).unwrap();
+    let exact_plan = exact_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        exact_plan.contains("HybridCompoundFtsScorer"),
+        "exact partial coverage should build one query-local residual index:\n{exact_plan}"
+    );
+    assert!(
+        !exact_plan.contains("FlatMatchQuery"),
+        "hybrid compound scoring must not scan the residual once per leaf:\n{exact_plan}"
+    );
     let exact = exact_scanner.try_into_batch().await.unwrap();
     assert_eq!(
         exact["id"].as_primitive::<Int32Type>().values(),
         &[0, 2],
         "exact search should include the appended hit"
+    );
+    let (_, exact_stats) = compound_fts_results_with_stats(&dataset, query.clone(), 2).await;
+    assert_eq!(
+        exact_stats
+            .all_counts
+            .get(crate::io::exec::fts::HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        exact_stats
+            .all_counts
+            .get(crate::io::exec::fts::HYBRID_COMPOUND_RESIDUAL_DOCS_INDEXED_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        exact_stats
+            .all_counts
+            .get(crate::io::exec::fts::HYBRID_COMPOUND_MERGED_CANDIDATES_METRIC),
+        Some(&2)
+    );
+
+    let mut filtered_scanner = dataset.scan();
+    filtered_scanner
+        .with_row_id()
+        .filter("id >= 0")
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    filtered_scanner.limit(Some(2), None).unwrap();
+    let filtered_plan = filtered_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !filtered_plan.contains("HybridCompoundFtsScorer"),
+        "filtered residual scoring must retain the exact fallback:\n{filtered_plan}"
+    );
+
+    let phrase_query: FtsQuery = BooleanQuery::new([
+        (
+            Occur::Must,
+            PhraseQuery::new("fresh alpha".to_string())
+                .with_column(Some("text".to_string()))
+                .into(),
+        ),
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+    ])
+    .into();
+    let phrase_plan = compound_fts_plan(&dataset, phrase_query, 2).await;
+    assert!(
+        !phrase_plan.contains("HybridCompoundFtsScorer"),
+        "phrase position gaps are not yet supported by the residual index:\n{phrase_plan}"
     );
 
     let mut fast_scanner = dataset.scan();
@@ -2670,6 +2728,92 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
             .unwrap()
             .num_rows(),
         0
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let appended = arrow_array::record_batch!(
+        ("text", Utf8, ["fresh alpha", "fresh beta"]),
+        ("id", Int32, [2, 3])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let boost_query: FtsQuery = BoostQuery::new(
+        positive,
+        compound_match_query("alpha", "text", 1.0),
+        Some(0.25),
+    )
+    .into();
+    let partial_boost = compound_fts_results(&dataset, boost_query.clone(), Some(10)).await;
+    assert_eq!(
+        partial_boost.len(),
+        3,
+        "MUST_NOT must exclude the blocked row"
+    );
+    assert_eq!(partial_boost[0].1.to_bits(), partial_boost[1].1.to_bits());
+    assert!(
+        partial_boost[0].0 < partial_boost[1].0,
+        "equal-score rows must use ascending row id as the exact tie break"
+    );
+
+    let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
+        "fresh alpha".to_string(),
+        vec!["text".to_string(), "text".to_string()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 2.0])
+    .unwrap()
+    .into();
+    let partial_multimatch =
+        compound_fts_results(&dataset, multimatch_query.clone(), Some(3)).await;
+
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".to_string()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+    let rebuilt_boost = compound_fts_results(&dataset, boost_query, Some(10)).await;
+    let rebuilt_multimatch = compound_fts_results(&dataset, multimatch_query, Some(3)).await;
+    assert_scored_rows_close("partial_hybrid_boost", &partial_boost, &rebuilt_boost);
+    assert_scored_rows_close(
+        "partial_hybrid_multimatch",
+        &partial_multimatch,
+        &rebuilt_multimatch,
     );
 }
 

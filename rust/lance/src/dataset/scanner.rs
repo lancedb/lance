@@ -102,8 +102,8 @@ use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
-    fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
-    resolve_fts_field, resolve_query_document_granularity,
+    fts_index_fragment_bitmap, load_segment_details, load_segment_params, load_segments,
+    normalize_inverted_details, resolve_fts_field, resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
@@ -114,7 +114,8 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::fts::{
     BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
-    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    FlatMatchQueryExec, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
+    SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -281,6 +282,65 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     }
     let columns = collect_fts_columns_in_order(query);
     !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
+}
+
+fn supports_exact_residual_compound(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Match(query) => query.fuzziness == Some(0),
+        // MemWAL phrase matching currently collapses tokenizer position gaps.
+        // Keep phrase queries on the established fallback until it can retain
+        // those gaps exactly (notably when stop words are configured).
+        FtsQuery::Phrase(_) => false,
+        FtsQuery::Boost(query) => {
+            supports_exact_residual_compound(&query.positive)
+                && supports_exact_residual_compound(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => query
+            .match_queries
+            .iter()
+            .all(|query| query.fuzziness == Some(0)),
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .all(supports_exact_residual_compound),
+    }
+}
+
+fn has_exact_hybrid_fts_coverage(
+    segments: &[IndexMetadata],
+    residual_fragments: &[Fragment],
+    target_fragments: &[Fragment],
+) -> bool {
+    let Some(target) = target_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let Some(residual) = residual_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let mut indexed = RoaringBitmap::new();
+    for segment in segments {
+        let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+            return false;
+        };
+        if !indexed.is_disjoint(coverage) {
+            return false;
+        }
+        indexed |= coverage;
+    }
+    if !indexed.is_subset(&target) || !indexed.is_disjoint(&residual) {
+        return false;
+    }
+    indexed | residual == target
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -4196,6 +4256,7 @@ impl Scanner {
         &self,
         query: &FtsQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
         document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -4220,6 +4281,17 @@ impl Scanner {
         }
         let mut phrase_columns = HashSet::new();
         collect_phrase_columns(query, &mut phrase_columns);
+        let allow_exact_residual = !cross_column
+            && !self.fast_search
+            && self.fragments.is_none()
+            && filter_plan.is_empty()
+            && self.external_row_mask.is_none()
+            && params.limit.is_some()
+            && document_granularity == DocumentGranularity::Row
+            && target_fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+            && supports_exact_residual_compound(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
             let phrase_columns = &phrase_columns;
@@ -4245,6 +4317,8 @@ impl Scanner {
                 let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
                 if !unindexed_fragments.is_empty()
                     && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
+                    && !(allow_exact_residual
+                        && unindexed_fragments.len() < target_fragments.len())
                 {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
@@ -4254,10 +4328,6 @@ impl Scanner {
                     // indexed.
                     return Ok(None);
                 }
-                let unindexed_fragment_ids = unindexed_fragments
-                    .iter()
-                    .map(|fragment| fragment.id as u32)
-                    .collect::<RoaringBitmap>();
                 let segments = match overlay_plan {
                     FtsOverlayPlan::Unchanged(Some(segments)) => segments,
                     FtsOverlayPlan::Unchanged(None) => {
@@ -4271,6 +4341,29 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
+                if allow_exact_residual && !unindexed_fragments.is_empty() {
+                    if !has_exact_hybrid_fts_coverage(
+                        &segments,
+                        &unindexed_fragments,
+                        target_fragments,
+                    ) {
+                        return Ok(None);
+                    }
+                    let first_segment = segments.first().ok_or_else(|| {
+                        Error::internal("hybrid compound FTS requires one indexed segment")
+                    })?;
+                    if load_segment_params(&self.dataset, first_segment)
+                        .await?
+                        .posting_block_size()
+                        != 128
+                    {
+                        // Larger posting blocks quantize document lengths. The
+                        // query-local residual index currently retains exact
+                        // lengths, so the two arms would not have bit-identical
+                        // scores.
+                        return Ok(None);
+                    }
+                }
 
                 if cross_column {
                     let details = futures::future::try_join_all(
@@ -4306,7 +4399,7 @@ impl Scanner {
                     }
                 }
 
-                Ok(Some((column, segments, unindexed_fragment_ids)))
+                Ok(Some((column, segments, unindexed_fragments)))
             }
         }))
         .await?;
@@ -4315,9 +4408,43 @@ impl Scanner {
         };
 
         if !cross_column {
-            let (_, segments, _) = segment_groups.into_iter().next().ok_or_else(|| {
-                Error::internal("compound scorer requires one column".to_string())
-            })?;
+            let (column, segments, unindexed_fragments) =
+                segment_groups.into_iter().next().ok_or_else(|| {
+                    Error::internal("compound scorer requires one column".to_string())
+                })?;
+            if allow_exact_residual && !unindexed_fragments.is_empty() {
+                let resolved =
+                    resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+                let scan_column = if resolved.has_lists() {
+                    resolved.root_column.clone()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let scan_projection = self
+                    .dataset
+                    .empty_projection()
+                    .with_row_id()
+                    .union_columns(&[scan_column], OnMissing::Error)?;
+                let PlannedFilteredScan { plan, .. } = self
+                    .filtered_read(
+                        &ExprFilterPlan::default(),
+                        scan_projection,
+                        /* make_deletions_null */ false,
+                        Some(Arc::new(unindexed_fragments)),
+                        None,
+                        /* is_prefilter */ true,
+                        None,
+                    )
+                    .await?;
+                return Ok(Some(Arc::new(HybridCompoundQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    column,
+                    segments,
+                    plan,
+                ))));
+            }
             return Ok(Some(Arc::new(
                 CompoundQueryExec::new_with_segments(
                     self.dataset.clone(),
@@ -4334,9 +4461,17 @@ impl Scanner {
         let Some((_, _, first_unindexed_fragments)) = coverage_groups.next() else {
             return Ok(None);
         };
-        if coverage_groups
-            .any(|(_, _, unindexed_fragments)| unindexed_fragments != first_unindexed_fragments)
-        {
+        let first_unindexed_fragment_ids = first_unindexed_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        if coverage_groups.any(|(_, _, unindexed_fragments)| {
+            unindexed_fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>()
+                != first_unindexed_fragment_ids
+        }) {
             // The cross-column scorer builds one shared prefilter. If column
             // coverage differs, that prefilter's union can re-admit stale
             // postings from a fragment invalidated only for another column.
@@ -4348,7 +4483,6 @@ impl Scanner {
             .into_iter()
             .map(|(column, segments, _)| (column, segments))
             .collect();
-
         let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
@@ -4371,7 +4505,13 @@ impl Scanner {
         if !document_granularity.is_list_element()
             && supports_compound_scorer(query)
             && let Some(plan) = self
-                .plan_compound_scorer(query, params, prefilter_source, document_granularity)
+                .plan_compound_scorer(
+                    query,
+                    params,
+                    filter_plan,
+                    prefilter_source,
+                    document_granularity,
+                )
                 .await?
         {
             return Ok(plan);
@@ -4441,6 +4581,7 @@ impl Scanner {
                                         .plan_compound_scorer(
                                             &child_query,
                                             params,
+                                            filter_plan,
                                             field_prefilter_source,
                                             document_granularity,
                                         )

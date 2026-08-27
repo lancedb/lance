@@ -38,6 +38,7 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
+use crate::dataset::mem_wal::index::FtsMemIndex;
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -56,8 +57,10 @@ use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
     MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
-    compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema, prepare_bm25_query,
+    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
+    cross_column_compound_search, exclusive_scaled_score_floor,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema, materialized_compound_top_k,
+    prepare_bm25_query,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -787,6 +790,262 @@ impl CompoundQueryExec {
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
+    }
+}
+
+/// Exact compound FTS over committed postings plus an append-only residual
+/// scan. The residual documents are tokenized once into query-local postings,
+/// rather than once for every compound leaf.
+#[derive(Debug)]
+pub(crate) struct HybridCompoundQueryExec {
+    dataset: Arc<Dataset>,
+    query: FtsQuery,
+    params: FtsSearchParams,
+    column: String,
+    segments: Arc<[IndexMetadata]>,
+    residual_input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl HybridCompoundQueryExec {
+    pub(crate) fn new(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        column: String,
+        segments: Vec<IndexMetadata>,
+        residual_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        Self {
+            dataset,
+            query,
+            params,
+            column,
+            segments: Arc::from(segments),
+            residual_input,
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(FTS_SCHEMA.clone()),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl DisplayAs for HybridCompoundQueryExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "HybridCompoundFtsScorer: column={}, query={}",
+            self.column, self.query
+        )
+    }
+}
+
+impl ExecutionPlan for HybridCompoundQueryExec {
+    fn name(&self) -> &str {
+        "HybridCompoundQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.residual_input]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "hybrid compound FTS expected one residual child, got {}",
+                children.len()
+            )));
+        }
+        let residual_input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("hybrid compound FTS lost its residual child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.dataset.clone(),
+            self.query.clone(),
+            self.params.clone(),
+            self.column.clone(),
+            self.segments.to_vec(),
+            residual_input,
+        )))
+    }
+
+    #[instrument(name = "hybrid_compound_fts_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let dataset = self.dataset.clone();
+        let query = self.query.clone();
+        let params = self.params.clone();
+        let column = self.column.clone();
+        let segments = self.segments.clone();
+        let mut residual_input = self.residual_input.execute(partition, context.clone())?;
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let residual_rows_scanned = self
+            .metrics
+            .new_count(HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC, partition);
+        let residual_docs_indexed = self
+            .metrics
+            .new_count(HYBRID_COMPOUND_RESIDUAL_DOCS_INDEXED_METRIC, partition);
+        let index_candidates = self
+            .metrics
+            .new_count(HYBRID_COMPOUND_INDEX_CANDIDATES_METRIC, partition);
+        let residual_candidates = self
+            .metrics
+            .new_count(HYBRID_COMPOUND_RESIDUAL_CANDIDATES_METRIC, partition);
+        let merged_candidates = self
+            .metrics
+            .new_count(HYBRID_COMPOUND_MERGED_CANDIDATES_METRIC, partition);
+        let schema = self.schema();
+
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let indices =
+                open_fts_segments(&dataset, &column, &segments, &metrics.index_metrics).await?;
+            let first_index = indices.first().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "FTS index for column {column} has no committed segments"
+                ))
+            })?;
+            let field_id = dataset.schema().field_id(&column)?;
+            let residual = FtsMemIndex::try_with_params(
+                field_id,
+                column.clone(),
+                first_index.params().clone(),
+            )?;
+            let terms = residual.exact_query_terms(&query)?;
+            let allowed_terms = terms.iter().cloned().collect::<HashSet<_>>();
+
+            while let Some(batch) = residual_input.try_next().await? {
+                residual_rows_scanned.add(batch.num_rows());
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "hybrid compound FTS residual input is missing _rowid".to_string(),
+                        )
+                    })?
+                    .as_primitive::<UInt64Type>();
+                residual.insert_with_row_ids_for_terms(&batch, row_ids, &allowed_terms)?;
+            }
+            residual_docs_indexed.add(residual.doc_count());
+
+            let query_tokens = Tokens::new(terms.clone(), first_index.tokenizer().doc_type());
+            let exact_params = params
+                .clone()
+                .with_fuzziness(Some(0))
+                .with_phrase_slop(None);
+            let mut scorer = build_global_bm25_scorer(
+                &indices,
+                &query_tokens,
+                &exact_params,
+                Some(metrics.as_ref()),
+            )
+            .await?;
+            let residual_stats = residual.bm25_stats_for_terms(&terms);
+            scorer.total_tokens = scorer
+                .total_tokens
+                .checked_add(residual_stats.total_tokens)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "hybrid compound FTS total token count overflow".to_string(),
+                    )
+                })?;
+            scorer.num_docs = scorer
+                .num_docs
+                .checked_add(residual_stats.num_docs)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "hybrid compound FTS document count overflow".to_string(),
+                    )
+                })?;
+            for term in &terms {
+                let residual_df = residual_stats.num_docs_containing_token(term);
+                let df = scorer.token_docs.get_mut(term).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "hybrid compound FTS scorer is missing query term '{term}'"
+                    ))
+                })?;
+                *df = df.checked_add(residual_df).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "hybrid compound FTS document frequency overflow for term '{term}'"
+                    ))
+                })?;
+            }
+            let scorer = Arc::new(scorer);
+            let limit = params.limit.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "hybrid compound FTS requires a bounded result limit".to_string(),
+                )
+            })?;
+
+            let prefilter = build_prefilter(
+                context,
+                partition,
+                &PreFilterSource::None,
+                dataset,
+                &segments,
+                None,
+                None,
+            )?;
+            let (indexed_row_ids, indexed_scores) = compound_search_with_base_scorer(
+                &indices,
+                &query,
+                &params,
+                prefilter,
+                metrics.clone(),
+                scorer.clone(),
+            )
+            .await?;
+            index_candidates.add(indexed_row_ids.len());
+            let residual_leaves = residual.exact_leaf_results(&query, scorer.as_ref())?;
+            let (residual_row_ids, residual_scores) =
+                materialized_compound_top_k(&query, residual_leaves, limit, metrics.as_ref())?;
+            residual_candidates.add(residual_row_ids.len());
+
+            let mut documents = indexed_row_ids
+                .into_iter()
+                .zip(indexed_scores)
+                .chain(residual_row_ids.into_iter().zip(residual_scores))
+                .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+                .collect::<Vec<_>>();
+            merged_candidates.add(documents.len());
+            documents.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .0
+                    .total_cmp(&left.score.0)
+                    .then_with(|| left.row_id.cmp(&right.row_id))
+            });
+            documents.truncate(limit);
+            metrics.baseline_metrics.record_output(documents.len());
+            scored_documents_batch(schema, documents).map_err(DataFusionError::from)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 }
 
@@ -1874,6 +2133,15 @@ impl Drop for SharedFtsScorerProducer {
 
 /// Time spent resolving an exact ordered UUID selection to committed FTS segments.
 pub const FTS_SEGMENT_BIND_DURATION_METRIC: &str = "fts_segment_bind_duration";
+pub(crate) const HYBRID_COMPOUND_RESIDUAL_ROWS_SCANNED_METRIC: &str =
+    "hybrid_compound_residual_rows_scanned";
+pub(crate) const HYBRID_COMPOUND_RESIDUAL_DOCS_INDEXED_METRIC: &str =
+    "hybrid_compound_residual_docs_indexed";
+pub(crate) const HYBRID_COMPOUND_INDEX_CANDIDATES_METRIC: &str = "hybrid_compound_index_candidates";
+pub(crate) const HYBRID_COMPOUND_RESIDUAL_CANDIDATES_METRIC: &str =
+    "hybrid_compound_residual_candidates";
+pub(crate) const HYBRID_COMPOUND_MERGED_CANDIDATES_METRIC: &str =
+    "hybrid_compound_merged_candidates";
 
 #[derive(Debug, Clone)]
 enum FtsSegmentSelection {
