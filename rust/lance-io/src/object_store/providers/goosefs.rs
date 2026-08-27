@@ -4,11 +4,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::GooseFs};
 use url::Url;
 
 use super::sanitized_authority;
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -172,11 +172,9 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         }
 
         // Create OpenDAL Operator with GooseFS service
-        let operator = Operator::from_iter::<GooseFs>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(format!("Failed to create GooseFS operator: {:?}", e))
-            })?
-            .finish();
+        let operator = Operator::from_iter::<GooseFs>(config_map).map_err(|e| {
+            Error::invalid_input(format!("Failed to create GooseFS operator: {:?}", e))
+        })?;
 
         // Wrap as object_store::ObjectStore via OpendalStore bridge
         let opendal_store = Arc::new(OpendalStore::new(operator));
@@ -184,6 +182,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),
             inner: opendal_store,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -193,6 +192,8 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            paginated_lister: None,
         })
     }
 

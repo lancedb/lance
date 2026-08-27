@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,7 +43,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, buffered_fragment_opens};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -169,18 +168,10 @@ impl LanceStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
-        let is_v2_scan = fragments
-            .iter()
-            .filter_map(|frag| frag.files.first().map(|f| !f.is_legacy_file()))
-            .next()
-            .unwrap_or(false);
-        if is_v2_scan {
-            Self::try_new_v2(
-                dataset, fragments, offsets, projection, config, metrics, partition,
-            )
-        } else {
-            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
-        }
+        let version = dataset.manifest().data_storage_format.lance_file_format();
+        crate::dataset::versions::create_scan_stream(
+            version, dataset, fragments, offsets, projection, config, metrics, partition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -417,6 +408,7 @@ impl LanceStream {
     pub fn try_new_v1(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        _offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
@@ -443,9 +435,11 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -457,9 +451,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -475,9 +469,11 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -489,9 +485,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -730,10 +726,6 @@ impl ExecutionPlan for LanceScanExec {
         "LanceScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -784,7 +776,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -801,10 +793,10 @@ impl ExecutionPlan for LanceScanExec {
             false => Precision::Absent,
         };
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

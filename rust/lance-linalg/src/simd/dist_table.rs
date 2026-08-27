@@ -5,6 +5,7 @@
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::mem::MaybeUninit;
 
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
@@ -34,7 +35,38 @@ pub fn sum_4bit_dist_table(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    assert!(n.is_multiple_of(BATCH_SIZE));
+    assert!(dists.len() >= n);
+    assert!(codes.len() >= n * code_len);
+    assert!(dist_table.len() >= BATCH_SIZE * code_len);
+    // A `u16` slice is also a valid `MaybeUninit<u16>` slice. The dispatched
+    // kernels overwrite every output slot.
+    let dists = unsafe {
+        std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
+    };
+    unsafe { sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists) };
+}
+
+/// Sum a 4-bit distance table into potentially uninitialized output storage.
+///
+/// Every element in `dists[..n]` is initialized before this function returns.
+///
+/// # Safety
+///
+/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
+/// `n * code_len` bytes, `dist_table` must contain at least
+/// `BATCH_SIZE * code_len` bytes, and `dists` must contain at least `n` slots.
+#[inline]
+pub unsafe fn sum_4bit_dist_table_uninit(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+) {
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
+    debug_assert!(dists.len() >= n);
+    debug_assert!(codes.len() >= n * code_len);
 
     match *SIMD_SUPPORT {
         #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
@@ -48,7 +80,7 @@ pub fn sum_4bit_dist_table(
                         codes.as_ptr(),
                         codes.len(),
                         dist_table.as_ptr(),
-                        dists[i..i + BATCH_SIZE].as_mut_ptr(),
+                        dists[i..i + BATCH_SIZE].as_mut_ptr().cast::<u16>(),
                     )
                 }
             }
@@ -73,7 +105,17 @@ pub fn sum_4bit_dist_table(
                 )
             }
         },
-        _ => sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists),
+        // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
+        // the AVX2 inner uses `_mm256_shuffle_epi8` / `_mm256_and_si256` /
+        // `_mm256_srli_epi16` / `_mm256_add_epi16` integer ops which
+        // neither AVX nor AVX+FMA provides. Scalar is the correct route.
+        _ => {
+            dists[..n].fill(MaybeUninit::new(0));
+            // Every slot was initialized immediately above.
+            let dists =
+                unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u16>(), n) };
+            sum_4bit_dist_table_scalar(code_len, &codes[..n * code_len], dist_table, dists);
+        }
     }
 }
 
@@ -160,6 +202,35 @@ pub fn sum_4bit_hacc_dist_table(
     hacc_dist_table: &[u8],
     dists: &mut [u32],
 ) {
+    assert!(n.is_multiple_of(BATCH_SIZE));
+    assert!(dists.len() >= n);
+    assert!(codes.len() >= n * code_len);
+    assert!(hacc_dist_table.len() >= code_len * 64);
+    // A `u32` slice is also a valid `MaybeUninit<u32>` slice. The dispatched
+    // kernels overwrite every output slot.
+    let dists = unsafe {
+        std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
+    };
+    unsafe { sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists) };
+}
+
+/// Sum a high-accuracy 4-bit distance table into uninitialized output storage.
+///
+/// Every element in `dists[..n]` is initialized before this function returns.
+///
+/// # Safety
+///
+/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
+/// `n * code_len` bytes, `hacc_dist_table` must contain at least
+/// `code_len * 64` bytes, and `dists` must contain at least `n` slots.
+#[inline]
+pub unsafe fn sum_4bit_hacc_dist_table_uninit(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    hacc_dist_table: &[u8],
+    dists: &mut [MaybeUninit<u32>],
+) {
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
     debug_assert!(dists.len() >= n);
     debug_assert!(codes.len() >= n * code_len);
@@ -172,7 +243,18 @@ pub fn sum_4bit_hacc_dist_table(
         {
             sum_4bit_hacc_dist_table_avx2(n, code_len, codes, hacc_dist_table, dists);
         }
-        _ => sum_4bit_hacc_dist_table_scalar(code_len, codes, hacc_dist_table, dists),
+        _ => {
+            dists[..n].fill(MaybeUninit::new(0));
+            // Every slot was initialized immediately above.
+            let dists =
+                unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u32>(), n) };
+            sum_4bit_hacc_dist_table_scalar(
+                code_len,
+                &codes[..n * code_len],
+                hacc_dist_table,
+                dists,
+            );
+        }
     }
 }
 
@@ -257,20 +339,24 @@ fn sum_4bit_hacc_dist_table_avx2(
     code_len: usize,
     codes: &[u8],
     hacc_dist_table: &[u8],
-    dists: &mut [u32],
+    dists: &mut [MaybeUninit<u32>],
 ) {
     const SAFE_CODE_LEN: usize = 128;
 
     for i in (0..n).step_by(BATCH_SIZE) {
         let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
         let batch_dists = &mut dists[i..i + BATCH_SIZE];
-        batch_dists.fill(0);
+
+        if code_len == 0 {
+            batch_dists.fill(MaybeUninit::new(0));
+            continue;
+        }
 
         for code_start in (0..code_len).step_by(SAFE_CODE_LEN) {
             let code_end = (code_start + SAFE_CODE_LEN).min(code_len);
             let code_range = code_start * BATCH_SIZE..code_end * BATCH_SIZE;
             let table_range = code_start * 64..code_end * 64;
-            if code_start == 0 && code_end == code_len {
+            if code_start == 0 {
                 unsafe {
                     sum_hacc_dist_table_32bytes_batch_avx2(
                         &batch_codes[code_range],
@@ -279,7 +365,7 @@ fn sum_4bit_hacc_dist_table_avx2(
                     );
                 }
             } else {
-                let mut chunk_dists = [0u32; BATCH_SIZE];
+                let mut chunk_dists = [MaybeUninit::<u32>::uninit(); BATCH_SIZE];
                 unsafe {
                     sum_hacc_dist_table_32bytes_batch_avx2(
                         &batch_codes[code_range],
@@ -287,6 +373,17 @@ fn sum_4bit_hacc_dist_table_avx2(
                         &mut chunk_dists,
                     );
                 }
+                // The kernel above initializes every temporary output slot.
+                let chunk_dists = unsafe {
+                    std::slice::from_raw_parts(chunk_dists.as_ptr().cast::<u32>(), BATCH_SIZE)
+                };
+                // The first code chunk initialized every output slot.
+                let batch_dists = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        batch_dists.as_mut_ptr().cast::<u32>(),
+                        BATCH_SIZE,
+                    )
+                };
                 batch_dists
                     .iter_mut()
                     .zip(chunk_dists.iter())
@@ -303,7 +400,7 @@ fn sum_4bit_hacc_dist_table_avx2(
 unsafe fn sum_hacc_dist_table_32bytes_batch_avx2(
     codes: &[u8],
     hacc_dist_table: &[u8],
-    dists: &mut [u32],
+    dists: &mut [MaybeUninit<u32>],
 ) {
     let low_mask = _mm256_set1_epi8(0x0f);
     let mut low_accu0 = _mm256_setzero_si256();
@@ -385,7 +482,11 @@ unsafe fn sum_hacc_dist_table_32bytes_batch_avx2(
 #[target_feature(enable = "avx2")]
 #[inline]
 #[allow(unused)]
-unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+unsafe fn sum_dist_table_32bytes_batch_avx2(
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+) {
     let mut c = _mm256_undefined_si256();
     let mut lo = _mm256_undefined_si256();
     let mut hi = _mm256_undefined_si256();
@@ -457,7 +558,11 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+unsafe fn sum_dist_table_32bytes_batch_neon(
+    codes: &[u8],
+    dist_table: &[u8],
+    dists: &mut [MaybeUninit<u16>],
+) {
     let low_mask = vdupq_n_u8(0x0f);
 
     // 8 accumulators: 4 per 128-bit "lane" (lo = bytes 0..16, hi = bytes 16..32 of each block)
@@ -513,8 +618,8 @@ unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dis
     // This is the NEON equivalent of AVX2's permute2f128 + blend + add
     let dis0_even = vaddq_u16(accu0_lo, accu0_hi);
     let dis0_odd = vaddq_u16(accu1_lo, accu1_hi);
-    vst1q_u16(dists.as_mut_ptr(), dis0_even);
-    vst1q_u16(dists.as_mut_ptr().add(8), dis0_odd);
+    vst1q_u16(dists.as_mut_ptr().cast::<u16>(), dis0_even);
+    vst1q_u16(dists.as_mut_ptr().add(8).cast::<u16>(), dis0_odd);
 
     // Same for hi-nibble accumulators (vectors 16..31)
     accu2_lo = vsubq_u16(accu2_lo, vshlq_n_u16::<8>(accu3_lo));
@@ -522,8 +627,8 @@ unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dis
 
     let dis1_even = vaddq_u16(accu2_lo, accu2_hi);
     let dis1_odd = vaddq_u16(accu3_lo, accu3_hi);
-    vst1q_u16(dists.as_mut_ptr().add(16), dis1_even);
-    vst1q_u16(dists.as_mut_ptr().add(24), dis1_odd);
+    vst1q_u16(dists.as_mut_ptr().add(16).cast::<u16>(), dis1_even);
+    vst1q_u16(dists.as_mut_ptr().add(24).cast::<u16>(), dis1_odd);
 }
 
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,

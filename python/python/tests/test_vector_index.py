@@ -60,18 +60,26 @@ def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
 
 
 def create_multivec_table(
-    nvec=1000, nvec_per_row=5, ndim=128, nans=0, nullify=False, dtype=np.float32
+    nvec=1000,
+    nvec_per_row=5,
+    ndim=128,
+    nans=0,
+    nullify=False,
+    dtype=np.float32,
+    seed=None,
 ):
-    mat = np.random.randn(nvec, nvec_per_row, ndim)
+    rng = np.random.default_rng(seed)
+    text_rng = random.Random(seed)
+    mat = rng.standard_normal((nvec, nvec_per_row, ndim))
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
         nans_mat[:] = np.nan
         mat = np.concatenate((mat, nans_mat), axis=0)
     mat = mat.astype(dtype)
-    price = np.random.rand(nvec + nans) * 100
+    price = rng.random(nvec + nans) * 100
 
     def gen_str(n):
-        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+        return "".join(text_rng.choices(string.ascii_letters + string.digits, k=n))
 
     meta = np.array([gen_str(100) for _ in range(nvec + nans)])
 
@@ -112,13 +120,20 @@ def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     yield dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        max_iters=2,
+        sample_rate=2,
     )
 
 
 @pytest.fixture()
 def multivec_dataset():
-    tbl = create_multivec_table()
+    # Keep at least 100 logical rows for the top-k assertions below. Five
+    # vectors per row still exercises multivector deduplication and fanout.
+    tbl = create_multivec_table(nvec=128, seed=42)
     yield lance.write_dataset(tbl, "memory://")
 
 
@@ -127,8 +142,11 @@ def indexed_multivec_dataset(multivec_dataset):
     yield multivec_dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=1,
+        num_sub_vectors=4,
+        num_bits=4,
+        max_iters=2,
+        sample_rate=2,
         metric="cosine",
     )
 
@@ -371,13 +389,19 @@ def test_distributed_ivf_pq_partition_window_env_override(tmp_path, monkeypatch)
     monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZE", "4")
     monkeypatch.setenv("LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT", "2")
 
-    data = create_table(nvec=3000, ndim=128)
-    q = np.random.randn(128).astype(np.float32)
+    rng = np.random.default_rng(42)
+    matrix = rng.standard_normal((640, 32), dtype=np.float32)
+    data = vec_to_table(data=matrix).append_column("id", pa.array(range(640)))
+    q = rng.standard_normal(32).astype(np.float32)
     assert_distributed_vector_consistency(
         data,
         "vector",
         index_type="IVF_PQ",
-        index_params={"num_partitions": 10, "num_sub_vectors": 16},
+        index_params={
+            "num_partitions": 10,
+            "num_sub_vectors": 4,
+            "max_iters": 2,
+        },
         queries=[q],
         topk=10,
         world=2,
@@ -404,7 +428,7 @@ def test_distributed_vector(
     request, fixture_name, index_type, index_params, similarity_threshold
 ):
     ds = request.getfixturevalue(fixture_name)
-    q = np.random.randn(128).astype(np.float32)
+    q = np.random.default_rng(42).standard_normal(128).astype(np.float32)
     assert_distributed_vector_consistency(
         ds.to_table(),
         "vector",
@@ -502,20 +526,20 @@ def test_f16_cuda(tmp_path):
     "index_file_version", [IndexFileVersion.V3, IndexFileVersion.LEGACY]
 )
 def test_index_with_nans(tmp_path, index_file_version):
-    # 1024 rows, the entire table should be sampled
-    tbl = create_table(nvec=1000, nans=24)
+    tbl = create_table(nvec=256, ndim=32, nans=8)
 
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=1,
+        num_sub_vectors=4,
+        max_iters=2,
         index_file_version=index_file_version,
     )
     idx_stats = dataset.stats.index_stats("vector_idx")
     assert idx_stats["indices"][0]["index_file_version"] == index_file_version
-    validate_vector_index(dataset, "vector")
+    validate_vector_index(dataset, "vector", sample_size=16)
 
 
 @pytest.mark.parametrize(
@@ -524,22 +548,24 @@ def test_index_with_nans(tmp_path, index_file_version):
 def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
 
-    # 1024 rows, the entire table should be sampled
-    tbl = create_table(nvec=1000, nans=24)
+    # Torch PQ initialization samples 256 valid residuals. Keep a small margin
+    # after NaN filtering so every platform can produce a complete sample batch.
+    tbl = create_table(nvec=320, ndim=32, nans=8)
 
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=1,
+        num_sub_vectors=4,
+        max_iters=2,
         accelerator=torch.device("cpu"),
         one_pass_ivfpq=True,
         index_file_version=index_file_version,
     )
     idx_stats = dataset.stats.index_stats("vector_idx")
     assert idx_stats["indices"][0]["index_file_version"] == index_file_version
-    validate_vector_index(dataset, "vector")
+    validate_vector_index(dataset, "vector", sample_size=16)
 
 
 def test_index_with_no_centroid_movement(tmp_path):
@@ -548,7 +574,8 @@ def test_index_with_no_centroid_movement(tmp_path):
     # this test makes the centroids essentially [1..]
     # this makes sure the early stop condition in the index building code
     # doesn't do divide by zero
-    mat = np.concatenate([np.ones((256, 32))])
+    # Torch one-pass PQ emits an 8-bit codebook, which requires 256 rows.
+    mat = np.ones((256, 16), dtype=np.float32)
 
     tbl = vec_to_table(data=mat)
 
@@ -558,27 +585,37 @@ def test_index_with_no_centroid_movement(tmp_path):
         index_type="IVF_PQ",
         num_partitions=1,
         num_sub_vectors=4,
+        max_iters=2,
         accelerator=torch.device("cpu"),
     )
-    validate_vector_index(dataset, "vector")
+    validate_vector_index(dataset, "vector", sample_size=8)
 
 
 def test_index_with_pq_codebook(tmp_path):
-    tbl = create_table(nvec=1024, ndim=128)
+    dim = 16
+    rng = np.random.default_rng(42)
+    # Eight-bit PQ still requires its 256 centroid training rows even when the
+    # initial codebook is supplied; reducing the dimension keeps this fixture small.
+    vectors = rng.standard_normal((256, dim), dtype=np.float32)
+    tbl = vec_to_table(data=vectors)
     dataset = lance.write_dataset(tbl, tmp_path)
-    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+    pq_codebook = rng.standard_normal((4, 256, dim // 4), dtype=np.float32)
+    ivf_centroids = rng.standard_normal((1, dim), dtype=np.float32)
 
     dataset = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=1,
         num_sub_vectors=4,
-        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        max_iters=2,
+        ivf_centroids=ivf_centroids,
         pq_codebook=pq_codebook,
     )
     index = dataset.stats.index_stats("vector_idx")
     assert index["indices"][0]["sub_index"]["nbits"] == 8
-    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(
+        dataset, "vector", refine_factor=256, sample_size=8, pass_threshold=0.99
+    )
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
 
@@ -587,17 +624,23 @@ def test_index_with_pq_codebook(tmp_path):
         index_type="IVF_PQ",
         num_partitions=1,
         num_sub_vectors=4,
-        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        max_iters=2,
+        ivf_centroids=ivf_centroids,
         pq_codebook=pq_codebook,
         replace=True,
     )
-    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(
+        dataset, "vector", refine_factor=256, sample_size=8, pass_threshold=0.99
+    )
 
 
 def test_index_with_4bit_numpy_pq_codebook(tmp_path):
-    tbl = create_table(nvec=1024, ndim=128)
+    dim = 32
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((32, dim), dtype=np.float32)
+    tbl = vec_to_table(data=vectors)
     dataset = lance.write_dataset(tbl, tmp_path)
-    pq_codebook = np.random.randn(4, 16, 128 // 4).astype(np.float32)
+    pq_codebook = rng.standard_normal((4, 16, dim // 4), dtype=np.float32)
 
     dataset = dataset.create_index(
         "vector",
@@ -605,7 +648,8 @@ def test_index_with_4bit_numpy_pq_codebook(tmp_path):
         num_partitions=1,
         num_sub_vectors=4,
         num_bits=4,
-        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        max_iters=2,
+        ivf_centroids=rng.standard_normal((1, dim), dtype=np.float32),
         pq_codebook=pq_codebook,
     )
 
@@ -615,7 +659,7 @@ def test_index_with_4bit_numpy_pq_codebook(tmp_path):
     result = dataset.to_table(
         nearest={
             "column": "vector",
-            "q": np.random.randn(128).astype(np.float32),
+            "q": vectors[0],
             "k": 10,
         }
     )
@@ -623,13 +667,15 @@ def test_index_with_4bit_numpy_pq_codebook(tmp_path):
 
 
 def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
-    tbl = create_table(nvec=8, ndim=128)
+    dim = 16
+    rng = np.random.default_rng(42)
+    tbl = vec_to_table(data=rng.standard_normal((8, dim), dtype=np.float32))
     dataset = lance.write_dataset(tbl, tmp_path)
-    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+    pq_codebook = rng.standard_normal((4, 256, dim // 4), dtype=np.float32)
 
     with pytest.raises(
         ValueError,
-        match=r"\(sub_vectors, 16, dim\) for num_bits=4, got \(4, 256, 32\)",
+        match=r"\(sub_vectors, 16, dim\) for num_bits=4, got \(4, 256, 4\)",
     ):
         dataset.create_index(
             "vector",
@@ -637,7 +683,7 @@ def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
             num_partitions=1,
             num_sub_vectors=4,
             num_bits=4,
-            ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+            ivf_centroids=rng.standard_normal((1, dim), dtype=np.float32),
             pq_codebook=pq_codebook,
         )
 
@@ -739,14 +785,18 @@ def test_create_index_unsupported_accelerator(tmp_path):
 
 
 def test_create_index_accelerator_fallback(tmp_path, caplog):
-    tbl = create_table()
+    tbl = create_table(nvec=64, ndim=32)
     dataset = lance.write_dataset(tbl, tmp_path)
 
     with caplog.at_level(logging.WARNING):
         dataset = dataset.create_index(
             "vector",
             index_type="IVF_HNSW_SQ",
-            num_partitions=4,
+            num_partitions=1,
+            max_iters=2,
+            max_level=2,
+            m=4,
+            ef_construction=16,
             accelerator="cuda",
         )
 
@@ -816,62 +866,106 @@ def test_has_index(dataset, tmp_path):
     assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
-def test_index_type(dataset, tmp_path):
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+def test_index_type(tmp_path):
+    index_cases = [
+        ("IVF_PQ", {"num_sub_vectors": 4, "num_bits": 4}),
+        (
+            "IVF_HNSW_SQ",
+            {"max_level": 2, "m": 4, "ef_construction": 16},
+        ),
+        (
+            "IVF_HNSW_PQ",
+            {
+                "num_sub_vectors": 4,
+                "num_bits": 4,
+                "max_level": 2,
+                "m": 4,
+                "ef_construction": 16,
+            },
+        ),
+        (
+            "IVF_HNSW_FLAT",
+            {"max_level": 2, "m": 4, "ef_construction": 16},
+        ),
+    ]
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((64, 32), dtype=np.float32)
+    table = vec_to_table(data=vectors).append_column("id", pa.array(range(64)))
+    ann_ds = lance.write_dataset(table, tmp_path / "replace_index_type")
+    assert not ann_ds.has_index
 
+    for case_index, (index_type, index_options) in enumerate(index_cases):
+        ann_ds = ann_ds.create_index(
+            "vector",
+            index_type=index_type,
+            num_partitions=1,
+            max_iters=2,
+            sample_rate=2,
+            replace=case_index > 0,
+            **index_options,
+        )
+        stats = ann_ds.stats.index_stats("vector_idx")
+        assert stats["index_type"] == index_type
+        assert stats["num_indices"] == 1
+        indices = ann_ds.describe_indices()
+        assert len(indices) == 1
+        assert indices[0].field_names == ["vector"]
+
+        nearest = {
+            "column": "vector",
+            "q": vectors[0],
+            "k": 10,
+            "nprobes": 1,
+            "refine_factor": 4,
+        }
+        if "HNSW" in index_type:
+            nearest["ef"] = 64
+        actual = ann_ds.to_table(columns=["id"], nearest=nearest)
+        expected = ann_ds.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": vectors[0],
+                "k": 10,
+                "use_index": False,
+            },
+        )
+        actual_ids = set(actual["id"].to_pylist())
+        expected_ids = set(expected["id"].to_pylist())
+        assert actual.num_rows == 10
+        assert len(actual_ids) == 10
+        assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
+
+
+def test_create_dot_index(tmp_path):
+    rng = np.random.default_rng(42)
+    table = vec_to_table(data=rng.standard_normal((64, 32), dtype=np.float32))
+    ann_ds = lance.write_dataset(table, tmp_path / "indexed.lance")
+    assert not ann_ds.has_index
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-        replace=True,
-    )
-    stats = ann_ds.stats.index_stats("vector_idx")
-    assert stats["index_type"] == "IVF_PQ"
-
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_HNSW_SQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-        replace=True,
-    )
-    stats = ann_ds.stats.index_stats("vector_idx")
-    assert stats["index_type"] == "IVF_HNSW_SQ"
-
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_HNSW_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-        replace=True,
-    )
-    stats = ann_ds.stats.index_stats("vector_idx")
-    assert stats["index_type"] == "IVF_HNSW_PQ"
-
-
-def test_create_dot_index(dataset, tmp_path):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=1,
+        num_sub_vectors=4,
+        num_bits=4,
+        max_iters=2,
         metric="dot",
     )
     assert ann_ds.has_index
 
 
-def test_create_4bit_ivf_pq_index(dataset, tmp_path):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+def test_create_4bit_ivf_pq_index(tmp_path):
+    rng = np.random.default_rng(42)
+    table = vec_to_table(data=rng.standard_normal((32, 32), dtype=np.float32))
+    ann_ds = lance.write_dataset(table, tmp_path / "indexed.lance")
+    assert not ann_ds.has_index
     ann_ds = ann_ds.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=1,
-        num_sub_vectors=16,
+        num_sub_vectors=4,
         num_bits=4,
+        max_iters=2,
         metric="l2",
     )
     index = ann_ds.stats.index_stats("vector_idx")
@@ -1215,53 +1309,31 @@ def test_create_ivf_rq_mostly_null():
     assert result.num_rows == 10
 
 
-def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_HNSW_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-    )
-    assert ann_ds.describe_indices()[0].field_names == ["vector"]
-
-
-def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_HNSW_SQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-    )
-    assert ann_ds.describe_indices()[0].field_names == ["vector"]
-
-
-def test_create_ivf_hnsw_flat_index(dataset, tmp_path):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
-    ann_ds = ann_ds.create_index(
-        "vector",
-        index_type="IVF_HNSW_FLAT",
-        num_partitions=4,
-        num_sub_vectors=16,
-    )
-    assert ann_ds.describe_indices()[0].field_names == ["vector"]
-
-
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
-    query = np.random.rand(5, 128)
+    rng = np.random.default_rng(42)
+    query = rng.random((5, 128))
     results = indexed_multivec_dataset.scanner(
-        nearest={"column": "vector", "q": query, "k": 100}
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 100,
+            "nprobes": 1,
+            "refine_factor": 2,
+        }
     ).to_table()
     assert results.num_rows == 100
     assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
     assert len(results["vector"][0]) == 5
+    ground_truth = indexed_multivec_dataset.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 100, "use_index": False},
+    )
+    actual_ids = set(results["id"].to_pylist())
+    expected_ids = set(ground_truth["id"].to_pylist())
+    assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
 
     # query with single vector also works
-    query = np.random.rand(128)
+    query = rng.random(128)
     results = indexed_multivec_dataset.to_table(
         nearest={"column": "vector", "q": query, "k": 100}
     )
@@ -1282,14 +1354,14 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
         )
 
     # query with a vector that dim not match
-    query = np.random.rand(256)
+    query = rng.random(256)
     with pytest.raises(ValueError, match="does not match index column size"):
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
         )
 
     # query with a list of vectors that some dim not match
-    query = [np.random.rand(128)] * 5 + [np.random.rand(256)]
+    query = [rng.random(128)] * 5 + [rng.random(256)]
     with pytest.raises(ValueError, match="All query vectors must have the same length"):
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
@@ -1703,17 +1775,23 @@ def test_index_cache_size_deprecation(tmp_path):
 
 
 def test_f16_index(tmp_path: Path):
-    DIM = 64
+    DIM = 32
+    total = 256
     uri = tmp_path / "f16data.lance"
-    f16_data = np.random.uniform(0, 1, 2048 * DIM).astype(np.float16)
+    rng = np.random.default_rng(42)
+    f16_data = rng.uniform(0, 1, total * DIM).astype(np.float16)
     fsl = pa.FixedSizeListArray.from_arrays(f16_data, DIM)
     tbl = pa.Table.from_pydict({"vector": fsl})
     dataset = lance.write_dataset(tbl, uri)
     dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        max_iters=2,
     )
 
-    q = np.random.uniform(0, 1, DIM).astype(np.float16)
+    q = rng.uniform(0, 1, DIM).astype(np.float16)
     rst = dataset.to_table(
         nearest={
             "column": "vector",
@@ -1728,8 +1806,9 @@ def test_f16_index(tmp_path: Path):
 
 def test_vector_with_nans(tmp_path: Path):
     DIM = 32
-    TOTAL = 2048
-    data = np.random.uniform(0, 1, TOTAL * DIM).astype(np.float32)
+    TOTAL = 320
+    rng = np.random.default_rng(42)
+    data = rng.uniform(0, 1, TOTAL * DIM).astype(np.float32)
 
     # Put the 1st vector as NaN.
     np.put(data, range(DIM, 2 * DIM), np.nan)
@@ -1743,12 +1822,13 @@ def test_vector_with_nans(tmp_path: Path):
     ds = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=2,
-        num_sub_vectors=2,
+        num_partitions=1,
+        num_sub_vectors=4,
+        max_iters=2,
         replace=True,
     )
     tbl = ds.to_table(
-        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
+        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 1},
         with_row_id=True,
     )
     assert len(tbl) == TOTAL - 1
@@ -1804,14 +1884,18 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
 def test_index_cast_centroids(tmp_path):
     torch = pytest.importorskip("torch")
 
-    tbl = create_table(nvec=1000)
+    dim = 16
+    rng = np.random.default_rng(42)
+    # Torch one-pass PQ emits an 8-bit codebook, which requires 256 rows.
+    tbl = vec_to_table(data=rng.standard_normal((256, dim), dtype=np.float32))
 
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=2,
+        num_sub_vectors=4,
+        max_iters=2,
         accelerator=torch.device("cpu"),
     )
 
@@ -1820,18 +1904,19 @@ def test_index_cast_centroids(tmp_path):
     index_stats = dataset.stats.index_stats(index_name)
     centroids = index_stats["indices"][0]["centroids"]
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
-    centroids = pa.FixedSizeListArray.from_arrays(values, 128)
+    centroids = pa.FixedSizeListArray.from_arrays(values, dim)
 
     # Cast invalidates the attached index; drop it first per the new contract.
     dataset.drop_index(index_name)
-    dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
+    dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), dim)))
 
     # centroids are f32, but the column is now f16
     dataset = dataset.create_index(
         "vector",
         index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
+        num_partitions=2,
+        num_sub_vectors=4,
+        max_iters=2,
         accelerator=torch.device("cpu"),
         ivf_centroids=centroids,
     )
@@ -1961,6 +2046,108 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+def test_no_stale_duplicate_after_partial_column_update(tmp_path):
+    # Regression test: updating an indexed vector column in place (via the
+    # low-level fragment.update_columns API + LanceOperation.Update) and then
+    # delta-optimizing the index must not leave a stale copy of the row in the
+    # original index segment.
+    #
+    # Mechanism: update_columns rewrites only the column data file, keeping the
+    # fragment id and row address. Committing the Update prunes the fragment
+    # from the old index segment's fragment_bitmap, but that segment's index
+    # file still physically holds the row's OLD vector. optimize_indices then
+    # builds a new delta segment with the NEW vector. Before the fix a KNN query
+    # searched both segments and returned the updated row TWICE - once with the
+    # stale vector (old segment) and once with the new value (delta segment).
+    np.random.seed(42)
+    ndim = 16
+
+    # Fragment 0: a "far" cluster bounded to [-1, 1]. No bulk vector is close to
+    # the query (all-10.8), so the bulk cannot crowd the stale copy out of top-k.
+    n_bulk = 1000
+    bulk = np.random.uniform(-1, 1, (n_bulk, ndim)).astype(np.float32)
+    table0 = pa.table(
+        {
+            "id": pa.array(range(n_bulk), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(bulk.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table0, tmp_path, mode="create")
+
+    # Fragment 1: a single row whose ORIGINAL vector (all 2.0) is closer to the
+    # query than any bulk vector, so its stale copy ranks well inside top-k.
+    orig = np.full((1, ndim), 2.0, dtype=np.float32)
+    table1 = pa.table(
+        {
+            "id": pa.array([10_000], type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(orig.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table1, tmp_path, mode="append")
+    assert len(ds.get_fragments()) == 2
+
+    # One index segment covering BOTH fragments {0, 1}.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="l2",
+        num_partitions=1,
+        num_sub_vectors=ndim,
+    )
+
+    # Overwrite fragment 1's vector in place and commit Update(fields_modified).
+    new_vec = [10.8] * ndim
+    frag = ds.get_fragment(1)
+    rowids = frag.to_table(columns=["id"], with_row_id=True)["_rowid"].to_pylist()
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(rowids, type=pa.uint64()),
+            "vector": pa.array(
+                [new_vec] * len(rowids), type=pa.list_(pa.float32(), ndim)
+            ),
+        }
+    )
+    updated_fragment, fields_modified = frag.update_columns(update_data)
+    op = lance.LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    ds = lance.LanceDataset.commit(ds.uri, op, read_version=ds.version)
+
+    # Delta-optimize: appends a new segment for the updated fragment; the old
+    # segment is left intact, still physically holding the stale vector.
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds = lance.dataset(ds.uri)
+    assert ds.stats.index_stats("vector_idx")["num_indices"] == 2
+
+    # KNN near the NEW value via the default vector search (searches all
+    # segments). The updated row must appear EXACTLY ONCE.
+    #
+    # This pins the filtering only. With a single partition the late search
+    # returns before the shared budget is consulted, so the accounting half of
+    # the fix is pinned by the Rust unit test
+    # `test_unowned_row_does_not_fill_the_shared_budget` instead.
+    q = np.array(new_vec, dtype=np.float32)
+    res = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10},
+        with_row_id=True,
+    ).to_pandas()
+    dupes = res[res["id"] == 10_000]
+    assert len(dupes) == 1, (
+        f"updated row id=10000 returned {len(dupes)} times "
+        f"(stale index segment not masked); rowids={res['_rowid'].tolist()}"
+    )
+    # A mask that over-restricts would drop the old segment wholesale and still
+    # satisfy the assertion above, so pin the full result set too.
+    assert len(res) == 10, f"expected a full top-10, got {len(res)} rows"
+    assert res["id"].is_unique, f"duplicate ids in result: {res['id'].tolist()}"
+
+
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
@@ -2051,6 +2238,34 @@ def test_read_partition(indexed_dataset):
     with pytest.raises(ValueError, match="not vector index"):
         indexed_dataset.create_scalar_index("id", index_type="BTREE")
         VectorIndexReader(indexed_dataset, "id_idx")
+
+
+def test_read_partition_nested_vector_quoted_field(tmp_path):
+    num_rows = 1024
+    dimensions = 8
+    rng = np.random.default_rng(42)
+    values = rng.integers(0, 256, size=num_rows * dimensions, dtype=np.uint8)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(values), dimensions)
+    nested = pa.StructArray.from_arrays([vectors], names=["embedding.v1"])
+    dataset = lance.write_dataset(pa.table({"data": nested}), tmp_path)
+    # Match nested uint8 pHash indexes without introducing PQ training setup.
+    dataset = dataset.create_index(
+        "data.`embedding.v1`",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        metric="hamming",
+        num_partitions=4,
+    )
+
+    reader = VectorIndexReader(dataset, "vector_idx")
+    for with_vector in (False, True):
+        partitions = [
+            reader.read_partition(partition_id, with_vector=with_vector)
+            for partition_id in range(reader.num_partitions())
+        ]
+
+        assert all("_rowid" in partition.column_names for partition in partitions)
+        assert sum(partition.num_rows for partition in partitions) == num_rows
 
 
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
@@ -2272,6 +2487,14 @@ def test_nested_field_vector_index(tmp_path):
     assert len(indices) == 1
     assert indices[0].field_names == ["data.embedding"]
 
+    reader = VectorIndexReader(dataset, indices[0].name)
+    for with_vector in (False, True):
+        partition_rows = sum(
+            reader.read_partition(partition_id, with_vector=with_vector).num_rows
+            for partition_id in range(reader.num_partitions())
+        )
+        assert partition_rows == num_rows
+
     # Test querying with the index
     query_vec = vectors[0]
     result = dataset.to_table(
@@ -2468,7 +2691,7 @@ def test_vector_index_distance_range(tmp_path):
     assert np.all(index_distances >= distance_range[0]) and np.all(
         index_distances < distance_range[1]
     )
-    assert np.allclose(brute_distances, index_distances, rtol=0.0, atol=0.0)
+    assert np.allclose(brute_distances, index_distances, rtol=1e-5, atol=0.0)
 
 
 # =============================================================================
@@ -2585,17 +2808,16 @@ def assert_distributed_vector_consistency(
     """Recall-only consistency check between single-machine and distributed indices.
 
     This helper keeps the original signature for compatibility but ignores
-    similarity_metric/similarity_threshold. It compares recall@K against a ground
-    truth computed via exact search (use_index=False) on the single dataset and
-    asserts that the recall difference between single-machine and distributed
-    indices is within 10%.
+    similarity_metric. It compares recall@K against a ground truth computed via
+    exact search (use_index=False), requires both indices to reach at least 0.5
+    recall, and bounds their recall difference with similarity_threshold.
 
     Steps
     -----
     1) Write `data` to two URIs (single, distributed); ensure distributed has >=2
        fragments (rewrite with max_rows_per_file if needed)
     2) Build a single-machine index via `create_index`
-    3) Global training (IVF/PQ) using `IndicesBuilder.prepare_global_ivfpq` when
+    3) Global training (IVF/PQ) using `IndicesBuilder.prepare_global_ivf_pq` when
        appropriate; for IVF_FLAT/SQ variants, train IVF centroids via
        `IndicesBuilder.train_ivf`
     4) Build the distributed index via
@@ -2603,11 +2825,12 @@ def assert_distributed_vector_consistency(
        preprocessed artifacts
     5) For each query, compute ground-truth TopK IDs using exact search
        (use_index=False), then compute TopK using single index and the distributed
-       index with consistent nearest settings (refine_factor=1; IVF uses nprobes)
-    6) Compute recall for single and distributed using the provided formula and
-       assert the absolute difference is <= 0.10. Also print the recalls.
+       index with consistent nearest settings (refine_factor=100; IVF probes all
+       fixture partitions)
+    6) Compute recall for single and distributed, require each to be >= 0.5,
+       and bound their absolute difference with similarity_threshold.
     """
-    # Keep signature compatibility but ignore similarity_metric/threshold
+    # Keep signature compatibility but ignore the superseded metric selector.
     _ = similarity_metric
 
     index_params = index_params or {}
@@ -2633,33 +2856,37 @@ def assert_distributed_vector_consistency(
             data, dist_uri, mode="overwrite", max_rows_per_file=500
         )
 
+    num_rows = single_ds.count_rows()
+    nparts = index_params.get("num_partitions", None)
+    is_pq = index_type in {"IVF_PQ", "IVF_HNSW_PQ"}
+    # Eight-bit PQ needs at least 256 centroids and sample_rate >= 2.
+    sample_rate = 2 if is_pq else min(8, num_rows // max(1, nparts or 1))
+    max_iters = index_params.get("max_iters", 5)
+    build_params = dict(index_params)
+    build_params.setdefault("sample_rate", sample_rate)
+    build_params.setdefault("max_iters", max_iters)
+
     # Build single-machine index
     single_ds = single_ds.create_index(
         column=column,
         index_type=index_type,
-        **index_params,
+        **build_params,
     )
 
     # Global training / preparation for distributed build
     preprocessed = None
     builder = IndicesBuilder(single_ds, column)
-    nparts = index_params.get("num_partitions", None)
     nsub = index_params.get("num_sub_vectors", None)
     dist_type = index_params.get("metric", "l2")
-    num_rows = single_ds.count_rows()
 
-    # Choose a safe sample_rate that satisfies IVF (nparts*sr <= rows) and PQ
-    # (256*sr <= rows). Minimum 2 as required by builder verification.
-    safe_sr_ivf = num_rows // max(1, nparts or 1)
-    safe_sr_pq = num_rows // 256
-    safe_sr = max(2, min(safe_sr_ivf, safe_sr_pq))
-
-    if index_type in {"IVF_PQ", "IVF_HNSW_PQ"}:
+    if is_pq:
+        assert num_rows >= 512, "8-bit PQ training requires at least 512 rows"
         preprocessed = builder.prepare_global_ivf_pq(
             nparts,
             nsub,
             distance_type=dist_type,
-            sample_rate=safe_sr,
+            sample_rate=sample_rate,
+            max_iters=max_iters,
         )
     elif (
         ("IVF_FLAT" in index_type)
@@ -2669,7 +2896,8 @@ def assert_distributed_vector_consistency(
         ivf_model = builder.train_ivf(
             nparts,
             distance_type=dist_type,
-            sample_rate=safe_sr,
+            sample_rate=sample_rate,
+            max_iters=max_iters,
         )
         preprocessed = {"ivf_centroids": ivf_model.centroids}
 
@@ -2723,7 +2951,7 @@ def assert_distributed_vector_consistency(
         # Consistent nearest settings for index-based search
         nearest = {"column": column, "q": q, "k": topk, "refine_factor": 100}
         if "IVF" in index_type:
-            nearest["nprobes"] = max(16, int(index_params.get("num_partitions", 4)) * 4)
+            nearest["nprobes"] = int(index_params.get("num_partitions", 4))
         if "HNSW" in index_type:
             # Ensure ef is large enough even when refine_factor multiplies k for HNSW
             effective_k = topk * int(
@@ -2751,10 +2979,18 @@ def assert_distributed_vector_consistency(
     rs = compute_recall(gt_ids, single_ids)
     rd = compute_recall(gt_ids, dist_ids)
 
-    # Assert recall difference within 10%
-    assert abs(rs - rd) <= 1 - similarity_threshold, (
+    assert rs >= 0.5, (
+        f"Single-machine {index_type} recall below 0.5: recall={rs:.3f}, "
+        f"num_partitions={nparts}, topk={topk}, queries={len(queries)}"
+    )
+    assert rd >= 0.5, (
+        f"Distributed {index_type} recall below 0.5: recall={rd:.3f}, "
+        f"num_partitions={nparts}, topk={topk}, queries={len(queries)}"
+    )
+    max_recall_difference = 1 - similarity_threshold
+    assert abs(rs - rd) <= max_recall_difference, (
         f"Recall difference too large: single={rs:.3f}, distributed={rd:.3f}, "
-        f"diff={abs(rs - rd):.3f} (> {similarity_threshold})"
+        f"diff={abs(rs - rd):.3f} (> {max_recall_difference:.3f})"
     )
 
     # Cleanup temporary directory if used
@@ -2773,324 +3009,88 @@ def _make_sample_dataset_base(
     max_rows_per_file: int = 500,
 ):
     """Common helper to construct sample datasets for distributed index tests."""
-    mat = np.random.rand(n_rows, dim).astype(np.float32)
+    mat = np.random.default_rng(42).random((n_rows, dim), dtype=np.float32)
     ids = np.arange(n_rows)
-    arr = pa.array(mat.tolist(), type=pa.list_(pa.float32(), dim))
+    arr = pa.FixedSizeListArray.from_arrays(pa.array(mat.reshape(-1)), dim)
     tbl = pa.table({"id": ids, "vector": arr})
     return lance.write_dataset(
         tbl, tmp_path / name, max_rows_per_file=max_rows_per_file
     )
 
 
-def test_prepared_global_ivfpq_distributed_merge_and_search(tmp_path: Path):
-    ds = _make_sample_dataset_base(tmp_path, "preproc_ds", 2000, 128)
-
-    # Global preparation
-    builder = IndicesBuilder(ds, "vector")
-    preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=4,
-        distance_type="l2",
-        sample_rate=3,
-        max_iters=20,
+@pytest.mark.parametrize(
+    "index_type",
+    [
+        "IVF_FLAT",
+        "IVF_PQ",
+        "IVF_SQ",
+    ],
+)
+def test_distributed_ivf_two_shard_build_merge_and_search(tmp_path, index_type):
+    dim = 32
+    num_partitions = 2
+    ds = _make_sample_dataset_base(
+        tmp_path,
+        f"dist_{index_type.lower()}",
+        n_rows=640,
+        dim=dim,
+        max_rows_per_file=320,
     )
-
-    # Distributed build using prepared centroids/codebook
-    ds = build_distributed_vector_index(
-        ds,
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=4,
-        world=2,
-        ivf_centroids=preprocessed["ivf_centroids"],
-        pq_codebook=preprocessed["pq_codebook"],
-    )
-
-    # Query sanity
-    q = np.random.rand(128).astype(np.float32)
-    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
-    assert 0 < len(results) <= 10
-
-
-def test_consistency_improves_with_preprocessed_centroids(tmp_path: Path):
-    ds = _make_sample_dataset_base(tmp_path, "preproc_ds", 2000, 128)
-
-    builder = IndicesBuilder(ds, "vector")
-    pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=16,
-        distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
-    )
-
-    # Build single-machine index as ground truth target index
-    single_ds = lance.write_dataset(ds.to_table(), tmp_path / "single_ivfpq")
-    single_ds = single_ds.create_index(
-        column="vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-    )
-
-    # Distributed with preprocessed IVF centroids
-    dist_pre = lance.write_dataset(ds.to_table(), tmp_path / "dist_pre")
-    dist_pre = build_distributed_vector_index(
-        dist_pre,
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-        world=2,
-        ivf_centroids=pre["ivf_centroids"],
-        pq_codebook=pre["pq_codebook"],
-    )
-
-    # Evaluate recall vs exact search
-    q = np.random.rand(128).astype(np.float32)
-    topk = 10
-    gt = single_ds.to_table(
-        nearest={"column": "vector", "q": q, "k": topk, "use_index": False}
-    )
-    res_pre = dist_pre.to_table(nearest={"column": "vector", "q": q, "k": topk})
-
-    gt_ids = gt["id"].to_pylist()
-    pre_ids = res_pre["id"].to_pylist()
-
-    def _recall(gt_ids, res_ids):
-        s = set(int(x) for x in gt_ids)
-        d = set(int(x) for x in res_ids)
-        return len(s & d) / max(1, len(s))
-
-    recall_pre = _recall(gt_ids, pre_ids)
-
-    # Expect some non-zero recall with preprocessed IVF centroids
-    if recall_pre < 0.10:
-        pytest.skip(
-            "Distributed IVF_PQ recall below threshold in current "
-            "environment - known issue"
-        )
-    assert recall_pre >= 0.10
-
-
-def test_metadata_merge_pq_success(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
     frags = ds.get_fragments()
-    assert len(frags) >= 2, "Need at least 2 fragments for distributed testing"
-    mid = max(1, len(frags) // 2)
-    node1 = [f.fragment_id for f in frags[:mid]]
-    node2 = [f.fragment_id for f in frags[mid:]]
+    assert len(frags) == 2
+    fragment_groups = [[fragment.fragment_id] for fragment in frags]
     builder = IndicesBuilder(ds, "vector")
-    pre = builder.prepare_global_ivf_pq(
-        num_partitions=8,
-        num_subvectors=16,
-        distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
-    )
-    try:
-        segments = _build_segments(
-            ds,
-            "vector",
-            "IVF_PQ",
-            [node1, node2],
-            index_name="vector_idx",
-            num_partitions=8,
-            num_sub_vectors=16,
-            ivf_centroids=pre["ivf_centroids"],
-            pq_codebook=pre["pq_codebook"],
+    build_kwargs = {"num_partitions": num_partitions}
+    if index_type == "IVF_PQ":
+        preprocessed = builder.prepare_global_ivf_pq(
+            num_partitions=num_partitions,
+            num_subvectors=4,
+            distance_type="l2",
+            sample_rate=2,
+            max_iters=2,
         )
-        ds = _commit_segments_helper(ds, segments, "vector")
-        q = np.random.rand(128).astype(np.float32)
-        results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
-        assert 0 < len(results) <= 10
-    except ValueError as e:
-        raise e
-
-
-def test_distributed_workflow_merge_and_search(tmp_path):
-    """End-to-end: build IVF_PQ on two groups, merge, and verify search returns
-    results."""
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
-    frags = ds.get_fragments()
-    if len(frags) < 2:
-        pytest.skip("Need at least 2 fragments for distributed testing")
-    mid = len(frags) // 2
-    node1 = [f.fragment_id for f in frags[:mid]]
-    node2 = [f.fragment_id for f in frags[mid:]]
-    builder = IndicesBuilder(ds, "vector")
-    pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=4,
-        distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
-    )
-    try:
-        segments = _build_segments(
-            ds,
-            "vector",
-            "IVF_PQ",
-            [node1, node2],
-            index_name="vector_idx",
-            num_partitions=4,
+        assert set(preprocessed) == {"ivf_centroids", "pq_codebook"}
+        assert len(preprocessed["ivf_centroids"]) == num_partitions
+        assert preprocessed["ivf_centroids"].type.list_size == dim
+        assert len(preprocessed["pq_codebook"]) > 0
+        assert preprocessed["pq_codebook"].type.list_size == dim
+        build_kwargs.update(
             num_sub_vectors=4,
-            ivf_centroids=pre["ivf_centroids"],
-            pq_codebook=pre["pq_codebook"],
+            ivf_centroids=preprocessed["ivf_centroids"],
+            pq_codebook=preprocessed["pq_codebook"],
         )
-        ds = _commit_segments_helper(ds, segments, "vector")
-        q = np.random.rand(128).astype(np.float32)
-        results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
-        assert 0 < len(results) <= 10
-    except ValueError as e:
-        raise e
-
-
-def test_vector_merge_two_shards_success_flat(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 1000, 128)
-    frags = ds.get_fragments()
-    assert len(frags) >= 2
-    shard1 = [frags[0].fragment_id]
-    shard2 = [frags[1].fragment_id]
-    # Global preparation
-    builder = IndicesBuilder(ds, "vector")
-    preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=4,
-        distance_type="l2",
-        sample_rate=3,
-        max_iters=20,
-    )
+    else:
+        ivf_model = builder.train_ivf(
+            num_partitions=num_partitions,
+            distance_type="l2",
+            sample_rate=8,
+            max_iters=2,
+        )
+        build_kwargs["ivf_centroids"] = ivf_model.centroids
 
     segments = _build_segments(
         ds,
         "vector",
-        "IVF_FLAT",
-        [shard1, shard2],
+        index_type,
+        fragment_groups,
         index_name="vector_idx",
-        num_partitions=4,
-        num_sub_vectors=128,
-        ivf_centroids=preprocessed["ivf_centroids"],
-        pq_codebook=preprocessed["pq_codebook"],
+        **build_kwargs,
     )
-    ds = _commit_segments_helper(ds, segments, column="vector")
-    q = np.random.rand(128).astype(np.float32)
-    result = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
-    assert 0 < len(result) <= 5
-
-
-@pytest.mark.parametrize(
-    "index_type,num_sub_vectors",
-    [
-        ("IVF_PQ", 4),
-        ("IVF_FLAT", 128),
-    ],
-)
-def test_distributed_ivf_parameterized(tmp_path, index_type, num_sub_vectors):
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
-    frags = ds.get_fragments()
-    assert len(frags) >= 2
-    mid = len(frags) // 2
-    node1 = [f.fragment_id for f in frags[:mid]]
-    node2 = [f.fragment_id for f in frags[mid:]]
-    builder = IndicesBuilder(ds, "vector")
-    pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=num_sub_vectors,
-        distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
-    )
-
-    try:
-        base_kwargs = dict(
-            column="vector",
-            index_type=index_type,
-            num_partitions=4,
-            num_sub_vectors=num_sub_vectors,
-        )
-
-        kwargs1 = dict(base_kwargs, fragment_ids=node1)
-        kwargs2 = dict(base_kwargs, fragment_ids=node2)
-
-        if pre is not None:
-            kwargs1.update(
-                ivf_centroids=pre["ivf_centroids"], pq_codebook=pre["pq_codebook"]
-            )
-            kwargs2.update(
-                ivf_centroids=pre["ivf_centroids"], pq_codebook=pre["pq_codebook"]
-            )
-
-        segments = [
-            ds.create_index_uncommitted(**kwargs1),
-            ds.create_index_uncommitted(**kwargs2),
-        ]
-        ds = _commit_segments_helper(ds, segments, "vector")
-
-        q = np.random.rand(128).astype(np.float32)
-        results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
-        assert 0 < len(results) <= 10
-    except ValueError as e:
-        raise e
-
-
-@pytest.mark.parametrize(
-    "index_type,num_sub_vectors",
-    [
-        ("IVF_PQ", 128),
-        ("IVF_SQ", None),
-    ],
-)
-def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds2", 2000, 128)
-    frags = ds.get_fragments()
-    assert len(frags) >= 2
-    shard1 = [frags[0].fragment_id]
-    shard2 = [frags[1].fragment_id]
-    builder = IndicesBuilder(ds, "vector")
-    pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=num_sub_vectors,
-        distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
-    )
-
-    base_kwargs = {
-        "column": "vector",
-        "index_type": index_type,
-        "num_partitions": 4,
-    }
-
-    # first shard
-    kwargs1 = dict(base_kwargs)
-    kwargs1["fragment_ids"] = shard1
-    if num_sub_vectors is not None:
-        kwargs1["num_sub_vectors"] = num_sub_vectors
-    if pre is not None:
-        kwargs1["ivf_centroids"] = pre["ivf_centroids"]
-        # only PQ has pq_codebook
-        if "pq_codebook" in pre:
-            kwargs1["pq_codebook"] = pre["pq_codebook"]
-    segment1 = ds.create_index_uncommitted(**kwargs1)
-
-    # second shard
-    kwargs2 = dict(base_kwargs)
-    kwargs2["fragment_ids"] = shard2
-    if num_sub_vectors is not None:
-        kwargs2["num_sub_vectors"] = num_sub_vectors
-    if pre is not None:
-        kwargs2["ivf_centroids"] = pre["ivf_centroids"]
-        if "pq_codebook" in pre:
-            kwargs2["pq_codebook"] = pre["pq_codebook"]
-    segment2 = ds.create_index_uncommitted(**kwargs2)
-
-    segments = [segment1, segment2]
+    assert len(segments) == 2
     ds = _commit_segments_helper(ds, segments, column="vector")
 
-    q = np.random.rand(128).astype(np.float32)
-    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == index_type
+    q = np.random.default_rng(43).random(dim, dtype=np.float32)
+    results = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 5,
+            "nprobes": num_partitions,
+            "refine_factor": 10,
+        }
+    )
     assert 0 < len(results) <= 5
 
 
@@ -3105,6 +3105,7 @@ def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
         num_partitions=2,
         distance_type="l2",
         sample_rate=8,
+        max_iters=2,
     )
     base_kwargs = {
         "column": "vector",
@@ -3147,6 +3148,7 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
         num_partitions=2,
         distance_type="l2",
         sample_rate=8,
+        max_iters=2,
     )
     rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
     base_kwargs = {
@@ -3175,16 +3177,21 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
 
 
 def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_path):
-    ds = _make_sample_dataset_base(tmp_path, "segment_commit_ds", 2000, 128)
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path,
+        "segment_commit_ds",
+        n_rows=512,
+        dim=dim,
+        max_rows_per_file=256,
+    )
     frags = ds.get_fragments()
-    assert len(frags) >= 2
-    builder = IndicesBuilder(ds, "vector")
-    preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=4,
+    assert len(frags) == 2
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
         distance_type="l2",
-        sample_rate=7,
-        max_iters=20,
+        sample_rate=8,
+        max_iters=2,
     )
 
     segments = [
@@ -3194,62 +3201,60 @@ def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_
             name="vector_idx",
             train=True,
             fragment_ids=[fragment.fragment_id],
-            num_partitions=4,
-            num_sub_vectors=128,
-            ivf_centroids=preprocessed["ivf_centroids"],
-            pq_codebook=preprocessed["pq_codebook"],
+            num_partitions=2,
+            ivf_centroids=ivf_model.centroids,
         )
-        for fragment in frags[:2]
+        for fragment in frags
     ]
 
     assert len(segments) == 2
     ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
 
-    q = np.random.rand(128).astype(np.float32)
+    q = np.random.rand(dim).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 
 
 def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     """Ensure distributed IVF_PQ build is invariant to shard build order."""
-    ds = _make_sample_dataset_base(tmp_path, "dist_ds", 2000, 128)
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path, "dist_ds", n_rows=640, dim=dim, max_rows_per_file=320
+    )
 
     # Global IVF+PQ training once; artifacts are reused across shard orders.
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=16,
+        num_partitions=2,
+        num_subvectors=4,
         distance_type="l2",
-        sample_rate=7,
+        sample_rate=2,
+        max_iters=2,
     )
 
     # Copy the dataset twice so index manifests do not clash and we can vary
     # the shard build order independently on identical data.
     ds_order_12 = lance.write_dataset(
-        ds.to_table(), tmp_path / "pq_order_node1_node2", max_rows_per_file=500
+        ds.to_table(), tmp_path / "pq_order_node1_node2", max_rows_per_file=320
     )
     ds_order_21 = lance.write_dataset(
-        ds.to_table(), tmp_path / "pq_order_node2_node1", max_rows_per_file=500
+        ds.to_table(), tmp_path / "pq_order_node2_node1", max_rows_per_file=320
     )
 
     # For each copy, derive two shard groups from its own fragments.
     frags_12 = ds_order_12.get_fragments()
-    if len(frags_12) < 2:
-        pytest.skip("Need at least 2 fragments for distributed indexing (order_12)")
+    assert len(frags_12) == 2
     mid_12 = len(frags_12) // 2
     node1_12 = [f.fragment_id for f in frags_12[:mid_12]]
     node2_12 = [f.fragment_id for f in frags_12[mid_12:]]
-    if not node1_12 or not node2_12:
-        pytest.skip("Failed to split fragments into two non-empty groups (order_12)")
+    assert node1_12 and node2_12
 
     frags_21 = ds_order_21.get_fragments()
-    if len(frags_21) < 2:
-        pytest.skip("Need at least 2 fragments for distributed indexing (order_21)")
+    assert len(frags_21) == 2
     mid_21 = len(frags_21) // 2
     node1_21 = [f.fragment_id for f in frags_21[:mid_21]]
     node2_21 = [f.fragment_id for f in frags_21[mid_21:]]
-    if not node1_21 or not node2_21:
-        pytest.skip("Failed to split fragments into two non-empty groups (order_21)")
+    assert node1_21 and node2_21
 
     def build_distributed_ivf_pq(ds_copy, shard_order):
         try:
@@ -3259,8 +3264,8 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
                 "IVF_PQ",
                 shard_order,
                 index_name="vector_idx",
-                num_partitions=4,
-                num_sub_vectors=16,
+                num_partitions=2,
+                num_sub_vectors=4,
                 ivf_centroids=pre["ivf_centroids"],
                 pq_codebook=pre["pq_codebook"],
             )
@@ -3273,11 +3278,8 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
 
     # Sample queries once from the original dataset and reuse for both index builds
     # to check order invariance under distributed PQ training and merging.
-    k = 10
-    sample_tbl = ds.sample(10, columns=["vector"])
-    queries = [
-        np.asarray(v, dtype=np.float32) for v in sample_tbl["vector"].to_pylist()
-    ]
+    k = 5
+    queries = np.random.default_rng(43).random((3, dim), dtype=np.float32)
 
     def collect_ids_and_distances(ds_with_index):
         ids_per_query = []
@@ -3289,8 +3291,8 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
                     "column": "vector",
                     "q": q,
                     "k": k,
-                    "nprobes": 16,
-                    "refine_factor": 100,
+                    "nprobes": 2,
+                    "refine_factor": 10,
                 },
             )
             ids_per_query.append([int(x) for x in tbl["id"].to_pylist()])

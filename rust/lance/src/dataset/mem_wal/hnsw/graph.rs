@@ -231,6 +231,17 @@ impl LevelLinks {
         }
     }
 
+    /// Heap bytes for one level, counting `published` at its full width even
+    /// while empty — the build fills it, and the caller budgets against a
+    /// ceiling where over-counting is the safe direction.
+    fn allocated_bytes(max_neighbors: usize) -> usize {
+        // Arc<Vec<u32>>: strong + weak refcounts, the Vec header, then the ids.
+        let published = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<u32>>()
+            + max_neighbors * std::mem::size_of::<u32>();
+        published + max_neighbors * std::mem::size_of::<ScoredPoint>()
+    }
+
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
         self.published.store(Arc::new(
             ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
@@ -257,6 +268,16 @@ impl Node {
             levels,
             dirty_levels: AtomicU64::new(0),
         }
+    }
+
+    /// Heap bytes held by a node of `target_level`, excluding the `Node` itself
+    /// (which lives inline in the graph's node arena).
+    fn allocated_bytes(target_level: u16, m: usize) -> usize {
+        let levels = target_level as usize + 1;
+        levels * std::mem::size_of::<LevelLinks>()
+            + (0..=target_level)
+                .map(|level| LevelLinks::allocated_bytes(max_neighbors(m, level)))
+                .sum::<usize>()
     }
 
     fn has_level(&self, level: u16) -> bool {
@@ -292,6 +313,12 @@ pub struct HnswGraph {
     visible_len: AtomicUsize,
     visited_pool: ArrayQueue<VisitedList>,
     packed_level0: ArcSwap<PackedLevel>,
+    /// Heap bytes of the node arena and visited pool. Fixed at construction:
+    /// both are sized from `capacity`, not from `len()`.
+    base_bytes: usize,
+    /// Heap bytes of the current `packed_level0` snapshot, which is rebuilt
+    /// wholesale on each level-0 publish rather than grown.
+    packed_bytes: AtomicUsize,
 }
 
 impl HnswGraph {
@@ -309,16 +336,18 @@ impl HnswGraph {
 
         let mut rng = SmallRng::seed_from_u64(params.seed);
         let mut nodes = Vec::with_capacity(capacity);
+        let mut node_bytes = 0;
         for id in 0..capacity {
             let target_level = if id == 0 {
                 0
             } else {
                 random_level(&params, &mut rng)
             };
+            node_bytes += Node::allocated_bytes(target_level, params.m);
             nodes.push(Node::new(target_level, params.m));
         }
 
-        let pool_size = rayon::current_num_threads().max(1) * 2;
+        let pool_size = visited_pool_size();
         let visited_pool = ArrayQueue::new(pool_size);
         for _ in 0..pool_size {
             let _ = visited_pool.push(VisitedList::new(0));
@@ -326,6 +355,9 @@ impl HnswGraph {
 
         Ok(Self {
             params,
+            base_bytes: capacity * std::mem::size_of::<Node>()
+                + node_bytes
+                + visited_pool_bytes(capacity),
             nodes,
             build_entry_point: AtomicU32::new(0),
             build_max_level: AtomicU16::new(0),
@@ -335,7 +367,50 @@ impl HnswGraph {
             visible_len: AtomicUsize::new(0),
             visited_pool,
             packed_level0: ArcSwap::from_pointee(PackedLevel::empty()),
+            packed_bytes: AtomicUsize::new(0),
         })
+    }
+
+    /// Upper bound on the graph's dominant heap allocations.
+    ///
+    /// Near-constant from the first insert rather than proportional to `len()`:
+    /// the node arena is allocated in full at construction, sized by `capacity`.
+    /// Callers budgeting memtable memory must account for this the moment a
+    /// vector memtable takes its first row.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.base_bytes + self.packed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a graph of this shape,
+    /// answerable before one is built.
+    ///
+    /// Everything `try_new` allocates is sized from `capacity`; the only random
+    /// input is how nodes divide across levels, and that division is a
+    /// geometric ladder — every node holds level 0, and the share reaching each
+    /// level above it falls by a factor of `m`. Walking that ladder lands close
+    /// to the built graph instead of sampling it, and level 0 — which dominates
+    /// — is not an estimate at all.
+    ///
+    /// Exists because the allocation is committed well before it happens: the
+    /// first vector row into a memtable materializes the whole graph. Charging
+    /// it only from that row on would put the largest single allocation in a
+    /// vector memtable beyond the reach of admission control.
+    pub(crate) fn reserved_bytes(capacity: usize, params: &BuildParams) -> usize {
+        // Guard the ladder's divisor rather than `params.m` itself: `validate`
+        // rejects m < 2, but this is reachable before that runs.
+        let ratio = params.m.max(2);
+        let mut reaching = capacity;
+        let mut links = 0;
+        for level in 0..params.max_level {
+            links += reaching
+                * (std::mem::size_of::<LevelLinks>()
+                    + LevelLinks::allocated_bytes(max_neighbors(params.m, level)));
+            reaching /= ratio;
+            if reaching == 0 {
+                break;
+            }
+        }
+        capacity * std::mem::size_of::<Node>() + links + visited_pool_bytes(capacity)
     }
 
     /// Number of nodes visible to readers.
@@ -594,9 +669,12 @@ impl HnswGraph {
     }
 
     fn validate_source(&self, vectors: &impl VectorSource, needed_len: usize) -> Result<()> {
+        // Not caller input: the graph was sized below what the memtable holds.
+        // See the matching note in `storage.rs::append_batch`.
         if needed_len > self.nodes.len() {
-            return Err(Error::invalid_input(format!(
-                "graph capacity {} exhausted: need {needed_len}",
+            return Err(Error::internal(format!(
+                "HNSW graph capacity {} exhausted: need {needed_len}; \
+                 the graph is sized below the memtable's row capacity",
                 self.nodes.len()
             )));
         }
@@ -1051,9 +1129,13 @@ impl HnswGraph {
             offsets.push(neighbors.len());
         }
 
+        let packed_bytes = offsets.capacity() * std::mem::size_of::<usize>()
+            + neighbors.capacity() * std::mem::size_of::<u32>();
+
         // ArcSwap reclaims the prior snapshot once no reader guard holds it.
         self.packed_level0
             .store(Arc::new(PackedLevel { offsets, neighbors }));
+        self.packed_bytes.store(packed_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1081,6 +1163,20 @@ fn random_level(params: &BuildParams, rng: &mut SmallRng) -> u16 {
 
 fn max_neighbors(m: usize, level: u16) -> usize {
     if level == 0 { m * 2 } else { m }
+}
+
+/// One list per worker, doubled so a searcher never blocks on the queue.
+fn visited_pool_size() -> usize {
+    rayon::current_num_threads().max(1) * 2
+}
+
+/// Heap the visited pool settles at for a graph of `capacity` nodes. The lists
+/// are pushed empty but `VisitedList::reset` resizes each to one bit per node
+/// on first use, so the pool is charged at its grown size from the start.
+fn visited_pool_bytes(capacity: usize) -> usize {
+    visited_pool_size()
+        * (std::mem::size_of::<VisitedList>()
+            + capacity.div_ceil(WORD_BITS) * std::mem::size_of::<usize>())
 }
 
 #[derive(Debug)]

@@ -35,7 +35,11 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
+from .lance import (
+    RowIdSequence as RowIdSequence,
+)
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
+from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
         ColumnOrdering,
         DatasetBasePath,
         LanceDataset,
+        LanceOperation,
         LanceScanner,
         ReaderLike,
         Transaction,
@@ -73,11 +78,26 @@ class FragmentMetadata:
     deletion_file : Optional[DeletionFile]
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
-        The row id metadata, if any.
+        The stable row ids of this fragment's rows, if any. When committing a
+        transaction by hand on a dataset that uses stable row ids, set this to
+        carry the ids of rewritten rows over to their new fragment; build it with
+        :class:`RowIdSequence`. Rows left without an id are treated as newly
+        inserted and are assigned ids during the commit.
     created_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row created at version metadata, if any.
+        The dataset version each row was created in. Derived during the commit
+        from ``row_id_meta`` -- a rewritten row keeps the version it first
+        appeared in -- so leave this as None when building a transaction. Any
+        value set here is ignored for newly written fragments.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row last updated at version metadata, if any.
+        The dataset version each row was last modified in. Derived during the
+        commit, like ``created_at_version_meta``; leave this as None. It cannot
+        be computed ahead of time because a commit that loses a race is retried
+        against a later version than the one it was built for.
+    overlays : List[LanceOperation.DataOverlayFile]
+        The data overlay files layered over this fragment's base data, if any.
+        Overlays are created via :class:`LanceOperation.DataOverlay`; they are
+        carried here so they survive operations that round-trip fragment
+        metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
     """
 
     id: int
@@ -87,6 +107,7 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
 
     @property
     def num_deletions(self) -> int:
@@ -110,12 +131,25 @@ class FragmentMetadata:
 
     def to_json(self) -> dict:
         """Get this as a simple JSON-serializable dictionary."""
-        files = [asdict(f) for f in self.files]
-        for f in files:
-            f["path"] = f.pop("_path")
+
+        def _data_file_to_json(f: DataFile) -> dict:
+            d = asdict(f)
+            d["path"] = d.pop("_path")
+            return d
+
+        files = [_data_file_to_json(f) for f in self.files]
+        overlays = [
+            dict(
+                data_file=_data_file_to_json(o.data_file),
+                offsets=o.offsets,
+                committed_version=o.committed_version,
+            )
+            for o in self.overlays
+        ]
         return dict(
             id=self.id,
             files=files,
+            overlays=overlays,
             physical_rows=self.physical_rows,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
@@ -159,6 +193,20 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        overlays = []
+        overlays_json = json_data.get("overlays")
+        if overlays_json:
+            from .dataset import LanceOperation
+
+            overlays = [
+                LanceOperation.DataOverlayFile(
+                    data_file=DataFile(**o["data_file"]),
+                    offsets=o["offsets"],
+                    committed_version=o.get("committed_version"),
+                )
+                for o in overlays_json
+            ]
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -167,6 +215,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            overlays=overlays,
         )
 
 
@@ -304,10 +353,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.__repr__()
 
     def __reduce__(self):
-        from .dataset import LanceDataset
-
-        ds = LanceDataset(self._ds.uri, self._ds.version)
-        return LanceFragment, (ds, self.fragment_id)
+        return LanceFragment, (self._ds, self.fragment_id)
 
     @staticmethod
     def create_from_file(
@@ -340,7 +386,7 @@ class LanceFragment(pa.dataset.Fragment):
         data: ReaderLike,
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
@@ -349,6 +395,7 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -369,8 +416,9 @@ class LanceFragment(pa.dataset.Fragment):
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.
-        max_rows_per_group: int, default 1024
-            The maximum number of rows per group in the data file.
+        max_rows_per_group: int, optional, default 1024
+            The maximum number of rows per group in the data file. ``None``
+            leaves the writer default in place.
         progress: FragmentWriteProgress, optional
             *Experimental API*. Progress tracking for writing the fragment. Pass
             a custom class that defines hooks to be called when each fragment is
@@ -397,6 +445,9 @@ class LanceFragment(pa.dataset.Fragment):
         table_id : optional, List[str]
             The table identifier when using a namespace (e.g., ["my_table"]).
             Must be provided together with `namespace_client`.
+        session : optional, Session
+            A session to reuse across operations. The session holds shared
+            caches (metadata and index) and the object store registry.
 
         See Also
         --------
@@ -450,6 +501,7 @@ class LanceFragment(pa.dataset.Fragment):
             storage_options=storage_options,
             namespace_client=namespace_client,
             table_id=table_id,
+            session=session,
         )
 
     @property
@@ -479,6 +531,16 @@ class LanceFragment(pa.dataset.Fragment):
         :meth:`count_rows` instead.
         """
         return self._fragment.physical_rows
+
+    def validate(self) -> None:
+        """
+        Validate the fragment.
+
+        This checks the integrity of the fragment and will raise an exception if
+        the fragment is corrupted. Unlike :meth:`lance.LanceDataset.validate`,
+        which checks every fragment, this validates only this fragment.
+        """
+        self._fragment.validate()
 
     @property
     def physical_schema(self) -> pa.Schema:
@@ -990,12 +1052,12 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
-    def data_files(self):
+    def data_files(self) -> List[DataFile]:
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
 
-    def deletion_file(self):
+    def deletion_file(self) -> Optional[str]:
         """Return the deletion file, if any"""
         return self._fragment.deletion_file()
 
@@ -1021,7 +1083,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[True],
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1036,6 +1098,7 @@ if TYPE_CHECKING:
         allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> Transaction: ...
 
     @overload
@@ -1047,7 +1110,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[False] = False,
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1062,6 +1125,7 @@ if TYPE_CHECKING:
         allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional[Session] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -1073,7 +1137,7 @@ def write_fragments(
     return_transaction: bool = False,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
-    max_rows_per_group: int = 1024,
+    max_rows_per_group: Optional[int] = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
@@ -1088,6 +1152,7 @@ def write_fragments(
     allow_external_blob_outside_bases: bool = False,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -1114,8 +1179,9 @@ def write_fragments(
         "overwrite" to assign new field ids to the schema.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
-    max_rows_per_group : int, default 1024
-        The maximum number of rows per group in the data file.
+    max_rows_per_group : int, optional, default 1024
+        The maximum number of rows per group in the data file. ``None`` leaves
+        the writer default in place.
     max_bytes_per_file : int, default 90 * 1024 * 1024 * 1024
         The max number of bytes to write before starting a new file. This is a
         soft limit. This limit is checked after each group is written, which
@@ -1196,6 +1262,9 @@ def write_fragments(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`.
+    session : optional, Session
+        A session to reuse across operations. The session holds shared caches
+        (metadata and index) and the object store registry.
 
     Returns
     -------
@@ -1232,6 +1301,12 @@ def write_fragments(
             base_store_params = dataset_uri._base_store_params
         if storage_options is None:
             storage_options = dataset_uri._storage_options
+        if session is not None and not session.is_same_as(dataset_uri.session()):
+            raise ValueError(
+                "The provided session is not the destination dataset's own "
+                "session. Please pass the dataset's session or omit the "
+                "'session' parameter."
+            )
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
@@ -1267,6 +1342,7 @@ def write_fragments(
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+        session=session,
     )
 
 

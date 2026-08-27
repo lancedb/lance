@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_CACHE_HITS_METRIC,
+    INDEX_CACHE_MISSES_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+    PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
@@ -17,6 +18,7 @@ use std::task::{Context, Poll};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
@@ -25,15 +27,39 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::FuturesUnordered;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
+use tracing::Instrument;
 
+use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
+
+/// Open fragments on cancellation-safe tasks while preserving the stream's
+/// ordering and readahead bound.
+pub(crate) fn buffered_fragment_opens<S, Open, OpenFuture, Reader>(
+    fragments: S,
+    fragment_readahead: usize,
+    mut open: Open,
+) -> impl Stream<Item = DataFusionResult<Reader>>
+where
+    S: Stream + Send,
+    Open: FnMut(S::Item) -> OpenFuture + Send,
+    OpenFuture: Future<Output = DataFusionResult<Reader>> + Send + 'static,
+    Reader: Send + 'static,
+{
+    fragments
+        .map(move |fragment| {
+            SpawnedTask::spawn(open(fragment).in_current_span()).map(|task_result| {
+                task_result.map_err(|error| DataFusionError::External(Box::new(error)))?
+            })
+        })
+        .buffered(fragment_readahead)
+}
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
@@ -51,6 +77,8 @@ pub(crate) fn build_prefilter(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
+    overlay_block: Option<RowAddrMask>,
+    external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -63,11 +91,21 @@ pub(crate) fn build_prefilter(
         }
         PreFilterSource::None => None,
     };
-    Ok(Arc::new(DatasetPreFilter::new(
-        ds,
-        index_meta,
-        prefilter_loader,
-    )))
+    // Combine the external row-address mask (logical AND) with whatever the
+    // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
+    // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
+    // applies separately to drop index entries staled by a data overlay.
+    let prefilter_loader = match external_mask {
+        Some(mask) => {
+            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+        }
+        None => prefilter_loader,
+    };
+    let mut prefilter = DatasetPreFilter::new(ds, index_meta, prefilter_loader);
+    if let Some(overlay_block) = overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter
@@ -421,10 +459,6 @@ impl ExecutionPlan for ReplayExec {
         "ReplayExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
     }
@@ -521,6 +555,8 @@ pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
+    index_cache_hits: Count,
+    index_cache_misses: Count,
     /// Per-query sink that accumulates exact index-file I/O as partitions are
     /// loaded from storage.  Shared by all clones of this `IndexMetrics`, so
     /// concurrent partition loads all funnel into the same counters.  Published
@@ -535,6 +571,8 @@ impl IndexMetrics {
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+            index_cache_hits: metrics.new_count(INDEX_CACHE_HITS_METRIC, partition),
+            index_cache_misses: metrics.new_count(INDEX_CACHE_MISSES_METRIC, partition),
             io_stats: IoStats::new(),
             io_metrics: IoMetrics::new(metrics, partition),
         }
@@ -547,6 +585,11 @@ impl IndexMetrics {
     pub fn flush_io(&self) {
         self.io_metrics.record_stats(self.io_stats.snapshot());
     }
+
+    /// Return the cumulative comparison count for phase-level deltas.
+    pub fn comparisons(&self) -> usize {
+        self.index_comparisons.value()
+    }
 }
 
 impl MetricsCollector for IndexMetrics {
@@ -558,6 +601,12 @@ impl MetricsCollector for IndexMetrics {
     }
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
+    }
+    fn record_index_cache_hits(&self, num_hits: usize) {
+        self.index_cache_hits.add(num_hits);
+    }
+    fn record_index_cache_misses(&self, num_misses: usize) {
+        self.index_cache_misses.add(num_misses);
     }
     fn io_stats(&self) -> Option<IoStats> {
         Some(self.io_stats.clone())

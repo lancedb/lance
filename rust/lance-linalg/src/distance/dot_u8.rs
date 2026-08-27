@@ -28,10 +28,12 @@
 
 use std::sync::OnceLock;
 
+use super::assert_equal_lengths;
+
 /// Portable scalar u8 dot product, also used for SIMD tail elements.
 #[inline]
 pub fn dot_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_equal_lengths(a.len(), b.len());
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| x as u32 * y as u32)
@@ -134,6 +136,10 @@ fn select_backend() -> DotU8Fn {
         if is_x86_feature_detected!("avx2") {
             return |a, b| unsafe { x86::dot_u8_avx2(a, b) };
         }
+        // AvxFma and Avx hosts (AMD Piledriver / Steamroller, Intel Sandy
+        // Bridge / Ivy Bridge) fall through to scalar: the AVX2 inner uses
+        // `vpmaddubsw` / `vpmaddwd` integer ops which neither AVX nor
+        // AVX+FMA provides.
     }
 
     dot_u8_scalar
@@ -142,12 +148,19 @@ fn select_backend() -> DotU8Fn {
 /// Dispatched u8 dot product, selecting the best available SIMD backend.
 #[inline]
 pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
+    assert_equal_lengths(a.len(), b.len());
     (DISPATCH.get_or_init(select_backend))(a, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_mismatched_lengths() {
+        assert!(std::panic::catch_unwind(|| dot_u8_scalar(&[1, 2], &[1])).is_err());
+        assert!(std::panic::catch_unwind(|| dot_u8(&[1, 2], &[1])).is_err());
+    }
 
     fn fill_random(buf: &mut [u8], seed: &mut u32) {
         for slot in buf.iter_mut() {

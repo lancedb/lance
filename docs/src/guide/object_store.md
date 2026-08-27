@@ -30,10 +30,10 @@ These options apply to all object stores.
 | Key                          | Description                                                                                                                                                                                                                                                                                             |
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
-| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `request_timeout`.                                                                                                    |
+| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
-| `request_timeout`            | Timeout for the entire request, from connection until the response body has finished. Default, `30s`.                                                                                                                                                                                                   |
+| `timeout`                    | Timeout for the entire request, from connection until the response body has finished. Default, `30s`. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside `LANCE_INITIAL_UPLOAD_SIZE`.                                    |
 | `user_agent`                 | User agent string to use in requests.                                                                                                                                                                                                                                                                   |
 | `proxy_url`                  | URL of a proxy server to use for requests. Default, `None`.                                                                                                                                                                                                                                             |
 | `proxy_ca_certificate`       | PEM-formatted CA certificate for proxy connections                                                                                                                                                                                                                                                      |
@@ -109,6 +109,38 @@ The following keys can be used as both environment variables or keys in the
 | `aws_server_side_encryption`                                        | The server-side encryption algorithm to use. Must be one of `"AES256"`, `"aws:kms"`, or `"aws:kms:dsse"`. Default, `None`.                       |
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
+
+### Credential provider selection
+
+By default, Lance uses the standard AWS credential provider chain (environment
+variables, shared config file, web identity tokens, ECS, EC2 instance metadata).
+
+The `aws_provider_scheme` storage option pins a dataset to a specific credential
+provider, which is useful when two datasets in the same process need different
+AWS auth (for example, one bucket using IRSA and another using ECS container
+credentials).
+
+| Value | Behavior |
+|-------|----------|
+| `token` | Use static access-key credentials. Returns an error if `aws_access_key_id` and `aws_secret_access_key` are not set. |
+| `ecs` | Use the ECS/Pod Identity container credential endpoint. Reads `AWS_CONTAINER_CREDENTIALS_FULL_URI` or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` from the environment. |
+| `irsa` | Use IRSA (IAM Roles for Service Accounts) web identity token credentials. Reads `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` from the environment. |
+
+```python
+import lance
+
+# Bucket A — use IRSA (web identity token from the environment)
+ds_a = lance.dataset(
+    "s3://bucket-a/path",
+    storage_options={"aws_provider_scheme": "irsa"},
+)
+
+# Bucket B — use ECS container credentials
+ds_b = lance.dataset(
+    "s3://bucket-b/path",
+    storage_options={"aws_provider_scheme": "ecs"},
+)
+```
 
 ### S3-compatible stores
 
@@ -326,6 +358,15 @@ parameter; explicit `storage_options` override environment variables:
 | `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
 
+!!! warning
+
+    Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+    ever had versioning enabled, even if versioning is now suspended. To prevent
+    silent manifest overwrites, Lance requires a custom distributed commit lock
+    for COS writes. Pass the same `commit_lock` implementation to every Python
+    writer, or provide a custom `CommitHandler` in Rust. Reads do not require a
+    commit lock.
+
 !!! note
 
     The OpenDAL `CosConfig` currently exposes a limited set of options. Additional
@@ -339,6 +380,31 @@ filesystem. Lance accesses GooseFS through its Master gRPC service. The URL form
 is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
 (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
 `/path` is the filesystem path within GooseFS.
+
+Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
+(`PutMode::Create` / if-not-exists), backed by GooseFS master's atomic
+no-replace rename so concurrent writers cannot clobber each other's
+versioned manifests.
+
+!!! warning "Mixed-version writers are NOT safe"
+
+    The `if-not-exists` guarantee only holds when **every** writer for a
+    dataset routes through this new handler. A writer running an older
+    Lance release still selects `UnsafeCommitHandler` for `goosefs://`
+    and writes the version path unconditionally, which can overwrite a
+    manifest that an upgraded writer has already won. Safe concurrent
+    commits therefore require:
+
+    - all writers for the dataset run a Lance release that includes this
+      routing change, **or**
+    - writers share an external coordination boundary (e.g. a single-writer
+      queue, table-level lock, or a gateway that serializes commits) that
+      prevents the old code path from racing the new one.
+
+    When upgrading in place, quiesce all writers (drain jobs, scale
+    clients to zero, or route traffic through a writer coordinator) before
+    rolling out the new Lance version, then bring writers back on the new
+    version together.
 
 !!! note "About the dataset path"
 

@@ -27,8 +27,8 @@ use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
-    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
-    WeakLanceCache,
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -36,7 +36,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
-use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
@@ -112,8 +112,6 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) metadata: <Q::Storage as QuantizerStorage>::Metadata,
     pub(crate) sub_index_type: SubIndexType,
     pub(crate) quantization_type: QuantizationType,
-    /// The cache key prefix used by the original index's WeakLanceCache.
-    pub(crate) cache_key_prefix: String,
     /// File sizes for the index and auxiliary files, used to avoid HEAD requests
     /// when reconstructing from cache.
     pub(crate) index_file_size: u64,
@@ -244,7 +242,6 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
             + self.aux_ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
-            + self.cache_key_prefix.deep_size_of_children(context)
             + self
                 .rq_search_cache
                 .lock()
@@ -356,7 +353,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 metadata,
                 sub_index_type,
                 quantization_type,
-                cache_key_prefix: header.cache_key_prefix,
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
@@ -428,7 +424,6 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json,
-            cache_key_prefix: self.cache_key_prefix.clone(),
             index_file_size: self.index_file_size,
             aux_file_size: self.aux_file_size,
         };
@@ -486,43 +481,12 @@ impl CacheKey for FileMetadataCacheKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         "".into()
     }
-}
 
-/// Cached open file readers for the index and aux files.
-///
-/// Stored in `file_metadata_cache` to avoid re-opening files on every reconstruction.
-/// Not serializable (no codec); a cache miss just triggers a re-open.
-struct CachedIndexReaders {
-    index_reader: Arc<FileReader>,
-    aux_reader: Arc<FileReader>,
-}
-
-impl lance_core::deepsize::DeepSizeOf for CachedIndexReaders {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        // FileReader doesn't impl DeepSizeOf. We approximate by counting the
-        // fixed struct size for each reader plus the Arc<CachedFileMetadata>
-        // heap contents. The metadata Arcs are also held by FileMetadataCacheKey
-        // entries, so this may over-count across cache entries, but
-        // over-counting is safer than under-counting for eviction purposes.
-        std::mem::size_of::<FileReader>() * 2
-            + self.index_reader.metadata().deep_size_of_children(context)
-            + self.aux_reader.metadata().deep_size_of_children(context)
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-file-metadata-key", 1)
     }
-}
 
-struct CachedIndexReadersKey {
-    uuid: String,
-}
-
-impl CacheKey for CachedIndexReadersKey {
-    type ValueType = CachedIndexReaders;
-    fn type_name() -> &'static str {
-        "CachedIndexReaders"
-    }
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        self.uuid.as_str().into()
-    }
-    // No codec() override → in-memory only
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 /// Open a FileReader, reusing cached file metadata if available.
@@ -552,14 +516,20 @@ async fn open_reader_cached(
         .await
     } else {
         let file_scheduler = scheduler.open_file(path, &cached_size).await?;
-        FileReader::try_open(
+        let reader = FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             cache,
             FileReaderOptions::default(),
         )
-        .await
+        .await?;
+        // File metadata is store-free, so it outlives the reader opened here:
+        // cache it to spare later reconstructions the footer read.
+        file_cache
+            .insert_with_key(&FileMetadataCacheKey, reader.metadata().clone())
+            .await;
+        Ok(reader)
     }
 }
 
@@ -601,9 +571,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 
     fn type_name() -> &'static str {
-        // Using type_name is safe here: the impl is in the same crate as the
-        // types, so the monomorphized pointer is consistent.
-        std::any::type_name::<PartitionEntry<S, Q>>()
+        "IVFPartition"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-partition-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(S::name());
+        builder.write_variant(match Q::quantization_type() {
+            QuantizationType::Flat => 0,
+            QuantizationType::FlatBin => 1,
+            QuantizationType::Product => 2,
+            QuantizationType::Scalar => 3,
+            QuantizationType::Rabit => 4,
+        });
+        builder.write_u64(self.partition_id as u64);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -625,6 +609,11 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     ivf: IvfModel,
 
     reader: FileReader,
+    /// Narrowed read of the index file, when the sub-index declares that
+    /// [`IvfSubIndex::load`] consumes only part of what it writes. `None` reads
+    /// every column. Built once here because it is fallible and only depends on
+    /// the file schema.
+    read_projection: Option<ReaderProjection>,
     sub_index_metadata: Vec<String>,
     storage: IvfQuantizationStorage<Q>,
 
@@ -665,6 +654,18 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
+    fn read_projection(reader: &FileReader) -> Result<Option<ReaderProjection>> {
+        S::read_columns()
+            .map(|columns| {
+                lance_file::versions::reader_projection_from_column_names(
+                    reader.metadata().version(),
+                    reader.schema(),
+                    columns,
+                )
+            })
+            .transpose()
+    }
+
     fn use_query_residual(
         storage: &IvfQuantizationStorage<Q>,
         distance_type: DistanceType,
@@ -1096,19 +1097,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
             .await;
 
-        // Cache open readers so the first reconstruction also skips file opens.
-        file_metadata_cache
-            .insert_with_key(
-                &CachedIndexReadersKey {
-                    uuid: uuid_str.clone(),
-                },
-                Arc::new(CachedIndexReaders {
-                    index_reader: Arc::new(index_reader.clone()),
-                    aux_reader: Arc::new(storage.reader().clone()),
-                }),
-            )
-            .await;
-
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
@@ -1120,6 +1108,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         // cumulative stats are exactly the one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
+        let read_projection = Self::read_projection(&index_reader)?;
+
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -1130,6 +1120,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             ivf,
             reader: index_reader,
+            read_projection,
             storage,
             sub_index_metadata,
             distance_type,
@@ -1154,11 +1145,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
-        Self {
+        let read_projection = Self::read_projection(&reader)?;
+        Ok(Self {
             uri,
             index_path,
             uuid,
@@ -1168,6 +1160,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             ivf,
             reader,
+            read_projection,
             storage,
             sub_index_metadata,
             distance_type,
@@ -1178,7 +1171,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             _marker: PhantomData,
-        }
+        })
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -1199,20 +1192,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
 
         if write_cache {
-            let entry = self
+            let result = self
                 .index_cache
-                .get_or_insert_with_key(cache_key, || async {
+                .get_or_insert_with_key_hit(cache_key, || async {
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
                     self.load_partition_entry(partition_id, metrics.io_stats())
                         .await
                 })
-                .await?;
+                .await;
+            match &result {
+                Ok((_, true)) => metrics.record_index_cache_hit(),
+                _ => metrics.record_index_cache_miss(),
+            }
+            let (entry, _) = result?;
             Ok(entry as Arc<dyn VectorIndexCacheEntry>)
         } else {
             if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
+                metrics.record_index_cache_hit();
                 return Ok(part_idx);
             }
+            metrics.record_index_cache_miss();
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
             Ok(Arc::new(
@@ -1227,7 +1227,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
-        let schema = Arc::new(self.reader.schema().as_ref().into());
+        // `concat_batches` indexes the batches by this schema's field positions
+        // without comparing the two, so the schema has to describe exactly what
+        // was read: the full file schema over a projected read would index past
+        // the last column.
+        let schema = Arc::new(match &self.read_projection {
+            Some(projection) => projection.schema.as_ref().into(),
+            None => self.reader.schema().as_ref().into(),
+        });
         let batch = match self.reader.metadata().num_rows {
             0 => RecordBatch::new_empty(schema),
             _ => {
@@ -1245,16 +1252,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                         }
                         None => Cow::Borrowed(&self.reader),
                     };
-                    let batches = reader
-                        .read_stream(
-                            ReadBatchParams::Range(row_range),
-                            u32::MAX,
-                            1,
-                            FilterExpression::no_filter(),
-                        )
-                        .await?
-                        .try_collect::<Vec<_>>()
-                        .await?;
+                    let params = ReadBatchParams::Range(row_range);
+                    let stream = match &self.read_projection {
+                        Some(projection) => {
+                            reader
+                                .read_stream_projected(
+                                    params,
+                                    u32::MAX,
+                                    1,
+                                    projection.clone(),
+                                    FilterExpression::no_filter(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            reader
+                                .read_stream(params, u32::MAX, 1, FilterExpression::no_filter())
+                                .await?
+                        }
+                    };
+                    let batches = stream.try_collect::<Vec<_>>().await?;
                     concat_batches(&schema, batches.iter())?
                 }
             }
@@ -1306,7 +1323,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             metadata: self.storage.metadata().clone(),
             sub_index_type,
             quantization_type,
-            cache_key_prefix: self.index_cache.prefix().to_string(),
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
@@ -1962,43 +1978,25 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
-    let readers_key = CachedIndexReadersKey {
-        uuid: state.uuid.clone(),
-    };
-
-    let (index_reader, aux_reader) =
-        if let Some(cached) = file_metadata_cache.get_with_key(&readers_key).await {
-            // Warm path: reuse the cached readers directly, no file opens needed.
-            ((*cached.index_reader).clone(), (*cached.aux_reader).clone())
-        } else {
-            // Cold path: open files, then cache the readers for future reconstructions.
-            let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-            let scheduler = ScanScheduler::new(object_store, scheduler_config);
-            let index_reader = open_reader_cached(
-                &scheduler,
-                &index_path,
-                file_metadata_cache,
-                state.index_file_size,
-            )
-            .await?;
-            let aux_reader = open_reader_cached(
-                &scheduler,
-                &aux_path,
-                file_metadata_cache,
-                state.aux_file_size,
-            )
-            .await?;
-            file_metadata_cache
-                .insert_with_key(
-                    &readers_key,
-                    Arc::new(CachedIndexReaders {
-                        index_reader: Arc::new(index_reader.clone()),
-                        aux_reader: Arc::new(aux_reader.clone()),
-                    }),
-                )
-                .await;
-            (index_reader, aux_reader)
-        };
+    // Readers carry a scheduler bound to an object store, so they cannot be
+    // shared across dataset opens. Reuse only portable file metadata and bind
+    // fresh readers to the object store supplied for this reconstruction.
+    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+    let index_reader = open_reader_cached(
+        &scheduler,
+        &index_path,
+        file_metadata_cache,
+        state.index_file_size,
+    )
+    .await?;
+    let aux_reader = open_reader_cached(
+        &scheduler,
+        &aux_path,
+        file_metadata_cache,
+        state.aux_file_size,
+    )
+    .await?;
 
     let storage = IvfQuantizationStorage::from_cached(
         aux_reader,
@@ -2023,22 +2021,28 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
-    );
+    )?;
     Ok(Arc::new(index))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::iter::repeat_n;
-    use std::{ops::Range, sync::Arc};
+    use std::{
+        ops::Range,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
-    use all_asserts::{assert_ge, assert_le, assert_lt};
+    use all_asserts::{assert_ge, assert_lt};
     use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -2051,11 +2055,14 @@ mod tests {
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::storage::VectorStore;
+    use lance_index::vector::v3::subindex::IvfSubIndex;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::vector::ivf::v2::IvfPq;
+    use crate::index::vector::ivf::v2::{
+        IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
+    };
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -2065,20 +2072,24 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
-    use lance_core::cache::LanceCache;
+    use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, Result};
+    use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
-    use lance_file::writer::FileWriter;
     use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::flat::index::FlatIndex;
+    use lance_index::vector::hnsw::HNSW;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
-    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::quantizer::QuantizerMetadata;
+    use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
@@ -2086,9 +2097,8 @@ mod tests {
         storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
-    use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_io::{
-        object_store::ObjectStore,
+        object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
         scheduler::{ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
     };
@@ -2096,13 +2106,22 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
     use lance_table::format::IndexMetadata;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
-    use rand::distr::uniform::SampleUniform;
+    use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
     use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+    // 8-bit PQ needs at least 256 training vectors; 320 leaves a stable margin
+    // while 20 neighbors provide a useful recall oracle.
+    const PQ_MATRIX_NUM_ROWS: usize = 320;
+    const PQ_MATRIX_K: usize = 20;
+    // An 8-bit PQ codebook has 256 centroids, so this is the smallest valid
+    // training fixture shared by the 8-bit and 4-bit runtime cases.
+    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
+    const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
+    const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -2393,27 +2412,32 @@ mod tests {
 
     fn generate_clustered_multivec_batch(
         cluster_sizes: &[usize],
-        offsets: &[f32],
+        centroids: &[(f32, f32)],
         vectors_per_row: usize,
+        start_id: u64,
     ) -> (RecordBatch, SchemaRef) {
         assert_eq!(
             cluster_sizes.len(),
-            offsets.len(),
-            "cluster sizes and offsets must match"
+            centroids.len(),
+            "cluster sizes and centroids must match"
         );
         const ITEM_FIELD_NAME: &str = "item";
         let total_rows: usize = cluster_sizes.iter().sum();
         let mut ids = Vec::with_capacity(total_rows);
         let mut values = Vec::with_capacity(total_rows * vectors_per_row * DIM);
         let mut rng = StdRng::seed_from_u64(12345);
-        let mut current_id = 0u64;
-        for (&rows, &offset) in cluster_sizes.iter().zip(offsets.iter()) {
+        let mut current_id = start_id;
+        for (&rows, &(x, y)) in cluster_sizes.iter().zip(centroids.iter()) {
             for _ in 0..rows {
                 ids.push(current_id);
                 current_id += 1;
                 for _ in 0..vectors_per_row {
                     for dim in 0..DIM {
-                        let base = if dim == 0 { offset } else { 0.0 };
+                        let base = match dim {
+                            0 => x,
+                            1 => y,
+                            _ => 0.0,
+                        };
                         let noise = (rng.random::<f32>() - 0.5) * 0.02;
                         values.push(base + noise);
                     }
@@ -2462,6 +2486,23 @@ mod tests {
                 DIM as i32,
             )
             .unwrap(),
+        )
+    }
+
+    fn build_centroids_2d(centroids: &[(f32, f32)]) -> Arc<FixedSizeListArray> {
+        let mut values = Vec::with_capacity(centroids.len() * DIM);
+        for &(x, y) in centroids {
+            for dim in 0..DIM {
+                values.push(match dim {
+                    0 => x,
+                    1 => y,
+                    _ => 0.0,
+                });
+            }
+        }
+        Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                .unwrap(),
         )
     }
 
@@ -2535,6 +2576,194 @@ mod tests {
                 .downcast_ref::<IvfPq>()
                 .expect("expected IvfPq index")
         }
+
+        fn ivf_flat(&self) -> &IvfFlatIndex {
+            self.index
+                .as_any()
+                .downcast_ref::<IvfFlatIndex>()
+                .expect("expected IvfFlat index")
+        }
+    }
+
+    fn lightweight_pq_params() -> PQBuildParams {
+        PQBuildParams {
+            num_sub_vectors: LIGHTWEIGHT_PQ_SUB_VECTORS,
+            num_bits: 4,
+            max_iters: 2,
+            sample_rate: 16,
+            ..Default::default()
+        }
+    }
+
+    fn lightweight_pq_params_with_bits(num_bits: usize) -> PQBuildParams {
+        let num_sub_vectors = if num_bits == 4 {
+            // M4 is only a 2-byte code, so random KMeans/HNSW can leave recall near
+            // the threshold. M32 restores the original 4-bit test capacity.
+            DIM
+        } else {
+            LIGHTWEIGHT_PQ_SUB_VECTORS
+        };
+        PQBuildParams {
+            num_sub_vectors,
+            num_bits,
+            max_iters: 2,
+            sample_rate: 16,
+            ..Default::default()
+        }
+    }
+
+    fn lightweight_hnsw_params() -> HnswBuildParams {
+        HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16)
+    }
+
+    fn make_seeded_vector_batch(num_rows: usize) -> (RecordBatch, SchemaRef) {
+        let batch = lance_datagen::gen_batch()
+            .with_seed(lance_datagen::Seed::from(42))
+            .col("id", lance_datagen::array::step::<UInt64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>((DIM as u32).into()),
+            )
+            .into_batch_rows(lance_datagen::RowCount::from(num_rows as u64))
+            .unwrap();
+        let schema = batch.schema();
+        (batch, schema)
+    }
+
+    async fn search_lightweight_pq_index(
+        dataset: &Dataset,
+        query: &dyn Array,
+        k: usize,
+        num_partitions: usize,
+        refine_factor: u32,
+        ef: usize,
+    ) -> RecordBatch {
+        dataset
+            .scan()
+            .nearest("vector", query, k)
+            .unwrap()
+            .minimum_nprobes(num_partitions)
+            .ef(ef)
+            .refine(refine_factor)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap()
+    }
+
+    async fn assert_lightweight_pq_index(
+        distance_type: DistanceType,
+        num_bits: usize,
+        use_hnsw: bool,
+    ) {
+        const INDEX_NAME: &str = "test_index";
+        const K: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS);
+        let vectors = batch["vector"].as_fixed_size_list().clone();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let pq_params = lightweight_pq_params_with_bits(num_bits);
+        let expected_num_sub_vectors = pq_params.num_sub_vectors;
+        let params = if use_hnsw {
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                distance_type,
+                ivf_params,
+                lightweight_hnsw_params(),
+                pq_params,
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats_json = dataset.index_statistics(INDEX_NAME).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let expected_index_type = if use_hnsw { "IVF_HNSW_PQ" } else { "IVF_PQ" };
+        let expected_sub_index = if use_hnsw { "HNSW" } else { "PQ" };
+        assert_eq!(stats["index_type"], expected_index_type);
+        assert_eq!(
+            stats["indices"][0]["num_partitions"],
+            LIGHTWEIGHT_PQ_PARTITIONS
+        );
+        assert_eq!(
+            stats["indices"][0]["sub_index"]["index_type"],
+            expected_sub_index
+        );
+        assert_eq!(stats["indices"][0]["sub_index"]["nbits"], num_bits);
+        assert_eq!(
+            stats["indices"][0]["sub_index"]["num_sub_vectors"],
+            expected_num_sub_vectors
+        );
+        if use_hnsw {
+            let hnsw_params = &stats["indices"][0]["sub_index"]["params"];
+            assert_eq!(hnsw_params["max_level"], 2);
+            assert_eq!(hnsw_params["m"], 4);
+            assert_eq!(hnsw_params["ef_construction"], 16);
+        }
+
+        let query = vectors.value(0);
+        let ground_truth = ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
+        let before_reopen = search_lightweight_pq_index(
+            &dataset,
+            query.as_ref(),
+            K,
+            LIGHTWEIGHT_PQ_PARTITIONS,
+            4,
+            64,
+        )
+        .await;
+        assert_eq!(before_reopen.num_rows(), K);
+        let row_ids = before_reopen[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+        let distances = before_reopen[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}");
+
+        drop(dataset);
+        let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+        let reopened_stats: serde_json::Value =
+            serde_json::from_str(&reopened.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+        assert_eq!(reopened_stats, stats);
+        assert_eq!(
+            search_lightweight_pq_index(
+                &reopened,
+                query.as_ref(),
+                K,
+                LIGHTWEIGHT_PQ_PARTITIONS,
+                4,
+                64,
+            )
+            .await,
+            before_reopen
+        );
     }
 
     async fn load_vector_index_context(
@@ -2560,57 +2789,11 @@ mod tests {
         }
     }
 
-    async fn verify_partition_split_after_append(
-        mut dataset: Dataset,
-        test_uri: &str,
-        params: VectorIndexParams,
-        description: &str,
-    ) {
-        const INDEX_NAME: &str = "vector_idx";
-        const APPEND_ROWS: usize = 50_000;
-
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some(INDEX_NAME.to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        let initial_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
-        assert_eq!(
-            initial_ctx.num_partitions(),
-            2,
-            "Expected {} initial partitions to be 2 before append, got stats: {}",
-            description,
-            initial_ctx.stats_json()
-        );
-
-        // Append tightly clustered vectors so data flows into the same partition.
-        append_dataset::<Float32Type>(&mut dataset, APPEND_ROWS, 0.0..0.05).await;
-
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
-        assert!(
-            final_ctx.num_partitions() >= 3,
-            "Expected partition split to increase partitions beyond 2 for {}, got stats: {}",
-            description,
-            final_ctx.stats_json()
-        );
-    }
-
     async fn shrink_smallest_partition(
         dataset: &mut Dataset,
         index_name: &str,
         expected_after_join: usize,
+        next_id: &mut u64,
     ) -> (usize, usize, usize) {
         const ROWS_TO_APPEND_FOR_JOIN: usize = 32;
         let row_count_before = dataset.count_all_rows().await.unwrap();
@@ -2648,7 +2831,13 @@ mod tests {
         delete_ids(dataset, &ids[1..]).await;
         compact_after_deletions(dataset).await;
 
-        append_constant_vector(dataset, ROWS_TO_APPEND_FOR_JOIN, &template_values).await;
+        append_constant_vector_with_start_id(
+            dataset,
+            ROWS_TO_APPEND_FOR_JOIN,
+            &template_values,
+            next_id,
+        )
+        .await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -2674,8 +2863,14 @@ mod tests {
         (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
-    async fn append_constant_vector(dataset: &mut Dataset, rows: usize, template: &[f32]) {
-        append_constant_vector_with_params(dataset, rows, template, None).await;
+    async fn append_constant_vector_with_start_id(
+        dataset: &mut Dataset,
+        rows: usize,
+        template: &[f32],
+        next_id: &mut u64,
+    ) {
+        append_constant_vector_batch(dataset, rows, template, *next_id, None).await;
+        *next_id += rows as u64;
     }
 
     async fn append_partition_templates(
@@ -2729,6 +2924,17 @@ mod tests {
         template: &[f32],
         write_params: Option<WriteParams>,
     ) {
+        let start_id = dataset.count_all_rows().await.unwrap() as u64;
+        append_constant_vector_batch(dataset, rows, template, start_id, write_params).await;
+    }
+
+    async fn append_constant_vector_batch(
+        dataset: &mut Dataset,
+        rows: usize,
+        template: &[f32],
+        start_id: u64,
+        write_params: Option<WriteParams>,
+    ) {
         assert_eq!(
             template.len(),
             DIM,
@@ -2736,7 +2942,6 @@ mod tests {
             DIM
         );
 
-        let start_id = dataset.count_all_rows().await.unwrap() as u64;
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + rows as u64,
         ));
@@ -2769,13 +2974,14 @@ mod tests {
         dataset: &mut Dataset,
         index_name: &str,
         template: &[f32],
+        next_id: &mut u64,
         rows_to_append: usize,
         expected_partitions: usize,
         expected_total_rows: usize,
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        append_constant_vector(dataset, rows_to_append, template).await;
+        append_constant_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -2863,6 +3069,17 @@ mod tests {
     }
 
     async fn load_partition_row_ids(index: &IvfPq, partition_idx: usize) -> Vec<u64> {
+        index
+            .storage
+            .load_partition(partition_idx, None)
+            .await
+            .unwrap()
+            .row_ids()
+            .copied()
+            .collect()
+    }
+
+    async fn load_flat_partition_row_ids(index: &IvfFlatIndex, partition_idx: usize) -> Vec<u64> {
         index
             .storage
             .load_partition(partition_idx, None)
@@ -2981,10 +3198,19 @@ mod tests {
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
     ) -> Dataset {
+        write_dataset_from_batches_with_max_rows(test_uri, schema, batches, 500).await
+    }
+
+    async fn write_dataset_from_batches_with_max_rows(
+        test_uri: &str,
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        max_rows_per_file: usize,
+    ) -> Dataset {
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         let write_params = WriteParams {
-            max_rows_per_file: 500,
+            max_rows_per_file,
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
@@ -2997,6 +3223,30 @@ mod tests {
     async fn prepare_global_ivf_pq(
         dataset: &Dataset,
         vector_column: &str,
+    ) -> (IvfBuildParams, PQBuildParams) {
+        prepare_ivf_pq(
+            dataset,
+            vector_column,
+            TWO_FRAG_DIM,
+            TWO_FRAG_NUM_PARTITIONS,
+            TWO_FRAG_NUM_SUBVECTORS,
+            TWO_FRAG_NUM_BITS,
+            TWO_FRAG_MAX_ITERS,
+            TWO_FRAG_SAMPLE_RATE,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_ivf_pq(
+        dataset: &Dataset,
+        vector_column: &str,
+        expected_dimension: usize,
+        num_partitions: usize,
+        num_sub_vectors: usize,
+        num_bits: usize,
+        max_iters: u32,
+        sample_rate: usize,
     ) -> (IvfBuildParams, PQBuildParams) {
         let batch = dataset
             .scan()
@@ -3011,39 +3261,33 @@ mod tests {
             .as_fixed_size_list();
 
         let dim = vectors.value_length() as usize;
-        assert_eq!(dim, TWO_FRAG_DIM, "unexpected vector dimension");
+        assert_eq!(dim, expected_dimension, "unexpected vector dimension");
 
         let values = vectors.values().as_primitive::<Float32Type>();
 
-        let kmeans_params = KMeansParams::new(None, TWO_FRAG_MAX_ITERS, 1, DistanceType::L2);
-        let kmeans = train_kmeans::<Float32Type>(
-            values,
-            kmeans_params,
-            dim,
-            TWO_FRAG_NUM_PARTITIONS,
-            TWO_FRAG_SAMPLE_RATE,
-        )
-        .unwrap();
+        let kmeans_params = KMeansParams::new(None, max_iters, 1, DistanceType::L2);
+        let kmeans =
+            train_kmeans::<Float32Type>(values, kmeans_params, dim, num_partitions, sample_rate)
+                .unwrap();
 
         let centroids_flat = kmeans.centroids.as_primitive::<Float32Type>().clone();
         let centroids_fsl =
             Arc::new(FixedSizeListArray::try_new_from_values(centroids_flat, dim as i32).unwrap());
         let mut ivf_params =
-            IvfBuildParams::try_with_centroids(TWO_FRAG_NUM_PARTITIONS, centroids_fsl).unwrap();
-        ivf_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        ivf_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+            IvfBuildParams::try_with_centroids(num_partitions, centroids_fsl).unwrap();
+        ivf_params.max_iters = max_iters as usize;
+        ivf_params.sample_rate = sample_rate;
 
-        let mut pq_train_params = PQBuildParams::new(TWO_FRAG_NUM_SUBVECTORS, TWO_FRAG_NUM_BITS);
-        pq_train_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        pq_train_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        let mut pq_train_params = PQBuildParams::new(num_sub_vectors, num_bits);
+        pq_train_params.max_iters = max_iters as usize;
+        pq_train_params.sample_rate = sample_rate;
 
         let pq = pq_train_params.build(vectors, DistanceType::L2).unwrap();
         let codebook_flat = pq.codebook.values().as_primitive::<Float32Type>().clone();
         let pq_codebook: ArrayRef = Arc::new(codebook_flat);
-        let mut pq_params =
-            PQBuildParams::with_codebook(TWO_FRAG_NUM_SUBVECTORS, TWO_FRAG_NUM_BITS, pq_codebook);
-        pq_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        pq_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        let mut pq_params = PQBuildParams::with_codebook(num_sub_vectors, num_bits, pq_codebook);
+        pq_params.max_iters = max_iters as usize;
+        pq_params.sample_rate = sample_rate;
 
         (ivf_params, pq_params)
     }
@@ -3782,9 +4026,21 @@ mod tests {
     async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
-        let (schema, batches) = make_two_fragment_batches();
+        let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
+            let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS * 2);
+            (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
+        } else {
+            let (schema, batches) = make_two_fragment_batches();
+            (schema, batches, 500)
+        };
         let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
-        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+        let mut dataset = write_dataset_from_batches_with_max_rows(
+            &dataset_uri,
+            schema,
+            batches,
+            max_rows_per_file,
+        )
+        .await;
 
         let fragments = dataset.get_fragments();
         assert!(fragments.len() >= 2);
@@ -3795,11 +4051,21 @@ mod tests {
                 HnswBuildParams::default(),
             ),
             "IVF_HNSW_PQ" => {
-                let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+                let (ivf_params, pq_params) = prepare_ivf_pq(
+                    &dataset,
+                    "vector",
+                    DIM,
+                    LIGHTWEIGHT_PQ_PARTITIONS,
+                    LIGHTWEIGHT_PQ_SUB_VECTORS,
+                    8,
+                    2,
+                    16,
+                )
+                .await;
                 VectorIndexParams::with_ivf_hnsw_pq_params(
                     DistanceType::L2,
                     ivf_params,
-                    HnswBuildParams::default(),
+                    lightweight_hnsw_params(),
                     pq_params,
                 )
             }
@@ -4129,6 +4395,126 @@ mod tests {
         }
     }
 
+    fn pq_matrix_batch<T>() -> RecordBatch
+    where
+        T: ArrowPrimitiveType + 'static,
+        T::Native: Copy + 'static,
+        PrimitiveArray<T>: From<Vec<T::Native>> + 'static,
+        StandardUniform: Distribution<T::Native>,
+    {
+        gen_batch()
+            .with_seed(Seed(42))
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<T>(Dimension::from(DIM as u32)))
+            .into_batch_rows(RowCount::from(PQ_MATRIX_NUM_ROWS as u64))
+            .unwrap()
+    }
+
+    fn pq_matrix_params(
+        nlist: usize,
+        distance_type: DistanceType,
+        version: IndexFileVersion,
+    ) -> VectorIndexParams {
+        let mut ivf_params = IvfBuildParams::new(nlist);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 4,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 1,
+            ..Default::default()
+        };
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        params.version(version);
+        params
+    }
+
+    async fn test_pq_matrix_case(
+        nlist: usize,
+        distance_type: DistanceType,
+        version: IndexFileVersion,
+    ) {
+        const INDEX_NAME: &str = "pq_matrix";
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let batch = pq_matrix_batch::<Float32Type>();
+        let schema = batch.schema();
+        let query = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let params = pq_matrix_params(nlist, distance_type, version.clone());
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+        assert_eq!(stats["index_type"], "IVF_PQ");
+        let indices = stats["indices"].as_array().unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index["index_type"], "IVF_PQ");
+        assert_eq!(index["metric_type"], distance_type.to_string());
+        assert_eq!(index["num_partitions"], nlist);
+        assert_eq!(index["sub_index"]["index_type"], "PQ");
+        assert_eq!(
+            index["index_file_version"],
+            match version {
+                IndexFileVersion::Legacy => "Legacy",
+                IndexFileVersion::V3 => "V3",
+            }
+        );
+
+        drop(dataset);
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let ground_truth = ground_truth(
+            &dataset,
+            "vector",
+            query.as_ref(),
+            PQ_MATRIX_K,
+            distance_type,
+        )
+        .await;
+        let result = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), PQ_MATRIX_K)
+            .unwrap()
+            .nprobes(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_rows(), PQ_MATRIX_K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(
+            row_ids.iter().copied().collect::<HashSet<_>>().len(),
+            PQ_MATRIX_K
+        );
+        let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(
+            distances.windows(2).all(|pair| pair[0] <= pair[1]),
+            "distances are not sorted: {distances:?}"
+        );
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / PQ_MATRIX_K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}, row_ids: {row_ids:?}");
+    }
+
     async fn test_index_impl<T: ArrowPrimitiveType>(
         params: VectorIndexParams,
         nlist: usize,
@@ -4422,78 +4808,75 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2(4, DistanceType::L2)]
+    #[case::cosine(4, DistanceType::Cosine)]
+    #[case::dot(4, DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .version(crate::index::vector::IndexFileVersion::Legacy)
-            .clone();
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        test_distance_range(Some(params.clone()), nlist).await;
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq(#[case] nlist: usize, #[case] distance_type: DistanceType) {
+        test_pq_matrix_case(nlist, distance_type, IndexFileVersion::Legacy).await;
     }
 
     #[rstest]
-    #[case(1, DistanceType::L2, 0.9)]
-    #[case(1, DistanceType::Cosine, 0.9)]
-    #[case(1, DistanceType::Dot, 0.85)]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2_nlist1(1, DistanceType::L2)]
+    #[case::cosine_nlist1(1, DistanceType::Cosine)]
+    #[case::dot_nlist1(1, DistanceType::Dot)]
+    #[case::l2_nlist4(4, DistanceType::L2)]
+    #[case::cosine_nlist4(4, DistanceType::Cosine)]
+    #[case::dot_nlist4(4, DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq_v3(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        test_distance_range(Some(params.clone()), nlist).await;
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params.clone(), nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq_v3(#[case] nlist: usize, #[case] distance_type: DistanceType) {
+        test_pq_matrix_case(nlist, distance_type, IndexFileVersion::V3).await;
+    }
+
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
+    #[tokio::test]
+    async fn test_ivf_pq_distance_range(#[case] version: IndexFileVersion) {
+        let params = pq_matrix_params(1, DistanceType::L2, version);
+        test_distance_range(Some(params), 1).await;
+    }
+
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
+    #[tokio::test]
+    async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
+        let test_dir = TempStrDir::default();
+        let batch = pq_matrix_batch::<Float64Type>();
+        let schema = batch.schema();
+        let vectors = Arc::new(batch["vector"].as_fixed_size_list().clone());
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let params = pq_matrix_params(1, DistanceType::L2, version);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        test_recall::<Float64Type>(params, 1, 0.5, "vector", &dataset, vectors).await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
+        let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+        test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_delete_all_rows_lifecycle() {
+        let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
         test_delete_all_rows(params).await;
     }
 
     #[rstest]
-    // Temporarily disable recall checks for 4-bit PQ.
-    #[case(4, DistanceType::L2, 0.0)]
-    #[case(4, DistanceType::Cosine, 0.0)]
-    #[case(4, DistanceType::Dot, 0.0)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq_4bit(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::new(32, 4);
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq_4bit(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 4, false).await;
     }
 
     #[rstest]
@@ -4718,57 +5101,304 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_create_ivf_hnsw_pq(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-            distance_type,
-            ivf_params,
-            hnsw_params,
-            pq_params,
-        );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_create_ivf_hnsw_pq(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 8, true).await;
     }
 
     #[rstest]
-    // Temporarily disable recall checks for 4-bit PQ.
-    #[case(4, DistanceType::L2, 0.0)]
-    #[case(4, DistanceType::Cosine, 0.0)]
-    #[case(4, DistanceType::Dot, 0.0)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_create_ivf_hnsw_pq_4bit(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::new(32, 4);
-        let hnsw_params = HnswBuildParams::default();
+    async fn test_create_ivf_hnsw_pq_4bit(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 4, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_multivec() {
+        const NUM_ROWS: usize = 64;
+        const K: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let batch = lance_datagen::gen_batch()
+            .with_seed(lance_datagen::Seed::from(42))
+            .col("id", lance_datagen::array::step::<UInt64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::cycle_vec_var(
+                    lance_datagen::array::rand_vec::<Float32Type>((DIM as u32).into()),
+                    3_u32.into(),
+                    4_u32.into(),
+                ),
+            )
+            .into_batch_rows(lance_datagen::RowCount::from(NUM_ROWS as u64))
+            .unwrap();
+        let vectors = batch["vector"].as_list::<i32>().clone();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let mut ivf_params = IvfBuildParams::new(1);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-            distance_type,
+            DistanceType::Cosine,
             ivf_params,
-            hnsw_params,
-            pq_params,
+            lightweight_hnsw_params(),
+            lightweight_pq_params(),
         );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        // Three vectors per query amplify the internal candidate k. This
+        // bounded budget covers all 64 * 3 vector entries in the fixture.
+        let result = search_lightweight_pq_index(&dataset, query.as_ref(), K, 1, 2, 256).await;
+        assert_eq!(result.num_rows(), K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+        let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let ground_truth = multivec_ground_truth(&vectors, query.as_ref(), K, DistanceType::Cosine)
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect::<HashSet<_>>();
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}");
+    }
+
+    // `lance-index` keeps these crate-private; spelling them out here also pins
+    // the on-disk names, which are part of the index file contract.
+    const HNSW_VECTOR_ID_COL: &str = "__vector_id";
+    const HNSW_NEIGHBORS_COL: &str = "__neighbors";
+
+    async fn build_ivf_hnsw_sq(test_uri: &str, nlist: usize) -> Dataset {
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(nlist),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+    }
+
+    async fn open_ivf_hnsw_sq(dataset: &Dataset) -> Arc<dyn VectorIndex> {
+        let indices = dataset.load_indices().await.unwrap();
+        dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_hnsw_columns(dataset: &Dataset, context: &str) {
+        let index = open_ivf_hnsw_sq(dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+
+        let written = hnsw
+            .reader
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            written,
+            vec![HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL, DIST_COL],
+            "{context}: the written index file must keep every column"
+        );
+
+        // Every partition, not just the first: a projection that applied
+        // unevenly would leave the partition cache holding mixed schemas.
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let entry = hnsw.load_partition_entry(partition_id, None).await.unwrap();
+            let loaded = entry.index.to_batch().unwrap();
+            let loaded_schema = loaded.schema();
+            let read = loaded_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                read,
+                vec![HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL],
+                "{context}: partition {partition_id} materialized the write-only distance column"
+            );
         }
+    }
+
+    /// The index file keeps all three HNSW columns while a loaded partition
+    /// carries only the two the graph reads. Both halves matter: shrinking the
+    /// written schema would panic readers older than v8.0.0, and widening the
+    /// read back would undo the saving.
+    ///
+    /// Re-checked after a delta merge, because that is the one path that writes
+    /// a new index file while an already-projected index is open.
+    #[tokio::test]
+    async fn test_hnsw_partition_load_reads_only_graph_columns() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        assert_hnsw_columns(&dataset, "fresh index").await;
+
+        append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        assert_hnsw_columns(&dataset, "after delta merge").await;
+    }
+
+    /// The saving is the point of the change, so pin it: reading a real
+    /// partition range through the declared projection must move strictly fewer
+    /// bytes than the full-schema read the index used to perform.
+    #[tokio::test]
+    async fn test_hnsw_read_projection_moves_fewer_bytes() {
+        use futures::TryStreamExt as _;
+
+        let test_dir = TempStrDir::default();
+        let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        let index = open_ivf_hnsw_sq(&dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+
+        let projection = hnsw
+            .read_projection
+            .as_ref()
+            .expect("HNSW declares a read projection");
+        assert_eq!(projection.schema.fields.len(), 2);
+
+        let row_range = hnsw.ivf.row_range(0);
+        assert!(!row_range.is_empty(), "partition 0 should hold rows");
+        let store = dataset.object_store.as_ref();
+
+        let read_bytes_for = async |projection: lance_file::reader::ReaderProjection| {
+            let _ = store.io_stats_incremental();
+            hnsw.reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::Range(row_range.clone()),
+                    u32::MAX,
+                    1,
+                    projection,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            store.io_stats_incremental().read_bytes
+        };
+
+        // Projected first on purpose: it then pays any first-touch metadata
+        // cost, so the comparison understates rather than flatters the saving.
+        let projected_bytes = read_bytes_for(projection.clone()).await;
+        let full_bytes = read_bytes_for(lance_file::versions::reader_projection_from_whole_schema(
+            hnsw.reader.schema(),
+            hnsw.reader.metadata().version(),
+        ))
+        .await;
+
+        assert!(
+            projected_bytes > 0,
+            "the projected read still has to fetch the graph"
+        );
+        assert_lt!(projected_bytes, full_bytes);
+    }
+
+    /// The projection selects columns by field id, and `__neighbors` and
+    /// `_distance` are both 4-byte-item lists whose child fields share a name,
+    /// so a wrong column index would reinterpret distances as neighbor ids with
+    /// no type error to catch it. Compare the columns themselves, not just names.
+    #[tokio::test]
+    async fn test_hnsw_projected_read_matches_full_read() {
+        use futures::TryStreamExt as _;
+
+        let test_dir = TempStrDir::default();
+        let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        let index = open_ivf_hnsw_sq(&dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+        let projection = hnsw
+            .read_projection
+            .as_ref()
+            .expect("HNSW declares a read projection");
+
+        let read_range = async |proj: lance_file::reader::ReaderProjection,
+                                range: std::ops::Range<usize>| {
+            let batches = hnsw
+                .reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::Range(range),
+                    u32::MAX,
+                    1,
+                    proj,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap()
+        };
+
+        let mut compared = 0;
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let range = hnsw.ivf.row_range(partition_id);
+            if range.is_empty() {
+                continue;
+            }
+            let full = read_range(
+                lance_file::versions::reader_projection_from_whole_schema(
+                    hnsw.reader.schema(),
+                    hnsw.reader.metadata().version(),
+                ),
+                range.clone(),
+            )
+            .await;
+            let projected = read_range(projection.clone(), range).await;
+
+            assert_eq!(projected.num_columns(), 2);
+            assert_eq!(projected.num_rows(), full.num_rows());
+            for name in [HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL] {
+                assert_eq!(
+                    projected.column_by_name(name).unwrap(),
+                    full.column_by_name(name).unwrap(),
+                    "partition {partition_id}: {name} differs between the projected and full read"
+                );
+            }
+            compared += 1;
+        }
+        assert!(compared > 0, "no non-empty partition was compared");
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
@@ -4831,6 +5461,8 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
+        assert_eq!(row_ids.len(), k);
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), k);
         let dists = result[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
@@ -4970,12 +5602,46 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 500;
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let num_rows = 32;
+        let num_partitions = num_rows + 2;
+        let mut vector_values = vec![0.0; num_rows * DIM];
+        for row in 0..num_rows {
+            vector_values[row * DIM + row] = 1.0;
+        }
+        let one_hot_vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vector_values.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let batch = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::jitter_centroids(one_hot_vectors, 0.0))
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let ivf_params = IvfBuildParams::new(nlist);
+        // Keep partition 0 empty: stats previously failed when the first partition was empty.
+        let mut centroid_values = Vec::with_capacity(num_partitions * DIM);
+        centroid_values.extend(std::iter::repeat_n(2.0, DIM));
+        centroid_values.extend(vector_values);
+        centroid_values.extend(std::iter::repeat_n(-2.0, DIM));
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(centroid_values),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(num_partitions, centroids).unwrap();
         let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(4)
+            .ef_construction(4);
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             ivf_params,
@@ -4998,14 +5664,25 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
 
         assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-        for index in stats["indices"].as_array().unwrap() {
-            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-            assert_eq!(
-                index["num_partitions"].as_number().unwrap(),
-                &serde_json::Number::from(nlist)
-            );
-            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
-        }
+        let indices = stats["indices"].as_array().unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        assert_eq!(
+            index["num_partitions"].as_number().unwrap(),
+            &serde_json::Number::from(num_partitions)
+        );
+        assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        let partition_sizes = index["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|partition| partition["size"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(partition_sizes.len(), num_partitions);
+        assert_eq!(partition_sizes.iter().sum::<u64>(), num_rows as u64);
+        assert_eq!(partition_sizes[0], 0);
+        assert!(partition_sizes.contains(&0));
     }
 
     async fn test_distance_range(params: Option<VectorIndexParams>, nlist: usize) {
@@ -5284,11 +5961,25 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let batch = reader
-            .read_range(0..reader.num_rows() as usize, None)
+        let projection = lance_file::versions::reader_projection_from_whole_schema(
+            reader.schema(),
+            reader.metadata().version(),
+        );
+        let batches = reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                u32::MAX,
+                projection,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
             .await?;
+        use futures::TryStreamExt as _;
+        let batches = batches.try_collect::<Vec<_>>().await?;
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut writer = FileWriter::try_new(
+        let mut writer = lance_file::versions::create_writer(
+            reader.metadata().version(),
             obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
             Default::default(),
@@ -5332,6 +6023,34 @@ mod tests {
             .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_non_divisible_pq_search() {
+        const DIM: usize = 64;
+        const PERSISTED_DIM: usize = 56;
+
+        let test_dir = copy_test_data_to_tmp("v0.10.15/non_divisible_pq").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let query = Float32Array::from(
+            (1..=DIM)
+                .map(|value| value as f32 + if value <= PERSISTED_DIM { 1.0 } else { 1_000.0 })
+                .collect::<Vec<_>>(),
+        );
+
+        let result = dataset
+            .scan()
+            .nearest("vector", &query, 1)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result[DIST_COL].as_primitive::<Float32Type>().values(),
+            &[PERSISTED_DIM as f32]
+        );
     }
 
     #[tokio::test]
@@ -5447,61 +6166,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_index_with_many_invalid_vectors() {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        // we use 8192 batch size by default, so we need to generate 8192 * 3 vectors to get 3 batches
-        // generate 3 batches, and the first batch's vectors are all with NaN
-        let num_rows = 8192 * 3;
-        let mut vectors = Vec::new();
-        for i in 0..num_rows {
-            if i < 8192 {
-                vectors.extend(std::iter::repeat_n(f32::NAN, DIM));
-            } else if i < 8192 * 2 {
-                vectors.extend(std::iter::repeat_n(rand::random::<f32>(), DIM));
-            } else {
-                vectors.extend(std::iter::repeat_n(rand::random::<f32>() * 1e20, DIM));
-            }
-        }
-        let schema = Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-            ),
-            true,
-        )]);
-        let schema = Arc::new(schema);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(
-                FixedSizeListArray::try_new_from_values(Float32Array::from(vectors), DIM as i32)
-                    .unwrap(),
-            )],
-        )
-        .unwrap();
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(batches, test_uri, Some(params))
-            .await
-            .unwrap();
-
-        let params = VectorIndexParams::ivf_pq(4, 8, DIM / 8, DistanceType::Dot, 50);
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_remap_join_on_second_delta() {
+    async fn test_compaction_remaps_second_delta_with_shared_partition_topology() {
         const INDEX_NAME: &str = "vector_idx";
-        const BASE_ROWS_PER_PARTITION: usize = 3_000;
+        const BASE_ROWS_PER_PARTITION: usize = 2_200;
         const SMALL_APPEND_ROWS: usize = 64;
         let offsets = [-50.0, 50.0];
 
@@ -5526,7 +6193,7 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
-            PQBuildParams::default(),
+            lightweight_pq_params(),
         );
         dataset
             .create_index(
@@ -5604,7 +6271,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let dataset = Dataset::open(test_uri).await.unwrap();
         let stats_after_compaction: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
         assert_eq!(stats_after_compaction["num_indices"].as_u64().unwrap(), 2);
@@ -5619,48 +6286,21 @@ mod tests {
             partitions_after,
             vec![base_partition_count, base_partition_count]
         );
-
-        const LARGE_APPEND_ROWS: usize = 40_000;
-        append_constant_vector(&mut dataset, LARGE_APPEND_ROWS, &template_values).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let stats_after_split: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
-        assert_eq!(stats_after_split["num_indices"].as_u64().unwrap(), 1);
-        let final_partition_count = stats_after_split["indices"][0]["num_partitions"]
-            .as_u64()
-            .unwrap() as usize;
-        assert_eq!(
-            final_partition_count,
-            base_partition_count + 1,
-            "expected split to increase partitions beyond {}, got {}",
-            base_partition_count,
-            final_partition_count
-        );
     }
 
     #[tokio::test]
     async fn test_spfresh_join_split() {
-        // Two join cycles followed by three append cycles:
-        // 1. Each deletion shrinks the smallest partition and verifies the partition count.
-        // 2. Append #1 (10k rows) creates a delta index without splitting.
-        // 3. Append #2 and #3 (40k rows each) trigger splits, forcing merges and validating partition sizes.
-
         const INDEX_NAME: &str = "vector_idx";
-        const NLIST: usize = 3;
-        const FIRST_APPEND_ROWS: usize = 10_000;
-        const SECOND_APPEND_ROWS: usize = 30_000;
-        const THIRD_APPEND_ROWS: usize = 35_000;
+        const NLIST: usize = 2;
+        const NO_SPLIT_APPEND_ROWS: usize = 32;
+        // The joined base and no-split delta contain 2,265 rows. This append
+        // takes the single IVF-PQ partition one row past its 32,768-row limit.
+        const SPLIT_APPEND_ROWS: usize = 30_504;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        // Two small clusters (for joins) and two large clusters (for splits).
-        let cluster_sizes = [100, 4_000, 4_000];
+        let cluster_sizes = [100, 2_200];
         let total_rows: usize = cluster_sizes.iter().sum();
 
         let mut centroid_values = Vec::new();
@@ -5722,7 +6362,7 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
-            PQBuildParams::default(),
+            lightweight_pq_params(),
         );
         dataset
             .create_index(
@@ -5735,8 +6375,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Template vector from the first large cluster for deterministic appends.
-        let template_id = (cluster_sizes[0] + cluster_sizes[1]) as u64;
+        let template_id = cluster_sizes[0] as u64;
         let template_batch = dataset
             .take_rows(&[template_id], dataset.schema().clone())
             .await
@@ -5753,63 +6392,37 @@ mod tests {
             "Template vector should match DIM"
         );
 
-        let mut expected_partitions = NLIST;
+        let mut next_id = total_rows as u64;
         let mut expected_rows = total_rows;
 
-        // Two join cycles.
-        for expected_after in [NLIST - 1, NLIST - 2] {
-            let (deleted_rows, appended_rows, actual_partitions) =
-                shrink_smallest_partition(&mut dataset, INDEX_NAME, expected_after).await;
-            expected_rows = expected_rows - deleted_rows + appended_rows;
-            assert_eq!(
-                dataset.count_all_rows().await.unwrap(),
-                expected_rows,
-                "Row count mismatch after join"
-            );
-            expected_partitions = actual_partitions;
-        }
+        let (deleted_rows, appended_rows, actual_partitions) =
+            shrink_smallest_partition(&mut dataset, INDEX_NAME, 1, &mut next_id).await;
+        expected_rows = expected_rows - deleted_rows + appended_rows;
+        assert_eq!(actual_partitions, 1);
+        assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
 
-        // Append #1: no split, expect a delta index.
-        let rows = FIRST_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
-            rows,
-            expected_partitions,
-            expected_rows + rows,
+            &mut next_id,
+            NO_SPLIT_APPEND_ROWS,
+            1,
+            expected_rows + NO_SPLIT_APPEND_ROWS,
             2,
             false,
         )
         .await;
-        expected_rows += rows;
+        expected_rows += NO_SPLIT_APPEND_ROWS;
 
-        // Append #2: triggers split and merge.
-        expected_partitions += 1;
-        let rows = SECOND_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
-            rows,
-            expected_partitions,
-            expected_rows + rows,
-            1,
-            true,
-        )
-        .await;
-        expected_rows += rows;
-
-        // Append #3: triggers another split, remains a single merged index.
-        expected_partitions += 1;
-        let rows = THIRD_APPEND_ROWS;
-        append_and_verify_append_phase(
-            &mut dataset,
-            INDEX_NAME,
-            &template_values,
-            rows,
-            expected_partitions,
-            expected_rows + rows,
+            &mut next_id,
+            SPLIT_APPEND_ROWS,
+            2,
+            expected_rows + SPLIT_APPEND_ROWS,
             1,
             true,
         )
@@ -5818,28 +6431,93 @@ mod tests {
 
     #[tokio::test]
     async fn test_partition_split_on_append_multivec() {
-        // This test verifies that when we append enough multivector data to a partition
-        // such that it exceeds MAX_PARTITION_SIZE_FACTOR * target_partition_size,
-        // the partition will be split into 2 partitions.
+        const INDEX_NAME: &str = "vector_idx";
+        const VECTORS_PER_ROW: usize = 3;
+        // 512 base rows and this append flatten to 33,036 vectors, just over
+        // the 32,768-vector IVF-PQ split threshold.
+        const APPEND_ROWS: usize = 10_500;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        // Create initial dataset with multivector data
-        let (dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) =
+            generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            IvfBuildParams::new(1),
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
 
-        // Create an IVF-PQ index with 2 partitions
-        // For IvfPq, target_partition_size = 8192
-        // Split triggers when partition_size > 4 * 8192 = 32,768
-        let params = VectorIndexParams::ivf_pq(2, 8, DIM / 8, DistanceType::Cosine, 50);
-        verify_partition_split_after_append(dataset, test_uri, params, "multivector data").await;
+        let initial_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(initial_ctx.num_partitions(), 1);
+
+        append_dataset::<Float32Type>(&mut dataset, APPEND_ROWS, 0.0..0.05).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let expected_rows = NUM_ROWS + APPEND_ROWS;
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            final_ctx.num_partitions(),
+            2,
+            "Expected one oversized multivector partition to split, stats: {}",
+            final_ctx.stats_json()
+        );
+        let partitions = final_ctx.stats()["indices"][0]["partitions"]
+            .as_array()
+            .expect("partitions should be present");
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|partition| partition["size"].as_u64().unwrap() as usize)
+                .sum::<usize>(),
+            expected_rows * VECTORS_PER_ROW
+        );
+        assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
+
+        let query_batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let query = query_batch["vector"].as_list::<i32>().value(0);
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .distance_metric(DistanceType::Cosine)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut row_ids = HashSet::new();
+        for row_id in results[ROW_ID].as_primitive::<UInt64Type>().values() {
+            assert!(row_ids.insert(*row_id), "duplicate row id {row_id}");
+        }
     }
 
     #[tokio::test]
     async fn test_split_multiple_partitions_in_one_optimize() {
         const INDEX_NAME: &str = "vector_idx";
         const BASE_ROWS_PER_PARTITION: usize = 512;
-        const APPEND_ROWS_PER_PARTITION: usize = 40_000;
+        // Each IVF-FLAT partition reaches 16,512 rows, just over its 16,384-row
+        // split threshold.
+        const APPEND_ROWS_PER_PARTITION: usize = 16_000;
         let offsets = [-50.0, 50.0];
 
         let test_dir = TempStrDir::default();
@@ -5860,11 +6538,7 @@ mod tests {
 
         let centroids = build_centroids_for_offsets(&offsets);
         let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            ivf_params,
-            PQBuildParams::default(),
-        );
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
         dataset
             .create_index(
                 &["vector"],
@@ -5878,22 +6552,14 @@ mod tests {
 
         let initial_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(initial_ctx.num_partitions(), 2);
-        let mut templates = Vec::with_capacity(2);
-        for partition_idx in 0..2 {
-            let row_ids = load_partition_row_ids(initial_ctx.ivf(), partition_idx).await;
-            let template_batch = dataset
-                .take_rows(&[row_ids[0]], dataset.schema().clone())
-                .await
-                .unwrap();
-            templates.push(
-                template_batch["vector"]
-                    .as_fixed_size_list()
-                    .value(0)
-                    .as_primitive::<Float32Type>()
-                    .values()
-                    .to_vec(),
-            );
-        }
+        let templates = offsets
+            .iter()
+            .map(|offset| {
+                let mut template = vec![0.0; DIM];
+                template[0] = *offset;
+                template
+            })
+            .collect::<Vec<_>>();
 
         append_partition_templates(&mut dataset, APPEND_ROWS_PER_PARTITION, &templates).await;
 
@@ -5933,6 +6599,24 @@ mod tests {
         assert_eq!(total_partition_rows, expected_rows);
         assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
 
+        let mut indexed_row_ids = HashSet::with_capacity(expected_rows);
+        for partition_idx in 0..final_ctx.num_partitions() {
+            for row_id in load_flat_partition_row_ids(final_ctx.ivf_flat(), partition_idx).await {
+                assert!(
+                    indexed_row_ids.insert(row_id),
+                    "row id {row_id} appeared in multiple partitions"
+                );
+            }
+        }
+        assert_eq!(indexed_row_ids.len(), expected_rows);
+        let live_row_ids = dataset.scan().with_row_id().try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(indexed_row_ids, live_row_ids);
+
         let nearest = dataset
             .scan()
             .with_row_id()
@@ -5950,22 +6634,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_join_partition_on_delete_multivec() {
-        // This test verifies that IVF index with multivector data handles deletions
-        // and compaction correctly, and that partition join works when applicable.
-        //
-        // Due to the complexity of multivector partition assignment, we use a more
-        // flexible verification approach that doesn't require specific partition sizes.
-
+        const INDEX_NAME: &str = "vector_idx";
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
         const MULTIVEC_PER_ROW: usize = 3;
-        let cluster_sizes = [4000, 4000, 400];
-        let offsets: Vec<f32> = vec![0.0, 10.0, 20.0];
-        let nlist = offsets.len();
+        const APPEND_ROWS: usize = 32;
+        let cluster_sizes = [800, 800, 400];
+        // Multivector indices require cosine distance. Unit centroids in three
+        // distinct directions avoid the collinear assignment in the old fixture.
+        let centroids = [(-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)];
+        let total_rows = cluster_sizes.iter().sum::<usize>();
         let mut dataset = {
             let (batch, schema) =
-                generate_clustered_multivec_batch(&cluster_sizes, &offsets, MULTIVEC_PER_ROW);
+                generate_clustered_multivec_batch(&cluster_sizes, &centroids, MULTIVEC_PER_ROW, 0);
             let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
             Dataset::write(
                 batches,
@@ -5979,254 +6661,13 @@ mod tests {
             .unwrap()
         };
 
-        const SMALL_APPEND_FOR_JOIN: usize = 32;
-        let centroids = build_centroids_for_offsets(&offsets);
-        let ivf_params = IvfBuildParams::try_with_centroids(nlist, centroids).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(centroids.len(), build_centroids_2d(&centroids))
+                .unwrap();
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::Cosine,
             ivf_params,
-            PQBuildParams::default(),
-        );
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector_idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify initial partition count and record it for later comparison.
-        let index_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
-        let initial_partitions = index_ctx.num_partitions();
-        assert!(
-            initial_partitions <= nlist && initial_partitions > 1,
-            "Expected at most {} partitions, got {}",
-            nlist,
-            initial_partitions
-        );
-
-        // Find the smallest partition and delete most of its rows
-        let row_ids = {
-            let ivf = index_ctx.ivf();
-            let mut smallest: Option<Vec<u64>> = None;
-            for i in 0..ivf.ivf.num_partitions() {
-                let partition_row_ids = load_partition_row_ids(ivf, i).await;
-                if partition_row_ids.is_empty() {
-                    continue;
-                }
-
-                let is_better = smallest
-                    .as_ref()
-                    .map(|existing| partition_row_ids.len() < existing.len())
-                    .unwrap_or(true);
-                if is_better {
-                    smallest = Some(partition_row_ids);
-                }
-            }
-            smallest.unwrap_or_default()
-        };
-
-        if row_ids.is_empty() {
-            // All partitions might be large - just verify basic functionality
-            let (batch, _) = generate_batch::<Float32Type>(1, None, 0.0..1.0, true);
-            let test_vector = batch["vector"].as_list::<i32>().value(0);
-            let result = dataset
-                .scan()
-                .nearest("vector", &test_vector, 5)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            assert!(result.num_rows() > 0, "Multivector search should work");
-            return;
-        }
-
-        // Keep only a few rows to make partition small
-        let keep_count = 5.min(row_ids.len());
-        let retained_ids: Vec<u64> = row_ids.iter().take(keep_count).copied().collect();
-
-        // Delete all rows except the first keep_count rows
-        delete_ids(&mut dataset, &row_ids[keep_count..]).await;
-
-        // Compact to potentially trigger partition join
-        compact_after_deletions(&mut dataset).await;
-
-        // Append a tiny batch and optimize incrementally to trigger the join path.
-        append_dataset::<Float32Type>(&mut dataset, SMALL_APPEND_FOR_JOIN, 0.0..0.01).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-        dataset
-            // A second pass ensures the incremental index sees the reduced
-            // partition sizes and applies the join.
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        // Verify partition count decreased after join
-        let final_ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
-        let final_num_partitions = final_ctx.num_partitions();
-        assert_le!(
-            final_num_partitions,
-            initial_partitions,
-            "Partition count should drop after join, was {}, now {}",
-            initial_partitions,
-            final_num_partitions
-        );
-
-        // Verify that multivector search still works after compaction
-        // Get a sample row by scanning and filtering
-        let sample_id = retained_ids[0];
-        let sample_row = dataset
-            .scan()
-            .filter(&format!("id = {}", sample_id))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        if sample_row.num_rows() > 0 {
-            let test_vector = sample_row["vector"].as_list::<i32>().value(0);
-            let result = dataset
-                .scan()
-                .nearest("vector", &test_vector, 10)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            assert!(
-                result.num_rows() > 0,
-                "Multivector search should return results after compaction"
-            );
-        }
-
-        // Verify the dataset still has rows after deletions and compaction
-        let remaining_rows = dataset.count_all_rows().await.unwrap();
-        assert!(
-            remaining_rows > 0,
-            "Dataset should still have rows after deletions and compaction"
-        );
-
-        // Verify we can perform multivector search on remaining data
-        let sample_batch = dataset
-            .scan()
-            .limit(Some(1), None)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        if sample_batch.num_rows() > 0 {
-            let test_vector = sample_batch["vector"].as_list::<i32>().value(0);
-            let search_result = dataset
-                .scan()
-                .nearest("vector", &test_vector, 10)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            assert!(
-                search_result.num_rows() > 0,
-                "Multivector search should return results with remaining data"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_prewarm_ivf_pq() {
-        use lance_io::assert_io_eq;
-
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::default(),
-        );
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("my_idx".to_owned()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Reset IO stats after index creation
-        dataset.object_store.as_ref().io_stats_incremental();
-
-        // Prewarm should perform IO to load all partitions into cache
-        dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert!(
-            stats.read_iops > 0,
-            "prewarm should have read from disk, but read_iops was 0"
-        );
-
-        // Can query index without IO
-        let q = Float32Array::from_iter_values(repeat_n(0.0, DIM));
-        dataset
-            .scan()
-            .nearest("vector", &q, 10)
-            .unwrap()
-            .project(&["_rowid"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(
-            stats,
-            read_iops,
-            0,
-            "query should not perform IO after prewarm"
-        );
-
-        // Second prewarm should not need IO (already cached)
-        dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
-    }
-
-    #[tokio::test]
-    async fn test_prewarm_ivf_pq_multiple_deltas() {
-        use lance_io::assert_io_eq;
-
-        const INDEX_NAME: &str = "my_idx";
-        const BASE_ROWS_PER_PARTITION: usize = 3_000;
-        const SMALL_APPEND_ROWS: usize = 64;
-        let offsets = [-50.0, 50.0];
-
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let (batch, schema) = generate_clustered_batch(BASE_ROWS_PER_PARTITION, offsets);
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let mut dataset = Dataset::write(
-            batches,
-            test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let centroids = build_centroids_for_offsets(&offsets);
-        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            ivf_params,
-            PQBuildParams::default(),
+            lightweight_pq_params(),
         );
         dataset
             .create_index(
@@ -6239,46 +6680,312 @@ mod tests {
             .await
             .unwrap();
 
-        let template_batch = dataset
-            .take_rows(&[0], dataset.schema().clone())
+        let index_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(index_ctx.num_partitions(), 3);
+
+        let mut logical_row_ids = {
+            let ivf = index_ctx.ivf();
+            let mut smallest: Option<HashSet<u64>> = None;
+            for i in 0..ivf.ivf.num_partitions() {
+                let partition_row_ids = load_partition_row_ids(ivf, i)
+                    .await
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                if partition_row_ids.is_empty() {
+                    continue;
+                }
+
+                let is_better = smallest
+                    .as_ref()
+                    .map(|existing| partition_row_ids.len() < existing.len())
+                    .unwrap_or(true);
+                if is_better {
+                    smallest = Some(partition_row_ids);
+                }
+            }
+            smallest
+                .expect("expected a non-empty partition")
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        logical_row_ids.sort_unstable();
+        assert_eq!(logical_row_ids.len(), cluster_sizes[2]);
+        let retained_id = logical_row_ids[0];
+        delete_ids(&mut dataset, &logical_row_ids[1..]).await;
+        compact_after_deletions(&mut dataset).await;
+
+        let (append_batch, append_schema) = generate_clustered_multivec_batch(
+            &[APPEND_ROWS],
+            &centroids[2..],
+            MULTIVEC_PER_ROW,
+            total_rows as u64,
+        );
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+                None,
+            )
             .await
             .unwrap();
-        let template_values = template_batch["vector"]
-            .as_fixed_size_list()
-            .value(0)
-            .as_primitive::<Float32Type>()
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        assert_eq!(
+            final_ctx.num_partitions(),
+            2,
+            "Expected the reduced multivector partition to join, stats: {}",
+            final_ctx.stats_json()
+        );
+        assert_eq!(final_ctx.stats()["num_indices"].as_u64().unwrap(), 1);
+        let expected_rows = total_rows - cluster_sizes[2] + 1 + APPEND_ROWS;
+        assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);
+
+        let sample_row = dataset
+            .scan()
+            .with_row_id()
+            .filter(&format!("id = {retained_id}"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(sample_row.num_rows(), 1);
+        let retained_row_id = sample_row[ROW_ID].as_primitive::<UInt64Type>().value(0);
+        let mut indexed_row_id_counts = HashMap::new();
+        for partition_idx in 0..final_ctx.num_partitions() {
+            for row_id in load_partition_row_ids(final_ctx.ivf(), partition_idx).await {
+                *indexed_row_id_counts.entry(row_id).or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(
+            indexed_row_id_counts.values().sum::<usize>(),
+            expected_rows * MULTIVEC_PER_ROW
+        );
+        assert_eq!(
+            indexed_row_id_counts.get(&retained_row_id),
+            Some(&MULTIVEC_PER_ROW),
+            "all vectors for the retained logical row should survive the join"
+        );
+        assert!(
+            indexed_row_id_counts
+                .values()
+                .all(|count| *count == MULTIVEC_PER_ROW),
+            "each logical row should have exactly {MULTIVEC_PER_ROW} indexed vectors"
+        );
+        let live_row_ids = dataset.scan().with_row_id().try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
             .values()
-            .to_vec();
-        let mut append_params = WriteParams {
-            max_rows_per_file: 32,
-            max_rows_per_group: 32,
-            ..Default::default()
-        };
-        append_params.mode = WriteMode::Append;
-        append_constant_vector_with_params(
-            &mut dataset,
-            SMALL_APPEND_ROWS,
-            &template_values,
-            Some(append_params),
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(live_row_ids.len(), expected_rows);
+        assert_eq!(
+            indexed_row_id_counts
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            live_row_ids
+        );
+    }
+
+    async fn row_ids_matching(dataset: &Dataset, predicate: &str) -> HashSet<u64> {
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.filter(predicate).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    struct OptimizeAfterDelete {
+        deleted_row_ids: HashSet<u64>,
+        index_row_ids: HashSet<u64>,
+        num_partitions_after: usize,
+        stats_json: String,
+    }
+
+    /// Shared scenario for the issue-7701 regressions: stable-row-id dataset,
+    /// IVF_FLAT index, scattered delete, optimize. Asserts the invariants both
+    /// partition adjustments must hold -- no live row lost, no id that never
+    /// existed -- and returns the state for the mode-specific assertions.
+    async fn optimize_after_delete(
+        total_rows: usize,
+        nlist: usize,
+        delete_predicate: &str,
+        keep_predicate: &str,
+    ) -> OptimizeAfterDelete {
+        const INDEX_NAME: &str = "vector_idx";
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (batch, schema) = generate_batch::<Float32Type>(total_rows, None, 0.0..1.0, false);
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
         )
-        .await;
+        .await
+        .unwrap();
+
+        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let deleted_row_ids = row_ids_matching(&dataset, delete_predicate).await;
+        let live_row_ids = row_ids_matching(&dataset, keep_predicate).await;
+        dataset.delete(delete_predicate).await.unwrap();
 
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
             .unwrap();
 
-        // Reopen dataset to avoid carrying index state in-memory from index creation.
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        let num_partitions_after = final_ctx.num_partitions();
+        let stats_json = final_ctx.stats_json().to_string();
+        let flat = final_ctx
+            .index
+            .as_any()
+            .downcast_ref::<IvfFlatIndex>()
+            .expect("expected IvfFlat index");
+        let mut index_row_ids = HashSet::new();
+        for part in 0..flat.ivf.num_partitions() {
+            index_row_ids.extend(load_flat_partition_row_ids(flat, part).await);
+        }
+
+        for row_id in &live_row_ids {
+            assert!(
+                index_row_ids.contains(row_id),
+                "live row id {} missing from index after optimize",
+                row_id
+            );
+        }
+        for row_id in &index_row_ids {
+            assert!(
+                live_row_ids.contains(row_id) || deleted_row_ids.contains(row_id),
+                "unexpected row id {} in index after optimize",
+                row_id
+            );
+        }
+
+        OptimizeAfterDelete {
+            deleted_row_ids,
+            index_row_ids,
+            num_partitions_after,
+            stats_json,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_join_after_delete_with_stable_row_ids() {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
+        // so optimize joins the smallest after a scattered delete.
+        let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
+
+        assert_eq!(
+            run.num_partitions_after, 3,
+            "optimize should have joined the smallest partition, got stats: {}",
+            run.stats_json
+        );
+
+        // The join reads every partition's stored rows through the merge filter, so
+        // deleted ids are dropped index-wide and not just from the joined partition.
+        for row_id in &run.deleted_row_ids {
+            assert!(
+                !run.index_row_ids.contains(row_id),
+                "deleted row id {} still in index after join",
+                row_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_split_after_delete_with_stable_row_ids() {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // one partition holds more than 4x the IVF_FLAT target, so optimize
+        // splits it after a scattered delete. This path reaches
+        // filter_deleted_ids through reshuffle_partitions, unlike the join
+        // path's take_vectors.
+        let run = optimize_after_delete(20_000, 1, "id % 5 = 0", "id % 5 != 0").await;
+
+        assert!(
+            run.num_partitions_after > 1,
+            "optimize should have split the oversized partition, got stats: {}",
+            run.stats_json
+        );
+
+        // The split rebuilds the whole partition from live rows: no deleted
+        // ids remain.
+        for row_id in &run.deleted_row_ids {
+            assert!(
+                !run.index_row_ids.contains(row_id),
+                "deleted row id {} still in index after split",
+                row_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_pq() {
+        use lance_io::assert_io_eq;
+
+        const INDEX_NAME: &str = "my_idx";
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::new(4, 4),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        append_dataset::<Float32Type>(&mut dataset, 8, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        // Reopen to avoid carrying index state in memory from index creation.
         let dataset = Dataset::open(test_uri).await.unwrap();
         let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        assert_eq!(indices.len(), 2, "expected two index deltas for my_idx");
+        assert_eq!(indices.len(), 2, "expected two index deltas");
         let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
         assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
 
-        // Reset IO stats after index creation
+        // Reset IO stats after index creation.
         dataset.object_store.as_ref().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache
+        // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
@@ -6286,11 +6993,11 @@ mod tests {
             "prewarm should have read from disk, but read_iops was 0"
         );
 
-        // Query should not perform IO after prewarm of all deltas
-        let q = Float32Array::from(template_values.clone());
+        // Query should not perform IO after prewarming all deltas.
+        let q = vectors.value(0);
         dataset
             .scan()
-            .nearest("vector", &q, 10)
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
             .unwrap()
             .project(&["_rowid"])
             .unwrap()
@@ -6305,59 +7012,126 @@ mod tests {
             "query should not perform IO after prewarm"
         );
 
-        // Second prewarm should not need IO (already cached)
+        // Second prewarm should not need IO (already cached).
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
-    type SerializedEntry = (Vec<u8>, lance_core::cache::CacheCodec, usize);
-
+    /// Index-cache backend that can drop partition entries on demand.
+    ///
+    /// Used to simulate cache invalidation after a credential rotation:
+    /// partition keys are opaque digests, so the test supplies the exact
+    /// [`InternalCacheKey`] set to bypass once the index identity is known
+    /// (see [`ivf_partition_cache_keys`]).
     #[derive(Debug)]
-    struct SerializingBackend {
-        /// Serialized entries: key -> (bytes, codec, size).
-        serialized: tokio::sync::Mutex<
-            std::collections::HashMap<lance_core::cache::InternalCacheKey, SerializedEntry>,
-        >,
-        /// Fallback for entries without a codec.
-        passthrough: lance_core::cache::MokaCacheBackend,
+    struct PartitionBypassCacheBackend {
+        inner: lance_core::cache::MokaCacheBackend,
+        partition_keys: std::sync::Mutex<HashSet<lance_core::cache::InternalCacheKey>>,
+        bypass_partitions: AtomicBool,
+        partition_hits: AtomicUsize,
     }
 
-    impl SerializingBackend {
+    impl PartitionBypassCacheBackend {
         fn new() -> Self {
             Self {
-                serialized: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                passthrough: lance_core::cache::MokaCacheBackend::with_capacity(256 * 1024 * 1024),
+                inner: lance_core::cache::MokaCacheBackend::with_capacity(256 * 1024 * 1024),
+                partition_keys: std::sync::Mutex::new(HashSet::new()),
+                bypass_partitions: AtomicBool::new(false),
+                partition_hits: AtomicUsize::new(0),
             }
         }
 
-        async fn serialized_entry_count(&self) -> usize {
-            self.serialized.lock().await.len()
+        fn set_partition_keys(&self, partition_keys: HashSet<lance_core::cache::InternalCacheKey>) {
+            *self.partition_keys.lock().unwrap() = partition_keys;
         }
 
-        async fn passthrough_entry_count(&self) -> usize {
-            use lance_core::cache::CacheBackend;
-            self.passthrough.num_entries().await
+        fn is_partition(&self, key: &lance_core::cache::InternalCacheKey) -> bool {
+            self.partition_keys.lock().unwrap().contains(key)
+        }
+
+        fn set_bypass_partitions(&self, bypass_partitions: bool) {
+            self.bypass_partitions
+                .store(bypass_partitions, Ordering::Relaxed);
+        }
+
+        fn should_bypass(&self, key: &lance_core::cache::InternalCacheKey) -> bool {
+            self.bypass_partitions.load(Ordering::Relaxed) && self.is_partition(key)
+        }
+
+        /// Whether the backend currently holds an entry for `key`.
+        async fn contains(&self, key: &lance_core::cache::InternalCacheKey) -> bool {
+            self.inner.get(key, None).await.is_some()
+        }
+
+        fn partition_hits(&self) -> usize {
+            self.partition_hits.load(Ordering::Relaxed)
         }
     }
 
+    /// Derive the internal cache keys of the IVF partition entries for an
+    /// index, replicating the namespace path
+    /// `dataset URI -> index UUID -> frag-reuse UUID` used when opening the
+    /// index. V3 partitions use [`IVFPartitionKey`]; legacy (v0.1/v0.2)
+    /// indices use `LegacyIVFPartitionKey`.
+    fn ivf_partition_cache_keys(
+        dataset_uri: &str,
+        uuid: &uuid::Uuid,
+        fri_uuid: Option<&uuid::Uuid>,
+        num_partitions: usize,
+        index_version: &IndexFileVersion,
+    ) -> HashSet<lance_core::cache::InternalCacheKey> {
+        use lance_core::cache::{CacheKey, CacheNamespace, KeyBuilder, UnsizedCacheKey};
+
+        let mut namespace = CacheNamespace::root().child(dataset_uri);
+        namespace = namespace.child(uuid.as_hyphenated().to_string().as_str());
+        if let Some(fri_uuid) = fri_uuid {
+            namespace = namespace.child(fri_uuid.as_hyphenated().to_string().as_str());
+        }
+
+        (0..num_partitions)
+            .map(|partition_id| {
+                if matches!(index_version, IndexFileVersion::V3) {
+                    let cache_key =
+                        IVFPartitionKey::<FlatIndex, ProductQuantizer>::new(partition_id);
+                    let mut builder = KeyBuilder::new(
+                        namespace,
+                        IVFPartitionKey::<FlatIndex, ProductQuantizer>::stable_type_id(),
+                        IVFPartitionKey::<FlatIndex, ProductQuantizer>::schema(),
+                    );
+                    cache_key.write_key(&mut builder);
+                    builder.finish()
+                } else {
+                    let cache_key =
+                        crate::index::vector::ivf::LegacyIVFPartitionKey::new(partition_id);
+                    let mut builder = KeyBuilder::new(
+                        namespace,
+                        crate::index::vector::ivf::LegacyIVFPartitionKey::stable_type_id(),
+                        crate::index::vector::ivf::LegacyIVFPartitionKey::schema(),
+                    );
+                    cache_key.write_key(&mut builder);
+                    builder.finish()
+                }
+            })
+            .collect()
+    }
+
     #[async_trait::async_trait]
-    impl lance_core::cache::CacheBackend for SerializingBackend {
+    impl lance_core::cache::CacheBackend for PartitionBypassCacheBackend {
         async fn get(
             &self,
             key: &lance_core::cache::InternalCacheKey,
             codec: Option<lance_core::cache::CacheCodec>,
         ) -> Option<lance_core::cache::CacheEntry> {
-            // Try serialized store first
-            let guard = self.serialized.lock().await;
-            if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return stored_codec
-                    .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-                    .hit();
+            if self.should_bypass(key) {
+                None
+            } else {
+                let entry = self.inner.get(key, codec).await;
+                if entry.is_some() && self.is_partition(key) {
+                    self.partition_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                entry
             }
-            drop(guard);
-            // Fall through to passthrough
-            self.passthrough.get(key, codec).await
         }
 
         async fn insert(
@@ -6367,17 +7141,8 @@ mod tests {
             size_bytes: usize,
             codec: Option<lance_core::cache::CacheCodec>,
         ) {
-            if let Some(codec) = codec {
-                let mut bytes = Vec::new();
-                codec
-                    .serialize(&entry, &mut bytes)
-                    .expect("serialization should succeed");
-                self.serialized
-                    .lock()
-                    .await
-                    .insert(key.clone(), (bytes, codec, size_bytes));
-            } else {
-                self.passthrough.insert(key, entry, size_bytes, None).await;
+            if !self.should_bypass(key) {
+                self.inner.insert(key, entry, size_bytes, codec).await;
             }
         }
 
@@ -6393,40 +7158,38 @@ mod tests {
             >,
             codec: Option<lance_core::cache::CacheCodec>,
         ) -> Result<(lance_core::cache::CacheEntry, bool)> {
-            if let Some(entry) = self.get(key, codec).await {
-                return Ok((entry, true));
+            if self.should_bypass(key) {
+                let (entry, _) = loader.await?;
+                Ok((entry, false))
+            } else {
+                let result = self.inner.get_or_insert(key, loader, codec).await;
+                if result.as_ref().is_ok_and(|(_, is_cache_hit)| *is_cache_hit)
+                    && self.is_partition(key)
+                {
+                    self.partition_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                result
             }
-            let (entry, size) = loader.await?;
-            self.insert(key, entry.clone(), size, codec).await;
-            Ok((entry, false))
-        }
-
-        async fn invalidate_prefix(&self, prefix: &str) {
-            self.serialized
-                .lock()
-                .await
-                .retain(|k, _| !k.starts_with(prefix));
-            self.passthrough.invalidate_prefix(prefix).await;
         }
 
         async fn clear(&self) {
-            self.serialized.lock().await.clear();
-            self.passthrough.clear().await;
+            self.inner.clear().await;
         }
 
         async fn num_entries(&self) -> usize {
-            self.serialized.lock().await.len() + self.passthrough.num_entries().await
+            self.inner.num_entries().await
         }
 
         async fn size_bytes(&self) -> usize {
-            let serialized: usize = self
-                .serialized
-                .lock()
-                .await
-                .values()
-                .map(|(_, _, s)| *s)
-                .sum();
-            serialized + self.passthrough.size_bytes().await
+            self.inner.size_bytes().await
+        }
+
+        fn approx_num_entries(&self) -> usize {
+            self.inner.approx_num_entries()
+        }
+
+        fn approx_size_bytes(&self) -> usize {
+            self.inner.approx_size_bytes()
         }
     }
 
@@ -6434,18 +7197,37 @@ mod tests {
     /// serializing cache backend, then query. Verifies that entries are
     /// serialized to bytes and that queries produce correct results after
     /// deserialization.
+    #[rstest]
+    #[case::ivf_pq(
+        VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        ),
+        <PartitionEntry<FlatIndex, ProductQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
+    #[case::ivf_hnsw_sq(
+        VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        ),
+        <PartitionEntry<HNSW, ScalarQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
     #[tokio::test]
-    async fn test_prewarm_and_query_with_serializing_backend() {
+    async fn test_prewarm_and_query_with_serializing_backend(
+        #[case] params: VectorIndexParams,
+        #[case] partition_type_id: &'static str,
+    ) {
+        use crate::utils::test::serializing_cache::SerializingCacheBackend;
+        use lance_io::assert_io_eq;
+
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
         // Create dataset with vector index using default cache
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::default(),
-        );
         dataset
             .create_index(
                 &["vector"],
@@ -6457,8 +7239,11 @@ mod tests {
             .await
             .unwrap();
 
+        let q = Float32Array::from_iter_values(repeat_n(0.5, DIM));
+        let expected = ground_truth(&dataset, "vector", &q, 10, DistanceType::L2).await;
+
         // Re-open with the serializing backend
-        let backend = Arc::new(SerializingBackend::new());
+        let backend = Arc::new(SerializingCacheBackend::new());
         let session = Arc::new(crate::session::Session::with_index_cache_backend(
             backend.clone(),
             128 * 1024 * 1024,
@@ -6473,7 +7258,10 @@ mod tests {
         // Prewarm — this should serialize entries into the backend
         dataset.prewarm_index("serde_idx").await.unwrap();
         let serialized = backend.serialized_entry_count().await;
-        let passthrough = backend.passthrough_entry_count().await;
+        let state_type_id = IvfStateEntryBox::TYPE_ID;
+        let state_inserts = backend.serialized_insert_count(state_type_id).await;
+        let partition_inserts = backend.serialized_insert_count(partition_type_id).await;
+        let passthrough = backend.l1_entry_count().await;
         assert!(
             serialized > 0,
             "prewarm should have serialized entries into the backend"
@@ -6484,18 +7272,53 @@ mod tests {
              but found {passthrough} passthrough entries"
         );
 
-        // Query — the backend will deserialize entries from bytes.
-        // After prewarm, all entries are in serialized form, so every
-        // cache hit involves a deserialization round-trip.
-        let q = Float32Array::from_iter_values(repeat_n(0.5, DIM));
+        drop(dataset);
+        let backend = Arc::new(backend.restart());
+        assert_eq!(
+            backend.l1_entry_count().await,
+            0,
+            "restarting must discard the in-memory L1"
+        );
+        assert_eq!(
+            backend.serialized_entry_count().await,
+            serialized,
+            "restarting must retain the serialized IVF state and partitions"
+        );
+        let session = Arc::new(crate::session::Session::with_index_cache_backend(
+            backend.clone(),
+            128 * 1024 * 1024,
+            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        ));
+        let dataset = crate::DatasetBuilder::from_uri(test_uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        // Query — the recreated backend will deserialize entries from bytes.
+        // All index entries are in serialized form, so every cache hit involves
+        // a deserialization round-trip.
         let results = dataset
             .scan()
+            .with_row_id()
             .nearest("vector", &q, 10)
             .unwrap()
             .nprobes(4)
+            .project(&["_rowid"])
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
+        assert_eq!(
+            backend.serialized_insert_count(state_type_id).await,
+            state_inserts,
+            "the first restarted query must reuse the serialized IVF state"
+        );
+        assert_eq!(
+            backend.serialized_insert_count(partition_type_id).await,
+            partition_inserts,
+            "the first restarted query must reuse every serialized IVF partition"
+        );
         assert_eq!(results.num_rows(), 10, "should return 10 nearest neighbors");
 
         // Verify distances are sorted (ascending for L2)
@@ -6508,5 +7331,391 @@ mod tests {
         for w in distances.windows(2) {
             assert!(w[1] >= w[0], "distances should be sorted ascending");
         }
+
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&expected).count() as f32 / expected.len() as f32;
+        assert_ge!(
+            recall,
+            0.5,
+            "serialized IVF query recall is below threshold: {recall}"
+        );
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .nprobes(4)
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "warmed IVF query should not perform IO after backend restart"
+        );
+    }
+
+    #[rstest]
+    #[case::v3(IndexFileVersion::V3)]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[tokio::test]
+    async fn test_vector_cache_uses_current_object_store(#[case] index_version: IndexFileVersion) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        append_dataset::<Float32Type>(&mut dataset, NUM_ROWS, 0.0..1.0).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        )
+        .version(index_version.clone())
+        .clone();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("credential_rotation_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let index_meta = dataset
+            .load_indices_by_name("credential_rotation_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let query = vectors.value(0);
+        let ground_truth = ground_truth(&dataset, "vector", &query, 20, DistanceType::L2).await;
+
+        let cache_backend = Arc::new(PartitionBypassCacheBackend::new());
+        let session = Arc::new(crate::session::Session::with_index_cache_backend(
+            cache_backend.clone(),
+            128 * 1024 * 1024,
+            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        ));
+        let dataset = crate::DatasetBuilder::from_uri(test_uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let store_params_a = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-a".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_a, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_a,
+        )
+        .await
+        .unwrap();
+        let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
+
+        let store_params_b = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-b".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_b, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_b,
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&store_a, &store_b));
+        let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
+
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+
+        dataset_a
+            .scan()
+            .nearest("vector", &query, 20)
+            .unwrap()
+            .minimum_nprobes(4)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let frag_reuse_uuid = dataset_a.frag_reuse_index_uuid().await;
+        let state_cache_key =
+            crate::index::IvfIndexStateCacheKey::new(&index_meta.uuid, frag_reuse_uuid.as_ref());
+        let cached_state = if matches!(index_version, IndexFileVersion::V3) {
+            Some(
+                dataset_a
+                    .index_cache
+                    .get_with_key(&state_cache_key)
+                    .await
+                    .expect("V3 IVF state should be cached"),
+            )
+        } else {
+            None
+        };
+        let index_path_fragment = format!("_indices/{}", index_meta.uuid);
+        let first_store_stats = store_a.io_stats_incremental();
+        assert!(
+            first_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the first query should read the index through the first object store: {first_store_stats:#?}"
+        );
+        let partition_keys = ivf_partition_cache_keys(
+            dataset.uri(),
+            &index_meta.uuid,
+            frag_reuse_uuid.as_ref(),
+            4,
+            &index_version,
+        );
+        cache_backend.set_partition_keys(partition_keys.clone());
+        for partition_key in &partition_keys {
+            assert!(
+                cache_backend.contains(partition_key).await,
+                "the first query should populate portable partition entries"
+            );
+        }
+        let index_entries_after_a = dataset.session().index_cache_stats().await.num_entries;
+        let metadata_entries_after_a = dataset.session().metadata_cache_stats().await.num_entries;
+        let _ = store_b.io_stats_incremental();
+
+        cache_backend.set_bypass_partitions(true);
+        let results = dataset_b
+            .scan()
+            .nearest("vector", &query, 20)
+            .unwrap()
+            .minimum_nprobes(4)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&ground_truth).count() as f32 / 20.0;
+        assert_ge!(recall, 0.5);
+
+        let old_store_stats = store_a.io_stats_incremental();
+        let old_store_index_reads = old_store_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains(&index_path_fragment))
+            .count();
+        let new_store_stats = store_b.io_stats_incremental();
+        let new_store_index_reads = new_store_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains(&index_path_fragment))
+            .count();
+        if matches!(index_version, IndexFileVersion::V3) {
+            assert_eq!(
+                old_store_index_reads, 0,
+                "the new dataset query must not use readers bound to the old object store: {old_store_stats:#?}"
+            );
+            assert!(
+                new_store_index_reads > 0,
+                "the new dataset query should read the index through the new object store: {new_store_stats:#?}"
+            );
+        } else {
+            // Legacy live indices are shared across dataset opens: their
+            // readers stay bound to the object store that first populated the
+            // cache, so the second dataset keeps reading through the old store.
+            assert!(
+                old_store_index_reads > 0,
+                "the cached legacy index should keep reading through the original object store: {old_store_stats:#?}"
+            );
+            assert_eq!(
+                new_store_index_reads, 0,
+                "the cached legacy index must not reopen through the new object store: {new_store_stats:#?}"
+            );
+        }
+        if let Some(cached_state) = cached_state {
+            let state_after_rotation = dataset_b
+                .index_cache
+                .get_with_key(&state_cache_key)
+                .await
+                .expect("V3 IVF state should remain cached after rotation");
+            assert!(
+                Arc::ptr_eq(&cached_state, &state_after_rotation),
+                "store-free IVF state should be reused across object-store generations"
+            );
+        }
+
+        // Re-query through the first dataset: V3 portable state is rebound to
+        // the store supplied by each reconstruction, while the cached legacy
+        // index keeps reading through its original store. Either way the second
+        // store must not be touched.
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+        dataset_a
+            .scan()
+            .nearest("vector", &query, 20)
+            .unwrap()
+            .minimum_nprobes(4)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let store_a_stats = store_a.io_stats_incremental();
+        let store_a_index_reads = store_a_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains(&index_path_fragment))
+            .count();
+        let store_b_stats = store_b.io_stats_incremental();
+        let store_b_index_reads = store_b_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains(&index_path_fragment))
+            .count();
+        assert!(
+            store_a_index_reads > 0,
+            "re-querying the first dataset should read the index through its object store: {store_a_stats:#?}"
+        );
+        assert_eq!(
+            store_b_index_reads, 0,
+            "re-querying the first dataset must not use the second object store: {store_b_stats:#?}"
+        );
+
+        // Cache keys are opaque digests, so they cannot embed credential
+        // material by construction. What rotation must not do is mint new
+        // entries: the same portable state, partitions, and file metadata
+        // serve both object-store generations.
+        let index_entries_after_rotation = dataset.session().index_cache_stats().await.num_entries;
+        let metadata_entries_after_rotation =
+            dataset.session().metadata_cache_stats().await.num_entries;
+        assert_eq!(
+            index_entries_after_rotation, index_entries_after_a,
+            "credential rotation must not create new index cache entries"
+        );
+        assert_eq!(
+            metadata_entries_after_rotation, metadata_entries_after_a,
+            "credential rotation must not create new metadata cache entries"
+        );
+
+        cache_backend.set_bypass_partitions(false);
+        let partition_hits_before = cache_backend.partition_hits();
+        dataset_b
+            .scan()
+            .nearest("vector", &query, 20)
+            .unwrap()
+            .minimum_nprobes(4)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(
+            cache_backend.partition_hits() > partition_hits_before,
+            "the second store should reuse portable partitions populated by the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let clone_uri = format!("{}/clone", test_dir.as_str());
+        let (mut source, vectors) =
+            generate_test_dataset::<Float32Type>(&source_uri, 0.0..1.0).await;
+        append_dataset::<Float32Type>(&mut source, NUM_ROWS, 0.0..1.0).await;
+        assert_eq!(source.get_fragments().len(), 2);
+
+        let params = VectorIndexParams::ivf_rq(4, 5, DistanceType::L2);
+        source
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("ivf_rq_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let ground_truth = ground_truth(&source, "vector", &query, 20, DistanceType::L2).await;
+        source
+            .tags()
+            .create("with_ivf_rq", source.version().version)
+            .await
+            .unwrap();
+        let cloned = source
+            .shallow_clone(&clone_uri, "with_ivf_rq", None)
+            .await
+            .unwrap();
+
+        let index_meta = cloned
+            .load_indices_by_name("ivf_rq_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            index_meta.base_id.is_some(),
+            "a shallow-cloned index should reference its source base"
+        );
+        assert_eq!(
+            cloned.indice_files_dir(&index_meta).unwrap(),
+            source.indices_dir(),
+            "the cloned index should resolve its path through the source base"
+        );
+        assert_ne!(
+            cloned.indice_files_dir(&index_meta).unwrap(),
+            cloned.indices_dir(),
+            "the cloned index should not use the clone's primary index directory"
+        );
+
+        let cloned = crate::DatasetBuilder::from_uri(&clone_uri)
+            .with_session(Arc::new(crate::session::Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        let results = cloned
+            .scan()
+            .nearest("vector", &query, 20)
+            .unwrap()
+            .minimum_nprobes(4)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&ground_truth).count() as f32 / 20.0;
+        assert_ge!(recall, 0.5);
     }
 }
