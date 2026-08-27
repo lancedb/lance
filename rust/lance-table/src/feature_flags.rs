@@ -51,26 +51,33 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// that exposure comes with the reclamation and is inherited by whichever flag
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
+/// Reserved for datasets that reference recognized V2 data files with
+/// different exact versions.
+pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 256;
 /// JSON columns may contain the exact Decimal64, Decimal128, or Decimal256
 /// encodings enabled by jsonb's arbitrary-precision parser.
 ///
 /// Readers built without arbitrary-precision jsonb support decode those values
 /// through `f64` and silently change them. Readers and writers that do not
 /// understand this representation must therefore refuse the table.
-pub const FLAG_JSON_EXACT_NUMBERS: u64 = 256;
+pub const FLAG_JSON_EXACT_NUMBERS: u64 = 512;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 512;
+pub const FLAG_UNKNOWN: u64 = 1024;
 
 // The highest flag allocated must stay below the unknown boundary, or
-// `supported_flags` would refuse a bit this code claims to understand. The next
-// flag takes 256, so it has to move the boundary to 512 with it.
+// `supported_flags` would refuse a bit this code claims to understand.
 const _: () = assert!(FLAG_JSON_EXACT_NUMBERS < FLAG_UNKNOWN);
+// The mixed-version capability remains reserved and unsupported even though a
+// later understood flag has moved the unknown boundary past it.
+const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_JSON_EXACT_NUMBERS);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (128).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
 // The previous build's unknown boundary was 256, so it refuses exact-number
 // JSON datasets before decoding their decimal JSONB values.
 const _: () = assert!(FLAG_JSON_EXACT_NUMBERS >= 256);
+
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -89,6 +96,7 @@ pub fn apply_feature_flags(
     // immediately before the write.
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
+    let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
 
     // Reset flags
     manifest.reader_feature_flags = 0;
@@ -163,7 +171,26 @@ pub fn apply_feature_flags(
 
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= sticky_paired_flags;
+    manifest.writer_feature_flags |= sticky_paired_flags;
 
+    Ok(())
+}
+
+/// Carry sticky paired capabilities from the manifest a new one is derived
+/// from.
+///
+/// [`apply_feature_flags`] carries these bits across its own reset, but it only
+/// ever sees one manifest. Constructors preserve these flags, and this helper
+/// also validates that the source is not half-set before a derived manifest is
+/// committed.
+///
+/// A half-set state is refused rather than normalized: one bit set means a
+/// legacy reader or a legacy writer is still permitted, which is neither mode.
+pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifest) -> Result<()> {
+    let sticky_flags = validated_sticky_paired_flags(source)?;
+    destination.reader_feature_flags |= sticky_flags;
+    destination.writer_feature_flags |= sticky_flags;
     Ok(())
 }
 
@@ -187,6 +214,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
+    mark_supported(&mut supported, FLAG_MIXED_DATA_FILE_VERSIONS, false);
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -207,8 +235,66 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
     writer_flags & !supported_flags() == 0
 }
 
+/// Refuse reads from manifests whose required reader features this build does
+/// not support or whose paired capabilities are inconsistent.
+pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
+    validate_paired_feature_flags(manifest)?;
+    if !can_read_dataset(manifest.reader_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be read by this version of Lance. Please upgrade \
+                 Lance to read this dataset. Flags: {}",
+                manifest.reader_feature_flags
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse writes to manifests whose required writer features this build does
+/// not support or whose paired capabilities are inconsistent.
+pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
+    validate_paired_feature_flags(manifest)?;
+    if !can_write_dataset(manifest.writer_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be written by this version of Lance. Please upgrade \
+                 Lance to write this dataset. Flags: {}",
+                manifest.writer_feature_flags
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
     writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
+}
+
+/// Refuse a manifest whose paired reader and writer capability bits disagree.
+///
+/// One word set and the other not is neither mode: it would let a legacy reader
+/// or a legacy writer through on a table where the other half is enforcing. The
+/// commit path refuses to *produce* this, so seeing it on read means the
+/// manifest was written by something that did not.
+pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
+    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+    if reader != writer {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
+             so its semantics are undefined",
+        ));
+    }
+    Ok(())
+}
+
+fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
+    validate_paired_feature_flags(manifest)?;
+    Ok(manifest.reader_feature_flags & STICKY_PAIRED_FLAGS)
 }
 
 #[cfg(test)]
@@ -237,14 +323,15 @@ mod tests {
     use crate::format::BasePath;
 
     /// The predecessor's supported mask ended immediately below bit 256. Keep
-    /// the precise-JSON flag on that boundary so the predecessor fails closed,
-    /// while this build accepts the representation it writes.
+    /// the precise-JSON flag beyond that boundary so the predecessor fails
+    /// closed, while this build accepts the representation it writes.
     #[test]
     fn test_exact_json_numbers_fence_predecessor_reader() {
         const PREDECESSOR_UNKNOWN_BOUNDARY: u64 = 256;
         const PREDECESSOR_SUPPORTED_FLAGS: u64 = PREDECESSOR_UNKNOWN_BOUNDARY - 1;
 
-        assert_eq!(FLAG_JSON_EXACT_NUMBERS, PREDECESSOR_UNKNOWN_BOUNDARY);
+        assert_eq!(FLAG_JSON_EXACT_NUMBERS, 512);
+        assert_ne!(FLAG_JSON_EXACT_NUMBERS, FLAG_MIXED_DATA_FILE_VERSIONS);
         assert!(can_read_dataset(FLAG_JSON_EXACT_NUMBERS));
         assert!(can_write_dataset(FLAG_JSON_EXACT_NUMBERS));
         assert_ne!(
@@ -432,5 +519,109 @@ mod tests {
             multi_base_manifest.writer_feature_flags & FLAG_BASE_PATHS,
             0
         );
+    }
+    #[test]
+    fn inheriting_carries_sticky_paired_bits_from_the_source() {
+        let mut source = empty_manifest();
+        source.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        source.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        // A fresh destination models any derived manifest before inheritance.
+        let mut destination = empty_manifest();
+
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+
+        assert_ne!(
+            destination.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            destination.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
+    #[test]
+    fn inheriting_refuses_a_half_set_source() {
+        for (reader, writer) in [
+            (FLAG_MIXED_DATA_FILE_VERSIONS, 0),
+            (0, FLAG_MIXED_DATA_FILE_VERSIONS),
+        ] {
+            let mut source = empty_manifest();
+            source.reader_feature_flags = reader;
+            source.writer_feature_flags = writer;
+            let mut destination = empty_manifest();
+
+            let err = inherit_sticky_feature_flags(&mut destination, &source).unwrap_err();
+
+            assert!(err.to_string().contains("only one of"), "{err}");
+        }
+    }
+
+    #[test]
+    fn apply_feature_flags_carries_sticky_paired_bits_across_its_reset() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
+    #[test]
+    fn apply_feature_flags_rejects_half_set_sticky_bits() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+
+        let err = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(err.to_string().contains("only one of"), "{err}");
+    }
+
+    #[test]
+    fn writer_gate_rejects_reserved_mixed_capability() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+
+        let err = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        assert!(err.to_string().contains("cannot be written"), "{err}");
+    }
+
+    fn empty_manifest() -> Manifest {
+        use crate::format::DataStorageFormat;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        )
+    }
+
+    /// A build that does not know the bit must refuse the table rather than
+    /// continue with legacy semantics.
+    #[test]
+    fn mixed_capability_remains_unsupported() {
+        assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
+        assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
+        assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS, 256);
+        assert_eq!(FLAG_UNKNOWN, 1024);
     }
 }
