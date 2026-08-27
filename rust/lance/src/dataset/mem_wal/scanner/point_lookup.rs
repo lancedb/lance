@@ -105,9 +105,8 @@ pub struct LsmPointLookupPlanner {
     /// on the plan fallback path (the part of point-lookup latency that doesn't
     /// scale with generation count).
     task_ctx: Arc<TaskContext>,
-    /// Which prefix of the in-memory memtables this planner may read. Applies to
-    /// every in-memory arm — the fast BTree probe and the plan fallback alike —
-    /// so both paths resolve a key against the same cursor.
+    /// Prefix of the in-memory memtables this planner reads. Applies to the fast
+    /// BTree probe and the plan fallback alike, so both resolve a key the same.
     visibility: MemTableVisibility,
 }
 
@@ -140,9 +139,8 @@ impl LsmPointLookupPlanner {
         }
     }
 
-    /// Read the in-memory memtables at `visibility` instead of the published
-    /// prefix. See [`MemTableVisibility::Indexed`] for the (narrow) conditions
-    /// under which anything but the default is sound.
+    /// Read the in-memory memtables at `visibility`. See
+    /// [`MemTableVisibility::Indexed`] for when a wider bound is sound.
     pub fn with_visibility(mut self, visibility: MemTableVisibility) -> Self {
         self.visibility = visibility;
         self

@@ -470,25 +470,19 @@ pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error 
 }
 
 /// Which prefix of a MemTable a reader may see.
-///
-/// The two cursors (`indexed`, `durable`) admit two different bounds, and which
-/// one is correct depends on *who* is reading — not on any per-read preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemTableVisibility {
-    /// [`IndexStore::visible_count`] — indexed and, under `durable_write`, also
-    /// durable. The only correct bound for anyone but the writer: a row outside
-    /// it may still fail its WAL append and never exist.
+    /// [`IndexStore::visible_count`]. Required for every reader but the writer
+    /// itself: a row past this bound can still fail its append and never exist.
     #[default]
     Published,
-    /// [`IndexStore::indexed_count`] — includes writes that are indexed but not
-    /// yet durable.
+    /// [`IndexStore::indexed_count`], which also covers writes whose append is
+    /// outstanding.
     ///
-    /// Sound *only* for the writer reading its own ordered prefix while holding
-    /// the lock that makes it the sole writer, as a partial-column update does
-    /// between its read and its merged write. Both cursors advance over
-    /// contiguous prefixes, so a row derived from position `p` cannot become
-    /// published before `p` does, and a failed append poisons the writer before
-    /// either is acknowledged. Any other caller reintroduces dirty reads.
+    /// Sound only for a writer reading its own prefix under the lock that makes
+    /// it the sole writer. Both cursors advance over contiguous prefixes, so a
+    /// row derived from `p` cannot be published before `p`, and a failed append
+    /// poisons the writer before either is acknowledged.
     Indexed,
 }
 
@@ -1330,9 +1324,7 @@ impl IndexStore {
         }
     }
 
-    /// The prefix readable under `visibility`. Every external reader passes
-    /// [`MemTableVisibility::Published`]; only the writer's own
-    /// read-modify-write passes [`MemTableVisibility::Indexed`].
+    /// The prefix readable under `visibility`.
     pub fn prefix_count(&self, visibility: MemTableVisibility) -> usize {
         match visibility {
             MemTableVisibility::Published => self.visible_count(),

@@ -483,12 +483,8 @@ impl MemTableScanner {
         Self::new_at_visibility(batch_store, indexes, schema, MemTableVisibility::Published)
     }
 
-    /// As [`Self::new`], but bounded by `visibility`. Read
-    /// [`MemTableVisibility::Indexed`] before reaching for anything but
-    /// [`MemTableVisibility::Published`].
-    ///
-    /// The bound is snapshotted here, at construction, so every plan this
-    /// scanner builds keys on one stable cursor.
+    /// As [`Self::new`], bounded by `visibility`. Snapshotted at construction,
+    /// so every plan this scanner builds keys on one stable cursor.
     pub fn new_at_visibility(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,

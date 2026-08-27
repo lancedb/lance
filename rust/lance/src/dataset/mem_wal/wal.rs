@@ -238,9 +238,8 @@ impl BatchDurableWatcher {
         }
     }
 
-    /// Whether the write has been indexed. Under `durable_write` this is the
-    /// weaker half of [`Self::is_visible`]: the rows are in the indexes but the
-    /// WAL append may still be outstanding.
+    /// Whether the write's batches are indexed — the weaker half of
+    /// [`Self::is_visible`], with the append possibly still outstanding.
     fn is_indexed(&self) -> bool {
         // WAL-only mode has no indexes, so there is nothing to index-wait on.
         let indexed = match &self.indexes {
@@ -263,14 +262,12 @@ impl BatchDurableWatcher {
         self.wait_until(Self::is_visible).await
     }
 
-    /// Wait only until the write is indexed, leaving durability outstanding.
+    /// Wait until the write is indexed, leaving durability outstanding. Pairs
+    /// with [`MemTableVisibility::Indexed`](crate::dataset::mem_wal::MemTableVisibility::Indexed)
+    /// on the read side.
     ///
-    /// For a writer that must read its own not-yet-durable prefix back — a
-    /// partial-column update merging under its own lock — paired with
-    /// [`MemTableVisibility::Indexed`](crate::dataset::mem_wal::MemTableVisibility::Indexed)
-    /// on the read. It is *not* an acknowledgement: a caller that promised
-    /// durability must still await [`Self::wait`], which it can do after
-    /// releasing the lock so concurrent appends still coalesce.
+    /// Not an acknowledgement: a caller promising durability must still await
+    /// [`Self::wait`].
     pub async fn wait_indexed(&mut self) -> Result<()> {
         self.wait_until(Self::is_indexed).await
     }
@@ -2523,9 +2520,7 @@ mod tests {
     }
 
     /// `wait_indexed` clears on the index apply alone; `wait` still needs the
-    /// append. This is what lets a partial-column merge read its own predecessor
-    /// back under the bucket lock without dragging an S3 round-trip into the
-    /// critical section — see `MemTableVisibility::Indexed`.
+    /// append.
     #[tokio::test]
     async fn test_wait_indexed_clears_before_durable() {
         let cursors = Arc::new(WriterCursors::new(true));
@@ -2550,8 +2545,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Indexed but not durable: the two bounds diverge, and only the writer's
-        // own read-modify-write may use the wider one.
+        // Indexed but not durable: the two bounds diverge.
         assert_eq!(indexes.indexed_count(), 1);
         assert_eq!(indexes.visible_count(), 0);
         assert_eq!(indexes.prefix_count(MemTableVisibility::Published), 0);
@@ -2576,9 +2570,8 @@ mod tests {
         assert_eq!(indexes.visible_count(), 1);
     }
 
-    /// A poisoned writer wakes an index waiter with the typed error. The rows may
-    /// well be indexed, but a merge that read them would build a row on a write
-    /// that is never going to exist.
+    /// A poisoned writer wakes an index waiter with the typed error: its rows
+    /// may be indexed, but they are never going to exist.
     #[tokio::test]
     async fn test_wait_indexed_surfaces_a_poisoned_writer() {
         let cursors = Arc::new(WriterCursors::new(true));
