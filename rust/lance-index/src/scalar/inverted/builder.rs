@@ -419,7 +419,10 @@ impl InvertedIndexBuilder {
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
-        let mut index_tasks = Vec::with_capacity(num_workers);
+        // JoinSet aborts all still-running workers when update_index is
+        // cancelled or returns early. Plain JoinHandles detach on drop and
+        // would let query-time residual builders outlive their resource permit.
+        let mut index_tasks = tokio::task::JoinSet::new();
         for _ in 0..num_workers {
             let tokenizer = tokenizer.clone();
             let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
@@ -427,7 +430,7 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
-            index_tasks.push(tokio::task::spawn(async move {
+            index_tasks.spawn(async move {
                 let mut worker =
                     IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -441,7 +444,7 @@ impl InvertedIndexBuilder {
                         .await?;
                 }
                 worker.finish().await
-            }));
+            });
         }
 
         let index_build = async {
@@ -485,8 +488,8 @@ impl InvertedIndexBuilder {
             let start = std::time::Instant::now();
             let mut tail_partitions = Vec::new();
             let mut files = Vec::new();
-            for index_task in index_tasks {
-                let output = index_task.await??;
+            while let Some(index_task) = index_tasks.join_next().await {
+                let output = index_task??;
                 self.new_partitions.extend(output.partitions);
                 files.extend(output.files);
                 if let Some(tail_partition) = output.tail_partition {
@@ -4108,6 +4111,60 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PendingWorkerProgress {
+        entered: tokio::sync::Notify,
+        stopped: tokio::sync::Notify,
+        resource: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    }
+
+    impl PendingWorkerProgress {
+        fn new(resource: tokio::sync::OwnedSemaphorePermit) -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                stopped: tokio::sync::Notify::new(),
+                resource: std::sync::Mutex::new(Some(resource)),
+            }
+        }
+    }
+
+    struct PendingWorkerGuard<'a> {
+        stopped: &'a tokio::sync::Notify,
+        _resource: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    impl Drop for PendingWorkerGuard<'_> {
+        fn drop(&mut self) {
+            self.stopped.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl IndexBuildProgress for PendingWorkerProgress {
+        async fn stage_start(&self, _stage: &str, _total: Option<u64>, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _stage: &str, _completed: u64) -> Result<()> {
+            let resource = self
+                .resource
+                .lock()
+                .expect("pending worker resource lock poisoned")
+                .take()
+                .expect("stage_progress called more than once");
+            let _guard = PendingWorkerGuard {
+                stopped: &self.stopped,
+                _resource: resource,
+            };
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+
+        async fn stage_complete(&self, _stage: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_builder_reports_progress_stages() -> Result<()> {
         let index_dir = TempDir::default();
@@ -4893,6 +4950,55 @@ mod tests {
         assert!(
             result.to_string().contains("injected progress failure"),
             "unexpected error: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_index_cancellation_aborts_workers() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch = make_doc_batch("hello world", 0);
+        let stream =
+            RecordBatchStreamAdapter::new(batch.schema(), stream::iter(std::iter::once(Ok(batch))));
+        let stream = Box::pin(stream);
+
+        let worker_resource = Arc::new(tokio::sync::Semaphore::new(1));
+        let worker_permit = worker_resource
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("worker resource semaphore closed");
+        let progress = Arc::new(PendingWorkerProgress::new(worker_permit));
+        let mut builder = InvertedIndexBuilder::new(
+            InvertedIndexParams::default()
+                .memory_limit_mb(1)
+                .num_workers(1),
+        )
+        .with_progress(progress.clone());
+
+        let update_task =
+            tokio::spawn(async move { builder.update_index(stream, store.as_ref()).await });
+        tokio::time::timeout(Duration::from_secs(5), progress.entered.notified())
+            .await
+            .expect("worker did not reach its observable pending point");
+        let stopped = progress.stopped.notified();
+        tokio::pin!(stopped);
+
+        update_task.abort();
+        let join_error = update_task
+            .await
+            .expect_err("cancelled update task unexpectedly completed");
+        assert!(join_error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("worker remained detached after update cancellation");
+        assert!(
+            worker_resource.try_acquire_owned().is_ok(),
+            "worker resource should be reusable after cancellation"
         );
     }
 
