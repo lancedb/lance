@@ -93,6 +93,18 @@ pub fn infer_system_index_type(
     }
 }
 
+/// Serializes tests that drive a spill-enabled DataFusion execution.
+///
+/// Each spill `SortExec` reserves a non-spillable merge buffer
+/// (`sort_spill_reservation_bytes`, 40MB with the default pool) from the
+/// process-wide cached memory pool (see `get_session_context`), and the default
+/// pool fits at most three concurrent reservations (150MB). Under nextest every
+/// test is its own process and this guard is a no-op, but under `cargo test`
+/// the whole test binary shares one process — and one pool — so unguarded
+/// tests must hold it to avoid spuriously exhausting the pool.
+#[cfg(test)]
+pub(crate) static SPILL_POOL_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

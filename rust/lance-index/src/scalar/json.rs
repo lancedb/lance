@@ -1351,6 +1351,7 @@ mod tests {
         #[case] query: SargableQuery,
         #[case] expected_row_ids: Vec<u64>,
     ) {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
@@ -1444,6 +1445,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_btree_update_reports_type_drift() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let (source_store, _source_dir) = local_json_index_store();
         let index = train_and_load_json_index(
             source_store,
@@ -1471,6 +1473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_derived_params_preserve_wrapper() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,
@@ -1536,13 +1539,6 @@ mod tests {
     ///
     /// Rows are fed in raw storage order (not sorted by value) to simulate what an
     /// unordered scan would produce.
-    ///
-    /// Each case below runs a spilling `SortExec` that reserves a non-spillable merge
-    /// buffer from the process-wide cached DataFusion memory pool (see
-    /// `get_session_context`); running the cases concurrently contends for that shared
-    /// pool and can spuriously exhaust it, so this guard serializes them.
-    static FLOAT_INDEX_CASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[rstest]
     #[case::range_gt_zero(
         SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
@@ -1566,7 +1562,7 @@ mod tests {
         #[case] query: SargableQuery,
         #[case] expected: Vec<u64>,
     ) {
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
@@ -1616,7 +1612,7 @@ mod tests {
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,

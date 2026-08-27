@@ -5148,6 +5148,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_ranged_index() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         // Setup stores for both indexes
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
@@ -5298,6 +5299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_with_exact_row_id_filter() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),

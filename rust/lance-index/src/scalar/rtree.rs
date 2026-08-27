@@ -1309,6 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_bbox() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let bbox_type = RectType::new(Dimension::XY, Default::default());
 
         let mut rng = rand::rng();
@@ -1354,6 +1355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_null() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let point_type = PointType::new(Dimension::XY, Default::default());
 
         let mut rng = rand::rng();
@@ -1390,6 +1392,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_geometries_are_not_indexed() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let line_string_type = LineStringType::new(Dimension::XY, Default::default());
         let mut builder = LineStringBuilder::new(line_string_type);
         builder
@@ -1450,6 +1453,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_finite_bounds_are_not_treated_as_empty() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
         builder.push_rect(Some(&Rect::new(
@@ -1490,6 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_rtree_indices_filters_rows_and_nulls() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let point_type = PointType::new(Dimension::XY, Default::default());
         let mut first_builder = PointBuilder::new(point_type.clone());
         first_builder.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
@@ -1587,6 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_removes_pre_fix_empty_entries() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
         builder.push_rect(Some(&BoundingBox::new()));
@@ -1652,6 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_and_search() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         fn gen_data(num_items: u32, frag_id: u32, nulls_addrs: &mut RowAddrTreeMap) -> RectArray {
             let bbox_type = RectType::new(Dimension::XY, Default::default());
 
@@ -1749,6 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm() {
+        let _guard = crate::SPILL_POOL_TEST_GUARD.lock().await;
         let point_type = PointType::new(Dimension::XY, Default::default());
 
         let mut rng = rand::rng();
