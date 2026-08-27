@@ -1836,7 +1836,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         LIMIT,
     )
     .await;
-    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query, LIMIT).await;
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
         "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
@@ -2564,8 +2564,12 @@ async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
     fast_scanner.limit(Some(1), None).unwrap();
     let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
     assert!(
-        fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
-        "fast search should use indexed-only cross-column scoring:\n{fast_plan}"
+        !fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "different per-column coverage must retain field-local masking:\n{fast_plan}"
+    );
+    assert!(
+        fast_plan.contains("BooleanQuery"),
+        "different per-column coverage should retain the field-local fallback:\n{fast_plan}"
     );
     assert_eq!(
         fast_scanner.try_into_batch().await.unwrap().num_rows(),
