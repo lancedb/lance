@@ -5085,8 +5085,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn flat_match_with_new_children_preserves_prepared_producer() {
+    #[test]
+    fn flat_match_with_new_children_preserves_prepared_producer() {
         let fixture = NoContextTestFixture::new();
         let input_schema = Arc::new(arrow_schema::Schema::new(vec![
             lance_core::ROW_ID_FIELD.clone(),
@@ -5133,7 +5133,10 @@ mod tests {
 
         let producer = SharedPreparedMatchProducer::new(rewritten_shared.clone());
         producer.publish(prepared_for_test("needle"));
-        assert_eq!(shared.wait().await.unwrap().tokens().get_token(0), "needle");
+        let SharedPreparedState::Ready(prepared) = shared.sender.borrow().clone() else {
+            panic!("rewritten producer must publish preparation to the original state");
+        };
+        assert_eq!(prepared.tokens().get_token(0), "needle");
     }
     use datafusion::physical_plan::union::UnionExec;
     use datafusion_physical_plan::joins::HashJoinExec;
