@@ -37,7 +37,7 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, build_prefilter};
+use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -933,12 +933,7 @@ impl ExecutionPlan for CompoundQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
-                vec![source]
-            }
-        }
+        self.prefilter_source.execution_plan().into_iter().collect()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -960,17 +955,7 @@ impl ExecutionPlan for CompoundQueryExec {
                         "compound FTS lost its prefilter child".to_string(),
                     ));
                 };
-                match &self.prefilter_source {
-                    PreFilterSource::FilteredRowIds(_) => PreFilterSource::FilteredRowIds(source),
-                    PreFilterSource::ScalarIndexQuery(_) => {
-                        PreFilterSource::ScalarIndexQuery(source)
-                    }
-                    PreFilterSource::None => {
-                        return Err(DataFusionError::Internal(
-                            "compound FTS received an unexpected prefilter child".to_string(),
-                        ));
-                    }
-                }
+                self.prefilter_source.with_execution_plan(source)?
             }
             count => {
                 return Err(DataFusionError::Internal(format!(
@@ -1059,8 +1044,10 @@ impl ExecutionPlan for CompoundQueryExec {
                 &prefilter_source,
                 dataset,
                 &segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
             )?;
             let deleted_fragments =
                 indices
@@ -1553,12 +1540,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
-                vec![source]
-            }
-        }
+        self.prefilter_source.execution_plan().into_iter().collect()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -1580,18 +1562,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                         "cross-column compound FTS lost its prefilter child".to_string(),
                     ));
                 };
-                match &self.prefilter_source {
-                    PreFilterSource::FilteredRowIds(_) => PreFilterSource::FilteredRowIds(source),
-                    PreFilterSource::ScalarIndexQuery(_) => {
-                        PreFilterSource::ScalarIndexQuery(source)
-                    }
-                    PreFilterSource::None => {
-                        return Err(DataFusionError::Internal(
-                            "cross-column compound FTS received an unexpected prefilter child"
-                                .to_string(),
-                        ));
-                    }
-                }
+                self.prefilter_source.with_execution_plan(source)?
             }
             count => {
                 return Err(DataFusionError::Internal(format!(
@@ -1659,8 +1630,10 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 &prefilter_source,
                 dataset.clone(),
                 &selected_segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2825,11 +2798,7 @@ impl ExecutionPlan for MatchQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(src) => vec![&src],
-            PreFilterSource::ScalarIndexQuery(src) => vec![&src],
-        }
+        self.prefilter_source.execution_plan().into_iter().collect()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -2872,19 +2841,7 @@ impl ExecutionPlan for MatchQueryExec {
             }
             1 => {
                 let src = children.pop().unwrap();
-                let prefilter_source = match &self.prefilter_source {
-                    PreFilterSource::FilteredRowIds(_) => {
-                        PreFilterSource::FilteredRowIds(src.clone())
-                    }
-                    PreFilterSource::ScalarIndexQuery(_) => {
-                        PreFilterSource::ScalarIndexQuery(src.clone())
-                    }
-                    PreFilterSource::None => {
-                        return Err(DataFusionError::Internal(
-                            "Unexpected prefilter source".to_string(),
-                        ));
-                    }
-                };
+                let prefilter_source = self.prefilter_source.with_execution_plan(src)?;
 
                 Self {
                     dataset: self.dataset.clone(),
@@ -2966,8 +2923,10 @@ impl ExecutionPlan for MatchQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
             )?;
             let deleted_fragments =
                 indices
@@ -4153,11 +4112,7 @@ impl ExecutionPlan for PhraseQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        match &self.prefilter_source {
-            PreFilterSource::None => vec![],
-            PreFilterSource::FilteredRowIds(src) => vec![&src],
-            PreFilterSource::ScalarIndexQuery(src) => vec![&src],
-        }
+        self.prefilter_source.execution_plan().into_iter().collect()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -4173,37 +4128,32 @@ impl ExecutionPlan for PhraseQueryExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let plan = match children.len() {
-            0 => Self {
-                dataset: self.dataset.clone(),
-                query: self.query.clone(),
-                tokenized_query: self.tokenized_query.clone(),
-                params: self.params.clone(),
-                prefilter_source: PreFilterSource::None,
-                base_scorer: self.base_scorer.clone(),
-                shared_scorer: self.shared_scorer.clone(),
-                segment_selection: self.segment_selection.clone(),
-                overlay_block: self.overlay_block.clone(),
-                document_granularity: self.document_granularity,
-                schema: self.schema.clone(),
-                external_mask: self.external_mask.clone(),
-                properties: self.properties.clone(),
-                metrics: ExecutionPlanMetricsSet::new(),
-            },
+            0 => {
+                if !matches!(self.prefilter_source, PreFilterSource::None) {
+                    return Err(DataFusionError::Internal(
+                        "Unexpected prefilter source".to_string(),
+                    ));
+                }
+                Self {
+                    dataset: self.dataset.clone(),
+                    query: self.query.clone(),
+                    tokenized_query: self.tokenized_query.clone(),
+                    params: self.params.clone(),
+                    prefilter_source: PreFilterSource::None,
+                    base_scorer: self.base_scorer.clone(),
+                    shared_scorer: self.shared_scorer.clone(),
+                    segment_selection: self.segment_selection.clone(),
+                    overlay_block: self.overlay_block.clone(),
+                    document_granularity: self.document_granularity,
+                    schema: self.schema.clone(),
+                    external_mask: self.external_mask.clone(),
+                    properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                }
+            }
             1 => {
                 let src = children.pop().unwrap();
-                let prefilter_source = match &self.prefilter_source {
-                    PreFilterSource::FilteredRowIds(_) => {
-                        PreFilterSource::FilteredRowIds(src.clone())
-                    }
-                    PreFilterSource::ScalarIndexQuery(_) => {
-                        PreFilterSource::ScalarIndexQuery(src.clone())
-                    }
-                    PreFilterSource::None => {
-                        return Err(DataFusionError::Internal(
-                            "Unexpected prefilter source".to_string(),
-                        ));
-                    }
-                };
+                let prefilter_source = self.prefilter_source.with_execution_plan(src)?;
                 Self {
                     dataset: self.dataset.clone(),
                     query: self.query.clone(),
@@ -4272,8 +4222,10 @@ impl ExecutionPlan for PhraseQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
             )?;
             let deleted_fragments =
                 indices

@@ -4396,35 +4396,42 @@ impl Scanner {
                 let unlimited_params = params.clone().with_limit(None);
                 let can_use_bounded_compound =
                     !document_granularity.is_list_element() && params.limit.is_some();
-                let children =
-                    futures::future::try_join_all(query.match_queries.iter().map(|match_query| {
-                        let unlimited_params = &unlimited_params;
-                        async move {
-                            if can_use_bounded_compound {
-                                let child_query = FtsQuery::Match(match_query.clone());
-                                if let Some(plan) = self
-                                    .plan_compound_scorer(
-                                        &child_query,
-                                        params,
-                                        prefilter_source,
-                                        document_granularity,
-                                    )
-                                    .await?
-                                {
-                                    return Ok(plan);
+                let field_prefilter_sources =
+                    prefilter_source.shared_for_multimatch_fields(query.match_queries.len());
+                let children = futures::future::try_join_all(
+                    query
+                        .match_queries
+                        .iter()
+                        .zip(field_prefilter_sources.iter())
+                        .map(|(match_query, field_prefilter_source)| {
+                            let unlimited_params = &unlimited_params;
+                            async move {
+                                if can_use_bounded_compound {
+                                    let child_query = FtsQuery::Match(match_query.clone());
+                                    if let Some(plan) = self
+                                        .plan_compound_scorer(
+                                            &child_query,
+                                            params,
+                                            field_prefilter_source,
+                                            document_granularity,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(plan);
+                                    }
                                 }
-                            }
 
-                            self.plan_match_query(
-                                match_query,
-                                unlimited_params,
-                                filter_plan,
-                                prefilter_source,
-                            )
-                            .await
-                        }
-                    }))
-                    .await?;
+                                self.plan_match_query(
+                                    match_query,
+                                    unlimited_params,
+                                    filter_plan,
+                                    field_prefilter_source,
+                                )
+                                .await
+                            }
+                        }),
+                )
+                .await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
