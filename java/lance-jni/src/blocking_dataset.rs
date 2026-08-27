@@ -1193,7 +1193,7 @@ fn inner_create_index<'local>(
             // do not deadlock on the field mutex.
             let mut working_dataset = {
                 let dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
                 }?;
                 dataset_guard.inner.clone()
             };
@@ -1214,7 +1214,7 @@ fn inner_create_index<'local>(
 
             if !skip_commit {
                 let mut dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
                 }?;
                 dataset_guard.inner = working_dataset;
             }
@@ -1286,9 +1286,9 @@ fn execute_create_index(
     }
 
     if skip_commit {
-        block_on(index_builder.execute_uncommitted())
+        Ok(block_on(index_builder.execute_uncommitted())?)
     } else {
-        block_on(index_builder.into_future())
+        Ok(block_on(index_builder.into_future())?)
     }
 }
 
