@@ -385,13 +385,6 @@ impl ArrowFixedSizeListVectorStore {
         self.to_record_batch_with_len(visible_len, total_rows)
     }
 
-    /// Materialize exactly the first `len` rows, for a caller pairing this batch
-    /// with a companion artifact that has to cover the same prefix. Clamped to
-    /// what is committed, so a stale length cannot read past it.
-    pub fn to_record_batch_upto(&self, len: usize, total_rows: Option<u64>) -> Result<RecordBatch> {
-        self.to_record_batch_with_len(len.min(self.committed_len()), total_rows)
-    }
-
     fn to_record_batch_with_len(
         &self,
         visible_len: usize,

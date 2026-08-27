@@ -432,18 +432,18 @@ impl HnswMemIndex {
         if state.graph.is_empty() {
             return Ok(None);
         }
-        // One exact prefix for both artifacts, because either can be ahead:
-        // storage is appended before the graph is built and published, so a
-        // graph past storage names rows with no vector, and storage past the
-        // graph writes rows no traversal can reach. Both lengths are read
-        // before either artifact is materialized, and both only grow, so the
-        // prefix they share is available to both.
-        let prefix = state.storage.committed_len().min(state.graph.len());
-        if prefix == 0 {
-            return Ok(None);
-        }
-        let storage_batch = state.storage.to_record_batch_upto(prefix, total_rows)?;
-        let hnsw_batch = state.graph.to_lance_hnsw_batch(Some(prefix))?;
+        // Bound the graph by storage, and only in that direction. A graph past
+        // storage names rows the batch has no vector for, which is the defect
+        // this fixes. Storage past the graph is left whole on purpose: those
+        // rows are unreachable by traversal either way, but `HNSW::search`
+        // brute-forces the storage domain under a narrow prefilter
+        // (`flat_search`), so dropping them would lose results this export
+        // previously returned. Closing that gap means finishing index
+        // application before export, not trimming storage to match.
+        let storage_batch = state.storage.to_record_batch(total_rows)?;
+        let hnsw_batch = state
+            .graph
+            .to_lance_hnsw_batch(Some(storage_batch.num_rows()))?;
         let hnsw = HNSW::load(hnsw_batch)?;
         Ok(Some((hnsw, storage_batch)))
     }
@@ -669,14 +669,15 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// The exported graph and storage must cover the same rows.
+    /// Storage leading the graph must keep its rows.
     ///
     /// `insert_batches` appends storage before it builds and publishes the
-    /// graph, so storage can lead. Exporting that interval writes storage rows
-    /// no traversal can reach, which makes them silently unsearchable in the
-    /// index that claims to hold them.
+    /// graph, so storage can lead. Those rows are unreachable by traversal
+    /// either way, but `HNSW::search` brute-forces the storage domain under a
+    /// narrow prefilter, so trimming storage to the graph would drop results
+    /// this export used to return. The graph still may not exceed storage.
     #[test]
-    fn to_lance_hnsw_exports_one_prefix_when_storage_leads_the_graph() {
+    fn to_lance_hnsw_keeps_storage_rows_the_graph_has_not_reached() {
         let dim = 8;
         let n = 32;
         let index = HnswMemIndex::with_capacity(
@@ -713,10 +714,14 @@ mod tests {
         };
         assert_eq!(
             storage_batch.num_rows(),
-            hnsw.len(),
-            "storage rows beyond the graph would be unreachable"
+            n * 2,
+            "storage keeps every committed row; a narrow prefilter scans them"
         );
-        assert_eq!(hnsw.len(), n, "the shared prefix is what the graph reached");
+        assert_eq!(hnsw.len(), n, "the graph covers only what it indexed");
+        assert!(
+            hnsw.len() <= storage_batch.num_rows(),
+            "the graph must never name a row storage has no vector for"
+        );
     }
 
     #[test]
