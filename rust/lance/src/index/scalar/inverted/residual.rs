@@ -174,6 +174,7 @@ impl OsObjectStore for BudgetedMemoryStore {
             uploaded_bytes: self.uploaded_bytes.clone(),
             budget_exceeded: self.budget_exceeded.clone(),
             max_uploaded_bytes: self.max_uploaded_bytes,
+            part_bytes: 0,
         }))
     }
 
@@ -231,23 +232,60 @@ struct BudgetedMultipartUpload {
     uploaded_bytes: Arc<AtomicUsize>,
     budget_exceeded: Arc<AtomicBool>,
     max_uploaded_bytes: usize,
+    part_bytes: usize,
+}
+
+struct TransientUploadReservation {
+    uploaded_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for TransientUploadReservation {
+    fn drop(&mut self) {
+        self.uploaded_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 #[async_trait]
 impl MultipartUpload for BudgetedMultipartUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
+        let payload_bytes = payload.content_length();
+        let Some(part_bytes) = self.part_bytes.checked_add(payload_bytes) else {
+            self.budget_exceeded.store(true, Ordering::Relaxed);
+            return Box::pin(async {
+                Err(object_store::Error::Generic {
+                    store: "BudgetedMemoryStore",
+                    source: "residual FTS multipart byte count overflowed".into(),
+                })
+            });
+        };
         if let Err(error) = reserve_upload_bytes(
             &self.uploaded_bytes,
             &self.budget_exceeded,
             self.max_uploaded_bytes,
-            payload.content_length(),
+            payload_bytes,
         ) {
             return Box::pin(async move { Err(error) });
         }
+        self.part_bytes = part_bytes;
         self.inner.put_part(payload)
     }
 
     async fn complete(&mut self) -> OsResult<PutResult> {
+        // InMemory concatenates all parts into a newly allocated buffer before
+        // the upload handle releases them. Reserve that full-copy peak across
+        // every concurrently building residual fragment, then release only the
+        // transient reservation when complete returns or is cancelled.
+        reserve_upload_bytes(
+            &self.uploaded_bytes,
+            &self.budget_exceeded,
+            self.max_uploaded_bytes,
+            self.part_bytes,
+        )?;
+        let _transient_reservation = TransientUploadReservation {
+            uploaded_bytes: self.uploaded_bytes.clone(),
+            bytes: self.part_bytes,
+        };
         self.inner.complete().await
     }
 
@@ -409,6 +447,7 @@ pub(crate) struct CachedResidualFtsSegment {
     rows: usize,
     documents: usize,
     serialized_bytes: usize,
+    resident_bytes: usize,
 }
 
 impl CachedResidualFtsSegment {
@@ -429,17 +468,13 @@ impl CachedResidualFtsSegment {
     }
 
     pub fn resident_bytes(&self) -> usize {
-        let mut context = Context::default();
-        self.deep_size_of_children(&mut context)
+        self.resident_bytes
     }
 }
 
 impl DeepSizeOf for CachedResidualFtsSegment {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        // `InvertedIndex` intentionally does not charge its object store. The
-        // store is private to this cache value, so account its serialized files
-        // explicitly in addition to decoded partition state.
-        self.index.deep_size_of_children(context) + self.serialized_bytes
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        self.resident_bytes
     }
 }
 
@@ -716,11 +751,22 @@ async fn build_residual_segment(
     // DSIndexCache computes its fixed admission weight.
     index.materialize_cache_weight().await?;
     let (_, documents, _) = index.bm25_stats_for_terms(&[], None).await?;
+    // `InvertedIndex` intentionally does not charge its object store. The
+    // store is private to this cache value, so account its serialized files
+    // explicitly in addition to decoded partition state. Cache this traversal
+    // before admission: DSIndexCache and every warm-query metric read can then
+    // use the fixed weight in O(1).
+    let mut size_context = Context::default();
+    let resident_bytes = index
+        .deep_size_of_children(&mut size_context)
+        .checked_add(serialized_bytes)
+        .ok_or_else(|| lance_core::Error::io("residual FTS resident byte count overflowed"))?;
     Ok(CachedResidualFtsSegment {
         index,
         rows,
         documents,
         serialized_bytes,
+        resident_bytes,
     })
 }
 
@@ -1092,6 +1138,23 @@ mod tests {
         assert!(error.to_string().contains("7 byte build budget"));
         assert!(exceeded.load(Ordering::Relaxed));
         assert!(second.list(None).next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn multipart_completion_reserves_full_copy_peak() {
+        use object_store::ObjectStoreExt;
+
+        let store = BudgetedMemoryStore::new(7);
+        let destination = Path::from("multipart");
+        let mut upload = store.put_multipart(&destination).await.unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"1234"))
+            .await
+            .unwrap();
+
+        let error = upload.complete().await.unwrap_err();
+        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(store.head(&destination).await.is_err());
     }
 
     #[tokio::test]

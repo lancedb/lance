@@ -496,10 +496,18 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merged_tail_partitions = spawn_cpu(move || {
-                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
-            })
-            .await?;
+            let merged_tail_partitions = if tail_partitions.len() <= 1 {
+                // A single worker can produce at most one tail. Keep its
+                // potentially large builder owned by this cancellable future;
+                // handing it to spawn_cpu would detach up to the full worker
+                // memory budget when the outer query is cancelled.
+                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)?
+            } else {
+                spawn_cpu(move || {
+                    merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+                })
+                .await?
+            };
             // Tail partitions hold most of the data when workers rarely hit the
             // flush threshold; writing them one at a time serializes the
             // posting-list compression of nearly the whole index behind a
