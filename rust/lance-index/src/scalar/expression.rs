@@ -21,7 +21,7 @@ use tokio::try_join;
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
-    query_touches_signed_zero,
+    signed_zero::rewrite_signed_zero_comparisons,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -308,19 +308,6 @@ impl SargableQueryParser {
         self.is_null_needs_recheck = false;
         self
     }
-
-    /// A query on a float zero always gets a recheck, even for an index that is
-    /// otherwise exact.
-    ///
-    /// The index compares in arrow's total order, where `-0.0` and `+0.0` are
-    /// distinct, so it can only answer with the candidates for both encodings.
-    /// Which of them satisfies the predicate is IEEE 754 semantics, which only
-    /// expression evaluation applies. This has to cover every query carrying a
-    /// zero, not just the ones [`widen_signed_zeros`] rewrites: `> -0.0` needs no
-    /// widening yet still admits `+0.0`, which IEEE 754 excludes.
-    fn needs_recheck_for(&self, query: &SargableQuery) -> bool {
-        self.needs_recheck || query_touches_signed_zero(query)
-    }
 }
 
 impl ScalarQueryParser for SargableQueryParser {
@@ -350,13 +337,12 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
-        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            needs_recheck,
+            self.needs_recheck,
         ))
     }
 
@@ -365,13 +351,12 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
         let query = SargableQuery::IsIn(in_list.to_vec());
-        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            needs_recheck,
+            self.needs_recheck,
         ))
     }
 
@@ -418,13 +403,12 @@ impl ScalarQueryParser for SargableQueryParser {
             Operator::NotEq => SargableQuery::Equals(value.clone()),
             _ => unreachable!(),
         };
-        let needs_recheck = self.needs_recheck_for(&query);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            needs_recheck,
+            self.needs_recheck,
         ))
     }
 
@@ -1998,12 +1982,7 @@ impl ScalarIndexExpr {
                 let search_result = index
                     .search_with_options(
                         search.query.as_ref(),
-                        SearchOptions::default()
-                            .with_track_nulls(track_nulls)
-                            // Pass down the plan's recheck decision: an index that
-                            // is otherwise exact needs it to widen a signed-zero
-                            // query into both encodings.
-                            .with_recheck(search.needs_recheck),
+                        SearchOptions::default().with_track_nulls(track_nulls),
                         metrics,
                     )
                     .await?;
@@ -2648,7 +2627,10 @@ impl PlannerIndexExt for Planner {
         index_info: &dyn IndexInformationProvider,
         use_scalar_index: bool,
     ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
+        // Runs after `optimize_expr`, which coerces the literal to the column's
+        // type and expands BETWEEN into two comparisons, so the rewrite sees
+        // every zero comparison in one shape.
+        let logical_expr = rewrite_signed_zero_comparisons(self.optimize_expr(filter)?)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
             let mut skip_recheck = false;
@@ -2689,37 +2671,6 @@ mod tests {
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
     use super::*;
-
-    /// An index that is otherwise exact is still forced to recheck any query
-    /// carrying a float zero, because it compares in total order and only
-    /// expression evaluation applies IEEE 754.
-    #[rstest]
-    #[case::eq_zero(Operator::Eq, ScalarValue::Float64(Some(0.0)), true)]
-    #[case::eq_neg_zero(Operator::Eq, ScalarValue::Float64(Some(-0.0)), true)]
-    #[case::eq_non_zero(Operator::Eq, ScalarValue::Float64(Some(1.0)), false)]
-    #[case::eq_int_zero(Operator::Eq, ScalarValue::Int64(Some(0)), false)]
-    #[case::ge_zero(Operator::GtEq, ScalarValue::Float64(Some(0.0)), true)]
-    #[case::gt_zero(Operator::Gt, ScalarValue::Float64(Some(0.0)), true)]
-    #[case::lt_zero(Operator::Lt, ScalarValue::Float64(Some(0.0)), true)]
-    #[case::le_neg_zero(Operator::LtEq, ScalarValue::Float64(Some(-0.0)), true)]
-    #[case::gt_non_zero(Operator::Gt, ScalarValue::Float64(Some(1.0)), false)]
-    fn test_signed_zero_forces_recheck(
-        #[case] op: Operator,
-        #[case] value: ScalarValue,
-        #[case] expected: bool,
-    ) {
-        let parser = SargableQueryParser::new(
-            "idx".to_string(),
-            "BTree".to_string(),
-            /*needs_recheck=*/ false,
-        );
-        let indexed = parser.visit_comparison("x", &value, &op).unwrap();
-        assert_eq!(
-            indexed.scalar_query.unwrap().needs_recheck(),
-            expected,
-            "{op} {value}"
-        );
-    }
 
     struct ColInfo {
         data_type: DataType,

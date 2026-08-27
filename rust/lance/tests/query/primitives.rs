@@ -17,7 +17,7 @@ use lance::index::DatasetIndexExt;
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
 
-use super::{test_filter, test_scan, test_take};
+use super::{assert_filter_ids, test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
 
 #[tokio::test]
@@ -223,13 +223,28 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
-            test_filter(&original, &ds, "value > 0.0").await;
-            test_filter(&original, &ds, "value < 0.0").await;
-            test_filter(&original, &ds, "value = 0.0").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "isnan(value)").await;
             test_filter(&original, &ds, "not isnan(value)").await;
+
+            // The remaining predicates compare against zero, where DataFusion
+            // 54 answers by Arrow's total order: it ranks `-0.0` below `+0.0`
+            // instead of treating the two encodings as one number the way
+            // IEEE 754 and SQL do. That makes it useless as the reference, so
+            // assert the rows. Ids are 0: +0.0, 1: -0.0, 2: +inf, 3: -inf,
+            // 4: NaN, 5: 1.0, 6: -1.0, 7: MIN, 8: MAX, 9: NULL.
+            for zero in ["0.0", "-0.0"] {
+                assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
+                // NaN is row 4. Arrow sorts it above every other value, so it
+                // survives `>` and `>=`, which IEEE would reject. That gap is
+                // not specific to zero and this rewrite leaves it alone.
+                assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8]).await;
+                assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8]).await;
+            }
         })
         .await
 }

@@ -5080,10 +5080,12 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
-    /// `MapIndexExec` uses the scalar index result as the answer and panics on a
-    /// non-exact one, so a float key of zero must not make the index widen. The
-    /// indexed path is selected here because the single join key is indexed and
-    /// nothing forces the full-scan path.
+    /// The merge_insert key lookup builds its index query straight from the
+    /// source values and treats the result as the answer, panicking on a
+    /// non-exact one, so it stays on arrow's total order. This pins that the
+    /// signed-zero rewrite, which sits in filter planning, does not reach it.
+    /// The indexed path is selected here because the single join key is indexed
+    /// and nothing forces the full-scan path.
     #[tokio::test]
     async fn test_indexed_merge_insert_on_float_zero_key() {
         let test_dir = TempStrDir::default();

@@ -20,7 +20,7 @@ use crate::scalar::registry::{
 use crate::scalar::seed::IndexSeedWriter;
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
-    compute_next_prefix, widen_signed_zeros,
+    compute_next_prefix,
 };
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
@@ -711,16 +711,6 @@ impl ScalarIndex for ZoneMapIndex {
         {
             return Ok(SearchResult::exact(null_rows.clone()));
         }
-
-        // Zone extrema keep the sign of a zero and are compared in arrow's total
-        // order, so a query on one encoding has to offer both or a zone whose
-        // extremum is the other encoding is pruned away. Unlike btree and bitmap
-        // this needs no opt-in from the caller: the zone scan below always answers
-        // `AtMost`, so every caller already has to narrow it down itself. The
-        // `IsNull` fast path above is the one exact answer, and it returns before
-        // this point.
-        let widened = widen_signed_zeros(query);
-        let query = widened.as_ref().unwrap_or(query);
 
         search_zones(&self.zones, metrics, |zone| {
             self.evaluate_zone_against_query(zone, query)
@@ -2243,72 +2233,6 @@ mod tests {
             }
             _ => panic!("Expected AtMost search result from zonemap"),
         }
-    }
-
-    /// Zone extrema keep the sign of a zero and are compared in total order, so
-    /// a zone whose max is `-0.0` would be pruned for a `= +0.0` query and vice
-    /// versa. Both zones have to survive as candidates.
-    #[tokio::test]
-    async fn test_zonemap_signed_zero_keeps_both_zones() {
-        let tmpdir = TempObjDir::default();
-        let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        // Two zones of two rows: [-1.0, -0.0] then [+0.0, 1.0], so each zone has
-        // one encoding of zero as an extremum. The third zone holds no zero, so
-        // the equality assertions below fail if pruning stops working.
-        let values = arrow_array::Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0, 5.0, 6.0]);
-        let row_ids = UInt64Array::from_iter_values(0..6u64);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
-            .unwrap();
-        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::once(std::future::ready(Ok(data))),
-        ));
-
-        ZoneMapIndexPlugin::train_zonemap_index(
-            data_stream,
-            test_store.as_ref(),
-            Some(ZoneMapIndexBuilderParams::new(2)),
-        )
-        .await
-        .unwrap();
-
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
-        assert_eq!(index.zones.len(), 3);
-
-        let mut zero_zones = RowAddrTreeMap::new();
-        zero_zones.insert_range(0..4);
-
-        for zero in [0.0f64, -0.0f64] {
-            let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
-            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            assert_eq!(
-                result,
-                SearchResult::at_most(zero_zones.clone()),
-                "querying {zero}"
-            );
-        }
-
-        // `>= +0.0` has to reach the zone whose max is -0.0. The third zone is a
-        // genuine match here, so this one covers every row.
-        let query = SargableQuery::Range(
-            Bound::Included(ScalarValue::Float64(Some(0.0))),
-            Bound::Unbounded,
-        );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        let mut all_zones = RowAddrTreeMap::new();
-        all_zones.insert_range(0..6);
-        assert_eq!(result, SearchResult::at_most(all_zones));
     }
 
     #[tokio::test]

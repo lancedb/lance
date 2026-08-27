@@ -14,7 +14,6 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
-    widen_signed_zeros_bloom,
 };
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -483,13 +482,6 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        // The filter hashes the raw bytes of a float, so the two encodings of zero
-        // are unrelated keys and each has to be probed. Like the zone map this
-        // needs no opt-in from the caller: every probe result is `AtMost`, so
-        // callers already narrow it down themselves. `IsNull` is the one exact
-        // answer, and `widen_signed_zeros_bloom` leaves it alone.
-        let widened = widen_signed_zeros_bloom(query);
-        let query = widened.as_ref().unwrap_or(query);
         let result = if let BloomFilterQuery::IsNull() = query
             && let Some(null_rows) = &self.null_rows
         {
@@ -2346,60 +2338,6 @@ mod tests {
         let query = BloomFilterQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
-    }
-
-    /// Bloom filters hash the raw bytes of a float, so `-0.0` and `+0.0` are
-    /// unrelated keys. A query for one encoding has to probe the other too, or a
-    /// zone that only holds the other encoding can be pruned.
-    #[tokio::test]
-    async fn test_bloomfilter_signed_zero_keeps_both_zones() {
-        let tmpdir = TempObjDir::default();
-        let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        // Two zones of two rows: [-1.0, -0.0] then [+0.0, 1.0], so each zone
-        // holds exactly one encoding of zero. A third zone holds no zero and must
-        // stay pruned, so the assertion below fails if pruning stops working.
-        let values = arrow_array::Float64Array::from(vec![-1.0, -0.0, 0.0, 1.0, 5.0, 6.0]);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Float64,
-            false,
-        )]));
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
-        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::once(std::future::ready(Ok(data))),
-        ));
-        let data_stream = add_row_addr(data_stream);
-
-        BloomFilterIndexPlugin::train_bloomfilter_index(
-            data_stream,
-            test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(2, 0.05)),
-        )
-        .await
-        .unwrap();
-
-        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-        assert_eq!(index.zones.len(), 3);
-
-        let mut both_zeros = RowAddrTreeMap::new();
-        both_zeros.insert_range(0..4);
-        for zero in [0.0f64, -0.0f64] {
-            let query = BloomFilterQuery::Equals(ScalarValue::Float64(Some(zero)));
-            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            assert_eq!(
-                result,
-                SearchResult::at_most(both_zeros.clone()),
-                "querying {zero}"
-            );
-        }
     }
 
     #[tokio::test]

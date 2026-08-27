@@ -14,7 +14,7 @@ use std::{
 use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
-    compute_next_prefix, query_touches_signed_zero, widen_signed_zeros,
+    compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
@@ -2140,13 +2140,6 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        // Page bounds are compared in arrow's total order, where -0.0 sorts below
-        // +0.0, so a query on zero may lose a page holding the other encoding, or
-        // admit a row IEEE 754 excludes. Only a caller that rechecks can take that
-        // answer, so ask for both encodings and report candidates.
-        let inexact = options.is_rechecked() && query_touches_signed_zero(query);
-        let widened = inexact.then(|| widen_signed_zeros(query)).flatten();
-        let query = widened.as_ref().unwrap_or(query);
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
@@ -2273,12 +2266,6 @@ impl ScalarIndex for BTreeIndex {
             )
         };
 
-        if inexact {
-            // The answer covers both encodings of zero, or admits a row IEEE 754
-            // excludes. Which rows match is decided by the recheck that
-            // `SargableQueryParser` forces for these queries.
-            return Ok(SearchResult::AtMost(selection));
-        }
         Ok(SearchResult::Exact(selection))
     }
 
@@ -3419,7 +3406,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
-    use std::ops::Bound;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -3647,96 +3633,6 @@ mod tests {
                 SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
-    }
-
-    /// Page bounds keep the sign of a zero and are compared in total order, so a
-    /// page whose max is `-0.0` would be pruned for a `= +0.0` query. Both pages
-    /// have to stay candidates.
-    #[tokio::test]
-    async fn test_btree_signed_zero_reaches_both_pages() {
-        let tmpdir = TempObjDir::default();
-        let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let batch = record_batch!(
-            (
-                "value",
-                Float64,
-                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
-            ),
-            ("_rowid", UInt64, [0, 1, 2, 3])
-        )
-        .unwrap();
-        let stream = stream::once(futures::future::ok(batch.clone()));
-        let stream = Box::pin(RecordBatchStreamAdapter::new(batch.schema(), stream))
-            as SendableRecordBatchStream;
-
-        // A batch size of 2 puts [-1.0, -0.0] on one page and [+0.0, 1.0] on the
-        // next, so each page has one encoding of zero as an extremum.
-        train_btree_index(stream, test_store.as_ref(), 2, None, None)
-            .await
-            .unwrap();
-        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let rechecked = SearchOptions::default().with_recheck(true);
-        let both_zeros = RowAddrTreeMap::from_iter([1u64, 2]);
-        for zero in [0.0f64, -0.0f64] {
-            let query = SargableQuery::Equals(ScalarValue::Float64(Some(zero)));
-            let result = index
-                .search_with_options(&query, rechecked, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            assert_eq!(
-                result,
-                SearchResult::at_most(both_zeros.clone()),
-                "querying {zero}"
-            );
-
-            // A caller that does not recheck gets the total-order answer, exactly
-            // as before this widening existed. merge_insert's key lookup panics on
-            // a non-exact result (`scalar_index.rs`'s `todo!`).
-            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let one_zero = if zero.is_sign_negative() { 1u64 } else { 2u64 };
-            assert_eq!(
-                result,
-                SearchResult::exact(RowAddrTreeMap::from_iter([one_zero])),
-                "querying {zero}"
-            );
-        }
-
-        // `>= +0.0` has to reach the page whose max is -0.0.
-        let query = SargableQuery::Range(
-            Bound::Included(ScalarValue::Float64(Some(0.0))),
-            Bound::Unbounded,
-        );
-        let result = index
-            .search_with_options(&query, rechecked, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            SearchResult::at_most(RowAddrTreeMap::from_iter([1u64, 2, 3]))
-        );
-
-        // `> -0.0` needs no rewrite, but total order still admits +0.0, which IEEE
-        // 754 excludes. The answer has to be candidates so the recheck can drop it.
-        let query = SargableQuery::Range(
-            Bound::Excluded(ScalarValue::Float64(Some(-0.0))),
-            Bound::Unbounded,
-        );
-        let result = index
-            .search_with_options(&query, rechecked, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            SearchResult::at_most(RowAddrTreeMap::from_iter([2u64, 3]))
-        );
     }
 
     #[tokio::test]

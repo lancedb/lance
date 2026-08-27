@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt32Array, cast::AsArray};
+use arrow_array::{RecordBatch, UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_select::concat::concat_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -95,6 +95,27 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
     let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
 
     assert_eq!(&expected, &scanned);
+}
+
+/// Assert a filtered scan returns exactly `expected_ids`.
+///
+/// Use this instead of [`test_filter`] for predicates whose correct answer
+/// differs from what the pinned DataFusion release computes, so there is no
+/// reference implementation to compare against.
+async fn assert_filter_ids(ds: &Dataset, predicate: &str, expected_ids: &[i32]) {
+    let mut scanner = ds.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .filter(predicate)
+        .unwrap()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap();
+    let scanned = scanner.try_into_batch().await.unwrap();
+    let ids = scanned["id"].as_primitive::<Int32Type>().values();
+    assert_eq!(&ids[..], expected_ids, "predicate: {predicate}");
 }
 
 // Rebuild a batch using only columns present in the schema (drops _score from FTS results).

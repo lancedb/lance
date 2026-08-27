@@ -508,23 +508,11 @@ pub struct SearchOptions {
     /// Callers may disable this only when NULL rows cannot affect the final
     /// result, such as a top-level filter whose NULL results will be discarded.
     track_nulls: bool,
-    /// The caller applies the query's own predicate to the returned rows.
-    ///
-    /// Only such a caller can accept a candidate set that is wider than the
-    /// query. An index that is otherwise exact uses this to answer with the
-    /// candidates for both encodings of a float zero, which arrow's total order
-    /// keeps apart while IEEE 754 treats them as equal. Callers that use the
-    /// result as the answer (merge_insert's key lookup, the label-list
-    /// sub-index) leave it off and get the total-order answer.
-    is_rechecked: bool,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self {
-            track_nulls: true,
-            is_rechecked: false,
-        }
+        Self { track_nulls: true }
     }
 }
 
@@ -534,18 +522,6 @@ impl SearchOptions {
     pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
         self.track_nulls = track_nulls;
         self
-    }
-
-    /// Declare that the caller rechecks the result against the query's own
-    /// predicate, which lets an index return a wider candidate set.
-    pub fn with_recheck(mut self, is_rechecked: bool) -> Self {
-        self.is_rechecked = is_rechecked;
-        self
-    }
-
-    /// Whether the caller rechecks the result against the query's predicate.
-    pub fn is_rechecked(&self) -> bool {
-        self.is_rechecked
     }
 
     /// Whether searches preserve rows where the query evaluates to NULL.
