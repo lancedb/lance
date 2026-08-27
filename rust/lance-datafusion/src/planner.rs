@@ -2098,6 +2098,7 @@ mod tests {
             ("jsonb '{\"key\": \"value\"}'", r#"{"key":"value"}"#),
             ("cast('{\"a\": 1}' as jsonb)", r#"{"a":1}"#),
             ("'{\"a\": 1}'::jsonb", r#"{"a":1}"#),
+            ("jsonb '{\"value\":1e3}'", r#"{"value":1000.0}"#),
         ];
         for (sql, expected) in cases {
             let ast = parse_sql_expr(sql).unwrap();

@@ -138,7 +138,12 @@ impl ScalarIndex for JsonIndex {
     }
 
     fn can_remap(&self) -> bool {
-        self.target_index.can_remap()
+        // Version-0 JSON indexes have no target-type sidecar. Some wrapped
+        // targets can remap their own storage without reporting the input type,
+        // but the JSON wrapper cannot write a sound version-1 sidecar for them.
+        // Reporting the wrapper as non-remappable lets compaction withdraw that
+        // legacy index instead of failing the entire operation.
+        self.target_index.can_remap() && self.training_data_type().is_some()
     }
 
     async fn remap(

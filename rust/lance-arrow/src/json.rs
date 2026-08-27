@@ -103,7 +103,7 @@ impl JsonArray {
         for json_str in iter {
             match json_str {
                 Some(s) => {
-                    let encoded = encode_json(s.as_ref()).map_err(|e| {
+                    let encoded = encode_json_exact(s.as_ref()).map_err(|e| {
                         ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
                     })?;
                     builder.append_value(&encoded);
@@ -207,7 +207,7 @@ impl TryFrom<&StringArray> for JsonArray {
                 builder.append_null();
             } else {
                 let json_str = array.value(i);
-                let encoded = encode_json(json_str).map_err(|e| {
+                let encoded = encode_json_exact(json_str).map_err(|e| {
                     ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
                 })?;
                 builder.append_value(&encoded);
@@ -239,7 +239,7 @@ impl TryFrom<&LargeStringArray> for JsonArray {
                 builder.append_null();
             } else {
                 let json_str = array.value(i);
-                let encoded = encode_json(json_str).map_err(|e| {
+                let encoded = encode_json_exact(json_str).map_err(|e| {
                     ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
                 })?;
                 builder.append_value(&encoded);
@@ -302,11 +302,20 @@ fn ensure_exact_json_numbers(value: &jsonb::Value<'_>) -> Result<(), InexactJson
     }
 }
 
-/// Encode a JSON string to JSONB without silently rounding numeric values.
+/// Encode a JSON string to JSONB.
+///
+/// This preserves the legacy permissive behavior needed for query literals that
+/// must still match JSON values written before exact-number validation existed.
+pub fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let value = jsonb::parse_value(json_str.as_bytes())?;
+    Ok(value.to_vec())
+}
+
+/// Encode JSONB for storage without silently rounding numeric values.
 ///
 /// Numbers must use non-exponent decimal notation and contain at most 76 digits,
 /// which is the exact domain supported by the JSONB Decimal256 representation.
-pub fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn encode_json_exact(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let value = jsonb::parse_value(json_str.as_bytes())?;
     ensure_exact_json_numbers(&value)?;
     Ok(value.to_vec())
@@ -790,12 +799,12 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_json_rejects_numbers_outside_exact_domain() {
+    fn test_json_array_rejects_numbers_outside_exact_domain() {
         for json in [
             r#"{"value":1.234567890123456789e-20}"#,
             r#"{"value":11111111111111111111111111111111111111111111111111111111111111111111111111111}"#,
         ] {
-            let error = encode_json(json).unwrap_err();
+            let error = JsonArray::try_from_iter([Some(json)]).unwrap_err();
             assert!(
                 error.to_string().contains(
                     "JSON numbers must use non-exponent decimal notation with at most 76 digits"
@@ -804,9 +813,10 @@ mod tests {
             );
         }
 
-        let encoded = encode_json(r#"{"value":"1.234567890123456789e-20"}"#).unwrap();
+        let array =
+            JsonArray::try_from_iter([Some(r#"{"value":"1.234567890123456789e-20"}"#)]).unwrap();
         assert_eq!(
-            decode_json(&encoded),
+            array.value(0).unwrap(),
             r#"{"value":"1.234567890123456789e-20"}"#
         );
     }

@@ -5900,6 +5900,103 @@ async fn test_legacy_json_btree_can_be_read_and_rebuilt() {
 }
 
 #[rstest]
+#[case::bitmap("bitmap")]
+#[case::ngram("ngram")]
+#[tokio::test]
+async fn test_legacy_json_index_without_target_type_does_not_block_compaction(
+    #[case] target_index_type: &str,
+) {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let first = json_batch(vec![r#"{"tag":"word7"}"#]);
+    let schema = first.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let second = json_batch(vec![r#"{"tag":"word8"}"#]);
+    let schema = second.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(second)], schema), None)
+        .await
+        .unwrap();
+
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": target_index_type,
+        "path": "tag",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Version-0 JSON indexes have the target index files but no target-type
+    // sidecar. Remove the sidecar from a current index to reproduce that layout.
+    let current = dataset.load_indices().await.unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].index_version, 1);
+    let sidecar = dataset
+        .indices_dir()
+        .join(current[0].uuid.to_string())
+        .join("json_target_type.lance");
+    dataset.object_store.delete(&sidecar).await.unwrap();
+    let mut legacy = current.to_vec();
+    legacy[0].index_version = 0;
+    if let Some(files) = &mut legacy[0].files {
+        files.retain(|file| file.path != "json_target_type.lance");
+    }
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: legacy,
+            removed_indices: current.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let fragments_before = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    let fragments_after = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
+    assert_ne!(fragments_after, fragments_before);
+
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    let live_fragments = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<roaring::RoaringBitmap>();
+    assert!(
+        after[0]
+            .effective_fragment_bitmap(&live_fragments)
+            .is_none_or(|bitmap| bitmap.is_empty())
+    );
+}
+
+#[rstest]
 #[case::small_first(
     &[r#"{"val": 1}"#],
     &[r#"{"val": 9223372036854775808}"#, r#"{"val": 9223372036854775809}"#]
