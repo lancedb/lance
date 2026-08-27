@@ -27,7 +27,7 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
@@ -105,6 +105,10 @@ pub struct LsmPointLookupPlanner {
     /// on the plan fallback path (the part of point-lookup latency that doesn't
     /// scale with generation count).
     task_ctx: Arc<TaskContext>,
+    /// Which prefix of the in-memory memtables this planner may read. Applies to
+    /// every in-memory arm — the fast BTree probe and the plan fallback alike —
+    /// so both paths resolve a key against the same cursor.
+    visibility: MemTableVisibility,
 }
 
 impl LsmPointLookupPlanner {
@@ -132,7 +136,16 @@ impl LsmPointLookupPlanner {
             warmer: None,
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
+            visibility: MemTableVisibility::Published,
         }
+    }
+
+    /// Read the in-memory memtables at `visibility` instead of the published
+    /// prefix. See [`MemTableVisibility::Indexed`] for the (narrow) conditions
+    /// under which anything but the default is sound.
+    pub fn with_visibility(mut self, visibility: MemTableVisibility) -> Self {
+        self.visibility = visibility;
+        self
     }
 
     /// Set the session used to open SSTables.
@@ -399,6 +412,7 @@ impl LsmPointLookupPlanner {
                             &self.pk_columns[0],
                             &pk_values[0],
                             target,
+                            self.visibility,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
                             Probe::Deleted => Ok(Some(FastOutcome::Deleted)),
@@ -507,7 +521,8 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key)? {
+                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
+                {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -686,8 +701,12 @@ impl LsmPointLookupPlanner {
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                let mut scanner = MemTableScanner::new_at_visibility(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    self.visibility,
+                );
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
@@ -895,6 +914,7 @@ fn probe_position(
     index_store: &IndexStore,
     pk_column: &str,
     pk_value: &ScalarValue,
+    visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
     // Visible batches are the committed prefix [0, last_visible_idx]; each
     // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
@@ -903,10 +923,10 @@ fn probe_position(
     if len == 0 {
         return Ok(ProbePos::Miss);
     }
-    // The cursor is an exclusive count, so the last visible batch sits at
-    // `count - 1`. A count of 0 means nothing is visible yet — not "batch 0".
-    let visible_count = index_store.visible_count().min(len);
-    let Some(last_visible_idx) = visible_count.checked_sub(1) else {
+    // The cursor is an exclusive count, so the last readable batch sits at
+    // `count - 1`. A count of 0 means nothing is readable yet — not "batch 0".
+    let readable_count = index_store.prefix_count(visibility).min(len);
+    let Some(last_visible_idx) = readable_count.checked_sub(1) else {
         return Ok(ProbePos::Miss);
     };
     let last = batch_store.get(last_visible_idx).ok_or_else(|| {
@@ -1008,8 +1028,9 @@ fn probe_memtable(
     pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
+    visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value)? {
+    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {

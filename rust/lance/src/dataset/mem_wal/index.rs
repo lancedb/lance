@@ -469,6 +469,29 @@ pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error 
     ))
 }
 
+/// Which prefix of a MemTable a reader may see.
+///
+/// The two cursors (`indexed`, `durable`) admit two different bounds, and which
+/// one is correct depends on *who* is reading — not on any per-read preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemTableVisibility {
+    /// [`IndexStore::visible_count`] — indexed and, under `durable_write`, also
+    /// durable. The only correct bound for anyone but the writer: a row outside
+    /// it may still fail its WAL append and never exist.
+    #[default]
+    Published,
+    /// [`IndexStore::indexed_count`] — includes writes that are indexed but not
+    /// yet durable.
+    ///
+    /// Sound *only* for the writer reading its own ordered prefix while holding
+    /// the lock that makes it the sole writer, as a partial-column update does
+    /// between its read and its merged write. Both cursors advance over
+    /// contiguous prefixes, so a row derived from position `p` cannot become
+    /// published before `p` does, and a failed append poisons the writer before
+    /// either is acknowledged. Any other caller reintroduces dirty reads.
+    Indexed,
+}
+
 /// Registry managing all in-memory indexes for a MemTable.
 ///
 /// Indexes are keyed by index name. Each index stores its field_id for
@@ -1304,6 +1327,16 @@ impl IndexStore {
         match &self.durability {
             Some((cursors, global_offset)) => cursors.visible_count(indexed, *global_offset),
             None => indexed,
+        }
+    }
+
+    /// The prefix readable under `visibility`. Every external reader passes
+    /// [`MemTableVisibility::Published`]; only the writer's own
+    /// read-modify-write passes [`MemTableVisibility::Indexed`].
+    pub fn prefix_count(&self, visibility: MemTableVisibility) -> usize {
+        match visibility {
+            MemTableVisibility::Published => self.visible_count(),
+            MemTableVisibility::Indexed => self.indexed_count(),
         }
     }
 

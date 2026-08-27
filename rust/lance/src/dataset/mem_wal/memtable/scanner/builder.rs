@@ -25,6 +25,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
+use crate::dataset::mem_wal::index::MemTableVisibility;
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -471,10 +472,7 @@ pub struct MemTableScanner {
 }
 
 impl MemTableScanner {
-    /// Create a new scanner.
-    ///
-    /// Captures `visible_count` from the `IndexStore` at construction
-    /// time to ensure consistent query visibility.
+    /// Create a new scanner over the published prefix.
     ///
     /// # Arguments
     ///
@@ -482,10 +480,22 @@ impl MemTableScanner {
     /// * `indexes` - Index registry (carries the visibility watermark)
     /// * `schema` - Schema of the data
     pub fn new(batch_store: Arc<BatchStore>, indexes: Arc<IndexStore>, schema: SchemaRef) -> Self {
-        // Snapshot the visibility cursor at construction time. The cursor is
-        // advanced by `flush_from_batch_store` after the WAL append succeeds,
-        // so this snapshot reflects WAL-durable data.
-        let visible_count = indexes.visible_count();
+        Self::new_at_visibility(batch_store, indexes, schema, MemTableVisibility::Published)
+    }
+
+    /// As [`Self::new`], but bounded by `visibility`. Read
+    /// [`MemTableVisibility::Indexed`] before reaching for anything but
+    /// [`MemTableVisibility::Published`].
+    ///
+    /// The bound is snapshotted here, at construction, so every plan this
+    /// scanner builds keys on one stable cursor.
+    pub fn new_at_visibility(
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        schema: SchemaRef,
+        visibility: MemTableVisibility,
+    ) -> Self {
+        let visible_count = indexes.prefix_count(visibility);
 
         Self {
             batch_store,
