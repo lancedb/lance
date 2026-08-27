@@ -89,14 +89,22 @@ fn is_zero_pair_over_column(expr: &Expr) -> bool {
     let Expr::InList(InList { expr, list, .. }) = expr else {
         return false;
     };
-    if !matches!(expr.as_ref(), Expr::Column(_)) || list.len() != 2 {
+    if !matches!(expr.as_ref(), Expr::Column(_)) {
         return false;
     }
-    let [Expr::Literal(first, _), Expr::Literal(second, _)] = list.as_slice() else {
+    let [Expr::Literal(first, _), ..] = list.as_slice() else {
         return false;
     };
     zero_encodings(first)
-        .is_some_and(|(negative, positive)| *first == negative && *second == positive)
+        .is_some_and(|(negative, positive)| list_is_pair(list, &negative, &positive))
+}
+
+/// True when `list` is exactly the two encodings of a zero, negative first.
+fn list_is_pair(list: &[Expr], negative: &ScalarValue, positive: &ScalarValue) -> bool {
+    let [Expr::Literal(first, _), Expr::Literal(second, _)] = list else {
+        return false;
+    };
+    first == negative && second == positive
 }
 
 /// The rewritten expression, or `None` when `expr` is not a comparison against a
@@ -189,6 +197,11 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             // needs no widening either.
             if let Expr::Literal(value, metadata) = expr.as_ref() {
                 let (negative, positive) = zero_encodings(value)?;
+                // The expansion below puts a zero literal in front of exactly this
+                // list, so stop rather than expanding that term again.
+                if list_is_pair(list, &negative, &positive) {
+                    return None;
+                }
                 let matches_any = list
                     .iter()
                     .map(|item| {
@@ -407,6 +420,11 @@ mod tests {
         list: vec![col("a"), col("b")],
         negated: false,
     }))]
+    #[case::zero_probe_over_literals(Expr::InList(InList {
+        expr: Box::new(lit(0.0)),
+        list: vec![col("a"), lit(0.0)],
+        negated: false,
+    }))]
     #[case::is_not_distinct_from(compare(col("x"), Operator::IsNotDistinctFrom, lit(0.0)))]
     #[case::is_distinct_from(compare(col("x"), Operator::IsDistinctFrom, lit(0.0)))]
     fn rewriting_twice_changes_nothing(#[case] expr: Expr) {
@@ -460,6 +478,10 @@ mod tests {
     #[case::lt("value < 0.0")]
     #[case::gt_eq("value >= 0.0")]
     #[case::between("value BETWEEN -0.0 AND 0.0")]
+    // The dedup that makes the first three cases hold keys on the probe being a
+    // bare column, which is also what DataFusion requires before it shortens a
+    // list. This case fails if a release ever relaxes that.
+    #[case::non_column_probe("abs(value) = 0.0")]
     // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
     // it as unsupported SQL; that arm is reachable only from a programmatically
     // built expression, and `rewriting_twice_changes_nothing` covers it there.

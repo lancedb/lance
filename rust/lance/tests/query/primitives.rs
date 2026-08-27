@@ -249,7 +249,11 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 // not specific to zero and this rewrite leaves it alone.
                 assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8]).await;
                 assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8]).await;
-                // The literal on the left, which mirrors the operator.
+                // A literal on the left. DataFusion's canonicalizer swaps it back
+                // before the rewrite runs, so this pins the answer rather than the
+                // mirroring branch, which `a_literal_on_the_left_mirrors_the_operator`
+                // owns and which SQL reaches only when the other side is not a
+                // bare column.
                 assert_filter_ids(&ds, &format!("{zero} > value"), &[3, 6, 7]).await;
                 // BETWEEN only works because the simplifier expands it into two
                 // comparisons before the rewrite runs.

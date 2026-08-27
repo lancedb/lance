@@ -1383,10 +1383,8 @@ impl MemTableScanner {
                 let mut column = None;
                 let mut values = Vec::new();
                 if self.collect_or_equalities(&filter, &mut column, &mut values) {
-                    return Some(ScalarPredicate::In {
-                        column: column?,
-                        values,
-                    });
+                    debug_assert!(column.is_some(), "a true return always names the column");
+                    return column.map(|column| ScalarPredicate::In { column, values });
                 }
             }
             Expr::BinaryExpr(binary) => {
