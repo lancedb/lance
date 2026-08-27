@@ -548,9 +548,12 @@ def test_index_with_nans(tmp_path, index_file_version):
 def test_torch_index_with_nans(tmp_path, index_file_version):
     torch = pytest.importorskip("torch")
 
-    # Torch PQ initialization samples 256 valid residuals. Keep a small margin
-    # after NaN filtering so every platform can produce a complete sample batch.
-    tbl = create_table(nvec=320, ndim=32, nans=8)
+    # Torch PQ initialization asks the sampler for 256 residuals in one batch
+    # (`next(iter(ds_init))`), so the table has to be large enough that the
+    # sample reliably fills. At 328 rows it did not, and the test failed with
+    # `StopIteration` on some runners; 1024 keeps the row count the sampler was
+    # written against while `ndim=32` keeps this cheap.
+    tbl = create_table(nvec=1000, ndim=32, nans=24)
 
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
