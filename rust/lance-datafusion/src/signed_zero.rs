@@ -82,9 +82,9 @@ fn flatten_chain<'a>(expr: &'a Expr, op: Operator, terms: &mut Vec<&'a Expr>) {
     terms.push(expr);
 }
 
-/// True for the shape this rewrite emits for an equality: a column tested against
-/// both encodings of a floating point zero. Only these terms are deduplicated, so
-/// an expression the caller wrote twice is left alone.
+/// True for the shape this rewrite emits for `=` and `!=`: a column tested
+/// against both encodings of a floating point zero, negated or not. Only these
+/// terms are deduplicated, so an expression the caller wrote twice is left alone.
 fn is_zero_pair_over_column(expr: &Expr) -> bool {
     let Expr::InList(InList { expr, list, .. }) = expr else {
         return false;
