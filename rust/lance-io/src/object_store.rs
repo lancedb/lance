@@ -1846,6 +1846,7 @@ mod tests {
         PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
     };
     use rstest::rstest;
+    use serial_test::serial;
     use std::env::set_current_dir;
     use std::fmt::{Display, Formatter};
     use std::fs::{create_dir_all, write};
@@ -2846,6 +2847,32 @@ mod tests {
             store.read_one_all(&destination).await.unwrap().as_ref(),
             contents
         );
+    }
+
+    #[test]
+    #[serial(server_side_copy_env)]
+    fn test_server_side_copy_environment_policy() {
+        let previous_value = std::env::var_os(SERVER_SIDE_COPY_ENABLED_ENV);
+        let mut store = ObjectStore::memory();
+        store.scheme = "test-cloud".to_string();
+        let destination_store = store.clone();
+
+        // SAFETY: this serialized test is the only test that mutates this task-specific
+        // environment variable, and it restores the original value before returning.
+        unsafe { std::env::remove_var(SERVER_SIDE_COPY_ENABLED_ENV) };
+        assert!(!store.uses_server_side_copy(&destination_store));
+
+        // SAFETY: see the serialized-test guarantee above.
+        unsafe { std::env::set_var(SERVER_SIDE_COPY_ENABLED_ENV, "true") };
+        assert!(store.uses_server_side_copy(&destination_store));
+
+        // SAFETY: restore the process environment before the test returns.
+        unsafe {
+            match previous_value {
+                Some(value) => std::env::set_var(SERVER_SIDE_COPY_ENABLED_ENV, value),
+                None => std::env::remove_var(SERVER_SIDE_COPY_ENABLED_ENV),
+            }
+        }
     }
 
     #[tokio::test]

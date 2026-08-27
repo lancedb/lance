@@ -55,6 +55,12 @@ Native copy can reduce client bandwidth and transfer cost, but it requires copy
 support from the object-store integration and is subject to the provider
 request's timeout and retry behavior.
 
+Deep clone bounds non-local file movement to four concurrent files by default.
+Set `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.
+
 ## Per-Base Configuration
 
 A dataset can register additional base paths that store part of its data, and each
