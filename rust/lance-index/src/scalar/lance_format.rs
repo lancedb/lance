@@ -489,7 +489,7 @@ impl IndexStore for LanceIndexStore {
                 let dest_path = dest_store.index_file_path(new_name)?;
                 let result = self
                     .object_store
-                    .copy_via_stream(&path, &dest_store.object_store, &dest_path)
+                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
                     .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),
@@ -517,7 +517,7 @@ impl IndexStore for LanceIndexStore {
         let new_path = self.index_file_path(new_name)?;
         let result = self
             .object_store
-            .copy_via_stream(&path, &self.object_store, &new_path)
+            .copy_bulk(&path, &self.object_store, &new_path)
             .await?;
         self.object_store.delete(&path).await?;
         Ok(IndexFile {

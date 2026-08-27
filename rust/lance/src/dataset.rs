@@ -3265,9 +3265,10 @@ impl Dataset {
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts). Object-store files are streamed through this process instead of
-    /// using provider-native copy operations; local files retain their filesystem
-    /// copy path.
+    /// accounts). Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
+    /// provider-native copy operations. Cross-store copies continue to stream, and
+    /// local files retain their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3353,7 +3354,7 @@ impl Dataset {
                 let target_path = build_absolute_path(relative_path, &target_base);
                 async move {
                     source_store
-                        .copy_via_stream(&src_path, &target_store, &target_path)
+                        .copy_bulk(&src_path, &target_store, &target_path)
                         .await?;
                     Result::Ok(())
                 }
