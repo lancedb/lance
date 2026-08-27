@@ -40,8 +40,8 @@ use lance_io::object_store::ObjectStore as LanceObjectStore;
 use lance_table::format::{Fragment, IndexMetadata};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OsObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result as OsResult, UploadPart, memory::InMemory, path::Path,
+    ObjectStore as OsObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions, Result as OsResult, UploadPart, memory::InMemory, path::Path,
 };
 use tokio::sync::Semaphore;
 use uuid::Uuid;

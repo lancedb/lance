@@ -1167,7 +1167,7 @@ mod tests {
     use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
     use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
-    use lance_core::Error;
+    use lance_core::{Error, deepsize::DeepSizeOf};
     use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
     use serde_json::json;
