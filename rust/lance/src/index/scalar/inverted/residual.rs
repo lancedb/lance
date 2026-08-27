@@ -11,10 +11,11 @@
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fmt::Display,
     ops::Range,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -50,20 +51,21 @@ use super::ResolvedFtsField;
 use crate::{Dataset, index::DatasetIndexInternalExt, index::scalar::load_fts_training_data};
 
 /// Bound query-time indexing without serializing unrelated datasets behind one
-/// long build. Same-key work is additionally coalesced by `DSIndexCache`.
-static RESIDUAL_FTS_BUILD_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| {
+/// long build. Exact and overlapping working sets are coalesced by the claim
+/// registry below before any fragment data is scanned.
+static RESIDUAL_FTS_BUILD_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     let permits = std::thread::available_parallelism()
         .map(|cpus| cpus.get().div_ceil(4))
         .unwrap_or(1)
         .clamp(1, 2);
-    Semaphore::new(permits)
+    Arc::new(Semaphore::new(permits))
 });
 
 pub(crate) const MAX_RESIDUAL_FTS_FRAGMENTS: usize = 16;
 pub(crate) const MAX_RESIDUAL_FTS_ROWS: usize = 1_000_000;
 const MAX_RESIDUAL_FTS_BUILD_MEMORY_MB: u64 = 256;
 const MAX_RESIDUAL_FTS_SERIALIZED_BYTES: usize = 1 << 30;
-const MAX_RESIDUAL_FTS_GROUP_UPLOAD_BYTES: usize = 2 << 30;
+const MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES: usize = 2 << 30;
 const RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY: usize = 2;
 
 #[derive(Debug)]
@@ -138,7 +140,7 @@ fn reserve_upload_bytes(
             object_store::Error::Generic {
                 store: "BudgetedMemoryStore",
                 source: format!(
-                    "residual FTS serialized output exceeded the {max_uploaded_bytes} byte build budget"
+                    "residual FTS build exceeded the {max_uploaded_bytes} byte resident budget"
                 )
                 .into(),
             }
@@ -300,7 +302,7 @@ impl MultipartUpload for BudgetedMultipartUpload {
 /// fields deliberately omit dataset version so an unchanged fragment is reused
 /// after another append. The complete serialized fragment metadata invalidates
 /// data rewrites, overlays, deletions, and row-id metadata changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct ResidualFtsFragmentKey {
     pub store_identity: Arc<str>,
     pub index_uuid: Uuid,
@@ -344,12 +346,62 @@ impl CacheKey for ResidualFtsFragmentKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ResidualFtsGroupKey {
     store_identity: Arc<str>,
     index_uuid: Uuid,
     index_version: i32,
     members: Arc<[ResidualFtsFragmentKey]>,
+}
+
+#[derive(Default)]
+struct ActiveResidualFtsBuilds {
+    groups: HashSet<ResidualFtsGroupKey>,
+    fragments: HashSet<ResidualFtsFragmentKey>,
+}
+
+static ACTIVE_RESIDUAL_FTS_BUILDS: LazyLock<Mutex<ActiveResidualFtsBuilds>> =
+    LazyLock::new(|| Mutex::new(ActiveResidualFtsBuilds::default()));
+
+struct ResidualFtsBuildClaim {
+    group: ResidualFtsGroupKey,
+    fragments: Vec<ResidualFtsFragmentKey>,
+}
+
+impl ResidualFtsBuildClaim {
+    fn try_acquire(
+        group: &ResidualFtsGroupKey,
+        fragments: &[ResidualFtsFragmentKey],
+    ) -> Option<Self> {
+        let mut active = ACTIVE_RESIDUAL_FTS_BUILDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.groups.contains(group)
+            || fragments
+                .iter()
+                .any(|fragment| active.fragments.contains(fragment))
+        {
+            return None;
+        }
+        active.groups.insert(group.clone());
+        active.fragments.extend(fragments.iter().cloned());
+        Some(Self {
+            group: group.clone(),
+            fragments: fragments.to_vec(),
+        })
+    }
+}
+
+impl Drop for ResidualFtsBuildClaim {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_RESIDUAL_FTS_BUILDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.groups.remove(&self.group);
+        for fragment in &self.fragments {
+            active.fragments.remove(fragment);
+        }
+    }
 }
 
 impl CacheKey for ResidualFtsGroupKey {
@@ -676,7 +728,8 @@ async fn build_residual_segment(
     resolved: &ResolvedFtsField,
     params: InvertedIndexParams,
     shared_tokenizer: Arc<dyn lance_index::scalar::inverted::document_tokenizer::LanceTokenizer>,
-    group_uploaded_bytes: Arc<AtomicUsize>,
+    build_lifetime: Arc<tokio::sync::OwnedSemaphorePermit>,
+    group_accounted_bytes: Arc<AtomicUsize>,
     group_budget_exceeded: Arc<AtomicBool>,
 ) -> Result<CachedResidualFtsSegment> {
     let fragment_id = u32::try_from(fragment.id).map_err(|_| {
@@ -703,9 +756,9 @@ async fn build_residual_segment(
 
     let mut object_store = LanceObjectStore::memory();
     object_store.inner = Arc::new(BudgetedMemoryStore::with_counter(
-        group_uploaded_bytes,
+        group_accounted_bytes.clone(),
         group_budget_exceeded.clone(),
-        MAX_RESIDUAL_FTS_GROUP_UPLOAD_BYTES,
+        MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
     ));
     let object_store = Arc::new(object_store);
     let index_dir = Path::from(format!("residual-{fragment_id}"));
@@ -721,7 +774,8 @@ async fn build_residual_segment(
         .memory_limit_mb(MAX_RESIDUAL_FTS_BUILD_MEMORY_MB)
         .num_workers(1);
     let mut builder =
-        InvertedIndexBuilder::new_with_fragment_mask(params, Some(u64::from(fragment_id) << 32));
+        InvertedIndexBuilder::new_with_fragment_mask(params, Some(u64::from(fragment_id) << 32))
+            .with_build_lifetime(build_lifetime);
     builder.update(stream, store.as_ref(), None).await?;
     lance_index::scalar::inverted::builder::merge_index_files(
         object_store.as_ref(),
@@ -761,6 +815,21 @@ async fn build_residual_segment(
         .deep_size_of_children(&mut size_context)
         .checked_add(serialized_bytes)
         .ok_or_else(|| lance_core::Error::io("residual FTS resident byte count overflowed"))?;
+    // Store writes have already charged the serialized backing bytes. Charge
+    // the retained decoded/index state before returning the segment so two
+    // concurrent fragment materializations cannot overshoot the group cap and
+    // defer the rejection until after both large values are resident.
+    let decoded_bytes = resident_bytes
+        .checked_sub(serialized_bytes)
+        .ok_or_else(|| {
+            lance_core::Error::io("residual FTS decoded resident byte count underflowed")
+        })?;
+    reserve_upload_bytes(
+        group_accounted_bytes.as_ref(),
+        group_budget_exceeded.as_ref(),
+        MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+        decoded_bytes,
+    )?;
     Ok(CachedResidualFtsSegment {
         index,
         rows,
@@ -788,8 +857,19 @@ pub(crate) async fn load_residual_fts_segments(
     let group_cache = dataset
         .metadata_cache
         .with_key_prefix("residual-fts-groups");
+    if matches!(
+        group_cache.get_with_key(&spec.group_key).await.as_deref(),
+        Some(ResidualFtsGroupState::Rejected)
+    ) {
+        return Ok(ResidualFtsAdmission::Rejected(
+            "residual working set exceeds cache admission capacity",
+        ));
+    }
 
-    // A completely warm group can bypass the usage marker and build permit.
+    // A completely warm group can bypass the usage marker and build permit,
+    // but not aggregate admission. Different append snapshots can warm
+    // individual members separately, so the combined group must still fit the
+    // same resident hard cap before it is searched.
     let mut warm_entries = Vec::with_capacity(spec.keys.len());
     for key in spec.keys.iter() {
         let Some(entry) = cache.get_with_key(key).await else {
@@ -799,6 +879,30 @@ pub(crate) async fn load_residual_fts_segments(
         warm_entries.push(entry);
     }
     if warm_entries.len() == spec.keys.len() {
+        let warm_resident_bytes = checked_resident_sum(warm_entries.iter().map(|entry| {
+            let CachedResidualFtsEntry::Ready(segment) = entry.as_ref();
+            segment.resident_bytes()
+        }));
+        if !matches!(warm_resident_bytes, Some(bytes) if bytes <= MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES)
+        {
+            group_cache
+                .insert_with_key(&spec.group_key, Arc::new(ResidualFtsGroupState::Rejected))
+                .await;
+            return Ok(ResidualFtsAdmission::Rejected(
+                "residual working set exceeds cache admission capacity",
+            ));
+        }
+        // A concurrent exact-group owner may have rejected admission while
+        // this task was probing members. Never let a fully warm posting set
+        // bypass that durable negative decision.
+        if matches!(
+            group_cache.get_with_key(&spec.group_key).await.as_deref(),
+            Some(ResidualFtsGroupState::Rejected)
+        ) {
+            return Ok(ResidualFtsAdmission::Rejected(
+                "residual working set exceeds cache admission capacity",
+            ));
+        }
         return Ok(ResidualFtsAdmission::Eligible(loaded_segments(
             warm_entries,
             spec.fragment_bitmap(),
@@ -830,13 +934,6 @@ pub(crate) async fn load_residual_fts_segments(
         }
     }
 
-    // Busy means exact fallback, not head-of-line blocking across datasets.
-    let Ok(_permit) = RESIDUAL_FTS_BUILD_SEMAPHORE.try_acquire() else {
-        return Ok(ResidualFtsAdmission::Deferred(
-            "residual build resources are busy",
-        ));
-    };
-
     // The independent group state can be available while the index cache is
     // disabled. Probe posting-entry retention before scanning any fragment.
     let retention_probe_key = ResidualFtsRetentionProbeKey(spec.group_key.clone());
@@ -850,6 +947,81 @@ pub(crate) async fn load_residual_fts_segments(
         return Ok(ResidualFtsAdmission::Rejected(
             "residual index cache cannot retain posting entries",
         ));
+    }
+
+    // Busy means exact fallback, not head-of-line blocking across datasets.
+    let Ok(build_lifetime) = RESIDUAL_FTS_BUILD_SEMAPHORE.clone().try_acquire_owned() else {
+        return Ok(ResidualFtsAdmission::Deferred(
+            "residual build resources are busy",
+        ));
+    };
+    let build_lifetime = Arc::new(build_lifetime);
+
+    // Claim the complete working set before building anything. This prevents
+    // concurrent invocations (including overlapping append snapshots) from
+    // each winning different fragment loaders under independent byte budgets.
+    let mut cached_entries = Vec::with_capacity(spec.keys.len());
+    for key in spec.keys.iter() {
+        match cache.get_with_key(key).await {
+            Some(entry) => cached_entries.push(Some(entry)),
+            None => cached_entries.push(None),
+        }
+    }
+    let Some(_build_claim) = ResidualFtsBuildClaim::try_acquire(&spec.group_key, &spec.keys) else {
+        return Ok(ResidualFtsAdmission::Deferred(
+            "residual working set is already building",
+        ));
+    };
+
+    // A different append snapshot may have committed one of the missing keys
+    // immediately before this claim. Re-probe while the overlapping-fragment
+    // claim is held so the baseline and local build list are exact.
+    let mut missing = Vec::new();
+    for ((key, fragment), entry) in spec
+        .keys
+        .iter()
+        .zip(spec.fragments.iter())
+        .zip(cached_entries.iter_mut())
+    {
+        if entry.is_none() {
+            *entry = cache.get_with_key(key).await;
+        }
+        if entry.is_none() {
+            missing.push((key.clone(), fragment.clone()));
+        }
+    }
+
+    let warm_count = cached_entries.iter().flatten().count();
+    let baseline_resident_bytes =
+        checked_resident_sum(cached_entries.iter().flatten().map(|entry| {
+            let CachedResidualFtsEntry::Ready(segment) = entry.as_ref();
+            segment.resident_bytes()
+        }));
+    let Some(baseline_resident_bytes) = baseline_resident_bytes else {
+        group_cache
+            .insert_with_key(&spec.group_key, Arc::new(ResidualFtsGroupState::Rejected))
+            .await;
+        return Ok(ResidualFtsAdmission::Rejected(
+            "residual working-set byte count overflowed",
+        ));
+    };
+    if baseline_resident_bytes > MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES {
+        group_cache
+            .insert_with_key(&spec.group_key, Arc::new(ResidualFtsGroupState::Rejected))
+            .await;
+        return Ok(ResidualFtsAdmission::Rejected(
+            "residual working set exceeds query-time build byte budget",
+        ));
+    }
+    if missing.is_empty() {
+        let retained = cached_entries.into_iter().flatten().collect::<Vec<_>>();
+        return Ok(ResidualFtsAdmission::Eligible(loaded_segments(
+            retained,
+            spec.fragment_bitmap(),
+            spec.keys.len(),
+            0,
+            Duration::default(),
+        )));
     }
 
     let committed_index = dataset
@@ -869,46 +1041,39 @@ pub(crate) async fn load_residual_fts_segments(
             ))
         })?;
     let shared_tokenizer = committed_index.shared_tokenizer();
-    let group_uploaded_bytes = Arc::new(AtomicUsize::new(0));
+    // Count fixed cached resident weight before any new allocation. A retry
+    // after cancellation therefore cannot build the group piecemeal around the
+    // invocation-local upload cap.
+    let group_accounted_bytes = Arc::new(AtomicUsize::new(baseline_resident_bytes));
     let group_budget_exceeded = Arc::new(AtomicBool::new(false));
 
     let started = std::time::Instant::now();
-    let entries = futures::stream::iter(
-        spec.keys
-            .iter()
-            .cloned()
-            .zip(spec.fragments.iter().cloned())
-            .map(|(key, fragment)| {
-                let cache = cache.clone();
-                let resolved = spec.resolved.clone();
-                let params = spec.params.clone();
-                let shared_tokenizer = shared_tokenizer.clone();
-                let group_uploaded_bytes = group_uploaded_bytes.clone();
-                let group_budget_exceeded = group_budget_exceeded.clone();
-                async move {
-                    cache
-                        .get_or_insert_with_key_hit(key.clone(), || async move {
-                            build_residual_segment(
-                                dataset,
-                                fragment,
-                                &resolved,
-                                params,
-                                shared_tokenizer,
-                                group_uploaded_bytes,
-                                group_budget_exceeded,
-                            )
-                            .await
-                            .map(CachedResidualFtsEntry::Ready)
-                        })
-                        .await
-                        .map(|(entry, reused)| (key, entry, reused))
-                }
-            }),
-    )
+    let built_entries = futures::stream::iter(missing.into_iter().map(|(key, fragment)| {
+        let resolved = spec.resolved.clone();
+        let params = spec.params.clone();
+        let shared_tokenizer = shared_tokenizer.clone();
+        let build_lifetime = build_lifetime.clone();
+        let group_accounted_bytes = group_accounted_bytes.clone();
+        let group_budget_exceeded = group_budget_exceeded.clone();
+        async move {
+            build_residual_segment(
+                dataset,
+                fragment,
+                &resolved,
+                params,
+                shared_tokenizer,
+                build_lifetime,
+                group_accounted_bytes,
+                group_budget_exceeded,
+            )
+            .await
+            .map(|entry| (key, CachedResidualFtsEntry::Ready(entry)))
+        }
+    }))
     .buffered(RESIDUAL_FTS_FRAGMENT_BUILD_CONCURRENCY)
     .try_collect::<Vec<_>>()
     .await;
-    let entries = match entries {
+    let built_entries = match built_entries {
         Ok(entries) => entries,
         Err(_) if group_budget_exceeded.load(Ordering::Relaxed) => {
             group_cache
@@ -921,10 +1086,36 @@ pub(crate) async fn load_residual_fts_segments(
         Err(error) => return Err(error),
     };
 
+    let group_resident_bytes =
+        built_entries
+            .iter()
+            .try_fold(baseline_resident_bytes, |total, (_, entry)| {
+                let CachedResidualFtsEntry::Ready(segment) = entry;
+                total.checked_add(segment.resident_bytes())
+            });
+    if !matches!(group_resident_bytes, Some(bytes) if bytes <= MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES)
+    {
+        group_cache
+            .insert_with_key(&spec.group_key, Arc::new(ResidualFtsGroupState::Rejected))
+            .await;
+        return Ok(ResidualFtsAdmission::Rejected(
+            "residual working set exceeds query-time build byte budget",
+        ));
+    }
+
+    // Publish only after every missing segment was built and the aggregate
+    // fixed weight passed admission. Cancellation during a retry cannot use
+    // partial prior builds to escape the group cap because those entries are
+    // included in the next baseline above.
+    let loader_runs = built_entries.len();
+    for (key, entry) in built_entries {
+        cache.insert_with_key(&key, Arc::new(entry)).await;
+    }
+
     // Verify the whole working set after all insertions. Per-entry success is
     // insufficient for a sharded cache: later siblings may already have
     // evicted an earlier one from the same shard.
-    let mut retained = Vec::with_capacity(entries.len());
+    let mut retained = Vec::with_capacity(spec.keys.len());
     for key in spec.keys.iter() {
         let Some(entry) = cache.get_with_key(key).await else {
             group_cache
@@ -948,15 +1139,19 @@ pub(crate) async fn load_residual_fts_segments(
         ));
     }
 
-    let reused = entries.iter().filter(|(_, _, reused)| *reused).count();
-    let loader_runs = entries.len().saturating_sub(reused);
     Ok(ResidualFtsAdmission::Eligible(loaded_segments(
         retained,
         spec.fragment_bitmap(),
-        reused,
+        warm_count,
         loader_runs,
         started.elapsed(),
     )))
+}
+
+fn checked_resident_sum(bytes: impl IntoIterator<Item = usize>) -> Option<usize> {
+    bytes
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| total.checked_add(bytes))
 }
 
 fn loaded_segments(
@@ -1020,8 +1215,9 @@ mod tests {
         }
     }
 
-    fn group_key() -> ResidualFtsGroupKey {
-        let member = key();
+    fn group_key_with_uuid(uuid: u128) -> ResidualFtsGroupKey {
+        let mut member = key();
+        member.index_uuid = Uuid::from_u128(uuid);
         ResidualFtsGroupKey {
             store_identity: member.store_identity.clone(),
             index_uuid: member.index_uuid,
@@ -1047,6 +1243,109 @@ mod tests {
     #[test]
     fn residual_key_reuses_identical_fragment() {
         assert_eq!(internal_key(&key()), internal_key(&key()));
+    }
+
+    #[test]
+    fn cancelled_group_claim_can_be_retried() {
+        let group = group_key_with_uuid(1);
+        let fragments = group.members.to_vec();
+        let claim = ResidualFtsBuildClaim::try_acquire(&group, &fragments)
+            .expect("first build should own the working set");
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_none());
+
+        drop(claim);
+        assert!(ResidualFtsBuildClaim::try_acquire(&group, &fragments).is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_group_builds_have_one_owner() {
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let attempted = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let start = start.clone();
+            let attempted = attempted.clone();
+            tasks.push(tokio::spawn(async move {
+                let group = group_key_with_uuid(2);
+                let fragments = group.members.to_vec();
+                start.wait().await;
+                let claim = ResidualFtsBuildClaim::try_acquire(&group, &fragments);
+                attempted.wait().await;
+                claim.is_some()
+            }));
+        }
+        start.wait().await;
+        attempted.wait().await;
+        let acquired = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .filter(|result| *result.as_ref().expect("claim task panicked"))
+            .count();
+        assert_eq!(acquired, 1);
+    }
+
+    #[test]
+    fn overlapping_snapshots_cannot_build_different_missing_members() {
+        let first_group = group_key_with_uuid(3);
+        let mut second_member = first_group.members[0].clone();
+        second_member.fragment_id += 1;
+        second_member.fragment_fingerprint = Arc::from(&b"fragment-b"[..]);
+        let second_group = ResidualFtsGroupKey {
+            store_identity: first_group.store_identity.clone(),
+            index_uuid: first_group.index_uuid,
+            index_version: first_group.index_version,
+            members: Arc::from([first_group.members[0].clone(), second_member]),
+        };
+
+        let _first_claim =
+            ResidualFtsBuildClaim::try_acquire(&first_group, first_group.members.as_ref())
+                .expect("first snapshot should own its working set");
+        assert!(
+            ResidualFtsBuildClaim::try_acquire(&second_group, second_group.members.as_ref())
+                .is_none(),
+            "overlapping append snapshots must not build under independent budgets"
+        );
+    }
+
+    #[test]
+    fn cached_group_baseline_consumes_shared_build_budget() {
+        let uploaded = AtomicUsize::new(MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES - 4);
+        let exceeded = AtomicBool::new(false);
+        reserve_upload_bytes(
+            &uploaded,
+            &exceeded,
+            MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+            4,
+        )
+        .unwrap();
+        assert!(
+            reserve_upload_bytes(
+                &uploaded,
+                &exceeded,
+                MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES,
+                1,
+            )
+            .is_err()
+        );
+        assert!(exceeded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn separately_warmed_segments_still_obey_combined_resident_cap() {
+        let first_snapshot = checked_resident_sum([MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES / 2]);
+        let second_snapshot = checked_resident_sum([MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES / 2 + 1]);
+        assert!(
+            matches!(first_snapshot, Some(bytes) if bytes <= MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES)
+        );
+        assert!(
+            matches!(second_snapshot, Some(bytes) if bytes <= MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES)
+        );
+
+        let combined = checked_resident_sum([
+            first_snapshot.expect("first snapshot byte count overflowed"),
+            second_snapshot.expect("second snapshot byte count overflowed"),
+        ]);
+        assert!(!matches!(combined, Some(bytes) if bytes <= MAX_RESIDUAL_FTS_GROUP_RESIDENT_BYTES));
     }
 
     #[test]
@@ -1115,7 +1414,7 @@ mod tests {
             .put(&Path::from("too-large"), PutPayload::from_static(b"12345"))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("4 byte build budget"));
+        assert!(error.to_string().contains("4 byte resident budget"));
         assert!(store.list(None).next().await.is_none());
     }
 
@@ -1135,7 +1434,7 @@ mod tests {
             .put(&Path::from("second"), PutPayload::from_static(b"5678"))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(error.to_string().contains("7 byte resident budget"));
         assert!(exceeded.load(Ordering::Relaxed));
         assert!(second.list(None).next().await.is_none());
     }
@@ -1153,7 +1452,7 @@ mod tests {
             .unwrap();
 
         let error = upload.complete().await.unwrap_err();
-        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(error.to_string().contains("7 byte resident budget"));
         assert!(store.head(&destination).await.is_err());
     }
 
@@ -1170,7 +1469,7 @@ mod tests {
             .unwrap();
 
         let error = store.copy(&source, &destination).await.unwrap_err();
-        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(error.to_string().contains("7 byte resident budget"));
         assert!(store.head(&source).await.is_ok());
         assert!(store.head(&destination).await.is_err());
     }
@@ -1188,7 +1487,7 @@ mod tests {
             .unwrap();
 
         let error = store.rename(&source, &destination).await.unwrap_err();
-        assert!(error.to_string().contains("7 byte build budget"));
+        assert!(error.to_string().contains("7 byte resident budget"));
         assert!(store.head(&source).await.is_ok());
         assert!(store.head(&destination).await.is_err());
     }
@@ -1197,7 +1496,7 @@ mod tests {
     async fn aggregate_rejection_is_independent_of_posting_eviction() {
         let posting_cache = LanceCache::with_capacity(192);
         let group_cache = LanceCache::with_capacity(4096);
-        let group_key = group_key();
+        let group_key = group_key_with_uuid(4);
         group_cache
             .insert_with_key(&group_key, Arc::new(ResidualFtsGroupState::Rejected))
             .await;
