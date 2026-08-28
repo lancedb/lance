@@ -2113,6 +2113,7 @@ mod tests {
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+    const MULTIVEC_VECTORS_PER_ROW: usize = 3;
     // 8-bit PQ needs at least 256 training vectors; 320 leaves a stable margin
     // while 20 neighbors provide a useful recall oracle.
     const PQ_MATRIX_NUM_ROWS: usize = 320;
@@ -2328,13 +2329,12 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        const VECTOR_NUM_PER_ROW: usize = 3;
         let start_id = start_id.unwrap_or(0);
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + num_rows as u64,
         ));
         let total_floats = match is_multivector {
-            true => num_rows * VECTOR_NUM_PER_ROW * DIM,
+            true => num_rows * MULTIVEC_VECTORS_PER_ROW * DIM,
             false => num_rows * DIM,
         };
         let vectors = generate_random_array_with_range::<T>(total_floats, range);
@@ -2358,7 +2358,7 @@ mod tests {
             ));
             let array = Arc::new(ListArray::new(
                 vector_field,
-                OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(MULTIVEC_VECTORS_PER_ROW, num_rows)),
                 Arc::new(fsl),
                 None,
             ));
@@ -4461,15 +4461,18 @@ mod tests {
         nlist: usize,
         distance_type: DistanceType,
         version: IndexFileVersion,
+        ivf_sample_rate: usize,
     ) -> VectorIndexParams {
         let mut ivf_params = IvfBuildParams::new(nlist);
         ivf_params.max_iters = 2;
-        ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
+        ivf_params.sample_rate = ivf_sample_rate;
+        ivf_params.kmeans_seed = Some(42);
         let pq_params = PQBuildParams {
             num_sub_vectors: 4,
             num_bits: 8,
             max_iters: 2,
             sample_rate: 1,
+            kmeans_seed: Some(42),
             ..Default::default()
         };
         let mut params =
@@ -4492,7 +4495,7 @@ mod tests {
         let query = batch["vector"].as_fixed_size_list().value(0);
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-        let params = pq_matrix_params(nlist, distance_type, version.clone());
+        let params = pq_matrix_params(nlist, distance_type, version.clone(), PQ_MATRIX_NUM_ROWS);
         dataset
             .create_index(
                 &["vector"],
@@ -4880,7 +4883,7 @@ mod tests {
     #[case::v3(IndexFileVersion::V3)]
     #[tokio::test]
     async fn test_ivf_pq_distance_range(#[case] version: IndexFileVersion) {
-        let params = pq_matrix_params(1, DistanceType::L2, version);
+        let params = pq_matrix_params(1, DistanceType::L2, version, PQ_MATRIX_NUM_ROWS);
         test_distance_range(Some(params), 1).await;
     }
 
@@ -4897,7 +4900,7 @@ mod tests {
         let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
             .await
             .unwrap();
-        let params = pq_matrix_params(1, DistanceType::L2, version);
+        let params = pq_matrix_params(1, DistanceType::L2, version, PQ_MATRIX_NUM_ROWS);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
@@ -4907,13 +4910,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
-        let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+        let params = pq_matrix_params(
+            1,
+            DistanceType::Cosine,
+            IndexFileVersion::Legacy,
+            NUM_ROWS * MULTIVEC_VECTORS_PER_ROW,
+        );
         test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
     }
 
     #[tokio::test]
     async fn test_ivf_pq_delete_all_rows_lifecycle() {
-        let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
+        let params = pq_matrix_params(
+            1,
+            DistanceType::L2,
+            IndexFileVersion::V3,
+            PQ_MATRIX_NUM_ROWS,
+        );
         test_delete_all_rows(params).await;
     }
 
