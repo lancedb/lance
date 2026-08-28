@@ -187,6 +187,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 | [rust](./rust)     | Core Rust implementation |
 | [python](./python) | Python bindings (PyO3)   |
 | [java](./java)     | Java bindings (JNI)      |
+| [kotoba](./kotoba) | Kotoba v1 magic/header (not a reader) |
 | [docs](./docs)     | Documentation source     |
 
 ## Benchmarks

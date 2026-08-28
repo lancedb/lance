@@ -2,7 +2,7 @@
 
 Lance is a modern columnar data format optimized for ML workflows and datasets, providing high-performance random access, vector search, zero-copy automatic versioning, and ecosystem integrations. The vision is to become the de facto standard columnar data format for machine learning and large language models.
 
-Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
+Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [kotoba/](kotoba/README.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
 
 ## File Format Stability and Compatibility
 
