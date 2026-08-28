@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 #
 # Compile lance.kotoba with Kotoba 0.7.2 (wasm32 / i64-v1) and assert the
-# vendored fixture's magic + v1 magics header. Missing tools or mismatches
+# vendored fixture's magic + version header. Missing tools or mismatches
 # fail. This script does not treat a skip as a pass.
 set -euo pipefail
 
@@ -59,27 +59,25 @@ src = pathlib.Path(sys.argv[1]).read_text()
 blob = pathlib.Path(sys.argv[2]).read_bytes()
 if len(blob) != 93:
     raise SystemExit(f"fail: fixture length {len(blob)} != 93")
-tail = blob[-16:]
-if tail[8:12] != bytes([0, 0, 1, 0]) or tail[12:] != b"LANC":
-    raise SystemExit(f"fail: fixture tail is not v1 magics LANC: {tail.hex()}")
-pos = int.from_bytes(tail[:8], "little", signed=True)
-major = int.from_bytes(tail[8:10], "little")
-minor = int.from_bytes(tail[10:12], "little")
-if pos != 65 or major != 0 or minor != 1:
-    raise SystemExit(f"fail: unexpected fixture header pos={pos} major={major} minor={minor}")
+tail = blob[-8:]
+if tail[4:] != b"LANC":
+    raise SystemExit(f"fail: fixture tail is not LANC: {tail.hex()}")
+major = int.from_bytes(tail[0:2], "little")
+minor = int.from_bytes(tail[2:4], "little")
+if major != 0 or minor != 1:
+    raise SystemExit(f"fail: unexpected fixture header major={major} minor={minor}")
 
 required = [
     "(lance-magic? 76 65 78 67)",
-    "(u16-le 65 0)",
     "(u16-le 0 0)",
     "(u16-le 1 0)",
 ]
 missing = [frag for frag in required if frag not in src]
 if missing:
     raise SystemExit(f"fail: lance.kotoba is missing fixture tail literals: {missing}")
-print(
-    f"fixture header: size=93 meta_pos={pos} major={major} minor={minor} magic=LANC"
-)
+if "(u16-le 65 0)" in src:
+    raise SystemExit("fail: lance.kotoba still reads past the version header")
+print(f"fixture header: size=93 major={major} minor={minor} magic=LANC")
 PY
 
 COMPILE_JSON="${WORKDIR}/compile.json"
@@ -122,20 +120,17 @@ value = ((report.get("kotoba.cli/data") or {}).get("kotoba.runtime/result") or {
     "kotoba.runtime/value"
 )
 blob = pathlib.Path(sys.argv[2]).read_bytes()
-tail = blob[-16:]
-pos = int.from_bytes(tail[:8], "little", signed=True)
-major = int.from_bytes(tail[8:10], "little")
-minor = int.from_bytes(tail[10:12], "little")
-magic_ok = 1 if tail[12:] == b"LANC" else 0
-expected = pos * 100000000 + magic_ok * 1000000 + major * 1000 + minor
+tail = blob[-8:]
+major = int.from_bytes(tail[0:2], "little")
+minor = int.from_bytes(tail[2:4], "little")
+magic_ok = 1 if tail[4:] == b"LANC" else 0
+expected = magic_ok * 1000000 + major * 1000 + minor
 if value != expected:
     raise SystemExit(
         f"fail: packed header {value!r} != {expected} "
-        f"(pos={pos} magic_ok={magic_ok} major={major} minor={minor})"
+        f"(magic_ok={magic_ok} major={major} minor={minor})"
     )
-print(
-    f"run: packed={value} meta_pos={pos} magic_ok={magic_ok} major={major} minor={minor}"
-)
+print(f"run: packed={value} magic_ok={magic_ok} major={major} minor={minor}")
 PY
 
 echo "kotoba v1 header checks passed"
