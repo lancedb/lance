@@ -16,11 +16,11 @@ const MS_PER_DAY: i64 = 86400000;
 /// Coerce a float to `f16`, rejecting a finite value that leaves the `f16` range
 /// rather than saturating it to an infinity.
 ///
-/// A value inside the range is rounded onto the `f16` grid, which is inexact in
-/// a way that shows: past 2048 the grid is coarser than the integers, so
-/// `= 2049` matches rows holding 2048 and `< 65519` excludes the rows equal to
-/// 65504. The `Float32` and `Float64` arms below round the same way on a finer
-/// grid, and that is not what the rejection is for.
+/// A value inside the range lands on the `f16` grid and is inexact in a way that
+/// shows: past 2048 the grid is coarser than the integers, so `= 2049` matches
+/// rows holding 2048 and `< 65519` excludes the rows equal to 65504. The
+/// `Float32` and `Float64` arms below are inexact too, on a finer grid, and that
+/// is not what the rejection is for.
 ///
 /// The rejection is for the literal changing kind. Saturated to an infinity,
 /// `= 100000` matches rows that really hold infinity; collapsed to zero,
@@ -35,9 +35,8 @@ const MS_PER_DAY: i64 = 86400000;
 ///
 /// `from_f64_const` rather than `from_f64`: the latter converts through `f32` on
 /// x86 with f16c and directly elsewhere, which moves that boundary by target.
-/// The const form drops the low 32 bits of the `f64` mantissa before rounding, so
-/// a value differing from a tie only in those bits is treated as the tie and
-/// rounds to even: `= 2049.001` matches rows holding 2048, not the nearer 2050.
+/// It is also not exactly round-to-nearest; `test_f16_range_edges` pins where it
+/// lands.
 fn coerce_to_f16(value: f64) -> Option<f16> {
     let coerced = f16::from_f64_const(value);
     if coerced.is_infinite() && !value.is_infinite() {
@@ -989,9 +988,9 @@ mod tests {
     // midpoint of 2048 and 2050, and the tie goes to the even mantissa. This is
     // the case the doc comment cites for `= 2049` matching rows holding 2048.
     #[case::odd_integer_ties_down(2049.0, Some(0x6800))]
-    // `from_f64_const` discards the low 32 bits of the f64 mantissa, so anything
-    // in [2049, 2049.001953125) is treated as that same tie even though 2050 is
-    // nearer. Reachable from a written literal, which is why the doc says so.
+    // Above that midpoint 2050 is the nearer neighbour, and this still lands on
+    // 2048, because `from_f64_const` truncates before it rounds. A written
+    // literal reaches it, so it is not a theoretical gap.
     #[case::truncated_tie(2049.001, Some(0x6800))]
     #[case::largest_finite(65504.0, Some(0x7BFF))]
     // Rounds down to the largest finite f16 rather than overflowing.
