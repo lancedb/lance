@@ -25,7 +25,7 @@ use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::future::try_join_all;
-use futures::stream::{self};
+use futures::stream::{self, FuturesUnordered};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
@@ -48,6 +48,7 @@ use crate::index::scalar::inverted::{
 };
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -796,11 +797,18 @@ impl CompoundQueryExec {
 }
 
 async fn index_query_local_residual_batch(
-    residual: QueryLocalFtsIndex,
+    residual: Option<QueryLocalFtsIndex>,
+    field_id: i32,
+    column: String,
+    index_params: InvertedIndexParams,
     batch: RecordBatch,
     allowed_terms: Arc<HashSet<String>>,
 ) -> Result<QueryLocalFtsIndex> {
     spawn_cpu(move || {
+        let residual = match residual {
+            Some(residual) => residual,
+            None => QueryLocalFtsIndex::try_with_params(field_id, column, index_params)?,
+        };
         let row_ids = batch
             .column_by_name(ROW_ID)
             .ok_or_else(|| {
@@ -813,6 +821,120 @@ async fn index_query_local_residual_batch(
         Ok(residual)
     })
     .await
+}
+
+/// Build a bounded set of independent residual posting shards.
+///
+/// A single [`QueryLocalFtsIndex`] intentionally has one writer. Reusing one
+/// index per CPU worker preserves that contract while allowing different scan
+/// batches to tokenize in parallel. Completed workers immediately take the
+/// next batch, so the stream is never collected in memory and the number of
+/// live tokenizers/posting maps is bounded by the CPU pool size.
+#[allow(clippy::too_many_arguments)]
+async fn index_query_local_residual(
+    mut residual_input: SendableRecordBatchStream,
+    seed: QueryLocalFtsIndex,
+    field_id: i32,
+    column: String,
+    index_params: InvertedIndexParams,
+    allowed_terms: Arc<HashSet<String>>,
+) -> DataFusionResult<Vec<QueryLocalFtsIndex>> {
+    let parallelism = get_num_compute_intensive_cpus().max(1);
+    let mut seed = Some(seed);
+    let mut in_flight = FuturesUnordered::new();
+    let mut is_input_exhausted = false;
+
+    while in_flight.len() < parallelism {
+        let Some(batch) = residual_input.try_next().await? else {
+            is_input_exhausted = true;
+            break;
+        };
+        in_flight.push(index_query_local_residual_batch(
+            seed.take(),
+            field_id,
+            column.clone(),
+            index_params.clone(),
+            batch,
+            allowed_terms.clone(),
+        ));
+    }
+
+    if in_flight.is_empty() {
+        return Ok(vec![seed.ok_or_else(|| {
+            DataFusionError::Internal(
+                "hybrid compound FTS lost its empty residual seed".to_string(),
+            )
+        })?]);
+    }
+
+    let mut shards = Vec::with_capacity(parallelism.min(in_flight.len()));
+    while let Some(shard) = in_flight.try_next().await? {
+        if is_input_exhausted {
+            shards.push(shard);
+            continue;
+        }
+        match residual_input.try_next().await? {
+            Some(batch) => in_flight.push(index_query_local_residual_batch(
+                Some(shard),
+                field_id,
+                column.clone(),
+                index_params.clone(),
+                batch,
+                allowed_terms.clone(),
+            )),
+            None => {
+                is_input_exhausted = true;
+                shards.push(shard);
+            }
+        }
+    }
+    Ok(shards)
+}
+
+async fn query_local_residual_stats(
+    shards: Vec<QueryLocalFtsIndex>,
+    terms: Arc<[String]>,
+) -> Result<Vec<(QueryLocalFtsIndex, MemBM25Scorer)>> {
+    stream::iter(shards.into_iter().map(|shard| {
+        let terms = terms.clone();
+        spawn_cpu(move || {
+            let stats = shard.bm25_stats_for_terms(terms.as_ref());
+            Ok::<_, Error>((shard, stats))
+        })
+    }))
+    .buffered(get_num_compute_intensive_cpus().max(1))
+    .try_collect()
+    .await
+}
+
+async fn query_local_residual_leaves(
+    shards: Vec<QueryLocalFtsIndex>,
+    query: FtsQuery,
+    scorer: Arc<MemBM25Scorer>,
+) -> Result<Vec<Vec<(u64, f32)>>> {
+    let shard_leaves = stream::iter(shards.into_iter().map(|shard| {
+        let query = query.clone();
+        let scorer = scorer.clone();
+        spawn_cpu(move || shard.exact_leaf_results(&query, scorer.as_ref()))
+    }))
+    .buffered(get_num_compute_intensive_cpus().max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    let leaf_count = shard_leaves.first().map_or(0, Vec::len);
+    let mut merged = vec![Vec::new(); leaf_count];
+    for leaves in shard_leaves {
+        if leaves.len() != leaf_count {
+            return Err(Error::internal(format!(
+                "hybrid compound FTS residual shards produced inconsistent leaf counts: expected {leaf_count}, got {}",
+                leaves.len()
+            )));
+        }
+        for (merged, rows) in merged.iter_mut().zip(leaves) {
+            merged.extend(rows);
+        }
+    }
+    Ok(merged)
 }
 
 /// Exact compound FTS over committed postings plus an append-only residual
@@ -928,23 +1050,27 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 ))
             })?;
             let field_id = dataset.schema().field_id(&column)?;
-            let mut residual = QueryLocalFtsIndex::try_with_params(
+            let residual_seed = QueryLocalFtsIndex::try_with_params(
                 field_id,
                 column.clone(),
                 first_index.params().clone(),
             )?;
-            let terms = residual.exact_query_terms(&query)?;
+            let terms = residual_seed.exact_query_terms(&query)?;
             if terms.is_empty() {
                 metrics.baseline_metrics.record_output(0);
                 return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
             }
             let allowed_terms = Arc::new(terms.iter().cloned().collect::<HashSet<_>>());
-            let mut residual_input = residual_input.execute(partition, context.clone())?;
-
-            while let Some(batch) = residual_input.try_next().await? {
-                residual = index_query_local_residual_batch(residual, batch, allowed_terms.clone())
-                    .await?;
-            }
+            let residual_input = residual_input.execute(partition, context.clone())?;
+            let residual_shards = index_query_local_residual(
+                residual_input,
+                residual_seed,
+                field_id,
+                column.clone(),
+                first_index.params().clone(),
+                allowed_terms,
+            )
+            .await?;
 
             let query_tokens = Tokens::new(terms.clone(), first_index.tokenizer().doc_type());
             let exact_params = params
@@ -958,41 +1084,46 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 Some(metrics.as_ref()),
             )
             .await?;
-            let stats_terms = terms.clone();
-            let (residual, residual_stats) = spawn_cpu(move || {
-                let stats = residual.bm25_stats_for_terms(&stats_terms);
-                Ok::<_, Error>((residual, stats))
-            })
+            let residual_shards = query_local_residual_stats(
+                residual_shards,
+                Arc::from(terms.clone().into_boxed_slice()),
+            )
             .await?;
-            scorer.total_tokens = scorer
-                .total_tokens
-                .checked_add(residual_stats.total_tokens)
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "hybrid compound FTS total token count overflow".to_string(),
-                    )
-                })?;
-            scorer.num_docs = scorer
-                .num_docs
-                .checked_add(residual_stats.num_docs)
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "hybrid compound FTS document count overflow".to_string(),
-                    )
-                })?;
-            for term in &terms {
-                let residual_df = residual_stats.num_docs_containing_token(term);
-                let df = scorer.token_docs.get_mut(term).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "hybrid compound FTS scorer is missing query term '{term}'"
-                    ))
-                })?;
-                *df = df.checked_add(residual_df).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "hybrid compound FTS document frequency overflow for term '{term}'"
-                    ))
-                })?;
+            for (_, residual_stats) in &residual_shards {
+                scorer.total_tokens = scorer
+                    .total_tokens
+                    .checked_add(residual_stats.total_tokens)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "hybrid compound FTS total token count overflow".to_string(),
+                        )
+                    })?;
+                scorer.num_docs = scorer
+                    .num_docs
+                    .checked_add(residual_stats.num_docs)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "hybrid compound FTS document count overflow".to_string(),
+                        )
+                    })?;
+                for term in &terms {
+                    let residual_df = residual_stats.num_docs_containing_token(term);
+                    let df = scorer.token_docs.get_mut(term).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "hybrid compound FTS scorer is missing query term '{term}'"
+                        ))
+                    })?;
+                    *df = df.checked_add(residual_df).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "hybrid compound FTS document frequency overflow for term '{term}'"
+                        ))
+                    })?;
+                }
             }
+            let residual_shards = residual_shards
+                .into_iter()
+                .map(|(shard, _)| shard)
+                .collect::<Vec<_>>();
             let scorer = Arc::new(scorer);
             let limit = params.limit.ok_or_else(|| {
                 DataFusionError::Execution(
@@ -1011,23 +1142,30 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     external_mask: None,
                 },
             )?;
-            let (indexed_row_ids, indexed_scores) = compound_search_with_base_scorer(
+            let indexed_search = compound_search_with_base_scorer(
                 &indices,
                 &query,
                 &params,
                 prefilter,
                 metrics.clone(),
                 scorer.clone(),
-            )
-            .await?;
+            );
             let residual_query = query.clone();
             let residual_scorer = scorer.clone();
-            let (residual_row_ids, residual_scores) = spawn_cpu(move || {
-                let residual_leaves =
-                    residual.exact_leaf_results(&residual_query, residual_scorer.as_ref())?;
-                materialized_compound_top_k(&residual_query, residual_leaves, limit)
-            })
-            .await?;
+            let residual_search = async move {
+                let residual_leaves = query_local_residual_leaves(
+                    residual_shards,
+                    residual_query.clone(),
+                    residual_scorer,
+                )
+                .await?;
+                spawn_cpu(move || {
+                    materialized_compound_top_k(&residual_query, residual_leaves, limit)
+                })
+                .await
+            };
+            let ((indexed_row_ids, indexed_scores), (residual_row_ids, residual_scores)) =
+                futures::future::try_join(indexed_search, residual_search).await?;
 
             let mut documents = indexed_row_ids
                 .into_iter()

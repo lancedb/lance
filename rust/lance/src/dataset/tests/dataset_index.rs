@@ -2782,15 +2782,24 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
     create_fragmented_fts_index(&mut dataset, "text", true).await;
 
     let appended = arrow_array::record_batch!(
-        ("text", Utf8, ["fresh alpha", "fresh beta"]),
-        ("id", Int32, [2, 3])
+        (
+            "text",
+            Utf8,
+            ["fresh alpha", "fresh beta", "fresh alpha", "fresh gamma"]
+        ),
+        ("id", Int32, [2, 3, 4, 5])
     )
     .unwrap();
     let schema = appended.schema();
     dataset
         .append(
             RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
+            Some(WriteParams {
+                // Keep the residual rows in separate scan batches so the
+                // parallel query-local shards must merge scores and ties.
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -2810,7 +2819,7 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
     let partial_boost = compound_fts_results(&dataset, boost_query.clone(), Some(10)).await;
     assert_eq!(
         partial_boost.len(),
-        3,
+        5,
         "MUST_NOT must exclude the blocked row"
     );
     assert_eq!(partial_boost[0].1.to_bits(), partial_boost[1].1.to_bits());
