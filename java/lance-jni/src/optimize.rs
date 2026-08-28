@@ -560,6 +560,7 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             read_version,
             original_fragments,
             row_addrs,
+            write_version: String::new(),
         })
     }
 }

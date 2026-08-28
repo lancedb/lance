@@ -53,6 +53,130 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 }
 
 #[tokio::test]
+async fn test_binary_copy_target_controls_copy_or_reencode() {
+    let test_dir = TempStrDir::default();
+    let data = sample_data();
+    let write_params = WriteParams {
+        max_rows_per_file: 2_500,
+        data_storage_version: Some(LanceFileVersion::V2_0),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+        &test_dir,
+        Some(write_params.clone()),
+    )
+    .await
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+    let force_error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000_000,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    let message = force_error.to_string();
+    assert!(message.contains("target is 2.1"));
+    assert!(message.contains("uses 2.0"));
+    assert!(message.contains(".lance"));
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000_000,
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_0
+    );
+    assert!(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .all(|file| file.file_version().unwrap() == ConcreteFileVersion::V2_1)
+    );
+    assert_ne!(
+        dataset.manifest.reader_feature_flags
+            & lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_inputs_reencode_to_exact_compaction_target() {
+    let test_dir = TempStrDir::default();
+    let data = sample_data();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 2_500,
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            Some(WriteParams {
+                max_rows_per_file: 2_500,
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000_000,
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .all(|file| file.file_version().unwrap() == ConcreteFileVersion::V2_1)
+    );
+}
+
+#[tokio::test]
 async fn test_binary_copy_packed_struct_column_mapping() {
     for version in NON_LEGACY_VERSIONS {
         do_test_binary_copy_packed_struct_column_mapping(version).await;

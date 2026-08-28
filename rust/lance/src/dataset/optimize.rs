@@ -123,6 +123,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -302,6 +303,11 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
+    /// Exact data file version for compacted output.
+    ///
+    /// If omitted, the dataset manifest fallback is resolved when each task
+    /// starts and carried in its [`RewriteResult`].
+    pub data_storage_version: Option<LanceFileVersion>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -335,6 +341,7 @@ impl Default for CompactionOptions {
             max_source_bytes: None,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
+            data_storage_version: None,
             transaction_properties: None,
         }
     }
@@ -364,6 +371,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
+    /// - `lance.compaction.data_storage_version`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -457,6 +465,14 @@ impl CompactionOptions {
                 }
                 "compaction_mode" => {
                     self.compaction_mode = Some(CompactionMode::try_from(value.as_str())?);
+                }
+                "data_storage_version" => {
+                    self.data_storage_version = Some(value.parse().map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}': {}",
+                            key, value, error
+                        ))
+                    })?);
                 }
                 "binary_copy_read_batch_bytes" => {
                     self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
@@ -555,6 +571,12 @@ impl CompactionOptions {
         self.transaction_properties = Some(Arc::new(properties));
         self
     }
+
+    fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+        self.data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
 }
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
@@ -573,13 +595,28 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let version = options.write_version(dataset);
     versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
             false
         })
+}
+
+fn first_binary_copy_version_mismatch(
+    fragments: &[Fragment],
+    target: ConcreteFileVersion,
+) -> Result<Option<(String, ConcreteFileVersion)>> {
+    for fragment in fragments {
+        for data_file in fragment.referenced_lance_files() {
+            let actual = data_file.file_version()?;
+            if actual != target {
+                return Ok(Some((data_file.path.clone(), actual)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(super) async fn can_use_binary_copy_current(
@@ -880,8 +917,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        let mut compaction_plan =
-            CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        let mut options = self.options.clone();
+        options.data_storage_version = Some(options.write_version(dataset).to_selector());
+        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
@@ -2115,6 +2153,9 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// Canonical exact output version resolved when the task started.
+    #[serde(default)]
+    pub write_version: String,
 }
 
 async fn reserve_fragment_ids(
@@ -2162,6 +2203,7 @@ async fn rewrite_files(
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
+    let write_version = options.write_version(dataset.as_ref());
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -2170,6 +2212,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            write_version: write_version.to_manifest_string().to_string(),
         });
     }
 
@@ -2206,6 +2249,15 @@ async fn rewrite_files(
     let mode = options.compaction_mode();
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
+        if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
+        {
+            return Err(Error::not_supported_source(
+                format!(
+                    "compaction task {task_id}: binary copy target is {write_version}, but data file '{path}' uses {actual}"
+                )
+                .into(),
+            ));
+        }
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -2276,6 +2328,7 @@ async fn rewrite_files(
         // (e.g. absolute file:// URIs with base_id == 0). Without this flag
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
+        data_storage_version: Some(write_version.to_selector()),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -2287,9 +2340,8 @@ async fn rewrite_files(
     }
 
     if can_binary_copy {
-        let version = dataset.manifest.data_storage_format.lance_file_format();
         new_fragments = versions::rewrite_files_binary_copy(
-            version,
+            write_version,
             dataset.as_ref(),
             &fragments,
             &params,
@@ -2323,7 +2375,7 @@ async fn rewrite_files(
         }
     } else {
         let (frags, _) = write_fragments_internal(
-            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
@@ -2394,6 +2446,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        write_version: write_version.to_manifest_string().to_string(),
     })
 }
 
@@ -2574,6 +2627,22 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
+    let mut resolved_write_version = None;
+    for task in &completed_tasks {
+        if task.write_version.is_empty() {
+            continue;
+        }
+        let task_version = ConcreteFileVersion::from_manifest_string(&task.write_version)?;
+        if let Some(expected) = resolved_write_version {
+            if task_version != expected {
+                return Err(Error::invalid_input(format!(
+                    "Compaction results use different exact output versions: {expected} and {task_version}"
+                )));
+            }
+        } else {
+            resolved_write_version = Some(task_version);
+        }
+    }
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     // Address-style results require immediate index remapping unless it is deferred.
     let needs_remapping =
@@ -3114,6 +3183,33 @@ mod tests {
 
         assert_eq!(metrics, CompactionMetrics::default());
         assert_eq!(dataset.manifest.version, 1);
+    }
+
+    #[rstest]
+    #[case::stable(LanceFileVersion::Stable, LanceFileVersion::V2_1)]
+    #[case::next(LanceFileVersion::Next, LanceFileVersion::V2_3)]
+    #[tokio::test]
+    async fn plan_compaction_freezes_storage_version_selector(
+        #[case] selector: LanceFileVersion,
+        #[case] exact: LanceFileVersion,
+    ) {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            &test_dir,
+            None,
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: Some(selector),
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+
+        assert_eq!(plan.options.data_storage_version, Some(exact));
     }
 
     #[rstest]
