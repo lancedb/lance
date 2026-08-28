@@ -330,7 +330,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
         let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
-        let created_index = match (self.index_type, self.params.index_name()) {
+        let mut created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -596,6 +596,16 @@ impl<'a> CreateIndexBuilder<'a> {
                 )));
             }
         };
+        if created_index
+            .index_details
+            .type_url
+            .ends_with("InvertedIndexDetails")
+        {
+            crate::index::scalar::inverted::set_physical_source_dataset_versions(
+                &mut created_index.index_details,
+                [self.dataset.manifest.version],
+            )?;
+        }
 
         Ok(IndexMetadata {
             uuid: output_index_uuid,

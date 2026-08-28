@@ -12,7 +12,7 @@ use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
@@ -2833,10 +2833,18 @@ async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
 }
 
 #[tokio::test]
-async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
+async fn test_partial_compound_hybrid_rejects_same_id_rewrite_after_deferred_remap() {
     let initial = arrow_array::record_batch!(
-        ("text", Utf8, ["stable alpha common", "stale alpha common"]),
-        ("id", Int32, [0, 1])
+        (
+            "text",
+            Utf8,
+            [
+                "stable alpha common",
+                "stable gamma common",
+                "stale alpha common"
+            ]
+        ),
+        ("id", Int32, [0, 1, 2])
     )
     .unwrap();
     let schema = initial.schema();
@@ -2862,12 +2870,12 @@ async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
         .await
         .unwrap();
 
-    let rewritten_fragment = dataset.get_fragment(1).unwrap();
+    let rewritten_fragment = dataset.get_fragment(2).unwrap();
     let mut replacement_file = rewritten_fragment.metadata().files[0].clone();
     replacement_file.path = "replacement.lance".to_string();
     let replacement = arrow_array::record_batch!(
         ("text", Utf8, ["replacement beta common"]),
-        ("id", Int32, [1])
+        ("id", Int32, [2])
     )
     .unwrap();
     let object_writer = dataset
@@ -2888,7 +2896,7 @@ async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
     let mut dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(1, replacement_file)],
+            replacements: vec![DataReplacementGroup(2, replacement_file)],
         },
         Some(read_version),
         None,
@@ -2904,12 +2912,45 @@ async fn test_partial_compound_hybrid_rejects_same_id_indexed_field_rewrite() {
         .unwrap()
         .unwrap();
     assert!(
-        !committed.fragment_bitmap.as_ref().unwrap().contains(1),
+        !committed.fragment_bitmap.as_ref().unwrap().contains(2),
         "the logical index must prune the same-id rewritten fragment"
+    );
+    let physical_source_version = committed.dataset_version;
+
+    // Compact only the two still-covered fragments and defer the address
+    // remap. The stale physical document from rewritten fragment 2 is absent
+    // from that remap and therefore remains in the postings.
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 2,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+
+    remapping::remap_column_index(&mut dataset, &["text"], Some("text_idx".to_string()))
+        .await
+        .unwrap();
+    let remapped = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(remapped.dataset_version > physical_source_version);
+    assert_eq!(
+        crate::index::scalar::inverted::physical_source_dataset_versions(&remapped).unwrap(),
+        Some(vec![physical_source_version]),
+        "deferred remap must not advance immutable physical provenance"
     );
 
     let appended =
-        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [2]))
+        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [3]))
             .unwrap();
     dataset
         .append(
@@ -3057,7 +3098,8 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
     )
     .await
     .unwrap();
-    let rewritten_file = &dataset.get_fragment(1).unwrap().metadata().files[0];
+    let rewritten_fragment = dataset.get_fragment(1).unwrap();
+    let rewritten_file = &rewritten_fragment.metadata().files[0];
     assert_eq!(rewritten_file.path, relative_path);
     assert_eq!(rewritten_file.base_id, Some(2));
 

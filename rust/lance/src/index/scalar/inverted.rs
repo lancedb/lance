@@ -3,7 +3,10 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
@@ -807,6 +810,11 @@ pub(crate) async fn merge_segments(
     let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
     let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
+    let source_sets = segments
+        .iter()
+        .map(physical_source_dataset_versions)
+        .collect::<Result<Vec<_>>>()?;
+    let merged_source_versions = merge_physical_source_dataset_versions(source_sets);
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -846,7 +854,7 @@ pub(crate) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = InvertedIndex::merge_segments(
+    let mut created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
@@ -854,6 +862,9 @@ pub(crate) async fn merge_segments(
         lance_index::progress::noop_progress(),
     )
     .await?;
+    if let Some(source_versions) = merged_source_versions {
+        set_physical_source_dataset_versions(&mut created_index.index_details, source_versions)?;
+    }
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -936,6 +947,74 @@ pub(crate) async fn fts_index_fragment_bitmap(
     Ok(fragment_bitmap)
 }
 
+/// Return the explicit dataset versions whose physical documents contribute to
+/// an inverted segment.
+///
+/// `None` means the segment predates explicit physical provenance. It must not
+/// fall back to `IndexMetadata::dataset_version`: older Lance versions may have
+/// advanced that mutable remap watermark while retaining stale postings.
+pub(crate) fn physical_source_dataset_versions(
+    segment: &IndexMetadata,
+) -> Result<Option<Vec<u64>>> {
+    let Some(details_any) = segment.index_details.as_ref() else {
+        return Ok(None);
+    };
+    let details = InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+        Error::io(format!(
+            "failed to decode InvertedIndexDetails physical provenance: {error}"
+        ))
+    })?;
+    if details.physical_source_dataset_versions.is_empty() {
+        return Ok(None);
+    }
+    let mut versions = details.physical_source_dataset_versions;
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(Some(versions))
+}
+
+/// Union known physical provenance sets. If any input is unknown, the merged
+/// corpus is also unknown because its retained postings cannot be attributed
+/// exactly.
+pub(crate) fn merge_physical_source_dataset_versions(
+    source_sets: impl IntoIterator<Item = Option<Vec<u64>>>,
+) -> Option<Vec<u64>> {
+    let mut merged = BTreeSet::new();
+    let mut has_input = false;
+    for source_versions in source_sets {
+        has_input = true;
+        let source_versions = source_versions?;
+        if source_versions.is_empty() {
+            return None;
+        }
+        merged.extend(source_versions);
+    }
+    (has_input && !merged.is_empty()).then(|| merged.into_iter().collect())
+}
+
+/// Stamp immutable physical provenance into an inverted-details payload while
+/// preserving its existing type URL.
+pub(crate) fn set_physical_source_dataset_versions(
+    details_any: &mut prost_types::Any,
+    dataset_versions: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    let mut details =
+        InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+            Error::io(format!(
+                "failed to decode InvertedIndexDetails physical provenance: {error}"
+            ))
+        })?;
+    let dataset_versions = dataset_versions.into_iter().collect::<BTreeSet<_>>();
+    if dataset_versions.is_empty() {
+        return Err(Error::invalid_input(
+            "physical source dataset versions must not be empty".to_string(),
+        ));
+    }
+    details.physical_source_dataset_versions = dataset_versions.into_iter().collect();
+    details_any.value = details.encode_to_vec();
+    Ok(())
+}
+
 /// Load and validate the shared [`InvertedIndexDetails`] across committed
 /// segments returned by [`load_segments`].
 ///
@@ -984,14 +1063,18 @@ pub async fn load_segment_details(
 fn canonicalize_inverted_index_details(
     details: InvertedIndexDetails,
 ) -> Result<InvertedIndexDetails> {
+    let physical_source_dataset_versions = details.physical_source_dataset_versions.clone();
     let params = InvertedIndexParams::try_from(&details)?;
-    InvertedIndexDetails::try_from(&params)
+    let mut canonical = InvertedIndexDetails::try_from(&params)?;
+    canonical.physical_source_dataset_versions = physical_source_dataset_versions;
+    Ok(canonical)
 }
 
 /// Compare canonicalized inverted-index details for shared semantic configuration.
 ///
 /// `posting_format_version` records how a single segment physically stores
-/// postings, so mixed-version FTS segments may disagree on it without being
+/// postings, and `physical_source_dataset_versions` records its provenance, so
+/// mixed FTS segments may disagree on either without being semantically
 /// incompatible. Every other field remains part of the equality check.
 fn inverted_index_details_semantically_equal(
     left: &InvertedIndexDetails,
@@ -1001,6 +1084,8 @@ fn inverted_index_details_semantically_equal(
     let mut right = right.clone();
     left.posting_format_version = None;
     right.posting_format_version = None;
+    left.physical_source_dataset_versions.clear();
+    right.physical_source_dataset_versions.clear();
     left == right
 }
 
@@ -1180,6 +1265,52 @@ mod tests {
         assert_eq!(
             canonicalize_inverted_index_details(legacy).unwrap(),
             canonicalize_inverted_index_details(current).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonicalize_inverted_details_preserves_physical_provenance() {
+        let mut details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        details.physical_source_dataset_versions = vec![17, 23];
+
+        let canonical = canonicalize_inverted_index_details(details).unwrap();
+
+        assert_eq!(canonical.physical_source_dataset_versions, vec![17, 23]);
+        let mut other_source = canonical.clone();
+        other_source.physical_source_dataset_versions = vec![18];
+        assert!(inverted_index_details_semantically_equal(
+            &canonical,
+            &other_source
+        ));
+    }
+
+    #[test]
+    fn canonicalize_inverted_details_preserves_unknown_physical_provenance() {
+        let unknown = canonicalize_inverted_index_details(InvertedIndexDetails::default()).unwrap();
+        assert!(unknown.physical_source_dataset_versions.is_empty());
+
+        let mut known = unknown.clone();
+        known.physical_source_dataset_versions = vec![17];
+        assert!(inverted_index_details_semantically_equal(&unknown, &known));
+    }
+
+    #[test]
+    fn merge_physical_provenance_unions_known_sources_and_preserves_unknown() {
+        assert_eq!(
+            merge_physical_source_dataset_versions([Some(vec![19, 17, 19]), Some(vec![18, 19])]),
+            Some(vec![17, 18, 19])
+        );
+        assert_eq!(
+            merge_physical_source_dataset_versions([Some(vec![17]), None]),
+            None
+        );
+        assert_eq!(
+            merge_physical_source_dataset_versions([Some(Vec::new())]),
+            None
+        );
+        assert_eq!(
+            merge_physical_source_dataset_versions(std::iter::empty::<Option<Vec<u64>>>()),
+            None
         );
     }
 

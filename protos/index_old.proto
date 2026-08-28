@@ -101,4 +101,11 @@ message InvertedIndexDetails {
   // The posting-list payload format. This is separate from index_version,
   // which identifies the overall inverted-index layout.
   optional uint32 posting_format_version = 15;
+  // Dataset versions whose physical documents contribute to this segment.
+  // Unlike IndexMetadata.dataset_version, this provenance is not advanced by
+  // row-address remapping because remapping can retain documents outside its
+  // address map. Writers sort and deduplicate this set. An empty set means
+  // provenance is unknown; readers must not infer it from
+  // IndexMetadata.dataset_version.
+  repeated uint64 physical_source_dataset_versions = 16;
 }
