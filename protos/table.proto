@@ -381,16 +381,16 @@ message DataFragment {
   oneof last_updated_at_version_sequence {
     // Current Lance writers store last-updated versions inline regardless of encoded size.
     bytes inline_last_updated_at_versions = 7;
-    // Reserved for future use. Current Lance readers cannot load this field;
-    // writers MUST NOT set it.
+    // Valid external alternative. Current Lance writers do not emit this field,
+    // and current Lance readers cannot load it.
     ExternalFile external_last_updated_at_versions = 8;
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
     // Current Lance writers store created-at versions inline regardless of encoded size.
     bytes inline_created_at_versions = 9;
-    // Reserved for future use. Current Lance readers cannot load this field;
-    // writers MUST NOT set it.
+    // Valid external alternative. Current Lance writers do not emit this field,
+    // and current Lance readers cannot load it.
     ExternalFile external_created_at_versions = 10;
   } // created_at_version_sequence
 
