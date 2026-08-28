@@ -567,6 +567,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                ..
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
@@ -823,6 +824,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                ..
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
