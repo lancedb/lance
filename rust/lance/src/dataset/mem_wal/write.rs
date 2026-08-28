@@ -4039,6 +4039,28 @@ impl MemTableFlushHandler {
                     None
                 };
 
+            // Step 1b: Wait until index application covers this whole memtable.
+            //
+            // Freeze queues the apply and this flush on separate channels, so
+            // without waiting the export can run while the indexes are still
+            // behind the batch store. The generation's vector index would then
+            // be short of rows its own SSTable holds, and SSTable vector search
+            // is index-only -- `fast_search`, no brute-force scan -- so those
+            // rows stop answering once the frozen memtable retires.
+            //
+            // `batch_count` is fixed at freeze, so this waits for a target that
+            // cannot move, and the watcher surfaces a poisoned writer rather
+            // than blocking on a cursor that will never arrive.
+            if !self.index_configs.is_empty()
+                && let Some(indexes) = memtable.indexes_arc()
+            {
+                let target_indexed = memtable.batch_count();
+                self.wal_flusher
+                    .track_batch(Some(indexes), target_indexed, 0)
+                    .wait()
+                    .await?;
+            }
+
             // Step 2: Flush the memtable to Lance storage. The covered WAL
             // entry position is either the one we just appended (per-memtable,
             // from the completion cell — authoritative even when concurrent
