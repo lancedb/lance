@@ -28,6 +28,7 @@ use lance_file::{
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
+use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
@@ -261,64 +262,146 @@ pub async fn rewrite_files_binary_copy(
 }
 
 pub fn check_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Validate)
+}
+
+pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Finalize)
+}
+
+#[derive(Clone, Copy)]
+enum StorageContractMode {
+    Validate,
+    Finalize,
+}
+
+fn check_manifest_storage_contract(
+    manifest: &mut Manifest,
+    mode: StorageContractMode,
+) -> Result<()> {
     let version = manifest.data_storage_format.lance_file_format();
-    match version {
-        ConcreteFileVersion::V1 => repair_legacy_manifest_storage(manifest),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => validate_exact_manifest_storage(manifest, version),
+    if version == ConcreteFileVersion::V1 {
+        repair_legacy_manifest_storage(manifest)?;
     }
+    validate_storage_contract(manifest, mode)
 }
 
-pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
-    match manifest.data_storage_format.lance_file_format() {
-        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => Ok(()),
-        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            validate_leaf_column_indices(manifest)
-        }
-    }
-}
+fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode) -> Result<()> {
+    let fallback = manifest.data_storage_format.lance_file_format();
+    let mixed_enabled = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0
+        && manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+    let mut saw_v1 = false;
+    let mut saw_v2 = false;
+    let mut first_non_fallback = None;
 
-fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             let file_version = data_file.file_version()?;
-            if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
-                continue;
+            match file_version {
+                ConcreteFileVersion::V1 => saw_v1 = true,
+                ConcreteFileVersion::V2_0
+                | ConcreteFileVersion::V2_1
+                | ConcreteFileVersion::V2_2
+                | ConcreteFileVersion::V2_3 => saw_v2 = true,
             }
-            if data_file.fields.len() != data_file.column_indices.len() {
+
+            if saw_v1 && saw_v2 {
                 return Err(Error::invalid_input(format!(
-                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. These must be the same length.",
-                    data_file.path,
-                    fragment.id,
-                    data_file.fields.len(),
-                    data_file.column_indices.len()
+                    "Dataset snapshot mixes V1 and V2 data files; file '{}' in fragment {} has version {}",
+                    data_file.path, fragment.id, file_version
                 )));
             }
-            if file_version == ConcreteFileVersion::V2_0 {
-                continue;
+
+            if !mixed_enabled && file_version != fallback && first_non_fallback.is_none() {
+                first_non_fallback = Some((data_file.path.clone(), fragment.id, file_version));
             }
-            for (field_id, column_index) in
-                data_file.fields.iter().zip(data_file.column_indices.iter())
-            {
-                let Some(field) = manifest.schema.field_by_id(*field_id) else {
-                    continue;
-                };
-                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
-                if needs_column && *column_index == -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
-                        field.name, field_id, data_file.path, fragment.id
-                    )));
-                }
-                if !needs_column && *column_index != -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) has column_index={}, but non-leaf fields should have column_index=-1 in file format 2.1+.",
-                        field.name, field_id, data_file.path, fragment.id, column_index
-                    )));
-                }
+
+            validate_file_column_indices(manifest, fragment.id, data_file, file_version)?;
+        }
+    }
+
+    if mixed_enabled && saw_v1 {
+        return Err(Error::invalid_input(
+            "Dataset has mixed data-file-version capability enabled but references V1 data files",
+        ));
+    }
+    if let Some((path, fragment_id, file_version)) = first_non_fallback {
+        if file_version == ConcreteFileVersion::V1 || fallback == ConcreteFileVersion::V1 {
+            return Err(Error::invalid_input(format!(
+                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback}; V1 and V2 storage versions cannot be mixed"
+            )));
+        }
+        match mode {
+            StorageContractMode::Validate => {
+                return Err(Error::invalid_input(format!(
+                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback} and mixed data-file-version capability is not enabled"
+                )));
             }
+            StorageContractMode::Finalize => {
+                manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+                manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
+    for fragment in manifest.fragments.iter() {
+        for data_file in fragment.referenced_lance_files() {
+            validate_file_column_indices(
+                manifest,
+                fragment.id,
+                data_file,
+                data_file.file_version()?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_column_indices(
+    manifest: &Manifest,
+    fragment_id: u64,
+    data_file: &DataFile,
+    file_version: ConcreteFileVersion,
+) -> Result<()> {
+    if matches!(
+        file_version,
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
+    ) {
+        return Ok(());
+    }
+    if data_file.column_indices.is_empty() {
+        return Ok(());
+    }
+    if data_file.fields.len() != data_file.column_indices.len() {
+        return Err(Error::invalid_input(format!(
+            "Data file '{}' (fragment {}) has {} field ids but {} column indices. These must be the same length.",
+            data_file.path,
+            fragment_id,
+            data_file.fields.len(),
+            data_file.column_indices.len()
+        )));
+    }
+    for (field_id, column_index) in data_file.fields.iter().zip(data_file.column_indices.iter()) {
+        let Some(field) = manifest.schema.field_by_id(*field_id) else {
+            continue;
+        };
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        if needs_column && *column_index == -1 {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
+                field.name, field_id, data_file.path, fragment_id
+            )));
+        }
+        if !needs_column && *column_index != -1 {
+            return Err(Error::invalid_input(format!(
+                "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) has column_index={}, but non-leaf fields should have column_index=-1 in file format 2.1+.",
+                field.name, field_id, data_file.path, fragment_id, column_index
+            )));
         }
     }
     Ok(())
@@ -822,12 +905,12 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
 
 fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
     let declared = manifest.data_storage_format.lance_file_format();
-    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)
-        .map_err(|error| {
-            Error::internal(format!(
-                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: {error}"
-            ))
-        })?
+    let actual = Fragment::try_infer_version(&manifest.fragments).map_err(|error| {
+        Error::invalid_input(format!(
+            "Dataset declares V1 storage but its referenced data files do not have a single version: {error}"
+        ))
+    })?;
+    if let Some(actual) = actual
         && actual != ConcreteFileVersion::V1
     {
         log::warn!(
@@ -836,21 +919,6 @@ fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
             actual
         );
         manifest.data_storage_format = DataStorageFormat::new(actual);
-    }
-    Ok(())
-}
-
-fn validate_exact_manifest_storage(
-    manifest: &Manifest,
-    expected: ConcreteFileVersion,
-) -> Result<()> {
-    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)?
-        && actual != expected
-    {
-        return Err(Error::internal(format!(
-            "The operation added files with version {}. However, the data storage version is {}.",
-            actual, expected
-        )));
     }
     Ok(())
 }
