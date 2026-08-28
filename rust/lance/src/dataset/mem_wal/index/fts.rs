@@ -1043,6 +1043,34 @@ impl QueryLocalFtsIndex {
         })
     }
 
+    /// Create an empty query-local shard without rebuilding tokenizer assets.
+    ///
+    /// The tokenizer pool and its loaded template are shared with the seed;
+    /// each shard only clones a writer tokenizer from that in-memory template.
+    pub(crate) fn empty_sibling(&self) -> Self {
+        let resolved_field = OnceLock::new();
+        if let Some(resolved) = self.inner.resolved_field.get() {
+            resolved_field
+                .set(resolved.clone())
+                .expect("new query-local shard traversal is empty");
+        }
+
+        Self {
+            inner: FtsMemIndex {
+                field_id: self.inner.field_id,
+                source_column_name: self.inner.source_column_name.clone(),
+                params: self.inner.params.clone(),
+                resolved_field,
+                tokenizer_pool: self.inner.tokenizer_pool.clone(),
+                writer_tokenizer: Mutex::new(self.inner.tokenizer_pool.acquire()),
+                state: ArcSwap::from(IndexState::empty()),
+                freeze_threshold_rows: self.inner.freeze_threshold_rows,
+                background_maintenance: false,
+                merge: Arc::new(Mutex::new(None)),
+            },
+        }
+    }
+
     pub(crate) fn exact_query_terms(&self, query: &FtsQuery) -> Result<Vec<String>> {
         self.inner.exact_query_terms(query)
     }
@@ -4565,6 +4593,20 @@ mod tests {
         assert!(index.inner.state.load().partitions.is_empty());
         assert!(index.inner.merge.lock().unwrap().is_none());
         assert_eq!(index.doc_count(), 3);
+
+        let sibling = index.empty_sibling();
+        assert!(Arc::ptr_eq(
+            &index.inner.tokenizer_pool,
+            &sibling.inner.tokenizer_pool
+        ));
+        assert_eq!(sibling.doc_count(), 0);
+        sibling
+            .insert_with_row_ids_for_terms(&batch, &UInt64Array::from(vec![901, 43, 778]), &terms)
+            .unwrap();
+        assert_eq!(index.doc_count(), 3);
+        assert_eq!(sibling.doc_count(), 3);
+        assert!(sibling.inner.state.load().partitions.is_empty());
+        assert!(sibling.inner.merge.lock().unwrap().is_none());
     }
 
     fn create_element_test_batch() -> RecordBatch {

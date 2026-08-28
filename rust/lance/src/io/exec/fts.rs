@@ -48,7 +48,6 @@ use crate::index::scalar::inverted::{
 };
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -797,18 +796,11 @@ impl CompoundQueryExec {
 }
 
 async fn index_query_local_residual_batch(
-    residual: Option<QueryLocalFtsIndex>,
-    field_id: i32,
-    column: String,
-    index_params: InvertedIndexParams,
+    residual: QueryLocalFtsIndex,
     batch: RecordBatch,
     allowed_terms: Arc<HashSet<String>>,
 ) -> Result<QueryLocalFtsIndex> {
     spawn_cpu(move || {
-        let residual = match residual {
-            Some(residual) => residual,
-            None => QueryLocalFtsIndex::try_with_params(field_id, column, index_params)?,
-        };
         let row_ids = batch
             .column_by_name(ROW_ID)
             .ok_or_else(|| {
@@ -828,43 +820,44 @@ async fn index_query_local_residual_batch(
 /// A single [`QueryLocalFtsIndex`] intentionally has one writer. Reusing one
 /// index per CPU worker preserves that contract while allowing different scan
 /// batches to tokenize in parallel. Completed workers immediately take the
-/// next batch, so the stream is never collected in memory and the number of
-/// live tokenizers/posting maps is bounded by the CPU pool size.
-#[allow(clippy::too_many_arguments)]
+/// next batch, so the entire stream is never collected in memory and the
+/// number of live tokenizers/posting maps is bounded by the CPU pool size.
 async fn index_query_local_residual(
     mut residual_input: SendableRecordBatchStream,
     seed: QueryLocalFtsIndex,
-    field_id: i32,
-    column: String,
-    index_params: InvertedIndexParams,
     allowed_terms: Arc<HashSet<String>>,
 ) -> DataFusionResult<Vec<QueryLocalFtsIndex>> {
     let parallelism = get_num_compute_intensive_cpus().max(1);
-    let mut seed = Some(seed);
-    let mut in_flight = FuturesUnordered::new();
+    let mut initial_batches = Vec::with_capacity(parallelism);
     let mut is_input_exhausted = false;
 
-    while in_flight.len() < parallelism {
+    while initial_batches.len() < parallelism {
         let Some(batch) = residual_input.try_next().await? else {
             is_input_exhausted = true;
             break;
         };
+        initial_batches.push(batch);
+    }
+
+    if initial_batches.is_empty() {
+        return Ok(vec![seed]);
+    }
+
+    // Construct every shard from the already-loaded seed before dispatching
+    // CPU work. This keeps tokenizer model I/O out of `spawn_cpu` closures.
+    let mut initial_shards = Vec::with_capacity(initial_batches.len());
+    for _ in 1..initial_batches.len() {
+        initial_shards.push(seed.empty_sibling());
+    }
+    initial_shards.push(seed);
+
+    let mut in_flight = FuturesUnordered::new();
+    for (shard, batch) in initial_shards.into_iter().zip(initial_batches) {
         in_flight.push(index_query_local_residual_batch(
-            seed.take(),
-            field_id,
-            column.clone(),
-            index_params.clone(),
+            shard,
             batch,
             allowed_terms.clone(),
         ));
-    }
-
-    if in_flight.is_empty() {
-        return Ok(vec![seed.ok_or_else(|| {
-            DataFusionError::Internal(
-                "hybrid compound FTS lost its empty residual seed".to_string(),
-            )
-        })?]);
     }
 
     let mut shards = Vec::with_capacity(parallelism.min(in_flight.len()));
@@ -875,10 +868,7 @@ async fn index_query_local_residual(
         }
         match residual_input.try_next().await? {
             Some(batch) => in_flight.push(index_query_local_residual_batch(
-                Some(shard),
-                field_id,
-                column.clone(),
-                index_params.clone(),
+                shard,
                 batch,
                 allowed_terms.clone(),
             )),
@@ -1062,15 +1052,8 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             }
             let allowed_terms = Arc::new(terms.iter().cloned().collect::<HashSet<_>>());
             let residual_input = residual_input.execute(partition, context.clone())?;
-            let residual_shards = index_query_local_residual(
-                residual_input,
-                residual_seed,
-                field_id,
-                column.clone(),
-                first_index.params().clone(),
-                allowed_terms,
-            )
-            .await?;
+            let residual_shards =
+                index_query_local_residual(residual_input, residual_seed, allowed_terms).await?;
 
             let query_tokens = Tokens::new(terms.clone(), first_index.tokenizer().doc_type());
             let exact_params = params
