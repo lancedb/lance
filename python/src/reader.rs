@@ -24,7 +24,7 @@ use lance_io::stream::RecordBatchStream;
 
 use crate::rt;
 
-const READER_CHANNEL_CAPACITY: usize = 2;
+const READER_CHANNEL_CAPACITY: usize = 4;
 
 enum ReaderMessage {
     Batch(Result<RecordBatch, ArrowError>),
@@ -35,9 +35,9 @@ enum ReaderMessage {
 ///
 /// The async scan is driven by one background producer for the lifetime of the
 /// reader. The synchronous Arrow C stream consumer receives batches through a
-/// channel with capacity two, avoiding a runtime task spawn and cross-thread
+/// channel with capacity four, avoiding a runtime task spawn and cross-thread
 /// rendezvous for every batch while preserving backpressure. The channel can
-/// queue two batches while the producer holds at most one more pending send.
+/// queue four batches while the producer holds at most one more pending send.
 pub struct LanceReader {
     schema: SchemaRef,
     receiver: std::sync::Arc<Mutex<mpsc::Receiver<ReaderMessage>>>,
@@ -356,10 +356,10 @@ mod tests {
         let mut reader = make_reader(schema, batches);
 
         assert_eq!(
-            (0..3)
+            (0..5)
                 .map(|_| poll_receiver.recv_timeout(Duration::from_secs(1)).unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1, 2]
+            [0, 1, 2, 3, 4]
         );
         assert!(
             poll_receiver
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
         assert_eq!(
             poll_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            3
+            5
         );
     }
 
