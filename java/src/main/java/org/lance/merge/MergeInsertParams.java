@@ -39,6 +39,7 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
+  private Optional<String> dataStorageVersion = Optional.empty();
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
@@ -245,6 +246,16 @@ public class MergeInsertParams {
   }
 
   /**
+   * Set the exact data storage version for files written by this operation.
+   *
+   * <p>If omitted, the manifest fallback is used. This does not change the manifest fallback.
+   */
+  public MergeInsertParams withDataStorageVersion(String version) {
+    this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
+    return this;
+  }
+
+  /**
    * Mark MemWAL SSTables as compacted into the base table.
    *
    * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
@@ -325,6 +336,10 @@ public class MergeInsertParams {
     return useIndex;
   }
 
+  public Optional<String> dataStorageVersion() {
+    return dataStorageVersion;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -343,6 +358,7 @@ public class MergeInsertParams {
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 

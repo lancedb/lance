@@ -121,3 +121,8 @@ class CompactionOptions(TypedDict):
     are not combined into the same task. Duplicate and unknown IDs are
     ignored. (default: None)
     """
+    data_storage_version: Optional[str]
+    """
+    Exact data storage version for rewritten files. If omitted, compaction
+    uses the manifest fallback. This does not change the manifest fallback.
+    """

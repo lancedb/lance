@@ -49,7 +49,8 @@ public class Compaction {
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
-          compactionOptions.getExcludedFragmentIds());
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getDataStorageVersion());
     }
   }
 
@@ -74,7 +75,8 @@ public class Compaction {
         compactionOptions.getMaxSourceFragments(),
         compactionOptions.getMaxSourceRows(),
         compactionOptions.getMaxSourceBytes(),
-        compactionOptions.getExcludedFragmentIds());
+        compactionOptions.getExcludedFragmentIds(),
+        compactionOptions.getDataStorageVersion());
   }
 
   /**
@@ -98,7 +100,8 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds) {
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return commitCompactionNative(
           dataset,
@@ -116,7 +119,8 @@ public class Compaction {
           maxSourceFragments,
           maxSourceRows,
           maxSourceBytes,
-          excludedFragmentIds);
+          excludedFragmentIds,
+          dataStorageVersion);
     }
   }
 
@@ -136,7 +140,8 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -153,5 +158,6 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion);
 }
