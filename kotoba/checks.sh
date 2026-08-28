@@ -18,12 +18,18 @@ trap 'rm -rf "${WORKDIR}"' EXIT
 # (kotoba-linux-amd64.json -> binarySha256).
 KOTOBA_072_LINUX_AMD64_SHA256="51f696d7d08b92d3d0f34ac5a32dc846ce63aeab3295b1baf74f8fc78a85601c"
 
-if [[ -x "${KOTOBA}" ]]; then
+# The repo has a kotoba/ directory. Directories are executable, so -x kotoba
+# must not win over the CLI binary (CI failed: sha256sum: kotoba: Is a directory).
+if [[ -f "${KOTOBA}" && -x "${KOTOBA}" ]]; then
   KOTOBA_BIN="${KOTOBA}"
 elif command -v "${KOTOBA}" >/dev/null 2>&1; then
   KOTOBA_BIN="$(command -v "${KOTOBA}")"
 else
   echo "fail: kotoba 0.7.2 is required and was not found (${KOTOBA})" >&2
+  exit 1
+fi
+if [[ ! -f "${KOTOBA_BIN}" || -d "${KOTOBA_BIN}" ]]; then
+  echo "fail: kotoba resolved to a directory, not the 0.7.2 CLI (${KOTOBA_BIN})" >&2
   exit 1
 fi
 
