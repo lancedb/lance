@@ -11,7 +11,6 @@ pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
 use arrow_array::{
     Array, DictionaryArray, PrimitiveArray, UInt64Array,
     cast::AsArray,
-    new_null_array,
     types::{
         ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
         UInt32Type, UInt64Type,
@@ -35,16 +34,6 @@ fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
     // TODO: Fast path when there is only one null index? (common case)
 
     let dict_array = array.as_dictionary_opt::<K>().expect_ok()?;
-
-    if dict_array.values().is_empty() && !dict_array.is_empty() {
-        // Valid non-empty dictionaries with no values can only contain null keys.  The
-        // structural encoder removes key validity after recording it as rep/def levels,
-        // so retain an unreachable value at index zero to keep those exposed key bytes valid.
-        let values = new_null_array(dict_array.values().data_type(), 1);
-        return Ok(
-            Arc::new(DictionaryArray::new(dict_array.keys().clone(), values)) as Arc<dyn Array>,
-        );
-    }
 
     if dict_array.values().null_count() == 0 {
         return Ok(array);
@@ -385,25 +374,8 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
-    use arrow_array::{Array, DictionaryArray, Int32Array, StringArray, types::Int32Type};
+    use arrow_array::{Array, StringArray};
     use std::sync::Arc;
-
-    #[test]
-    fn test_normalize_empty_all_null_dictionary() {
-        let keys = Int32Array::new_null(2);
-        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as Arc<dyn Array>;
-        let dictionary = Arc::new(DictionaryArray::<Int32Type>::new(keys, values));
-
-        let normalized = normalize_dict_nulls(dictionary).unwrap();
-        let data_without_key_nulls = normalized
-            .to_data()
-            .into_builder()
-            .nulls(None)
-            .build()
-            .unwrap();
-
-        assert_eq!(data_without_key_nulls.len(), 2);
-    }
 
     #[test]
     fn test_dictionary_encode_abort_fixed_width() {
