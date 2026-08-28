@@ -30,7 +30,7 @@ use arrow::array::AsArray;
 use arrow::array::builder::{LargeListBuilder, LargeStringBuilder};
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, LargeBinaryArray, StructArray};
+use arrow_array::{Array, LargeBinaryArray, MapArray, StructArray};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray, UInt64Array,
     types::{Int32Type, UInt64Type},
@@ -1884,6 +1884,150 @@ async fn test_merge_insert_nested_reorder_preserves_values(#[values(false, true)
             .value(0),
         400
     );
+}
+
+/// Map entries participate in the same recursive name-based merge contract as
+/// structs and lists, including when the map value is itself a struct.
+#[rstest]
+#[tokio::test]
+async fn test_merge_insert_map_value_reorder_preserves_values(
+    #[values(false, true)] use_index: bool,
+) {
+    let map_field = |value_fields: &Fields| {
+        let entry_fields = Fields::from(vec![
+            ArrowField::new("key", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Struct(value_fields.clone()), true),
+        ]);
+        let entries = ArrowField::new("entries", DataType::Struct(entry_fields), false);
+        ArrowField::new("m", DataType::Map(Arc::new(entries), false), false)
+    };
+    let map_array = |value_fields: &Fields, keys: Vec<&str>, a: Vec<i32>, b: Vec<i32>| {
+        let value_columns = value_fields
+            .iter()
+            .map(|field| {
+                let values = if field.name() == "a" {
+                    a.clone()
+                } else {
+                    b.clone()
+                };
+                Arc::new(Int32Array::from(values)) as ArrayRef
+            })
+            .collect();
+        let values = StructArray::new(value_fields.clone(), value_columns, None);
+        let entry_fields = Fields::from(vec![
+            ArrowField::new("key", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Struct(value_fields.clone()), true),
+        ]);
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(values) as ArrayRef,
+            ],
+            None,
+        );
+        let offsets = (0..=entries.len() as i32).collect::<Vec<_>>();
+        Arc::new(MapArray::new(
+            Arc::new(ArrowField::new(
+                "entries",
+                DataType::Struct(entry_fields),
+                false,
+            )),
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            entries,
+            None,
+            false,
+        )) as ArrayRef
+    };
+
+    let target_value_fields = Fields::from(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]);
+    let target_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        map_field(&target_value_fields),
+    ]));
+    let initial = RecordBatch::try_new(
+        target_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            map_array(
+                &target_value_fields,
+                vec!["k1", "k2"],
+                vec![100, 200],
+                vec![10, 20],
+            ),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(initial)], target_schema);
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    if use_index {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let source_value_fields = Fields::from(vec![
+        ArrowField::new("b", DataType::Int32, false),
+        ArrowField::new("a", DataType::Int32, false),
+    ]);
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        map_field(&source_value_fields),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            map_array(&source_value_fields, vec!["k2"], vec![300], vec![400]),
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(source)], source_schema);
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let (dataset, _) = merge_job
+        .execute(reader_to_stream(Box::new(reader)))
+        .await
+        .unwrap();
+
+    let row = dataset
+        .scan()
+        .filter("id = 2")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(row.num_rows(), 1);
+    let map = row["m"].as_map();
+    assert_eq!(map.value_length(0), 1);
+    let entries = map.value(0);
+    let values = entries["value"].as_struct();
+    assert_eq!(values["a"].as_primitive::<Int32Type>().value(0), 300);
+    assert_eq!(values["b"].as_primitive::<Int32Type>().value(0), 400);
 }
 
 /// With stable row ids, updating a top-level struct column keeps a scalar index on a

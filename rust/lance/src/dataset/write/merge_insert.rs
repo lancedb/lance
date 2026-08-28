@@ -190,6 +190,12 @@ pub(crate) fn canonical_source_schema(
             ) => {
                 DataType::FixedSizeList(Arc::new(canonical_field(source_item, target_item)?), *size)
             }
+            (DataType::Map(source_entries, sorted), DataType::Map(target_entries, _)) => {
+                DataType::Map(
+                    Arc::new(canonical_field(source_entries, target_entries)?),
+                    *sorted,
+                )
+            }
             _ => source.data_type().clone(),
         };
         Ok(source.clone().with_data_type(data_type))
