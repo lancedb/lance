@@ -13,22 +13,30 @@ use half::f16;
 
 const MS_PER_DAY: i64 = 86400000;
 
-/// Coerce a float to `f16`, rejecting a finite value that does not survive the
-/// much narrower `f16` range.
+/// Coerce a float to `f16`, rejecting a finite value that leaves the `f16` range
+/// rather than saturating it to an infinity.
 ///
-/// Rounding within the range is fine and matches the integer-to-float arms
-/// below: a literal that lands on a nearby `f16` still filters sensibly.
-/// Saturating does not, because this function cannot see the operator it is
-/// coercing for. `value < 100000` would answer correctly once the literal
-/// became infinity, but `value = 100000` would then match rows that really hold
-/// infinity, and `value = 1e-30` collapsed to zero would match real zeros. An
-/// infinite or NaN input converts faithfully and is kept.
+/// A value inside the range is rounded to the nearest `f16`, which is inexact in
+/// a way that shows: past 2048 the grid is coarser than the integers, so
+/// `= 2049` matches rows holding 2048 and `< 65519` excludes the rows equal to
+/// 65504. The `Float32` and `Float64` arms below round the same way on a finer
+/// grid, and that is not what the rejection is for.
 ///
-/// `Float64` to `Float32` saturates rather than rejecting. Reaching that takes a
-/// literal above 1e38, while `f16` overflows at 65520, which ordinary data
-/// passes.
+/// The rejection is for the literal changing kind. Saturated to an infinity,
+/// `= 100000` matches rows that really hold infinity; collapsed to zero,
+/// `= 1e-30` matches real zeros. The cost is the queries where saturating would
+/// have been right: `< 100000` errors instead of returning every finite row.
+/// This function cannot see the operator, so it cannot allow saturation only
+/// where it is harmless, and an error the caller reports beats a wrong row set.
+/// An infinite or NaN input converts faithfully and is kept.
+///
+/// `Float64` to `Float32` still saturates. Reaching that takes a literal above
+/// 1e38, while `f16` overflows at 65520, which ordinary data passes.
+///
+/// `from_f64_const` rather than `from_f64`: the latter converts through `f32` on
+/// x86 with f16c and directly elsewhere, which moves that boundary by target.
 fn coerce_to_f16(value: f64) -> Option<f16> {
-    let coerced = f16::from_f64(value);
+    let coerced = f16::from_f64_const(value);
     if coerced.is_infinite() && !value.is_infinite() {
         return None;
     }
@@ -968,27 +976,30 @@ mod tests {
     }
 
     /// Rounding inside the `f16` range is accepted; leaving the range is not.
-    /// Saturating to infinity or collapsing to zero would answer an ordered
-    /// comparison correctly and an equality wrongly, and this function cannot
-    /// see which operator it is coercing for.
+    /// Expected values are spelled as bits so a change in how the input is
+    /// rounded fails here rather than being recomputed by the same library call
+    /// the code under test uses.
     #[rstest::rstest]
-    // Rounds to the nearest representable f16 (0.1 is not exact in any binary float).
-    #[case::rounds(0.1, Some(0.1_f32))]
-    #[case::largest_finite(65504.0, Some(65504.0))]
-    #[case::smallest_subnormal(6e-8, Some(6e-8))]
-    // Overflows the f16 range rather than saturating to infinity.
+    // 0.1 has no exact binary form, so it lands on the nearest f16, 0x2E66.
+    #[case::rounds(0.1, Some(0x2E66))]
+    #[case::largest_finite(65504.0, Some(0x7BFF))]
+    // Rounds down to the largest finite f16 rather than overflowing.
+    #[case::just_under_overflow(65519.0, Some(0x7BFF))]
+    #[case::smallest_subnormal(6e-8, Some(0x0001))]
+    // 65520 is the first value that rounds to infinity, not 65504.
+    #[case::overflow_threshold(65520.0, None)]
     #[case::overflow(70000.0, None)]
     #[case::negative_overflow(-70000.0, None)]
     #[case::f32_max(f32::MAX as f64, None)]
     // Underflows to zero rather than silently matching real zeros.
     #[case::underflow(1e-30, None)]
     #[case::negative_underflow(-1e-30, None)]
-    fn test_f16_range_edges(#[case] input: f64, #[case] expected: Option<f32>) {
+    fn test_f16_range_edges(#[case] input: f64, #[case] expected: Option<u16>) {
         let coerced = safe_coerce_scalar(&ScalarValue::Float64(Some(input)), &DataType::Float16);
         match expected {
-            Some(expected) => assert_eq!(
+            Some(bits) => assert_eq!(
                 coerced,
-                Some(ScalarValue::Float16(Some(f16::from_f32(expected)))),
+                Some(ScalarValue::Float16(Some(f16::from_bits(bits)))),
             ),
             None => assert_eq!(coerced, None),
         }

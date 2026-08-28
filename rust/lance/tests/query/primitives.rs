@@ -149,9 +149,9 @@ async fn test_query_float(#[case] data_type: DataType) {
         .col("value", array::rand_type(&data_type).with_random_nulls(0.1))
         .into_batch_rows(RowCount::from(60))
         .unwrap();
-    // BloomFilter is left out for Float16 because the index rejects the type
-    // outright (`Bloom filter index does not support data type: Float16`), which
-    // is a gap in that index rather than in literal coercion.
+    // BloomFilter is left out for Float16 because that index rejects the type
+    // outright. `test_bloom_filter_rejects_float16` pins the rejection so this
+    // skip cannot outlive it.
     let mut index_types = vec![
         None,
         Some(IndexType::BTree),
@@ -174,6 +174,44 @@ async fn test_query_float(#[case] data_type: DataType) {
             test_filter(&original, &ds, "not isnan(value)").await;
         })
         .await
+}
+
+/// `test_query_float` runs its Float16 case without `IndexType::BloomFilter`
+/// because that index refuses the type. Pin the refusal here so the skip cannot
+/// outlive it: once bloom filters accept Float16 this test fails, and whoever
+/// makes it pass should drop the skip too.
+#[tokio::test]
+async fn test_bloom_filter_rejects_float16() {
+    let batch = gen_batch()
+        .col("value", array::rand_type(&DataType::Float16))
+        .into_batch_rows(RowCount::from(16))
+        .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://bloom_f16",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let err = ds
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .expect_err("bloom filter should still refuse Float16");
+    assert!(
+        matches!(err, lance::Error::InvalidInput { .. }),
+        "unexpected error variant: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("Float16"),
+        "error should name the rejected type: {err}"
+    );
 }
 
 #[tokio::test]
