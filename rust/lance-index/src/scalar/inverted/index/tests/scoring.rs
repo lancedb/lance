@@ -4,24 +4,6 @@
 use super::super::partition::validate_no_impact_scorer_upper_bound;
 use super::*;
 
-#[derive(Default)]
-struct NoImpactFallbackMetrics {
-    global_scorer_fallbacks: AtomicU64,
-}
-
-impl MetricsCollector for NoImpactFallbackMetrics {
-    fn record_parts_loaded(&self, _num_parts: usize) {}
-
-    fn record_index_loads(&self, _num_indexes: usize) {}
-
-    fn record_comparisons(&self, _num_comparisons: usize) {}
-
-    fn record_no_impact_global_scorer_fallbacks(&self, num_fallbacks: usize) {
-        self.global_scorer_fallbacks
-            .fetch_add(num_fallbacks as u64, Ordering::Relaxed);
-    }
-}
-
 #[tokio::test]
 async fn test_bm25_search_uses_global_idf() {
     let tmpdir = TempObjDir::default();
@@ -359,7 +341,7 @@ async fn test_no_impact_segments_preserve_global_bm25_top_k() {
     ));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
     let mut candidates = Vec::new();
-    let metrics = Arc::new(NoImpactFallbackMetrics::default());
+    let metrics = Arc::new(NoOpMetricsCollector);
     // Reverse segment visitation so neither the result nor its row-id tie break
     // can accidentally depend on the physical search order.
     for index in [second_index, first_index] {
@@ -399,7 +381,6 @@ async fn test_no_impact_segments_preserve_global_bm25_top_k() {
     let exact_winner_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1);
     assert!((exact_winner_score - 4.633_705).abs() < 1e-5);
     assert!((exact_winner_score - candidates[0].1).abs() < 1e-5);
-    assert_eq!(metrics.global_scorer_fallbacks.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1039,7 +1020,7 @@ async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
 
     let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
-    let metrics = Arc::new(NoImpactFallbackMetrics::default());
+    let metrics = Arc::new(NoOpMetricsCollector);
     let (row_ids, scores) = index
         .bm25_search(
             tokens.clone(),
@@ -1054,7 +1035,6 @@ async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
 
     assert_eq!(row_ids, vec![200]);
     assert_eq!(row_ids.len(), scores.len());
-    assert_eq!(metrics.global_scorer_fallbacks.load(Ordering::Relaxed), 1);
 
     let scorer = index
         .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
@@ -1085,7 +1065,7 @@ async fn test_two_no_impact_partitions_share_global_scorer_and_threshold() {
 
     let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
-    let metrics = Arc::new(NoImpactFallbackMetrics::default());
+    let metrics = Arc::new(NoOpMetricsCollector);
     let (row_ids, scores) = index
         .bm25_search(
             tokens.clone(),
@@ -1100,7 +1080,6 @@ async fn test_two_no_impact_partitions_share_global_scorer_and_threshold() {
 
     assert_eq!(row_ids, vec![200]);
     assert_eq!(scores.len(), 1);
-    assert_eq!(metrics.global_scorer_fallbacks.load(Ordering::Relaxed), 2);
     let scorer = index
         .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
         .await

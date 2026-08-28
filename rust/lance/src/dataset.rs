@@ -35,7 +35,6 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
@@ -176,6 +175,32 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
+    value
+        .parse::<NonZero<usize>>()
+        .map(NonZero::get)
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
+            ))
+        })
+}
+
+fn deep_clone_copy_parallelism(
+    configured_io_parallelism: usize,
+    uses_streaming_copy: bool,
+    stream_copy_parallelism: Option<usize>,
+) -> usize {
+    if !uses_streaming_copy {
+        configured_io_parallelism
+    } else if let Some(value) = stream_copy_parallelism {
+        value
+    } else {
+        configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+    }
+}
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
@@ -3250,13 +3275,15 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset without loading data into memory.
+    /// index files) into the target dataset with bounded memory use.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed through this process.
+    /// accounts). Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
+    /// provider-native copy operations. Cross-store copies continue to stream, and
+    /// local files retain their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3267,6 +3294,8 @@ impl Dataset {
     /// Note: external `base_paths` referenced by the source manifest are read through
     /// this dataset's object store; per-base distinct source credentials are not yet
     /// supported (see <https://github.com/lance-format/lance/issues/6093>).
+    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3308,18 +3337,28 @@ impl Dataset {
             path
         };
 
-        // When the source and target live in the same store we can keep the copy
-        // server-side. Otherwise (e.g. cloning across accounts) we stream each file
-        // from the source store to the target store.
-        let same_store = src_ds.object_store.store_prefix == target_store.store_prefix;
-
-        // TODO: Leverage object store bulk copy for efficient same-store deep_clone.
-        //
-        // All cloud storage providers support batch copy APIs that would provide significant
-        // performance improvements. We use single file copy before we have upstream support.
-        //
-        // Tracked by: https://github.com/lance-format/lance/issues/5435
-        let io_parallelism = self.object_store.io_parallelism();
+        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        // Provider-native copy can fall back to streaming for large objects, so every
+        // non-direct-local transfer stays within the bounded file-copy window.
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
+        let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be valid UTF-8 and a positive \
+                     integer, got {value:?}"
+                )));
+            }
+        };
+        // Limit the number of concurrently buffered transfers by default while
+        // preserving efficient local copies and the operation-specific override.
+        let io_parallelism = deep_clone_copy_parallelism(
+            configured_io_parallelism,
+            uses_streaming_copy,
+            stream_copy_parallelism,
+        );
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
@@ -3328,14 +3367,9 @@ impl Dataset {
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
                 async move {
-                    if same_store {
-                        target_store.copy(&src_path, &target_path).await?;
-                    } else {
-                        let reader = source_store.open(&src_path).await?;
-                        let mut writer = target_store.create(&target_path).await?;
-                        writer.copy_from_reader(reader.as_ref()).await?;
-                        writer.shutdown().await?;
-                    }
+                    source_store
+                        .copy_bulk(&src_path, &target_store, &target_path)
+                        .await?;
                     Result::Ok(())
                 }
             })

@@ -23,6 +23,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::utils::parse::str_is_truthy;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
@@ -165,7 +166,7 @@ impl ArrowFieldExt for ArrowField {
         let metadata = self.metadata();
         metadata
             .get(PACKED_STRUCT_LEGACY_META_KEY)
-            .map(|v| v == "true")
+            .map(|v| str_is_truthy(v))
             .unwrap_or(metadata.contains_key(PACKED_STRUCT_META_KEY))
     }
 }
