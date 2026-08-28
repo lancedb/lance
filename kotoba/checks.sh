@@ -89,9 +89,60 @@ import json
 import pathlib
 import sys
 
+WASM_IMPORT_SECTION = 2
+
+
+def read_uleb128(buf, i):
+    shift = 0
+    value = 0
+    while True:
+        if i >= len(buf):
+            raise ValueError("truncated uleb128")
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        if byte & 0x80 == 0:
+            return value, i
+        shift += 7
+        if shift > 35:
+            raise ValueError("uleb128 too long")
+
+
+def wasm_import_section(buf):
+    if buf[:4] != b"\x00asm":
+        raise ValueError(f"artifact magic {buf[:4]!r} is not wasm")
+    if len(buf) < 8:
+        raise ValueError("truncated wasm header")
+    i = 8
+    found = False
+    import_count = None
+    while i < len(buf):
+        section_id = buf[i]
+        i += 1
+        size, i = read_uleb128(buf, i)
+        end = i + size
+        if end > len(buf):
+            raise ValueError("truncated wasm section")
+        payload = buf[i:end]
+        i = end
+        if section_id == WASM_IMPORT_SECTION:
+            found = True
+            import_count, _ = read_uleb128(payload, 0) if payload else (0, 0)
+    return found, import_count
+
+
+if wasm_import_section(b"\x00asm\x01\x00\x00\x00") != (False, None):
+    raise SystemExit("fail: import-section checker failed on a no-section wasm")
+if wasm_import_section(b"\x00asm\x01\x00\x00\x00\x02\x01\x00") != (True, 0):
+    raise SystemExit("fail: import-section checker failed to see an import section")
+
 report = json.loads(pathlib.Path(sys.argv[1]).read_text())
 if report.get("kotoba.cli/ok?") is not True:
     raise SystemExit(f"fail: compile did not succeed: {report}")
+if report.get("kotoba.cli/code") != "emitted":
+    raise SystemExit(
+        f"fail: compile JSON code is {report.get('kotoba.cli/code')!r}, want 'emitted'"
+    )
 data = report.get("kotoba.cli/data") or {}
 profile = data.get("value-profile")
 target = (data.get("compatibility") or {}).get("target")
@@ -102,7 +153,12 @@ if target != "wasm32-kotoba-v1":
 wasm = pathlib.Path(sys.argv[2]).read_bytes()
 if wasm[:4] != b"\0asm":
     raise SystemExit("fail: compile output is not a wasm32 module (missing \\0asm)")
-print(f"compile: target={target} value-profile={profile} wasm_bytes={len(wasm)}")
+has_imports, import_count = wasm_import_section(wasm)
+if has_imports:
+    raise SystemExit(
+        f"fail: wasm has import section (id 2, count={import_count}); FFI is out of v1"
+    )
+print(f"compile: code=emitted target={target} value-profile={profile} import-section=absent")
 PY
 
 RUN_JSON="${WORKDIR}/run.json"

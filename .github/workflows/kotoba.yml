@@ -7,14 +7,14 @@ on:
       - release/**
     paths:
       - kotoba/**
-      - .github/workflows/kotoba.yml
+      - .github/workflows/kotoba*.yml
   pull_request:
     branches:
       - main
       - release/**
     paths:
       - kotoba/**
-      - .github/workflows/kotoba.yml
+      - .github/workflows/kotoba*.yml
 
 permissions:
   contents: read

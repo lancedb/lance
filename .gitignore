@@ -108,7 +108,6 @@ test_data/venv
 !test_data/**/*.lance
 !rust/lance-file/test_data/**/*.lance
 !kotoba/fixtures/**/*.lance
-kotoba/*.wasm
 
 # Pytest benchmarks
 .benchmarks/
