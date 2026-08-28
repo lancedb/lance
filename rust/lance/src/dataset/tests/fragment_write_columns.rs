@@ -140,6 +140,50 @@ async fn declare_all_null(dataset: &mut Dataset, name: &str) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_compact_metadata_only_all_null_dictionary() {
+    let batch = batch_of(
+        vec![ArrowField::new("id", DataType::Int32, false)],
+        vec![ints(vec![1, 2])],
+    );
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 1,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dictionary_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "category",
+                dictionary_type.clone(),
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["category"].data_type(), &dictionary_type);
+    assert_eq!(batch["category"].null_count(), 2);
+}
+
 /// Stage `values` for an existing `column` of one fragment.
 async fn stage_column(
     dataset: &Dataset,
