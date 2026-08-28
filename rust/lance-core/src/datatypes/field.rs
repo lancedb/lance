@@ -31,6 +31,7 @@ use super::{
 use crate::{
     Error, Result,
     datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    utils::parse::str_is_truthy,
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -1080,7 +1081,7 @@ impl Field {
         PACKED_KEYS.iter().any(|key| {
             self.metadata
                 .get(*key)
-                .map(|value| value.eq_ignore_ascii_case("true"))
+                .map(|value| str_is_truthy(value))
                 .unwrap_or(false)
         })
     }
@@ -1187,7 +1188,7 @@ impl TryFrom<&ArrowField> for Field {
                 // Backward compatibility: use 0 for legacy boolean flag
                 metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .filter(|s| str_is_truthy(s))
                     .map(|_| 0)
             });
         let unenforced_clustering_key_position = metadata
