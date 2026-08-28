@@ -143,6 +143,7 @@ impl IndexMetadata {
         self.index_details.as_ref().is_some_and(|details| {
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
+                || details.type_url.ends_with("FMIndexDetails")
         })
     }
 
@@ -594,6 +595,21 @@ mod tests {
             base_id: None,
             files: None,
         }
+    }
+
+    #[rstest]
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
+    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
+    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new(),
+        }));
+
+        assert_eq!(metadata.results_are_row_addrs(), expected);
     }
 
     #[rstest]
