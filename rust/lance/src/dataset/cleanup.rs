@@ -3673,6 +3673,14 @@ mod tests {
     // Note: branch2 is stored as "dev/branch2"; comments may refer to it as branch2 for brevity.
     // Important: auto_cleanup_hook uses policy derived from manifest config; it does not flip
     // clean_referenced_branches unless tests call cleanup_old_versions with a custom policy.
+    // Cleanup retains or removes an index UUID directory as a unit. Each
+    // inverted-index generation has seven core files plus its provenance sidecar.
+    const INDEX_FILES_PER_GENERATION: usize = 8;
+
+    fn index_file_count(generations: usize) -> usize {
+        generations * INDEX_FILES_PER_GENERATION
+    }
+
     struct LineageSetup {
         main: BranchDatasetFixture,
         branch1: BranchDatasetFixture,
@@ -4092,13 +4100,13 @@ mod tests {
         // - 1 manifest file
         // - 1 data file
         // - 1 deletion file
-        // - 4 index files
+        // - one index generation
         // The left is the counts for the latest version of appending
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 2);
-        assert_eq!(setup.branch1.counts.num_index_files, 14);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(2));
         setup.assert_all_unchanged().await;
 
         setup.branch1.compact().await.unwrap();
@@ -4107,13 +4115,13 @@ mod tests {
         // - 1 manifest file
         // - 1 data file
         // - 1 deletion file
-        // - 4 index files
-        // The left (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        // - one index generation
+        // Counts include one retained index generation.
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 14);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(2));
         setup.assert_all_unchanged().await;
 
         // Now we clean the referenced files of branch1 by branch2 and branch3
@@ -4122,28 +4130,28 @@ mod tests {
         setup.branch3.run_cleanup().await.unwrap();
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        // Counts include one retained index generation.
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        // Counts include one retained index generation.
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup.branch1.run_cleanup().await.unwrap();
 
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        // Counts include one retained index generation.
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
         setup.assert_all_unchanged().await;
     }
 
@@ -4160,7 +4168,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -4176,17 +4184,17 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
 
         setup.branch3.compact().await.unwrap();
         setup.branch3.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -4194,12 +4202,12 @@ mod tests {
         setup.branch2.compact().await.unwrap();
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
     }
 
     #[tokio::test]
@@ -4216,7 +4224,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 2);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 2);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -4225,28 +4233,28 @@ mod tests {
         // - 1 manifest file
         // - 2 data files
         // - 1 deletion file
-        // - 4 index files
+        // - one index generation
         // Branch4 holds references from main:
         // - 1 manifest file
         // - 3 data files
         // - 1 deletion file
-        // - 4 index files
+        // - one index generation
         // The left(1, 1, 1, 0, 0) is the counts for the latest version of compaction
         assert_eq!(setup.main.counts.num_manifest_files, 3);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
 
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts of one version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
         setup.assert_all_unchanged().await;
 
         setup.main.run_cleanup().await.unwrap();
@@ -4254,13 +4262,13 @@ mod tests {
         // - 1 manifest file
         // - 2 data files
         // - 1 deletion file
-        // - 4 index files
-        // The left(1, 1, 1, 0, 4) is the counts for the latest version of compaction
+        // - one index generation
+        // Counts include one retained index generation.
         assert_eq!(setup.main.counts.num_manifest_files, 2);
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
     }
 
     #[tokio::test]
@@ -4274,18 +4282,18 @@ mod tests {
         // - 1 manifest file
         // - 2 data files
         // - 1 deletion file
-        // - 4 index files(only for branch1)
+        // - one index generation(only for branch1)
         // Branch4 holds references from main:
         // - 1 manifest file
         // - 3 data files
         // - 1 deletion file
-        // - 4 index files
-        // The left(1, 1, 1, 1, 4) is the counts for the latest version of compaction
+        // - one index generation
+        // Counts include one retained index generation.
         assert_eq!(setup.main.counts.num_manifest_files, 3);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 21);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(3));
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -4296,7 +4304,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 21);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(3));
         setup.assert_all_unchanged().await;
 
         setup.branch1.write_data().await.unwrap();
@@ -4312,19 +4320,19 @@ mod tests {
         // - 1 manifest file
         // - 1 data files
         // - 2 deletion files
-        // - 4 index files
+        // - one index generation
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 14);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(2));
         setup.branch1.run_cleanup().await.unwrap();
-        // Cleanup 4 index files referenced from branch2
+        // Cleanup one index generation referenced from branch2
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
 
         setup.main.run_cleanup().await.unwrap();
         // Branch3 holds references from main:
@@ -4335,12 +4343,12 @@ mod tests {
         // - 1 manifest file
         // - 3 data files
         // - 2 deletion files
-        // - 4 index files
+        // - one index generation
         assert_eq!(setup.main.counts.num_manifest_files, 3);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -4350,7 +4358,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
 
         setup.main.run_cleanup().await.unwrap();
         // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
@@ -4358,7 +4366,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
 
         // Cleanup doesn't take effect if we don't clean branch2 first
         setup.branch1.run_cleanup().await.unwrap();
@@ -4366,57 +4374,57 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
 
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
 
         setup.branch1.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
 
         setup.main.run_cleanup().await.unwrap();
         // Branch4 holds references from main:
         // - 1 manifest file
         // - 3 data files
         // - 2 deletion files
-        // - 4 index files
+        // - one index generation
         assert_eq!(setup.main.counts.num_manifest_files, 2);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
 
         setup.branch4.write_data().await.unwrap();
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
 
         setup.main.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts for the latest version
+        // Counts include one retained index generation.
         assert_eq!(setup.main.counts.num_manifest_files, 1);
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
     }
 
     #[tokio::test]
@@ -4440,7 +4448,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         // After auto-clean: branch3
         // 2 appends produced 2 data files
         // 2 deletes produced 2 deletion files
@@ -4448,7 +4456,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -4465,19 +4473,19 @@ mod tests {
             .unwrap();
         setup.branch3.refresh().await.unwrap();
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts of one version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         // Only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts of one version
+        // Counts include one retained index generation.
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -4502,12 +4510,12 @@ mod tests {
         // - 1 manifest file
         // - 3 data files
         // - 1 deletion file
-        // - 4 index files
+        // - one index generation
         assert_eq!(setup.main.counts.num_manifest_files, 3);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
 
         setup.main.compact().await.unwrap();
         setup
@@ -4527,7 +4535,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
 
         setup.branch4.compact().await.unwrap();
         setup
@@ -4544,13 +4552,13 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 7);
-        // (1, 1, 1, 0, 4) is the counts of one version
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
+        // Counts include one retained index generation.
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
 
         setup.branch1.write_data().await.unwrap();
         setup.branch1.compact().await.unwrap();
@@ -4568,7 +4576,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
         // Branch3 and branch2 still hold references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -4577,7 +4585,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
 
         setup.branch2.write_data().await.unwrap();
         setup.branch2.compact().await.unwrap();
@@ -4595,7 +4603,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
         // Branch3 still holds references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -4604,7 +4612,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
         // Branch3 still holds references from branch2:
         // - 1 manifest file
         // - 1 data files
@@ -4613,7 +4621,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -4626,27 +4634,27 @@ mod tests {
         setup.branch2.refresh().await.unwrap();
         setup.branch3.refresh().await.unwrap();
         // For all branches, only the latest manifest is retained.
-        // (1, 1, 1, 0, 4) is the counts of one version
+        // Counts include one retained index generation.
         assert_eq!(setup.main.counts.num_manifest_files, 1);
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         setup.assert_unchanged(&["branch4"]).await;
     }
 
@@ -4753,29 +4761,29 @@ mod tests {
         setup.branch3.refresh().await.unwrap();
         setup.branch4.refresh().await.unwrap();
         // Two tags hold two manifest references
-        // Main tag holds 1 tx file, 3 data files, 2 deletion files and 4 index files
+        // Main tag holds 1 tx file, 3 data files, 2 deletion files and one index generation
         assert_eq!(setup.main.counts.num_manifest_files, 3);
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
-        // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
+        // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and one index generation
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
-        // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
+        // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and one index generation
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
 
         setup
             .branch3
@@ -4798,27 +4806,27 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 14);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(2));
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 7);
+        assert_eq!(setup.branch1.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
 
         setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
@@ -4834,22 +4842,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 7);
+        assert_eq!(setup.main.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 7);
+        assert_eq!(setup.branch2.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 7);
+        assert_eq!(setup.branch3.counts.num_index_files, index_file_count(1));
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 7);
+        assert_eq!(setup.branch4.counts.num_index_files, index_file_count(1));
     }
 
     #[test]
