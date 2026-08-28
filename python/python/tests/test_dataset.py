@@ -1754,6 +1754,27 @@ def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+def _wait_until_latest_version_is_older_than(dataset, older_than_seconds):
+    latest_timestamp = dataset.versions()[-1]["timestamp"]
+    threshold = latest_timestamp + timedelta(seconds=older_than_seconds)
+    deadline = time.monotonic() + older_than_seconds + 1
+
+    while True:
+        now = (
+            datetime.now(latest_timestamp.tzinfo)
+            if latest_timestamp.tzinfo is not None
+            else datetime.now()
+        )
+        remaining = (threshold - now).total_seconds()
+        if remaining < 0:
+            return
+
+        timeout_remaining = deadline - time.monotonic()
+        if timeout_remaining <= 0:
+            pytest.fail("latest dataset version did not pass the cleanup age threshold")
+        time.sleep(min(remaining + 0.05, timeout_remaining))
+
+
 def test_auto_cleanup(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1768,11 +1789,11 @@ def test_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    dataset = lance.dataset(base_dir)
+    _wait_until_latest_version_is_older_than(dataset, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 2
 
 
@@ -1787,7 +1808,7 @@ def test_config_update_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 0.001)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1823,12 +1844,13 @@ def test_auto_cleanup_invalid(tmp_path):
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
 
-    time.sleep(3)
+    dataset = lance.dataset(base_dir)
+    assert "lance.auto_cleanup.interval" not in dataset.config()
+    assert "lance.auto_cleanup.older_than" not in dataset.config()
 
     lance.write_dataset(
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 4
 
 
@@ -1846,7 +1868,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1854,12 +1876,14 @@ def test_enable_disable_auto_cleanup(tmp_path):
 
     # this is a transactional commit, so will increase a version
     ds.optimize.disable_auto_cleanup()
+    assert "lance.auto_cleanup.interval" not in ds.config()
+    assert "lance.auto_cleanup.older_than" not in ds.config()
 
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # wait to see if cleanup would be trigger
     lance.write_dataset(table, base_dir, mode="append")
@@ -5448,7 +5472,12 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5480,7 +5509,7 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5534,7 +5563,9 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5574,7 +5605,9 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     import json
 
     base_dir = tmp_path / "test"
@@ -5627,7 +5660,9 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+def test_data_overlay_rejects_invalid_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5669,7 +5704,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+def test_data_overlay_rejects_unsorted_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
     # Offsets map positionally to value rows in data_file. A RoaringBitmap would
     # silently reorder/dedup them, so a non-ascending list must be rejected up
     # front rather than corrupting the row mapping.
