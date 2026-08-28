@@ -13,14 +13,60 @@ use half::f16;
 
 const MS_PER_DAY: i64 = 86400000;
 
+/// The exact tie between the largest finite `f16` and the value that would
+/// follow it. A tie goes to the even mantissa, which there is the one that does
+/// not exist, so this magnitude and anything above it rounds to an infinity.
+const F16_OVERFLOW_THRESHOLD: f64 = 65520.0;
+
+/// The finite `f16` nearest `value`, with a tie going to the even mantissa.
+///
+/// Neither of `half`'s conversions is correctly rounded, in two different ways:
+/// the software path truncates the low 32 bits of the `f64` mantissa before it
+/// rounds ([half-rs#151]), and the x86 hardware path rounds through `f32` first
+/// ([half-rs#116]). Both land within one step of the right answer, so this starts
+/// from the software path, which at least does not vary by target, and then looks
+/// at the two neighbours. Widening `f16` to `f64` is exact, so comparing the three
+/// distances in `f64` decides exactly.
+///
+/// The caller must have excluded the overflow range first. Truncation only ever
+/// shrinks the magnitude, so below the threshold the starting point is finite.
+///
+/// [half-rs#151]: https://github.com/VoidStarKat/half-rs/issues/151
+/// [half-rs#116]: https://github.com/VoidStarKat/half-rs/issues/116
+fn nearest_finite_f16(value: f64) -> f16 {
+    let start = f16::from_f64_const(value);
+    debug_assert!(
+        start.is_finite(),
+        "caller must reject the overflow range before calling: {value}"
+    );
+    let mut best = start;
+    let mut best_distance = (value - start.to_f64()).abs();
+    let start_bits = start.to_bits();
+    // Stepping the bit pattern by one walks to the adjacent magnitude on either
+    // side of `start`, for negatives as well. Stepping off an end lands on an
+    // infinity or a NaN, which is not a candidate.
+    for candidate in [start_bits.wrapping_sub(1), start_bits.wrapping_add(1)].map(f16::from_bits) {
+        if !candidate.is_finite() {
+            continue;
+        }
+        let distance = (value - candidate.to_f64()).abs();
+        let wins =
+            distance < best_distance || (distance == best_distance && candidate.to_bits() & 1 == 0);
+        if wins {
+            best = candidate;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
 /// Coerce a float to `f16`, rejecting a finite value that leaves the `f16` range
 /// rather than saturating it to an infinity.
 ///
 /// A value inside the range lands on the `f16` grid and is inexact in a way that
 /// shows: past 2048 the grid is coarser than the integers, so `= 2049` matches
-/// rows holding 2048 and `< 65519` excludes the rows equal to 65504. The
-/// `Float32` and `Float64` arms below are inexact too, on a finer grid, and that
-/// is not what the rejection is for.
+/// rows holding 2048. The `Float32` and `Float64` arms below are inexact too, on
+/// a finer grid, and that is not what the rejection is for.
 ///
 /// The rejection is for the literal changing kind. Saturated to an infinity,
 /// `= 100000` matches rows that really hold infinity; collapsed to zero,
@@ -32,20 +78,27 @@ const MS_PER_DAY: i64 = 86400000;
 ///
 /// `Float64` to `Float32` still saturates. Reaching that takes a literal above
 /// 1e38, while `f16` overflows at 65520, which an ordinary literal passes.
-///
-/// `from_f64_const` rather than `from_f64`: the latter converts through `f32` on
-/// x86 with f16c and directly elsewhere, which moves that boundary by target.
-/// The const form is also not exactly round-to-nearest; `test_f16_range_edges`
-/// pins where it lands.
 fn coerce_to_f16(value: f64) -> Option<f16> {
-    let coerced = f16::from_f64_const(value);
-    if coerced.is_infinite() && !value.is_infinite() {
+    if value.is_nan() {
+        return Some(f16::NAN);
+    }
+    if value.is_infinite() {
+        return Some(if value.is_sign_positive() {
+            f16::INFINITY
+        } else {
+            f16::NEG_INFINITY
+        });
+    }
+    if value.abs() >= F16_OVERFLOW_THRESHOLD {
         return None;
     }
-    if coerced == f16::ZERO && value != 0.0 {
+    let nearest = nearest_finite_f16(value);
+    // `f16::ZERO == f16::NEG_ZERO`, and so does `-0.0 == 0.0`, so a signed zero
+    // literal keeps its sign here and only a genuinely nonzero value is rejected.
+    if nearest == f16::ZERO && value != 0.0 {
         return None;
     }
-    Some(coerced)
+    Some(nearest)
 }
 
 // This is slightly tedious but when we convert expressions from SQL strings to logical
@@ -988,10 +1041,10 @@ mod tests {
     // midpoint of 2048 and 2050, and the tie goes to the even mantissa. This is
     // the case the doc comment cites for `= 2049` matching rows holding 2048.
     #[case::odd_integer_ties_down(2049.0, Some(0x6800))]
-    // Above that midpoint 2050 is the nearer neighbour, and this still lands on
-    // 2048, because `from_f64_const` truncates before it rounds. A written
-    // literal reaches it, so it is not a theoretical gap.
-    #[case::truncated_tie(2049.001, Some(0x6800))]
+    // Above that midpoint 2050 is the nearer neighbour, and the coercion picks it.
+    // `half`'s own conversion returns 2048 here, which is the defect
+    // `nearest_finite_f16` exists to correct.
+    #[case::just_above_a_tie(2049.001, Some(0x6801))]
     #[case::largest_finite(65504.0, Some(0x7BFF))]
     // Rounds down to the largest finite f16 rather than overflowing.
     #[case::just_under_overflow(65519.0, Some(0x7BFF))]
@@ -1048,6 +1101,77 @@ mod tests {
             safe_coerce_scalar(&ScalarValue::Int64(Some(0)), &DataType::Float16),
             Some(ScalarValue::Float16(Some(f16::ZERO))),
         );
+    }
+
+    /// Sweep every rounding decision the conversion can make instead of trusting
+    /// the handful of points named above: for each adjacent pair of finite `f16`
+    /// values, the exact midpoint and the two `f64` values either side of it. A
+    /// misrounding anywhere in the range shows up here, which is how the
+    /// `2049.001` case was found in the first place.
+    ///
+    /// The expectation is stated, not recomputed: below the midpoint the lower
+    /// neighbour, above it the upper one, at it the even mantissa.
+    #[test]
+    fn test_f16_rounds_to_nearest_even_across_the_whole_range() {
+        fn coerce(value: f64) -> Option<f16> {
+            match safe_coerce_scalar(&ScalarValue::Float64(Some(value)), &DataType::Float16) {
+                Some(ScalarValue::Float16(Some(v))) => Some(v),
+                // Rejected, which the underflow side of the range expects.
+                None => None,
+                other => panic!("expected a Float16 literal for {value}, got {other:?}"),
+            }
+        }
+        // A nonzero literal that lands on zero is rejected rather than coerced,
+        // so the smallest pair expects `None` on its lower side.
+        fn want(expected: f16, input: f64) -> Option<f16> {
+            if expected == f16::ZERO && input != 0.0 {
+                None
+            } else {
+                Some(expected)
+            }
+        }
+
+        // 0x7BFF is the largest finite f16, so pairing each bit pattern with the
+        // next covers every adjacent finite pair on the positive side. Negatives
+        // are covered by the symmetry check below.
+        for lower_bits in 0..0x7BFFu16 {
+            let lower = f16::from_bits(lower_bits);
+            let upper = f16::from_bits(lower_bits + 1);
+            // Both operands are f16 widened to f64, so the average is exact.
+            let midpoint = (lower.to_f64() + upper.to_f64()) / 2.0;
+            let below = f64::from_bits(midpoint.to_bits() - 1);
+            let above = f64::from_bits(midpoint.to_bits() + 1);
+
+            assert_eq!(coerce(below), want(lower, below), "just below {midpoint}");
+            assert_eq!(coerce(above), want(upper, above), "just above {midpoint}");
+            let even = if lower.to_bits() & 1 == 0 {
+                lower
+            } else {
+                upper
+            };
+            assert_eq!(coerce(midpoint), want(even, midpoint), "at {midpoint}");
+        }
+    }
+
+    /// Sign is not part of the rounding decision, so negating the input negates
+    /// the result. This is what lets the sweep above cover only positives.
+    #[rstest::rstest]
+    #[case(0.1)]
+    #[case(2049.001)]
+    #[case(65504.0)]
+    #[case(6e-8)]
+    #[case(70000.0)]
+    #[case(1e-30)]
+    fn test_f16_coercion_is_sign_symmetric(#[case] magnitude: f64) {
+        let positive =
+            safe_coerce_scalar(&ScalarValue::Float64(Some(magnitude)), &DataType::Float16);
+        let negative =
+            safe_coerce_scalar(&ScalarValue::Float64(Some(-magnitude)), &DataType::Float16);
+        let flipped = match positive {
+            Some(ScalarValue::Float16(Some(v))) => Some(ScalarValue::Float16(Some(-v))),
+            other => other,
+        };
+        assert_eq!(negative, flipped);
     }
 
     #[test]
