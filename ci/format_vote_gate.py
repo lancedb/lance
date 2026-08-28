@@ -33,6 +33,9 @@ COMMENT_MARKER = "<!-- format-spec-vote-status -->"
 REQUIRED_APPROVALS = 3
 PERIOD_HOURS = 72
 VOTING_URL = "https://lance.org/community/voting/"
+WORKFLOW_FILE = "format-vote-gate.yml"
+# Keep in sync with the `cron` in the workflow; only used in the comment text.
+SWEEP_MINUTES = 15
 
 # The weekend boundary is fixed in UTC rather than a local zone: it has no DST
 # transitions to reason about, and no PMC member's timezone gets to define when
@@ -150,7 +153,7 @@ def _as_utc(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
-def _build_comment(headline, approval_cell, vetoes, period_cell):
+def _build_comment(headline, approval_cell, vetoes, period_cell, rerun_url):
     return "\n".join(
         [
             COMMENT_MARKER,
@@ -173,9 +176,12 @@ def _build_comment(headline, approval_cell, vetoes, period_cell):
             f"| Vetoes | {_fmt_list(vetoes)} |",
             f"| Voting period | {period_cell} |",
             "",
-            "<sub>Updated automatically by the format-spec vote gate. A PMC member "
-            f"may apply the `{WAIVED_LABEL}` label to waive the vote for a trivial "
-            "edit (typo, wording, formatting).</sub>",
+            "<sub>Updated automatically by the format-spec vote gate, which "
+            f"re-checks every {SWEEP_MINUTES} minutes — just voted? "
+            f"[Re-check now]({rerun_url}) (press Run workflow; leave the input "
+            "blank to re-check every open format PR). A PMC member may apply "
+            f"the `{WAIVED_LABEL}` label to waive the vote for a trivial edit "
+            "(typo, wording, formatting).</sub>",
         ]
     )
 
@@ -190,10 +196,11 @@ def _load_pmc(workspace):
 
 
 class Gate:
-    def __init__(self, repo, pmc, run_url):
+    def __init__(self, repo, pmc, run_url, rerun_url):
         self.repo = repo
         self.pmc = pmc
         self.run_url = run_url
+        self.rerun_url = rerun_url
 
     def is_pmc(self, login):
         return login is not None and login.lower() in self.pmc
@@ -327,7 +334,10 @@ class Gate:
 
         self.set_status(head_sha, state, summary)
         self.upsert_comment(
-            issue, _build_comment(headline, approval_cell, vetoes, period_cell)
+            issue,
+            _build_comment(
+                headline, approval_cell, vetoes, period_cell, self.rerun_url
+            ),
         )
         print(f"PR #{number}: {summary}")
 
@@ -339,23 +349,27 @@ def main():
     token = os.environ["GITHUB_TOKEN"]
     repo_name = os.environ["GITHUB_REPOSITORY"]
     event_name = os.environ["GITHUB_EVENT_NAME"]
-    run_url = (
-        f"{os.environ['GITHUB_SERVER_URL']}/{repo_name}/actions/runs/"
-        f"{os.environ['GITHUB_RUN_ID']}"
-    )
+    actions_url = f"{os.environ['GITHUB_SERVER_URL']}/{repo_name}/actions"
+    run_url = f"{actions_url}/runs/{os.environ['GITHUB_RUN_ID']}"
+    rerun_url = f"{actions_url}/workflows/{WORKFLOW_FILE}"
 
     repo = Github(token).get_repo(repo_name)
-    gate = Gate(repo, _load_pmc(workspace), run_url)
+    gate = Gate(repo, _load_pmc(workspace), run_url, rerun_url)
+    print(f"Re-check on demand: {rerun_url}")
 
-    if event_name == "schedule":
-        # The schedule trigger has no PR context, so sweep every open
-        # format-change PR to re-check the voting-period clock.
+    if event_name in ("schedule", "workflow_dispatch"):
+        # Neither trigger carries PR context. A manual run may name one PR;
+        # otherwise sweep every open format-change PR.
+        requested = os.environ.get("GATE_PR", "").strip()
+        if requested:
+            gate.evaluate(int(requested))
+            return
         pulls = [
             pr
             for pr in repo.get_pulls(state="open")
             if any(label.name == FORMAT_LABEL for label in pr.labels)
         ]
-        print(f"Scheduled sweep: {len(pulls)} open {FORMAT_LABEL} PR(s).")
+        print(f"Sweep: {len(pulls)} open {FORMAT_LABEL} PR(s).")
         for pr in pulls:
             try:
                 gate.evaluate(pr.number)

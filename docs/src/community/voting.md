@@ -106,8 +106,9 @@ blocks merging a `format-change` PR until all of the following hold:
 The gate is the `format-spec-vote` required status check on protected branches.
 The PMC roster used to count votes is read from
 [`docs/src/community/pmc.yaml`](./pmc.md). It re-evaluates on a 15-minute
-schedule, so expect the tally comment and the status check to trail a review by
-a few minutes.
+schedule, so the tally comment and the status check trail a review by a few
+minutes; the comment links to a "Run workflow" page for anyone who would rather
+re-check immediately.
 
 For a trivial edit that does not change the format — a typo, wording, or
 formatting fix — a PMC member may apply the `format-waived` label to waive the

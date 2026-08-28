@@ -27,7 +27,9 @@ name: Format spec vote gate
 # fork PR's review event gets a read-only GITHUB_TOKEN no matter what the
 # `permissions` block below asks for, so it cannot post the status — and format
 # proposals from non-committers are exactly the fork-PR case. Approvals are
-# therefore picked up by the `schedule` sweep instead.
+# therefore picked up by the `schedule` sweep instead, or by a manual
+# `workflow_dispatch` run for a voter who does not want to wait for it. The
+# gate's PR comment links to that dispatch page.
 
 on:
   pull_request_target:
@@ -47,6 +49,12 @@ on:
     # above), and the period routinely elapses days after the third approval.
     # Every 15 minutes, because this is the only path that observes a vote.
     - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to re-check (blank = every open format-change PR)"
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -75,3 +83,4 @@ jobs:
         run: python ci/format_vote_gate.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATE_PR: ${{ inputs.pr }}
