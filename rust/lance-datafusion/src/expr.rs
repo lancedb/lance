@@ -35,8 +35,8 @@ const MS_PER_DAY: i64 = 86400000;
 ///
 /// `from_f64_const` rather than `from_f64`: the latter converts through `f32` on
 /// x86 with f16c and directly elsewhere, which moves that boundary by target.
-/// It is also not exactly round-to-nearest; `test_f16_range_edges` pins where it
-/// lands.
+/// The const form is also not exactly round-to-nearest; `test_f16_range_edges`
+/// pins where it lands.
 fn coerce_to_f16(value: f64) -> Option<f16> {
     let coerced = f16::from_f64_const(value);
     if coerced.is_infinite() && !value.is_infinite() {
