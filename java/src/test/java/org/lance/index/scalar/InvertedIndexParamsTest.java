@@ -43,6 +43,7 @@ class InvertedIndexParamsTest {
     Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
     assertEquals(128, ((Number) json.get("block_size")).intValue());
     assertEquals("row", json.get("document_granularity"));
+    assertEquals(40, ((Number) json.get("max_token_length")).intValue());
   }
 
   @Test
@@ -102,6 +103,12 @@ class InvertedIndexParamsTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> InvertedIndexParams.builder().baseTokenizer("code").formatVersion(2).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().analyzer("code").formatVersion(1).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().analyzer("code").formatVersion(2).build());
   }
 
   @Test
@@ -131,8 +138,8 @@ class InvertedIndexParamsTest {
   }
 
   @Test
-  void unlimitedTokenLengthIsSerializedAsNull() {
-    ScalarIndexParams params = InvertedIndexParams.builder().unlimitedTokenLength().build();
+  void nullMaxTokenLengthIsSerializedAsNull() {
+    ScalarIndexParams params = InvertedIndexParams.builder().maxTokenLength(null).build();
 
     Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
     assertTrue(json.containsKey("max_token_length"));
@@ -140,9 +147,19 @@ class InvertedIndexParamsTest {
   }
 
   @Test
-  void invalidResourceParametersAreRejected() {
+  void zeroResourceParametersAreSerialized() {
+    ScalarIndexParams params = InvertedIndexParams.builder().memoryLimit(0).numWorkers(0).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(0L, ((Number) json.get("memory_limit")).longValue());
+    assertEquals(0, ((Number) json.get("num_workers")).intValue());
+  }
+
+  @Test
+  void negativeResourceParametersAreRejected() {
     assertThrows(
-        IllegalArgumentException.class, () -> InvertedIndexParams.builder().memoryLimit(0));
-    assertThrows(IllegalArgumentException.class, () -> InvertedIndexParams.builder().numWorkers(0));
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().memoryLimit(-1));
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().numWorkers(-1));
   }
 }
