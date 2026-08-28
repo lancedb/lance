@@ -17,6 +17,7 @@ import com.google.common.base.MoreObjects;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -29,6 +30,7 @@ import java.util.UUID;
 public class Index {
   private final UUID uuid;
   private final List<Integer> fields;
+  private final List<Integer> coveringFields;
   private final String name;
   private final long datasetVersion;
   private final List<Integer> fragments;
@@ -42,6 +44,7 @@ public class Index {
   private Index(
       UUID uuid,
       List<Integer> fields,
+      List<Integer> coveringFields,
       String name,
       long datasetVersion,
       List<Integer> fragments,
@@ -53,6 +56,7 @@ public class Index {
       IndexType indexType) {
     this.uuid = uuid;
     this.fields = fields;
+    this.coveringFields = coveringFields;
     this.name = name;
     this.datasetVersion = datasetVersion;
     this.fragments = fragments;
@@ -75,6 +79,20 @@ public class Index {
    */
   public List<Integer> fields() {
     return fields;
+  }
+
+  /**
+   * Fields whose values this index carries but is not keyed on. Always a suffix of {@link
+   * #fields()}, and never all of it, so the first entry of {@code fields()} is always a column the
+   * index is keyed on. Empty for an index that carries no extra columns.
+   *
+   * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
+   * reading {@code fields()} as the index's dependency set also covers them with no change.
+   *
+   * @return the covering field IDs
+   */
+  public List<Integer> coveringFields() {
+    return coveringFields;
   }
 
   /**
@@ -154,6 +172,7 @@ public class Index {
         && indexVersion == index.indexVersion
         && Objects.equals(uuid, index.uuid)
         && Objects.equals(fields, index.fields)
+        && Objects.equals(coveringFields, index.coveringFields)
         && Objects.equals(name, index.name)
         && Objects.equals(fragments, index.fragments)
         && Arrays.equals(indexDetails, index.indexDetails)
@@ -169,6 +188,7 @@ public class Index {
         Objects.hash(
             uuid,
             fields,
+            coveringFields,
             name,
             datasetVersion,
             indexVersion,
@@ -186,6 +206,7 @@ public class Index {
     return MoreObjects.toStringHelper(this)
         .add("uuid", uuid)
         .add("fields", fields)
+        .add("coveringFields", coveringFields)
         .add("name", name)
         .add("datasetVersion", datasetVersion)
         .add("indexVersion", indexVersion)
@@ -209,6 +230,7 @@ public class Index {
 
     private UUID uuid;
     private List<Integer> fields;
+    private List<Integer> coveringFields = Collections.emptyList();
     private String name;
     private long datasetVersion;
     private List<Integer> fragments;
@@ -228,6 +250,11 @@ public class Index {
 
     public Builder fields(List<Integer> fields) {
       this.fields = fields;
+      return this;
+    }
+
+    public Builder coveringFields(List<Integer> coveringFields) {
+      this.coveringFields = coveringFields;
       return this;
     }
 
@@ -280,6 +307,7 @@ public class Index {
       return new Index(
           uuid,
           fields,
+          coveringFields,
           name,
           datasetVersion,
           fragments,

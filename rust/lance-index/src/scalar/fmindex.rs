@@ -23,15 +23,16 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
@@ -49,6 +50,17 @@ use crate::scalar::{
     RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
+
+/// Schema of one FM-index block batch.
+static BLOCK_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("node_id", DataType::UInt32, false),
+        Field::new("block_id", DataType::UInt32, false),
+        Field::new("words", DataType::LargeBinary, false),
+        Field::new("prefix_rank", DataType::UInt64, false),
+        Field::new("bit_len", DataType::UInt64, false),
+    ]))
+});
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
@@ -90,12 +102,7 @@ static LANCE_FMINDEX_WRITE_QUEUE_SIZE: std::sync::LazyLock<usize> =
 static LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         std::env::var("LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS")
-            .map(|value| {
-                matches!(
-                    value.as_str(),
-                    "1" | "true" | "TRUE" | "True" | "yes" | "YES"
-                )
-            })
+            .map(|value| str_is_truthy(&value))
             .unwrap_or(false)
     });
 static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
@@ -1108,7 +1115,7 @@ impl FMIndex {
             }
         }
         let refs: Vec<&[u8]> = words_b.iter().map(|v| v.as_slice()).collect();
-        let schema = Arc::new(Self::block_schema());
+        let schema = BLOCK_SCHEMA.clone();
         Ok(RecordBatch::try_new(
             schema,
             vec![
@@ -1119,16 +1126,6 @@ impl FMIndex {
                 Arc::new(UInt64Array::from(bl_b)),
             ],
         )?)
-    }
-
-    fn block_schema() -> arrow_schema::Schema {
-        arrow_schema::Schema::new(vec![
-            Field::new("node_id", DataType::UInt32, false),
-            Field::new("block_id", DataType::UInt32, false),
-            Field::new("words", DataType::LargeBinary, false),
-            Field::new("prefix_rank", DataType::UInt64, false),
-            Field::new("bit_len", DataType::UInt64, false),
-        ])
     }
 }
 
@@ -2104,7 +2101,7 @@ async fn write_fmindex(
     filename: &str,
     partition_fingerprint: Option<&str>,
 ) -> Result<IndexFile> {
-    let schema = Arc::new(FMIndex::block_schema());
+    let schema = BLOCK_SCHEMA.clone();
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
 

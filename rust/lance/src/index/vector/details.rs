@@ -364,7 +364,7 @@ pub fn needs_vector_details_inference(
 ) -> bool {
     match &index.index_details {
         Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
-        None => index.fields.iter().any(|&field_id| {
+        None => index.fields.first().is_some_and(|&field_id| {
             schema
                 .field_by_id(field_id)
                 .map(|f| matches!(f.data_type(), arrow_schema::DataType::FixedSizeList(_, _)))
@@ -926,6 +926,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -948,6 +949,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -968,6 +970,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1005,6 +1008,7 @@ mod tests {
         IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![field_id],
+            covering_fields: vec![],
             name: "idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1091,6 +1095,7 @@ mod tests {
             let index = IndexMetadata {
                 uuid: uuid::Uuid::new_v4(),
                 fields: vec![0],
+                covering_fields: vec![],
                 name: "test_index".to_string(),
                 dataset_version: 1,
                 fragment_bitmap: None,
