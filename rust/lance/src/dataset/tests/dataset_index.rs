@@ -2944,7 +2944,9 @@ async fn test_partial_compound_hybrid_rejects_same_id_rewrite_after_deferred_rem
         .unwrap();
     assert!(remapped.dataset_version > physical_source_version);
     assert_eq!(
-        crate::index::scalar::inverted::physical_source_dataset_versions(&remapped).unwrap(),
+        crate::index::scalar::inverted::physical_source_dataset_versions(&dataset, &remapped)
+            .await
+            .unwrap(),
         Some(vec![physical_source_version]),
         "deferred remap must not advance immutable physical provenance"
     );

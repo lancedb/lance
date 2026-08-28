@@ -5,6 +5,7 @@ use crate::{
     Error, Result,
     dataset::{
         Dataset,
+        index::LanceIndexStoreExt,
         transaction::{Operation, TransactionBuilder},
     },
     index::{
@@ -601,10 +602,17 @@ impl<'a> CreateIndexBuilder<'a> {
             .type_url
             .ends_with("InvertedIndexDetails")
         {
-            crate::index::scalar::inverted::set_physical_source_dataset_versions(
-                &mut created_index.index_details,
-                [self.dataset.manifest.version],
+            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+                self.dataset,
+                &output_index_uuid,
             )?;
+            created_index.files.push(
+                crate::index::scalar::inverted::write_physical_source_dataset_versions(
+                    &store,
+                    [self.dataset.manifest.version],
+                )
+                .await?,
+            );
         }
 
         Ok(IndexMetadata {

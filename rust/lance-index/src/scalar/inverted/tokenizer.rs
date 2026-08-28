@@ -427,7 +427,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             ),
             document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
             posting_format_version: Some(params.resolved_format_version().index_version()),
-            physical_source_dataset_versions: Vec::new(),
         })
     }
 }
@@ -1560,7 +1559,6 @@ mod tests {
             code_config: None,
             document_granularity: PbDocumentGranularity::Row as i32,
             posting_format_version: None,
-            physical_source_dataset_versions: Vec::new(),
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);

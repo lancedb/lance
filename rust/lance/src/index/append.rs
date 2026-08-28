@@ -1214,10 +1214,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             Arc::new(NoopIndexBuildProgress),
                         )
                         .await?;
-                        crate::index::scalar::inverted::set_physical_source_dataset_versions(
-                            &mut created_index.index_details,
-                            [dataset.manifest.version],
-                        )?;
+                        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
+                        created_index.files.push(
+                            crate::index::scalar::inverted::write_physical_source_dataset_versions(
+                                &new_store,
+                                [dataset.manifest.version],
+                            )
+                            .await?,
+                        );
                         return Ok(Some(IndexMergeResults {
                             new_uuid,
                             removed_indices: old_indices.to_vec(),
@@ -1299,14 +1303,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let source_versions = if selected_indices.is_empty() {
                         Some(vec![dataset.manifest.version])
                     } else {
-                        let mut source_sets = selected_old_indices
-                            .iter()
-                            .map(|segment| {
+                        let mut source_sets = Vec::with_capacity(selected_old_indices.len() + 1);
+                        for segment in &selected_old_indices {
+                            source_sets.push(
                                 crate::index::scalar::inverted::physical_source_dataset_versions(
+                                    dataset.as_ref(),
                                     segment,
                                 )
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                                .await?,
+                            );
+                        }
                         if !unindexed.is_empty() {
                             source_sets.push(Some(vec![dataset.manifest.version]));
                         }
@@ -1337,10 +1343,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .await?
                     };
                     if let Some(source_versions) = source_versions {
-                        crate::index::scalar::inverted::set_physical_source_dataset_versions(
-                            &mut created_index.index_details,
-                            source_versions,
-                        )?;
+                        created_index.files.push(
+                            crate::index::scalar::inverted::write_physical_source_dataset_versions(
+                                &new_store,
+                                source_versions,
+                            )
+                            .await?,
+                        );
                     }
 
                     Ok((

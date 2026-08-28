@@ -260,7 +260,8 @@ pub(crate) async fn has_append_only_indexed_field_history(
 
     let mut physical_sources = Vec::with_capacity(segments.len());
     for segment in segments {
-        let Ok(Some(source_versions)) = scalar::inverted::physical_source_dataset_versions(segment)
+        let Ok(Some(source_versions)) =
+            scalar::inverted::physical_source_dataset_versions(dataset, segment).await
         else {
             return false;
         };
@@ -1371,13 +1372,16 @@ pub(crate) async fn remap_index(
                         // current dataset instead of retaining old postings.
                         Some(vec![dataset.manifest.version])
                     } else {
-                        scalar::inverted::physical_source_dataset_versions(matched)?
+                        scalar::inverted::physical_source_dataset_versions(dataset, matched).await?
                     };
                     if let Some(source_versions) = source_versions {
-                        scalar::inverted::set_physical_source_dataset_versions(
-                            &mut created_index.index_details,
-                            source_versions,
-                        )?;
+                        created_index.files.push(
+                            scalar::inverted::write_physical_source_dataset_versions(
+                                &new_store,
+                                source_versions,
+                            )
+                            .await?,
+                        );
                     }
                     created_index
                 }
