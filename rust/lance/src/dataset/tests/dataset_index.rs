@@ -1889,7 +1889,16 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         "fast search must skip the partially covered body's flat path:\n{fast_plan}"
     );
 
-    create_fragmented_fts_index(&mut partial_dataset, "body", true).await;
+    partial_dataset
+        .create_index(
+            &["body"],
+            IndexType::Inverted,
+            Some("body_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
     let mut rebuilt_oracle = compound_fts_results(&partial_dataset, explicit_query, None).await;
     assert!(
         rebuilt_oracle.len() > LIMIT,
