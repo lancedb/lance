@@ -13,11 +13,15 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::{ManifestWriteConfig, validate_dataset_root_for_drop, write_manifest_file};
+use crate::dataset::transaction::Operation;
+use crate::dataset::{
+    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
+    validate_dataset_root_for_drop, write_manifest_file,
+};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
-use lance_table::format::{DataStorageFormat, Fragment};
+use lance_table::format::DataStorageFormat;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
@@ -43,8 +47,9 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::BasePath;
+use lance_table::format::{BasePath, Fragment, pb};
 use object_store::ObjectStoreExt;
+use prost::Message;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
@@ -62,6 +67,40 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::zero("0")]
+#[case::negative("-1")]
+#[case::not_a_number("many")]
+fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value: &str) {
+    let error = parse_deep_clone_stream_concurrency(value).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("LANCE_DEEP_CLONE_STREAM_CONCURRENCY"));
+    assert!(message.contains(&format!("{value:?}")));
+}
+
+#[test]
+fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
+    assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
+}
+
+#[rstest]
+#[case::direct_local_copy(64, false, None, 64)]
+#[case::streaming_default_cap(64, true, None, 4)]
+#[case::streaming_configured_below_cap(2, true, None, 2)]
+#[case::streaming_override(64, true, Some(17), 17)]
+fn test_deep_clone_copy_parallelism(
+    #[case] configured: usize,
+    #[case] uses_streaming_copy: bool,
+    #[case] stream_override: Option<usize>,
+    #[case] expected: usize,
+) {
+    assert_eq!(
+        deep_clone_copy_parallelism(configured, uses_streaming_copy, stream_override),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -1363,6 +1402,132 @@ async fn test_write_manifest(
 }
 
 #[tokio::test]
+async fn test_restore_rejects_unknown_target_flags() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let write_config = ManifestWriteConfig {
+        auto_set_feature_flags: false,
+        ..Default::default()
+    };
+    let mut unknown_manifest = dataset.manifest.as_ref().clone();
+    unknown_manifest.version = 2;
+    unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut supported_manifest = dataset.manifest.as_ref().clone();
+    supported_manifest.version = 3;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut supported_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = Dataset::commit(
+        &test_uri,
+        Operation::Restore { version: 2 },
+        Some(3),
+        None,
+        None,
+        Default::default(),
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let original_version = dataset.version().version;
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let location = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = dataset.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert_eq!(dataset.version().version, original_version);
+    assert!(
+        dataset
+            .metadata_cache
+            .get_with_key(&ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_none(),
+        "unsupported manifest must not be cached"
+    );
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_unsupported_reader() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let serialized_manifest = pb::Manifest::from(&unsupported_manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
 async fn test_rle_v2_v23_write_and_append() {
     let test_uri = TempStrDir::default();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1743,6 +1908,98 @@ async fn test_deep_clone(
 }
 
 #[tokio::test]
+async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .deep_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .shallow_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
 async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
     use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
 
@@ -1781,8 +2038,8 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has
 // known platform-specific quirks on Windows (it reads back empty there; see the note in
 // tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
-// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
-// against real cloud stores is platform-agnostic std/tokio I/O.
+// covered on Windows by `test_deep_clone`, and streaming copies against real cloud stores
+// use platform-agnostic std/tokio I/O.
 #[cfg(not(windows))]
 #[rstest]
 #[tokio::test]
@@ -1790,9 +2047,8 @@ async fn test_deep_clone_cross_store(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
-    // Source lives in an in-memory store while the target is a local directory, so the
-    // two stores have different `store_prefix`es and `deep_clone` must stream files from
-    // the source store to the target store (the cross-account code path).
+    // Source lives in an in-memory store while the target is a local directory. Their
+    // different `store_prefix`es exercise separate source and destination implementations.
     let session = Arc::new(Session::default());
     let test_dir = TempStdDir::default();
     let clone_dir = test_dir.join("clone_ds");
