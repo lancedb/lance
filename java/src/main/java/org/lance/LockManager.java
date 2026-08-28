@@ -33,14 +33,23 @@ public class LockManager {
    * concurrently, but prevents write access.
    */
   public class ReadLock implements AutoCloseable {
+    private final boolean callbackLease;
+
     /** Acquires a read lock on the lock manager. */
     public ReadLock() {
-      lock.readLock().lock();
+      // The outer index create already pins the Dataset with a read lock. Callback re-entry uses
+      // that lease instead of blocking behind a writer queued on the same lock.
+      callbackLease = dataset != null && ContextIndexBuildProgress.isActive(dataset);
+      if (!callbackLease) {
+        lock.readLock().lock();
+      }
     }
 
     @Override
     public void close() {
-      lock.readLock().unlock();
+      if (!callbackLease) {
+        lock.readLock().unlock();
+      }
     }
   }
 
@@ -48,7 +57,7 @@ public class LockManager {
   public class WriteLock implements AutoCloseable {
     /** Constructs a new WriteLock and acquires the write lock. */
     public WriteLock() {
-      if (dataset != null && ContextIndexBuildProgress.isCurrent(dataset)) {
+      if (dataset != null && ContextIndexBuildProgress.isActive(dataset)) {
         throw new IllegalStateException("Dataset is busy in an index progress callback");
       }
       lock.writeLock().lock();

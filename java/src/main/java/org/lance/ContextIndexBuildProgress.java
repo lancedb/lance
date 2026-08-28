@@ -15,16 +15,19 @@ package org.lance;
 
 import org.lance.index.IndexBuildProgress;
 
+import java.util.IdentityHashMap;
 import java.util.Optional;
 
 /**
- * Marks the current thread as executing an index progress callback for a specific Dataset.
+ * Marks the current thread as executing an index progress callback for one or more Datasets.
  *
- * <p>This context lets Dataset reject conflicting callback re-entry without rejecting unrelated
- * concurrent callers.
+ * <p>The active contexts are tracked by Dataset identity and nesting count. This lets Dataset give
+ * callback threads a scoped read lease and reject conflicting write re-entry without rejecting
+ * unrelated concurrent callers.
  */
 final class ContextIndexBuildProgress implements IndexBuildProgress {
-  private static final ThreadLocal<Dataset> CURRENT_DATASET = new ThreadLocal<>();
+  private static final ThreadLocal<IdentityHashMap<Dataset, int[]>> ACTIVE_CALLBACKS =
+      new ThreadLocal<>();
 
   private final Dataset dataset;
   private final IndexBuildProgress delegate;
@@ -34,37 +37,62 @@ final class ContextIndexBuildProgress implements IndexBuildProgress {
     this.delegate = delegate;
   }
 
-  static boolean isCurrent(Dataset dataset) {
-    return CURRENT_DATASET.get() == dataset;
+  static boolean isActive(Dataset dataset) {
+    IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
+    return activeCallbacks != null && activeCallbacks.containsKey(dataset);
+  }
+
+  private static void begin(Dataset dataset) {
+    IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
+    if (activeCallbacks == null) {
+      activeCallbacks = new IdentityHashMap<>();
+      ACTIVE_CALLBACKS.set(activeCallbacks);
+    }
+    activeCallbacks.computeIfAbsent(dataset, key -> new int[1])[0]++;
+  }
+
+  private static void end(Dataset dataset) {
+    IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
+    int[] count = activeCallbacks.get(dataset);
+    if (count == null) {
+      throw new IllegalStateException("Callback context is not active");
+    }
+    count[0]--;
+    if (count[0] == 0) {
+      activeCallbacks.remove(dataset);
+    }
+    if (activeCallbacks.isEmpty()) {
+      ACTIVE_CALLBACKS.remove();
+    }
   }
 
   @Override
   public void stageStart(String stage, Optional<Long> total, String unit) {
-    CURRENT_DATASET.set(dataset);
+    begin(dataset);
     try {
       delegate.stageStart(stage, total, unit);
     } finally {
-      CURRENT_DATASET.remove();
+      end(dataset);
     }
   }
 
   @Override
   public void stageProgress(String stage, long completed) {
-    CURRENT_DATASET.set(dataset);
+    begin(dataset);
     try {
       delegate.stageProgress(stage, completed);
     } finally {
-      CURRENT_DATASET.remove();
+      end(dataset);
     }
   }
 
   @Override
   public void stageComplete(String stage) {
-    CURRENT_DATASET.set(dataset);
+    begin(dataset);
     try {
       delegate.stageComplete(stage);
     } finally {
-      CURRENT_DATASET.remove();
+      end(dataset);
     }
   }
 }

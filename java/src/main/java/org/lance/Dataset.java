@@ -1225,7 +1225,7 @@ public class Dataset implements Closeable {
   }
 
   private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
-    if (ContextIndexBuildProgress.isCurrent(this)) {
+    if (ContextIndexBuildProgress.isActive(this)) {
       throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
     synchronized (createIndexLock) {

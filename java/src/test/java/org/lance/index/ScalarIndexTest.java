@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -269,6 +270,131 @@ public class ScalarIndexTest {
     public void stageComplete(String stage) {
       recorder.stageComplete(stage);
     }
+  }
+
+  private static final class QueuedWriterProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final AtomicReference<Thread> writer = new AtomicReference<>();
+    private final AtomicReference<RuntimeException> writerFailure = new AtomicReference<>();
+    private final AtomicBoolean readCompleted = new AtomicBoolean();
+    private boolean attempted;
+
+    private QueuedWriterProgress(Dataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      if (!attempted) {
+        attempted = true;
+        Thread queuedWriter =
+            new Thread(
+                () -> {
+                  try {
+                    dataset.checkoutLatest();
+                  } catch (RuntimeException failure) {
+                    writerFailure.set(failure);
+                  }
+                });
+        writer.set(queuedWriter);
+        queuedWriter.start();
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Interrupted while waiting for queued writer", e);
+        }
+        assertTrue(queuedWriter.isAlive(), "Expected writer to queue behind outer create");
+        assertTrue(dataset.version() > 0);
+        assertTrue(dataset.countRows() > 0);
+        readCompleted.set(true);
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {}
+
+    @Override
+    public void stageComplete(String stage) {}
+  }
+
+  private static final class CrossDatasetNestedProgress implements IndexBuildProgress {
+    private final Dataset outerDataset;
+    private final Dataset nestedDataset;
+    private final AtomicBoolean readCompleted = new AtomicBoolean();
+
+    private CrossDatasetNestedProgress(Dataset outerDataset, Dataset nestedDataset) {
+      this.outerDataset = outerDataset;
+      this.nestedDataset = nestedDataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      assertTrue(outerDataset.version() > 0);
+      assertTrue(nestedDataset.version() > 0);
+      readCompleted.set(true);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {}
+
+    @Override
+    public void stageComplete(String stage) {}
+  }
+
+  private static final class CrossDatasetOuterProgress implements IndexBuildProgress {
+    private final Dataset outerDataset;
+    private final Dataset nestedDataset;
+    private final IndexOptions nestedOptions;
+    private final CrossDatasetNestedProgress nestedProgress;
+    private final AtomicReference<Thread> writer = new AtomicReference<>();
+    private final AtomicReference<RuntimeException> writerFailure = new AtomicReference<>();
+    private final AtomicBoolean nestedCompleted = new AtomicBoolean();
+    private boolean attempted;
+
+    private CrossDatasetOuterProgress(
+        Dataset outerDataset,
+        Dataset nestedDataset,
+        IndexOptions nestedOptions,
+        CrossDatasetNestedProgress nestedProgress) {
+      this.outerDataset = outerDataset;
+      this.nestedDataset = nestedDataset;
+      this.nestedOptions = nestedOptions;
+      this.nestedProgress = nestedProgress;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      if (!attempted) {
+        attempted = true;
+        Thread queuedWriter =
+            new Thread(
+                () -> {
+                  try {
+                    outerDataset.checkoutLatest();
+                  } catch (RuntimeException failure) {
+                    writerFailure.set(failure);
+                  }
+                });
+        writer.set(queuedWriter);
+        queuedWriter.start();
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Interrupted while waiting for queued writer", e);
+        }
+        assertTrue(queuedWriter.isAlive(), "Expected writer to queue behind outer create");
+        nestedDataset.createIndex(nestedOptions, nestedProgress);
+        nestedCompleted.set(true);
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {}
+
+    @Override
+    public void stageComplete(String stage) {}
   }
 
   @Test
@@ -754,6 +880,99 @@ public class ScalarIndexTest {
         assertFalse(concurrentClose.isAlive(), "Concurrent close timed out");
         assertNull(outerFailure.get(), "Outer create failed");
         assertNull(closeFailure.get(), "Concurrent close should not fail");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testCreateInvertedIndexAllowsReadWithQueuedWriter(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_read_with_queued_writer").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 20)) {
+        Fragment fragment = dataset.getFragments().get(0);
+        QueuedWriterProgress progress = new QueuedWriterProgress(dataset);
+        AtomicReference<RuntimeException> createFailure = new AtomicReference<>();
+
+        Thread outerCreate =
+            new Thread(
+                () -> {
+                  try {
+                    dataset.createIndex(createInvertedSegmentOptions(fragment.getId()), progress);
+                  } catch (RuntimeException failure) {
+                    createFailure.set(failure);
+                  }
+                });
+        outerCreate.start();
+        outerCreate.join(5000);
+
+        assertFalse(outerCreate.isAlive(), "Outer create timed out");
+        assertNull(createFailure.get(), "Outer create failed");
+        assertTrue(progress.readCompleted.get(), "Callback read did not complete");
+
+        Thread queuedWriter = progress.writer.get();
+        assertNotNull(queuedWriter, "Queued writer did not start");
+        queuedWriter.join(5000);
+        assertFalse(queuedWriter.isAlive(), "Queued writer timed out");
+        assertNull(progress.writerFailure.get(), "Queued writer failed");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testCreateIndexPreservesOuterDatasetCallbackContextAcrossDatasets(
+      @TempDir Path tempDir) throws Exception {
+    String outerPath = tempDir.resolve("inverted_cross_dataset_outer").toString();
+    String nestedPath = tempDir.resolve("inverted_cross_dataset_nested").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset outerTestDataset =
+          new TestUtils.SimpleTestDataset(allocator, outerPath);
+      TestUtils.SimpleTestDataset nestedTestDataset =
+          new TestUtils.SimpleTestDataset(allocator, nestedPath);
+      outerTestDataset.createEmptyDataset().close();
+      nestedTestDataset.createEmptyDataset().close();
+      try (Dataset outerDataset = outerTestDataset.write(1, 20);
+          Dataset nestedDataset = nestedTestDataset.write(1, 20)) {
+        Fragment outerFragment = outerDataset.getFragments().get(0);
+        Fragment nestedFragment = nestedDataset.getFragments().get(0);
+        CrossDatasetNestedProgress nestedProgress =
+            new CrossDatasetNestedProgress(outerDataset, nestedDataset);
+        CrossDatasetOuterProgress outerProgress =
+            new CrossDatasetOuterProgress(
+                outerDataset,
+                nestedDataset,
+                createInvertedSegmentOptions(nestedFragment.getId()),
+                nestedProgress);
+        AtomicReference<RuntimeException> createFailure = new AtomicReference<>();
+
+        Thread outerCreate =
+            new Thread(
+                () -> {
+                  try {
+                    outerDataset.createIndex(
+                        createInvertedSegmentOptions(outerFragment.getId()), outerProgress);
+                  } catch (RuntimeException failure) {
+                    createFailure.set(failure);
+                  }
+                });
+        outerCreate.start();
+        outerCreate.join(5000);
+
+        assertFalse(outerCreate.isAlive(), "Outer create timed out");
+        assertNull(createFailure.get(), "Outer create failed");
+        assertTrue(outerProgress.nestedCompleted.get(), "Nested create did not complete");
+        assertTrue(nestedProgress.readCompleted.get(), "Nested callback read did not complete");
+
+        Thread queuedWriter = outerProgress.writer.get();
+        assertNotNull(queuedWriter, "Queued writer did not start");
+        queuedWriter.join(5000);
+        assertFalse(queuedWriter.isAlive(), "Queued writer timed out");
+        assertNull(outerProgress.writerFailure.get(), "Queued writer failed");
       }
     }
   }
