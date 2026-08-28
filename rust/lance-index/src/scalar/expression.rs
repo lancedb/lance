@@ -2670,6 +2670,10 @@ mod tests {
         parser: Box<MultiQueryParser>,
     }
 
+    fn f16_scalar(value: f32) -> ScalarValue {
+        ScalarValue::Float16(Some(half::f16::from_f32(value)))
+    }
+
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
             Self {
@@ -2929,6 +2933,57 @@ mod tests {
 
         assert_eq!(plan.index_query, expected.scalar_query);
         assert!(plan.refine_expr.is_none());
+    }
+
+    /// A `Float16` column must reach its scalar index like any other numeric
+    /// column. This is a second, quieter face of the coercion gap: `maybe_scalar`
+    /// runs `safe_coerce_scalar` on a literal the planner already coerced, so
+    /// without a `Float16` arm the whole predicate silently becomes a refine
+    /// filter. The rows stay correct, which is why only the plan catches it.
+    #[rstest]
+    #[case("temp = 1.0", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case(
+        "temp < 1.0",
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+    )]
+    #[case(
+        // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
+        // alone; at three or fewer over a bare column it becomes an `OR` chain and
+        // stops exercising `maybe_scalar_list`.
+        "temp IN (1.0, 2.5, 3.0, 4.0)",
+        SargableQuery::IsIn(vec![
+            f16_scalar(1.0),
+            f16_scalar(2.5),
+            f16_scalar(3.0),
+            f16_scalar(4.0),
+        ])
+    )]
+    fn test_float16_column_reaches_its_index(#[case] expr: &str, #[case] expected: SargableQuery) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "temp",
+            ColInfo::new(
+                DataType::Float16,
+                Box::new(SargableQueryParser::new(
+                    "temp_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("temp", DataType::Float16, true)]);
+
+        check_with_schema(
+            &index_info,
+            expr,
+            Some(IndexedExpression::index_query(
+                "temp".to_string(),
+                "temp_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(expected),
+            )),
+            true,
+            schema,
+        );
     }
 
     #[test]

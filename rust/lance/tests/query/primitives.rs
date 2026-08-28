@@ -140,6 +140,7 @@ async fn test_btree_nullable_or_with_absent_value() {
 
 #[tokio::test]
 #[rstest::rstest]
+#[case::float16(DataType::Float16)]
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float(#[case] data_type: DataType) {
@@ -148,17 +149,20 @@ async fn test_query_float(#[case] data_type: DataType) {
         .col("value", array::rand_type(&data_type).with_random_nulls(0.1))
         .into_batch_rows(RowCount::from(60))
         .unwrap();
+    // BloomFilter is left out for Float16 because the index rejects the type
+    // outright (`Bloom filter index does not support data type: Float16`), which
+    // is a gap in that index rather than in literal coercion.
+    let mut index_types = vec![
+        None,
+        Some(IndexType::BTree),
+        Some(IndexType::Bitmap),
+        Some(IndexType::ZoneMap),
+    ];
+    if data_type != DataType::Float16 {
+        index_types.push(Some(IndexType::BloomFilter));
+    }
     DatasetTestCases::from_data(batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::BTree),
-                Some(IndexType::Bitmap),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
+        .with_index_types("value", index_types)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
