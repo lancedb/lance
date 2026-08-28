@@ -72,8 +72,11 @@ This protocol mirrors fragment ID assignment and ensures row IDs are unique acro
 
 Stable row IDs are a dataset-level feature recorded in the table manifest.
 
-- Stable row IDs **must be enabled when the dataset is first created**.
-- Currently, they **cannot be turned on later** for an existing dataset. Attempts to write with `enable_stable_row_ids = true` against a dataset that was created without stable row IDs will not change the dataset's configuration.
+- Stable row IDs may be enabled when a dataset is created or by migrating an existing dataset.
+- An ordinary write with `enable_stable_row_ids = true` does not migrate an existing dataset. Use the stable row ID migration operation instead; the Rust API exposes it as `Dataset::migrate_to_stable_row_ids`.
+- Before migration, drop all secondary indices and recreate them after migration.
+- Quiesce data-modifying writers during migration. The migration uses a single atomic merge commit and does not retry when a concurrent write causes a conflict; the caller must retry the migration.
+- Migration assigns an ID to every physical row position, including deleted positions, and atomically enables the feature and advances `next_row_id`. Migrating a dataset that already uses stable row IDs is a no-op.
 - When stable row IDs are disabled, the `_rowid` column (if requested) is not stable and should not be used as a persistent identifier.
 
 Row-level version tracking (`_row_created_at_version`, `_row_last_updated_at_version`) and the row ID index described below are only available when stable row IDs are enabled.
@@ -181,11 +184,14 @@ The implementation selects the most compact encoding based on the value range, c
 
 </details>
 
-#### Inline vs External Storage
+#### Inline and External Storage
 
-Row ID sequences are stored either inline in the fragment metadata or in external files.
-Sequences smaller than ~200KB are stored inline to avoid additional I/O, while larger sequences are written to external files referenced by path and offset.
-This threshold balances manifest size against the overhead of separate file reads.
+`DataFragment` defines inline and external metadata fields for row ID sequences and row version sequences.
+These fields do not currently imply a size-based switching threshold.
+Lance writers store all three sequence types inline in the fragment metadata regardless of their encoded size.
+
+Lance readers can load externally stored row ID sequences, but Lance writers do not emit them.
+External storage for created-at and last-updated-at version sequences is reserved for future use: current Lance readers cannot load those fields, and writers MUST NOT emit them.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
@@ -360,4 +366,3 @@ WHERE _row_created_at_version <= {begin_version}
 ```
 
 This query excludes newly inserted rows by requiring `_row_created_at_version <= {begin_version}`, ensuring only pre-existing rows that were subsequently updated are returned.
-
