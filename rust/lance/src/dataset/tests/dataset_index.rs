@@ -1833,7 +1833,7 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         .await
         .unwrap();
     // Index only the title after the append so it can retain a bounded plan
-    // while the partially covered body uses the exhaustive leaf fallback.
+    // while the partially covered body uses a query-local hybrid scorer.
     create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
     partial_dataset
         .create_index(
@@ -1845,13 +1845,8 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         )
         .await
         .unwrap();
-    assert_compound_matches_independent_oracle(
-        &partial_dataset,
-        "partial_top_level_cross_column_multimatch",
-        &explicit_query,
-        LIMIT,
-    )
-    .await;
+    let partial_results =
+        compound_fts_results(&partial_dataset, explicit_query.clone(), Some(LIMIT as i64)).await;
     let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
     assert!(
         !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
@@ -1859,18 +1854,23 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     );
     assert_eq!(
         partial_plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should retain field-local bounded compound scorers:\n{partial_plan}"
+    );
+    assert_eq!(
+        partial_plan.matches("HybridCompoundFtsScorer").count(),
         1,
-        "the fully indexed title should retain its bounded compound scorer:\n{partial_plan}"
+        "only the partially covered body should use a query-local hybrid scorer:\n{partial_plan}"
     );
     assert!(
-        partial_plan.contains("FlatMatchQuery"),
-        "the partially covered body should use the exact indexed-plus-flat fallback:\n{partial_plan}"
+        !partial_plan.contains("FlatMatchQuery"),
+        "the hybrid body scorer should replace the indexed-plus-flat fallback:\n{partial_plan}"
     );
 
     let mut fast_scanner = partial_dataset.scan();
     fast_scanner
         .with_row_id()
-        .full_text_search(FullTextSearchQuery::new_query(explicit_query))
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query.clone()))
         .unwrap()
         .fast_search();
     fast_scanner.limit(Some(LIMIT as i64), None).unwrap();
@@ -1887,6 +1887,19 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
     assert!(
         !fast_plan.contains("FlatMatchQuery"),
         "fast search must skip the partially covered body's flat path:\n{fast_plan}"
+    );
+
+    create_fragmented_fts_index(&mut partial_dataset, "body", true).await;
+    let mut rebuilt_oracle = compound_fts_results(&partial_dataset, explicit_query, None).await;
+    assert!(
+        rebuilt_oracle.len() > LIMIT,
+        "the rebuilt exact oracle must contain candidates beyond k"
+    );
+    rebuilt_oracle.truncate(LIMIT);
+    assert_scored_rows_close(
+        "partial_top_level_cross_column_multimatch",
+        &partial_results,
+        &rebuilt_oracle,
     );
 }
 

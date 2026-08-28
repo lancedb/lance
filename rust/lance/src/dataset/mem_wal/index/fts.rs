@@ -4511,17 +4511,23 @@ mod tests {
         let row_ids = UInt64Array::from(vec![900, 42, 777]);
         let terms = HashSet::from(["hello".to_string()]);
         let index = FtsMemIndex::new(1, "description".to_string());
+        let full_index = FtsMemIndex::new(1, "description".to_string());
 
         index
             .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
             .unwrap();
+        full_index.insert(&batch, 0).unwrap();
 
         assert_eq!(index.doc_count(), 3);
         assert_eq!(index.entry_count(), 2);
         let scorer = index.bm25_stats_for_terms(&["hello".to_string()]);
-        assert_eq!(scorer.num_docs, 3);
-        assert_eq!(scorer.total_tokens, 6);
-        assert_eq!(scorer.num_docs_containing_token("hello"), 2);
+        let full_scorer = full_index.bm25_stats_for_terms(&["hello".to_string()]);
+        assert_eq!(scorer.num_docs, full_scorer.num_docs);
+        assert_eq!(scorer.total_tokens, full_scorer.total_tokens);
+        assert_eq!(
+            scorer.num_docs_containing_token("hello"),
+            full_scorer.num_docs_containing_token("hello")
+        );
 
         let query = FtsQuery::Match(
             lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
