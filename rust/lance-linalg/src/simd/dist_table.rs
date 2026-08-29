@@ -85,8 +85,17 @@ pub unsafe fn sum_4bit_dist_table_uninit(
                 }
             }
         }
+        // `SIMD_SUPPORT` is a single exclusive tier, so an AVX-512 host reports
+        // `Avx512` or `Avx512FP16` and never `Avx2`. Matching only `Avx2` here
+        // would send every AVX-512 host that misses the arm above, because
+        // `avx512bw` is absent or because `kernel_support = "avx512_dist_table"`
+        // was not set, down the scalar path while it has AVX2.
+        // `sum_4bit_hacc_dist_table_uninit` already matches the three tiers
+        // together.
         #[cfg(target_arch = "x86_64")]
-        SimdSupport::Avx2 => unsafe {
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2
+            if std::arch::is_x86_feature_detected!("avx2") =>
+        unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
                 sum_dist_table_32bytes_batch_avx2(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
