@@ -29,10 +29,6 @@ pub struct CosineAccumulators {
 }
 
 /// Portable scalar fused cosine accumulation.
-///
-/// # Panics
-///
-/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8_accum_scalar(a: &[u8], b: &[u8]) -> CosineAccumulators {
     assert_equal_lengths(a.len(), b.len());
@@ -65,10 +61,6 @@ fn normalize(acc: CosineAccumulators) -> f32 {
 }
 
 /// Portable scalar u8 cosine distance.
-///
-/// # Panics
-///
-/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8_scalar(a: &[u8], b: &[u8]) -> f32 {
     normalize(cosine_u8_accum_scalar(a, b))
@@ -76,7 +68,7 @@ pub fn cosine_u8_scalar(a: &[u8], b: &[u8]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{CosineAccumulators, assert_equal_lengths};
+    use super::CosineAccumulators;
     use std::arch::x86_64::*;
 
     /// Horizontal sum of all 8 × i32 lanes in a __m256i.
@@ -93,7 +85,7 @@ mod x86 {
     /// AVX2 fused cosine: three VPMADDWD products per half, 32 elements/iter.
     #[target_feature(enable = "avx2")]
     pub unsafe fn cosine_u8_accum_avx2(a: &[u8], b: &[u8]) -> CosineAccumulators {
-        assert_equal_lengths(a.len(), b.len());
+        debug_assert_eq!(a.len(), b.len());
         let n = a.len();
         let mut acc_dot = _mm256_setzero_si256();
         let mut acc_na = _mm256_setzero_si256();
@@ -143,7 +135,7 @@ mod x86 {
     /// AVX-512 VNNI fused cosine: VPDPWSSD for each product, 64 elements/iter.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn cosine_u8_accum_avx512_vnni(a: &[u8], b: &[u8]) -> CosineAccumulators {
-        assert_equal_lengths(a.len(), b.len());
+        debug_assert_eq!(a.len(), b.len());
         let n = a.len();
         let zeros = _mm512_setzero_si512();
         let mut acc_dot = _mm512_setzero_si512();
@@ -221,16 +213,13 @@ fn select_backend() -> CosineU8AccumFn {
 /// Dispatched fused u8 cosine accumulation.
 #[inline]
 fn cosine_u8_accum(a: &[u8], b: &[u8]) -> CosineAccumulators {
+    assert_equal_lengths(a.len(), b.len());
     (DISPATCH.get_or_init(select_backend))(a, b)
 }
 
 /// Dispatched u8 cosine distance, selecting the best available SIMD backend.
 ///
 /// Returns `1 - dot(a,b) / (‖a‖ × ‖b‖)` computed in a single pass.
-///
-/// # Panics
-///
-/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn cosine_u8(a: &[u8], b: &[u8]) -> f32 {
     normalize(cosine_u8_accum(a, b))
