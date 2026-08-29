@@ -1149,18 +1149,63 @@ mod tests {
         assert_eq!(hamming_u64(0xAAAAAAAAAAAAAAAA, 0x5555555555555555), 64);
     }
 
-    #[test]
-    fn test_hamming_batch_u64() {
-        let query = 0u64;
-        let targets: Vec<u64> = (0..128).collect();
-        let mut results = vec![0u32; 128];
+    /// Runs `kernel` over `n` targets, with 8 guard slots past the output it is
+    /// handed, then checks every value and every guard.
+    ///
+    /// 8 is the widest chunk store in the file, so one extra chunk iteration
+    /// lands inside this allocation rather than on unrelated memory. Two extra
+    /// iterations would still escape it. The remainder loops cannot trip the
+    /// guards at all: all three index through bounds-checked `results[..]` and
+    /// would panic instead.
+    fn check_kernel_tail(n: usize, kernel: impl FnOnce(u64, &[u64], &mut [u32])) {
+        const GUARD: u32 = u32::MAX;
+        const GUARD_SLOTS: usize = 8;
+        let query = 0xDEAD_BEEF_CAFE_F00D_u64;
+        let targets: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let mut results = vec![GUARD; n + GUARD_SLOTS];
 
-        hamming_batch_u64(query, &targets, &mut results);
+        kernel(query, &targets, &mut results[..n]);
 
-        assert_eq!(results[0], 0);
-        assert_eq!(results[1], 1);
-        assert_eq!(results[3], 2); // 0b11 has 2 bits set
-        assert_eq!(results[7], 3); // 0b111 has 3 bits set
+        for (slot, &target) in targets.iter().enumerate() {
+            assert_eq!(
+                results[slot],
+                (query ^ target).count_ones(),
+                "n={n}, slot {slot}"
+            );
+        }
+        for (slot, &guard) in results.iter().enumerate().skip(n) {
+            assert_eq!(guard, GUARD, "n={n}: wrote past results, at {slot}");
+        }
+    }
+
+    /// Each kernel behind `hamming_batch_u64` takes a fixed number of targets per
+    /// chunk and finishes the rest in a remainder loop: 4 for
+    /// `hamming_batch_avx2`, 8 for `hamming_batch_avx512` and for the unrolled
+    /// scalar fallback.
+    ///
+    /// Those loops do run today, but only through the pairwise tests, whose row
+    /// sweep passes every width from `n - 1` down to 1 and so covers every
+    /// residue incidentally. A tail bug surfaces there as a mismatch somewhere
+    /// among hundreds of thousands of pairs. This asserts every slot at each
+    /// width instead.
+    #[rstest]
+    #[case::one(1)]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::four(4)]
+    #[case::five(5)]
+    #[case::six(6)]
+    #[case::seven(7)]
+    #[case::eight(8)]
+    #[case::nine(9)]
+    #[case::fifteen(15)]
+    #[case::sixteen(16)]
+    #[case::seventeen(17)]
+    #[case::one_hundred_twenty_eight(128)]
+    fn test_hamming_batch_u64(#[case] n: usize) {
+        check_kernel_tail(n, hamming_batch_u64);
     }
 
     #[rstest]
@@ -1746,6 +1791,33 @@ mod tests {
     // =========================================================================
     // SIMD-specific tests
     // =========================================================================
+
+    // `hamming_batch_simd` returns early on the AVX-512 branch when
+    // `avx512vpopcntdq` and `avx512f` are both present, so on a VPOPCNTDQ host
+    // nothing reaches `hamming_batch_avx2` through `hamming_batch_u64`. This
+    // calls it directly. The AVX-512 kernel needs no such test: it only runs
+    // where the dispatched test already drives it, over a wider set of widths.
+
+    /// `hamming_batch_avx2` consumes 4 targets per chunk, so `n % 4` covers its
+    /// remainder loop.
+    #[rstest]
+    #[cfg(target_arch = "x86_64")]
+    #[case::one(1)]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::four(4)]
+    #[case::five(5)]
+    #[case::seven(7)]
+    fn test_avx2_covers_tail(#[case] n: usize) {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        check_kernel_tail(n, |query, targets, results| {
+            // SAFETY: AVX2 was just detected, and `check_kernel_tail` passes a
+            // `results` of exactly `targets.len()`.
+            unsafe { hamming_batch_avx2(query, targets, results) }
+        });
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
