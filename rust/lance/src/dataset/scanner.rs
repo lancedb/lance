@@ -4242,12 +4242,22 @@ impl Scanner {
                     self.fts_overlay_plan(&column, document_granularity, target_fragments),
                 )
                 .await?;
-                if !self.retain_target_fragments(unindexed_fragments).is_empty() {
+                let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
+                if !unindexed_fragments.is_empty()
+                    && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
+                {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
-                    // coverage.
+                    // coverage. Fast search deliberately excludes unindexed
+                    // fragments, so its indexed-only domain remains valid for
+                    // the compound scorer when at least one target fragment is
+                    // indexed.
                     return Ok(None);
                 }
+                let unindexed_fragment_ids = unindexed_fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect::<RoaringBitmap>();
                 let segments = match overlay_plan {
                     FtsOverlayPlan::Unchanged(Some(segments)) => segments,
                     FtsOverlayPlan::Unchanged(None) => {
@@ -4296,7 +4306,7 @@ impl Scanner {
                     }
                 }
 
-                Ok(Some((column, segments)))
+                Ok(Some((column, segments, unindexed_fragment_ids)))
             }
         }))
         .await?;
@@ -4305,7 +4315,7 @@ impl Scanner {
         };
 
         if !cross_column {
-            let (_, segments) = segment_groups.into_iter().next().ok_or_else(|| {
+            let (_, segments, _) = segment_groups.into_iter().next().ok_or_else(|| {
                 Error::internal("compound scorer requires one column".to_string())
             })?;
             return Ok(Some(Arc::new(
@@ -4319,6 +4329,25 @@ impl Scanner {
                 .with_external_mask(self.external_row_mask.clone()),
             )));
         }
+
+        let mut coverage_groups = segment_groups.iter();
+        let Some((_, _, first_unindexed_fragments)) = coverage_groups.next() else {
+            return Ok(None);
+        };
+        if coverage_groups
+            .any(|(_, _, unindexed_fragments)| unindexed_fragments != first_unindexed_fragments)
+        {
+            // The cross-column scorer builds one shared prefilter. If column
+            // coverage differs, that prefilter's union can re-admit stale
+            // postings from a fragment invalidated only for another column.
+            // Keep the field-local fallback, which preserves each column's
+            // own index domain.
+            return Ok(None);
+        }
+        let segment_groups = segment_groups
+            .into_iter()
+            .map(|(column, segments, _)| (column, segments))
+            .collect();
 
         let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),

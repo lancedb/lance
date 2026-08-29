@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -979,10 +981,19 @@ impl ObjectStore {
                     .parent()
                     .expect("file path must have parent")
                     .to_owned();
-                let named_temp =
-                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
-                        .await
-                        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+                let named_temp = tokio::task::spawn_blocking(move || {
+                    #[cfg(unix)]
+                    {
+                        // NamedTempFile defaults to 0o600. Use ordinary file creation permissions so the published file honors the caller's umask.
+                        tempfile::Builder::new()
+                            .permissions(std::fs::Permissions::from_mode(0o666))
+                            .tempfile_in(parent)
+                    }
+                    #[cfg(not(unix))]
+                    tempfile::NamedTempFile::new_in(parent)
+                })
+                .await
+                .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
                 Ok(Box::new(LocalWriter::new(
@@ -2444,6 +2455,29 @@ mod tests {
         let reader = ObjectStore::open_local(&file_path).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
         assert_eq!(buf.as_ref(), b"LOCAL");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_direct_local_writer_uses_standard_file_permissions() {
+        let directory = TempStdDir::default();
+        let reference_path = directory.join("reference");
+        std::fs::File::create(&reference_path).unwrap();
+        let expected_mode = std::fs::metadata(reference_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let output_path = directory.join("output");
+        let object_path = Path::from_absolute_path(&output_path).unwrap();
+        let store = ObjectStore::local();
+        let mut writer = store.create(&object_path).await.unwrap();
+        writer.write_all(b"LOCAL").await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let actual_mode = std::fs::metadata(output_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(actual_mode, expected_mode);
     }
 
     #[tokio::test]

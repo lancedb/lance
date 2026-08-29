@@ -4120,8 +4120,34 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    // Every manifest write funnels through here, including restore and clone,
+    // which rebuild a manifest from a stored one rather than from an Arrow
+    // schema, so this is where the invariant holds for a schema that never
+    // passed through that conversion.
+    //
+    // Only for transactions that can change the schema. Released versions could
+    // install a key on a nullable column through the metadata path, and
+    // validating every write would make such a table read-only on upgrade --
+    // including through the delete that removes the offending rows, which is
+    // the first step of repairing it. A repair still has to pass: it changes
+    // the schema, and the schema it produces is valid.
+    //
+    // The caller classifies the operation, rather than this reading it off
+    // `transaction`, which is None whenever the encoded bytes were too large
+    // to inline. Deriving it here would make the verdict depend on payload
+    // size, so the same operation would be exempt while small and validated
+    // once it spilled -- and a MemWAL table spills routinely, since its
+    // transactions carry mem-table state.
+    if may_change_schema {
+        manifest
+            .schema
+            .verify_primary_key()
+            .map_err(CommitError::OtherError)?;
+    }
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
