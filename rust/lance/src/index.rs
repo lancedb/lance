@@ -796,10 +796,11 @@ fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
 /// Segments without details predate type URLs and remain readable through the
 /// legacy file-based detection in the index open paths.
 pub(crate) fn index_type_is_known(index: &IndexMetadata) -> bool {
-    index
-        .index_details
-        .as_ref()
-        .is_none_or(|details| IndexDetails(details.clone()).has_reader())
+    is_system_index(index)
+        || index
+            .index_details
+            .as_ref()
+            .is_none_or(|details| IndexDetails(details.clone()).has_reader())
 }
 
 /// Detect FTS / inverted segments from manifest details.
@@ -1814,16 +1815,13 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
-        if indices
-            .iter()
-            .all(|idx| unsupported_index_version(idx).is_none())
-        {
+        if indices.iter().all(index_is_usable) {
             return Ok(indices);
         }
         Ok(Arc::new(
             indices
                 .iter()
-                .filter(|idx| unsupported_index_version(idx).is_none())
+                .filter(|idx| index_is_usable(idx))
                 .cloned()
                 .collect(),
         ))
@@ -2651,12 +2649,8 @@ async fn gather_fragment_statistics(
 /// version it does support.
 ///
 /// Only a version bump of a type this build already has a plugin for is caught.
-/// An index whose `type_url` resolves to no plugin at all - a wholly new index
-/// type, or a built-in behind a Cargo feature this build lacks - falls back to a
-/// ceiling of `i32::MAX` and is reported as supported, so it reaches the query
-/// planner and fails on open instead. That predates this split and is left
-/// as-is: reversing it needs the system indices exempted first, since neither
-/// the fragment-reuse nor the mem-wal details resolve to a scalar plugin either.
+/// Reader availability is checked separately by [`index_is_usable`], because
+/// an unknown type has no meaningful maximum version in this build.
 pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
     let max_supported_version = index
         .index_details
@@ -2670,6 +2664,15 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
     (index.index_version > max_supported_version as i32).then_some(max_supported_version)
 }
 
+/// Whether this build may expose an index through the usable-index view.
+///
+/// System indices have dedicated readers rather than scalar plugins. Ordinary
+/// indices need both a reader for their exact declared type and a supported
+/// format version.
+pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
+    index_type_is_known(index) && unsupported_index_version(index).is_none()
+}
+
 /// Name the indices this build has no reader for, once per manifest read.
 ///
 /// Deliberately not inside the filter in [`DatasetIndexExt::load_indices`]: that
@@ -2678,7 +2681,18 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 /// per hidden index per query for as long as the dataset carries one.
 pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
     for idx in indices {
-        if let Some(max_supported_version) = unsupported_index_version(idx) {
+        if !index_type_is_known(idx) {
+            let type_url = idx
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                .unwrap_or("<legacy>");
+            log::warn!(
+                "Index {} has unrecognized type {}, ignoring it",
+                idx.name,
+                type_url,
+            );
+        } else if let Some(max_supported_version) = unsupported_index_version(idx) {
             log::warn!(
                 "Index {} has version {}, which is not supported (<={}), ignoring it",
                 idx.name,
@@ -4813,6 +4827,23 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(
+            dataset
+                .load_indices_by_name("foreign_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an index with no reader must not enter the usable-index view"
+        );
+        assert_eq!(
+            load_all_indices_by_name(&dataset, "foreign_idx")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "hiding an unusable index must not erase its manifest metadata"
+        );
+
         let query = Float32Array::from(vec![0.5_f32; 8]);
         let mut scanner = dataset.scan();
         scanner.nearest("vector", &query, 5).unwrap();
@@ -4822,12 +4853,13 @@ mod tests {
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("number_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 0);
-        assert!(
-            dataset
-                .load_index_by_name("foreign_idx")
+        assert_eq!(
+            load_all_indices_by_name(&dataset, "foreign_idx")
                 .await
                 .unwrap()
-                .is_some()
+                .len(),
+            1,
+            "optimizing supported indices must preserve the opaque segment"
         );
     }
 
@@ -10862,18 +10894,34 @@ mod tests {
             .into_reader_rows(RowCount::from(10), BatchCount::from(1))
     }
 
-    /// Raise `index_name` past the version this build can read, and give it the
-    /// full fragment coverage a real index of that name would have.
-    async fn hide_index_from_this_build(dataset: &mut Dataset, index_name: &str) {
+    #[derive(Debug, Clone, Copy)]
+    enum UnreadableIndexKind {
+        NewerVersion,
+        UnknownType,
+    }
+
+    /// Make `index_name` unreadable to this build, and give it the full fragment
+    /// coverage a real index of that name would have.
+    async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: UnreadableIndexKind) {
         let current = dataset.load_indices_by_name(index_name).await.unwrap();
         assert_eq!(current.len(), 1);
-        let mut from_the_future = current.clone();
-        from_the_future[0].index_version = current[0].index_version + 1;
-        from_the_future[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+        let mut unreadable = current.clone();
+        match kind {
+            UnreadableIndexKind::NewerVersion => {
+                unreadable[0].index_version = current[0].index_version + 1;
+            }
+            UnreadableIndexKind::UnknownType => {
+                unreadable[0].index_details = Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
+                    value: Vec::new(),
+                }));
+            }
+        }
+        unreadable[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
         let transaction = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
-                new_indices: from_the_future,
+                new_indices: unreadable,
                 removed_indices: current,
             },
             None,
@@ -10884,12 +10932,16 @@ mod tests {
             .unwrap();
     }
 
+    /// Raise `index_name` past the version this build can read.
+    async fn hide_index_from_this_build(dataset: &mut Dataset, index_name: &str) {
+        hide_index_as(dataset, index_name, UnreadableIndexKind::NewerVersion).await;
+    }
+
     /// The readable companion every fixture below carries over `payload`.
     const READABLE_INDEX: &str = "payload_idx";
 
-    /// A dataset carrying a BTree index over `id` whose version this build has
-    /// no reader for - what an index written by a newer Lance looks like from
-    /// here - beside an ordinary readable BTree index over `payload`.
+    /// A dataset carrying an unreadable BTree index over `id` beside an ordinary
+    /// readable BTree index over `payload`.
     ///
     /// The readable companion is what makes the filter's selectivity visible:
     /// with a single entry, "hid the one it cannot read" and "hid everything"
@@ -10899,7 +10951,11 @@ mod tests {
     /// Nothing here ever reads them, and training one would take a non-spillable
     /// 40 MB reservation out of the session's shared 150 MB pool to sort ten
     /// rows - three of those in flight at once is all the pool has room for.
-    async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &str) -> Dataset {
+    async fn dataset_with_an_unreadable_index(
+        uri: &str,
+        index_name: &str,
+        kind: UnreadableIndexKind,
+    ) -> Dataset {
         let mut dataset = Dataset::write(two_column_reader(), uri, None)
             .await
             .unwrap();
@@ -10911,7 +10967,7 @@ mod tests {
             .train(false)
             .await
             .unwrap();
-        hide_index_from_this_build(&mut dataset, index_name).await;
+        hide_index_as(&mut dataset, index_name, kind).await;
 
         dataset
             .create_index_builder(&["payload"], IndexType::BTree, &btree_params)
@@ -10922,7 +10978,12 @@ mod tests {
         dataset
     }
 
-    /// Indices the manifest itself carries, bypassing the version filter.
+    /// A dataset carrying an index whose version is newer than this build.
+    async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &str) -> Dataset {
+        dataset_with_an_unreadable_index(uri, index_name, UnreadableIndexKind::NewerVersion).await
+    }
+
+    /// Indices the manifest itself carries, bypassing the usable-index filter.
     async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
         lance_table::io::manifest::read_manifest_indexes(
             &dataset.object_store,
@@ -11036,11 +11097,16 @@ mod tests {
     /// `migrate_indices` recalculates a missing `fragment_bitmap` by opening the
     /// index, which is precisely what this build cannot do - so an unreadable
     /// index would fail every later commit instead of riding along.
+    #[rstest]
+    #[case::newer_version(UnreadableIndexKind::NewerVersion)]
+    #[case::unknown_type(UnreadableIndexKind::UnknownType)]
     #[tokio::test]
-    async fn test_unsupported_index_without_a_bitmap_does_not_fail_later_commits() {
+    async fn test_unsupported_index_without_a_bitmap_does_not_fail_later_commits(
+        #[case] kind: UnreadableIndexKind,
+    ) {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+        let mut dataset = dataset_with_an_unreadable_index(test_uri, "id_idx", kind).await;
 
         // Drop the coverage too, so migration would want to rebuild it.
         let hidden = manifest_index(&dataset, "id_idx").await;
@@ -11693,8 +11759,13 @@ mod tests {
     ///
     /// The stable-row-id case is the test above: there the fragment-reuse index
     /// repairs the coverage afterwards, so nothing has to be held back.
+    #[rstest]
+    #[case::newer_version(UnreadableIndexKind::NewerVersion)]
+    #[case::unknown_type(UnreadableIndexKind::UnknownType)]
     #[tokio::test]
-    async fn test_compaction_defers_fragments_an_unsupported_index_covers() {
+    async fn test_compaction_defers_fragments_an_unsupported_index_covers(
+        #[case] kind: UnreadableIndexKind,
+    ) {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -11715,7 +11786,7 @@ mod tests {
             .train(false)
             .await
             .unwrap();
-        hide_index_from_this_build(&mut dataset, "id_idx").await;
+        hide_index_as(&mut dataset, "id_idx", kind).await;
         let covered = manifest_index(&dataset, "id_idx")
             .await
             .fragment_bitmap
