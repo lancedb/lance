@@ -44,6 +44,11 @@ impl std::fmt::Debug for f64x4 {
 }
 
 impl From<&[f64]> for f64x4 {
+    /// Loads the first 4 elements of `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` has fewer than 4 elements.
     fn from(value: &[f64]) -> Self {
         assert!(
             value.len() >= 4,
@@ -393,6 +398,11 @@ impl std::fmt::Debug for f64x8 {
 }
 
 impl From<&[f64]> for f64x8 {
+    /// Loads the first 8 elements of `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` has fewer than 8 elements.
     fn from(value: &[f64]) -> Self {
         assert!(
             value.len() >= 8,

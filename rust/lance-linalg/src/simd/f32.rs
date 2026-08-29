@@ -147,6 +147,11 @@ fn gather_scalar_x86(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
 }
 
 impl From<&[f32]> for f32x8 {
+    /// Loads the first 8 elements of `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` has fewer than 8 elements.
     fn from(value: &[f32]) -> Self {
         assert!(
             value.len() >= 8,
@@ -532,6 +537,11 @@ impl std::fmt::Debug for f32x16 {
 }
 
 impl From<&[f32]> for f32x16 {
+    /// Loads the first 16 elements of `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` has fewer than 16 elements.
     fn from(value: &[f32]) -> Self {
         assert!(
             value.len() >= 16,
