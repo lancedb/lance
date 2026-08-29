@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
@@ -104,10 +105,7 @@ static RABIT_PRUNE_STATS_INTERVAL: OnceLock<u64> = OnceLock::new();
 
 fn rabit_prune_stats_enabled() -> bool {
     *RABIT_PRUNE_STATS_ENABLED.get_or_init(|| match std::env::var(RABIT_PRUNE_STATS_ENV) {
-        Ok(value) => {
-            let value = value.to_ascii_lowercase();
-            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
-        }
+        Ok(value) => str_is_truthy(value.trim()),
         Err(_) => false,
     })
 }

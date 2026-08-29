@@ -500,7 +500,7 @@ impl Positions {
         &self.data[start..end]
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.data.capacity() * std::mem::size_of::<u32>()
     }
@@ -532,11 +532,11 @@ impl TermChunk {
         self.row_positions.len()
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         let base = std::mem::size_of::<Self>()
             + self.row_positions.capacity() * std::mem::size_of::<u64>()
             + self.frequencies.capacity() * std::mem::size_of::<u32>();
-        base + self.positions.as_ref().map_or(0, Positions::memory_size)
+        base + self.positions.as_ref().map_or(0, Positions::resident_bytes)
     }
 }
 
@@ -579,10 +579,10 @@ impl TermSlice {
         TermChunkIter { cur: Some(self) }
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         // Each node: the struct itself plus its chunk's payload.
         self.chunks()
-            .map(|c| std::mem::size_of::<Self>() + c.memory_size())
+            .map(|c| std::mem::size_of::<Self>() + c.resident_bytes())
             .sum::<usize>()
             + std::mem::size_of::<Self>() // empty root node
     }
@@ -630,11 +630,15 @@ impl BatchMeta {
         self.document(document_position).map(|doc| doc.num_tokens)
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.documents.capacity() * std::mem::size_of::<DocumentMetadata>()
     }
 }
+
+/// Per-entry overhead charged for a `SkipMap` node (tower + links) when sizing
+/// the tail's term map. An estimate — the node layout is crossbeam-internal.
+const SKIPMAP_ENTRY_OVERHEAD: usize = 32;
 
 /// Size of a sealed batch block. Small enough that copying the partial tail
 /// block on append stays cheap; large enough that sealing (which clones the
@@ -845,6 +849,11 @@ struct TailIndex {
     /// hash probe instead of a skiplist search. Reset implicitly when the tail
     /// is replaced on freeze. Uncontended — the single writer holds it briefly.
     writer_term_cache: Mutex<FxHashMap<Arc<str>, Arc<ArcSwap<TermSlice>>>>,
+    /// Running total mirroring [`Self::resident_bytes`], maintained by
+    /// `append_batch`. Exists so the write path can budget memtable memory
+    /// without the O(terms) walk. `test_tail_bytes_tracks_memory_size` pins the
+    /// two together.
+    bytes: AtomicUsize,
 }
 
 impl TailIndex {
@@ -854,7 +863,13 @@ impl TailIndex {
             snapshot: ArcSwap::from(Snapshot::empty()),
             next_batch_position: AtomicUsize::new(0),
             writer_term_cache: Mutex::new(FxHashMap::default()),
+            bytes: AtomicUsize::new(std::mem::size_of::<Self>()),
         })
+    }
+
+    /// [`Self::resident_bytes`] without the walk. See [`Self::bytes`].
+    fn resident_bytes_cached(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -889,8 +904,19 @@ impl TailIndex {
             .writer_term_cache
             .lock()
             .expect("writer term cache poisoned — single-writer invariant violated");
+        // Mirrors `memory_size`'s per-term arithmetic; keep the two in step.
+        let mut added = 0;
         for (term, builder) in term_builders {
             let chunk = builder.build(batch_position, with_position);
+            added += std::mem::size_of::<TermSlice>() + chunk.resident_bytes();
+            if !cache.contains_key(&term) {
+                // First sight this generation: the SkipMap entry plus the
+                // slice's empty root node.
+                added += std::mem::size_of::<Arc<str>>()
+                    + term.len()
+                    + SKIPMAP_ENTRY_OVERHEAD
+                    + std::mem::size_of::<TermSlice>();
+            }
             // First sight of the term this generation populates the SkipMap
             // (so readers can find it) and caches the slot; later batches hit
             // only the cache.
@@ -910,6 +936,8 @@ impl TailIndex {
             document_position_start,
             documents,
         });
+        added += new_meta.resident_bytes();
+        self.bytes.fetch_add(added, Ordering::Relaxed);
         let cur = self.snapshot.load();
         debug_assert_eq!(document_position_start, cur.cumulative_doc_count);
         self.snapshot.store(Arc::new(Snapshot {
@@ -920,19 +948,19 @@ impl TailIndex {
         }));
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
         for entry in self.terms.iter() {
             let term: &Arc<str> = entry.key();
-            total += std::mem::size_of::<Arc<str>>() + term.len() + 32;
-            total += entry.value().load().memory_size();
+            total += std::mem::size_of::<Arc<str>>() + term.len() + SKIPMAP_ENTRY_OVERHEAD;
+            total += entry.value().load().resident_bytes();
         }
         total += self
             .snapshot
             .load()
             .batches
             .iter()
-            .map(|b| b.memory_size())
+            .map(|b| b.resident_bytes())
             .sum::<usize>();
         total
     }
@@ -1155,12 +1183,31 @@ impl FtsMemIndex {
     }
 
     /// Estimated bytes of heap memory held by this index.
-    pub fn memory_usage(&self) -> usize {
+    ///
+    /// Walks every tail term. Prefer `resident_bytes` on the write path.
+    pub fn resident_bytes_exact(&self) -> usize {
         let st = self.state.load_full();
         let mut total = std::mem::size_of::<Self>();
-        total += st.partitions.iter().map(|p| p.memory_size()).sum::<usize>();
-        total += st.tail.memory_size();
+        total += st
+            .partitions
+            .iter()
+            .map(|p| p.resident_bytes())
+            .sum::<usize>();
+        total += st.tail.resident_bytes();
         total
+    }
+
+    /// [`Self::resident_bytes_exact`] without the per-term walk: partitions are capped
+    /// at `MAX_PARTITIONS` and size themselves in O(1), and the tail keeps a
+    /// running total. Cheap enough for the write path.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let st = self.state.load();
+        std::mem::size_of::<Self>()
+            + st.partitions
+                .iter()
+                .map(|p| p.resident_bytes())
+                .sum::<usize>()
+            + st.tail.resident_bytes_cached()
     }
 
     /// Component memory breakdown (bytes), for diagnostics:
@@ -1184,7 +1231,7 @@ impl FtsMemIndex {
             df,
             pos,
             docs,
-            st.tail.memory_size(),
+            st.tail.resident_bytes(),
         )
     }
 
@@ -3328,7 +3375,7 @@ impl Partition {
             .unwrap_or(0)
     }
 
-    fn memory_size(&self) -> usize {
+    fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.term_fst.as_fst().as_bytes().len()
             + self.postings.len() * std::mem::size_of::<PostingRef>()
@@ -5466,19 +5513,50 @@ mod tests {
         let schema = create_test_schema();
         let index = FtsMemIndex::new(1, "description".to_string());
 
-        let empty = index.memory_usage();
+        let empty = index.resident_bytes_exact();
         index.insert(&create_test_batch(&schema), 0).unwrap();
-        let after_one = index.memory_usage();
+        let after_one = index.resident_bytes_exact();
         index
             .insert(&create_phrase_test_batch(&schema), 100)
             .unwrap();
-        let after_two = index.memory_usage();
+        let after_two = index.resident_bytes_exact();
 
         assert!(after_one > empty, "memory should grow after first insert");
         assert!(
             after_two > after_one,
             "memory should grow after second insert"
         );
+    }
+
+    /// The tail's running byte counter must stay exactly in step with the walk
+    /// it replaces, including across a freeze (which swaps in a fresh tail).
+    #[test]
+    fn test_tail_bytes_tracks_resident_bytes() {
+        let schema = create_test_schema();
+        // Freeze partway through so the counter is checked on both a live tail
+        // and a post-freeze one.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(4);
+
+        for round in 0..6 {
+            let batch = if round % 2 == 0 {
+                create_test_batch(&schema)
+            } else {
+                create_phrase_test_batch(&schema)
+            };
+            index.insert(&batch, round * 100).unwrap();
+
+            let st = index.state.load();
+            assert_eq!(
+                st.tail.resident_bytes_cached(),
+                st.tail.resident_bytes(),
+                "tail byte counter drifted from the walk at round {round}"
+            );
+            assert_eq!(
+                index.resident_bytes(),
+                index.resident_bytes_exact(),
+                "index memory_size drifted from memory_usage at round {round}"
+            );
+        }
     }
 
     #[test]
