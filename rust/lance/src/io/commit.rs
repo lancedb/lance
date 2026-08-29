@@ -37,7 +37,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, pb,
+    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -358,6 +358,9 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    // Classified from the operation itself. Reading it back off the inline
+    // copy would tie the verdict to the payload size instead.
+    let may_change_schema = operation_may_change_schema(&pb_transaction);
 
     let clone_source = if let Operation::Clone {
         ref_version,
@@ -497,6 +500,7 @@ async fn do_commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
+        may_change_schema,
     )
     .await;
 
@@ -1058,6 +1062,9 @@ pub(crate) async fn do_commit_detached_transaction(
     ensure_can_write_manifest(&dataset.manifest)?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    // Classified from the operation itself. Reading it back off the inline
+    // copy would tie the verdict to the payload size instead.
+    let may_change_schema = operation_may_change_schema(&pb_transaction);
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -1133,6 +1140,7 @@ pub(crate) async fn do_commit_detached_transaction(
             write_config,
             ManifestNamingScheme::V2,
             inline_tx.take(),
+            may_change_schema,
         )
         .await;
 
@@ -1411,6 +1419,9 @@ pub(crate) async fn commit_transaction(
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+        // Classified from the operation itself. Reading it back off the inline
+        // copy would tie the verdict to the payload size instead.
+        let may_change_schema = operation_may_change_schema(&pb_transaction);
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
@@ -1488,6 +1499,7 @@ pub(crate) async fn commit_transaction(
             write_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
+            may_change_schema,
         )
         .await;
 
