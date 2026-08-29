@@ -153,6 +153,16 @@ impl Dot for bf16 {
             SimdSupport::Avx512FP16 => unsafe {
                 bf16_kernel::dot_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
+            #[cfg(all(
+                feature = "fp16kernels",
+                not(kernel_support = "avx512_bf16"),
+                target_arch = "x86_64"
+            ))]
+            // `Avx512*` tier detection does not check FMA, and these kernels are
+            // compiled `-march=haswell`, which enables it.
+            SimdSupport::Avx512FP16 if std::is_x86_feature_detected!("fma") => unsafe {
+                bf16_kernel::dot_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
                 bf16_kernel::dot_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
@@ -209,6 +219,16 @@ impl Dot for f16 {
             ))]
             SimdSupport::Avx512FP16 => unsafe {
                 kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                not(kernel_support = "avx512_f16"),
+                target_arch = "x86_64"
+            ))]
+            // `Avx512*` tier detection does not check FMA, and these kernels are
+            // compiled `-march=haswell`, which enables it.
+            SimdSupport::Avx512FP16 if std::is_x86_feature_detected!("fma") => unsafe {
+                kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
