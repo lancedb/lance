@@ -1178,6 +1178,17 @@ impl ExecutionPlan for HardCapBatchSizeExec {
             0,
             max_bytes,
         );
+        let rechunked = rechunked.map(move |result| {
+            if let Ok(batch) = &result {
+                let batch_bytes = batch.get_array_memory_size();
+                if batch.num_rows() == 1 && batch_bytes > max_bytes {
+                    warn!(
+                        "HardCapBatchSizeExec cannot split a single-row batch of {batch_bytes} bytes, which exceeds the maximum batch size of {max_bytes} bytes; passing it through unchanged"
+                    );
+                }
+            }
+            result
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechunked)))
     }
 
@@ -1341,5 +1352,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_hard_cap_passes_through_oversized_single_row() {
+        let value = "x".repeat(1024);
+        let batch = arrow_array::record_batch!(("value", Utf8, [value.as_str()])).unwrap();
+        let max_bytes = 64;
+        assert!(batch.get_array_memory_size() > max_bytes);
+
+        let input = Arc::new(OneShotExec::from_batch(batch.clone()));
+        let exec = HardCapBatchSizeExec::new(input, max_bytes);
+        let context = SessionContext::new().task_ctx();
+        let mut output = exec.execute(0, context).unwrap();
+
+        assert_eq!(output.next().await.unwrap().unwrap(), batch);
+        assert!(output.next().await.is_none());
     }
 }

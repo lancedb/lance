@@ -1885,7 +1885,11 @@ impl MergeInsertJob {
         // Fully stage the joined updates before starting the fragment sort. An
         // indexed join can keep merge streams for both sorted inputs live while
         // its output is pulled; draining a disk-backed replay first releases
-        // those upstream reservations before the downstream sort allocates.
+        // those upstream reservations before the downstream sort allocates. The
+        // zero memory limit is deliberate: the staging buffer holds plain
+        // RecordBatches outside DataFusion's memory-pool accounting, so any
+        // in-memory allowance would weaken the operation's bounded-memory
+        // contract.
         let staged_source = spilling_table_provider_with_job_disk_manager(
             source,
             0,
