@@ -31,6 +31,8 @@ use u8::u8x16;
 /// `Mul` operates independently on each lane. Integer implementations keep the
 /// low bits of each product, wrapping on overflow, while floating-point
 /// implementations follow the scalar type's multiplication semantics.
+/// `Add` and `Sub` retain implementation-specific overflow behavior; notably,
+/// [`u8x16`] addition saturates while its subtraction wraps.
 ///
 pub trait SIMD<T: Num + Copy, const N: usize>:
     std::fmt::Debug
