@@ -3,7 +3,7 @@
 
 //! Rewrites of comparisons against a floating point zero literal.
 
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::InList};
+use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
 use datafusion_common::tree_node::{Transformed, TreeNode};
@@ -109,6 +109,21 @@ fn list_is_pair(list: &[Expr], negative: &ScalarValue, positive: &ScalarValue) -
 
 /// The rewritten expression, or `None` when `expr` is not a comparison against a
 /// floating point zero.
+/// The encoding a zero bound needs to answer `op` correctly, or `None` when the
+/// expression is not a zero literal.
+fn rewrite_bound(bound: &Expr, op: Operator) -> Option<Expr> {
+    let Expr::Literal(value, metadata) = bound else {
+        return None;
+    };
+    let (negative, positive) = zero_encodings(value)?;
+    let encoding = match op {
+        Operator::GtEq => negative,
+        Operator::LtEq => positive,
+        _ => return None,
+    };
+    Some(Expr::Literal(encoding, metadata.clone()))
+}
+
 fn rewrite_node(expr: &Expr) -> Option<Expr> {
     match expr {
         // DataFusion's simplifier expands an `IN` list of three or fewer values
@@ -195,6 +210,25 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                 left: Box::new(other.clone()),
                 op,
                 right: Box::new(Expr::Literal(zero, metadata.clone())),
+            }))
+        }
+        // `BETWEEN` normally reaches this rewrite already expanded into `>=` and
+        // `<=` by the simplifier. It survives unexpanded when every operand is
+        // constant, because then the simplifier expands and folds it in one pass
+        // and the comparison is gone before the post-pass looks. The bounds take
+        // the encodings their expanded operators would: `low` is a `>=` bound and
+        // `high` is a `<=` bound.
+        Expr::Between(between) => {
+            let low = rewrite_bound(&between.low, Operator::GtEq);
+            let high = rewrite_bound(&between.high, Operator::LtEq);
+            if low.is_none() && high.is_none() {
+                return None;
+            }
+            Some(Expr::Between(Between {
+                expr: between.expr.clone(),
+                negated: between.negated,
+                low: Box::new(low.unwrap_or_else(|| (*between.low).clone())),
+                high: Box::new(high.unwrap_or_else(|| (*between.high).clone())),
             }))
         }
         Expr::InList(InList {
@@ -546,6 +580,23 @@ mod tests {
     #[case::not_eq("(-1.0 * 0.0) != 0.0", false)]
     #[case::gt("(-1.0 * 0.0) > 0.0", false)]
     #[case::lt_eq("(-1.0 * 0.0) <= 0.0", true)]
+    // The zero on the right is produced by folding rather than written, so these
+    // reach the rewrite only because the operands are folded before the
+    // comparison is.
+    #[case::folded_rhs_lt("-1.0 * 0.0 < (1.0 - 1.0)", false)]
+    #[case::folded_rhs_eq("(-1.0 * 0.0) = (1.0 - 1.0)", true)]
+    #[case::folded_rhs_gt_eq("(-1.0 * 0.0) >= (1.0 - 1.0)", true)]
+    #[case::folded_rhs_not_eq("(-1.0 * 0.0) != (1.0 - 1.0)", false)]
+    #[case::both_sides_folded("(0.0 * -1.0) < (1.0 - 1.0)", false)]
+    // `BETWEEN` and `IN` fold the same way, and a fully constant `BETWEEN` never
+    // reaches the rewrite already expanded, which is why the rewrite has its own
+    // arm for it.
+    #[case::folded_between("(-1.0 * 0.0) BETWEEN (1.0 - 1.0) AND 1.0", true)]
+    #[case::folded_in_list("(-1.0 * 0.0) IN ((1.0 - 1.0), 1.0)", true)]
+    #[case::folded_not_in_list("(-1.0 * 0.0) NOT IN ((1.0 - 1.0), 1.0)", false)]
+    // Nested under a connective, so the operand pass has to descend.
+    #[case::under_or("(-1.0 * 0.0) < (1.0 - 1.0) OR 1.0 > 2.0", false)]
+    #[case::under_not("NOT ((-1.0 * 0.0) < (1.0 - 1.0))", true)]
     fn folded_constant_comparisons_use_ieee_semantics(
         #[case] filter: &str,
         #[case] expected: bool,

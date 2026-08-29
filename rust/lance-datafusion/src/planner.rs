@@ -24,6 +24,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::expr::InList as InListExpr;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -1025,14 +1026,18 @@ impl Planner {
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
 
-        // Once before simplify and once after, because each pass reaches
-        // comparisons the other cannot.
-        //
-        // Before, because `simplify` const-folds a fully constant comparison
-        // under Arrow's total order and leaves a bare boolean behind:
-        // `-1.0 * 0.0 < 0.0` folds to `true` where IEEE says false, and by then
-        // there is no zero comparison left to repair.
-        //
+        // Fold the operands of each comparison before folding the comparison
+        // itself. `simplify` does both in one pass, so a fully constant predicate
+        // whose zero is produced during folding never presents a zero literal to
+        // the rewrite: `-1.0 * 0.0 < (1.0 - 1.0)` became `true` where IEEE says
+        // false. Simplifying only the operands leaves the comparison standing, so
+        // the rewrite below sees the zeros the folding just produced.
+        let expr =
+            simplify_zero_sensitive_operands(expr, &|operand| Ok(simplifier.simplify(operand)?))?;
+
+        // Once here and once after simplify, because each pass reaches comparisons
+        // the other cannot. Here, because `simplify` const-folds a fully constant
+        // comparison under Arrow's total order and leaves a bare boolean behind.
         // After, because `simplify` is also what expands `BETWEEN` into two
         // comparisons and folds the casts `coerce` inserts, so those forms only
         // become visible on the second pass.
@@ -1079,6 +1084,75 @@ impl Planner {
         };
         expr.visit(&mut visitor).unwrap();
         visitor.columns.into_iter().collect()
+    }
+}
+
+/// Whether the signed-zero rewrite acts on comparisons under `op`.
+fn is_zero_sensitive(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Eq
+            | Operator::NotEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    )
+}
+
+/// Fold the operands of every zero-sensitive comparison, leaving the comparison
+/// itself alone.
+///
+/// `ExprSimplifier::simplify` folds operands and the comparison above them in one
+/// pass, so a fully constant predicate whose zero appears only as a result of
+/// folding never presents a zero literal to the rewrite. Folding just the operands
+/// keeps the comparison standing so the rewrite can act on it.
+///
+/// Descends through `AND`, `OR` and `NOT` so a comparison nested in a boolean
+/// expression is reached. It does not descend into the operands themselves: a
+/// comparison used as a value inside arithmetic is not a shape the rewrite acts on.
+fn simplify_zero_sensitive_operands(
+    expr: Expr,
+    simplify: &impl Fn(Expr) -> Result<Expr>,
+) -> Result<Expr> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_zero_sensitive(op) => {
+            Ok(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(simplify(*left)?),
+                op,
+                right: Box::new(simplify(*right)?),
+            }))
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            Ok(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(simplify_zero_sensitive_operands(*left, simplify)?),
+                op,
+                right: Box::new(simplify_zero_sensitive_operands(*right, simplify)?),
+            }))
+        }
+        Expr::Not(inner) => Ok(Expr::Not(Box::new(simplify_zero_sensitive_operands(
+            *inner, simplify,
+        )?))),
+        Expr::Between(between) => Ok(Expr::Between(Between {
+            expr: Box::new(simplify(*between.expr)?),
+            negated: between.negated,
+            low: Box::new(simplify(*between.low)?),
+            high: Box::new(simplify(*between.high)?),
+        })),
+        Expr::InList(in_list) => Ok(Expr::InList(InListExpr {
+            expr: Box::new(simplify(*in_list.expr)?),
+            list: in_list
+                .list
+                .into_iter()
+                .map(simplify)
+                .collect::<Result<Vec<_>>>()?,
+            negated: in_list.negated,
+        })),
+        other => Ok(other),
     }
 }
 
