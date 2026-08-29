@@ -48,6 +48,9 @@ impl std::fmt::Debug for i32x8 {
     }
 }
 
+/// # Panics
+///
+/// Panics if `value` contains fewer than 8 elements.
 impl From<&[i32]> for i32x8 {
     fn from(value: &[i32]) -> Self {
         assert!(

@@ -83,6 +83,9 @@ impl std::fmt::Debug for u8x16 {
     }
 }
 
+/// # Panics
+///
+/// Panics if `value` contains fewer than 16 elements.
 impl From<&[u8]> for u8x16 {
     fn from(value: &[u8]) -> Self {
         assert!(

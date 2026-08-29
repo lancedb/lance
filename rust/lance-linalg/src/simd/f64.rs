@@ -43,6 +43,9 @@ impl std::fmt::Debug for f64x4 {
     }
 }
 
+/// # Panics
+///
+/// Panics if `value` contains fewer than 4 elements.
 impl From<&[f64]> for f64x4 {
     fn from(value: &[f64]) -> Self {
         assert!(
@@ -392,6 +395,9 @@ impl std::fmt::Debug for f64x8 {
     }
 }
 
+/// # Panics
+///
+/// Panics if `value` contains fewer than 8 elements.
 impl From<&[f64]> for f64x8 {
     fn from(value: &[f64]) -> Self {
         assert!(
