@@ -488,3 +488,32 @@ rows with 768 dimensions and 1 bit per dimension:
 ```
 100M * (768 / 8 + 16) = ~10.8 GiB
 ```
+
+#### AMX Acceleration
+
+On Linux x86_64 with an AMX-FP16 CPU (Intel Granite Rapids / Xeon 6 and newer), a `float16`
+vector column indexed with `dot` distance uses the AMX tile instructions, provided the build
+machine had clang >= 16 or gcc >= 13 to compile the kernel. There is nothing to enable —
+Lance checks the CPU at run time and falls back to the previous implementation everywhere else.
+
+The accelerated paths are also shape-gated, because below these sizes a tile pass costs more
+than it saves and the kernel declines the work:
+
+| Condition | Why |
+|---|---|
+| `float16` vectors, `dot` distance | The kernel is fp16-specific; other types and metrics keep their existing paths |
+| `dimension >= 32` | One tile pass covers 32 dimensions; a shorter vector would be all scalar cleanup |
+| `num_centroids >= 32` | The GEMM steps its centroid loop by 32 and has no partial-tile path |
+
+Anything outside them behaves exactly as it does today, so a small dataset or a low-dimensional
+column simply keeps the previous implementation rather than changing behaviour.
+
+Index build also changes algorithm where all of the above hold: comparing every vector against
+every centroid becomes affordable, so partition assignment is exact instead of approximated with
+a graph search over the centroids. Recall improves, and partition assignments differ from what an
+older build produced.
+
+Set `LANCE_DISABLE_AMX=1` to take the AMX paths out of service without rebuilding — for
+A/B measurement, or to get the previous behaviour back. Because it also moves partition
+assignment back to the approximate path, an index built with it set is not equivalent to one
+built without it; compare recall, not just build time.

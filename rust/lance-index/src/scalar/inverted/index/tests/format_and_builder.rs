@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
 
 #[test]
@@ -345,6 +346,208 @@ async fn test_build_search_uses_configured_posting_block_size() {
     assert_eq!(row_ids.len(), 10);
     assert_eq!(scores.len(), 10);
     assert!(row_ids.iter().all(|row_id| *row_id >= 1_000));
+}
+
+#[rstest::rstest]
+#[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE, 514, 7)]
+#[case::v3(InvertedListFormatVersion::V3, 256, 6, 4)]
+#[tokio::test]
+async fn test_into_builder_chunks_postings_by_list_children(
+    #[case] format_version: InvertedListFormatVersion,
+    #[case] block_size: usize,
+    #[case] max_list_children: u64,
+    #[case] expected_chunk_count: usize,
+) {
+    const NUM_TOKENS: usize = 7;
+    const NUM_DOCS: usize = 257;
+    // V1's nested per-document position block count is not stored in metadata,
+    // so each token gets its own read. V3's exact metadata-derived bound admits
+    // two token rows per read.
+
+    let source_dir = TempObjDir::default();
+    let source_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        source_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut source = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        format_version,
+        block_size,
+    );
+    for token_id in 0..NUM_TOKENS {
+        source.tokens.add(format!("token_{token_id}"));
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            format_version.posting_tail_codec(),
+            block_size,
+        );
+        for doc_id in 0..NUM_DOCS {
+            posting.add(
+                doc_id as u32,
+                PositionRecorder::Position(vec![token_id as u32, token_id as u32 + 10].into()),
+            );
+        }
+        source.posting_lists.push(posting);
+    }
+    for doc_id in 0..NUM_DOCS {
+        source
+            .docs
+            .append(1_000 + doc_id as u64, (NUM_TOKENS * 2) as u32);
+    }
+    source.write(source_store.as_ref()).await.unwrap();
+
+    let source_partition = InvertedPartition::load(
+        source_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+    let (mut merged, chunk_count) = source_partition
+        .into_builder_with_chunk_limits(NUM_TOKENS, max_list_children)
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_count, expected_chunk_count,
+        "list-child limit must split merge reads"
+    );
+    assert_eq!(merged.posting_lists.len(), NUM_TOKENS);
+    assert!(
+        merged
+            .posting_lists
+            .iter()
+            .all(|posting| posting.len() == NUM_DOCS && posting.has_positions())
+    );
+
+    // Rewriting the chunk-built builder verifies that V3 positions survived
+    // conversion and that impact data can be regenerated from every posting.
+    let dest_dir = TempObjDir::default();
+    let dest_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dest_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    merged.write(dest_store.as_ref()).await.unwrap();
+    let merged_cache = LanceCache::with_capacity(1 << 20);
+    let merged_partition = InvertedPartition::load(
+        dest_store,
+        0,
+        None,
+        &merged_cache,
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+    let posting = merged_partition
+        .inverted_list
+        .posting_list(0, true, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let PostingList::Compressed(posting) = posting else {
+        panic!("expected compressed posting list");
+    };
+    assert_eq!(posting.block_size, block_size);
+    assert!(posting.impacts.is_some());
+    let actual = PostingList::Compressed(posting)
+        .iter()
+        .map(|(doc_id, frequency, positions)| {
+            (doc_id, frequency, positions.unwrap().collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), NUM_DOCS);
+    assert_eq!(actual[0], (0, 2, vec![0, 10]));
+    assert_eq!(actual[NUM_DOCS - 1], (256, 2, vec![0, 10]));
+}
+
+#[tokio::test]
+async fn test_chunk_posting_mode_controls_buffer_sharing() {
+    const NUM_TOKENS: usize = 2;
+    const NUM_DOCS: usize = 257;
+
+    let source_dir = TempObjDir::default();
+    let source_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        source_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut source = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V3,
+        MAX_POSTING_BLOCK_SIZE,
+    );
+    for token_id in 0..NUM_TOKENS {
+        source.tokens.add(format!("token_{token_id}"));
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+        );
+        for doc_id in 0..NUM_DOCS {
+            posting.add(doc_id as u32, PositionRecorder::Count(1));
+        }
+        source.posting_lists.push(posting);
+    }
+    for doc_id in 0..NUM_DOCS {
+        source.docs.append(1_000 + doc_id as u64, NUM_TOKENS as u32);
+    }
+    source.write(source_store.as_ref()).await.unwrap();
+
+    let source_partition = InvertedPartition::load(
+        source_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+    let merge_postings = source_partition
+        .inverted_list
+        .build_chunk_postings_for_test(0, NUM_TOKENS, false, ChunkPostingMode::Merge)
+        .await
+        .unwrap();
+    let prewarm_postings = source_partition
+        .inverted_list
+        .build_chunk_postings_for_test(0, NUM_TOKENS, false, ChunkPostingMode::Prewarm)
+        .await
+        .unwrap();
+
+    let [
+        PostingList::Compressed(merge_first),
+        PostingList::Compressed(merge_second),
+    ] = merge_postings.as_slice()
+    else {
+        panic!("expected two compressed merge posting lists");
+    };
+    assert!(
+        merge_first
+            .blocks
+            .values()
+            .ptr_eq(merge_second.blocks.values()),
+        "merge posting lists from one chunk should share backing storage"
+    );
+
+    let [
+        PostingList::Compressed(prewarm_first),
+        PostingList::Compressed(prewarm_second),
+    ] = prewarm_postings.as_slice()
+    else {
+        panic!("expected two compressed prewarm posting lists");
+    };
+    assert!(
+        !prewarm_first
+            .blocks
+            .values()
+            .ptr_eq(prewarm_second.blocks.values()),
+        "prewarm posting lists should own compact backing storage"
+    );
 }
 
 #[tokio::test]

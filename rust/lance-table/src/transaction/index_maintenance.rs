@@ -965,6 +965,7 @@ mod tests {
         IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![field_id],
+            covering_fields: vec![],
             name: name.to_string(),
             dataset_version,
             fragment_bitmap,
@@ -983,6 +984,7 @@ mod tests {
         IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![field_id],
+            covering_fields: vec![],
             name: name.to_string(),
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),

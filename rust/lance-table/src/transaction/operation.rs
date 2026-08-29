@@ -185,7 +185,12 @@ pub enum Operation {
         preserves_nullability: bool,
     },
 
-    /// Update the dataset configuration.
+    /// Update the dataset configuration and metadata.
+    ///
+    /// Schema or field metadata updates conflict with a concurrent
+    /// [`Self::Merge`] in either commit order. A merge carries complete schema
+    /// state from its read version, so rebasing the operations could discard
+    /// metadata installed by the other transaction.
     UpdateConfig {
         config_updates: Option<UpdateMap>,
         table_metadata_updates: Option<UpdateMap>,
@@ -198,12 +203,6 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
-        /// Requests the one-way migration to required index catch-up.
-        ///
-        /// One-way because returning to legacy semantics — where a missing
-        /// coverage entry reads as "fully caught up" — is unsafe once any
-        /// SSTable has been retired against a recorded catch-up position.
-        require_index_catchup: bool,
     },
 
     /// Clone a dataset.

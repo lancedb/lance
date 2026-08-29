@@ -217,6 +217,17 @@ pub struct ShardManifest {
     pub status: ShardStatus,
 }
 
+impl ShardManifest {
+    /// The version a manifest built on this one must carry.
+    ///
+    /// Manifest versions are CAS-allocated and must stay gap-free: a reader
+    /// scans forward and stops at the first version it cannot find, so a gap
+    /// hides everything past it.
+    pub fn next_version(&self) -> u64 {
+        self.version + 1
+    }
+}
+
 impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
@@ -434,24 +445,6 @@ impl MemWalIndex {
             .find(|icp| icp.index_name == index_name)
             .and_then(|icp| icp.caught_up_generation_for_shard(shard_id))
     }
-
-    /// Whether an index covers all compacted data for a shard, under **legacy**
-    /// semantics.
-    ///
-    /// A missing `index_catchup` entry is read here as "fully caught up". That
-    /// is only correct for a table without the index-catchup feature bit. On
-    /// an activated table a missing entry means *unknown*: the index has not
-    /// recorded anything, so its SSTables must be retained and a repair
-    /// scheduled. This accessor cannot see the manifest, so it cannot make that
-    /// distinction -- callers must select the semantics from the feature bit,
-    /// and the name says which one they get here.
-    pub fn is_index_caught_up_legacy(&self, index_name: &str, shard_id: &Uuid) -> bool {
-        let compacted_gen = self.compacted_generation_for_shard(shard_id).unwrap_or(0);
-        let caught_up_gen = self.index_caught_up_generation(index_name, shard_id);
-
-        // Missing means "caught up" only because this is the legacy reading.
-        caught_up_gen.is_none_or(|generation| generation >= compacted_gen)
-    }
 }
 
 // Reading and updating the `IndexMetadata` entry that carries the details above.
@@ -569,6 +562,7 @@ pub fn new_mem_wal_index_meta(
         uuid: Uuid::new_v4(),
         name: MEM_WAL_INDEX_NAME.to_string(),
         fields: vec![],
+        covering_fields: vec![],
         dataset_version,
         fragment_bitmap: None,
         index_details: Some(Arc::new(prost_types::Any::from_msg(

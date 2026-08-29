@@ -21,6 +21,7 @@ use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::inverted::query::{BooleanQuery, FtsQuery, MatchQuery, Occur};
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use mock_instant::thread_local::MockClock;
 
@@ -2763,6 +2764,140 @@ async fn test_fts_stale_entries_after_data_replacement() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+/// Cross-column compound fast search must not combine different column-local
+/// fragment domains after a partial data replacement.
+#[tokio::test]
+async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("title", DataType::Utf8, false),
+        ArrowField::new("body", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec!["noise", "target"])),
+            Arc::new(StringArray::from(vec!["noise", "stale"])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://cross_column_fast_search_replacement",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    for column in ["title", "body"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    let body_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "body",
+        DataType::Utf8,
+        false,
+    )]));
+    let replacement = RecordBatch::try_new(
+        body_schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["fresh"]))],
+    )
+    .unwrap();
+    let replacement_path = dataset.data_dir().join("body_replacement.lance");
+    let object_writer = dataset
+        .object_store
+        .create(&replacement_path)
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_1::create_writer(
+        object_writer,
+        body_schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let (file_major_version, file_minor_version) =
+        LanceFileVersion::Stable.resolve().to_data_file_numbers();
+    let replacement_file = DataFile {
+        path: "body_replacement.lance".to_string(),
+        fields: Arc::from([2]),
+        column_indices: Arc::from([0]),
+        file_major_version,
+        file_minor_version,
+        file_size_bytes: CachedFileSize::unknown(),
+        base_id: None,
+    };
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(1, replacement_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let match_query = |term: &str, column: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some(column.to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("target", "title")),
+        (Occur::Must, match_query("stale", "body")),
+    ])
+    .into();
+
+    let mut exact_scanner = dataset.scan();
+    exact_scanner
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    exact_scanner.limit(Some(10), None).unwrap();
+    assert_eq!(
+        exact_scanner.try_into_batch().await.unwrap().num_rows(),
+        0,
+        "the current body value must not match the stale term"
+    );
+
+    let mut fast_scanner = dataset.scan();
+    fast_scanner
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(10), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !fast_plan.contains("CrossColumnCompoundFtsScorer"),
+        "different per-column coverage must retain field-local masking:\n{fast_plan}"
+    );
+    assert_eq!(
+        fast_scanner.try_into_batch().await.unwrap().num_rows(),
+        0,
+        "the title index must not re-admit the body's stale physical posting"
+    );
 }
 
 /// Same scenario as test_fts_index_incremental_reindex_after_in_place_update
