@@ -160,28 +160,33 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                     }));
                 }
                 Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
-                    // This is the one shape whose rewrite has to name `other`
-                    // twice, so restrict it to a bare column: duplicating an
-                    // arbitrary expression would evaluate it twice per row, and
-                    // twice is wrong outright for a volatile one.
-                    if !matches!(other, Expr::Column(_)) {
-                        return None;
-                    }
-                    // Spelled with `IS [NOT] NULL` around the list rather than as
-                    // a pair of distinct-from probes, so that a second pass finds
-                    // both encodings already listed and leaves this alone.
+                    // Both encodings have to be listed, and the null case has to
+                    // stay decided rather than becoming NULL, so this pairs the
+                    // list with `IS [NOT] TRUE`. `NULL IN (..)` is NULL, and
+                    // `NULL IS TRUE` is false, which is what distinctness means
+                    // for a null against a non-null literal.
+                    //
+                    // The list carries `other` once. An earlier version guarded
+                    // this arm to a bare column so it could name `other` twice as
+                    // `IS NOT NULL AND IN (..)`, but bailing out left the
+                    // `filter_expr` path answering computed operands on Arrow's
+                    // sign-sensitive order, which is wrong rows rather than an
+                    // unsupported spelling.
+                    //
+                    // Always the non-negated list, so a second pass sees the same
+                    // complete pair it would leave alone anywhere else.
                     let covered = Expr::InList(InList {
                         expr: Box::new(other.clone()),
                         list: vec![
                             Expr::Literal(negative, metadata.clone()),
                             Expr::Literal(positive, metadata.clone()),
                         ],
-                        negated: op == Operator::IsDistinctFrom,
+                        negated: false,
                     });
                     return Some(if op == Operator::IsDistinctFrom {
-                        other.clone().is_null().or(covered)
+                        covered.is_not_true()
                     } else {
-                        other.clone().is_not_null().and(covered)
+                        covered.is_true()
                     });
                 }
                 _ => return None,
@@ -393,21 +398,44 @@ mod tests {
         assert_eq!(rewrite(expr.clone()), expr);
     }
 
+    /// Distinctness has to stay decided for a null operand, and it has to name
+    /// the operand once so a computed one is not evaluated twice.
     #[rstest]
     #[case::is_not_distinct_from(Operator::IsNotDistinctFrom)]
     #[case::is_distinct_from(Operator::IsDistinctFrom)]
-    fn distinct_from_keeps_its_null_handling(#[case] op: Operator) {
+    fn distinct_from_lowers_through_a_null_defaulted_list(#[case] op: Operator) {
         let covered = Expr::InList(InList {
             expr: Box::new(col("x")),
             list: vec![lit(-0.0), lit(0.0)],
-            negated: op == Operator::IsDistinctFrom,
+            negated: false,
         });
         let expected = if op == Operator::IsDistinctFrom {
-            col("x").is_null().or(covered)
+            covered.is_not_true()
         } else {
-            col("x").is_not_null().and(covered)
+            covered.is_true()
         };
         assert_eq!(rewrite(compare(col("x"), op, lit(0.0))), expected);
+    }
+
+    /// The operand does not have to be a column. Bailing out on anything else
+    /// used to leave `filter_expr` answering computed operands on Arrow's
+    /// sign-sensitive order, which returns wrong rows.
+    #[rstest]
+    #[case::is_not_distinct_from(Operator::IsNotDistinctFrom)]
+    #[case::is_distinct_from(Operator::IsDistinctFrom)]
+    fn distinct_from_rewrites_a_computed_operand(#[case] op: Operator) {
+        let computed = col("x") * lit(2.0);
+        let covered = Expr::InList(InList {
+            expr: Box::new(computed.clone()),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        });
+        let expected = if op == Operator::IsDistinctFrom {
+            covered.is_not_true()
+        } else {
+            covered.is_true()
+        };
+        assert_eq!(rewrite(compare(computed, op, lit(0.0))), expected);
     }
 
     /// Several paths optimize the same expression more than once, so every shape
@@ -504,5 +532,38 @@ mod tests {
             .optimize_expr(planner.parse_filter(filter).unwrap())
             .unwrap();
         assert_eq!(planner.optimize_expr(once.clone()).unwrap(), once);
+    }
+
+    /// A comparison whose operands are all constant never reaches the rewrite if
+    /// the rewrite only runs after `simplify`: the simplifier folds it to a bare
+    /// boolean under Arrow's total order first, and there is nothing left to
+    /// repair. These fold to the IEEE answer only because the rewrite also runs
+    /// before `simplify`.
+    #[rstest]
+    #[case::lt("-1.0 * 0.0 < 0.0", false)]
+    #[case::eq("(-1.0 * 0.0) = 0.0", true)]
+    #[case::gt_eq("(-1.0 * 0.0) >= 0.0", true)]
+    #[case::not_eq("(-1.0 * 0.0) != 0.0", false)]
+    #[case::gt("(-1.0 * 0.0) > 0.0", false)]
+    #[case::lt_eq("(-1.0 * 0.0) <= 0.0", true)]
+    fn folded_constant_comparisons_use_ieee_semantics(
+        #[case] filter: &str,
+        #[case] expected: bool,
+    ) {
+        let schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Float64,
+                true,
+            )]));
+        let planner = crate::planner::Planner::new(schema);
+        let optimized = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        assert_eq!(
+            optimized,
+            Expr::Literal(ScalarValue::Boolean(Some(expected)), None),
+            "filter: {filter}"
+        );
     }
 }

@@ -1024,10 +1024,23 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
-        let expr = simplifier.simplify(expr)?;
 
-        // Last, so the rewrite sees literals already coerced to the column's type
-        // and BETWEEN already expanded into two comparisons.
+        // Once before simplify and once after, because each pass reaches
+        // comparisons the other cannot.
+        //
+        // Before, because `simplify` const-folds a fully constant comparison
+        // under Arrow's total order and leaves a bare boolean behind:
+        // `-1.0 * 0.0 < 0.0` folds to `true` where IEEE says false, and by then
+        // there is no zero comparison left to repair.
+        //
+        // After, because `simplify` is also what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on the second pass.
+        //
+        // Running twice is safe because the rewrite is a fixed point of
+        // `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
+        let expr = rewrite_signed_zero_comparisons(expr)?;
+        let expr = simplifier.simplify(expr)?;
         let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
