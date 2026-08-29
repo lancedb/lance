@@ -81,6 +81,7 @@ class IndexSegmentDescription:
     created_at: Optional[datetime]
     size_bytes: Optional[int]
     base_id: Optional[int]
+    covering_fields: list[int]
 
     def __repr__(self) -> str: ...
 

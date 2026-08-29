@@ -448,6 +448,25 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::BinaryView => Some(value.clone()),
             _ => None,
         },
+        ScalarValue::LargeBinary(_) => match ty {
+            DataType::LargeBinary => Some(value.clone()),
+            _ => None,
+        },
+        ScalarValue::Decimal128(_, _, _) => match ty {
+            DataType::Decimal128(_, _) => value.cast_to(ty).ok(),
+            _ => None,
+        },
+        ScalarValue::Decimal256(_, _, _) => match ty {
+            DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
+            _ => None,
+        },
+        ScalarValue::DurationSecond(_)
+        | ScalarValue::DurationMillisecond(_)
+        | ScalarValue::DurationMicrosecond(_)
+        | ScalarValue::DurationNanosecond(_) => match ty {
+            DataType::Duration(_) => value.cast_to(ty).ok(),
+            _ => None,
+        },
         // A dictionary-encoded literal (e.g. produced by DataFusion's dictionary
         // cast in the scalar-index path) coerces by unwrapping its underlying value.
         ScalarValue::Dictionary(_, inner) => safe_coerce_scalar(inner, ty),
@@ -457,6 +476,8 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::i256;
+
     use super::*;
 
     #[test]
@@ -732,6 +753,13 @@ mod tests {
             ),
             Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
         );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::DurationNanosecond(Some(2_000_000)),
+                &DataType::Duration(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::DurationMillisecond(Some(2)))
+        );
     }
 
     #[test]
@@ -788,6 +816,31 @@ mod tests {
                 &DataType::BinaryView
             ),
             Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::LargeBinary(Some(vec![1, 2, 3])),
+                &DataType::LargeBinary
+            ),
+            Some(ScalarValue::LargeBinary(Some(vec![1, 2, 3])))
+        );
+    }
+
+    #[test]
+    fn test_decimal_coerce() {
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Decimal128(Some(2), 10, 0),
+                &DataType::Decimal128(12, 2),
+            ),
+            Some(ScalarValue::Decimal128(Some(200), 12, 2))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Decimal256(Some(i256::from_i128(2)), 76, 0),
+                &DataType::Decimal256(76, 2),
+            ),
+            Some(ScalarValue::Decimal256(Some(i256::from_i128(200)), 76, 2))
         );
     }
 

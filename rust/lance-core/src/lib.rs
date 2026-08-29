@@ -60,6 +60,9 @@ pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 /// - `_rowoffset`: The row offset
 /// - `_row_last_updated_at_version`: The version when the row was last updated
 /// - `_row_created_at_version`: The version when the row was created
+///
+/// Write paths must reject a stored column named for one: the scanner injects
+/// these itself, so a stored copy collides with the injected one on read.
 pub fn is_system_column(column_name: &str) -> bool {
     matches!(
         column_name,

@@ -20,7 +20,7 @@ use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
     Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
-    LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    LargeListArray, ListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
     UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
@@ -475,6 +475,20 @@ pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> 
     }
 }
 
+pub fn iter_binary_array(
+    arr: &dyn Array,
+) -> Result<Box<dyn Iterator<Item = Option<&[u8]>> + Send + '_>> {
+    match arr.data_type() {
+        DataType::Binary => Ok(Box::new(arr.as_binary::<i32>().iter())),
+        DataType::LargeBinary => Ok(Box::new(arr.as_binary::<i64>().iter())),
+        DataType::BinaryView => Ok(Box::new(arr.as_binary_view().iter())),
+        DataType::FixedSizeBinary(_) => Ok(Box::new(arr.as_fixed_size_binary().iter())),
+        data_type => Err(ArrowError::InvalidArgumentError(format!(
+            "Expecting a binary type, found {data_type}"
+        ))),
+    }
+}
+
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
@@ -845,6 +859,30 @@ fn project_array(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
                 projected_values,
                 list_arr.nulls().cloned(),
             )))
+        }
+        // A nullable entries field fails MapArray::try_new unconditionally,
+        // so a (schema-invalid) map declared that way keeps the clone
+        // fallthrough it always had rather than gaining a new error.
+        DataType::Map(entries_field, sorted) if !entries_field.is_nullable() => {
+            let map_arr = array.as_map();
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(ArrowError::SchemaError(format!(
+                    "Map entries field must be a struct, got {}",
+                    entries_field.data_type()
+                )));
+            };
+            let projected_entries = project(map_arr.entries(), entry_fields)?;
+            // try_new re-checks the entries invariants (a non-null entries
+            // struct, two entry columns, offset bounds); null keys are ruled
+            // out one level down, by the struct rebuild against the
+            // non-nullable key field.
+            Ok(Arc::new(MapArray::try_new(
+                entries_field.clone(),
+                map_arr.offsets().clone(),
+                projected_entries,
+                map_arr.nulls().cloned(),
+                *sorted,
+            )?))
         }
         _ => Ok(array.clone()),
     }
@@ -1560,8 +1598,11 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
-    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
+    use arrow_array::{
+        BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Int32Array,
+        LargeBinaryArray, ListArray, NullArray, StringArray, StructArray, new_empty_array,
+        new_null_array,
+    };
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1961,6 +2002,60 @@ mod tests {
                 vec![Arc::new(Int32Array::from_iter_values(0..20))],
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_project_rebuilds_sliced_map() {
+        // A sliced MapArray keeps its full entries array behind sliced
+        // offsets and validity; the Map projection arm must rebuild it
+        // without renormalizing either.
+        let entry_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]);
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entry_fields.clone()),
+            false,
+        ));
+        let entries = StructArray::new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1", "k2"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(vec![0, 1, 1, 3].into()),
+            entries,
+            Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(entries_field, false),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(map) as ArrayRef]).unwrap();
+
+        // Rows 1..3: a null slot and a two-entry slot, offsets not zero-based.
+        let projected = batch
+            .slice(1, 2)
+            .project_by_schema(schema.as_ref())
+            .unwrap();
+        let map = projected.column(0).as_map();
+        assert!(map.is_null(0));
+        assert!(map.is_valid(1));
+        assert_eq!(map.value_length(1), 2);
+        assert_eq!(
+            map.value(1)
+                .column(1)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[2, 3]
         );
     }
 
@@ -2760,5 +2855,43 @@ mod tests {
             innermost_struct.column(1).as_ref(),
             &Int32Array::from(vec![1, 2]) as &dyn Array
         );
+    }
+
+    #[test]
+    fn test_iter_binary_array_accepts_binary_variants() {
+        let binary = BinaryArray::from(vec![b"a".as_slice(), b"bc"]);
+        assert_eq!(
+            iter_binary_array(&binary).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"a".as_slice()), Some(b"bc".as_slice())]
+        );
+
+        let large_binary = LargeBinaryArray::from(vec![b"x".as_slice(), b"yz"]);
+        assert_eq!(
+            iter_binary_array(&large_binary)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![Some(b"x".as_slice()), Some(b"yz".as_slice())]
+        );
+
+        let binary_view = BinaryViewArray::from(vec![b"1".as_slice(), b"23"]);
+        assert_eq!(
+            iter_binary_array(&binary_view).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"1".as_slice()), Some(b"23".as_slice())]
+        );
+
+        let fixed_size = FixedSizeBinaryArray::from(vec![b"abcd", b"efgh"]);
+        assert_eq!(
+            iter_binary_array(&fixed_size).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"abcd".as_slice()), Some(b"efgh".as_slice())]
+        );
+    }
+
+    #[test]
+    fn test_iter_binary_array_rejects_non_binary() {
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let Err(error) = iter_binary_array(&int_array) else {
+            panic!("expected an error for non-binary array");
+        };
+        assert!(error.to_string().contains("Expecting a binary type"));
     }
 }
