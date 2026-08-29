@@ -3,6 +3,7 @@
 
 //! Rewrites of comparisons against a floating point zero literal.
 
+use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
@@ -47,6 +48,76 @@ pub fn rewrite_signed_zero_comparisons(expr: Expr) -> Result<Expr> {
             Ok(match rewrite_node(&node) {
                 Some(rewritten) => Transformed::yes(rewritten),
                 None => Transformed::no(node),
+            })
+        })?
+        .data)
+}
+
+/// Whether the rewrite acts on comparisons under `op`.
+fn is_zero_sensitive(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Eq
+            | Operator::NotEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    )
+}
+
+/// Fold each zero-sensitive comparison's own operands and rewrite it, bottom-up,
+/// before anything above it has a chance to fold.
+///
+/// [`rewrite_signed_zero_comparisons`] alone cannot reach a comparison whose zero
+/// does not exist yet. `ExprSimplifier::simplify` folds an operand and everything
+/// above it in one pass, so `-1.0 * 0.0 < (1.0 - 1.0)` goes straight to a boolean
+/// decided by Arrow's total order, and a wrapper like `IS TRUE` or a `CAST` around
+/// it does the same to the comparison's own result.
+///
+/// Visiting bottom-up and folding only the operands of the node in hand is what
+/// closes that: by the time any container is folded, every comparison inside it
+/// already carries the corrected literal. This deliberately does not enumerate
+/// which containers are allowed above a comparison. Enumerating them is what left
+/// `IS TRUE`, `IS FALSE`, `= TRUE`, `CAST(.. AS BOOLEAN)` and `IN (TRUE)` exposed,
+/// and any list would keep missing the next spelling.
+pub fn normalize_zero_comparisons(
+    expr: Expr,
+    simplify: &dyn Fn(Expr) -> DFResult<Expr>,
+) -> Result<Expr> {
+    Ok(expr
+        .transform_up(|node| {
+            let folded = match node {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_zero_sensitive(op) => {
+                    Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(simplify(*left)?),
+                        op,
+                        right: Box::new(simplify(*right)?),
+                    })
+                }
+                Expr::Between(between) => Expr::Between(Between {
+                    expr: Box::new(simplify(*between.expr)?),
+                    negated: between.negated,
+                    low: Box::new(simplify(*between.low)?),
+                    high: Box::new(simplify(*between.high)?),
+                }),
+                Expr::InList(in_list) => Expr::InList(InList {
+                    expr: Box::new(simplify(*in_list.expr)?),
+                    list: in_list
+                        .list
+                        .into_iter()
+                        .map(simplify)
+                        .collect::<DFResult<Vec<_>>>()?,
+                    negated: in_list.negated,
+                }),
+                other => return Ok(Transformed::no(other)),
+            };
+            Ok(match rewrite_node(&folded) {
+                Some(rewritten) => Transformed::yes(rewritten),
+                // The operands were still folded, so this is a change either way.
+                None => Transformed::yes(folded),
             })
         })?
         .data)
@@ -597,6 +668,17 @@ mod tests {
     // Nested under a connective, so the operand pass has to descend.
     #[case::under_or("(-1.0 * 0.0) < (1.0 - 1.0) OR 1.0 > 2.0", false)]
     #[case::under_not("NOT ((-1.0 * 0.0) < (1.0 - 1.0))", true)]
+    // Wrapped in something that folds the comparison's own result. These are why
+    // the operand folding walks every container instead of a list of allowed
+    // parents: each of these is a different spelling of the same exposure.
+    #[case::under_is_true("((-1.0 * 0.0) < (1.0 - 1.0)) IS TRUE", false)]
+    #[case::under_is_false("((-1.0 * 0.0) < (1.0 - 1.0)) IS FALSE", true)]
+    #[case::under_is_not_true("((-1.0 * 0.0) < (1.0 - 1.0)) IS NOT TRUE", true)]
+    #[case::under_eq_true("((-1.0 * 0.0) < (1.0 - 1.0)) = TRUE", false)]
+    #[case::under_cast("CAST(((-1.0 * 0.0) < (1.0 - 1.0)) AS BOOLEAN)", false)]
+    #[case::under_in_true("((-1.0 * 0.0) < (1.0 - 1.0)) IN (TRUE)", false)]
+    #[case::under_is_true_eq("((-1.0 * 0.0) = (1.0 - 1.0)) IS TRUE", true)]
+    #[case::under_nested_wrappers("NOT (((-1.0 * 0.0) < (1.0 - 1.0)) IS TRUE)", true)]
     fn folded_constant_comparisons_use_ieee_semantics(
         #[case] filter: &str,
         #[case] expected: bool,
