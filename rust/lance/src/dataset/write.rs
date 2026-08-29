@@ -595,6 +595,41 @@ pub async fn write_fragments(
         .await
 }
 
+/// Split `batches` at exactly `split_rows`, returning `(head, tail)` where
+/// `head` contains the first `split_rows` rows and `tail` the remainder.
+///
+/// A batch that straddles the boundary is sliced into a head part and a tail
+/// part.  Empty slices are dropped.  Used by [`do_write_fragments_impl`] to
+/// honor the hard `max_rows_per_file` boundary when a byte-triggered chunk
+/// emission produces a chunk whose row count would push the current file over
+/// the cap.
+fn split_batches_at_row_boundary(
+    batches: Vec<RecordBatch>,
+    split_rows: usize,
+) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut taken = 0usize;
+    for batch in batches {
+        let rows = batch.num_rows();
+        if taken >= split_rows {
+            tail.push(batch);
+        } else if taken + rows <= split_rows {
+            head.push(batch);
+            taken += rows;
+        } else {
+            let need = split_rows - taken;
+            head.push(batch.slice(0, need));
+            let tail_rows = rows - need;
+            if tail_rows > 0 {
+                tail.push(batch.slice(need, tail_rows));
+            }
+            taken = split_rows;
+        }
+    }
+    (head, tail)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     dataset: Option<&Dataset>,
@@ -607,6 +642,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
+    split_chunks_at_file_boundary: bool,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -643,26 +679,89 @@ where
     // can run cleanup before propagating the error.
     let loop_result: Result<()> = async {
         while let Some(batch_chunk) = buffered_reader.next().await {
-            let batch_chunk = batch_chunk?;
+            let mut batch_chunk = batch_chunk?;
 
-            if writer.is_none() {
-                let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-                params.progress.begin(&new_fragment).await?;
-                writer = Some(new_writer);
-                fragments.push(new_fragment);
-            }
+            // A byte-triggered chunk emission may produce a chunk whose row
+            // count would push the current file over `max_rows_per_file`.  Split
+            // such chunks at the writer's remaining row capacity so the hard
+            // row cap is honored independently of input batch width.
+            loop {
+                if writer.is_none() {
+                    let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+                    params.progress.begin(&new_fragment).await?;
+                    writer = Some(new_writer);
+                    fragments.push(new_fragment);
+                }
 
-            writer.as_mut().unwrap().write(&batch_chunk).await?;
-            for seed_writer in seed_writers.iter_mut() {
-                let col_name = seed_writer.column_name().to_owned();
-                for batch in &batch_chunk {
-                    if let Some(col) = batch.column_by_name(&col_name) {
-                        seed_writer.observe_batch(col)?;
+                let remaining = if split_chunks_at_file_boundary {
+                    params.max_rows_per_file - num_rows_in_current_file as usize
+                } else {
+                    // V1 relies on row-group chunking and only rotates after a
+                    // chunk pushes the file over the cap, so do not split chunks
+                    // here (preserves the legacy behavior tested by
+                    // test_max_rows_per_group).
+                    usize::MAX
+                };
+                let chunk_rows: usize = batch_chunk.iter().map(|b| b.num_rows()).sum();
+
+                if chunk_rows <= remaining {
+                    writer.as_mut().unwrap().write(&batch_chunk).await?;
+                    for seed_writer in seed_writers.iter_mut() {
+                        let col_name = seed_writer.column_name().to_owned();
+                        for batch in &batch_chunk {
+                            if let Some(col) = batch.column_by_name(&col_name) {
+                                seed_writer.observe_batch(col)?;
+                            }
+                        }
+                    }
+                    for batch in &batch_chunk {
+                        num_rows_in_current_file += batch.num_rows() as u32;
+                    }
+                    break;
+                }
+
+                // Split: head fills the remaining row capacity, tail goes to
+                // the next file.
+                let (head, tail) = split_batches_at_row_boundary(batch_chunk, remaining);
+                writer.as_mut().unwrap().write(&head).await?;
+                for seed_writer in seed_writers.iter_mut() {
+                    let col_name = seed_writer.column_name().to_owned();
+                    for batch in &head {
+                        if let Some(col) = batch.column_by_name(&col_name) {
+                            seed_writer.observe_batch(col)?;
+                        }
                     }
                 }
-            }
-            for batch in &batch_chunk {
-                num_rows_in_current_file += batch.num_rows() as u32;
+                for batch in &head {
+                    num_rows_in_current_file += batch.num_rows() as u32;
+                }
+
+                // The head filled the file's row capacity; finish and rotate.
+                let mut w = writer.take().unwrap();
+                flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
+                let (num_rows, data_file) = w.finish().await?;
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                debug_assert_eq!(num_rows, num_rows_in_current_file);
+                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                rows_completed += num_rows as u64;
+                files_written += 1;
+                let last_fragment = fragments.last_mut().unwrap();
+                last_fragment.physical_rows = Some(num_rows as usize);
+                last_fragment.files.push(data_file);
+                params.progress.complete(fragments.last().unwrap()).await?;
+                if let Some(cb) = &params.write_progress {
+                    cb.call(WriteStats {
+                        bytes_written: bytes_completed,
+                        rows_written: rows_completed,
+                        files_written,
+                    });
+                }
+                num_rows_in_current_file = 0;
+
+                if tail.is_empty() {
+                    break;
+                }
+                batch_chunk = tail;
             }
 
             if let Some(cb) = &params.write_progress {
@@ -2161,6 +2260,132 @@ mod tests {
             .map(|f| f.physical_rows.unwrap_or(0))
             .collect();
         assert_eq!(row_counts, vec![5000, 5000, 2000]);
+    }
+
+    // Zero file-size limits must be rejected at the write boundary with a
+    // descriptive error rather than silently dropping input or panicking
+    // inside the chunker.
+    #[tokio::test]
+    async fn test_zero_file_limits_rejected() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("x", arrow::datatypes::DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let make_stream = || {
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok(batch.clone())]),
+            ))
+        };
+
+        let object_store = Arc::new(ObjectStore::memory());
+
+        let err = write_fragments_internal(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store.clone(),
+            &Path::from("test"),
+            Schema::try_from(schema.as_ref()).unwrap(),
+            make_stream(),
+            WriteParams {
+                max_rows_per_file: 0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("max_rows_per_file"),
+            "expected max_rows_per_file in error, got: {err}"
+        );
+
+        let err = write_fragments_internal(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store,
+            &Path::from("test"),
+            Schema::try_from(schema.as_ref()).unwrap(),
+            make_stream(),
+            WriteParams {
+                max_bytes_per_file: 0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("max_bytes_per_file"),
+            "expected max_bytes_per_file in error, got: {err}"
+        );
+    }
+
+    // Byte-triggered chunk emissions must still honor the hard
+    // `max_rows_per_file` boundary.  With max_rows_per_file=10 and three 4-row
+    // FixedSizeBinary(3 MiB) batches (each larger than the chunker byte budget),
+    // the writer must split the third emitted chunk so the result is [10, 2]
+    // rather than [12].
+    #[tokio::test]
+    async fn test_byte_flush_preserves_hard_row_cap() {
+        use arrow::array::FixedSizeBinaryArray;
+
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "payload",
+            arrow::datatypes::DataType::FixedSizeBinary(3 * 1024 * 1024),
+            false,
+        ));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+        let make_batch = |n: usize| {
+            let arr = FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(
+                vec![0xAB; 3 * 1024 * 1024],
+                n,
+            ))
+            .unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap()
+        };
+
+        // Three 4-row batches, each 12 MiB > 8 MiB chunker byte budget → each
+        // triggers a byte flush.  With max_rows_per_file=10 the writer must
+        // split the third chunk (2 rows to fill file 1, 2 rows to file 2).
+        let batches = vec![make_batch(4), make_batch(4), make_batch(4)];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let data_stream = {
+            let s = reader.map(|rb| rb.map_err(datafusion::error::DataFusionError::from));
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(s),
+            ))
+        };
+
+        let object_store = Arc::new(ObjectStore::memory());
+        let (fragments, _) = write_fragments_internal(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store,
+            &Path::from("test"),
+            Schema::try_from(schema.as_ref()).unwrap(),
+            data_stream,
+            WriteParams {
+                max_rows_per_file: 10,
+                max_bytes_per_file: 1024 * 1024 * 1024,
+                mode: WriteMode::Create,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let row_counts: Vec<usize> = fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap_or(0))
+            .collect();
+        assert_eq!(row_counts, vec![10, 2]);
     }
 
     #[tokio::test]

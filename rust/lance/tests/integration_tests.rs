@@ -3,6 +3,7 @@
 
 // NOTE: we only create one integration test binary, to keep compilation overhead down.
 
+mod compaction_page_coalescing;
 mod count_pushdown;
 mod mem_wal;
 #[cfg(feature = "slow_tests")]
