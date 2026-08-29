@@ -1433,7 +1433,9 @@ def test_packed_blob_writer_scalar_buffer_inputs(tmp_path, payload):
     assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize("array_type", [pa.binary(), pa.large_binary()])
+@pytest.mark.parametrize(
+    "array_type", [pa.binary(), pa.large_binary(), pa.binary_view()]
+)
 @pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
 @pytest.mark.parametrize(
     "values,slice_offset,slice_length,expected_values,expected_data",
@@ -2403,3 +2405,75 @@ def test_to_pandas_returns_blob_files_when_nested_field_is_aliased(
     assert images[0].readall() == b"foo"
     assert images[1] is None
     assert images[2].readall() == b"baz"
+
+
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_binary_view(tmp_path, as_chunked):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    values = [b"hello", None, b"", b"world"]
+    payloads = pa.array(values, type=pa.binary_view())
+    if as_chunked:
+        payloads = pa.chunked_array([payloads.slice(0, 2), payloads.slice(2)])
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    expected_descriptors = []
+    position = 0
+    for value in values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"helloworld"
+
+
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_fixed_size_binary(tmp_path, as_chunked):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    values = [b"word", None, b"test"]
+    payloads = pa.array(values, type=pa.binary(4))
+    if as_chunked:
+        payloads = pa.chunked_array([payloads.slice(0, 2), payloads.slice(2)])
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    expected_descriptors = []
+    position = 0
+    for value in values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"wordtest"

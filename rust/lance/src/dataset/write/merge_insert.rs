@@ -76,7 +76,7 @@ use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SortOptions};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -149,6 +149,73 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+/// Build a source schema in target field order while preserving the source's
+/// logical leaf types. The latter matters for extension columns such as Arrow
+/// JSON, whose write input is Utf8 while the dataset's physical type is binary.
+pub(crate) fn canonical_source_schema(
+    source: &Schema,
+    target: &Schema,
+) -> std::result::Result<Schema, ArrowError> {
+    fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
+        let data_type = match (source.data_type(), target.data_type()) {
+            (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                let fields = target_fields
+                    .iter()
+                    .map(|target_field| {
+                        let source_field = source_fields
+                            .iter()
+                            .find(|field| field.name() == target_field.name())
+                            .ok_or_else(|| {
+                                ArrowError::SchemaError(format!(
+                                    "field {} does not exist in source struct {}",
+                                    target_field.name(),
+                                    source.name()
+                                ))
+                            })?;
+                        canonical_field(source_field, target_field).map(Arc::new)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                DataType::Struct(fields.into())
+            }
+            (DataType::List(source_item), DataType::List(target_item)) => {
+                DataType::List(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (DataType::LargeList(source_item), DataType::LargeList(target_item)) => {
+                DataType::LargeList(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (
+                DataType::FixedSizeList(source_item, size),
+                DataType::FixedSizeList(target_item, _),
+            ) => {
+                DataType::FixedSizeList(Arc::new(canonical_field(source_item, target_item)?), *size)
+            }
+            (DataType::Map(source_entries, sorted), DataType::Map(target_entries, _)) => {
+                DataType::Map(
+                    Arc::new(canonical_field(source_entries, target_entries)?),
+                    *sorted,
+                )
+            }
+            _ => source.data_type().clone(),
+        };
+        Ok(source.clone().with_data_type(data_type))
+    }
+
+    let fields = target
+        .fields()
+        .iter()
+        .map(|target_field| {
+            let source_field = source.field_with_name(target_field.name()).map_err(|_| {
+                ArrowError::SchemaError(format!(
+                    "field {} does not exist in source schema",
+                    target_field.name()
+                ))
+            })?;
+            canonical_field(source_field, target_field).map(Arc::new)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Schema::new_with_metadata(fields, source.metadata().clone()))
+}
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -1148,19 +1215,26 @@ struct SequentialSourcePartitionStream {
     input: Arc<dyn ExecutionPlan>,
     schema: Arc<Schema>,
     ordinal_field: Option<Field>,
+    projection_schema: Option<Arc<Schema>>,
 }
 
 impl SequentialSourcePartitionStream {
-    fn try_new(input: Arc<dyn ExecutionPlan>, ordinal_field: Option<Field>) -> Result<Self> {
+    fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        ordinal_field: Option<Field>,
+        projection_schema: Option<Arc<Schema>>,
+    ) -> Result<Self> {
+        let input_schema = projection_schema.clone().unwrap_or_else(|| input.schema());
         let schema = if let Some(field) = ordinal_field.as_ref() {
-            Arc::new(input.schema().as_ref().try_with_column(field.clone())?)
+            Arc::new(input_schema.as_ref().try_with_column(field.clone())?)
         } else {
-            input.schema()
+            input_schema
         };
         Ok(Self {
             input,
             schema,
             ordinal_field,
+            projection_schema,
         })
     }
 
@@ -1171,9 +1245,10 @@ impl SequentialSourcePartitionStream {
         provider: &Arc<dyn TableProvider>,
         context: &SessionContext,
         ordinal_field: Option<Field>,
+        projection_schema: Option<Arc<Schema>>,
     ) -> Result<Arc<dyn TableProvider>> {
         let input = provider.scan(&context.state(), None, &[], None).await?;
-        let partition = Arc::new(Self::try_new(input, ordinal_field)?);
+        let partition = Arc::new(Self::try_new(input, ordinal_field, projection_schema)?);
         Ok(Arc::new(StreamingTable::try_new(
             partition.schema().clone(),
             vec![partition],
@@ -1195,6 +1270,17 @@ impl PartitionStream for SequentialSourcePartitionStream {
         let partition_streams = stream::iter(0..partition_count)
             .map(move |partition| input.execute(partition, context.clone()))
             .try_flatten();
+        let projection_schema = self.projection_schema.clone();
+        let partition_streams = partition_streams.map(move |batch| {
+            let batch = batch?;
+            if let Some(projection_schema) = projection_schema.as_ref() {
+                batch
+                    .project_by_schema(projection_schema.as_ref())
+                    .map_err(DataFusionError::from)
+            } else {
+                Ok(batch)
+            }
+        });
 
         if let Some(ordinal_field) = self.ordinal_field.clone() {
             let mut next_ordinal = 0_u64;
@@ -1263,6 +1349,9 @@ impl MergeInsertJob {
             .lance_file_format();
         let mut options = versions::schema_compare_options(version);
         options.compare_nullability = NullabilityComparison::Ignore;
+        // Merge columns are matched by name, so a complete source remains a
+        // full-schema merge even when the caller orders its fields differently.
+        options.ignore_field_order = true;
 
         // Try full schema match first.
         if lance_schema
@@ -1274,7 +1363,6 @@ impl MergeInsertJob {
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
-        options.ignore_field_order = true; // Subschema matching should typically ignore order.
 
         lance_schema
             .check_compatible(target_schema, &options)
@@ -1336,6 +1424,7 @@ impl MergeInsertJob {
         source_provider: Arc<dyn TableProvider>,
         source_is_replayable: bool,
         indexed_keys: Vec<(String, IndexMetadata)>,
+        source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
@@ -1343,7 +1432,9 @@ impl MergeInsertJob {
             !indexed_keys.is_empty(),
             "create_indexed_scan_joined_stream requires at least one indexed key"
         );
-        let schema = source_provider.schema();
+        let schema = source_projection
+            .clone()
+            .unwrap_or_else(|| source_provider.schema());
         let add_row_addr = match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => false,
             SchemaComparison::Subschema => true,
@@ -1377,12 +1468,14 @@ impl MergeInsertJob {
                 &source_provider,
                 session_ctx,
                 ordinal_field.clone(),
+                source_projection.clone(),
             )
             .await?;
             let index_scan = SequentialSourcePartitionStream::from_provider_scan(
                 &source_provider,
                 session_ctx,
                 None,
+                source_projection.clone(),
             )
             .await?;
             (
@@ -1398,6 +1491,7 @@ impl MergeInsertJob {
                 &source_provider,
                 session_ctx,
                 ordinal_field,
+                source_projection.clone(),
             )
             .await?;
             let source = provider_to_stream(normalized_source).await?;
@@ -1722,6 +1816,7 @@ impl MergeInsertJob {
         &self,
         source_provider: Arc<dyn TableProvider>,
         source_is_replayable: bool,
+        source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
         if self.params.use_index
             && matches!(
@@ -1740,6 +1835,7 @@ impl MergeInsertJob {
                         source_provider,
                         source_is_replayable,
                         indexed_keys,
+                        source_projection,
                     )
                     .await;
             }
@@ -1755,6 +1851,20 @@ impl MergeInsertJob {
         }
 
         let source = provider_to_stream(source_provider).await?;
+        let source = if let Some(projection_schema) = source_projection {
+            let output_schema = projection_schema.clone();
+            let projected = source.map(move |batch| {
+                batch.and_then(|batch| {
+                    batch
+                        .project_by_schema(projection_schema.as_ref())
+                        .map_err(DataFusionError::from)
+                })
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, projected))
+                as SendableRecordBatchStream
+        } else {
+            source
+        };
         self.create_full_table_joined_stream(source).await
     }
 
@@ -2280,6 +2390,16 @@ impl MergeInsertJob {
                     .collect::<Vec<_>>()
                     .into();
                 data_file.fields = new_fields;
+            }
+        }
+
+        // Data files record physical leaf fields, while an index can be attached to
+        // a logical parent such as a list. Include every affected ancestor so index
+        // coverage is pruned for the complete logical column that was rewritten.
+        let directly_updated_fields = all_fields_updated.iter().copied().collect::<Vec<_>>();
+        for field_id in directly_updated_fields {
+            if let Some(ancestry) = dataset.schema().field_ancestry_by_id(field_id as i32) {
+                all_fields_updated.extend(ancestry.into_iter().map(|field| field.id as u32));
             }
         }
 
@@ -2962,11 +3082,23 @@ impl MergeInsertJob {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
                 compare_nullability: NullabilityComparison::Ignore,
+                // Keep this classification consistent with `can_use_create_plan`
+                // and `check_compatible_schema`: merge columns match by name.
+                ignore_field_order: true,
                 ..Default::default()
             },
         );
+        let source_projection = if is_full_schema {
+            Some(Arc::new(canonical_source_schema(
+                source_schema.as_ref(),
+                &Schema::from(full_schema),
+            )?))
+        } else {
+            None
+        };
+        let source_schema = source_projection.clone().unwrap_or(source_schema);
         let joined = self
-            .create_joined_stream(provider, source_is_replayable)
+            .create_joined_stream(provider, source_is_replayable, source_projection)
             .await?;
         let merger = Merger::try_new(
             self.params.clone(),
@@ -3028,8 +3160,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
@@ -3183,8 +3314,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
@@ -8871,7 +9001,7 @@ mod tests {
     #[rstest::rstest]
     #[case::all_success(Duration::from_secs(100_000))]
     #[case::timeout(Duration::from_millis(200))]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),

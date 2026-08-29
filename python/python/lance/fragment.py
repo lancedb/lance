@@ -386,7 +386,7 @@ class LanceFragment(pa.dataset.Fragment):
         data: ReaderLike,
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
@@ -416,8 +416,9 @@ class LanceFragment(pa.dataset.Fragment):
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.
-        max_rows_per_group: int, default 1024
-            The maximum number of rows per group in the data file.
+        max_rows_per_group: int, optional, default 1024
+            The maximum number of rows per group in the data file. ``None``
+            leaves the writer default in place.
         progress: FragmentWriteProgress, optional
             *Experimental API*. Progress tracking for writing the fragment. Pass
             a custom class that defines hooks to be called when each fragment is
@@ -1051,12 +1052,12 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
-    def data_files(self):
+    def data_files(self) -> List[DataFile]:
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
 
-    def deletion_file(self):
+    def deletion_file(self) -> Optional[str]:
         """Return the deletion file, if any"""
         return self._fragment.deletion_file()
 
@@ -1082,7 +1083,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[True],
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1109,7 +1110,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[False] = False,
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1136,7 +1137,7 @@ def write_fragments(
     return_transaction: bool = False,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
-    max_rows_per_group: int = 1024,
+    max_rows_per_group: Optional[int] = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
@@ -1178,8 +1179,9 @@ def write_fragments(
         "overwrite" to assign new field ids to the schema.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
-    max_rows_per_group : int, default 1024
-        The maximum number of rows per group in the data file.
+    max_rows_per_group : int, optional, default 1024
+        The maximum number of rows per group in the data file. ``None`` leaves
+        the writer default in place.
     max_bytes_per_file : int, default 90 * 1024 * 1024 * 1024
         The max number of bytes to write before starting a new file. This is a
         soft limit. This limit is checked after each group is written, which
