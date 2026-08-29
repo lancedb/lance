@@ -203,7 +203,7 @@ def _sample_init_centroids(
 ) -> "torch.Tensor":
     """Take up to k vectors from ds to seed kmeans, skipping non-finite ones."""
     # `column is not null` does not exclude NaN vectors, so they can still be
-    # sampled here. Training drops them (distance returns id -1), but a NaN
+    # sampled here.  Training drops them (distance returns id -1), but a NaN
     # centroid never recovers and leaves every partition NaN.
     sampled = []
     num_sampled = 0

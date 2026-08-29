@@ -80,6 +80,7 @@ use lance_namespace::models::{
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result, box_error};
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
@@ -498,31 +499,31 @@ impl DirectoryNamespaceBuilder {
         // Extract manifest_enabled (default: true)
         let manifest_enabled = properties
             .get("manifest_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract dir_listing_enabled (default: true)
         let dir_listing_enabled = properties
             .get("dir_listing_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract inline_optimization_enabled (default: true)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
             .get("table_version_tracking_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
         let dir_listing_to_manifest_migration_enabled = properties
             .get("dir_listing_to_manifest_migration_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
@@ -543,7 +544,7 @@ impl DirectoryNamespaceBuilder {
         // Extract vend_input_storage_options (default: false)
         let vend_input_storage_options = properties
             .get("vend_input_storage_options")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract vend_input_storage_options_refresh_interval_millis (optional)
@@ -554,7 +555,7 @@ impl DirectoryNamespaceBuilder {
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {
