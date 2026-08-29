@@ -215,6 +215,8 @@ impl<'a> InitializeMemWalBuilder<'a> {
         // Resolve (and validate) the sharding choice before any I/O.
         let (sharding_specs, num_shards) = resolve_sharding(dataset, sharding)?;
 
+        dataset.schema().verify_primary_key()?;
+
         let indices = dataset.load_indices().await?;
         if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
             return Err(Error::invalid_input(
