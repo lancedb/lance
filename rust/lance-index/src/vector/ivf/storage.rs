@@ -18,6 +18,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::pb::Ivf as PbIvf;
+use crate::vector::utils::SimpleIndex;
 
 pub const IVF_METADATA_KEY: &str = "lance:ivf";
 pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
@@ -115,6 +116,35 @@ impl IvfModel {
             vec![],
         );
         internal.find_partitions(query, nprobes)
+    }
+
+    /// Use the query vector to find `nprobes` closest partitions, optionally
+    /// routing through an in-memory HNSW index over the centroids.
+    pub fn find_partitions_with_index(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        distance_type: DistanceType,
+        centroid_index: Option<&SimpleIndex>,
+    ) -> Result<(UInt32Array, Float32Array)> {
+        let num_partitions = self.num_partitions();
+        if num_partitions == 0 {
+            return Err(Error::index(
+                "Cannot find IVF partitions because the index has no partitions".to_string(),
+            ));
+        }
+        if nprobes == 0 {
+            return Err(Error::invalid_input(
+                "IVF nprobes must be greater than zero".to_string(),
+            ));
+        }
+        let effective_nprobes = nprobes.min(num_partitions);
+        if effective_nprobes < num_partitions
+            && let Some(centroid_index) = centroid_index
+        {
+            return centroid_index.search_n(query.slice(0, query.len()), effective_nprobes);
+        }
+        self.find_partitions(query, effective_nprobes, distance_type)
     }
 
     /// Add the offset and length of one partition.
@@ -348,5 +378,64 @@ mod tests {
         assert_eq!(first_vals.len(), 2);
         assert_eq!(first_vals.value(0), 1.0);
         assert_eq!(first_vals.value(1), 2.0);
+    }
+
+    #[test]
+    fn test_hnsw_centroid_routing_and_exact_all_partition_fallback() {
+        let centroids = Float32Array::from(
+            (0..100)
+                .flat_map(|value| std::iter::repeat_n(value as f32, 16))
+                .collect::<Vec<_>>(),
+        );
+        let centroids = FixedSizeListArray::try_new_from_values(centroids, 16).unwrap();
+        let ivf = IvfModel::new(centroids.clone(), None);
+        let index = SimpleIndex::try_new_centroid_index(&centroids, DistanceType::L2)
+            .unwrap()
+            .unwrap();
+        let query = Float32Array::from(vec![42.0; 16]);
+
+        let (ids, distances) = ivf
+            .find_partitions_with_index(&query, 5, DistanceType::L2, Some(&index))
+            .unwrap();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(distances.len(), 5);
+        assert_eq!(ids.value(0), 42);
+        assert_eq!(distances.value(0), 0.0);
+        assert_eq!(index.search_count(), 1);
+        assert!(
+            distances
+                .values()
+                .windows(2)
+                .all(|window| window[0] <= window[1])
+        );
+        assert_eq!(
+            ids.values()
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            ids.len()
+        );
+
+        let (all_ids, all_distances) = ivf
+            .find_partitions_with_index(&query, 101, DistanceType::L2, Some(&index))
+            .unwrap();
+        assert_eq!(all_ids.len(), 100);
+        assert_eq!(all_distances.len(), 100);
+        assert_eq!(
+            index.search_count(),
+            1,
+            "all partitions should use exact routing"
+        );
+
+        let error = ivf
+            .find_partitions_with_index(&query, 0, DistanceType::L2, Some(&index))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("nprobes must be greater than zero")
+        );
     }
 }

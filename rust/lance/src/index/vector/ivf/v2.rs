@@ -11,7 +11,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -34,6 +34,7 @@ use lance_core::cache::{
     KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -52,7 +53,7 @@ use lance_index::vector::bq::rabit_ex_bits;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
-use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
@@ -62,6 +63,9 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
     QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext,
     VectorStore,
+};
+use lance_index::vector::utils::{
+    QUERY_CENTROID_HNSW_EF_MULTIPLIER, QUERY_CENTROID_HNSW_MIN_EF, SimpleIndex,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -89,7 +93,193 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
-use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
+use super::{
+    IvfCentroidRouterStatistics, IvfIndexPartitionStatistics, IvfIndexStatistics,
+    maybe_centroids_for_stats,
+};
+
+/// Enables an in-memory HNSW router over IVF centroids at query time for the
+/// current V3 index path.
+///
+/// The graph is reconstructed eagerly from persisted centroids when an index
+/// is opened, so enabling this does not change the index format or require an
+/// index rebuild.
+pub(crate) const LANCE_USE_HNSW_CENTROID_SEARCH: &str = "LANCE_USE_HNSW_CENTROID_SEARCH";
+static NEXT_CENTROID_ROUTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn parse_hnsw_centroid_search_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| str_is_truthy(value.trim()))
+}
+
+fn hnsw_centroid_search_enabled() -> bool {
+    let value = std::env::var(LANCE_USE_HNSW_CENTROID_SEARCH).ok();
+    parse_hnsw_centroid_search_enabled(value.as_deref())
+}
+
+fn build_centroid_router(
+    ivf: IvfModel,
+    distance_type: DistanceType,
+) -> Result<CentroidRouterEntry> {
+    let centroids = ivf.centroids_array().ok_or_else(|| {
+        Error::index(
+            "LANCE_USE_HNSW_CENTROID_SEARCH is enabled but the IVF index has no centroids"
+                .to_string(),
+        )
+    })?;
+    let index = SimpleIndex::try_new_centroid_index(centroids, distance_type)?.ok_or_else(|| {
+        Error::not_supported(format!(
+            "LANCE_USE_HNSW_CENTROID_SEARCH is enabled but HNSW centroid search does not support centroid type {} with distance type {}",
+            centroids.value_type(),
+            distance_type,
+        ))
+    })?;
+    Ok(CentroidRouterEntry {
+        index,
+        metrics: CentroidRouterMetrics::new(),
+        instance_id: NEXT_CENTROID_ROUTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+    })
+}
+
+#[derive(Debug)]
+struct CentroidRouterMetrics {
+    flat_query_count: AtomicU64,
+    fallback_count: AtomicU64,
+    selected_partition_count: AtomicU64,
+    last_selected_partition_count: AtomicU64,
+}
+
+impl CentroidRouterMetrics {
+    fn new() -> Self {
+        Self {
+            flat_query_count: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
+            selected_partition_count: AtomicU64::new(0),
+            last_selected_partition_count: AtomicU64::new(0),
+        }
+    }
+
+    fn record_search(&self, is_hnsw: bool, is_fallback: bool, selected_partitions: usize) {
+        if !is_hnsw {
+            self.flat_query_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_fallback {
+            self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.selected_partition_count
+            .fetch_add(selected_partitions as u64, Ordering::Relaxed);
+        self.last_selected_partition_count
+            .store(selected_partitions as u64, Ordering::Relaxed);
+    }
+
+    fn statistics(
+        &self,
+        centroid_index: &SimpleIndex,
+        router_instance_id: u64,
+    ) -> IvfCentroidRouterStatistics {
+        let hnsw_params = HnswBuildParams::default();
+        IvfCentroidRouterStatistics {
+            mode: "hnsw",
+            hnsw_m: Some(hnsw_params.m),
+            hnsw_ef_construction: Some(hnsw_params.ef_construction),
+            hnsw_query_ef_min: Some(QUERY_CENTROID_HNSW_MIN_EF),
+            hnsw_query_ef_multiplier: Some(QUERY_CENTROID_HNSW_EF_MULTIPLIER),
+            last_hnsw_query_ef: Some(centroid_index.last_search_ef()),
+            router_instance_id,
+            hnsw_query_count: centroid_index.search_count(),
+            flat_query_count: self.flat_query_count.load(Ordering::Relaxed),
+            fallback_count: self.fallback_count.load(Ordering::Relaxed),
+            selected_partition_count: self.selected_partition_count.load(Ordering::Relaxed),
+            last_selected_partition_count: self
+                .last_selected_partition_count
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CentroidRouterEntry {
+    index: SimpleIndex,
+    metrics: CentroidRouterMetrics,
+    instance_id: u64,
+}
+
+impl DeepSizeOf for CentroidRouterEntry {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.index.deep_size_of_children(context)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CentroidRouterCacheKey;
+
+impl CacheKey for CentroidRouterCacheKey {
+    type ValueType = CentroidRouterEntry;
+
+    fn key(&self) -> Cow<'_, str> {
+        "".into()
+    }
+
+    fn type_name() -> &'static str {
+        "IvfCentroidRouter"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-centroid-router-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
+}
+
+async fn load_centroid_router(
+    ivf: &IvfModel,
+    distance_type: DistanceType,
+    index_cache: &LanceCache,
+    enabled: bool,
+) -> Result<Option<Arc<CentroidRouterEntry>>> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    let ivf = ivf.clone();
+    index_cache
+        .get_or_insert_with_key(CentroidRouterCacheKey, move || async move {
+            spawn_cpu(move || build_centroid_router(ivf, distance_type)).await
+        })
+        .await
+        .map(Some)
+}
+
+fn find_partitions_with_router(
+    ivf: &IvfModel,
+    query: &Query,
+    distance_type: DistanceType,
+    centroid_router: Option<&CentroidRouterEntry>,
+) -> Result<(UInt32Array, Float32Array)> {
+    let max_nprobes = query.maximum_nprobes.unwrap_or(ivf.num_partitions());
+    let Some(centroid_router) = centroid_router else {
+        return ivf.find_partitions(&query.key, max_nprobes, distance_type);
+    };
+
+    let effective_nprobes = max_nprobes.min(ivf.num_partitions());
+    let is_hnsw = effective_nprobes > 0 && effective_nprobes < ivf.num_partitions();
+    let (partitions, distances) = ivf.find_partitions_with_index(
+        &query.key,
+        max_nprobes,
+        distance_type,
+        Some(&centroid_router.index),
+    )?;
+    if partitions.len() != effective_nprobes || distances.len() != effective_nprobes {
+        return Err(Error::index(format!(
+            "IVF centroid routing requested {effective_nprobes} partitions but returned {} IDs and {} distances",
+            partitions.len(),
+            distances.len()
+        )));
+    }
+    centroid_router
+        .metrics
+        .record_search(is_hnsw, !is_hnsw, partitions.len());
+    Ok((partitions, distances))
+}
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
@@ -644,6 +834,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     /// Ivf model
     ivf: IvfModel,
+    /// Runtime-only HNSW router over IVF centroids.
+    centroid_router: Option<Arc<CentroidRouterEntry>>,
 
     reader: FileReader,
     /// Narrowed read of the index file, when the sub-index declares that
@@ -678,6 +870,11 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
         self.uri.deep_size_of_children(context)
             + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
+            + self
+                .centroid_router
+                .as_ref()
+                .map(|router| router.deep_size_of_children(context))
+                .unwrap_or_default()
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
@@ -1175,6 +1372,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let rq_search_cache = Self::build_rq_search_cache(&ivf, &storage)?;
+        let centroid_distance_type = if distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            distance_type
+        };
+        let centroid_router = load_centroid_router(
+            &ivf,
+            centroid_distance_type,
+            &index_cache,
+            hnsw_centroid_search_enabled(),
+        )
+        .await?;
 
         // The scheduler is freshly created above and, at this point, has served
         // only the open-time reads (file footers, IVF centroids, quantization
@@ -1192,6 +1401,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             use_residual_scratch,
             rq_search_cache,
             ivf,
+            centroid_router,
             reader: index_reader,
             read_projection,
             storage,
@@ -1206,7 +1416,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     /// Reconstruct an IVFIndex from pre-parsed state without any I/O.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_cached_state(
+    async fn from_cached_state(
         uri: String,
         index_path: String,
         uuid: Uuid,
@@ -1223,6 +1433,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
+        let centroid_distance_type = if distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            distance_type
+        };
+        let centroid_router = load_centroid_router(
+            &ivf,
+            centroid_distance_type,
+            &index_cache,
+            hnsw_centroid_search_enabled(),
+        )
+        .await?;
         Ok(Self {
             uri,
             index_path,
@@ -1232,6 +1454,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             use_residual_scratch,
             rq_search_cache,
             ivf,
+            centroid_router,
             reader,
             read_projection,
             storage,
@@ -1497,6 +1720,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             uuid: self.uuid.to_string(),
             uri: self.uri.clone(),
             metric_type: self.distance_type.to_string(),
+            centroid_router: self
+                .centroid_router
+                .as_ref()
+                .map(|router| router.metrics.statistics(&router.index, router.instance_id)),
             num_partitions: self.ivf.num_partitions(),
             sub_index: serde_json::Value::Object(sub_index_stats),
             partitions: partitions_statistics,
@@ -1533,9 +1760,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             self.distance_type
         };
 
-        let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
-
-        self.ivf.find_partitions(&query.key, max_nprobes, dt)
+        find_partitions_with_router(&self.ivf, query, dt, self.centroid_router.as_deref())
     }
 
     fn total_partitions(&self) -> usize {
@@ -2084,7 +2309,8 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
-    )?;
+    )
+    .await?;
     Ok(Arc::new(index))
 }
 
@@ -2105,7 +2331,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt8Array, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -2146,17 +2372,17 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::prefilter::PreFilter;
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::hnsw::HNSW;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
-    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::ivf::{IvfBuildParams, storage::IvfModel};
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{DIST_COL, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -5093,6 +5319,135 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_remap(params.clone(), nlist, recall_requirement).await;
+    }
+
+    #[test]
+    fn test_hnsw_centroid_search_env_parsing() {
+        assert!(!super::parse_hnsw_centroid_search_enabled(None));
+        assert!(super::parse_hnsw_centroid_search_enabled(Some("true")));
+        assert!(super::parse_hnsw_centroid_search_enabled(Some(" YES ")));
+        assert!(!super::parse_hnsw_centroid_search_enabled(Some("false")));
+        assert!(!super::parse_hnsw_centroid_search_enabled(Some("invalid")));
+    }
+
+    fn centroid_router_test_query(query: ArrayRef, nprobes: usize) -> Query {
+        Query {
+            column: "vector".to_string(),
+            key: query,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: nprobes,
+            maximum_nprobes: Some(nprobes),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_default_centroid_routing_preserves_zero_nprobes() {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..64).map(|value| value as f32).collect::<Vec<_>>()),
+            16,
+        )
+        .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+        let query = centroid_router_test_query(Arc::new(Float32Array::from(vec![0.0; 16])), 0);
+
+        let (partition_ids, partition_distances) =
+            super::find_partitions_with_router(&ivf, &query, DistanceType::L2, None).unwrap();
+
+        assert!(partition_ids.is_empty());
+        assert!(partition_distances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_time_centroid_router_is_coalesced_and_counted() {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..100)
+                    .flat_map(|value| std::iter::repeat_n(value as f32, 16))
+                    .collect::<Vec<_>>(),
+            ),
+            16,
+        )
+        .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+
+        let (first, second) = tokio::join!(
+            super::load_centroid_router(&ivf, DistanceType::L2, &cache, true),
+            super::load_centroid_router(&ivf, DistanceType::L2, &cache, true),
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let query = centroid_router_test_query(Arc::new(Float32Array::from(vec![42.0; 16])), 20);
+        let (partition_ids, partition_distances) =
+            super::find_partitions_with_router(&ivf, &query, DistanceType::L2, Some(&first))
+                .unwrap();
+        assert_eq!(partition_ids.len(), 20);
+        assert_eq!(partition_distances.len(), 20);
+
+        let stats = serde_json::to_value(first.metrics.statistics(&first.index, first.instance_id))
+            .unwrap();
+        assert_eq!(stats["mode"], "hnsw");
+        assert_eq!(stats["hnsw_m"], 20);
+        assert_eq!(stats["hnsw_ef_construction"], 150);
+        assert_eq!(stats["router_instance_id"], first.instance_id);
+        assert_eq!(stats["hnsw_query_count"], 1);
+        assert_eq!(stats["flat_query_count"], 0);
+        assert_eq!(stats["fallback_count"], 0);
+        assert_eq!(stats["last_selected_partition_count"], 20);
+        assert_eq!(stats["last_hnsw_query_ef"], 80);
+
+        let all_partitions_query =
+            centroid_router_test_query(Arc::new(Float32Array::from(vec![42.0; 16])), 100);
+        let (all_partition_ids, _) = super::find_partitions_with_router(
+            &ivf,
+            &all_partitions_query,
+            DistanceType::L2,
+            Some(&second),
+        )
+        .unwrap();
+        assert_eq!(all_partition_ids.len(), 100);
+        let stats =
+            serde_json::to_value(second.metrics.statistics(&second.index, second.instance_id))
+                .unwrap();
+        assert_eq!(stats["router_instance_id"], first.instance_id);
+        assert_eq!(stats["hnsw_query_count"], 1);
+        assert_eq!(stats["flat_query_count"], 1);
+        assert_eq!(stats["fallback_count"], 1);
+        assert_eq!(stats["last_selected_partition_count"], 100);
+
+        let disabled = super::load_centroid_router(&ivf, DistanceType::L2, &cache, false)
+            .await
+            .unwrap();
+        assert!(disabled.is_none());
+
+        let unsupported_centroids =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0; 8]), 2).unwrap();
+        let unsupported_ivf = IvfModel::new(unsupported_centroids, None);
+        let unsupported_cache = LanceCache::with_capacity(1024 * 1024);
+        let unsupported_error = super::load_centroid_router(
+            &unsupported_ivf,
+            DistanceType::L2,
+            &unsupported_cache,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            unsupported_error
+                .to_string()
+                .contains("does not support centroid type UInt8")
+        );
     }
 
     #[rstest]

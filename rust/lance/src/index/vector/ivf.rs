@@ -1232,11 +1232,34 @@ pub struct IvfIndexPartitionStatistics {
 }
 
 #[derive(Serialize)]
+pub struct IvfCentroidRouterStatistics {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hnsw_m: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hnsw_ef_construction: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hnsw_query_ef_min: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hnsw_query_ef_multiplier: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_hnsw_query_ef: Option<u64>,
+    router_instance_id: u64,
+    hnsw_query_count: u64,
+    flat_query_count: u64,
+    fallback_count: u64,
+    selected_partition_count: u64,
+    last_selected_partition_count: u64,
+}
+
+#[derive(Serialize)]
 pub struct IvfIndexStatistics {
     index_type: String,
     uuid: String,
     uri: String,
     metric_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    centroid_router: Option<IvfCentroidRouterStatistics>,
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
@@ -1379,6 +1402,7 @@ impl Index for IVFIndex {
             uuid: self.uuid.to_string(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
+            centroid_router: None,
             num_partitions: self.ivf.num_partitions(),
             sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
@@ -5123,6 +5147,7 @@ mod tests {
             uuid: "uuid".to_string(),
             uri: "uri".to_string(),
             metric_type: "l2".to_string(),
+            centroid_router: None,
             num_partitions: 0,
             sub_index: serde_json::Value::Null,
             partitions: vec![],

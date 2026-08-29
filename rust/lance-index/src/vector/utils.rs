@@ -7,15 +7,25 @@ use arrow::{
     compute::cast,
 };
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, UInt32Array, cast::AsArray,
+};
 use arrow_schema::{DataType, Field};
 use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::dot_f16::amx_fp16_available;
 use prost::bytes;
+use std::collections::HashSet;
 use std::sync::LazyLock;
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use super::pb;
 use crate::pb::Tensor;
@@ -23,12 +33,22 @@ use crate::vector::flat::storage::FlatBinStorage;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::hnsw::HNSW;
 use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
+use crate::vector::storage::VectorStore;
 use crate::vector::v3::subindex::IvfSubIndex;
 
 enum SimpleIndexStatus {
     Auto,
     Enabled,
     Disabled,
+}
+
+/// Minimum HNSW query beam used by query-time IVF centroid routing.
+pub const QUERY_CENTROID_HNSW_MIN_EF: usize = 64;
+/// HNSW query beam multiplier applied to IVF `nprobes`.
+pub const QUERY_CENTROID_HNSW_EF_MULTIPLIER: usize = 4;
+
+fn indexing_hnsw_params() -> HnswBuildParams {
+    HnswBuildParams::default().ef_construction(15).num_edges(12)
 }
 
 static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
@@ -92,6 +112,9 @@ fn prefers_flat_amx_assignment(
 pub struct SimpleIndex {
     store: SimpleStore,
     index: HNSW,
+    num_vectors: usize,
+    search_count: AtomicU64,
+    last_search_ef: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -100,19 +123,33 @@ enum SimpleStore {
     Binary(FlatBinStorage),
 }
 
+impl DeepSizeOf for SimpleIndex {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.index.deep_size_of_children(context)
+            + match &self.store {
+                SimpleStore::Float(store) => store.deep_size_of_children(context),
+                SimpleStore::Binary(store) => store.deep_size_of_children(context),
+            }
+    }
+}
+
 impl SimpleIndex {
-    fn try_new(store: SimpleStore) -> Result<Self> {
-        let hnsw = match &store {
-            SimpleStore::Float(store) => HNSW::index_vectors(
-                store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
-            )?,
-            SimpleStore::Binary(store) => HNSW::index_vectors(
-                store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
-            )?,
+    fn try_new_with_params(store: SimpleStore, params: HnswBuildParams) -> Result<Self> {
+        let num_vectors = match &store {
+            SimpleStore::Float(store) => store.len(),
+            SimpleStore::Binary(store) => store.len(),
         };
-        Ok(Self { store, index: hnsw })
+        let hnsw = match &store {
+            SimpleStore::Float(store) => HNSW::index_vectors(store, params)?,
+            SimpleStore::Binary(store) => HNSW::index_vectors(store, params)?,
+        };
+        Ok(Self {
+            store,
+            index: hnsw,
+            num_vectors,
+            search_count: AtomicU64::new(0),
+            last_search_ef: AtomicU64::new(0),
+        })
     }
 
     // train HNSW over the centroids to speed up finding the nearest clusters,
@@ -145,6 +182,47 @@ impl SimpleIndex {
             _ => {}
         }
 
+        Self::try_new_from_values(centroids, dimension, distance_type)
+    }
+
+    /// Build an in-memory HNSW index over IVF centroids.
+    ///
+    /// Returns `None` for centroid types and distance metrics that HNSW centroid
+    /// search does not support. Unlike [`Self::may_train_index`], this method is
+    /// not controlled by the indexing-time threshold or environment variable.
+    /// It is intended for callers that have explicitly enabled query-time HNSW
+    /// centroid routing.
+    pub fn try_new_centroid_index(
+        centroids: &FixedSizeListArray,
+        distance_type: DistanceType,
+    ) -> Result<Option<Self>> {
+        Self::try_new_from_values_with_params(
+            centroids.values().clone(),
+            centroids.value_length() as usize,
+            distance_type,
+            HnswBuildParams::default(),
+        )
+    }
+
+    fn try_new_from_values(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Result<Option<Self>> {
+        Self::try_new_from_values_with_params(
+            centroids,
+            dimension,
+            distance_type,
+            indexing_hnsw_params(),
+        )
+    }
+
+    fn try_new_from_values_with_params(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+        params: HnswBuildParams,
+    ) -> Result<Option<Self>> {
         let store = match (centroids.data_type(), distance_type) {
             (DataType::Float16 | DataType::Float32 | DataType::Float64, _) => {
                 let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
@@ -156,7 +234,7 @@ impl SimpleIndex {
             }
             _ => return Ok(None),
         };
-        Self::try_new(store).map(Some)
+        Self::try_new_with_params(store, params).map(Some)
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
@@ -179,6 +257,94 @@ impl SimpleIndex {
             }
         };
         Ok((res[0].id, res[0].dist.0))
+    }
+
+    /// Find the nearest `limit` centroids with the in-memory HNSW graph.
+    pub fn search_n(&self, query: ArrayRef, limit: usize) -> Result<(UInt32Array, Float32Array)> {
+        if limit == 0 {
+            return Ok((
+                UInt32Array::from(Vec::<u32>::new()),
+                Float32Array::from(Vec::<f32>::new()),
+            ));
+        }
+        if limit > self.num_vectors {
+            return Err(Error::invalid_input(format!(
+                "HNSW centroid search limit {limit} exceeds centroid count {}",
+                self.num_vectors
+            )));
+        }
+        let query_ef = limit
+            .saturating_mul(QUERY_CENTROID_HNSW_EF_MULTIPLIER)
+            .max(QUERY_CENTROID_HNSW_MIN_EF)
+            .min(self.num_vectors);
+        let params = HnswQueryParams {
+            // Keep enough candidates for stable partition routing at the common
+            // nprobes=20 setting while still bounding centroid-search work.
+            ef: query_ef,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let res = match &self.store {
+            SimpleStore::Float(store) => self
+                .index
+                .search_basic(query, limit, &params, None, store)?,
+            SimpleStore::Binary(store) => {
+                let query = if query.data_type() == &DataType::UInt8 {
+                    query
+                } else {
+                    cast(&query, &DataType::UInt8).map_err(|e| Error::index(e.to_string()))?
+                };
+                self.index
+                    .search_basic(query, limit, &params, None, store)?
+            }
+        };
+        if res.len() != limit {
+            return Err(Error::index(format!(
+                "HNSW centroid search requested {limit} partitions but returned {}",
+                res.len()
+            )));
+        }
+        let mut nodes = res;
+        nodes.sort_unstable_by(|left, right| {
+            left.dist
+                .0
+                .total_cmp(&right.dist.0)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut unique_ids = HashSet::with_capacity(limit);
+        for node in &nodes {
+            if node.id as usize >= self.num_vectors {
+                return Err(Error::index(format!(
+                    "HNSW centroid search returned out-of-range partition {} for {} centroids",
+                    node.id, self.num_vectors
+                )));
+            }
+            if !unique_ids.insert(node.id) {
+                return Err(Error::index(format!(
+                    "HNSW centroid search returned duplicate partition {}",
+                    node.id
+                )));
+            }
+        }
+        let (ids, distances): (Vec<_>, Vec<_>) =
+            nodes.into_iter().map(|node| (node.id, node.dist.0)).unzip();
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        self.last_search_ef
+            .store(query_ef as u64, Ordering::Relaxed);
+        Ok((UInt32Array::from(ids), Float32Array::from(distances)))
+    }
+
+    /// Number of successful HNSW searches served by this in-memory graph.
+    pub fn search_count(&self) -> u64 {
+        self.search_count.load(Ordering::Relaxed)
+    }
+
+    /// HNSW beam used by the most recent successful search, or zero before any
+    /// search has completed.
+    pub fn last_search_ef(&self) -> u64 {
+        self.last_search_ef.load(Ordering::Relaxed)
     }
 }
 
@@ -360,7 +526,7 @@ mod tests {
         let f32_centroids = cast(&centroids, &DataType::Float32).unwrap();
         let fsl = FixedSizeListArray::try_new_from_values(f32_centroids, dim as i32).unwrap();
         let store = SimpleStore::Float(FlatFloatStorage::new(fsl, DistanceType::L2));
-        SimpleIndex::try_new(store).unwrap()
+        SimpleIndex::try_new_with_params(store, indexing_hnsw_params()).unwrap()
     }
 
     fn build_binary_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
@@ -371,7 +537,7 @@ mod tests {
         };
         let fsl = FixedSizeListArray::try_new_from_values(u8_centroids, dim as i32).unwrap();
         let store = SimpleStore::Binary(FlatBinStorage::new(fsl, DistanceType::Hamming));
-        SimpleIndex::try_new(store).unwrap()
+        SimpleIndex::try_new_with_params(store, indexing_hnsw_params()).unwrap()
     }
 
     #[rstest]
@@ -402,6 +568,24 @@ mod tests {
         let (id, dist) = index.search(query).unwrap();
         assert_eq!(id, 42);
         assert_eq!(dist, 0.0);
+    }
+
+    #[test]
+    fn test_simple_index_returns_multiple_centroids() {
+        let centroids: ArrayRef = Arc::new(Float32Array::from(
+            (0..100)
+                .flat_map(|i| std::iter::repeat_n(i as f32, 16))
+                .collect::<Vec<_>>(),
+        ));
+        let index = build_index(centroids, 16);
+        let query: ArrayRef = Arc::new(Float32Array::from(vec![42.0; 16]));
+
+        let (ids, distances) = index.search_n(query, 5).unwrap();
+
+        assert_eq!(ids.len(), 5);
+        assert_eq!(distances.len(), 5);
+        assert_eq!(ids.value(0), 42);
+        assert_eq!(distances.value(0), 0.0);
     }
 
     #[test]
