@@ -62,34 +62,37 @@ public class AsyncScanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    AsyncScanner scanner =
-        createAsyncScanner(
-            dataset,
-            options.getFragmentIds(),
-            options.getColumns(),
-            options.getSubstraitFilter(),
-            options.getFilter(),
-            options.getBatchSize(),
-            options.getBatchSizeBytes(),
-            options.getIoBufferSize(),
-            options.getLimit(),
-            options.getOffset(),
-            options.getNearest(),
-            options.getFullTextQuery(),
-            options.isPrefilter(),
-            options.isWithRowId(),
-            options.isWithRowAddress(),
-            options.getBatchReadahead(),
-            options.getFragmentReadahead(),
-            options.isScanInOrder(),
-            options.getLateMaterialization(),
-            options.getColumnOrderings(),
-            options.isUseScalarIndex(),
-            options.isFastSearch(),
-            options.getSubstraitAggregate(),
-            options.isIncludeDeletedRows(),
-            options.isStrictBatchSize(),
-            options.isDisableScoringAutoprojection());
+    AsyncScanner scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      scanner =
+          createAsyncScanner(
+              dataset,
+              options.getFragmentIds(),
+              options.getColumns(),
+              options.getSubstraitFilter(),
+              options.getFilter(),
+              options.getBatchSize(),
+              options.getBatchSizeBytes(),
+              options.getIoBufferSize(),
+              options.getLimit(),
+              options.getOffset(),
+              options.getNearest(),
+              options.getFullTextQuery(),
+              options.isPrefilter(),
+              options.isWithRowId(),
+              options.isWithRowAddress(),
+              options.getBatchReadahead(),
+              options.getFragmentReadahead(),
+              options.isScanInOrder(),
+              options.getLateMaterialization(),
+              options.getColumnOrderings(),
+              options.isUseScalarIndex(),
+              options.isFastSearch(),
+              options.getSubstraitAggregate(),
+              options.isIncludeDeletedRows(),
+              options.isStrictBatchSize(),
+              options.isDisableScoringAutoprojection());
+    }
     scanner.allocator = allocator;
     return scanner;
   }

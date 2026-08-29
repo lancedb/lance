@@ -82,7 +82,7 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
@@ -99,7 +99,9 @@ use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_inte
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::DatasetIndexExt;
+use crate::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, unsupported_index_version,
+};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -125,7 +127,8 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -270,6 +273,29 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum number of source rows to compact in a single run. Rows are
+    /// counted as live rows (physical rows minus soft-deleted rows). When
+    /// set, tasks are included in the plan until adding the next task would
+    /// exceed this limit.
+    /// Defaults to `None` (no limit).
+    pub max_source_rows: Option<usize>,
+    /// Maximum number of source bytes to compact in a single run, measured as
+    /// the total size of the source fragments' data and overlay files. When
+    /// set, tasks are included in the plan until adding the next task would
+    /// exceed this limit.
+    /// Blob v2 payloads live in separate blob files and are not counted, so
+    /// this is not a cap on total compaction I/O for datasets with blob
+    /// columns.
+    /// Defaults to `None` (no limit).
+    pub max_source_bytes: Option<u64>,
+    /// Fragment IDs to exclude from compaction planning.
+    ///
+    /// Excluded fragments act as boundaries between adjacent compaction candidates,
+    /// so fragments on opposite sides of an exclusion are never combined into the
+    /// same task. IDs that are duplicated or absent from the dataset are ignored.
+    /// Defaults to an empty list.
+    #[serde(default)]
+    pub excluded_fragment_ids: Vec<u32>,
     /// Maximum number of data overlay files a fragment may carry before it is
     /// fully compacted. When set, any fragment with more than this many overlays
     /// is rewritten into a fresh fragment with its overlays (and deletions)
@@ -308,6 +334,9 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_source_rows: None,
+            max_source_bytes: None,
+            excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
             transaction_properties: None,
         }
@@ -335,6 +364,8 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_source_rows`
+    /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
@@ -446,6 +477,22 @@ impl CompactionOptions {
                         ))
                     })?);
                 }
+                "max_source_rows" => {
+                    self.max_source_rows = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_bytes" => {
+                    self.max_source_bytes = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
                 "max_overlays_per_fragment" => {
                     // The default is `Some(10)`, so an explicit "none" is the only
                     // way to disable the trigger through the manifest config.
@@ -467,11 +514,28 @@ impl CompactionOptions {
         Ok(())
     }
 
-    pub fn validate(&mut self) {
+    pub fn validate(&mut self) -> Result<()> {
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
         }
+
+        for (name, value) in [
+            (
+                "max_source_fragments",
+                self.max_source_fragments.map(|v| v as u64),
+            ),
+            ("max_source_rows", self.max_source_rows.map(|v| v as u64)),
+            ("max_source_bytes", self.max_source_bytes),
+        ] {
+            if value == Some(0) {
+                return Err(Error::invalid_input(format!(
+                    "CompactionOptions::{} must be greater than 0 (use None for no limit)",
+                    name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the effective [`CompactionMode`], preferring the new
@@ -657,12 +721,17 @@ pub trait CompactionPlanner: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
+    excluded_fragment_ids: RoaringBitmap,
 }
 
 impl DefaultCompactionPlanner {
-    pub fn new(mut options: CompactionOptions) -> Self {
-        options.validate();
-        Self { options }
+    pub fn new(mut options: CompactionOptions) -> Result<Self> {
+        options.validate()?;
+        let excluded_fragment_ids = options.excluded_fragment_ids.iter().copied().collect();
+        Ok(Self {
+            options,
+            excluded_fragment_ids,
+        })
     }
 }
 
@@ -686,11 +755,44 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
         );
+        // Without stable row ids a rewrite moves every row address, so the
+        // indices over the rewritten fragments have to be remapped in the same
+        // commit. An index this build cannot open cannot be remapped, so its
+        // fragments join the caller's own exclusions and are left uncompacted -
+        // taking the same path, which terminates the current bin rather than
+        // letting the candidates on either side of the gap be planned together.
+        let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
+        if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
+            let unremappable = unremappable_index_coverage(dataset)
+                .await?
+                .into_iter()
+                .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
+                    covered |= fragments;
+                    covered
+                });
+            if !unremappable.is_empty() {
+                // Otherwise a compaction that plans nothing looks like a
+                // compaction that found nothing to do.
+                log::info!(
+                    "holding {} fragment(s) back from compaction: they are covered by an index \
+                     this build cannot read, and so cannot be remapped here",
+                    unremappable.len(),
+                );
+            }
+            excluded_fragment_ids |= unremappable;
+        }
+        let excluded_fragment_ids = &excluded_fragment_ids;
+
         let mut fragment_metrics = futures::stream::iter(fragments)
             .map(|fragment| async move {
-                match collect_metrics(&fragment).await {
-                    Ok(metrics) => Ok((fragment.metadata, metrics)),
-                    Err(e) => Err(e),
+                if u32::try_from(fragment.id())
+                    .is_ok_and(|fragment_id| excluded_fragment_ids.contains(fragment_id))
+                {
+                    Ok(None)
+                } else {
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| Some((fragment.metadata, metrics)))
                 }
             })
             .buffered(dataset.object_store.as_ref().io_parallelism());
@@ -710,7 +812,16 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut i = 0;
 
         while let Some(res) = fragment_metrics.next().await {
-            let (fragment, metrics) = res?;
+            let Some((fragment, metrics)) = res? else {
+                // Exclusions preserve adjacency semantics: they terminate the
+                // current bin instead of allowing candidates on either side to
+                // be planned together.
+                if let Some(bin) = current_bin.take() {
+                    candidate_bins.push(bin);
+                }
+                i += 1;
+                continue;
+            };
 
             let over_overlay_limit = self
                 .options
@@ -783,27 +894,22 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
+        let all_tasks: Vec<(TaskData, usize)> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| TaskData {
-                fragments: bin.fragments,
+            .map(|bin| {
+                let live_rows = bin.row_counts.iter().sum();
+                (
+                    TaskData {
+                        fragments: bin.fragments,
+                    },
+                    live_rows,
+                )
             })
             .collect();
 
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_frags <= max_frags
-                })
-                .collect()
-        } else {
-            all_tasks
-        };
+        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -829,7 +935,7 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    let planner = DefaultCompactionPlanner::new(options);
+    let planner = DefaultCompactionPlanner::new(options)?;
     compact_files_with_planner(dataset, remap_options, &planner).await
 }
 
@@ -903,6 +1009,111 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
         physical_rows,
         num_deletions,
     })
+}
+
+/// Truncates a planned task list to the configured per-run source budgets
+/// (`max_source_fragments`, `max_source_rows`, `max_source_bytes`).
+///
+/// All configured budgets apply together: tasks are kept, in order, until
+/// adding the next task would exceed any one of them. The budgets are hard
+/// upper bounds, so if the first task already exceeds one of them the
+/// returned plan is empty and a warning is logged, since compaction would
+/// otherwise stall silently.
+///
+/// Each task is paired with the number of live rows in its source fragments.
+fn limit_tasks_to_source_budget(
+    options: &CompactionOptions,
+    schema: &lance_core::datatypes::Schema,
+    all_tasks: Vec<(TaskData, usize)>,
+) -> Result<Vec<TaskData>> {
+    if options.max_source_fragments.is_none()
+        && options.max_source_rows.is_none()
+        && options.max_source_bytes.is_none()
+    {
+        return Ok(all_tasks.into_iter().map(|(task, _)| task).collect());
+    }
+
+    // Only needed for the bytes budget: files whose fields are all absent
+    // from the current schema only back dropped columns, which compaction
+    // does not read.
+    let schema_field_ids: HashSet<i32> = if options.max_source_bytes.is_some() {
+        schema.field_ids().into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+
+    let num_candidate_tasks = all_tasks.len();
+    let mut total_fragments = 0_usize;
+    let mut total_rows = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut tasks = Vec::with_capacity(all_tasks.len());
+    for (task, live_rows) in all_tasks {
+        total_fragments += task.fragments.len();
+        total_rows = total_rows.saturating_add(live_rows);
+        if options.max_source_bytes.is_some() {
+            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+        }
+
+        let over_budget = options
+            .max_source_fragments
+            .is_some_and(|max| total_fragments > max)
+            || options.max_source_rows.is_some_and(|max| total_rows > max)
+            || options
+                .max_source_bytes
+                .is_some_and(|max| total_bytes > max);
+        if over_budget {
+            break;
+        }
+
+        tasks.push(task);
+    }
+
+    if tasks.is_empty() && num_candidate_tasks > 0 {
+        warn!(
+            "Compaction plan is empty: the first of {} candidate tasks already exceeds a source \
+             budget (max_source_fragments={:?}, max_source_rows={:?}, max_source_bytes={:?}); \
+             compaction cannot make progress until the budget is raised",
+            num_candidate_tasks,
+            options.max_source_fragments,
+            options.max_source_rows,
+            options.max_source_bytes
+        );
+    }
+
+    Ok(tasks)
+}
+
+/// Returns the total size in bytes of a task's source data and overlay files.
+///
+/// Files whose fields are all absent from `schema_field_ids` only back
+/// dropped columns; compaction does not read them, so they are neither
+/// counted nor required to have a recorded size.
+/// Only sizes recorded in the manifest are used: a missing size is an error
+/// rather than a metadata request against object storage, which would turn
+/// planning into one round trip per file. Deletion files are not counted.
+fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+    let mut total_bytes = 0_u64;
+    for fragment in &task.fragments {
+        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+        for data_file in fragment.files.iter().chain(overlay_files) {
+            if !data_file
+                .fields
+                .iter()
+                .any(|field_id| schema_field_ids.contains(field_id))
+            {
+                continue;
+            }
+            let size = data_file.file_size_bytes.get().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
+                     in the manifest; unset max_source_bytes to compact this dataset",
+                    data_file.path, fragment.id
+                ))
+            })?;
+            total_bytes = total_bytes.saturating_add(size.get());
+        }
+    }
+    Ok(total_bytes)
 }
 
 /// A plan for what groups of fragments to compact.
@@ -1884,34 +2095,125 @@ impl CandidateBin {
 }
 
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
-    let indices = dataset.load_indices().await?;
+    // Coverage, not usability: these bitmaps decide the rewrite groups. Under
+    // stable row ids `Transaction::recalculate_fragment_bitmap` then rejects any
+    // group that splits an index's coverage, and it walks every index the new
+    // manifest carries - including the ones this build cannot read. Binning from
+    // the filtered view fails that check outright on a dataset holding an index
+    // written by a newer Lance. The same bitmaps also decide, through
+    // `any_group_indexed`, whether a deferred compaction writes the
+    // fragment-reuse index that a build which can read that index needs to
+    // repair its coverage.
+    let indices = load_all_indices(dataset).await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
     // System indices (fragment-reuse, mem-wal) don't define data coverage and
     // aren't remapped per rewrite group, so they must not constrain compaction
     // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
     // splits the small-fragment run and they never coalesce.
     for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
-            index_fragmaps.push(fragment_bitmap.clone());
-        } else {
-            let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            // max_fragment_id is inclusive (the highest id); +1 for an exclusive
-            // upper bound so the last fragment is covered (None => empty range).
-            let frags = 0..dataset_at_index
-                .manifest
-                .max_fragment_id
-                .map_or(0, |m| m + 1);
-            index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
-        }
+        index_fragmaps.push(index_fragment_coverage(dataset, index).await?);
     }
     Ok(index_fragmaps)
+}
+
+/// The fragments an index segment covers, reconstructing the coverage of a
+/// legacy segment that predates the bitmap from the dataset it was written
+/// against.
+async fn index_fragment_coverage(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<RoaringBitmap> {
+    if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+        return Ok(fragment_bitmap.clone());
+    }
+    let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
+    // max_fragment_id is inclusive (the highest id); +1 for an exclusive
+    // upper bound so the last fragment is covered (None => empty range).
+    let frags = 0..dataset_at_index
+        .manifest
+        .max_fragment_id
+        .map_or(0, |m| m + 1);
+    let mut coverage = RoaringBitmap::from_sorted_iter(frags).unwrap();
+    // Reconstructed in the id space of the version the index was written
+    // against, which a later compaction has already moved on from.
+    // `load_all_indices` puts a stored bitmap into the current space by running
+    // it through the fragment-reuse index and leaves a `None` one alone, so a
+    // reconstruction has to take that step itself. Skipping it names the
+    // fragments a deferred compaction moved these rows out of, which is a set
+    // no rewrite can intersect - the guards below then wave through the rewrite
+    // of the fragment the rows actually live in.
+    if let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? {
+        frag_reuse_index.remap_fragment_bitmap(&mut coverage)?;
+    }
+    Ok(coverage)
+}
+
+/// Each index this build has no reader for, by name, and the fragments it covers.
+///
+/// A rewrite moves every row address in the fragments it touches, and putting an
+/// index back in step means opening it. A build that cannot open one cannot
+/// remap it, so compacting the fragments it covers would leave it addressing
+/// rows that are gone -- worse than the erase this whole path exists to prevent.
+/// They are held out of the plan instead, and the rest of the table still
+/// compacts.
+///
+/// Only the eager remap path needs this. Stable row ids keep the addresses
+/// across a rewrite, and `defer_index_remap` hands the repair to a build that
+/// can read the index, through the fragment-reuse index it writes.
+async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
+    let mut coverage = Vec::new();
+    for index in load_all_indices(dataset).await?.iter() {
+        if is_system_index(index) || unsupported_index_version(index).is_none() {
+            continue;
+        }
+        coverage.push((
+            index.name.clone(),
+            index_fragment_coverage(dataset, index).await?,
+        ));
+    }
+    Ok(coverage)
+}
+
+/// Refuse a plan that rewrites fragments an index this build cannot read covers.
+///
+/// [`DefaultCompactionPlanner`] keeps those fragments out of the plan, but
+/// nothing forces a caller through it: `compact_files_with_planner` takes any
+/// planner, [`CompactionPlan`] is public and serializable, and a distributed
+/// driver hands [`commit_compaction`] results planned elsewhere. Committing such
+/// a plan strands the index on fragment ids the rewrite deleted, so the commit
+/// boundary refuses it rather than the planner alone.
+async fn reject_unremappable_rewrite(
+    dataset: &Dataset,
+    completed_tasks: &[RewriteResult],
+) -> Result<()> {
+    let rewritten = completed_tasks
+        .iter()
+        .flat_map(|task| task.original_fragments.iter())
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<RoaringBitmap>();
+
+    for (name, covered) in unremappable_index_coverage(dataset).await? {
+        let blocked = covered & &rewritten;
+        if !blocked.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "compaction would rewrite fragment(s) {:?}, which index {:?} covers. This build \
+                 has no reader for that index, so it cannot be remapped onto the rewritten \
+                 fragments and the commit would leave it addressing rows that no longer exist. \
+                 Plan with DefaultCompactionPlanner, which holds those fragments back, set \
+                 defer_index_remap, or compact from a build that can read the index.",
+                blocked.iter().collect::<Vec<_>>(),
+                name,
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    let planner = DefaultCompactionPlanner::new(options.clone());
+    let planner = DefaultCompactionPlanner::new(options.clone())?;
     planner.plan(dataset).await
 }
 
@@ -2392,6 +2694,14 @@ pub async fn commit_compaction(
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
+    }
+
+    // Before anything is written or committed. The condition is the planner's,
+    // not `has_address_style`: a dataset whose only index is one this build
+    // cannot read captures no row addresses at all, which is exactly the plan
+    // that has to be refused here.
+    if !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap {
+        reject_unremappable_rewrite(dataset, &completed_tasks).await?;
     }
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
@@ -6787,14 +7097,14 @@ mod tests {
         use arrow_array::types::{Float32Type, Int32Type};
         use lance_datagen::Dimension;
 
-        const DIM: u32 = 32;
+        const DIM: u32 = 8;
         let mut dataset = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
             )
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(64))
             .await
             .unwrap();
         dataset
@@ -6834,7 +7144,7 @@ mod tests {
                 }
             }
         }
-        let step = (rows.len() / 16).max(1);
+        let step = (rows.len() / 4).max(1);
         let queries: Vec<Vec<f32>> = rows.iter().step_by(step).cloned().collect();
         let mut baseline: Vec<Vec<i32>> = Vec::new();
         for q in &queries {
@@ -6845,7 +7155,7 @@ mod tests {
         let metrics = compact_files(
             &mut dataset,
             CompactionOptions {
-                target_rows_per_fragment: 2_000,
+                target_rows_per_fragment: 128,
                 defer_index_remap: true,
                 ..Default::default()
             },
@@ -6989,10 +7299,15 @@ mod tests {
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::L2,
             small_ivf(),
-            HnswBuildParams::default(),
+            HnswBuildParams::default()
+                .max_level(2)
+                .num_edges(4)
+                .ef_construction(16),
             PQBuildParams {
                 max_iters: 2,
                 num_sub_vectors: 2,
+                num_bits: 4,
+                sample_rate: 2,
                 ..Default::default()
             },
         );
@@ -7110,7 +7425,7 @@ mod tests {
             ..Default::default()
         };
 
-        let planner = DefaultCompactionPlanner::new(options);
+        let planner = DefaultCompactionPlanner::new(options).unwrap();
         let plan = planner.plan(&dataset).await.unwrap();
 
         // Should create tasks to compact small fragments
@@ -7167,6 +7482,18 @@ mod tests {
                 "lance.compaction.index_remap_mode".to_string(),
                 "compact".to_string(),
             ),
+            (
+                "lance.compaction.max_source_fragments".to_string(),
+                "20".to_string(),
+            ),
+            (
+                "lance.compaction.max_source_rows".to_string(),
+                "1000000".to_string(),
+            ),
+            (
+                "lance.compaction.max_source_bytes".to_string(),
+                "1073741824".to_string(),
+            ),
         ]);
 
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -7182,6 +7509,9 @@ mod tests {
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
         // A non-default value proves the config string was actually parsed.
         assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
+        assert_eq!(opts.max_source_fragments, Some(20));
+        assert_eq!(opts.max_source_rows, Some(1_000_000));
+        assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
     }
 
     #[test]
@@ -7369,37 +7699,7 @@ mod tests {
     #[tokio::test]
     async fn test_max_source_fragments() {
         let test_dir = TempStrDir::default();
-        let test_uri = &test_dir;
-
-        let data = sample_data();
-        let schema = data.schema();
-
-        // Create 10 small fragments (100 rows each) via 10 appends
-        let write_params = WriteParams {
-            max_rows_per_file: 100,
-            ..Default::default()
-        };
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
-            test_uri,
-            Some(write_params.clone()),
-        )
-        .await
-        .unwrap();
-        for i in 1..10 {
-            let mut append_params = write_params.clone();
-            append_params.mode = WriteMode::Append;
-            Dataset::write(
-                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
-                test_uri,
-                Some(append_params),
-            )
-            .await
-            .unwrap();
-        }
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.get_fragments().len(), 10);
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
 
         // Plan without limit - all 10 fragments should be candidates.
         // Use a target that splits the 10 fragments into multiple tasks.
@@ -7470,6 +7770,180 @@ mod tests {
             after_second <= after_first,
             "expected progress: {after_second} should be <= {after_first}"
         );
+    }
+
+    /// Writes `sample_data` as 10 fragments of 100 rows each, deletes half of
+    /// fragment 0's rows, and puts a one-cell data overlay on it, so every
+    /// `max_source_*` planning budget is exercised against a dataset that
+    /// carries deleted rows and overlay files.
+    async fn dataset_with_ten_small_fragments(test_uri: &str) -> Dataset {
+        let data = sample_data();
+        let schema = data.schema();
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        for i in 1..10 {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+        }
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+        // Fragment 0 keeps 100 physical rows but only 50 live rows.
+        dataset.delete("a < 50").await.unwrap();
+        // The overlay shadows one surviving base value (offset 60, kept clear
+        // of the delete predicate) without adding any rows.
+        let dataset = commit_overlay(
+            dataset,
+            0,
+            &[0],
+            OverlayCoverage::dense(bitmap([60])),
+            vec![Arc::new(Int64Array::from(vec![60_000_i64]))],
+        )
+        .await;
+        assert_eq!(
+            dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+            1
+        );
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_excluded_fragments_are_planning_boundaries() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let excluded_fragment_id = 4;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 250,
+            excluded_fragment_ids: vec![excluded_fragment_id, excluded_fragment_id, u32::MAX],
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let planned_fragment_ids = plan
+            .tasks()
+            .iter()
+            .map(|task| {
+                task.fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            planned_fragment_ids,
+            vec![vec![0, 1, 2, 3], vec![5, 6, 7, 8, 9]]
+        );
+        assert!(
+            planned_fragment_ids
+                .iter()
+                .flatten()
+                .all(|fragment_id| *fragment_id != excluded_fragment_id)
+        );
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 9);
+        let remaining_fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert!(remaining_fragment_ids.contains(&excluded_fragment_id));
+    }
+
+    #[tokio::test]
+    async fn test_max_source_rows() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+        // The first task covers fragments 0..=2: 250 live rows (fragment 0
+        // keeps 50 after the deletes, and its overlay adds none) but 300
+        // physical rows. A budget between the two admits it and only it,
+        // proving the budget is enforced against live rows.
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_rows: Some(270),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        let physical_rows: usize = plan
+            .tasks()
+            .iter()
+            .flat_map(|t| &t.fragments)
+            .map(|f| f.physical_rows.unwrap())
+            .sum();
+        assert_eq!(physical_rows, 300);
+    }
+
+    #[tokio::test]
+    async fn test_max_source_bytes() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+        let first_task_base_bytes: u64 = dataset.get_fragments()[..3]
+            .iter()
+            .flat_map(|f| f.metadata.files.iter())
+            .map(|df| df.file_size_bytes.get().unwrap().get())
+            .sum();
+        let overlay_bytes = dataset.get_fragment(0).unwrap().metadata().overlays[0]
+            .data_file
+            .file_size_bytes
+            .get()
+            .unwrap()
+            .get();
+        assert!(first_task_base_bytes > 0 && overlay_bytes > 0);
+
+        // The first task covers fragments 0..=2 (target 250 rows). A budget of
+        // exactly their base bytes is exceeded once fragment 0's overlay file
+        // is counted, so the plan is empty: the budget is a hard upper bound,
+        // overlay bytes are part of a task's source, and deletion files are
+        // never counted.
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(first_task_base_bytes),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+
+        // Widening the budget by the overlay's bytes admits exactly the first
+        // task and nothing more.
+        let budget = first_task_base_bytes + overlay_bytes;
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(budget),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        let source_bytes: u64 = plan
+            .tasks()
+            .iter()
+            .flat_map(|t| &t.fragments)
+            .flat_map(|f| {
+                f.files
+                    .iter()
+                    .chain(f.overlays.iter().map(|o| &o.data_file))
+            })
+            .map(|df| df.file_size_bytes.get().unwrap().get())
+            .sum();
+        assert_eq!(source_bytes, budget);
     }
 
     #[tokio::test]
