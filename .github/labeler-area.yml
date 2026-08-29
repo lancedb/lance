@@ -37,6 +37,16 @@ A-format:
           - "protos/**"
           - "docs/src/format/**"
 
+# Drives the format-spec vote gate (.github/workflows/format-vote-gate.yml):
+# any change to the proto definitions or the spec docs requires a PMC vote.
+# Scoped to *.proto (not e.g. protos/AGENTS.md) since only the IDL and spec are
+# the format. A PMC member waives a trivial edit with the `format-waived` label.
+format-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "protos/**/*.proto"
+          - "docs/src/format/**"
+
 # Lockfiles are intentionally not excluded: a pure dependency bump gets both
 # A-python and A-deps. Over-labeling beats dropping the area signal on PRs that
 # touch python code alongside a lockfile.

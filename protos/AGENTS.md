@@ -2,6 +2,11 @@
 
 Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
+## Change Process
+
+- Changes to `*.proto` require a PMC vote on the pull request, enforced by the `format-spec-vote` CI gate. See [Lance Format Specification Changes](../docs/src/community/voting.md#lance-format-specification-changes).
+- Keep a proto change in its own PR, together with the matching `docs/src/format/` change and only the library edits needed to compile. Put the implementation in a follow-up PR — voters need to read the contract, not its implementation.
+
 ## Compatibility
 
 - Protobuf schemas that are part of a stable file format or any other stable persisted contract must remain backwards compatible. Never reuse or change their existing field numbers.

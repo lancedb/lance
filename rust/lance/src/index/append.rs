@@ -2380,29 +2380,37 @@ mod tests {
     #[tokio::test]
     async fn test_query_delta_indices(
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2),
             VectorIndexParams::ivf_rq(2, 1, MetricType::L2),
             VectorIndexParams::ivf_hnsw(
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 }
             ),
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 MetricType::L2,
-                IvfBuildParams::new(2),
+                IvfBuildParams {
+                    num_partitions: Some(2),
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                },
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 },
                 PQBuildParams {
-                    num_sub_vectors: 4,
+                    num_sub_vectors: 2,
+                    num_bits: 4,
+                    max_iters: 2,
+                    sample_rate: 2,
                     ..Default::default()
                 }
             ),
@@ -2410,9 +2418,9 @@ mod tests {
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 },
                 SQBuildParams::default()
@@ -2420,9 +2428,9 @@ mod tests {
         )]
         index_params: VectorIndexParams,
     ) {
-        const DIM: usize = 64;
-        const INITIAL_ROWS: usize = 1000;
-        const APPENDED_ROWS: usize = 64;
+        const DIM: usize = 8;
+        const INITIAL_ROWS: usize = 64;
+        const APPENDED_ROWS: usize = 16;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();

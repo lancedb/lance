@@ -1256,6 +1256,31 @@ impl IndexStore {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
+    /// Heap bytes held by every index in the registry.
+    ///
+    /// `MemTable::row_bytes` deliberately omits this — it sizes the flush
+    /// unit, which is row data. Callers budgeting *resident* memory must add it:
+    /// a configured HNSW index pre-allocates its whole graph on the first insert
+    /// and is charged for it from the moment it is configured (see
+    /// `HnswMemIndex::resident_bytes`), so it can dwarf a memtable's row bytes
+    /// while `row_bytes` still reads zero.
+    pub fn resident_bytes(&self) -> usize {
+        let btrees: usize = self
+            .btree_indexes
+            .values()
+            .map(|b| b.resident_bytes())
+            .sum();
+        let hnsw: usize = self.hnsw_indexes.values().map(|h| h.resident_bytes()).sum();
+        let fts: usize = self.fts_indexes.values().map(|f| f.resident_bytes()).sum();
+        // A `Single` PK aliases a `btree_indexes` entry, already counted above.
+        // A composite PK's index is held only here.
+        let pk = match &self.pk_index {
+            Some(PkIndex::Composite { index, .. }) => index.resident_bytes(),
+            Some(PkIndex::Single(_)) | None => 0,
+        };
+        btrees + hnsw + fts + pk
+    }
+
     /// How many batches of this memtable have been fully indexed (exclusive
     /// count; 0 before any batch is indexed).
     ///
@@ -1892,6 +1917,47 @@ mod tests {
         // Also test field_id lookup
         assert!(registry.get_btree_by_field_id(0).is_some());
         assert!(registry.get_fts_by_field_id(2).is_some());
+    }
+
+    /// The admission controller reads `IndexStore::resident_bytes` *before* the
+    /// insert that would allocate an HNSW graph, so a configured-but-untouched
+    /// vector index reporting zero would put the largest allocation in a vector
+    /// memtable outside its reach. It must be charged from configuration.
+    #[test]
+    fn test_resident_bytes_charges_hnsw_before_first_insert() {
+        let max_rows = 100_000;
+        let btree_only = IndexStore::from_configs(
+            &[MemIndexConfig::BTree(BTreeIndexConfig {
+                name: "pk_idx".to_string(),
+                field_id: 0,
+                column: "id".to_string(),
+            })],
+            max_rows,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            btree_only.resident_bytes(),
+            0,
+            "a BTree index allocates per row, so an untouched one holds nothing"
+        );
+
+        let with_hnsw = IndexStore::from_configs(
+            &[MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+                "vec_idx".to_string(),
+                2,
+                "vector".to_string(),
+                DistanceType::L2,
+            )))],
+            max_rows,
+            1_000,
+        )
+        .unwrap();
+        assert!(
+            with_hnsw.resident_bytes() > max_rows * 128,
+            "the graph is sized from capacity and owed from configuration, got {}",
+            with_hnsw.resident_bytes()
+        );
     }
 
     fn vector_schema() -> Arc<ArrowSchema> {
