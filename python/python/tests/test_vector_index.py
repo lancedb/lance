@@ -568,6 +568,42 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
     validate_vector_index(dataset, "vector", sample_size=16)
 
 
+def test_torch_index_nan_init_centroid(tmp_path):
+    """A NaN vector must never seed a centroid.
+
+    `vector is not null` does not exclude NaN, so sampling could pick one; with
+    a single partition that left every residual NaN and the index build failed.
+    """
+    torch = pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+    from lance.vector import _sample_init_centroids
+
+    # Only the last 8 rows are finite, so any sample that keeps NaN rows seeds
+    # the centroid with one.
+    mat = np.full((32, 8), np.nan, dtype=np.float32)
+    mat[24:] = np.random.randn(8, 8).astype(np.float32)
+    dataset = lance.write_dataset(vec_to_table(data=mat), tmp_path)
+    assert dataset.to_table()["vector"].null_count == 0
+
+    ds = TorchDataset(dataset, batch_size=1, columns=["vector"], samples=32)
+    centroids = _sample_init_centroids(ds, 4, filter_nan=True)
+    assert centroids.shape[0] == 4
+    assert torch.isfinite(centroids).all()
+
+
+def test_torch_index_all_nan_rejected(tmp_path):
+    pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+    from lance.vector import _sample_init_centroids
+
+    mat = np.full((16, 8), np.nan, dtype=np.float32)
+    dataset = lance.write_dataset(vec_to_table(data=mat), tmp_path)
+
+    ds = TorchDataset(dataset, batch_size=1, columns=["vector"], samples=16)
+    with pytest.raises(ValueError, match="all null or non-finite"):
+        _sample_init_centroids(ds, 1, filter_nan=True)
+
+
 def test_index_with_no_centroid_movement(tmp_path):
     torch = pytest.importorskip("torch")
 
