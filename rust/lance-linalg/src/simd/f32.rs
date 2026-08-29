@@ -146,10 +146,12 @@ fn gather_scalar_x86(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
     unsafe { f32x8::load_unaligned(values.as_ptr()) }
 }
 
-/// # Panics
-///
-/// Panics if `value` contains fewer than 8 elements.
 impl From<&[f32]> for f32x8 {
+    /// Loads the first 8 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 8 values.
     fn from(value: &[f32]) -> Self {
         assert!(
             value.len() >= 8,
@@ -534,10 +536,12 @@ impl std::fmt::Debug for f32x16 {
     }
 }
 
-/// # Panics
-///
-/// Panics if `value` contains fewer than 16 elements.
 impl From<&[f32]> for f32x16 {
+    /// Loads the first 16 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 16 values.
     fn from(value: &[f32]) -> Self {
         assert!(
             value.len() >= 16,
