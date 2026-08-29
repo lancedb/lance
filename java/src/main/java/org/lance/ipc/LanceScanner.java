@@ -58,35 +58,38 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    LanceScanner scanner =
-        createScanner(
-            dataset,
-            options.getFragmentIds(),
-            options.getColumns(),
-            options.getSubstraitFilter(),
-            options.getFilter(),
-            options.getBatchSize(),
-            options.getBatchSizeBytes(),
-            options.getIoBufferSize(),
-            options.getLimit(),
-            options.getOffset(),
-            options.getNearest(),
-            options.getFullTextQuery(),
-            options.isPrefilter(),
-            options.isWithRowId(),
-            options.isWithRowAddress(),
-            options.getBatchReadahead(),
-            options.getFragmentReadahead(),
-            options.isScanInOrder(),
-            options.getLateMaterialization(),
-            options.getColumnOrderings(),
-            options.isUseScalarIndex(),
-            options.isFastSearch(),
-            options.getSubstraitAggregate(),
-            options.isCollectStats(),
-            options.isIncludeDeletedRows(),
-            options.isStrictBatchSize(),
-            options.isDisableScoringAutoprojection());
+    LanceScanner scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      scanner =
+          createScanner(
+              dataset,
+              options.getFragmentIds(),
+              options.getColumns(),
+              options.getSubstraitFilter(),
+              options.getFilter(),
+              options.getBatchSize(),
+              options.getBatchSizeBytes(),
+              options.getIoBufferSize(),
+              options.getLimit(),
+              options.getOffset(),
+              options.getNearest(),
+              options.getFullTextQuery(),
+              options.isPrefilter(),
+              options.isWithRowId(),
+              options.isWithRowAddress(),
+              options.getBatchReadahead(),
+              options.getFragmentReadahead(),
+              options.isScanInOrder(),
+              options.getLateMaterialization(),
+              options.getColumnOrderings(),
+              options.isUseScalarIndex(),
+              options.isFastSearch(),
+              options.getSubstraitAggregate(),
+              options.isCollectStats(),
+              options.isIncludeDeletedRows(),
+              options.isStrictBatchSize(),
+              options.isDisableScoringAutoprojection());
+    }
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
