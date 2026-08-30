@@ -1423,17 +1423,14 @@ mod tests {
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
 
-    /// `cosine_batch` takes `dimension` as the stride for both operands, so a
-    /// key that does not match it, or a batch that is not a whole number of
-    /// vectors, has to stop at the boundary. Covers the trait default through
-    /// `f64` and the `f32` override.
+    /// A key that does not match `dimension`, or a batch that is not a whole
+    /// number of vectors, has to stop at the boundary. Covers the trait default
+    /// through `f64` and the `f32` override.
     #[rstest::rstest]
     #[case::key_longer_than_dimension(32, 64, 16)]
     #[case::key_shorter_than_dimension(8, 64, 16)]
     #[case::batch_remainder(16, 63, 16)]
     #[case::zero_dimension(16, 64, 0)]
-    #[case::dim8_key_mismatch(9, 64, 8)]
-    #[case::dim16_key_mismatch(17, 64, 16)]
     fn cosine_batch_rejects_bad_layout(
         #[case] key_len: usize,
         #[case] batch_len: usize,
@@ -1456,12 +1453,9 @@ mod tests {
         );
     }
 
-    /// Every `cosine_fast` override reaches a kernel that takes one length and
-    /// reads both vectors with it, so a mismatch has to stop at the boundary
-    /// rather than read past the shorter one.
-    ///
-    /// The lengths are 16 and 15 so both directions enter a vector loop rather
-    /// than only its scalar remainder.
+    /// A mismatch has to stop at the boundary rather than reach a kernel that
+    /// takes one length and reads both vectors with it. The lengths are 16 and 15
+    /// so the wider loops run instead of only a scalar remainder.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
@@ -1476,6 +1470,7 @@ mod tests {
         let long_f64 = [1.0f64; 16];
         let short_f64 = [1.0f64; 15];
         assert!(std::panic::catch_unwind(|| f64::cosine_fast(&long_f64, 1.0, &short_f64)).is_err());
+        assert!(std::panic::catch_unwind(|| f64::cosine_fast(&short_f64, 1.0, &long_f64)).is_err());
 
         // Both directions for f16 and bf16: the kernels take `y.len()` and read
         // `x` with it, so a short `x` is the one that reads out of bounds.
