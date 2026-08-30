@@ -166,18 +166,25 @@ impl DatasetPreFilter {
             dataset: Arc<Dataset>,
             frag: FileFragment,
         ) -> Result<RowAddrTreeMap> {
+            // Load the row id sequence and deletion vector asynchronously,
+            // then run the CPU-bound clone, deletion masking and tree
+            // construction for each piece on the CPU pool, keeping the async
+            // runtime free (the whole-mask fold previously ran this work in
+            // one spawn_cpu block after all loads).
             let row_ids = load_row_id_sequence(&dataset, frag.metadata());
             let deletion_vector = frag.get_deletion_vector();
             let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
             let row_ids = row_ids?;
-            match deletion_vector? {
+            let deletion_vector = deletion_vector?;
+            spawn_cpu(move || match deletion_vector {
                 Some(deletion_vector) => {
                     let mut row_ids = row_ids.as_ref().clone();
                     row_ids.mask(deletion_vector.to_sorted_iter())?;
                     Ok(RowAddrTreeMap::from(&row_ids))
                 }
                 None => Ok(RowAddrTreeMap::from(row_ids.as_ref())),
-            }
+            })
+            .await
         }
 
         let restrict_hash = restrict_to.as_ref().map(|b| {
