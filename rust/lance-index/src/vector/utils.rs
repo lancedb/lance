@@ -182,23 +182,36 @@ impl SimpleIndex {
     }
 }
 
+/// Cap on how many cache lines one `do_prefetch` call touches.
+///
+/// Distance kernels read a vector sequentially, so once its head is resident
+/// the hardware stream prefetcher covers the tail; issuing one prefetch
+/// instruction per line of a large vector (48 for a 768-dim f32 vector) costs
+/// more in issue overhead and cache pollution than the misses it hides. Eight
+/// lines is one full 128-dim f32 vector, so smaller vectors are prefetched
+/// exactly as before, while at 768 dims the cap turns a within-noise effect
+/// into a 20-28% search speedup on the `search_hnsw_prefetch` bench
+/// (issue #8275).
+const PREFETCH_MAX_CACHE_LINES: usize = 8;
+
 #[inline]
 pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     // TODO use rust intrinsics instead of x86 intrinsics
-    // TODO finish this
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        let (ptr, end_ptr) = (ptrs.start as *const i8, ptrs.end as *const i8);
-        let mut current_ptr = ptr;
-        while current_ptr < end_ptr {
-            const CACHE_LINE_SIZE: usize = 64;
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                _mm_prefetch(current_ptr, _MM_HINT_T0);
-            }
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        const CACHE_LINE_SIZE: usize = 64;
+        let start = ptrs.start as *const i8;
+        let end =
+            (ptrs.end as *const i8).min(start.add(PREFETCH_MAX_CACHE_LINES * CACHE_LINE_SIZE));
+        let mut current_ptr = start;
+        while current_ptr < end {
+            _mm_prefetch(current_ptr, _MM_HINT_T0);
             current_ptr = current_ptr.add(CACHE_LINE_SIZE);
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptrs;
 }
 
 impl From<pb::tensor::DataType> for DataType {
