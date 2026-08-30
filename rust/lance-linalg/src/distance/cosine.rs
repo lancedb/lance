@@ -24,7 +24,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
-use super::{Dot, norm_l2::norm_l2};
+use super::{Dot, assert_equal_lengths, norm_l2::norm_l2};
 use super::{Normalize, dot::dot};
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
@@ -108,6 +108,9 @@ mod bf16_kernel {
 
 impl Cosine for bf16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        // The kernels below take one length and read both vectors with it
+        // through raw pointers, so this is the only bound on either read.
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -164,6 +167,9 @@ mod kernel {
 
 impl Cosine for f16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        // The kernels below take one length and read both vectors with it
+        // through raw pointers, so this is the only bound on either read.
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -565,6 +571,9 @@ mod f32_baseline {
 impl Cosine for f32 {
     #[inline]
     fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
+        // The kernels behind this dispatch derive their loop bound from one
+        // vector and offset a raw pointer into the other.
+        assert_equal_lengths(x.len(), other.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -573,6 +582,7 @@ impl Cosine for f32 {
 
     #[inline]
     fn cosine_with_norms(x: &[Self], x_norm: Self, y_norm: Self, y: &[Self]) -> Self {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -844,6 +854,9 @@ impl ExactSizeIterator for CosineBatchIter<'_> {
 impl Cosine for f64 {
     #[inline]
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        // The kernels behind this dispatch derive their loop bound from one
+        // vector and offset a raw pointer into the other.
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -1418,6 +1431,43 @@ mod tests {
     use approx::assert_relative_eq;
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
+
+    /// Every `cosine_fast` override reaches a kernel that takes one length and
+    /// reads both vectors with it, so a mismatch has to stop at the boundary
+    /// rather than read past the shorter one.
+    ///
+    /// The lengths are 16 and 15 because the f32 and f64 kernels step 16 and 8
+    /// elements at a time through raw pointers: a pair too short for one full
+    /// step never enters the loop that does the reading.
+    #[test]
+    fn cosine_rejects_mismatched_lengths() {
+        let long_f32 = [1.0f32; 16];
+        let short_f32 = [1.0f32; 15];
+        assert!(std::panic::catch_unwind(|| f32::cosine_fast(&long_f32, 1.0, &short_f32)).is_err());
+        assert!(std::panic::catch_unwind(|| f32::cosine_fast(&short_f32, 1.0, &long_f32)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32))
+                .is_err()
+        );
+
+        let long_f64 = [1.0f64; 16];
+        let short_f64 = [1.0f64; 15];
+        assert!(std::panic::catch_unwind(|| f64::cosine_fast(&long_f64, 1.0, &short_f64)).is_err());
+
+        let long_f16 = [f16::from_f32(1.0); 16];
+        let short_f16 = [f16::from_f32(1.0); 15];
+        assert!(std::panic::catch_unwind(|| f16::cosine_fast(&long_f16, 1.0, &short_f16)).is_err());
+
+        let long_bf16 = [
+            bf16::from_f32(1.0),
+            bf16::from_f32(2.0),
+            bf16::from_f32(3.0),
+        ];
+        let short_bf16 = [bf16::from_f32(1.0), bf16::from_f32(2.0)];
+        assert!(
+            std::panic::catch_unwind(|| bf16::cosine_fast(&long_bf16, 1.0, &short_bf16)).is_err()
+        );
+    }
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
