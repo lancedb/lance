@@ -5,7 +5,6 @@ use crate::{
     Error, Result,
     dataset::{
         Dataset,
-        index::LanceIndexStoreExt,
         transaction::{Operation, TransactionBuilder},
     },
     index::{
@@ -331,7 +330,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
         let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
-        let mut created_index = match (self.index_type, self.params.index_name()) {
+        let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -597,23 +596,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 )));
             }
         };
-        if created_index
-            .index_details
-            .type_url
-            .ends_with("InvertedIndexDetails")
-        {
-            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
-                self.dataset,
-                &output_index_uuid,
-            )?;
-            created_index.files.push(
-                crate::index::scalar::inverted::write_physical_source_dataset_versions(
-                    &store,
-                    [self.dataset.manifest.version],
-                )
-                .await?,
-            );
-        }
 
         Ok(IndexMetadata {
             uuid: output_index_uuid,

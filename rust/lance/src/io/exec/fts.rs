@@ -38,6 +38,7 @@ use lance_core::{
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
+use rustc_hash::FxHashSet;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
@@ -798,7 +799,7 @@ impl CompoundQueryExec {
 async fn index_query_local_residual_batch(
     residual: QueryLocalFtsIndex,
     batch: RecordBatch,
-    allowed_terms: Arc<HashSet<String>>,
+    allowed_terms: Arc<FxHashSet<String>>,
 ) -> Result<QueryLocalFtsIndex> {
     spawn_cpu(move || {
         let row_ids = batch
@@ -823,10 +824,23 @@ async fn index_query_local_residual_batch(
 /// next batch, so the entire stream is never collected in memory and the
 /// number of live tokenizers/posting maps is bounded by the CPU pool size.
 async fn index_query_local_residual(
-    mut residual_input: SendableRecordBatchStream,
+    residual_input: SendableRecordBatchStream,
     seed: QueryLocalFtsIndex,
-    allowed_terms: Arc<HashSet<String>>,
+    allowed_terms: Arc<FxHashSet<String>>,
 ) -> DataFusionResult<Vec<QueryLocalFtsIndex>> {
+    // Match flat FTS's CPU-task sizing. Dataset scan batches are normally
+    // row-bounded (often 8,192 rows), which can leave a small residual with
+    // only one or two tokenizer tasks. Byte rechunking keeps tasks substantial
+    // while exposing enough parallelism for variable-width text.
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let input_schema = residual_input.schema();
+    let mut residual_input = Box::pin(lance_arrow::stream::rechunk_stream_by_size(
+        residual_input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    ));
     let parallelism = get_num_compute_intensive_cpus().max(1);
     let mut initial_batches = Vec::with_capacity(parallelism);
     let mut is_input_exhausted = false;
@@ -881,22 +895,6 @@ async fn index_query_local_residual(
     Ok(shards)
 }
 
-async fn query_local_residual_stats(
-    shards: Vec<QueryLocalFtsIndex>,
-    terms: Arc<[String]>,
-) -> Result<Vec<(QueryLocalFtsIndex, MemBM25Scorer)>> {
-    stream::iter(shards.into_iter().map(|shard| {
-        let terms = terms.clone();
-        spawn_cpu(move || {
-            let stats = shard.bm25_stats_for_terms(terms.as_ref());
-            Ok::<_, Error>((shard, stats))
-        })
-    }))
-    .buffered(get_num_compute_intensive_cpus().max(1))
-    .try_collect()
-    .await
-}
-
 async fn query_local_residual_leaves(
     shards: Vec<QueryLocalFtsIndex>,
     query: FtsQuery,
@@ -927,9 +925,13 @@ async fn query_local_residual_leaves(
     Ok(merged)
 }
 
-/// Exact compound FTS over committed postings plus an append-only residual
-/// scan. The residual documents are tokenized once into query-local postings,
-/// rather than once for every compound leaf.
+/// Compound FTS over committed postings plus a small append-only residual scan.
+///
+/// The residual documents are tokenized once into query-local postings, rather
+/// than once for every compound leaf. Both arms use the committed segments'
+/// BM25 corpus statistics. This intentionally assumes the residual rows follow
+/// the indexed corpus distribution: scores can differ from a rebuilt index,
+/// but remain comparable without paying to rebuild corpus statistics per query.
 #[derive(Debug)]
 pub(crate) struct HybridCompoundQueryExec {
     dataset: Arc<Dataset>,
@@ -1040,74 +1042,43 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 ))
             })?;
             let field_id = dataset.schema().field_id(&column)?;
-            let residual_seed = QueryLocalFtsIndex::try_with_params(
+            let tokenizer = first_index.tokenizer();
+            let doc_type = tokenizer.doc_type();
+            let residual_seed = QueryLocalFtsIndex::try_with_loaded_tokenizer(
                 field_id,
                 column.clone(),
                 first_index.params().clone(),
+                tokenizer,
             )?;
             let terms = residual_seed.exact_query_terms(&query)?;
             if terms.is_empty() {
                 metrics.baseline_metrics.record_output(0);
                 return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
             }
-            let allowed_terms = Arc::new(terms.iter().cloned().collect::<HashSet<_>>());
-            let residual_input = residual_input.execute(partition, context.clone())?;
-            let residual_shards =
-                index_query_local_residual(residual_input, residual_seed, allowed_terms).await?;
-
-            let query_tokens = Tokens::new(terms.clone(), first_index.tokenizer().doc_type());
+            let allowed_terms = Arc::new(terms.iter().cloned().collect::<FxHashSet<_>>());
+            let query_tokens = Tokens::new(terms.clone(), doc_type);
             let exact_params = params
                 .clone()
                 .with_fuzziness(Some(0))
                 .with_phrase_slop(None);
-            let mut scorer = build_global_bm25_scorer(
-                &indices,
-                &query_tokens,
-                &exact_params,
-                Some(metrics.as_ref()),
-            )
-            .await?;
-            let residual_shards = query_local_residual_stats(
-                residual_shards,
-                Arc::from(terms.clone().into_boxed_slice()),
-            )
-            .await?;
-            for (_, residual_stats) in &residual_shards {
-                scorer.total_tokens = scorer
-                    .total_tokens
-                    .checked_add(residual_stats.total_tokens)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "hybrid compound FTS total token count overflow".to_string(),
-                        )
-                    })?;
-                scorer.num_docs = scorer
-                    .num_docs
-                    .checked_add(residual_stats.num_docs)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "hybrid compound FTS document count overflow".to_string(),
-                        )
-                    })?;
-                for term in &terms {
-                    let residual_df = residual_stats.num_docs_containing_token(term);
-                    let df = scorer.token_docs.get_mut(term).ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "hybrid compound FTS scorer is missing query term '{term}'"
-                        ))
-                    })?;
-                    *df = df.checked_add(residual_df).ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "hybrid compound FTS document frequency overflow for term '{term}'"
-                        ))
-                    })?;
-                }
-            }
-            let residual_shards = residual_shards
-                .into_iter()
-                .map(|(shard, _)| shard)
-                .collect::<Vec<_>>();
-            let scorer = Arc::new(scorer);
+
+            let residual_context = context.clone();
+            let residual_indexing = async move {
+                let residual_input = residual_input.execute(partition, residual_context)?;
+                index_query_local_residual(residual_input, residual_seed, allowed_terms).await
+            };
+            let scorer_build = async {
+                let scorer = build_global_bm25_scorer(
+                    &indices,
+                    &query_tokens,
+                    &exact_params,
+                    Some(metrics.as_ref()),
+                )
+                .await?;
+                DataFusionResult::<Arc<MemBM25Scorer>>::Ok(Arc::new(scorer))
+            };
+            let (residual_shards, scorer) =
+                futures::future::try_join(residual_indexing, scorer_build).await?;
             let limit = params.limit.ok_or_else(|| {
                 DataFusionError::Execution(
                     "hybrid compound FTS requires a bounded result limit".to_string(),

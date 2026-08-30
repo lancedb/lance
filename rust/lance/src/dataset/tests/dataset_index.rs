@@ -11,8 +11,6 @@ use std::vec;
 use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
@@ -23,7 +21,7 @@ use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -52,13 +50,9 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{
-    FullTextSearchQuery, OldIndexDataFilter, ScalarIndex, index_files_to_table,
-};
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
-use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
@@ -71,9 +65,7 @@ use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
 use lance_table::format::BasePath;
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
-use roaring::RoaringBitmap;
 use rstest::rstest;
-use uuid::Uuid;
 
 #[rstest]
 #[tokio::test]
@@ -1889,26 +1881,14 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
         "fast search must skip the partially covered body's flat path:\n{fast_plan}"
     );
 
-    partial_dataset
-        .create_index(
-            &["body"],
-            IndexType::Inverted,
-            Some("body_idx".to_owned()),
-            &InvertedIndexParams::default().with_position(true),
-            true,
-        )
-        .await
-        .unwrap();
-    let mut rebuilt_oracle = compound_fts_results(&partial_dataset, explicit_query, None).await;
-    assert!(
-        rebuilt_oracle.len() > LIMIT,
-        "the rebuilt exact oracle must contain candidates beyond k"
+    assert_eq!(
+        partial_results.len(),
+        LIMIT,
+        "the approximate residual path must still return a bounded top-k"
     );
-    rebuilt_oracle.truncate(LIMIT);
-    assert_scored_rows_close(
-        "partial_top_level_cross_column_multimatch",
-        &partial_results,
-        &rebuilt_oracle,
+    assert!(
+        partial_results.iter().all(|(_, score)| score.is_finite()),
+        "committed-index statistics must produce finite residual scores"
     );
 }
 
@@ -2650,27 +2630,27 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
     ])
     .into();
 
-    let mut exact_scanner = dataset.scan();
-    exact_scanner
+    let mut hybrid_scanner = dataset.scan();
+    hybrid_scanner
         .project(&["id"])
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(query.clone()))
         .unwrap();
-    exact_scanner.limit(Some(2), None).unwrap();
-    let exact_plan = exact_scanner.explain_plan(false).await.unwrap();
+    hybrid_scanner.limit(Some(2), None).unwrap();
+    let hybrid_plan = hybrid_scanner.explain_plan(false).await.unwrap();
     assert!(
-        exact_plan.contains("HybridCompoundFtsScorer"),
-        "exact partial coverage should build one query-local residual index:\n{exact_plan}"
+        hybrid_plan.contains("HybridCompoundFtsScorer"),
+        "partial coverage should build one indexed-statistics query-local residual index:\n{hybrid_plan}"
     );
     assert!(
-        !exact_plan.contains("FlatMatchQuery"),
-        "hybrid compound scoring must not scan the residual once per leaf:\n{exact_plan}"
+        !hybrid_plan.contains("FlatMatchQuery"),
+        "hybrid compound scoring must not scan the residual once per leaf:\n{hybrid_plan}"
     );
-    let exact = exact_scanner.try_into_batch().await.unwrap();
+    let hybrid = hybrid_scanner.try_into_batch().await.unwrap();
     assert_eq!(
-        exact["id"].as_primitive::<Int32Type>().values(),
+        hybrid["id"].as_primitive::<Int32Type>().values(),
         &[0, 2],
-        "exact search should include the appended hit"
+        "approximate residual search should include the appended hit"
     );
 
     let empty_terms_query: FtsQuery = BooleanQuery::new([
@@ -2765,301 +2745,24 @@ async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
 }
 
 #[tokio::test]
-async fn test_partial_compound_hybrid_matches_rebuilt_index_scores_and_ties() {
-    let initial = arrow_array::record_batch!(
-        ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
-        ("id", Int32, [0, 1])
-    )
-    .unwrap();
-    let schema = initial.schema();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
-        "memory://",
-        None,
-    )
-    .await
-    .unwrap();
-    create_fragmented_fts_index(&mut dataset, "text", true).await;
-
-    let appended = arrow_array::record_batch!(
-        (
-            "text",
-            Utf8,
-            ["fresh alpha", "fresh beta", "fresh alpha", "fresh gamma"]
-        ),
-        ("id", Int32, [2, 3, 4, 5])
-    )
-    .unwrap();
-    let schema = appended.schema();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            Some(WriteParams {
-                // Keep the residual rows in separate scan batches so the
-                // parallel query-local shards must merge scores and ties.
-                max_rows_per_file: 1,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-    let positive: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
-        (Occur::Should, compound_match_query("alpha", "text", 1.0)),
-        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
-    ])
-    .into();
-    let boost_query: FtsQuery = BoostQuery::new(
-        positive,
-        compound_match_query("alpha", "text", 1.0),
-        Some(0.25),
-    )
-    .into();
-    let partial_boost = compound_fts_results(&dataset, boost_query.clone(), Some(10)).await;
-    assert_eq!(
-        partial_boost.len(),
-        5,
-        "MUST_NOT must exclude the blocked row"
-    );
-    assert_eq!(partial_boost[0].1.to_bits(), partial_boost[1].1.to_bits());
-    assert!(
-        partial_boost[0].0 < partial_boost[1].0,
-        "equal-score rows must use ascending row id as the exact tie break"
-    );
-
-    let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
-        "fresh alpha".to_string(),
-        vec!["text".to_string(), "text".to_string()],
-    )
-    .unwrap()
-    .try_with_boosts(vec![1.0, 2.0])
-    .unwrap()
-    .into();
-    let partial_multimatch =
-        compound_fts_results(&dataset, multimatch_query.clone(), Some(3)).await;
-
-    dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".to_string()),
-            &InvertedIndexParams::default().with_position(true),
-            true,
-        )
-        .await
-        .unwrap();
-    let rebuilt_boost = compound_fts_results(&dataset, boost_query, Some(10)).await;
-    let rebuilt_multimatch = compound_fts_results(&dataset, multimatch_query, Some(3)).await;
-    assert_eq!(
-        scored_row_bits(&partial_boost),
-        scored_row_bits(&rebuilt_boost),
-        "hybrid Boost scores must be bit-identical to a rebuilt index"
-    );
-    assert_eq!(
-        scored_row_bits(&partial_multimatch),
-        scored_row_bits(&rebuilt_multimatch),
-        "hybrid MultiMatch scores must be bit-identical to a rebuilt index"
-    );
-}
-
-#[tokio::test]
-async fn test_partial_compound_hybrid_rejects_same_id_rewrite_after_deferred_remap() {
-    let initial = arrow_array::record_batch!(
-        (
-            "text",
-            Utf8,
-            [
-                "stable alpha common",
-                "stable gamma common",
-                "stale alpha common"
-            ]
-        ),
-        ("id", Int32, [0, 1, 2])
-    )
-    .unwrap();
-    let schema = initial.schema();
-    let test_uri = TempStrDir::default();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema.clone()),
-        &test_uri,
-        Some(WriteParams {
-            max_rows_per_file: 1,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".to_string()),
-            &InvertedIndexParams::default().with_position(true),
-            true,
-        )
-        .await
-        .unwrap();
-
-    let rewritten_fragment = dataset.get_fragment(2).unwrap();
-    let mut replacement_file = rewritten_fragment.metadata().files[0].clone();
-    replacement_file.path = "replacement.lance".to_string();
-    let replacement = arrow_array::record_batch!(
-        ("text", Utf8, ["replacement beta common"]),
-        ("id", Int32, [2])
-    )
-    .unwrap();
-    let object_writer = dataset
-        .object_store
-        .create(&dataset.data_dir().join(replacement_file.path.as_str()))
-        .await
-        .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
-        object_writer,
-        schema.as_ref().try_into().unwrap(),
-        Default::default(),
-    )
-    .unwrap();
-    writer.write_batch(&replacement).await.unwrap();
-    writer.finish().await.unwrap();
-
-    let read_version = dataset.manifest.version;
-    let mut dataset = Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(2, replacement_file)],
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap();
-    let committed = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        !committed.fragment_bitmap.as_ref().unwrap().contains(2),
-        "the logical index must prune the same-id rewritten fragment"
-    );
-    let physical_source_version = committed.dataset_version;
-
-    // Compact only the two still-covered fragments and defer the address
-    // remap. The stale physical document from rewritten fragment 2 is absent
-    // from that remap and therefore remains in the postings.
-    let metrics = compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 2,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(metrics.fragments_removed, 2);
-    assert_eq!(metrics.fragments_added, 1);
-
-    remapping::remap_column_index(&mut dataset, &["text"], Some("text_idx".to_string()))
-        .await
-        .unwrap();
-    let remapped = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(remapped.dataset_version > physical_source_version);
-    assert_eq!(
-        crate::index::scalar::inverted::physical_source_dataset_versions(&dataset, &remapped)
-            .await
-            .unwrap(),
-        Some(vec![physical_source_version]),
-        "deferred remap must not advance immutable physical provenance"
-    );
-
-    let appended =
-        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [3]))
-            .unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let query: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("common", "text", 1.0)),
-        (Occur::Should, compound_match_query("alpha", "text", 1.0)),
-        (Occur::Should, compound_match_query("beta", "text", 1.0)),
-        (Occur::MustNot, compound_match_query("stale", "text", 1.0)),
-    ])
-    .into();
-    let plan = compound_fts_plan(&dataset, query.clone(), 2).await;
-    assert!(
-        !plan.contains("HybridCompoundFtsScorer"),
-        "same-id indexed-field rewrites make physical BM25 stats unsafe:\n{plan}"
-    );
-
-    let actual = compound_fts_results(&dataset, query.clone(), Some(2)).await;
-    let mut flat_oracle = compound_fts_results(&dataset, query, None).await;
-    flat_oracle.truncate(2);
-    assert_eq!(
-        actual, flat_oracle,
-        "bounded fallback must preserve the flat path's ordered row ids and scores"
-    );
-
-    let exact_oracle_query: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("common", "text", 0.0)),
-        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
-        (Occur::Should, compound_match_query("beta", "text", 0.0)),
-        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
-    ])
-    .into();
-    let exact_actual = compound_fts_results(&dataset, exact_oracle_query.clone(), Some(3)).await;
-    let mut rebuilt = dataset.clone();
-    rebuilt
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".to_string()),
-            &InvertedIndexParams::default().with_position(true),
-            true,
-        )
-        .await
-        .unwrap();
-    let exact_expected = compound_fts_results(&rebuilt, exact_oracle_query, Some(3)).await;
-    assert_eq!(
-        scored_row_bits(&exact_actual),
-        scored_row_bits(&exact_expected),
-        "same-id rewrite fallback must match a rebuilt index exactly"
-    );
-}
-
-#[tokio::test]
-async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite() {
+async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() {
     let primary = TempStrDir::default();
     let base_one = TempStrDir::default();
     let base_two = TempStrDir::default();
     let initial = arrow_array::record_batch!(
-        ("text", Utf8, ["stable alpha common", "stale alpha common"]),
+        ("text", Utf8, ["stable alpha", "stale alpha"]),
         ("id", Int32, [0, 1])
     )
     .unwrap();
     let schema = initial.schema();
-    let mut dataset = Dataset::write(
+    let dataset = Dataset::write(
         RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema.clone()),
         &primary,
         Some(WriteParams {
             max_rows_per_file: 1,
             initial_bases: Some(vec![
-                BasePath::new(1, base_one.to_string(), Some("base-one".to_string()), false),
-                BasePath::new(2, base_two.to_string(), Some("base-two".to_string()), false),
+                BasePath::new(1, base_one.to_string(), None, false),
+                BasePath::new(2, base_two.to_string(), None, false),
             ]),
             target_bases: Some(vec![1]),
             ..Default::default()
@@ -3067,30 +2770,29 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
     )
     .await
     .unwrap();
-    assert!(dataset.get_fragments().iter().all(|fragment| {
-        fragment
-            .metadata()
-            .files
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert!(
+        dataset
+            .get_fragments()
             .iter()
-            .all(|file| file.base_id == Some(1))
-    }));
-
-    let columns = ["text"];
-    let params = InvertedIndexParams::default().with_position(true);
+            .all(|fragment| { fragment.metadata().files[0].base_id == Some(1) })
+    );
     let segment = dataset
-        .create_index_builder(&columns, IndexType::Inverted, &params)
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default().with_position(true),
+        )
         .name("text_idx".to_string())
         .execute_uncommitted()
         .await
         .unwrap();
 
-    let rewritten_fragment = dataset.get_fragment(1).unwrap();
-    let relative_path = rewritten_fragment.metadata().files[0].path.clone();
-    let replacement = arrow_array::record_batch!(
-        ("text", Utf8, ["replacement beta common"]),
-        ("id", Int32, [1])
-    )
-    .unwrap();
+    let relative_path = dataset.get_fragment(1).unwrap().metadata().files[0]
+        .path
+        .clone();
+    let replacement =
+        arrow_array::record_batch!(("text", Utf8, ["current beta"]), ("id", Int32, [1])).unwrap();
     let replacement_path = dataset
         .data_file_dir_for_base(Some(2))
         .unwrap()
@@ -3131,11 +2833,6 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
     )
     .await
     .unwrap();
-    let rewritten_fragment = dataset.get_fragment(1).unwrap();
-    let rewritten_file = &rewritten_fragment.metadata().files[0];
-    assert_eq!(rewritten_file.path, relative_path);
-    assert_eq!(rewritten_file.base_id, Some(2));
-
     dataset
         .commit_existing_index_segments("text_idx", "text", vec![segment])
         .await
@@ -3146,381 +2843,203 @@ async fn test_partial_compound_hybrid_rejects_same_path_different_base_rewrite()
         .unwrap()
         .unwrap();
     let coverage = committed.fragment_bitmap.as_ref().unwrap();
-    assert!(coverage.contains(0));
+    assert!(
+        coverage.contains(0),
+        "the unchanged physical file must remain covered"
+    );
     assert!(
         !coverage.contains(1),
-        "changing only the registered base must prune stale logical coverage"
+        "the same path on a different registered base must be pruned"
     );
-
-    let appended =
-        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [2]))
-            .unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
-        )
-        .await
-        .unwrap();
 
     let query: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("common", "text", 0.0)),
-        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
-        (Occur::Should, compound_match_query("beta", "text", 0.0)),
-        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
+        (Occur::Must, compound_match_query("beta", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("alpha", "text", 1.0)),
     ])
     .into();
-    let plan = compound_fts_plan(&dataset, query.clone(), 3).await;
-    assert!(
-        !plan.contains("HybridCompoundFtsScorer"),
-        "same-path files from different bases make physical BM25 stats unsafe:\n{plan}"
-    );
-    let actual = compound_fts_results(&dataset, query.clone(), Some(3)).await;
-
-    let mut rebuilt = dataset.clone();
-    rebuilt
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".to_string()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    let expected = compound_fts_results(&rebuilt, query, Some(3)).await;
-    assert_eq!(
-        scored_row_bits(&actual),
-        scored_row_bits(&expected),
-        "different-base rewrite fallback must match a rebuilt index exactly"
-    );
-}
-
-#[tokio::test]
-async fn test_partial_compound_hybrid_rejects_rebound_registered_base() {
-    let primary = TempStrDir::default();
-    let base_a = TempStrDir::default();
-    let base_b = TempStrDir::default();
-    let stable =
-        arrow_array::record_batch!(("text", Utf8, ["stable alpha common"]), ("id", Int32, [0]))
-            .unwrap();
-    let schema = stable.schema();
-    let dataset = Dataset::write(
-        RecordBatchIterator::new(vec![stable].into_iter().map(Ok), schema.clone()),
-        &primary,
-        Some(WriteParams {
-            max_rows_per_file: 1,
-            initial_bases: Some(vec![BasePath::new(
-                1,
-                base_a.to_string(),
-                Some("base-a".to_string()),
-                false,
-            )]),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    let indexed_on_base =
-        arrow_array::record_batch!(("text", Utf8, ["stale alpha common"]), ("id", Int32, [1]))
-            .unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![indexed_on_base].into_iter().map(Ok), schema.clone()),
-        Arc::new(dataset),
-        Some(WriteParams {
-            mode: WriteMode::Append,
-            target_bases: Some(vec![1]),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        dataset.get_fragment(0).unwrap().metadata().files[0].base_id,
-        None
-    );
-    assert_eq!(
-        dataset.get_fragment(1).unwrap().metadata().files[0].base_id,
-        Some(1)
-    );
-
-    let columns = ["text"];
-    let params = InvertedIndexParams::default().with_position(true);
-    let segment = dataset
-        .create_index_builder(&columns, IndexType::Inverted, &params)
-        .name("text_idx".to_string())
-        .execute_uncommitted()
-        .await
-        .unwrap();
-
-    let fragment_before = dataset.get_fragment(1).unwrap().metadata().clone();
-    let relative_path = fragment_before.files[0].path.clone();
-    let replacement = arrow_array::record_batch!(
-        ("text", Utf8, ["replacement beta common"]),
-        ("id", Int32, [1])
-    )
-    .unwrap();
-    let (base_b_store, base_b_root) = ObjectStore::from_uri(&base_b).await.unwrap();
-    let object_writer = base_b_store
-        .create(&base_b_root.join(relative_path.as_str()))
-        .await
-        .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
-        object_writer,
-        schema.as_ref().try_into().unwrap(),
-        Default::default(),
-    )
-    .unwrap();
-    writer.write_batch(&replacement).await.unwrap();
-    writer.finish().await.unwrap();
-
-    let binding_before = dataset.manifest.base_paths.get(&1).unwrap().clone();
-    dataset = Arc::new(dataset)
-        .add_bases(
-            vec![BasePath::new(
-                1,
-                base_b.to_string(),
-                Some("base-b".to_string()),
-                false,
-            )],
-            None,
-        )
-        .await
-        .unwrap();
-    let binding_after = dataset.manifest.base_paths.get(&1).unwrap();
-    assert_eq!(binding_before.path, base_a.to_string());
-    assert_eq!(binding_after.path, base_b.to_string());
-    assert_eq!(
-        binding_before.is_dataset_root,
-        binding_after.is_dataset_root
-    );
-    assert_eq!(
-        dataset.get_fragment(1).unwrap().metadata(),
-        &fragment_before,
-        "UpdateBases must leave the DataFile identity unchanged"
-    );
-
-    dataset
-        .commit_existing_index_segments("text_idx", "text", vec![segment])
-        .await
-        .unwrap();
-    let committed = dataset
-        .load_index_by_name("text_idx")
-        .await
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
         .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap();
-    let coverage = committed.fragment_bitmap.as_ref().unwrap();
-    assert!(coverage.contains(0));
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        !coverage.contains(1),
-        "rebinding a referenced base must prune stale logical coverage"
+        plan.contains("HybridCompoundFtsScorer"),
+        "the physically pruned fragment should use hybrid residual scoring:\n{plan}"
     );
-
-    let appended =
-        arrow_array::record_batch!(("text", Utf8, ["tail beta common"]), ("id", Int32, [2]))
-            .unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
-        )
-        .await
-        .unwrap();
-    let query: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("common", "text", 0.0)),
-        (Occur::Should, compound_match_query("alpha", "text", 0.0)),
-        (Occur::Should, compound_match_query("beta", "text", 0.0)),
-        (Occur::MustNot, compound_match_query("stale", "text", 0.0)),
-    ])
-    .into();
-    let plan = compound_fts_plan(&dataset, query.clone(), 3).await;
-    assert!(
-        !plan.contains("HybridCompoundFtsScorer"),
-        "a rebound registered base makes physical BM25 stats unsafe:\n{plan}"
-    );
-    let actual = compound_fts_results(&dataset, query.clone(), Some(3)).await;
-
-    let mut rebuilt = dataset.clone();
-    rebuilt
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".to_string()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    let expected = compound_fts_results(&rebuilt, query, Some(3)).await;
+    let results = scanner.try_into_batch().await.unwrap();
     assert_eq!(
-        scored_row_bits(&actual),
-        scored_row_bits(&expected),
-        "rebound-base fallback must match a rebuilt index exactly"
+        results["id"].as_primitive::<Int32Type>().values(),
+        &[1],
+        "the current beta row must be visible without leaking stale alpha membership"
+    );
+    assert!(
+        results[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|score| score.is_finite())
     );
 }
 
 #[tokio::test]
-async fn test_partial_compound_hybrid_rejects_retired_physical_fragments() {
+async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
     let initial = arrow_array::record_batch!(
-        ("text", Utf8, ["retired alpha", "live alpha"]),
+        ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
         ("id", Int32, [0, 1])
     )
     .unwrap();
     let schema = initial.schema();
-    let test_uri = TempStrDir::default();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
-        &test_uri,
+        "memory://",
         None,
     )
     .await
     .unwrap();
     create_fragmented_fts_index(&mut dataset, "text", true).await;
 
-    let initial_segment = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    let retired_fragments = initial_segment.fragment_bitmap.clone().unwrap();
-    let initial_index = dataset
-        .open_scalar_index(
+    let appended = arrow_array::record_batch!(
+        (
             "text",
-            &initial_segment.uuid,
-            &lance_index::metrics::NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-
-    dataset.delete("id = 0").await.unwrap();
-    let metrics = compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 10,
-            materialize_deletions_threshold: 0.0,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(metrics.fragments_removed > 0);
-    assert!(
-        dataset
-            .get_fragments()
-            .iter()
-            .all(|fragment| fragment.metadata().deletion_file.is_none())
-    );
-    let indexed_fragments = dataset.fragment_bitmap.as_ref().clone();
-    assert!(indexed_fragments.is_disjoint(&retired_fragments));
-
-    // Model an incremental FTS replacement that retains the old postings and
-    // records their now-retired fragment ids for merge-on-read filtering.
-    let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
-        dataset.schema(),
-        initial_segment.fields[0],
-        DocumentGranularity::Row,
+            Utf8,
+            [
+                "fresh alpha",
+                "fresh beta",
+                "fresh alpha",
+                "fresh gamma",
+                "fresh beta blocked"
+            ]
+        ),
+        ("id", Int32, [2, 3, 4, 5, 6])
     )
     .unwrap();
-    let current_fragments = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.metadata().clone())
-        .collect();
-    let update_criteria = initial_index.update_criteria();
-    let new_data = crate::index::scalar::load_fts_training_data(
-        &dataset,
-        &resolved,
-        &update_criteria.data_criteria,
-        Some(current_fragments),
-        true,
-        None,
-    )
-    .await
-    .unwrap();
-    let updated_uuid = Uuid::new_v4();
-    let updated_store = LanceIndexStore::from_dataset_for_new(&dataset, &updated_uuid).unwrap();
-    let created = initial_index
-        .update(
-            new_data,
-            &updated_store,
-            Some(OldIndexDataFilter::Fragments {
-                to_keep: RoaringBitmap::new(),
-                to_remove: retired_fragments.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-    let updated_segment = lance_table::format::IndexMetadata {
-        uuid: updated_uuid,
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(indexed_fragments),
-        index_details: Some(Arc::new(created.index_details)),
-        index_version: created.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created.files)),
-        ..initial_segment
-    };
-    dataset
-        .commit_existing_index_segments("text_idx", "text", vec![updated_segment])
-        .await
-        .unwrap();
-
-    let committed = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    let committed_index = dataset
-        .open_scalar_index(
-            "text",
-            &committed.uuid,
-            &lance_index::metrics::NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-    let committed_index = committed_index
-        .as_any()
-        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
-        .unwrap();
-    assert_eq!(committed_index.deleted_fragments(), &retired_fragments);
-
-    let appended =
-        arrow_array::record_batch!(("text", Utf8, ["tail alpha"]), ("id", Int32, [2])).unwrap();
     let schema = appended.schema();
     dataset
         .append(
             RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
-            None,
+            Some(WriteParams {
+                // Keep the residual rows in separate fragments; execution may
+                // rechunk their scan batches before query-local indexing.
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
 
-    let query: FtsQuery = BooleanQuery::new([
-        (Occur::Should, compound_match_query("retired", "text", 1.0)),
-        (Occur::Should, compound_match_query("tail", "text", 1.0)),
+    let positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
     ])
     .into();
-    let plan = compound_fts_plan(&dataset, query.clone(), 10).await;
-    assert!(
-        !plan.contains("HybridCompoundFtsScorer"),
-        "retired physical docs make unified hybrid BM25 stats unsafe:\n{plan}"
+    let boost_query: FtsQuery = BoostQuery::new(
+        positive,
+        compound_match_query("alpha", "text", 1.0),
+        Some(0.25),
+    )
+    .into();
+    let partial_boost = compound_fts_results(&dataset, boost_query.clone(), Some(10)).await;
+    assert_eq!(
+        partial_boost.len(),
+        5,
+        "MUST_NOT must exclude the blocked row"
     );
+    assert_eq!(partial_boost[0].1.to_bits(), partial_boost[1].1.to_bits());
+    assert!(
+        partial_boost[0].0 < partial_boost[1].0,
+        "equal-score rows must use ascending row id as the exact tie break"
+    );
+    let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
+        "fresh alpha".to_string(),
+        vec!["text".to_string(), "text".to_string()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 2.0])
+    .unwrap()
+    .into();
+    for (query_name, query) in [
+        ("Boost", boost_query.clone()),
+        ("MultiMatch", multimatch_query.clone()),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        scanner.limit(Some(10), None).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>().values();
+        let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+        let score_bits = ids
+            .iter()
+            .copied()
+            .zip(scores.iter().map(|score| score.to_bits()))
+            .collect::<HashMap<_, _>>();
+        for residual_id in [2, 4] {
+            assert_eq!(
+                score_bits.get(&residual_id),
+                score_bits.get(&0),
+                "{query_name} must score identical indexed and residual documents identically"
+            );
+        }
+    }
 
-    let mut scanner = dataset.scan();
-    scanner
+    let mut indexed_only_scanner = dataset.scan();
+    indexed_only_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(boost_query.clone()))
+        .unwrap()
+        .fast_search();
+    indexed_only_scanner.limit(Some(10), None).unwrap();
+    let indexed_only =
+        compound_fts_result_bits(&indexed_only_scanner.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+    let partial_boost_bits = scored_row_bits(&partial_boost)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    for (row_id, score) in indexed_only {
+        assert_eq!(
+            partial_boost_bits.get(&row_id),
+            Some(&score),
+            "hybrid scoring must preserve committed-index scores for indexed row {row_id}"
+        );
+    }
+
+    let residual_only_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("beta", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let mut residual_only_scanner = dataset.scan();
+    residual_only_scanner
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query))
-        .unwrap()
-        .limit(Some(10), None)
+        .full_text_search(FullTextSearchQuery::new_query(residual_only_query))
         .unwrap();
-    let results = scanner.try_into_batch().await.unwrap();
+    residual_only_scanner.limit(Some(10), None).unwrap();
+    let residual_only_plan = residual_only_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        residual_only_plan.contains("HybridCompoundFtsScorer"),
+        "residual-only term membership must use the indexed-statistics hybrid path:\n{residual_only_plan}"
+    );
+    let residual_only = residual_only_scanner.try_into_batch().await.unwrap();
     assert_eq!(
-        results["id"].as_primitive::<Int32Type>().values(),
-        &[2],
-        "fallback must prune stale postings from the retired fragment"
+        residual_only["id"].as_primitive::<Int32Type>().values(),
+        &[3],
+        "the zero-weight beta leaf must retain membership while MUST_NOT excludes id=6"
+    );
+    assert_eq!(
+        residual_only[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .values(),
+        &[0.0],
+        "a residual-only term must contribute zero when committed df is zero"
     );
 }
 
@@ -4332,16 +3851,6 @@ async fn test_fts_v1_remains_queryable_after_append_optimize() {
     let schema = batch.schema();
     let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
     dataset.append(batches, None).await.unwrap();
-    let compound_query: FtsQuery = BooleanQuery::new([
-        (Occur::Must, compound_match_query("alpha", "text", 1.0)),
-        (Occur::Should, compound_match_query("original", "text", 1.0)),
-    ])
-    .into();
-    let plan = compound_fts_plan(&dataset, compound_query, 2).await;
-    assert!(
-        !plan.contains("HybridCompoundFtsScorer"),
-        "a physical FTS v1 segment must not enter the modern hybrid path:\n{plan}"
-    );
     dataset
         .optimize_indices(&OptimizeOptions::append())
         .await

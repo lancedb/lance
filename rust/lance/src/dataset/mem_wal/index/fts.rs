@@ -63,7 +63,7 @@ use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, Lanc
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::RowPosition;
 use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
@@ -770,12 +770,15 @@ impl std::fmt::Debug for TokenizerPool {
 
 impl TokenizerPool {
     fn new(params: &InvertedIndexParams, cap: usize) -> Result<Self> {
-        let template = params.build()?;
-        Ok(Self {
+        Ok(Self::from_template(params.build()?, cap))
+    }
+
+    fn from_template(template: Box<dyn LanceTokenizer>, cap: usize) -> Self {
+        Self {
             template,
             free: Mutex::new(Vec::new()),
             cap: cap.max(1),
-        })
+        }
     }
 
     /// Acquire a tokenizer. Pops from the free list, otherwise clones the
@@ -1016,7 +1019,7 @@ pub struct FtsMemIndex {
     merge: Arc<Mutex<Option<PendingMerge>>>,
 }
 
-/// Query-owned exact postings for one residual scan.
+/// Query-owned term-only postings for one residual scan.
 ///
 /// This deliberately exposes only the immutable feature-materialization API
 /// needed by hybrid execution. Unlike [`FtsMemIndex`], it never freezes or
@@ -1028,6 +1031,7 @@ pub struct QueryLocalFtsIndex {
 }
 
 impl QueryLocalFtsIndex {
+    #[cfg(test)]
     pub(crate) fn try_with_params(
         field_id: i32,
         column_name: String,
@@ -1040,6 +1044,25 @@ impl QueryLocalFtsIndex {
                 params,
                 false,
             )?,
+        })
+    }
+
+    pub(crate) fn try_with_loaded_tokenizer(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        tokenizer: Box<dyn LanceTokenizer>,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        let pool = TokenizerPool::from_template(tokenizer, FtsMemIndex::DEFAULT_TOKENIZER_POOL_CAP);
+        Ok(Self {
+            inner: FtsMemIndex::with_tokenizer_pool_and_maintenance(
+                field_id,
+                column_name,
+                params,
+                pool,
+                false,
+            ),
         })
     }
 
@@ -1079,7 +1102,7 @@ impl QueryLocalFtsIndex {
         &self,
         batch: &RecordBatch,
         row_ids: &UInt64Array,
-        terms: &HashSet<String>,
+        terms: &FxHashSet<String>,
     ) -> Result<()> {
         self.inner
             .insert_with_row_ids_for_terms(batch, row_ids, terms)
@@ -1088,10 +1111,6 @@ impl QueryLocalFtsIndex {
     #[cfg(test)]
     fn doc_count(&self) -> usize {
         self.inner.doc_count()
-    }
-
-    pub(crate) fn bm25_stats_for_terms(&self, terms: &[String]) -> MemBM25Scorer {
-        self.inner.bm25_stats_for_terms(terms)
     }
 
     pub(crate) fn exact_leaf_results(
@@ -1194,8 +1213,24 @@ impl FtsMemIndex {
     ) -> Result<Self> {
         params.validate_format_version()?;
         let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
+        Ok(Self::with_tokenizer_pool_and_maintenance(
+            field_id,
+            column_name,
+            params,
+            pool,
+            background_maintenance,
+        ))
+    }
+
+    fn with_tokenizer_pool_and_maintenance(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        pool: TokenizerPool,
+        background_maintenance: bool,
+    ) -> Self {
         let writer_tokenizer = pool.template.box_clone();
-        Ok(Self {
+        Self {
             field_id,
             source_column_name: column_name,
             params,
@@ -1206,7 +1241,7 @@ impl FtsMemIndex {
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
             background_maintenance,
             merge: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     pub(crate) fn try_with_resolved_field(
@@ -1361,12 +1396,12 @@ impl FtsMemIndex {
     /// Insert explicit, potentially non-contiguous rows while retaining
     /// postings only for query terms.
     /// The tokenizer still visits the complete document so BM25 document
-    /// length and corpus totals remain identical to a full index.
+    /// lengths remain accurate when scoring with committed-index statistics.
     pub(crate) fn insert_with_row_ids_for_terms(
         &self,
         batch: &RecordBatch,
         row_ids: &UInt64Array,
-        terms: &HashSet<String>,
+        terms: &FxHashSet<String>,
     ) -> Result<()> {
         if row_ids.len() != batch.num_rows() || row_ids.null_count() != 0 {
             return Err(Error::invalid_input(format!(
@@ -1395,7 +1430,7 @@ impl FtsMemIndex {
         &self,
         batch: &RecordBatch,
         row_position: impl Fn(usize) -> Result<u64>,
-        allowed_terms: Option<&HashSet<String>>,
+        allowed_terms: Option<&FxHashSet<String>>,
     ) -> Result<()> {
         let st = self.state.load_full();
         let document_position_start = st.tail.doc_count();
@@ -1424,20 +1459,35 @@ impl FtsMemIndex {
         // per-document map and per-`(term, doc)` `Vec` allocation that
         // dominated insert cost. `FxHashMap` skips SipHash on the hot lookup.
         let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
-        let mut documents: Vec<DocumentMetadata> = Vec::with_capacity(batch.num_rows());
+        let mut documents: Vec<DocumentMetadata> = if allowed_terms.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(batch.num_rows())
+        };
         let mut total_tokens: u64 = 0;
         let preserve_zero_token_documents =
             self.params.get_document_granularity().is_list_element();
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
             let document_position = document_position_start + documents.len() as u64;
-            let num_tokens = index_text_filtered(
-                text,
-                document_position,
-                tokenizer,
-                &mut term_builders,
-                allowed_terms,
-            )?;
-            if preserve_zero_token_documents || num_tokens > 0 {
+            let (num_tokens, retained_term) = match allowed_terms {
+                Some(allowed_terms) => index_text_filtered(
+                    text,
+                    document_position,
+                    tokenizer,
+                    &mut term_builders,
+                    allowed_terms,
+                )?,
+                None => (
+                    index_text(text, document_position, tokenizer, &mut term_builders)?,
+                    false,
+                ),
+            };
+            let retain_document = if allowed_terms.is_some() {
+                retained_term
+            } else {
+                preserve_zero_token_documents || num_tokens > 0
+            };
+            if retain_document {
                 documents.push(DocumentMetadata { key, num_tokens });
                 total_tokens += num_tokens as u64;
             }
@@ -1524,16 +1574,9 @@ impl FtsMemIndex {
         Ok(terms)
     }
 
-    /// Build exact residual corpus statistics for the supplied query terms.
-    pub(crate) fn bm25_stats_for_terms(&self, terms: &[String]) -> MemBM25Scorer {
-        let st = self.state.load_full();
-        let tail = st.tail.snapshot();
-        build_scorer(&st, &tail, terms, true)
-    }
-
-    /// Materialize each exact leaf with a caller-supplied logical-corpus
-    /// scorer. Compound semantics are deliberately evaluated by the canonical
-    /// lance-index scorer instead of being duplicated here.
+    /// Materialize each exact leaf with a caller-supplied scorer. Compound
+    /// semantics are deliberately evaluated by the canonical lance-index
+    /// scorer instead of being duplicated here.
     pub(crate) fn exact_leaf_results(
         &self,
         query: &FtsQuery,
@@ -1810,6 +1853,7 @@ impl FtsMemIndex {
                         Operator::Or,
                         &scorer,
                         theta,
+                        false,
                     ) {
                         topk.offer(e.score, e.key());
                     }
@@ -1829,6 +1873,7 @@ impl FtsMemIndex {
                         operator,
                         &scorer,
                         f32::NEG_INFINITY,
+                        false,
                     ));
                 }
                 results
@@ -1886,7 +1931,7 @@ impl FtsMemIndex {
         operator: Operator,
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
-        if tokens.is_empty() || scorer.num_docs() == 0 {
+        if tokens.is_empty() {
             return Vec::new();
         }
         let tail = st.tail.snapshot();
@@ -1901,6 +1946,7 @@ impl FtsMemIndex {
             operator,
             scorer,
             f32::NEG_INFINITY,
+            true,
         ));
         results
     }
@@ -2645,15 +2691,39 @@ impl BatchTermBuilder {
     }
 }
 
+fn index_text(
+    text: &str,
+    document_position: u64,
+    tokenizer: &mut dyn LanceTokenizer,
+    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
+) -> Result<u32> {
+    index_text_with_predicate(text, document_position, tokenizer, term_builders, |_| true)
+        .map(|(num_tokens, _)| num_tokens)
+}
+
 fn index_text_filtered(
     text: &str,
     document_position: u64,
     tokenizer: &mut dyn LanceTokenizer,
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
-    allowed_terms: Option<&HashSet<String>>,
-) -> Result<u32> {
+    allowed_terms: &FxHashSet<String>,
+) -> Result<(u32, bool)> {
+    index_text_with_predicate(text, document_position, tokenizer, term_builders, |term| {
+        allowed_terms.contains(term)
+    })
+}
+
+#[inline]
+fn index_text_with_predicate(
+    text: &str,
+    document_position: u64,
+    tokenizer: &mut dyn LanceTokenizer,
+    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
+    mut retain_term: impl FnMut(&str) -> bool,
+) -> Result<(u32, bool)> {
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
+    let mut retained_term = false;
     while let Some(token) = stream.next() {
         let position = u32::try_from(token.position).map_err(|_| {
             Error::invalid_input(format!(
@@ -2662,7 +2732,8 @@ fn index_text_filtered(
             ))
         })?;
         let term = token.text.as_str();
-        if allowed_terms.is_none_or(|allowed| allowed.contains(term)) {
+        if retain_term(term) {
+            retained_term = true;
             if let Some(builder) = term_builders.get_mut(term) {
                 builder.observe(document_position, position);
             } else {
@@ -2678,7 +2749,7 @@ fn index_text_filtered(
             ))
         })?;
     }
-    Ok(num_tokens)
+    Ok((num_tokens, retained_term))
 }
 
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
@@ -2769,6 +2840,11 @@ fn tail_token_df(
 
 /// Score `tokens` against the visible tail, summing each token's BM25
 /// contribution per document. Uses the shared corpus-wide `scorer`.
+///
+/// `retain_zero_weight_matches` is reserved for query-local residual postings
+/// scored with committed-index statistics. A term absent from the committed
+/// corpus has zero BM25 weight, but its fresh matching rows must remain visible
+/// to compound membership and MUST_NOT evaluation.
 fn score_terms(
     snap: &Snapshot,
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
@@ -2776,6 +2852,7 @@ fn score_terms(
     operator: Operator,
     scorer: &MemBM25Scorer,
     theta: f32,
+    retain_zero_weight_matches: bool,
 ) -> Vec<FtsEntry> {
     // Per-token tail data + its score upper bound (max freq over visible chunks,
     // scored at the most generous doc length of 1). If even the sum of those
@@ -2791,7 +2868,7 @@ fn score_terms(
             continue;
         };
         let qw = scorer.query_weight(token);
-        if qw == 0.0 {
+        if qw == 0.0 && !retain_zero_weight_matches {
             continue;
         }
         let slice = entry.value().load_full();
@@ -2801,7 +2878,9 @@ fn score_terms(
             .map(|c| c.max_freq)
             .max()
             .unwrap_or(0);
-        tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        if qw != 0.0 {
+            tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        }
         tail_terms.push((qw, slice));
     }
     if tail_ub <= theta {
@@ -2818,8 +2897,12 @@ fn score_terms(
                 continue;
             };
             for (i, &document_position) in chunk.row_positions.iter().enumerate() {
-                let dl = meta.dl(document_position).unwrap_or(1);
-                let score = qw * scorer.doc_weight(chunk.frequencies[i], dl);
+                let score = if qw == 0.0 {
+                    0.0
+                } else {
+                    let dl = meta.dl(document_position).unwrap_or(1);
+                    qw * scorer.doc_weight(chunk.frequencies[i], dl)
+                };
                 *doc_scores.entry(document_position).or_default() += score;
                 if let Some(doc_hits) = &mut doc_hits {
                     *doc_hits.entry(document_position).or_default() += 1;
@@ -4533,12 +4616,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_row_ids_and_query_term_allowlist_preserve_bm25_stats() {
+    fn query_term_allowlist_preserves_document_lengths_with_external_scorer() {
         let schema = create_test_schema();
         let batch = create_test_batch(schema.as_ref());
         let row_ids = UInt64Array::from(vec![900, 42, 777]);
-        let terms = HashSet::from(["hello".to_string()]);
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let index = QueryLocalFtsIndex::try_with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default(),
+        )
+        .unwrap();
         let full_index = FtsMemIndex::new(1, "description".to_string());
 
         index
@@ -4546,28 +4634,68 @@ mod tests {
             .unwrap();
         full_index.insert(&batch, 0).unwrap();
 
-        assert_eq!(index.doc_count(), 3);
-        assert_eq!(index.entry_count(), 2);
-        let scorer = index.bm25_stats_for_terms(&["hello".to_string()]);
-        let full_scorer = full_index.bm25_stats_for_terms(&["hello".to_string()]);
-        assert_eq!(scorer.num_docs, full_scorer.num_docs);
-        assert_eq!(scorer.total_tokens, full_scorer.total_tokens);
-        assert_eq!(
-            scorer.num_docs_containing_token("hello"),
-            full_scorer.num_docs_containing_token("hello")
-        );
+        // The unmatched row (row id 42) contributes neither postings nor
+        // metadata; retained documents still keep their full token counts.
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(index.inner.entry_count(), 2);
+        let committed_scorer = MemBM25Scorer::new(6, 3, HashMap::from([("hello".to_string(), 2)]));
 
         let query = FtsQuery::Match(
             lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
                 .with_column(Some("description".to_string())),
         );
-        let leaves = index.exact_leaf_results(&query, &scorer).unwrap();
+        let leaves = index.exact_leaf_results(&query, &committed_scorer).unwrap();
+        let full_leaves = full_index
+            .exact_leaf_results(&query, &committed_scorer)
+            .unwrap();
         let mut actual = leaves[0]
             .iter()
             .map(|(row_id, _)| *row_id)
             .collect::<Vec<_>>();
         actual.sort_unstable();
         assert_eq!(actual, vec![777, 900]);
+        let mut actual_scores = leaves[0]
+            .iter()
+            .map(|(_, score)| score.to_bits())
+            .collect::<Vec<_>>();
+        let mut full_scores = full_leaves[0]
+            .iter()
+            .map(|(_, score)| score.to_bits())
+            .collect::<Vec<_>>();
+        actual_scores.sort_unstable();
+        full_scores.sort_unstable();
+        assert_eq!(actual_scores, full_scores);
+    }
+
+    #[test]
+    fn query_local_external_empty_scorer_retains_zero_score_membership() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.as_ref());
+        let row_ids = UInt64Array::from(vec![900, 42, 777]);
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let index = QueryLocalFtsIndex::try_with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default(),
+        )
+        .unwrap();
+        index
+            .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
+            .unwrap();
+
+        let committed_scorer = MemBM25Scorer::new(0, 0, HashMap::from([("hello".to_string(), 0)]));
+        let query = FtsQuery::Match(
+            lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
+                .with_column(Some("description".to_string())),
+        );
+        let leaves = index.exact_leaf_results(&query, &committed_scorer).unwrap();
+
+        let mut actual = leaves[0].clone();
+        actual.sort_unstable_by_key(|(row_id, _)| *row_id);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].0, 777);
+        assert_eq!(actual[1].0, 900);
+        assert!(actual.iter().all(|(_, score)| score.to_bits() == 0));
     }
 
     #[test]
@@ -4575,11 +4703,14 @@ mod tests {
         let schema = create_test_schema();
         let batch = create_test_batch(schema.as_ref());
         let row_ids = UInt64Array::from(vec![900, 42, 777]);
-        let terms = HashSet::from(["hello".to_string()]);
-        let mut index = QueryLocalFtsIndex::try_with_params(
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let params = InvertedIndexParams::default();
+        let tokenizer = params.build().unwrap();
+        let mut index = QueryLocalFtsIndex::try_with_loaded_tokenizer(
             1,
             "description".to_string(),
-            InvertedIndexParams::default(),
+            params,
+            tokenizer,
         )
         .unwrap();
         // Crossing the normal freeze threshold would create a partition and
@@ -4592,7 +4723,7 @@ mod tests {
 
         assert!(index.inner.state.load().partitions.is_empty());
         assert!(index.inner.merge.lock().unwrap().is_none());
-        assert_eq!(index.doc_count(), 3);
+        assert_eq!(index.doc_count(), 2);
 
         let sibling = index.empty_sibling();
         assert!(Arc::ptr_eq(
@@ -4603,8 +4734,8 @@ mod tests {
         sibling
             .insert_with_row_ids_for_terms(&batch, &UInt64Array::from(vec![901, 43, 778]), &terms)
             .unwrap();
-        assert_eq!(index.doc_count(), 3);
-        assert_eq!(sibling.doc_count(), 3);
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(sibling.doc_count(), 2);
         assert!(sibling.inner.state.load().partitions.is_empty());
         assert!(sibling.inner.merge.lock().unwrap().is_none());
     }

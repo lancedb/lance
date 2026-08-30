@@ -3,10 +3,7 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
@@ -24,12 +21,12 @@ use lance_core::{
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{IndexFile, IndexStore, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -40,9 +37,6 @@ use crate::{
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
 };
-
-const PHYSICAL_SOURCE_VERSIONS_FILE: &str = "physical_source_versions.lance";
-const PHYSICAL_SOURCE_VERSION_COLUMN: &str = "dataset_version";
 
 #[derive(Debug, Clone)]
 enum FtsTraversal {
@@ -813,11 +807,6 @@ pub(crate) async fn merge_segments(
     let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
     let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
-    let mut source_sets = Vec::with_capacity(segments.len());
-    for segment in &segments {
-        source_sets.push(physical_source_dataset_versions(dataset, segment).await?);
-    }
-    let merged_source_versions = merge_physical_source_dataset_versions(source_sets);
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -857,7 +846,7 @@ pub(crate) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let mut created_index = InvertedIndex::merge_segments(
+    let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
@@ -865,11 +854,6 @@ pub(crate) async fn merge_segments(
         lance_index::progress::noop_progress(),
     )
     .await?;
-    if let Some(source_versions) = merged_source_versions {
-        created_index
-            .files
-            .push(write_physical_source_dataset_versions(&new_store, source_versions).await?);
-    }
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -952,134 +936,6 @@ pub(crate) async fn fts_index_fragment_bitmap(
     Ok(fragment_bitmap)
 }
 
-/// Read the dataset versions whose physical documents contribute to an
-/// inverted segment.
-///
-/// Missing sidecars represent legacy segments with unknown provenance. A
-/// malformed sidecar returns an error so corruption is never mistaken for
-/// missing provenance.
-pub(crate) async fn physical_source_dataset_versions(
-    dataset: &Dataset,
-    segment: &IndexMetadata,
-) -> Result<Option<Vec<u64>>> {
-    match &segment.files {
-        Some(files) => {
-            if !files
-                .iter()
-                .any(|file| file.path == PHYSICAL_SOURCE_VERSIONS_FILE)
-            {
-                return Ok(None);
-            }
-        }
-        None => {
-            let sidecar_path = dataset
-                .indice_files_dir(segment)?
-                .join(segment.uuid.to_string())
-                .join(PHYSICAL_SOURCE_VERSIONS_FILE);
-            let object_store = dataset.object_store_for_index(segment).await?;
-            if !object_store.exists(&sidecar_path).await? {
-                return Ok(None);
-            }
-        }
-    }
-
-    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
-    let reader = store.open_index_file(PHYSICAL_SOURCE_VERSIONS_FILE).await?;
-    let num_rows = reader.num_rows();
-    if num_rows == 0 {
-        return Err(Error::io(format!(
-            "physical provenance sidecar for index {} is empty",
-            segment.uuid
-        )));
-    }
-    let batch = reader.read_range(0..num_rows, None).await?;
-    let schema = batch.schema();
-    if schema.fields().len() != 1
-        || schema.field(0).name() != PHYSICAL_SOURCE_VERSION_COLUMN
-        || schema.field(0).data_type() != &DataType::UInt64
-        || schema.field(0).is_nullable()
-    {
-        return Err(Error::io(format!(
-            "physical provenance sidecar for index {} has invalid schema {:?}",
-            segment.uuid, schema
-        )));
-    }
-    if batch.num_rows() != num_rows {
-        return Err(Error::io(format!(
-            "physical provenance sidecar for index {} declared {} rows but read {}",
-            segment.uuid,
-            num_rows,
-            batch.num_rows()
-        )));
-    }
-    let versions = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            Error::io(format!(
-                "physical provenance sidecar for index {} has a non-UInt64 column",
-                segment.uuid
-            ))
-        })?;
-    if versions.null_count() != 0 {
-        return Err(Error::io(format!(
-            "physical provenance sidecar for index {} contains null versions",
-            segment.uuid
-        )));
-    }
-    let mut versions = versions.values().to_vec();
-    versions.sort_unstable();
-    versions.dedup();
-    Ok(Some(versions))
-}
-
-/// Union known physical provenance sets. If any input is unknown, the merged
-/// corpus is also unknown because its retained postings cannot be attributed
-/// exactly.
-pub(crate) fn merge_physical_source_dataset_versions(
-    source_sets: impl IntoIterator<Item = Option<Vec<u64>>>,
-) -> Option<Vec<u64>> {
-    let mut merged = BTreeSet::new();
-    let mut has_input = false;
-    for source_versions in source_sets {
-        has_input = true;
-        let source_versions = source_versions?;
-        if source_versions.is_empty() {
-            return None;
-        }
-        merged.extend(source_versions);
-    }
-    (has_input && !merged.is_empty()).then(|| merged.into_iter().collect())
-}
-
-/// Write immutable physical provenance as an index-local Lance sidecar.
-pub(crate) async fn write_physical_source_dataset_versions(
-    store: &dyn IndexStore,
-    dataset_versions: impl IntoIterator<Item = u64>,
-) -> Result<IndexFile> {
-    let dataset_versions = dataset_versions.into_iter().collect::<BTreeSet<_>>();
-    if dataset_versions.is_empty() {
-        return Err(Error::invalid_input(
-            "physical source dataset versions must not be empty".to_string(),
-        ));
-    }
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        PHYSICAL_SOURCE_VERSION_COLUMN,
-        DataType::UInt64,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(UInt64Array::from_iter_values(dataset_versions))],
-    )?;
-    let mut writer = store
-        .new_index_file(PHYSICAL_SOURCE_VERSIONS_FILE, schema)
-        .await?;
-    writer.write_record_batch(batch).await?;
-    writer.finish().await
-}
-
 /// Load and validate the shared [`InvertedIndexDetails`] across committed
 /// segments returned by [`load_segments`].
 ///
@@ -1136,8 +992,7 @@ fn canonicalize_inverted_index_details(
 ///
 /// `posting_format_version` records how a single segment physically stores
 /// postings, so mixed-version FTS segments may disagree on it without being
-/// semantically incompatible. Every other field remains part of the equality
-/// check.
+/// incompatible. Every other field remains part of the equality check.
 fn inverted_index_details_semantically_equal(
     left: &InvertedIndexDetails,
     right: &InvertedIndexDetails,
@@ -1325,26 +1180,6 @@ mod tests {
         assert_eq!(
             canonicalize_inverted_index_details(legacy).unwrap(),
             canonicalize_inverted_index_details(current).unwrap()
-        );
-    }
-
-    #[test]
-    fn merge_physical_provenance_sidecar_sources() {
-        assert_eq!(
-            merge_physical_source_dataset_versions([Some(vec![19, 17, 19]), Some(vec![18, 19])]),
-            Some(vec![17, 18, 19])
-        );
-        assert_eq!(
-            merge_physical_source_dataset_versions([Some(vec![17]), None]),
-            None
-        );
-        assert_eq!(
-            merge_physical_source_dataset_versions([Some(Vec::new())]),
-            None
-        );
-        assert_eq!(
-            merge_physical_source_dataset_versions(std::iter::empty::<Option<Vec<u64>>>()),
-            None
         );
     }
 

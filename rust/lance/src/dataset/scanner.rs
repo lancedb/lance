@@ -77,8 +77,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, InvertedIndex, InvertedIndexParams, SCORE_COL, SCORE_FIELD,
-    fts_schema,
+    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -100,16 +99,16 @@ use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_f
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
-    fts_index_fragment_bitmap, load_segment_details, load_segment_params, load_segments,
-    normalize_inverted_details, resolve_fts_field, resolve_query_document_granularity,
+    fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
+    resolve_fts_field, resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::index::{DatasetIndexInternalExt, has_append_only_indexed_field_history};
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
@@ -285,7 +284,7 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
 }
 
-fn supports_exact_residual_compound(query: &FtsQuery) -> bool {
+fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
     match query {
         FtsQuery::Match(query) => query.fuzziness == Some(0),
         // MemWAL phrase matching currently collapses tokenizer position gaps.
@@ -293,8 +292,8 @@ fn supports_exact_residual_compound(query: &FtsQuery) -> bool {
         // those gaps exactly (notably when stop words are configured).
         FtsQuery::Phrase(_) => false,
         FtsQuery::Boost(query) => {
-            supports_exact_residual_compound(&query.positive)
-                && supports_exact_residual_compound(&query.negative)
+            supports_indexed_stats_residual_compound(&query.positive)
+                && supports_indexed_stats_residual_compound(&query.negative)
         }
         FtsQuery::MultiMatch(query) => query
             .match_queries
@@ -305,11 +304,22 @@ fn supports_exact_residual_compound(query: &FtsQuery) -> bool {
             .iter()
             .chain(&query.must)
             .chain(&query.must_not)
-            .all(supports_exact_residual_compound),
+            .all(supports_indexed_stats_residual_compound),
     }
 }
 
-fn has_exact_hybrid_fts_coverage(
+const MAX_QUERY_LOCAL_RESIDUAL_ROWS: usize = 100_000;
+
+fn has_bounded_query_local_residual_rows(fragments: &[Fragment]) -> bool {
+    fragments
+        .iter()
+        .try_fold(0usize, |total, fragment| {
+            total.checked_add(fragment.physical_rows?)
+        })
+        .is_some_and(|total| total <= MAX_QUERY_LOCAL_RESIDUAL_ROWS)
+}
+
+fn has_complete_hybrid_fts_coverage(
     segments: &[IndexMetadata],
     residual_fragments: &[Fragment],
     target_fragments: &[Fragment],
@@ -342,27 +352,6 @@ fn has_exact_hybrid_fts_coverage(
         return false;
     }
     indexed | residual == target
-}
-
-fn has_compatible_hybrid_physical_segments(
-    params: &[InvertedIndexParams],
-    details: &[InvertedIndexDetails],
-    has_deleted_fragments: &[bool],
-) -> bool {
-    let Some(first) = params.first() else {
-        return false;
-    };
-    params.len() == details.len()
-        && params.len() == has_deleted_fragments.len()
-        && first.posting_block_size() == 128
-        && params.iter().all(|params| params == first)
-        && details.iter().all(|details| {
-            matches!(
-                details.posting_format_version,
-                Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
-            )
-        })
-        && has_deleted_fragments.iter().all(|has_deleted| !has_deleted)
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -4303,7 +4292,11 @@ impl Scanner {
         }
         let mut phrase_columns = HashSet::new();
         collect_phrase_columns(query, &mut phrase_columns);
-        let allow_exact_residual = !cross_column
+        // Query-local residual scoring intentionally reuses committed-index
+        // BM25 statistics. Matching remains exact for the supported leaf
+        // shapes, but ranking is approximate until the appended rows are
+        // incorporated into a persistent index.
+        let allow_indexed_stats_residual = !cross_column
             && !self.fast_search
             && self.fragments.is_none()
             && filter_plan.is_empty()
@@ -4313,7 +4306,7 @@ impl Scanner {
             && target_fragments
                 .iter()
                 .all(|fragment| fragment.deletion_file.is_none())
-            && supports_exact_residual_compound(query);
+            && supports_indexed_stats_residual_compound(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
             let phrase_columns = &phrase_columns;
@@ -4337,9 +4330,11 @@ impl Scanner {
                 )
                 .await?;
                 let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
+                let has_bounded_residual = allow_indexed_stats_residual
+                    && has_bounded_query_local_residual_rows(&unindexed_fragments);
                 if !unindexed_fragments.is_empty()
                     && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
-                    && !(allow_exact_residual
+                    && !(has_bounded_residual
                         && unindexed_fragments.len() < target_fragments.len())
                 {
                     // Flat and posting-backed leaves do not share a document
@@ -4363,8 +4358,8 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
-                if allow_exact_residual && !unindexed_fragments.is_empty() {
-                    if !has_exact_hybrid_fts_coverage(
+                if has_bounded_residual && !unindexed_fragments.is_empty() {
+                    if !has_complete_hybrid_fts_coverage(
                         &segments,
                         &unindexed_fragments,
                         target_fragments,
@@ -4377,62 +4372,8 @@ impl Scanner {
                         ));
                     }
                     // Preserve the established semantic mismatch error before
-                    // applying the narrower physical fast-path gate.
+                    // constructing query-local postings with the same tokenizer.
                     load_segment_details(&self.dataset, &column, &segments).await?;
-                    if !has_append_only_indexed_field_history(&self.dataset, &segments).await {
-                        // Logical coverage can prune a same-id field rewrite
-                        // while the physical segment still contributes the
-                        // obsolete document to BM25 corpus statistics.
-                        return Ok(None);
-                    }
-                    let physical_details = futures::future::try_join_all(
-                        segments.iter().map(|segment| {
-                            load_physical_fts_details(&self.dataset, &column, segment)
-                        }),
-                    )
-                    .await?;
-                    let segment_params = futures::future::try_join_all(
-                        segments
-                            .iter()
-                            .map(|segment| load_segment_params(&self.dataset, segment)),
-                    )
-                    .await?;
-                    let has_deleted_fragments = futures::future::try_join_all(
-                        segments.iter().map(|segment| {
-                            let column = &column;
-                            async move {
-                                let index = self
-                                    .dataset
-                                    .open_scalar_index(
-                                        column,
-                                        &segment.uuid,
-                                        &NoOpMetricsCollector,
-                                    )
-                                    .await?;
-                                let index = index
-                                    .as_any()
-                                    .downcast_ref::<InvertedIndex>()
-                                    .ok_or_else(|| {
-                                        Error::internal(format!(
-                                            "hybrid compound FTS segment {} is not an inverted index",
-                                            segment.uuid
-                                        ))
-                                    })?;
-                                Ok::<_, Error>(!index.deleted_fragments().is_empty())
-                            }
-                        }),
-                    )
-                    .await?;
-                    if !has_compatible_hybrid_physical_segments(
-                        &segment_params,
-                        &physical_details,
-                        &has_deleted_fragments,
-                    ) {
-                        // Larger posting blocks quantize document lengths, and
-                        // retired physical documents remain in corpus stats.
-                        // Either would make the two arms incomparable.
-                        return Ok(None);
-                    }
                 }
 
                 if cross_column {
@@ -4482,7 +4423,7 @@ impl Scanner {
                 segment_groups.into_iter().next().ok_or_else(|| {
                     Error::internal("compound scorer requires one column".to_string())
                 })?;
-            if allow_exact_residual && !unindexed_fragments.is_empty() {
+            if allow_indexed_stats_residual && !unindexed_fragments.is_empty() {
                 let resolved =
                     resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
                 let scan_column = if resolved.has_lists() {
@@ -7438,6 +7379,28 @@ mod test {
     }
 
     #[test]
+    fn test_query_local_residual_row_bound() {
+        let fragment_with_rows = |id, physical_rows| {
+            let mut fragment = Fragment::new(id);
+            fragment.physical_rows = physical_rows;
+            fragment
+        };
+
+        assert!(has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_000)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_001)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(1)),
+            fragment_with_rows(1, None),
+        ]));
+    }
+
+    #[test]
     fn test_normalize_fts_zero_boosts_recurses_and_preserves_nonzero_values() {
         fn boost_bits(query: &FtsQuery) -> Vec<u32> {
             match query {
@@ -7602,53 +7565,6 @@ mod test {
 
         assert!(supports_compound_scorer(&single_column));
         assert!(!supports_compound_scorer(&cross_column));
-    }
-
-    #[test]
-    fn test_hybrid_compound_requires_compatible_live_physical_segments() {
-        let params = InvertedIndexParams::default();
-        let modern_details = InvertedIndexDetails {
-            posting_format_version: Some(INVERTED_INDEX_VERSION_V3),
-            ..Default::default()
-        };
-        assert!(has_compatible_hybrid_physical_segments(
-            &[params.clone(), params.clone()],
-            &[modern_details.clone(), modern_details.clone()],
-            &[false, false]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            &[params.clone(), params.clone()],
-            &[modern_details.clone(), modern_details.clone()],
-            &[false, true]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            &[params.clone(), params.clone().with_position(true)],
-            &[modern_details.clone(), modern_details.clone()],
-            &[false, false]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            &[params.clone().block_size(256).unwrap()],
-            std::slice::from_ref(&modern_details),
-            &[false]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            std::slice::from_ref(&params),
-            &[InvertedIndexDetails {
-                posting_format_version: Some(1),
-                ..Default::default()
-            }],
-            &[false]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            std::slice::from_ref(&params),
-            &[InvertedIndexDetails::default()],
-            &[false]
-        ));
-        assert!(!has_compatible_hybrid_physical_segments(
-            &[params],
-            &[modern_details],
-            &[]
-        ));
     }
 
     #[test]

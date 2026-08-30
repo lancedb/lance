@@ -217,9 +217,9 @@ fn fragment_field_files<'a>(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
+fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in fields {
+    for field_id in segment.fields() {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -228,106 +228,6 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
         collect_subtree_field_ids(field, &mut indexed_field_ids);
     }
     Ok(indexed_field_ids)
-}
-
-fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
-    indexed_field_ids(dataset, segment.fields())
-}
-
-/// Prove that every indexed-field file present at a segment's physical source
-/// version is still the current file for the same fragment id.
-///
-/// A committed segment's logical bitmap may already have pruned a rewritten
-/// fragment even though its physical postings and corpus statistics still
-/// contain that fragment. Since the original per-segment coverage is no longer
-/// available after that pruning, this check deliberately considers every
-/// fragment present at each physical source version. That is conservative, but
-/// it makes the hybrid scorer available only when the history can be proven to
-/// be a pure append with respect to the indexed field subtrees.
-pub(crate) async fn has_append_only_indexed_field_history(
-    dataset: &Dataset,
-    segments: &[IndexMetadata],
-) -> bool {
-    let current_version = dataset.manifest.version;
-    let current_fragments = dataset
-        .fragments()
-        .iter()
-        .filter_map(|fragment| u32::try_from(fragment.id).ok().map(|id| (id, fragment)))
-        .collect::<HashMap<_, _>>();
-    if current_fragments.len() != dataset.fragments().len() {
-        return false;
-    }
-
-    let mut physical_sources = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let Ok(Some(source_versions)) =
-            scalar::inverted::physical_source_dataset_versions(dataset, segment).await
-        else {
-            return false;
-        };
-        // `dataset_version` is an independent mutable address-remap watermark.
-        // A merged segment can legitimately contain physical sources newer
-        // than its oldest address watermark, but neither may be in the future.
-        if source_versions
-            .iter()
-            .any(|source_version| *source_version > current_version)
-            || segment.dataset_version > current_version
-        {
-            return false;
-        }
-        physical_sources.push((segment, source_versions));
-    }
-    let build_versions = physical_sources
-        .iter()
-        .flat_map(|(_, source_versions)| source_versions.iter().copied())
-        .collect::<HashSet<_>>();
-    for build_version in build_versions {
-        if build_version > current_version {
-            return false;
-        }
-        if build_version == current_version {
-            continue;
-        }
-        let Ok(historical) = dataset.checkout_version(build_version).await else {
-            return false;
-        };
-        let mut indexed_field_ids_at_version = HashSet::new();
-        for (segment, _) in physical_sources
-            .iter()
-            .filter(|(_, source_versions)| source_versions.contains(&build_version))
-        {
-            let Ok(historical_field_ids) = indexed_field_ids(&historical, &segment.fields) else {
-                return false;
-            };
-            let Ok(current_field_ids) = indexed_field_ids(dataset, &segment.fields) else {
-                return false;
-            };
-            if historical_field_ids != current_field_ids {
-                return false;
-            }
-            indexed_field_ids_at_version.extend(historical_field_ids);
-        }
-
-        for historical_fragment in historical.fragments().iter() {
-            let Ok(fragment_id) = u32::try_from(historical_fragment.id) else {
-                return false;
-            };
-            let Some(current_fragment) = current_fragments.get(&fragment_id) else {
-                return false;
-            };
-            let historical_files = fragment_field_files(
-                &historical,
-                historical_fragment,
-                &indexed_field_ids_at_version,
-            );
-            let current_files =
-                fragment_field_files(dataset, current_fragment, &indexed_field_ids_at_version);
-            if historical_files.is_none() || historical_files != current_files {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 async fn prune_stale_segment_coverage(
@@ -1339,8 +1239,7 @@ pub(crate) async fn remap_index(
                         .as_any()
                         .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
                         .ok_or(Error::index("expected inverted index".to_string()))?;
-                    let is_legacy = inverted_index.is_legacy();
-                    let mut created_index = if is_legacy {
+                    if inverted_index.is_legacy() {
                         log::warn!(
                             "reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
                             scalar_index.index_type(),
@@ -1366,24 +1265,7 @@ pub(crate) async fn remap_index(
                         .await?
                     } else {
                         scalar_index.remap(row_id_map, &new_store).await?
-                    };
-                    let source_versions = if is_legacy {
-                        // Legacy remapping performs a full rebuild from the
-                        // current dataset instead of retaining old postings.
-                        Some(vec![dataset.manifest.version])
-                    } else {
-                        scalar::inverted::physical_source_dataset_versions(dataset, matched).await?
-                    };
-                    if let Some(source_versions) = source_versions {
-                        created_index.files.push(
-                            scalar::inverted::write_physical_source_dataset_versions(
-                                &new_store,
-                                source_versions,
-                            )
-                            .await?,
-                        );
                     }
-                    created_index
                 }
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
             }
