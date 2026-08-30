@@ -24,7 +24,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
-use super::{Dot, assert_equal_lengths, norm_l2::norm_l2};
+use super::{Dot, assert_batch_layout, assert_equal_lengths, norm_l2::norm_l2};
 use super::{Normalize, dot::dot};
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
@@ -61,6 +61,7 @@ pub trait Cosine: Dot + Normalize {
         batch: &'a [Self],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
+        assert_batch_layout(x.len(), batch.len(), dimension);
         let x_norm = norm_l2(x);
 
         Box::new(
@@ -594,9 +595,9 @@ impl Cosine for f32 {
         batch: &'a [Self],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        // Preserve the original `chunks_exact` validation before constructing
-        // a specialized iterator.
-        let _ = batch.chunks_exact(dimension);
+        // Every branch below reaches a kernel that takes `dimension` as its
+        // stride and offsets a raw pointer into `x` with it.
+        assert_batch_layout(x.len(), batch.len(), dimension);
         let x_norm = norm_l2(x);
 
         // On a build whose baseline already guarantees AVX2, avoid the
@@ -1431,6 +1432,40 @@ mod tests {
     use approx::assert_relative_eq;
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
+
+    /// `cosine_batch` takes `dimension` as the stride for both operands, so a
+    /// key that does not match it, or a batch that is not a whole number of
+    /// vectors, has to stop at the boundary. Covers the trait default through
+    /// `f64` and the `f32` override, including the fixed dimensions 8 and 16 that
+    /// the override special-cases.
+    #[rstest::rstest]
+    #[case::key_longer_than_dimension(32, 64, 16)]
+    #[case::key_shorter_than_dimension(8, 64, 16)]
+    #[case::batch_remainder(16, 63, 16)]
+    #[case::zero_dimension(16, 64, 0)]
+    #[case::dim8_key_mismatch(9, 64, 8)]
+    #[case::dim16_key_mismatch(17, 64, 16)]
+    fn cosine_batch_rejects_bad_layout(
+        #[case] key_len: usize,
+        #[case] batch_len: usize,
+        #[case] dimension: usize,
+    ) {
+        let key = vec![1.0f32; key_len];
+        let batch = vec![1.0f32; batch_len];
+        assert!(
+            std::panic::catch_unwind(|| cosine_distance_batch(&key, &batch, dimension).count())
+                .is_err(),
+            "f32 accepted key={key_len} batch={batch_len} dimension={dimension}"
+        );
+
+        let key = vec![1.0f64; key_len];
+        let batch = vec![1.0f64; batch_len];
+        assert!(
+            std::panic::catch_unwind(|| cosine_distance_batch(&key, &batch, dimension).count())
+                .is_err(),
+            "f64 accepted key={key_len} batch={batch_len} dimension={dimension}"
+        );
+    }
 
     /// Every `cosine_fast` override reaches a kernel that takes one length and
     /// reads both vectors with it, so a mismatch has to stop at the boundary
