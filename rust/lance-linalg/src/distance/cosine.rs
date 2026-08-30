@@ -639,9 +639,10 @@ impl Cosine for f32 {
         // once per vector without materializing the full batch.
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {
-            if dimension == 8 && x.len() >= 8 {
-                // SAFETY: both loads read from the verified eight-element key,
-                // and x86_64 guarantees SSE.
+            if dimension == 8 {
+                // SAFETY: `assert_batch_layout` above established
+                // `x.len() == dimension == 8`, so both loads stay in bounds, and
+                // x86_64 guarantees SSE.
                 return Box::new(unsafe { CosineBatch8Iter::new(x, x_norm, batch) });
             }
 
@@ -1450,6 +1451,18 @@ mod tests {
             std::panic::catch_unwind(|| cosine_distance_batch(&key, &batch, dimension).count())
                 .is_err(),
             "f64 accepted key={key_len} batch={batch_len} dimension={dimension}"
+        );
+    }
+
+    /// The free functions are the surface most callers reach, so pin them too
+    /// rather than only the trait methods they forward to.
+    #[test]
+    fn cosine_free_functions_reject_bad_input() {
+        let long = [1.0f32; 16];
+        let short = [1.0f32; 15];
+        assert!(std::panic::catch_unwind(|| cosine_distance(&long, &short)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| cosine_distance_batch(&long, &short, 16).count()).is_err()
         );
     }
 
