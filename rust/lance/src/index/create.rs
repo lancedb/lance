@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        build_index_metadata_from_segments, load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -261,8 +261,10 @@ impl<'a> CreateIndexBuilder<'a> {
         )
         .await?;
 
-        // Load indices from the disk.
-        let indices = self.dataset.load_indices().await?;
+        // Load indices from the disk. Names are reserved against every index the
+        // manifest carries: one this build cannot read still owns its name, and
+        // handing that name out again commits two indices under it.
+        let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -635,8 +637,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let new_idx = self.execute_uncommitted().await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
-            self.dataset
-                .load_indices()
+            load_all_indices(self.dataset)
                 .await?
                 .iter()
                 .filter(|idx| idx.name == new_idx.name)
@@ -709,7 +710,7 @@ impl<'a> CreateIndexBuilder<'a> {
             false
         };
 
-        let indices = self.dataset.load_indices().await?;
+        let indices = load_all_indices(self.dataset).await?;
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
