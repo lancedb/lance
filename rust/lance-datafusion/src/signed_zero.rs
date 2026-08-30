@@ -87,28 +87,37 @@ pub fn normalize_zero_comparisons(
     expr: Expr,
     simplify: &dyn Fn(Expr) -> DFResult<Expr>,
 ) -> Result<Expr> {
+    // A literal is already folded, and an `IN` list can hold hundreds of them.
+    // Handing each one to the simplifier anyway roughly doubled planning time on
+    // large lists, for an operand that cannot change.
+    let fold = |operand: Expr| -> DFResult<Expr> {
+        if matches!(operand, Expr::Literal(..)) {
+            return Ok(operand);
+        }
+        simplify(operand)
+    };
     Ok(expr
         .transform_up(|node| {
             let folded = match node {
                 Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_zero_sensitive(op) => {
                     Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(simplify(*left)?),
+                        left: Box::new(fold(*left)?),
                         op,
-                        right: Box::new(simplify(*right)?),
+                        right: Box::new(fold(*right)?),
                     })
                 }
                 Expr::Between(between) => Expr::Between(Between {
-                    expr: Box::new(simplify(*between.expr)?),
+                    expr: Box::new(fold(*between.expr)?),
                     negated: between.negated,
-                    low: Box::new(simplify(*between.low)?),
-                    high: Box::new(simplify(*between.high)?),
+                    low: Box::new(fold(*between.low)?),
+                    high: Box::new(fold(*between.high)?),
                 }),
                 Expr::InList(in_list) => Expr::InList(InList {
-                    expr: Box::new(simplify(*in_list.expr)?),
+                    expr: Box::new(fold(*in_list.expr)?),
                     list: in_list
                         .list
                         .into_iter()
-                        .map(simplify)
+                        .map(fold)
                         .collect::<DFResult<Vec<_>>>()?,
                     negated: in_list.negated,
                 }),
