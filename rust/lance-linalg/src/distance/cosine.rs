@@ -1428,30 +1428,40 @@ mod tests {
     /// number of vectors, has to stop at the boundary. Covers the trait default
     /// through `f64` and the `f32` override.
     #[rstest::rstest]
-    #[case::key_longer_than_dimension(32, 64, 16)]
-    #[case::key_shorter_than_dimension(8, 64, 16)]
-    #[case::batch_remainder(16, 63, 16)]
-    #[case::zero_dimension(16, 64, 0)]
+    #[case::key_longer_than_dimension(32, 64, 16, "must match dimension")]
+    #[case::key_shorter_than_dimension(8, 64, 16, "must match dimension")]
+    #[case::batch_remainder(16, 63, 16, "divisible by dimension")]
+    #[case::zero_dimension(16, 64, 0, "greater than zero")]
     fn cosine_batch_rejects_bad_layout(
         #[case] key_len: usize,
         #[case] batch_len: usize,
         #[case] dimension: usize,
+        #[case] expected: &str,
     ) {
         let key = vec![1.0f32; key_len];
         let batch = vec![1.0f32; batch_len];
-        assert!(
-            std::panic::catch_unwind(|| cosine_distance_batch(&key, &batch, dimension).count())
-                .is_err(),
-            "f32 accepted key={key_len} batch={batch_len} dimension={dimension}"
-        );
+        let message = panic_message(|| {
+            cosine_distance_batch(&key, &batch, dimension).count();
+        });
+        assert!(message.contains(expected), "f32: {message}");
 
         let key = vec![1.0f64; key_len];
         let batch = vec![1.0f64; batch_len];
-        assert!(
-            std::panic::catch_unwind(|| cosine_distance_batch(&key, &batch, dimension).count())
-                .is_err(),
-            "f64 accepted key={key_len} batch={batch_len} dimension={dimension}"
-        );
+        let message = panic_message(|| {
+            cosine_distance_batch(&key, &batch, dimension).count();
+        });
+        assert!(message.contains(expected), "f64: {message}");
+    }
+
+    /// Returns the panic message, so a case pins the assert that fired rather
+    /// than passing on any panic from the same call.
+    fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
     }
 
     /// The free functions are the surface most callers reach, so pin them too
@@ -1460,9 +1470,11 @@ mod tests {
     fn cosine_free_functions_reject_bad_input() {
         let long = [1.0f32; 16];
         let short = [1.0f32; 15];
-        assert!(std::panic::catch_unwind(|| cosine_distance(&long, &short)).is_err());
         assert!(
-            std::panic::catch_unwind(|| cosine_distance_batch(&long, &short, 16).count()).is_err()
+            panic_message(|| {
+                cosine_distance(&long, &short);
+            })
+            .contains("equal lengths")
         );
     }
 
@@ -1473,33 +1485,55 @@ mod tests {
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
         let short_f32 = [1.0f32; 15];
-        assert!(std::panic::catch_unwind(|| f32::cosine_fast(&long_f32, 1.0, &short_f32)).is_err());
-        assert!(std::panic::catch_unwind(|| f32::cosine_fast(&short_f32, 1.0, &long_f32)).is_err());
-        assert!(
-            std::panic::catch_unwind(|| f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32))
-                .is_err()
-        );
+        for message in [
+            panic_message(|| {
+                f32::cosine_fast(&long_f32, 1.0, &short_f32);
+            }),
+            panic_message(|| {
+                f32::cosine_fast(&short_f32, 1.0, &long_f32);
+            }),
+            panic_message(|| {
+                f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32);
+            }),
+        ] {
+            assert!(message.contains("equal lengths"), "f32: {message}");
+        }
 
         let long_f64 = [1.0f64; 16];
         let short_f64 = [1.0f64; 15];
-        assert!(std::panic::catch_unwind(|| f64::cosine_fast(&long_f64, 1.0, &short_f64)).is_err());
-        assert!(std::panic::catch_unwind(|| f64::cosine_fast(&short_f64, 1.0, &long_f64)).is_err());
+        for message in [
+            panic_message(|| {
+                f64::cosine_fast(&long_f64, 1.0, &short_f64);
+            }),
+            panic_message(|| {
+                f64::cosine_fast(&short_f64, 1.0, &long_f64);
+            }),
+        ] {
+            assert!(message.contains("equal lengths"), "f64: {message}");
+        }
 
         // Both directions for f16 and bf16: the kernels take `y.len()` and read
         // `x` with it, so a short `x` is the one that reads out of bounds.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
-        assert!(std::panic::catch_unwind(|| f16::cosine_fast(&long_f16, 1.0, &short_f16)).is_err());
-        assert!(std::panic::catch_unwind(|| f16::cosine_fast(&short_f16, 1.0, &long_f16)).is_err());
-
         let long_bf16 = [bf16::from_f32(1.0); 16];
         let short_bf16 = [bf16::from_f32(1.0); 15];
-        assert!(
-            std::panic::catch_unwind(|| bf16::cosine_fast(&long_bf16, 1.0, &short_bf16)).is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| bf16::cosine_fast(&short_bf16, 1.0, &long_bf16)).is_err()
-        );
+        for message in [
+            panic_message(|| {
+                f16::cosine_fast(&long_f16, 1.0, &short_f16);
+            }),
+            panic_message(|| {
+                f16::cosine_fast(&short_f16, 1.0, &long_f16);
+            }),
+            panic_message(|| {
+                bf16::cosine_fast(&long_bf16, 1.0, &short_bf16);
+            }),
+            panic_message(|| {
+                bf16::cosine_fast(&short_bf16, 1.0, &long_bf16);
+            }),
+        ] {
+            assert!(message.contains("equal lengths"), "half: {message}");
+        }
     }
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
