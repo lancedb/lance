@@ -866,6 +866,14 @@ pub struct L2Prepared {
 
 impl L2Prepared {
     /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    ///
+    /// `targets.len()` must be a multiple of `dimension`; a remainder is
+    /// dropped rather than reported, since `num_targets` comes from an integer
+    /// division.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dimension` is zero.
     pub fn new(targets: &[f32], dimension: usize) -> Self {
         let num_targets = targets.len() / dimension;
         debug_assert_eq!(targets.len(), num_targets * dimension);
@@ -886,7 +894,8 @@ impl L2Prepared {
 
     /// Compute L2 distances from `query` to every target, writing into `out`.
     ///
-    /// `out` must have length `num_targets`. It will be zeroed before accumulation.
+    /// `query` must have length `dimension` and `out` must have length
+    /// `num_targets`. `out` will be zeroed before accumulation.
     pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
         debug_assert_eq!(query.len(), self.dimension);
         debug_assert_eq!(out.len(), self.num_targets);
