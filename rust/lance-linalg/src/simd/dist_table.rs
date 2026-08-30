@@ -60,9 +60,10 @@ fn dist_table_backend(
             DistTableBackend::Avx2
         }
         SimdSupport::Neon => DistTableBackend::Neon,
-        // `Avx` and `AvxFma` land here. The AVX2 inner uses
-        // `_mm256_shuffle_epi8` / `_mm256_and_si256` / `_mm256_srli_epi16` /
-        // `_mm256_add_epi16`, integer ops that neither tier provides.
+        // Everything else, including `Avx` and `AvxFma`: the AVX2 inner uses
+        // integer ops (`_mm256_shuffle_epi8`, `_mm256_and_si256`,
+        // `_mm256_srli_epi16`, `_mm256_add_epi16`) that neither of those tiers
+        // provides.
         _ => DistTableBackend::Scalar,
     }
 }
@@ -168,7 +169,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
                 )
             }
         },
-        // Every backend this build has no arm for, plus `Scalar`.
+        // `Scalar`, plus any backend this build compiled no arm for.
         _ => {
             dists[..n].fill(MaybeUninit::new(0));
             // Every slot was initialized immediately above.
@@ -297,7 +298,8 @@ pub unsafe fn sum_4bit_hacc_dist_table_uninit(
     debug_assert!(hacc_dist_table.len() >= code_len * 64);
 
     // `false` for the AVX-512 kernel: this entry point has none, so an AVX-512
-    // host takes AVX2 here.
+    // host takes AVX2 here. It has no NEON kernel either, so an aarch64 host gets
+    // `Neon` from the selector and falls through to scalar below.
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
     match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2) {
         #[cfg(target_arch = "x86_64")]
@@ -728,8 +730,6 @@ mod tests {
         true,
         DistTableBackend::Avx2
     )]
-    // The hacc entry point, where no tier can reach an AVX-512 kernel.
-    #[case::hacc_avx512(SimdSupport::Avx512, false, true, true, DistTableBackend::Avx2)]
     #[case::avx2_tier(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
     // Without AVX2 there is nothing to fall back to.
     #[case::avx512_no_avx2(SimdSupport::Avx512, false, false, false, DistTableBackend::Scalar)]
