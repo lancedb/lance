@@ -924,20 +924,25 @@ fn remap_zone(
                     length
                 ))
             })?
-        } else if length > 1 || !is_nested {
+        } else if length > 1 || (!is_nested && !ZoneMapIndex::zone_has_missing_extrema(zone)) {
             // Without exact null positions, one null conservatively preserves both
-            // null and non-null candidates. Nested singleton zones cannot represent
-            // both states because null_count == length means all-null.
+            // null and non-null candidates when the run has multiple rows. A scalar
+            // singleton is also safe when its extrema independently prove that it
+            // may contain a comparable value. Otherwise null_count == length would
+            // fabricate an all-null zone and could prune live non-null rows.
             1
         } else {
             return Err(Error::not_supported(format!(
                 "cannot safely remap a mixed-null ZoneMap zone without an exact null bitmap: \
-                 fragment_id={}, start={}, original_length={}, null_count={}, remapped_length={}",
+                 fragment_id={}, start={}, original_length={}, null_count={}, remapped_length={}, \
+                 nested={}, missing_extrema={}",
                 zone.bound.fragment_id,
                 zone.bound.start,
                 zone.bound.length,
                 zone.null_count,
-                length
+                length,
+                is_nested,
+                ZoneMapIndex::zone_has_missing_extrema(zone)
             )));
         };
 
@@ -2137,6 +2142,57 @@ mod tests {
         let remapper = TestRemapper::new([(2, 0)]);
 
         let error = remap_zone(&zone, &remapper, None, true).unwrap_err();
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot safely remap a mixed-null ZoneMap zone")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
+        let mut source = train_and_load::<Decimal128Type>(vec![vec![None, Some(200)]]).await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let zone = &mut source_mut.zones[0];
+        zone.min = ScalarValue::Decimal128(None, 38, 10);
+        zone.max = ScalarValue::Decimal128(None, 38, 10);
+        source_mut.null_rows = None;
+        source_mut.fri = Some(Arc::new(TestRemapper::new([(1, 3_u64 << 32)])));
+
+        let candidate = ScalarValue::Decimal128(Some(200), 38, 10);
+        let queries = [
+            SargableQuery::Equals(candidate.clone()),
+            SargableQuery::Range(
+                Bound::Included(candidate.clone()),
+                Bound::Included(candidate.clone()),
+            ),
+            SargableQuery::IsIn(vec![candidate]),
+        ];
+        for query in queries {
+            assert!(
+                source
+                    .evaluate_zone_against_query(&source.zones[0], &query)
+                    .unwrap(),
+                "legacy Decimal source must retain the non-null candidate for {query:?}"
+            );
+        }
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let error = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .err()
+        .expect("ambiguous legacy Decimal singleton must reject consolidation");
+
         assert!(matches!(error, lance_core::Error::NotSupported { .. }));
         assert!(
             error
