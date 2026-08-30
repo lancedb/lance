@@ -167,8 +167,15 @@ fn slice_batch(
     let batch_bytes = batch.get_array_memory_size();
     let num_rows = batch.num_rows();
 
-    if batch_bytes <= max_bytes || num_rows <= 1 {
+    if batch_bytes <= max_bytes {
         return Ok(vec![batch]);
+    }
+    if num_rows <= 1 {
+        return if deep_copy {
+            Ok(vec![deep_copy_batch_sliced(&batch)?])
+        } else {
+            Ok(vec![batch])
+        };
     }
 
     let rows_per_chunk = (max_bytes as u64 * num_rows as u64 / batch_bytes as u64).max(1) as usize;
@@ -212,8 +219,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, LargeBinaryArray, UInt64Array, new_null_array};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use futures::executor::block_on;
 
     fn make_batch(num_rows: usize) -> RecordBatch {
@@ -437,6 +444,70 @@ mod tests {
             .into_iter()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    #[test]
+    fn test_large_binary_with_null_struct_sibling_respects_max_bytes() {
+        let payload = vec![7_u8; 4096];
+        let blob_values = LargeBinaryArray::from_iter_values((0..8192).map(|_| payload.as_slice()));
+        let descriptor = DataType::Struct(Fields::from(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("image", DataType::LargeBinary, false),
+            Field::new("image_copy", descriptor.clone(), true),
+            Field::new("_rowaddr", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(blob_values),
+                new_null_array(&descriptor, 8192),
+                Arc::new(UInt64Array::from_iter_values(0..8192)),
+            ],
+        )
+        .unwrap();
+        let input = stream::iter([Ok::<_, ArrowError>(batch)]);
+        let max_bytes = 9 * 1024 * 1024;
+        let batches = block_on(
+            rechunk_stream_by_size_deep_copy(input, schema, 0, max_bytes).collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.as_ref().unwrap().num_rows())
+                .sum::<usize>(),
+            8192
+        );
+        assert!(batches.iter().all(|batch| {
+            let batch = batch.as_ref().unwrap();
+            batch.get_array_memory_size() <= max_bytes
+        }));
+    }
+
+    #[test]
+    fn test_single_row_slice_is_compacted_before_oversized_classification() {
+        let payload = vec![7_u8; 4096];
+        let values = LargeBinaryArray::from_iter_values((0..8192).map(|_| payload.as_slice()));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "blob",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let parent = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let sliced = parent.slice(parent.num_rows() - 1, 1);
+        assert!(sliced.get_array_memory_size() > 8 * 1024);
+
+        let input = stream::iter([Ok::<_, ArrowError>(sliced)]);
+        let rechunked = rechunk_stream_by_size_deep_copy(input, schema, 0, 8 * 1024);
+        let batches = block_on(rechunked.collect::<Vec<_>>());
+        let batch = batches.into_iter().next().unwrap().unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        assert!(batch.get_array_memory_size() <= 8 * 1024);
     }
 
     #[test]

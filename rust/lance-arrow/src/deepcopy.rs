@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, make_array};
+use arrow_array::{Array, RecordBatch, UInt64Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
 
@@ -98,14 +98,14 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     mutable.freeze()
 }
 
-/// Deep copy an array, extracting only the sliced portion using MutableArrayData
+/// Deep copy an array by taking every visible value from its logical slice.
 pub fn deep_copy_array_sliced(array: &dyn Array) -> Arc<dyn Array> {
-    let data = array.to_data();
-    let data = deep_copy_array_data_sliced(&data);
-    make_array(data)
+    let indices = UInt64Array::from_iter_values(0..array.len() as u64);
+    arrow_select::take::take(array, &indices, None)
+        .expect("taking every visible value from an Arrow array should not fail")
 }
 
-/// Deep copy a RecordBatch, extracting only the sliced portion using MutableArrayData
+/// Deep copy a RecordBatch, extracting only the visible portion of every array.
 pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch> {
     let arrays = batch
         .columns()
@@ -119,7 +119,7 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -211,6 +211,20 @@ mod tests {
             assert_eq!(id_col.value(i), 10 + i as i32);
             assert_eq!(name_col.value(i), format!("name_{}", 10 + i));
         }
+    }
+
+    #[test]
+    fn test_deep_copy_sliced_large_binary_releases_the_parent_buffer() {
+        let payload = vec![7_u8; 4096];
+        let array = LargeBinaryArray::from_iter_values((0..8192).map(|_| payload.as_slice()));
+        let sliced = array.slice(8191, 1);
+
+        let copied = super::deep_copy_array_sliced(&sliced);
+
+        assert_eq!(copied.len(), 1);
+        assert!(copied.get_array_memory_size() < 8192);
+        let copied = copied.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        assert_eq!(copied.value(0), payload);
     }
 
     #[test]
