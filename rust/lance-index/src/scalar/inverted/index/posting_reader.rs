@@ -67,6 +67,14 @@ pub(super) enum PositionsLayout {
     SharedStream(PositionStreamCodec),
 }
 
+/// Selects whether a posting lookup may read neighboring token rows on a
+/// cache miss. Exact reads still reuse an already-resident read-ahead group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum PostingReadPolicy {
+    ReadAhead,
+    CacheAwareExact,
+}
+
 impl std::fmt::Debug for PostingListReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("InvertedListReader");
@@ -401,47 +409,59 @@ impl PostingListReader {
         Ok(batch)
     }
 
-    #[instrument(level = "debug", skip(self, metrics))]
     pub(crate) async fn posting_list(
         &self,
         token_id: u32,
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
+        self.posting_list_with_policy(
+            token_id,
+            is_phrase_query,
+            metrics,
+            PostingReadPolicy::ReadAhead,
+        )
+        .await
+    }
+
+    #[instrument(name = "posting_list", level = "debug", skip(self, metrics))]
+    pub(in super::super) async fn posting_list_with_policy(
+        &self,
+        token_id: u32,
+        is_phrase_query: bool,
+        metrics: &dyn MetricsCollector,
+        read_policy: PostingReadPolicy,
+    ) -> Result<PostingList> {
         let mut posting = match self.group_range_for_token(token_id) {
             // Grouped path (issue #7040): one cache entry covers rows
             // [start, end), so neighbouring rare terms share a single read.
             Some((start, end)) => {
-                let result = self
-                    .index_cache
-                    .get_or_insert_with_key_hit(
-                        posting_list_group_cache_key(start, end, self.has_impacts),
-                        || async move {
-                            metrics.record_part_load();
-                            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
-                            self.load_posting_list_group(start, end).await
-                        },
-                    )
-                    .await;
-                match &result {
-                    Ok((_, true)) => metrics.record_index_cache_hit(),
-                    _ => metrics.record_index_cache_miss(),
-                }
-                let (group, _) = result?;
-                let (max_score, length) = if group.needs_external_metadata() {
-                    self.posting_metadata_for_token(token_id, Some(metrics))
+                let exact_end = token_id.checked_add(1).ok_or_else(|| {
+                    Error::index(format!(
+                        "posting token id {token_id} cannot form an exclusive singleton range"
+                    ))
+                })?;
+                if read_policy == PostingReadPolicy::CacheAwareExact
+                    && (start != token_id || end != exact_end)
+                    && let Some(group) = self
+                        .index_cache
+                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
+                        .await
+                {
+                    // This cache-only probe never invokes the posting loader.
+                    // Report the group hit because it is the path that serves
+                    // the posting; a probe miss is not a query-cache miss.
+                    metrics.record_index_cache_hit();
+                    self.posting_from_group(token_id, start, end, group.as_ref(), metrics)
                         .await?
                 } else {
-                    (None, None)
-                };
-                let slot = (token_id - start) as usize;
-                group
-                    .posting_list(slot, max_score, length)?
-                    .ok_or_else(|| {
-                        Error::index(format!(
-                            "token {token_id} maps to slot {slot} outside posting group [{start}, {end})"
-                        ))
-                    })?
+                    let (selected_start, selected_end) = match read_policy {
+                        PostingReadPolicy::ReadAhead => (start, end),
+                        PostingReadPolicy::CacheAwareExact => (token_id, exact_end),
+                    };
+                    self.load_cached_posting_group(token_id, selected_start, selected_end, metrics)
+                        .await?
+                }
             }
             // Fallback for layouts that cannot use row-based groups: one cache
             // entry per token.
@@ -485,6 +505,55 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    async fn load_cached_posting_group(
+        &self,
+        token_id: u32,
+        start: u32,
+        end: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PostingList> {
+        let result = self
+            .index_cache
+            .get_or_insert_with_key_hit(
+                posting_list_group_cache_key(start, end, self.has_impacts),
+                || async move {
+                    metrics.record_part_load();
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
+                    self.load_posting_list_group(start, end).await
+                },
+            )
+            .await;
+        match &result {
+            Ok((_, true)) => metrics.record_index_cache_hit(),
+            _ => metrics.record_index_cache_miss(),
+        }
+        let (group, _) = result?;
+        self.posting_from_group(token_id, start, end, group.as_ref(), metrics)
+            .await
+    }
+
+    async fn posting_from_group(
+        &self,
+        token_id: u32,
+        start: u32,
+        end: u32,
+        group: &PostingListGroup,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PostingList> {
+        let (max_score, length) = if group.needs_external_metadata() {
+            self.posting_metadata_for_token(token_id, Some(metrics))
+                .await?
+        } else {
+            (None, None)
+        };
+        let slot = (token_id - start) as usize;
+        group.posting_list(slot, max_score, length)?.ok_or_else(|| {
+            Error::index(format!(
+                "token {token_id} maps to slot {slot} outside posting group [{start}, {end})"
+            ))
+        })
     }
 
     pub(super) async fn ensure_modern_posting_validated(

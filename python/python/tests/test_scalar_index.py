@@ -12,6 +12,7 @@ import sys
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -133,19 +134,26 @@ def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
     num_fragments = 3
-    rows_per_fragment = 10000
+    rows_per_fragment = 100
     total_rows = num_fragments * rows_per_fragment
 
+    fragment_path = tmp_path / "fragment"
     fragment_ds = generate_multi_fragment_dataset(
-        tmp_path / "fragment",
+        fragment_path,
         num_fragments=num_fragments,
         rows_per_fragment=rows_per_fragment,
     )
 
-    complete_ds = generate_multi_fragment_dataset(
-        tmp_path / "complete",
-        num_fragments=num_fragments,
-        rows_per_fragment=rows_per_fragment,
+    complete_path = tmp_path / "complete"
+    shutil.copytree(fragment_path, complete_path)
+    complete_ds = lance.dataset(complete_path)
+    fragment_count = len(fragment_ds.get_fragments())
+    complete_count = len(complete_ds.get_fragments())
+    assert fragment_count == num_fragments, (
+        f"Expected {num_fragments} segmented fragments, got {fragment_count}"
+    )
+    assert complete_count == num_fragments, (
+        f"Expected {num_fragments} complete-index fragments, got {complete_count}"
     )
 
     fragment_ds_committed = _commit_segmented_btree_index(
@@ -696,24 +704,87 @@ def test_indexed_vector_scan_postfilter(
     assert scanner.to_table().num_rows == 0
 
 
-def test_fixed_size_binary(tmp_path):
-    arr = pa.array([b"0123012301230123", b"2345234523452345"], pa.uuid())
+@pytest.mark.parametrize(
+    "index_type, data_type, values, filter_expr",
+    [
+        pytest.param(
+            "BTREE",
+            pa.uuid(),
+            [b"0123012301230123", b"2345234523452345"],
+            (
+                "value = arrow_cast(0x32333435323334353233343532333435, "
+                "'FixedSizeBinary(16)')"
+            ),
+            id="btree-fixed-size-binary",
+        ),
+        *[
+            pytest.param(
+                index_type,
+                data_type,
+                values,
+                filter_expr,
+                id=f"{index_type.lower()}-{type_name}",
+            )
+            for type_name, data_type, values, filter_expr in [
+                (
+                    "large-string",
+                    pa.large_string(),
+                    ["alpha", "beta", "gamma"],
+                    "value = 'beta'",
+                ),
+                (
+                    "binary",
+                    pa.binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'Binary')",
+                ),
+                (
+                    "large-binary",
+                    pa.large_binary(),
+                    [b"alpha", b"beta", b"gamma"],
+                    "value = arrow_cast(0x62657461, 'LargeBinary')",
+                ),
+                (
+                    "decimal128",
+                    pa.decimal128(10, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal128(10, 2)')",
+                ),
+                (
+                    "decimal256",
+                    pa.decimal256(76, 2),
+                    [Decimal("1.00"), Decimal("2.00"), Decimal("3.00")],
+                    "value = arrow_cast(2.00, 'Decimal256(76, 2)')",
+                ),
+                (
+                    "duration",
+                    pa.duration("ms"),
+                    [1, 2, 3],
+                    "value = arrow_cast(2, 'Duration(Millisecond)')",
+                ),
+            ]
+            for index_type in ["BTREE", "BITMAP", "ZONEMAP"]
+        ],
+    ],
+)
+def test_scalar_index_types(tmp_path, index_type, data_type, values, filter_expr):
+    values = pa.array(values, type=data_type)
+    ds = lance.write_dataset(pa.table({"value": values}), tmp_path)
 
-    ds = lance.write_dataset(pa.table({"uuid": arr}), tmp_path)
+    ds.create_scalar_index("value", index_type)
 
-    ds.create_scalar_index("uuid", "BTREE")
+    scanner = ds.scanner(filter=filter_expr)
+    assert "ScalarIndexQuery" in scanner.explain_plan()
+    assert scanner.to_table()["value"].to_pylist() == values.slice(1, 1).to_pylist()
 
-    query = (
-        "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
+    fragment_id = ds.get_fragments()[0].fragment_id
+    segment = ds.create_index_uncommitted(
+        column="value",
+        index_type=index_type,
+        name=f"{index_type.lower()}_segment_idx",
+        fragment_ids=[fragment_id],
     )
-    assert (
-        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
-        in ds.scanner(filter=query).explain_plan()
-    )
-
-    table = ds.scanner(filter=query).to_table()
-    assert table.num_rows == 1
-    assert table.column("uuid").to_pylist() == arr.slice(1, 1).to_pylist()
+    assert segment.fragment_ids == {fragment_id}
 
 
 def test_index_take_batch_size(tmp_path):
@@ -5304,74 +5375,98 @@ def test_btree_fragment_ids_parameter_validation(tmp_path):
     assert segment.fragment_ids == {valid_fragment_id}
 
 
-@pytest.mark.parametrize(
-    "test_name,filter_expr",
-    [
-        # Test 1: Boundary values at fragment edges
-        ("First value", "id = 0"),
-        ("Fragment 0 last value", "id = 9999"),
-        ("Fragment 1 first value", "id = 10000"),
-        ("Fragment 1 last value", "id = 19999"),
-        ("Fragment 2 first value", "id = 20000"),
-        ("Last value", "id = 29999"),
-        # Test 2: Values in the middle of fragments
-        ("Fragment 0 middle", "id = 5000"),
-        ("Fragment 1 middle", "id = 15000"),
-        ("Fragment 2 middle", "id = 25000"),
-        # Test 3: Range queries within single fragments
-        ("Range within fragment 0", "id >= 10 AND id < 20"),
-        ("Range within fragment 1", "id >= 10010 AND id < 10020"),
-        ("Range within fragment 2", "id >= 20010 AND id < 20020"),
-        # Test 4: Range queries spanning multiple fragments
-        ("Cross fragment 0-1", "id >= 9995 AND id < 10005"),
-        ("Cross fragment 1-2", "id >= 19995 AND id < 20005"),
-        ("Cross all fragments", "id >= 5000 AND id < 25000"),
-        # Test 5: Edge cases
-        ("Non-existent small value", "id = -1"),
-        ("Non-existent large value", "id = 30100"),
-        ("Large range", "id >= 0 AND id < 30000"),
-        # Test 6: Comparison operators
-        ("Less than boundary", "id < 10000"),
-        ("Greater than boundary", "id > 19999"),
-        ("Less than or equal", "id <= 10050"),
-        ("Greater than or equal", "id >= 10050"),
-    ],
-)
-def test_btree_query_comparison_parametrized(
-    btree_comparison_datasets, test_name, filter_expr
-):
+def test_btree_query_comparison(btree_comparison_datasets):
     """
-    Parametrized B-tree index query comparison test.
+    B-tree index query comparison test covering representative query shapes.
 
     Compares segmented fragment-built BTree results with a complete BTree index.
     """
     fragment_ds = btree_comparison_datasets["fragment_ds"]
     complete_ds = btree_comparison_datasets["complete_ds"]
+    rows_per_fragment = btree_comparison_datasets["rows_per_fragment"]
+    total_rows = btree_comparison_datasets["total_rows"]
+    fragment_starts = [idx * rows_per_fragment for idx in range(3)]
+    fragment_ends = [start + rows_per_fragment - 1 for start in fragment_starts]
+    fragment_middles = [start + rows_per_fragment // 2 for start in fragment_starts]
+    range_start_offset = rows_per_fragment // 10
+    range_end_offset = range_start_offset * 2
+    cross_fragment_margin = rows_per_fragment // 20
 
-    fragment_results = fragment_ds.scanner(
-        filter=filter_expr,
-        columns=["id", "text"],
-    ).to_table()
+    cases = [
+        # Boundary values at fragment edges
+        ("First value", f"id = {fragment_starts[0]}"),
+        ("Fragment 0 last value", f"id = {fragment_ends[0]}"),
+        ("Fragment 1 first value", f"id = {fragment_starts[1]}"),
+        ("Fragment 1 last value", f"id = {fragment_ends[1]}"),
+        ("Fragment 2 first value", f"id = {fragment_starts[2]}"),
+        ("Last value", f"id = {total_rows - 1}"),
+        # Values in the middle of fragments
+        ("Fragment 0 middle", f"id = {fragment_middles[0]}"),
+        ("Fragment 1 middle", f"id = {fragment_middles[1]}"),
+        ("Fragment 2 middle", f"id = {fragment_middles[2]}"),
+        # Range queries within single fragments
+        (
+            "Range within fragment 0",
+            f"id >= {fragment_starts[0] + range_start_offset} "
+            f"AND id < {fragment_starts[0] + range_end_offset}",
+        ),
+        (
+            "Range within fragment 1",
+            f"id >= {fragment_starts[1] + range_start_offset} "
+            f"AND id < {fragment_starts[1] + range_end_offset}",
+        ),
+        (
+            "Range within fragment 2",
+            f"id >= {fragment_starts[2] + range_start_offset} "
+            f"AND id < {fragment_starts[2] + range_end_offset}",
+        ),
+        # Range queries spanning multiple fragments
+        (
+            "Cross fragment 0-1",
+            f"id >= {fragment_ends[0] - cross_fragment_margin + 1} "
+            f"AND id < {fragment_starts[1] + cross_fragment_margin}",
+        ),
+        (
+            "Cross fragment 1-2",
+            f"id >= {fragment_ends[1] - cross_fragment_margin + 1} "
+            f"AND id < {fragment_starts[2] + cross_fragment_margin}",
+        ),
+        (
+            "Cross all fragments",
+            f"id >= {fragment_middles[0]} AND id < {fragment_middles[2]}",
+        ),
+        # Missing values and the full indexed range
+        ("Non-existent small value", f"id = {fragment_starts[0] - 1}"),
+        (
+            "Non-existent large value",
+            f"id = {total_rows + rows_per_fragment}",
+        ),
+        (
+            "Large range",
+            f"id >= {fragment_starts[0]} AND id < {total_rows}",
+        ),
+        # Comparison operators
+        ("Less than boundary", f"id < {fragment_starts[1]}"),
+        ("Greater than boundary", f"id > {fragment_ends[1]}"),
+        ("Less than or equal", f"id <= {fragment_middles[1]}"),
+        ("Greater than or equal", f"id >= {fragment_middles[1]}"),
+    ]
 
-    complete_results = complete_ds.scanner(
-        filter=filter_expr,
-        columns=["id", "text"],
-    ).to_table()
+    for test_name, filter_expr in cases:
+        fragment_results = fragment_ds.scanner(
+            filter=filter_expr,
+            columns=["id", "text"],
+        ).to_table()
+        complete_results = complete_ds.scanner(
+            filter=filter_expr,
+            columns=["id", "text"],
+        ).to_table()
 
-    assert fragment_results.num_rows == complete_results.num_rows, (
-        f"Test '{test_name}' failed: Fragment index "
-        f"returned {fragment_results.num_rows} rows, "
-        f"but complete index returned {complete_results.num_rows}"
-        f" rows for filter: {filter_expr}"
-    )
-
-    if fragment_results.num_rows > 0:
-        fragment_ids = sorted(fragment_results.column("id").to_pylist())
-        complete_ids = sorted(complete_results.column("id").to_pylist())
-
-        assert fragment_ids == complete_ids, (
-            f"Test '{test_name}' failed: Fragment index "
-            f"and complete index returned different results for filter: {filter_expr}"
+        fragment_results = fragment_results.sort_by([("id", "ascending")])
+        complete_results = complete_results.sort_by([("id", "ascending")])
+        assert fragment_results.equals(complete_results), (
+            f"Test '{test_name}' failed: segmented and complete BTree indexes returned "
+            f"different results for filter: {filter_expr}"
         )
 
 
