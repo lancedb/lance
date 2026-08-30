@@ -81,7 +81,7 @@ pub trait L2: Num {
     }
 }
 
-/// L2 distance between two vectors of any [`L2`] element type.
+/// Squared L2 distance between two vectors of any [`L2`] element type.
 ///
 /// # Panics
 ///
