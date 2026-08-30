@@ -869,8 +869,7 @@ pub struct L2Prepared {
 impl L2Prepared {
     /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
     ///
-    /// `targets.len()` must be a multiple of `dimension`, since `num_targets`
-    /// comes from an integer division.
+    /// `targets.len()` must be a multiple of `dimension`.
     ///
     /// # Panics
     ///
@@ -899,6 +898,11 @@ impl L2Prepared {
     ///
     /// `query` must have length `dimension` and `out` must have length
     /// `num_targets`. `out` will be zeroed before accumulation.
+    ///
+    /// # Panics
+    ///
+    /// With debug assertions on, panics unless both lengths match. A `query`
+    /// longer than `dimension` can also panic on a slice range without them.
     pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
         debug_assert_eq!(query.len(), self.dimension);
         debug_assert_eq!(out.len(), self.num_targets);
