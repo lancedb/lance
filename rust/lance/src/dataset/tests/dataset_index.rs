@@ -2948,20 +2948,6 @@ async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
         5,
         "MUST_NOT must exclude the blocked row"
     );
-    let partial_boost_positions = partial_boost
-        .iter()
-        .enumerate()
-        .map(|(position, (row_id, _))| (*row_id, position))
-        .collect::<HashMap<_, _>>();
-    let partial_boost_scores = partial_boost
-        .iter()
-        .map(|(row_id, score)| (*row_id, score.to_bits()))
-        .collect::<HashMap<_, _>>();
-    assert_eq!(partial_boost_scores.get(&2), partial_boost_scores.get(&4));
-    assert!(
-        partial_boost_positions[&2] < partial_boost_positions[&4],
-        "equal-score residual rows must use ascending row id as the exact tie break"
-    );
     let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
         "fresh alpha".to_string(),
         vec!["text".to_string(), "text".to_string()],

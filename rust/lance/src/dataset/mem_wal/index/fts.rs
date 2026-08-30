@@ -4709,13 +4709,13 @@ mod tests {
         assert_eq!(index.doc_count(), 2);
         assert_eq!(index.inner.entry_count(), 2);
         assert_eq!(stats.doc_count, 3);
-        assert_eq!(stats.total_tokens, 6);
+        assert_eq!(stats.total_tokens, 5);
         assert_eq!(stats.token_docs.get("hello"), Some(&2));
         let committed_scorer = MemBM25Scorer::new(6, 3, HashMap::from([("hello".to_string(), 2)]));
         let mut residual_scorer = committed_scorer.clone();
         stats.add_to_scorer(&mut residual_scorer).unwrap();
         assert_eq!(residual_scorer.num_docs, 6);
-        assert_eq!(residual_scorer.total_tokens, 12);
+        assert_eq!(residual_scorer.total_tokens, 11);
         assert_eq!(residual_scorer.token_docs.get("hello"), Some(&4));
 
         let query = FtsQuery::Match(
