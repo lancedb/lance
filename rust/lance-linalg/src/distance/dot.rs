@@ -109,7 +109,9 @@ pub trait Dot: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x` and `y` have different lengths.
+    /// `x` and `y` must have the same length. An implementation is required to
+    /// reject a mismatch rather than read past the shorter slice; the five in
+    /// this crate do it by panicking.
     fn dot(x: &[Self], y: &[Self]) -> f32;
 
     /// Dot product of `x` against each `dimension`-sized vector in `batch`.

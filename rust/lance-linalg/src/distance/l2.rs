@@ -50,7 +50,9 @@ pub trait L2: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x` and `y` have different lengths.
+    /// `x` and `y` must have the same length. An implementation is required to
+    /// reject a mismatch rather than read past the shorter slice; the five in
+    /// this crate do it by panicking.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
     /// L2 distance from `x` to each `dimension`-sized vector in `y`.
@@ -867,13 +869,14 @@ pub struct L2Prepared {
 impl L2Prepared {
     /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
     ///
-    /// `targets.len()` must be a multiple of `dimension`; a remainder is
-    /// dropped rather than reported, since `num_targets` comes from an integer
-    /// division.
+    /// `targets.len()` must be a multiple of `dimension`, since `num_targets`
+    /// comes from an integer division.
     ///
     /// # Panics
     ///
-    /// Panics if `dimension` is zero.
+    /// Panics if `dimension` is zero. With debug assertions on, also panics if
+    /// `targets.len()` is not a multiple of `dimension`; without them the
+    /// trailing partial vector is dropped.
     pub fn new(targets: &[f32], dimension: usize) -> Self {
         let num_targets = targets.len() / dimension;
         debug_assert_eq!(targets.len(), num_targets * dimension);
