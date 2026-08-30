@@ -1031,7 +1031,7 @@ pub struct QueryLocalFtsIndex {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct QueryLocalFtsStats {
+pub struct QueryLocalFtsStats {
     doc_count: usize,
     total_tokens: u64,
     token_docs: FxHashMap<String, usize>,
