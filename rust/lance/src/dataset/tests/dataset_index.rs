@@ -2755,7 +2755,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
     )
     .unwrap();
     let schema = initial.schema();
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema.clone()),
         &primary,
         Some(WriteParams {
@@ -2885,7 +2885,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
 }
 
 #[tokio::test]
-async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
+async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
     let initial = arrow_array::record_batch!(
         ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
         ("id", Int32, [0, 1])
@@ -2909,7 +2909,7 @@ async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
                 "fresh alpha",
                 "fresh beta",
                 "fresh alpha",
-                "fresh gamma",
+                "fresh beta beta",
                 "fresh beta blocked"
             ]
         ),
@@ -2948,10 +2948,19 @@ async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
         5,
         "MUST_NOT must exclude the blocked row"
     );
-    assert_eq!(partial_boost[0].1.to_bits(), partial_boost[1].1.to_bits());
+    let partial_boost_positions = partial_boost
+        .iter()
+        .enumerate()
+        .map(|(position, (row_id, _))| (*row_id, position))
+        .collect::<HashMap<_, _>>();
+    let partial_boost_scores = partial_boost
+        .iter()
+        .map(|(row_id, score)| (*row_id, score.to_bits()))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(partial_boost_scores.get(&2), partial_boost_scores.get(&4));
     assert!(
-        partial_boost[0].0 < partial_boost[1].0,
-        "equal-score rows must use ascending row id as the exact tie break"
+        partial_boost_positions[&2] < partial_boost_positions[&4],
+        "equal-score residual rows must use ascending row id as the exact tie break"
     );
     let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
         "fresh alpha".to_string(),
@@ -2980,13 +2989,20 @@ async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
             .copied()
             .zip(scores.iter().map(|score| score.to_bits()))
             .collect::<HashMap<_, _>>();
-        for residual_id in [2, 4] {
-            assert_eq!(
-                score_bits.get(&residual_id),
-                score_bits.get(&0),
-                "{query_name} must score identical indexed and residual documents identically"
-            );
-        }
+        let positions = ids
+            .iter()
+            .enumerate()
+            .map(|(position, row_id)| (*row_id, position))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            score_bits.get(&2),
+            score_bits.get(&4),
+            "{query_name} must preserve equal scores within the residual arm"
+        );
+        assert!(
+            positions[&2] < positions[&4],
+            "{query_name} must preserve the row-id tie break within the residual arm"
+        );
     }
 
     let mut indexed_only_scanner = dataset.scan();
@@ -3010,6 +3026,9 @@ async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
             "hybrid scoring must preserve committed-index scores for indexed row {row_id}"
         );
     }
+    // The residual arm intentionally uses committed + query-local statistics,
+    // so its scores are not expected to equal either indexed-arm scores or a
+    // fully rebuilt index's exact global scores.
 
     let residual_only_query: FtsQuery = BooleanQuery::new([
         (Occur::Must, compound_match_query("beta", "text", 1.0)),
@@ -3031,15 +3050,16 @@ async fn test_partial_compound_hybrid_uses_committed_index_statistics() {
     let residual_only = residual_only_scanner.try_into_batch().await.unwrap();
     assert_eq!(
         residual_only["id"].as_primitive::<Int32Type>().values(),
-        &[3],
-        "the zero-weight beta leaf must retain membership while MUST_NOT excludes id=6"
+        &[5, 3],
+        "residual beta TF must rank id=5 first while MUST_NOT excludes id=6"
     );
-    assert_eq!(
-        residual_only[SCORE_COL]
-            .as_primitive::<Float32Type>()
-            .values(),
-        &[0.0],
-        "a residual-only term must contribute zero when committed df is zero"
+    let residual_only_scores = residual_only[SCORE_COL]
+        .as_primitive::<Float32Type>()
+        .values();
+    assert!(
+        residual_only_scores.iter().all(|score| score.is_finite())
+            && residual_only_scores[0] > residual_only_scores[1],
+        "residual-only terms must retain membership and use query-local TF/DF scoring"
     );
 }
 

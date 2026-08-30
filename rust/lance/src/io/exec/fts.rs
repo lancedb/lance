@@ -42,7 +42,7 @@ use rustc_hash::FxHashSet;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
-use crate::dataset::mem_wal::index::QueryLocalFtsIndex;
+use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -796,11 +796,17 @@ impl CompoundQueryExec {
     }
 }
 
+#[derive(Debug)]
+struct QueryLocalResidualShard {
+    index: QueryLocalFtsIndex,
+    stats: QueryLocalFtsStats,
+}
+
 async fn index_query_local_residual_batch(
-    residual: QueryLocalFtsIndex,
+    mut residual: QueryLocalResidualShard,
     batch: RecordBatch,
     allowed_terms: Arc<FxHashSet<String>>,
-) -> Result<QueryLocalFtsIndex> {
+) -> Result<QueryLocalResidualShard> {
     spawn_cpu(move || {
         let row_ids = batch
             .column_by_name(ROW_ID)
@@ -810,7 +816,12 @@ async fn index_query_local_residual_batch(
                 )
             })?
             .as_primitive::<UInt64Type>();
-        residual.insert_with_row_ids_for_terms(&batch, row_ids, allowed_terms.as_ref())?;
+        let stats = residual.index.insert_with_row_ids_for_terms(
+            &batch,
+            row_ids,
+            allowed_terms.as_ref(),
+        )?;
+        residual.stats.checked_add_assign(stats)?;
         Ok(residual)
     })
     .await
@@ -827,7 +838,7 @@ async fn index_query_local_residual(
     residual_input: SendableRecordBatchStream,
     seed: QueryLocalFtsIndex,
     allowed_terms: Arc<FxHashSet<String>>,
-) -> DataFusionResult<Vec<QueryLocalFtsIndex>> {
+) -> DataFusionResult<Vec<QueryLocalResidualShard>> {
     // Match flat FTS's CPU-task sizing. Dataset scan batches are normally
     // row-bounded (often 8,192 rows), which can leave a small residual with
     // only one or two tokenizer tasks. Byte rechunking keeps tasks substantial
@@ -854,16 +865,25 @@ async fn index_query_local_residual(
     }
 
     if initial_batches.is_empty() {
-        return Ok(vec![seed]);
+        return Ok(vec![QueryLocalResidualShard {
+            index: seed,
+            stats: QueryLocalFtsStats::default(),
+        }]);
     }
 
     // Construct every shard from the already-loaded seed before dispatching
     // CPU work. This keeps tokenizer model I/O out of `spawn_cpu` closures.
     let mut initial_shards = Vec::with_capacity(initial_batches.len());
     for _ in 1..initial_batches.len() {
-        initial_shards.push(seed.empty_sibling());
+        initial_shards.push(QueryLocalResidualShard {
+            index: seed.empty_sibling(),
+            stats: QueryLocalFtsStats::default(),
+        });
     }
-    initial_shards.push(seed);
+    initial_shards.push(QueryLocalResidualShard {
+        index: seed,
+        stats: QueryLocalFtsStats::default(),
+    });
 
     let mut in_flight = FuturesUnordered::new();
     for (shard, batch) in initial_shards.into_iter().zip(initial_batches) {
@@ -896,14 +916,14 @@ async fn index_query_local_residual(
 }
 
 async fn query_local_residual_leaves(
-    shards: Vec<QueryLocalFtsIndex>,
+    shards: Vec<QueryLocalResidualShard>,
     query: FtsQuery,
     scorer: Arc<MemBM25Scorer>,
 ) -> Result<Vec<Vec<(u64, f32)>>> {
     let shard_leaves = stream::iter(shards.into_iter().map(|shard| {
         let query = query.clone();
         let scorer = scorer.clone();
-        spawn_cpu(move || shard.exact_leaf_results(&query, scorer.as_ref()))
+        spawn_cpu(move || shard.index.exact_leaf_results(&query, scorer.as_ref()))
     }))
     .buffered(get_num_compute_intensive_cpus().max(1))
     .try_collect::<Vec<_>>()
@@ -925,13 +945,25 @@ async fn query_local_residual_leaves(
     Ok(merged)
 }
 
+fn residual_bm25_scorer(
+    committed_scorer: &MemBM25Scorer,
+    shards: &[QueryLocalResidualShard],
+) -> Result<MemBM25Scorer> {
+    let mut scorer = committed_scorer.clone();
+    for shard in shards {
+        shard.stats.add_to_scorer(&mut scorer)?;
+    }
+    Ok(scorer)
+}
+
 /// Compound FTS over committed postings plus a small append-only residual scan.
 ///
 /// The residual documents are tokenized once into query-local postings, rather
-/// than once for every compound leaf. Both arms use the committed segments'
-/// BM25 corpus statistics. This intentionally assumes the residual rows follow
-/// the indexed corpus distribution: scores can differ from a rebuilt index,
-/// but remain comparable without paying to rebuild corpus statistics per query.
+/// than once for every compound leaf. The indexed arm uses committed-index
+/// BM25 statistics. The residual arm extends those statistics with the
+/// query-local materialized documents, which matches the established mixed
+/// flat-search approximation without rescanning the residual input or rebuilding
+/// exact corpus statistics.
 #[derive(Debug)]
 pub(crate) struct HybridCompoundQueryExec {
     dataset: Arc<Dataset>,
@@ -1077,8 +1109,12 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 .await?;
                 DataFusionResult::<Arc<MemBM25Scorer>>::Ok(Arc::new(scorer))
             };
-            let (residual_shards, scorer) =
+            let (residual_shards, committed_scorer) =
                 futures::future::try_join(residual_indexing, scorer_build).await?;
+            let residual_scorer = Arc::new(residual_bm25_scorer(
+                committed_scorer.as_ref(),
+                &residual_shards,
+            )?);
             let limit = params.limit.ok_or_else(|| {
                 DataFusionError::Execution(
                     "hybrid compound FTS requires a bounded result limit".to_string(),
@@ -1102,10 +1138,9 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 &params,
                 prefilter,
                 metrics.clone(),
-                scorer.clone(),
+                committed_scorer,
             );
             let residual_query = query.clone();
-            let residual_scorer = scorer.clone();
             let residual_search = async move {
                 let residual_leaves = query_local_residual_leaves(
                     residual_shards,

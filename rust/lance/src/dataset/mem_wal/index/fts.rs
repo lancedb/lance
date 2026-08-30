@@ -1030,6 +1030,51 @@ pub struct QueryLocalFtsIndex {
     inner: FtsMemIndex,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct QueryLocalFtsStats {
+    doc_count: usize,
+    total_tokens: u64,
+    token_docs: FxHashMap<String, usize>,
+}
+
+impl QueryLocalFtsStats {
+    pub(crate) fn checked_add_assign(&mut self, other: Self) -> Result<()> {
+        self.doc_count = self
+            .doc_count
+            .checked_add(other.doc_count)
+            .ok_or_else(|| Error::internal("query-local FTS document count overflow"))?;
+        self.total_tokens = self
+            .total_tokens
+            .checked_add(other.total_tokens)
+            .ok_or_else(|| Error::internal("query-local FTS total token count overflow"))?;
+        for (token, df) in other.token_docs {
+            let current = self.token_docs.entry(token).or_default();
+            *current = current
+                .checked_add(df)
+                .ok_or_else(|| Error::internal("query-local FTS term document count overflow"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_to_scorer(&self, scorer: &mut MemBM25Scorer) -> Result<()> {
+        scorer.num_docs = scorer
+            .num_docs
+            .checked_add(self.doc_count)
+            .ok_or_else(|| Error::internal("residual BM25 document count overflow"))?;
+        scorer.total_tokens = scorer
+            .total_tokens
+            .checked_add(self.total_tokens)
+            .ok_or_else(|| Error::internal("residual BM25 total token count overflow"))?;
+        for (token, df) in &self.token_docs {
+            let current = scorer.token_docs.entry(token.clone()).or_default();
+            *current = current
+                .checked_add(*df)
+                .ok_or_else(|| Error::internal("residual BM25 term document count overflow"))?;
+        }
+        Ok(())
+    }
+}
+
 impl QueryLocalFtsIndex {
     #[cfg(test)]
     pub(crate) fn try_with_params(
@@ -1103,7 +1148,7 @@ impl QueryLocalFtsIndex {
         batch: &RecordBatch,
         row_ids: &UInt64Array,
         terms: &FxHashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<QueryLocalFtsStats> {
         self.inner
             .insert_with_row_ids_for_terms(batch, row_ids, terms)
     }
@@ -1402,7 +1447,7 @@ impl FtsMemIndex {
         batch: &RecordBatch,
         row_ids: &UInt64Array,
         terms: &FxHashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<QueryLocalFtsStats> {
         if row_ids.len() != batch.num_rows() || row_ids.null_count() != 0 {
             return Err(Error::invalid_input(format!(
                 "MemWAL FTS explicit row ids require {} non-null values, got len={} nulls={}",
@@ -1424,6 +1469,7 @@ impl FtsMemIndex {
             },
             None,
         )
+        .map(|_| ())
     }
 
     fn insert_batch_with_keys(
@@ -1431,7 +1477,7 @@ impl FtsMemIndex {
         batch: &RecordBatch,
         row_position: impl Fn(usize) -> Result<u64>,
         allowed_terms: Option<&FxHashSet<String>>,
-    ) -> Result<()> {
+    ) -> Result<QueryLocalFtsStats> {
         let st = self.state.load_full();
         let document_position_start = st.tail.doc_count();
         if self.resolved_field.get().is_none() {
@@ -1465,6 +1511,8 @@ impl FtsMemIndex {
             Vec::with_capacity(batch.num_rows())
         };
         let mut total_tokens: u64 = 0;
+        let mut query_local_corpus_doc_count = 0usize;
+        let mut query_local_corpus_total_tokens = 0u64;
         let preserve_zero_token_documents =
             self.params.get_document_granularity().is_list_element();
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
@@ -1482,10 +1530,19 @@ impl FtsMemIndex {
                     false,
                 ),
             };
+            let belongs_in_corpus = preserve_zero_token_documents || num_tokens > 0;
+            if allowed_terms.is_some() && belongs_in_corpus {
+                query_local_corpus_doc_count = query_local_corpus_doc_count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("query-local FTS document count overflow"))?;
+                query_local_corpus_total_tokens = query_local_corpus_total_tokens
+                    .checked_add(num_tokens as u64)
+                    .ok_or_else(|| Error::internal("query-local FTS total token count overflow"))?;
+            }
             let retain_document = if allowed_terms.is_some() {
                 retained_term
             } else {
-                preserve_zero_token_documents || num_tokens > 0
+                belongs_in_corpus
             };
             if retain_document {
                 documents.push(DocumentMetadata { key, num_tokens });
@@ -1504,8 +1561,21 @@ impl FtsMemIndex {
             )?;
         }
 
+        let query_local_stats = if allowed_terms.is_some() {
+            QueryLocalFtsStats {
+                doc_count: query_local_corpus_doc_count,
+                total_tokens: query_local_corpus_total_tokens,
+                token_docs: term_builders
+                    .iter()
+                    .map(|(term, builder)| (term.to_string(), builder.row_positions.len()))
+                    .collect(),
+            }
+        } else {
+            QueryLocalFtsStats::default()
+        };
+
         if documents.is_empty() {
-            return Ok(());
+            return Ok(query_local_stats);
         }
 
         // Drop the tokenizer guard before publishing so we don't hold it
@@ -1525,7 +1595,7 @@ impl FtsMemIndex {
         if self.background_maintenance && st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
             self.freeze(&st)?;
         }
-        Ok(())
+        Ok(query_local_stats)
     }
 
     /// Analyze every exact leaf and return the deduplicated query terms in
@@ -4629,16 +4699,24 @@ mod tests {
         .unwrap();
         let full_index = FtsMemIndex::new(1, "description".to_string());
 
-        index
+        let stats = index
             .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
             .unwrap();
         full_index.insert(&batch, 0).unwrap();
 
-        // The unmatched row (row id 42) contributes neither postings nor
-        // metadata; retained documents still keep their full token counts.
+        // The unmatched nonempty row (row id 42) contributes no postings or
+        // metadata, but remains part of the approximate residual BM25 corpus.
         assert_eq!(index.doc_count(), 2);
         assert_eq!(index.inner.entry_count(), 2);
+        assert_eq!(stats.doc_count, 3);
+        assert_eq!(stats.total_tokens, 6);
+        assert_eq!(stats.token_docs.get("hello"), Some(&2));
         let committed_scorer = MemBM25Scorer::new(6, 3, HashMap::from([("hello".to_string(), 2)]));
+        let mut residual_scorer = committed_scorer.clone();
+        stats.add_to_scorer(&mut residual_scorer).unwrap();
+        assert_eq!(residual_scorer.num_docs, 6);
+        assert_eq!(residual_scorer.total_tokens, 12);
+        assert_eq!(residual_scorer.token_docs.get("hello"), Some(&4));
 
         let query = FtsQuery::Match(
             lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
