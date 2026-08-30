@@ -95,7 +95,10 @@ use super::transaction::{
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::{
+    WriteMode, WriteParams, cleanup_data_fragments,
+    write::write_fragments_internal_with_file_row_counts,
+};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -2390,8 +2393,54 @@ async fn rewrite_files(
         }
     }
 
+    let surviving_rows = fragments.iter().try_fold(0_u64, |total, fragment| {
+        let fragment_rows = fragment.num_rows().ok_or_else(|| {
+            Error::internal(format!(
+                "Fragment {} is missing row count metadata after migration",
+                fragment.id
+            ))
+        })?;
+        total.checked_add(fragment_rows as u64).ok_or_else(|| {
+            Error::internal("Compaction task surviving row count overflowed u64".to_string())
+        })
+    })?;
+
+    // Planner-sized tasks may exceed the target, but should remain one output
+    // instead of producing a target-sized fragment plus a stranded tail. For
+    // genuinely oversized tasks, choose a target-scale output count and spread
+    // the tail across those outputs.
+    let target_rows_per_fragment = options.target_rows_per_fragment as u64;
+    let output_fragment_count = surviving_rows
+        .checked_div(target_rows_per_fragment)
+        .unwrap_or(1)
+        .max(1);
+    let output_fragment_count_usize = usize::try_from(output_fragment_count).map_err(|_| {
+        Error::internal(format!(
+            "Compaction output fragment count {output_fragment_count} does not fit in usize"
+        ))
+    })?;
+    let base_rows_per_file = surviving_rows / output_fragment_count;
+    let larger_file_count =
+        usize::try_from(surviving_rows % output_fragment_count).map_err(|_| {
+            Error::internal("Compaction larger output fragment count does not fit in usize")
+        })?;
+    let file_row_counts = if surviving_rows == 0 {
+        Vec::new()
+    } else {
+        (0..output_fragment_count_usize)
+            .map(|file_index| {
+                let file_rows = base_rows_per_file + u64::from(file_index < larger_file_count);
+                usize::try_from(file_rows).map_err(|_| {
+                    Error::internal(format!(
+                        "Compaction output row count {file_rows} does not fit in usize"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let max_rows_per_file = file_row_counts.first().copied().unwrap_or(1);
     let mut params = WriteParams {
-        max_rows_per_file: options.target_rows_per_fragment,
+        max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
         // External blobs may reference URIs outside the dataset's base_paths
@@ -2444,7 +2493,7 @@ async fn rewrite_files(
             row_ids_rx = Some(rx);
         }
     } else {
-        let (frags, _) = write_fragments_internal(
+        let (frags, _) = write_fragments_internal_with_file_row_counts(
             dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
@@ -2453,6 +2502,7 @@ async fn rewrite_files(
             reader.expect("reader must be prepared for non-binary-copy path"),
             params,
             None,
+            Some(file_row_counts),
         )
         .await?;
         new_fragments = frags;
@@ -3599,49 +3649,44 @@ mod tests {
             .unwrap();
 
         let first_new_frag_idx = 7;
-        // Predicting the remap is difficult.  One task will remap to fragments 7/8 and the other
-        // will remap to fragments 9/10 but we don't know which is which and so we just allow ourselves
-        // to expect both possibilities.
+        // The tasks execute concurrently, so either one may reserve the first
+        // output fragment id.
         let remap_a = expect_remap(
             &[
                 vec![
-                    // 3 small fragments are rewritten to frags 7 & 8
+                    // 3 small fragments are rewritten to frag 7
                     (row_addrs(0, 0..400), true),
                     (row_addrs(1, 0..400), true),
-                    (row_addrs(2, 0..200), true),
+                    (row_addrs(2, 0..400), true),
                 ],
-                vec![(row_addrs(2, 200..400), true)],
                 // frag 3 is skipped since it does not have enough missing data
-                // Frags 4, 5, and 6 are rewritten to frags 9 & 10
+                // Frags 4, 5, and 6 are rewritten to frag 8
                 vec![
-                    // Only 800 of the 1000 rows taken from frag 4
                     (row_addrs(4, 0..200), true),
                     (row_addrs(4, 200..400), false),
                     (row_addrs(4, 400..1000), true),
-                    // frags 5 compacted with frag 4
-                    (row_addrs(5, 0..200), true),
+                    (row_addrs(5, 0..300), true),
+                    (row_addrs(6, 0..300), true),
                 ],
-                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
             ],
             first_new_frag_idx,
         );
         let remap_b = expect_remap(
             &[
-                // Frags 4, 5, and 6 are rewritten to frags 7 & 8
+                // Frags 4, 5, and 6 are rewritten to frag 7
                 vec![
                     (row_addrs(4, 0..200), true),
                     (row_addrs(4, 200..400), false),
                     (row_addrs(4, 400..1000), true),
-                    (row_addrs(5, 0..200), true),
+                    (row_addrs(5, 0..300), true),
+                    (row_addrs(6, 0..300), true),
                 ],
-                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
-                // 3 small fragments rewritten to frags 9 & 10
+                // 3 small fragments rewritten to frag 8
                 vec![
                     (row_addrs(0, 0..400), true),
                     (row_addrs(1, 0..400), true),
-                    (row_addrs(2, 0..200), true),
+                    (row_addrs(2, 0..400), true),
                 ],
-                vec![(row_addrs(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -3682,16 +3727,155 @@ mod tests {
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
-        assert_eq!(metrics.fragments_added, 4);
+        assert_eq!(metrics.fragments_added, 2);
         assert_eq!(metrics.files_removed, 7); // 6 data files + 1 deletion file
-        assert_eq!(metrics.files_added, 4);
+        assert_eq!(metrics.files_added, 2);
 
         let fragment_ids = dataset
             .get_fragments()
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
+        assert_eq!(fragment_ids, vec![3, 7, 8]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_compaction_does_not_strand_small_remainders(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 2_000);
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 500,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(metrics.fragments_removed, 10);
+        assert_eq!(metrics.fragments_added, 3);
+        let mut fragment_sizes = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .collect::<Vec<_>>();
+        fragment_sizes.sort_unstable();
+        assert_eq!(fragment_sizes, vec![600, 600, 800]);
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
+    }
+
+    #[rstest]
+    #[case::legacy(LanceFileVersion::Legacy)]
+    #[case::stable(LanceFileVersion::Stable)]
+    #[tokio::test]
+    async fn test_compaction_rebalances_oversized_task(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 5_100);
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 5_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 5_000,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(5_000, 100))], data.schema());
+        dataset.append(reader, None).await.unwrap();
+
+        dataset.delete("a < 1000").await.unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].fragments.len(), 2);
+
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 4);
+        assert_eq!(
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.metadata.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            vec![1_025; 4]
+        );
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
+    }
+
+    #[tokio::test]
+    async fn test_compaction_balances_non_divisible_stable_task() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 121);
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 121,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("a < 20").await.unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].fragments.len(), 1);
+
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 1);
+        assert_eq!(metrics.fragments_added, 10);
+        assert_eq!(
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.metadata.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            [vec![11], vec![10; 9]].concat()
+        );
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
     }
 
     #[rstest]
