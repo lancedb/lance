@@ -360,14 +360,6 @@ message Transaction {
   message UpdateMemWalState {
     // SSTables being marked as compacted.
     repeated CompactedSsTable compacted_sstables = 1;
-
-    // Presence with true requests the one-way migration to required catch-up.
-    // False is invalid; absence is an ordinary progress update.
-    //
-    // The migration is one-way because returning to legacy semantics — where a
-    // missing coverage entry reads as "fully caught up" — is unsafe once any
-    // SSTable has been retired against a recorded catch-up position.
-    optional bool require_index_catchup = 2;
   }
 
   // An operation that updates base paths in the dataset.

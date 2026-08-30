@@ -114,3 +114,10 @@ class CompactionOptions(TypedDict):
     columns.
     (default: None, no limit)
     """
+    excluded_fragment_ids: Optional[list[int]]
+    """
+    Fragment IDs to exclude from compaction planning. Excluded fragments
+    remain unchanged and act as boundaries, so fragments on opposite sides
+    are not combined into the same task. Duplicate and unknown IDs are
+    ignored. (default: None)
+    """

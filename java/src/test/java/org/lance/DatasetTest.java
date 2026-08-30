@@ -982,6 +982,23 @@ public class DatasetTest {
   }
 
   @Test
+  void testDropRejectsNonDatasetPath(@TempDir Path tempDir) {
+    Path warehouse = tempDir.resolve("warehouse");
+    Path tablePath = warehouse.resolve("table.lance");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tablePath.toString());
+      dataset = testDataset.createEmptyDataset();
+
+      // Pointing at the parent of a dataset must not wipe out the whole warehouse.
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Dataset.drop(warehouse.toString(), new HashMap<>()));
+      assertTrue(Files.exists(tablePath));
+    }
+  }
+
+  @Test
   void testTake(@TempDir Path tempDir) throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -2254,6 +2271,10 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
         assertTrue(
             desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
             "segment size should be positive");

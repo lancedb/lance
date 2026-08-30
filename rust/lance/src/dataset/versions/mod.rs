@@ -9,6 +9,7 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_schema::{DataType, Field as ArrowField};
+use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -321,24 +322,6 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn validate_fragment_schema(
-    version: ConcreteFileVersion,
-    schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
-    match version {
-        ConcreteFileVersion::V1 => {
-            super::transaction::schema_fragments_legacy_valid(schema, fragments)
-        }
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            super::transaction::schema_fragments_modern_valid(schema, fragments)
-        }
-    }
 }
 
 pub async fn write_fragment(
@@ -713,6 +696,7 @@ pub(in crate::dataset) async fn filtered_read(
     fragments: Option<Arc<Vec<Fragment>>>,
     scan_range: Option<Range<u64>>,
     is_prefilter: bool,
+    session: Option<&dyn Session>,
 ) -> Result<PlannedFilteredScan> {
     match version {
         ConcreteFileVersion::V1 => {
@@ -739,6 +723,7 @@ pub(in crate::dataset) async fn filtered_read(
                     make_deletions_null,
                     fragments,
                     scan_range,
+                    session,
                 )
                 .await?;
             Ok(PlannedFilteredScan {

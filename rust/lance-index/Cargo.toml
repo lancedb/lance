@@ -77,9 +77,10 @@ rangemap.workspace = true
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
-env_logger = "0.11.6"
+env_logger.workspace = true
 geo-traits.workspace = true
 lance-datagen.workspace = true
+lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true
@@ -96,7 +97,7 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

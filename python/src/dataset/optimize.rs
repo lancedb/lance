@@ -82,6 +82,10 @@ fn parse_compaction_options(
             "max_source_bytes" => {
                 opts.max_source_bytes = value.extract()?;
             }
+            "excluded_fragment_ids" => {
+                opts.excluded_fragment_ids =
+                    value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
