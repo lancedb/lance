@@ -4039,6 +4039,28 @@ impl MemTableFlushHandler {
                     None
                 };
 
+            // Step 1b: Wait until index application covers this whole memtable.
+            //
+            // Freeze queues the apply and this flush on separate channels, so
+            // without waiting the export can run while the indexes are still
+            // behind the batch store. The generation's vector index would then
+            // be short of rows its own SSTable holds, and SSTable vector search
+            // is index-only -- `fast_search`, no brute-force scan -- so those
+            // rows stop answering once the frozen memtable retires.
+            //
+            // `batch_count` is fixed at freeze, so this waits for a target that
+            // cannot move, and the watcher surfaces a poisoned writer rather
+            // than blocking on a cursor that will never arrive.
+            if !self.index_configs.is_empty()
+                && let Some(indexes) = memtable.indexes_arc()
+            {
+                let target_indexed = memtable.batch_count();
+                self.wal_flusher
+                    .track_batch(Some(indexes), target_indexed, 0)
+                    .wait()
+                    .await?;
+            }
+
             // Step 2: Flush the memtable to Lance storage. The covered WAL
             // entry position is either the one we just appended (per-memtable,
             // from the completion cell — authoritative even when concurrent
@@ -10788,5 +10810,43 @@ mod shard_writer_tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// The other paths now prevent a nullable key, so this forges one to stand
+    /// in for a table written before they were closed.
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_a_nullable_primary_key() {
+        let vector_dim = 128;
+        let schema = create_append_only_schema(vector_dim);
+        let uri = format!("memory://test_mem_wal_nullable_pk_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            let id_field = manifest
+                .schema
+                .fields
+                .iter_mut()
+                .find(|field| field.name == "id")
+                .expect("schema has an id column");
+            id_field.unenforced_primary_key_position = Some(1);
+            id_field.nullable = true;
+        }
+
+        let err = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect_err("MemWAL must not enable on a nullable primary key");
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "unexpected error: {err}"
+        );
     }
 }
