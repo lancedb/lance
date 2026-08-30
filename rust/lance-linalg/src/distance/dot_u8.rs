@@ -31,6 +31,10 @@ use std::sync::OnceLock;
 use super::assert_equal_lengths;
 
 /// Portable scalar u8 dot product, also used for SIMD tail elements.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn dot_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
@@ -146,6 +150,10 @@ fn select_backend() -> DotU8Fn {
 }
 
 /// Dispatched u8 dot product, selecting the best available SIMD backend.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());

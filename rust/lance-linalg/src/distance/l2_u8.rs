@@ -25,6 +25,10 @@ use std::sync::OnceLock;
 use super::assert_equal_lengths;
 
 /// Portable scalar u8 squared L2 distance, also used for SIMD tail elements.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
@@ -155,6 +159,10 @@ fn select_backend() -> L2U8Fn {
 }
 
 /// Dispatched u8 squared L2 distance, selecting the best available SIMD backend.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn l2_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
