@@ -132,6 +132,14 @@ message Transaction {
     repeated RewriteGroup groups = 3;
     // Indices that have been rewritten
     repeated RewrittenIndex rewritten_indices = 4;
+    // Metadata for the fragment reuse index produced by this rewrite.
+    //
+    // When present, index remapping is deferred through this index, so the
+    // rewrite can be compatible with a concurrently created index. When
+    // absent, including for transactions written before this field existed,
+    // index remapping is not deferred and conflict detection remains
+    // conservative.
+    optional IndexMetadata frag_reuse_index = 5;
   }
 
   // An operation that merges in a new column, altering the schema.

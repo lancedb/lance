@@ -199,6 +199,9 @@ Reorganizes data without semantic modification.
 This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
+The optional `frag_reuse_index` records the fragment reuse index produced by a rewrite that defers index remapping.
+Its presence allows conflict detection to treat the rewrite as compatible with concurrently created indices; its absence,
+including in transactions from older writers, retains conservative conflict detection.
 
 <details>
 <summary>Rewrite protobuf message</summary>
