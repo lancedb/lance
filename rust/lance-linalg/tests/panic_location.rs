@@ -4,9 +4,9 @@
 //! Where a length-contract panic reports itself.
 //!
 //! This lives in its own integration binary because it replaces the global
-//! panic hook, which races with any other test that panics in the same
-//! process. `distance/dot_f16.rs` already swaps the hook inside the lib test
-//! binary, so this must not share that process.
+//! panic hook. Any other test that panics while the hook is installed lands in
+//! this one's sink instead, and the lib test binary runs its tests on threads of
+//! one process.
 
 use std::ffi::OsStr;
 use std::path::Path;
