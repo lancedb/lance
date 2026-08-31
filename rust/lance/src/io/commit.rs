@@ -56,7 +56,7 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
-use crate::index::{load_all_indices, unsupported_index_version};
+use crate::index::{index_is_usable, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -952,7 +952,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         // unrelated commit. Skipped, not untouched - `load_all_indices` still
         // remaps its `fragment_bitmap` through the fragment-reuse index, which
         // is what keeps its coverage pointing at the fragments its rows live in.
-        if unsupported_index_version(index).is_some() {
+        if !index_is_usable(index) {
             continue;
         }
         if needs_recalculating.contains(&index.name)

@@ -5326,10 +5326,9 @@ impl Scanner {
             // from `covering_fields` either -- that is computed from a field older
             // writers drop, so it would widen to the carried columns exactly when the
             // declaration is lost.
-            else if let Some(index) = indices
-                .iter()
-                .find(|i| i.fields.first() == Some(&column_id))
-            {
+            else if let Some(index) = indices.iter().find(|i| {
+                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+            }) {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
