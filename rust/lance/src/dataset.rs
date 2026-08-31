@@ -816,6 +816,7 @@ impl Dataset {
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
                 store_identity: &object_store.store_prefix,
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
