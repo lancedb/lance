@@ -8,9 +8,14 @@ use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::{
+    parser::Statement as DFStatement,
+    sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement},
+};
 use futures::TryStreamExt;
-use lance_core::datatypes::BlobHandling;
+use lance_core::{ROW_ADDR, ROW_ID, datatypes::BlobHandling};
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -67,6 +72,10 @@ impl SqlQueryBuilder {
 
     /// Specify if the query result should include the internal row id.
     /// If true, the query result will include an additional column named "_rowid".
+    ///
+    /// The column is appended only when output rows map one-to-one to dataset
+    /// rows. For other queries (DISTINCT, GROUP BY, aggregates, ...) it is not
+    /// appended, but can still be referenced explicitly in the SQL text.
     pub fn with_row_id(mut self, row_id: bool) -> Self {
         self.with_row_id = row_id;
         self
@@ -74,6 +83,10 @@ impl SqlQueryBuilder {
 
     /// Specify if the query result should include the internal row address.
     /// If true, the query result will include an additional column named "_rowaddr".
+    ///
+    /// The column is appended only when output rows map one-to-one to dataset
+    /// rows. For other queries (DISTINCT, GROUP BY, aggregates, ...) it is not
+    /// appended, but can still be referenced explicitly in the SQL text.
     pub fn with_row_addr(mut self, row_addr: bool) -> Self {
         self.with_row_addr = row_addr;
         self
@@ -132,8 +145,131 @@ impl SqlQueryBuilder {
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
-        let df = ctx.sql(&self.sql).await?;
+        let state = ctx.state();
+        let dialect = state.config_options().sql_parser.dialect;
+        let statement = state.sql_to_statement(&self.sql, &dialect)?;
+        let mut projected = statement.clone();
+        let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
+        let plan = state.statement_to_plan(statement).await?;
+        let plan = if safe_to_inject_system_columns(&plan, &columns)
+            && project_system_columns(&mut projected, &columns)
+        {
+            // Fall back to the original plan when the rewritten statement
+            // fails to plan (e.g. another expression aliased to a system
+            // column name), so the query still runs without the extra columns.
+            state.statement_to_plan(projected).await.unwrap_or(plan)
+        } else {
+            plan
+        };
+        let df = ctx.execute_logical_plan(plan).await?;
         Ok(SqlQuery::new(df))
+    }
+}
+
+/// Returns true when appending the enabled system columns to the query's
+/// top-level SELECT list is provably safe:
+///
+/// 1. Row identity: every output row maps to exactly one scanned source row
+///    (whitelist of row-preserving operators; aggregates, DISTINCT, joins,
+///    unions, ... collapse, duplicate, or synthesize rows), so the injection
+///    cannot change the other columns' values or cardinality.
+/// 2. Name lineage: no intermediate projection redefines an enabled system
+///    column name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery), so
+///    the injected identifiers can only bind to the real scan columns.
+fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::Projection(projection) => {
+            let shadows_system_column = projection
+                .schema
+                .fields()
+                .iter()
+                .zip(&projection.expr)
+                .filter(|(field, _)| {
+                    columns
+                        .iter()
+                        .any(|&(enabled, name)| enabled && field.name().as_str() == name)
+                })
+                .any(|(field, expr)| {
+                    let mut expr = expr;
+                    while let LogicalExpr::Alias(alias) = expr {
+                        expr = &alias.expr;
+                    }
+                    !matches!(expr, LogicalExpr::Column(column) if &column.name == field.name())
+                });
+            !shadows_system_column && safe_to_inject_system_columns(&projection.input, columns)
+        }
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::SubqueryAlias(_) => plan
+            .inputs()
+            .iter()
+            .all(|input| safe_to_inject_system_columns(input, columns)),
+        _ => false,
+    }
+}
+
+/// Appends each enabled system column in `columns` to the statement's SELECT
+/// list unless the query already projects it (directly or via a wildcard).
+/// Returns true if the statement was modified.
+///
+/// Only rewrites top-level `SELECT` statements; the caller must separately
+/// verify that the injection is safe (see [`safe_to_inject_system_columns`])
+/// before planning the rewritten statement.
+fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)]) -> bool {
+    let DFStatement::Statement(statement) = statement else {
+        return false;
+    };
+    let Statement::Query(query) = statement.as_mut() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    for &(enabled, name) in columns {
+        if !enabled {
+            continue;
+        }
+        let already_projected = select
+            .projection
+            .iter()
+            .any(|item| projects_column(item, name));
+        if already_projected {
+            continue;
+        }
+        select
+            .projection
+            .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))));
+        changed = true;
+    }
+    changed
+}
+
+/// Returns true if the SELECT item already yields the column `name`, either
+/// as a bare/qualified identifier (e.g. `_rowid`, `t._rowid`) or through a
+/// wildcard (`*`, `t.*`), so injecting it again would duplicate the column.
+///
+/// Expressions that merely reference the column (e.g. `_rowid + 1`, aliases)
+/// intentionally don't count: they produce a different output column.
+fn projects_column(item: &SelectItem, name: &str) -> bool {
+    match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident_matches(ident, name),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents
+            .last()
+            .is_some_and(|ident| ident_matches(ident, name)),
+        _ => false,
+    }
+}
+
+fn ident_matches(ident: &Ident, name: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == name
+    } else {
+        ident.value.eq_ignore_ascii_case(name)
     }
 }
 
@@ -191,13 +327,14 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch};
     use lance_file::reader::FileReaderOptions;
     use lance_file::version::LanceFileVersion;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -246,6 +383,142 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    /// Requested system columns are appended after the user's columns when
+    /// injection is safe, are not duplicated when already projected under any
+    /// accepted spelling, and are skipped when a subquery alias shadows them
+    /// (the injected identifiers would bind to the derived expressions and
+    /// return arbitrary values as row metadata).
+    #[rstest]
+    #[case::plain("SELECT x FROM dataset", vec!["x", "_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::filter_sort_limit(
+        "SELECT x FROM dataset WHERE x >= 0 ORDER BY x DESC LIMIT 2",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![1, 0]
+    )]
+    #[case::wildcard("SELECT * FROM dataset", vec!["x", "_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::already_projected(
+        "SELECT x, _rowid, _rowaddr FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::unquoted_uppercase(
+        "SELECT x, _ROWID, _ROWADDR FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::quoted(
+        r#"SELECT x, "_rowid", "_rowaddr" FROM dataset"#,
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::table_qualified(
+        "SELECT x, dataset._rowid, dataset._rowaddr FROM dataset",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::expression_reference(
+        "SELECT _rowid + 1 AS y FROM dataset",
+        vec!["y", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::system_columns_only("SELECT _rowid FROM dataset", vec!["_rowid", "_rowaddr"], vec![0, 1])]
+    #[case::passthrough_subquery(
+        "SELECT x FROM (SELECT x, _rowid, _rowaddr FROM dataset) s",
+        vec!["x", "_rowid", "_rowaddr"],
+        vec![0, 1]
+    )]
+    #[case::shadowed_subquery(
+        "SELECT x FROM (SELECT x, (_rowid + 1) AS _rowid, (_rowaddr + 1) AS _rowaddr FROM dataset) s",
+        vec!["x"],
+        vec![]
+    )]
+    #[tokio::test]
+    async fn test_sql_system_column_injection(
+        #[case] sql: &str,
+        #[case] expected_columns: Vec<&str>,
+        #[case] expected_row_ids: Vec<u64>,
+    ) {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_system_column_injection",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql(sql)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(batch.schema().field_names(), expected_columns);
+        for name in ["_rowid", "_rowaddr"] {
+            if expected_columns.contains(&name) {
+                assert_eq!(
+                    batch[name].as_primitive::<UInt64Type>().values().as_ref(),
+                    expected_row_ids.as_slice(),
+                    "unexpected values for column {name}",
+                );
+            }
+        }
+    }
+
+    /// System columns must never be injected into queries whose output rows
+    /// are not one-to-one with dataset rows: under GROUP BY ALL or DISTINCT
+    /// the injected columns would become extra grouping/dedup keys and change
+    /// the relational results.
+    #[rstest]
+    #[case::group_by_all("SELECT x % 1 AS k, COUNT(*) AS n FROM dataset GROUP BY ALL ORDER BY k")]
+    #[case::group_by_expr("SELECT x % 1 AS k, COUNT(*) AS n FROM dataset GROUP BY k ORDER BY k")]
+    #[case::distinct("SELECT DISTINCT x % 1 AS k FROM dataset ORDER BY k")]
+    #[case::distinct_in_subquery(
+        "SELECT k FROM (SELECT DISTINCT x % 1 AS k FROM dataset) ORDER BY k"
+    )]
+    #[case::bare_aggregate("SELECT COUNT(*) AS n FROM dataset")]
+    #[tokio::test]
+    async fn test_sql_system_columns_skip_cardinality_changing_queries(#[case] sql: &str) {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_system_columns_cardinality",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let baseline = ds
+            .sql(sql)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let with_system_columns = ds
+            .sql(sql)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        pretty_assertions::assert_eq!(with_system_columns, baseline);
     }
 
     #[tokio::test]
