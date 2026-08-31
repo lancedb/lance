@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-
 use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -290,10 +289,11 @@ impl Writer {
             let encoded_page = encoding_task?;
             self.write_page(encoded_page).await?;
         }
-        // It's important to flush here, we don't know when the next batch will arrive
-        // and the underlying cloud store could have writes in progress that won't advance
-        // until we interact with the writer again.  These in-progress writes will time out
-        // if we don't flush.
+        // Flushing here reaps any upload that has already failed, so the error
+        // is attributed to this batch rather than to whichever later batch or
+        // the shutdown happens to poll the writer next. It does not wait for
+        // in-flight uploads: those are spawned tasks the runtime drives on its
+        // own, and blocking on them would stall the next batch behind them.
         self.writer.flush().await?;
         Ok(())
     }
@@ -309,6 +309,9 @@ impl Writer {
         Ok(())
     }
 
+    /// Reject a null in a non-nullable field whether or not a null ancestor
+    /// masks it: the 2.0 logical encoders cannot store such a slot. The 2.1+
+    /// structural writer counts only visible nulls (`writer::nullability`).
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
             return Err(Error::invalid_input(format!(
@@ -688,12 +691,14 @@ impl Writer {
     /// `column_metadata` must describe the buffers already persisted by the
     /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
     /// of rows in those buffers.
-    pub fn initialize_with_external_metadata(
+    pub(crate) fn initialize_with_external_metadata(
         &mut self,
-        schema: lance_core::datatypes::Schema,
+        mut schema: lance_core::datatypes::Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,
         rows_written: u64,
     ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.num_columns = column_metadata.len() as u32;
         self.column_metadata = column_metadata;
@@ -843,7 +848,7 @@ impl Writer {
     }
 
     /// Append a buffer whose metadata is supplied by the caller.
-    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         let start = self.tell().await?;
         self.writer.write_all(bytes).await?;
         Ok((start, bytes.len() as u64))
