@@ -605,6 +605,7 @@ async fn record_new_dataset_commit(
 ) {
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
+        e_tag: location.e_tag.as_deref(),
     };
     metadata_cache
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
@@ -1296,6 +1297,7 @@ async fn record_successful_commit(
 ) {
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
+        e_tag: location.e_tag.as_deref(),
     };
     dataset
         .metadata_cache
