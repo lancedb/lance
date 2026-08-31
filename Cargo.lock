@@ -4868,6 +4868,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "serial_test",
  "smallvec",
  "tempfile",
  "test-log",
