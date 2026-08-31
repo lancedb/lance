@@ -1512,8 +1512,11 @@ mod tests {
             assert!(message.contains("equal lengths"), "f64: {message}");
         }
 
-        // Both directions for f16 and bf16: the kernels take `y.len()` and read
-        // `x` with it, so a short `x` is the one that reads out of bounds.
+        // Both directions for f16 and bf16. With `fp16kernels` on, the kernels
+        // take `y.len()` and read `x` with it, so a short `x` is the operand that
+        // reads out of bounds and these two asserts are what stops it. Without
+        // the feature these arms reach `cosine_scalar`, where `dot` rejects the
+        // pair first and produces the same message.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
         let long_bf16 = [bf16::from_f32(1.0); 16];
