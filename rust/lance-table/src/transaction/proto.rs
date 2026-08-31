@@ -153,7 +153,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 groups,
                 rewritten_indices,
-                frag_reuse_index,
+                frag_reuse_index: _,
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
@@ -176,12 +176,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .iter()
                     .map(RewrittenIndex::try_from)
                     .collect::<Result<_>>()?;
-                let frag_reuse_index = frag_reuse_index.map(IndexMetadata::try_from).transpose()?;
 
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    frag_reuse_index,
+                    frag_reuse_index: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -557,7 +556,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                frag_reuse_index,
+                frag_reuse_index: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -567,7 +566,6 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(|rewritten| rewritten.into())
                     .collect(),
-                frag_reuse_index: frag_reuse_index.as_ref().map(pb::IndexMetadata::from),
                 ..Default::default()
             }),
             Operation::CreateIndex {
@@ -813,48 +811,6 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-
-    #[test]
-    fn test_rewrite_frag_reuse_index_roundtrips() {
-        let frag_reuse_index = IndexMetadata {
-            uuid: Uuid::new_v4(),
-            name: "__lance_frag_reuse".to_owned(),
-            fields: vec![],
-            covering_fields: vec![],
-            dataset_version: 7,
-            fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
-            index_details: None,
-            index_version: 0,
-            created_at: None,
-            base_id: None,
-            files: None,
-        };
-        let transaction = Transaction::new(
-            7,
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: vec![Fragment::new(0)],
-                    new_fragments: vec![Fragment::new(9)],
-                }],
-                rewritten_indices: vec![],
-                frag_reuse_index: Some(frag_reuse_index.clone()),
-            },
-            None,
-        );
-
-        let decoded = Transaction::try_from(pb::Transaction::from(&transaction)).unwrap();
-
-        match decoded.operation {
-            Operation::Rewrite {
-                frag_reuse_index: decoded_frag_reuse_index,
-                ..
-            } => assert_eq!(
-                decoded_frag_reuse_index.map(|index| index.uuid),
-                Some(frag_reuse_index.uuid)
-            ),
-            other => panic!("expected Rewrite, got {other:?}"),
-        }
-    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {
