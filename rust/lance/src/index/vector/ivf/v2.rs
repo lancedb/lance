@@ -540,14 +540,30 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub index: S,
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
+    partition_rows_reserved_bytes: usize,
+}
+
+/// Reserve for the least-compressed coverage layout: one row in each fragment.
+///
+/// Cache backends fix an entry's eviction weight at insertion, before the lazy
+/// coverage is populated. A one-row map includes the B-tree entry, bitmap, and
+/// map allocation; charging one such map per stored row therefore bounds every
+/// later `RowAddrTreeMap` layout without enumerating row addresses eagerly.
+static PARTITION_ROW_RESERVATION_PER_ROW: LazyLock<usize> =
+    LazyLock::new(|| RowAddrTreeMap::from_iter([0]).deep_size_of());
+
+fn partition_rows_reserved_bytes(num_rows: usize) -> usize {
+    num_rows.saturating_mul(*PARTITION_ROW_RESERVATION_PER_ROW)
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     pub(super) fn new(index: S, storage: Q::Storage) -> Self {
+        let partition_rows_reserved_bytes = partition_rows_reserved_bytes(storage.len());
         Self {
             index,
             storage,
             partition_rows: OnceLock::new(),
+            partition_rows_reserved_bytes,
         }
     }
 
@@ -566,7 +582,7 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for PartitionEntry<S, Q> {
                 .partition_rows
                 .get()
                 .map(|rows| rows.deep_size_of_children(context))
-                .unwrap_or_default()
+                .unwrap_or(self.partition_rows_reserved_bytes)
     }
 }
 
@@ -2216,33 +2232,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_partition_coverage_is_only_built_for_capable_filters() {
+    #[tokio::test]
+    async fn test_partition_coverage_is_only_built_for_capable_filters() {
         let vectors =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0_f32; 16]), 4)
                 .unwrap();
-        let entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(
+        let entry = Arc::new(PartitionEntry::<FlatIndex, FlatQuantizer>::new(
             FlatIndex::default(),
             FlatFloatStorage::new(vectors, DistanceType::L2),
-        );
+        ));
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
             needs_partition_rows: false,
         });
         let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
-            &entry,
+            entry.as_ref(),
             ordinary_filter.clone(),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&returned, &ordinary_filter));
         assert!(entry.partition_rows.get().is_none());
 
-        let size_without_coverage = entry.deep_size_of();
+        let size_with_reserved_coverage = entry.deep_size_of();
+        let maximally_fragmented_rows: RowAddrTreeMap = (0..entry.storage.len() as u64)
+            .map(|fragment_id| fragment_id << 32)
+            .collect();
+        assert!(
+            super::partition_rows_reserved_bytes(entry.storage.len())
+                >= maximally_fragmented_rows.deep_size_of()
+        );
+        let cache = LanceCache::with_capacity(1 << 20);
+        cache
+            .insert_with_key(
+                &IVFPartitionKey::<FlatIndex, FlatQuantizer>::new(0),
+                entry.clone(),
+            )
+            .await;
+        let cache_weight = cache.size_bytes().await;
         let segment_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
             needs_partition_rows: true,
         });
         let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
-            &entry,
+            entry.as_ref(),
             segment_filter,
         )
         .unwrap();
@@ -2251,7 +2282,9 @@ mod tests {
         let first_rows = entry.partition_rows();
         let second_rows = entry.partition_rows();
         assert!(Arc::ptr_eq(&first_rows, &second_rows));
-        assert!(entry.deep_size_of() > size_without_coverage);
+        assert!(entry.deep_size_of() <= size_with_reserved_coverage);
+        assert_eq!(cache.size_bytes().await, cache_weight);
+        assert!(cache_weight >= entry.deep_size_of());
     }
 
     #[test]
