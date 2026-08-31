@@ -1370,9 +1370,8 @@ where
 ///
 /// # Panics
 ///
-/// With debug assertions on, panics if the length of `from` is not equal to the
-/// dimension (value length) of `to`, unless one of the errors above is returned
-/// first.
+/// Panics if the length of `from` is not equal to the dimension (value length)
+/// of `to`, unless one of the errors above is returned first.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
