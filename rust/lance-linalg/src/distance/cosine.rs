@@ -1453,8 +1453,8 @@ mod tests {
         assert!(message.contains(expected), "f64: {message}");
     }
 
-    /// Returns the panic message, so a case pins the assert that fired rather
-    /// than passing on any panic from the same call.
+    /// Returns the panic message, so a case pins which contract was violated
+    /// rather than passing on any panic from the same call.
     fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
         payload
@@ -1511,8 +1511,6 @@ mod tests {
             assert!(message.contains("equal lengths"), "f64: {message}");
         }
 
-        // Both directions, because the kernels take `y.len()` and read `x` with
-        // it, so a short `x` is the operand that reads out of bounds.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
         let long_bf16 = [bf16::from_f32(1.0); 16];
