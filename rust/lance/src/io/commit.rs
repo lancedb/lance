@@ -37,7 +37,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, pb,
+    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -54,9 +54,9 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
-use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
+use crate::index::{index_is_usable, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -358,6 +358,9 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    // Classified from the operation itself. Reading it back off the inline
+    // copy would tie the verdict to the payload size instead.
+    let may_change_schema = operation_may_change_schema(&pb_transaction);
 
     let clone_source = if let Operation::Clone {
         ref_version,
@@ -497,6 +500,7 @@ async fn do_commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
+        may_change_schema,
     )
     .await;
 
@@ -942,6 +946,15 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     };
     for index in indices.iter_mut() {
+        // Migration is skipped for an index this build has no reader for: every
+        // branch below would have to open it to recalculate anything, which is
+        // exactly what this build cannot do, and failing here would fail an
+        // unrelated commit. Skipped, not untouched - `load_all_indices` still
+        // remaps its `fragment_bitmap` through the fragment-reuse index, which
+        // is what keeps its coverage pointing at the fragments its rows live in.
+        if !index_is_usable(index) {
+            continue;
+        }
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -1058,6 +1071,9 @@ pub(crate) async fn do_commit_detached_transaction(
     ensure_can_write_manifest(&dataset.manifest)?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    // Classified from the operation itself. Reading it back off the inline
+    // copy would tie the verdict to the payload size instead.
+    let may_change_schema = operation_may_change_schema(&pb_transaction);
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -1094,7 +1110,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_all_indices(dataset).await?.as_ref().clone(),
                 &transaction_file,
                 &write_config.to_build_config(),
             )?,
@@ -1133,6 +1149,7 @@ pub(crate) async fn do_commit_detached_transaction(
             write_config,
             ManifestNamingScheme::V2,
             inline_tx.take(),
+            may_change_schema,
         )
         .await;
 
@@ -1355,10 +1372,10 @@ pub(crate) async fn commit_transaction(
     // covering every fragment live here holds every row compaction had copied
     // in by then.
     //
-    // The Arc is kept rather than cloned out: `load_indices` returns shared
+    // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
-    let read_version_indices = read_version_dataset.load_indices().await?;
+    let read_version_indices = load_all_indices(&read_version_dataset).await?;
     let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
         manifest: read_version_dataset.manifest.as_ref(),
         indices: read_version_indices.as_slice(),
@@ -1411,6 +1428,9 @@ pub(crate) async fn commit_transaction(
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+        // Classified from the operation itself. Reading it back off the inline
+        // copy would tie the verdict to the payload size instead.
+        let may_change_schema = operation_may_change_schema(&pb_transaction);
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
@@ -1441,7 +1461,7 @@ pub(crate) async fn commit_transaction(
             }
             _ => transaction.build_manifest_with_read_version(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_all_indices(&dataset).await?.as_ref().clone(),
                 transaction_file,
                 &write_config.to_build_config(),
                 read_version_state,
@@ -1488,6 +1508,7 @@ pub(crate) async fn commit_transaction(
             write_config,
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
+            may_change_schema,
         )
         .await;
 
@@ -1668,6 +1689,7 @@ mod tests {
 
     use crate::Dataset;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 

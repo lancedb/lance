@@ -84,6 +84,7 @@ lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true
+serial_test.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
