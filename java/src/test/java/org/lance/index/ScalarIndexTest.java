@@ -614,6 +614,40 @@ public class ScalarIndexTest {
   }
 
   @Test
+  public void testCreateBTreeIndexReportsProgress(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("btree_create_progress").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 20)) {
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        RecordingIndexBuildProgress progress = new RecordingIndexBuildProgress();
+
+        Index index =
+            dataset.createIndex(
+                IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                    .withIndexName("btree_progress_idx")
+                    .replace(true)
+                    .build(),
+                progress);
+
+        assertEquals("btree_progress_idx", index.name());
+        assertTrue(dataset.listIndexes().contains("btree_progress_idx"));
+        List<String> events = progress.snapshot();
+        assertFalse(events.isEmpty(), "Expected BTree create to report progress events");
+        assertTrue(
+            events.stream().anyMatch(event -> event.startsWith("start:")),
+            "Expected at least one stageStart event, got: " + events);
+        assertTrue(
+            events.stream().anyMatch(event -> event.startsWith("complete:")),
+            "Expected at least one stageComplete event, got: " + events);
+      }
+    }
+  }
+
+  @Test
   public void testCreateInvertedIndexReportsProgress(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("inverted_create_progress").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -1146,6 +1180,36 @@ public class ScalarIndexTest {
         assertTrue(
             progress.recorder.snapshot().contains("complete:write_merged_metadata"),
             "Expected merge to finish after re-entrant Dataset access, got: "
+                + progress.recorder.snapshot());
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testMergeInvertedIndexMetadataRejectsWriteReentryPromptly(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_write_reentry").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        WriteReentrantIndexBuildProgress progress = new WriteReentrantIndexBuildProgress(dataset);
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        RuntimeException failure = progress.writeFailure.get();
+        assertNotNull(failure, "Expected write re-entry to be rejected");
+        assertTrue(
+            failure.getMessage().contains("busy in an index progress callback"),
+            "Unexpected write re-entry failure: " + failure.getMessage());
+        assertTrue(progress.reentries.get() > 0, "Expected callback to attempt a write lock");
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to finish after rejected write re-entry, got: "
                 + progress.recorder.snapshot());
       }
     }

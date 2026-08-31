@@ -15,8 +15,10 @@ package org.lance;
 
 import org.lance.index.IndexBuildProgress;
 
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Marks the current thread as executing an index progress callback for one or more Datasets.
@@ -31,10 +33,19 @@ final class ContextIndexBuildProgress implements IndexBuildProgress {
 
   private final Dataset dataset;
   private final IndexBuildProgress delegate;
+  private final Set<Dataset> inheritedDatasets;
 
   ContextIndexBuildProgress(Dataset dataset, IndexBuildProgress delegate) {
     this.dataset = dataset;
     this.delegate = delegate;
+    IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
+    if (activeCallbacks == null || activeCallbacks.isEmpty()) {
+      this.inheritedDatasets = Collections.emptySet();
+    } else {
+      Set<Dataset> inheritedDatasets = Collections.newSetFromMap(new IdentityHashMap<>());
+      inheritedDatasets.addAll(activeCallbacks.keySet());
+      this.inheritedDatasets = inheritedDatasets;
+    }
   }
 
   static boolean isActive(Dataset dataset) {
@@ -42,12 +53,17 @@ final class ContextIndexBuildProgress implements IndexBuildProgress {
     return activeCallbacks != null && activeCallbacks.containsKey(dataset);
   }
 
-  private static void begin(Dataset dataset) {
+  private static IdentityHashMap<Dataset, int[]> activeCallbacks() {
     IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
     if (activeCallbacks == null) {
       activeCallbacks = new IdentityHashMap<>();
       ACTIVE_CALLBACKS.set(activeCallbacks);
     }
+    return activeCallbacks;
+  }
+
+  private static void begin(Dataset dataset) {
+    IdentityHashMap<Dataset, int[]> activeCallbacks = activeCallbacks();
     activeCallbacks.computeIfAbsent(dataset, key -> new int[1])[0]++;
   }
 
@@ -66,33 +82,48 @@ final class ContextIndexBuildProgress implements IndexBuildProgress {
     }
   }
 
+  private void beginCallback() {
+    for (Dataset inheritedDataset : inheritedDatasets) {
+      begin(inheritedDataset);
+    }
+    begin(dataset);
+  }
+
+  private void endCallback() {
+    // Release in reverse acquisition order so nested contexts unwind cleanly.
+    end(dataset);
+    for (Dataset inheritedDataset : inheritedDatasets) {
+      end(inheritedDataset);
+    }
+  }
+
   @Override
   public void stageStart(String stage, Optional<Long> total, String unit) {
-    begin(dataset);
+    beginCallback();
     try {
       delegate.stageStart(stage, total, unit);
     } finally {
-      end(dataset);
+      endCallback();
     }
   }
 
   @Override
   public void stageProgress(String stage, long completed) {
-    begin(dataset);
+    beginCallback();
     try {
       delegate.stageProgress(stage, completed);
     } finally {
-      end(dataset);
+      endCallback();
     }
   }
 
   @Override
   public void stageComplete(String stage) {
-    begin(dataset);
+    beginCallback();
     try {
       delegate.stageComplete(stage);
     } finally {
-      end(dataset);
+      endCallback();
     }
   }
 }

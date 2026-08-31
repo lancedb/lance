@@ -90,7 +90,9 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  private final Object createIndexLock = new Object();
+  /** Serializes create/merge index builds on this Dataset handle. */
+  private final Object indexBuildLock = new Object();
+
   private final LockManager lockManager = new LockManager(this);
 
   private Dataset() {}
@@ -1190,6 +1192,9 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
+   * handle are serialized.
+   *
    * @param options options for building index
    * @return the metadata of the created index
    */
@@ -1205,6 +1210,8 @@ public class Dataset implements Closeable {
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
    * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
    * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
+   * are serialized.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1228,7 +1235,7 @@ public class Dataset implements Closeable {
     if (ContextIndexBuildProgress.isActive(this)) {
       throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
-    synchronized (createIndexLock) {
+    synchronized (indexBuildLock) {
       try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         if (progress == null) {
@@ -1298,7 +1305,7 @@ public class Dataset implements Closeable {
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
-    innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, null);
   }
 
   private native void innerMergeIndexMetadata(
@@ -1306,6 +1313,10 @@ public class Dataset implements Closeable {
 
   /**
    * Merge distributed index metadata while reporting stage-level progress.
+   *
+   * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
+   * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
+   * create/merge builds on this handle are serialized.
    *
    * @param indexUUID shared UUID used by the distributed index parts
    * @param indexType type of index metadata to merge
@@ -1318,7 +1329,31 @@ public class Dataset implements Closeable {
       Optional<Integer> batchReadHead,
       IndexBuildProgress progress) {
     Preconditions.checkNotNull(progress, "progress cannot be null");
-    innerMergeIndexMetadataWithProgress(indexUUID, indexType.getValue(), batchReadHead, progress);
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, progress);
+  }
+
+  private void mergeIndexMetadataInternal(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
+    synchronized (indexBuildLock) {
+      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        if (progress == null) {
+          innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+        } else {
+          innerMergeIndexMetadataWithProgress(
+              indexUUID,
+              indexType.getValue(),
+              batchReadHead,
+              new ContextIndexBuildProgress(this, progress));
+        }
+      }
+    }
   }
 
   private native void innerMergeIndexMetadataWithProgress(
