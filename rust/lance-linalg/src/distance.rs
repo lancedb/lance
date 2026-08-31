@@ -31,9 +31,8 @@ pub mod norm_l2;
 /// Widens an `Int8` query vector to `f32`, rejecting nulls.
 ///
 /// The three `_arrow_batch` entry points that accept `Int8` take the query as a
-/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null element has no
-/// distance to compute, and the widening this replaced resolved it with an
-/// `unwrap`.
+/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null
+/// element has no distance to compute, so it is rejected rather than widened.
 fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
     if query.null_count() > 0 {
         return Err(ArrowError::InvalidArgumentError(format!(
