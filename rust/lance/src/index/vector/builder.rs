@@ -107,6 +107,21 @@ const PARTITION_BUILD_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Bound ready-map overhead even when many consecutive partitions are empty.
 const PARTITION_BUILD_ENTRIES_PER_WORKER: usize = 2;
 
+#[derive(Debug, Clone, Copy)]
+struct FreshPartitionBuildLimits {
+    window_bytes: usize,
+    decoded_budget_bytes: usize,
+}
+
+impl Default for FreshPartitionBuildLimits {
+    fn default() -> Self {
+        Self {
+            window_bytes: DEFAULT_PARTITION_WINDOW_BYTES,
+            decoded_budget_bytes: PARTITION_BUILD_BUDGET_BYTES,
+        }
+    }
+}
+
 /// Build a new centroid array that incorporates the results of partition splits.
 ///
 /// For each `(part_idx, centroid1, centroid2)` in `splits`:
@@ -289,6 +304,19 @@ fn admit_partition_inputs<T: Send + 'static>(
             }
         })
         .boxed()
+}
+
+fn partition_window_entry_limit(
+    partition_range: &std::ops::Range<usize>,
+    num_partitions: usize,
+    max_entries: usize,
+    concurrency: usize,
+) -> usize {
+    if partition_range.start == 0 && partition_range.end == num_partitions {
+        max_entries
+    } else {
+        max_entries.div_ceil(concurrency)
+    }
 }
 
 struct PartitionBuildResult<S: IvfSubIndex, Q: Quantization> {
@@ -1045,6 +1073,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 sub_index_params,
                 column,
                 frag_reuse_index,
+                FreshPartitionBuildLimits::default(),
             );
         }
         let partition_adjustment = Arc::new(partition_adjustment);
@@ -1177,6 +1206,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         column: String,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        limits: FreshPartitionBuildLimits,
     ) -> Result<BuildStream<S, Q>> {
         let concurrency = get_num_compute_intensive_cpus().max(1);
         let max_entries = concurrency.saturating_mul(PARTITION_BUILD_ENTRIES_PER_WORKER);
@@ -1194,7 +1224,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
                 let plan = reader.plan_partition_window(
                     next_partition_id,
-                    DEFAULT_PARTITION_WINDOW_BYTES,
+                    limits.window_bytes,
                 )?;
                 if plan.partition_range.start != next_partition_id
                     || plan.partition_range.end <= plan.partition_range.start
@@ -1207,13 +1237,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
                 let next_partition_id = plan.partition_range.end;
                 let planned_range = plan.partition_range;
+                let window_entry_limit = partition_window_entry_limit(
+                    &planned_range,
+                    num_partitions,
+                    max_entries,
+                    concurrency,
+                );
                 let job = WeightedJob::with_permit(
                     plan.estimated_decoded_bytes,
                     move |mut admission| async move {
                         let mut window = reader
                             .read_partition_window(
                                 planned_range.start,
-                                DEFAULT_PARTITION_WINDOW_BYTES,
+                                limits.window_bytes,
                             )
                             .await?;
                         if window.partition_range != planned_range
@@ -1279,12 +1315,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         }
                         admission.reconcile(decoded_bytes);
 
-                        // Each concurrently polled window owns a small FIFO entry
-                        // budget. With at most `concurrency` active window streams,
-                        // their combined active/completed results remain bounded by
-                        // `max_entries`, while a later window cannot consume every
-                        // slot needed for the oldest window to make ordered progress.
-                        let window_entry_limit = max_entries.div_ceil(concurrency);
+                        // Multiple windows each own a small FIFO entry budget so a
+                        // later window cannot consume every slot needed for the
+                        // oldest window to make ordered progress. If the whole
+                        // shuffle fits in one window, that window owns the complete
+                        // entry budget and can use the full CPU concurrency.
                         let entry_permits = Arc::new(Semaphore::new(window_entry_limit));
                         let builds = admit_partition_inputs(inputs, entry_permits)
                             .map_ok(move |(input, entry_permit)| {
@@ -1344,7 +1379,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let windows = BoundedPartitionStream::try_new(
             jobs,
             concurrency,
-            PARTITION_BUILD_BUDGET_BYTES,
+            limits.decoded_budget_bytes,
             // One admission entry per outstanding window. Together with each
             // window's entry limit above, this bounds partition results by
             // `max_entries` even after an inner stream has finished.
@@ -1354,14 +1389,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .map_ok(|window| {
                 let Budgeted {
                     value: builds,
-                    _permit,
-                    _entry_permit,
+                    permit,
+                    entry_permit,
                 } = window;
-                debug_assert!(_entry_permit.is_none());
+                debug_assert!(entry_permit.is_none());
                 builds.map_ok(move |(value, entry_permit)| Budgeted {
                     value,
-                    _permit: _permit.clone(),
-                    _entry_permit: Some(entry_permit),
+                    permit: permit.clone(),
+                    entry_permit: Some(entry_permit),
                 })
             })
             .try_flatten_unordered(Some(concurrency))
@@ -1554,8 +1589,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             while let Some((partition_id, result)) = ordered_results.pop_next() {
                 let Budgeted {
                     value: PartitionBuildResult { built: part, .. },
-                    _permit,
-                    _entry_permit,
+                    permit: _permit,
+                    entry_permit: _entry_permit,
                 } = result;
                 let completed_partitions = partition_id + 1;
                 progress
@@ -2639,9 +2674,14 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use arrow_array::{Array, Float32Array, NullArray};
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+    use lance_index::vector::v3::shuffler::{
+        ShufflePartition, ShufflePartitionWindow, ShufflePartitionWindowPlan,
+    };
 
     struct SingleBatchReader {
         batch: RecordBatch,
@@ -2676,6 +2716,121 @@ mod tests {
         fn total_loss(&self) -> Option<f64> {
             None
         }
+    }
+
+    struct WindowedBatchReader {
+        batches: Vec<RecordBatch>,
+        windows_read: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShuffleReader for WindowedBatchReader {
+        async fn read_partition(
+            &self,
+            partition_id: usize,
+        ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+            let Some(batch) = self.batches.get(partition_id) else {
+                return Ok(None);
+            };
+            Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            ))))
+        }
+
+        fn plan_partition_window(
+            &self,
+            start_partition_id: usize,
+            max_decoded_bytes: usize,
+        ) -> Result<ShufflePartitionWindowPlan> {
+            if max_decoded_bytes == 0 {
+                return Err(Error::invalid_input(
+                    "max_decoded_bytes must be greater than 0",
+                ));
+            }
+            if start_partition_id >= self.batches.len() {
+                return Err(Error::invalid_input(format!(
+                    "start_partition_id={} is out of range [0, {})",
+                    start_partition_id,
+                    self.batches.len()
+                )));
+            }
+            let end_partition_id = start_partition_id
+                .saturating_add(max_decoded_bytes)
+                .min(self.batches.len());
+            Ok(ShufflePartitionWindowPlan {
+                partition_range: start_partition_id..end_partition_id,
+                estimated_decoded_bytes: end_partition_id - start_partition_id,
+            })
+        }
+
+        async fn read_partition_window(
+            &self,
+            start_partition_id: usize,
+            max_decoded_bytes: usize,
+        ) -> Result<ShufflePartitionWindow> {
+            let plan = self.plan_partition_window(start_partition_id, max_decoded_bytes)?;
+            self.windows_read.fetch_add(1, Ordering::Relaxed);
+            if start_partition_id == 0 {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while self.windows_read.load(Ordering::Relaxed) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .map_err(|_| Error::internal("second partition window was not admitted"))?;
+            }
+            let partitions = plan
+                .partition_range
+                .clone()
+                .map(|partition_id| {
+                    let batch = self.batches[partition_id].clone();
+                    ShufflePartition {
+                        partition_id,
+                        data: Some(Box::new(RecordBatchStreamAdapter::new(
+                            batch.schema(),
+                            stream::iter(vec![Ok(batch)]),
+                        ))),
+                    }
+                })
+                .collect();
+            Ok(ShufflePartitionWindow {
+                materialized_decoded_bytes: Some(plan.partition_range.len()),
+                partition_range: plan.partition_range,
+                partitions,
+            })
+        }
+
+        fn partition_size(&self, partition_id: usize) -> Result<usize> {
+            Ok(self
+                .batches
+                .get(partition_id)
+                .map(RecordBatch::num_rows)
+                .unwrap_or(0))
+        }
+
+        fn total_loss(&self) -> Option<f64> {
+            None
+        }
+    }
+
+    fn flat_partition_batch(partition_id: usize) -> RecordBatch {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![partition_id as f32, partition_id as f32 + 0.5]),
+            2,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("vector", vectors.data_type().clone(), false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![partition_id as u64])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap()
     }
 
     // Helper to read centroid i from a FixedSizeListArray as a Vec<f32>
@@ -2721,6 +2876,57 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(partition_id, 1);
+    }
+
+    #[test]
+    fn single_partition_window_uses_full_entry_budget() {
+        assert_eq!(partition_window_entry_limit(&(0..64), 64, 32, 16), 32);
+        assert_eq!(partition_window_entry_limit(&(0..32), 64, 32, 16), 2);
+        assert_eq!(partition_window_entry_limit(&(32..64), 64, 32, 16), 2);
+    }
+
+    #[tokio::test]
+    async fn fresh_partition_build_runs_multiple_windows_end_to_end() {
+        let num_partitions = 6;
+        let windows_read = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(WindowedBatchReader {
+            batches: (0..num_partitions).map(flat_partition_batch).collect(),
+            windows_read: windows_read.clone(),
+        });
+        let mut build_stream =
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::build_fresh_partitions_windowed(
+                reader,
+                num_partitions,
+                DistanceType::L2,
+                FlatQuantizer::new(2, DistanceType::L2),
+                (),
+                "vector".to_string(),
+                None,
+                FreshPartitionBuildLimits {
+                    window_bytes: 2,
+                    decoded_budget_bytes: 4,
+                },
+            )
+            .unwrap();
+
+        let mut ordered_results = OrderedPartitionResults::new(num_partitions);
+        let mut merged_partition_ids = Vec::with_capacity(num_partitions);
+        while let Some(result) = build_stream.try_next().await.unwrap() {
+            ordered_results
+                .push(result.value.partition_id, result)
+                .unwrap();
+            while let Some((partition_id, result)) = ordered_results.pop_next() {
+                assert!(result.value.built.is_some());
+                merged_partition_ids.push(partition_id);
+            }
+        }
+        ordered_results.finish().unwrap();
+
+        assert_eq!(windows_read.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            merged_partition_ids,
+            (0..num_partitions).collect::<Vec<_>>()
+        );
     }
 
     #[test]

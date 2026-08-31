@@ -59,16 +59,16 @@ impl<T> WeightedJob<T> {
 /// an earlier partition to finish.
 pub(super) struct Budgeted<T> {
     pub(super) value: T,
-    pub(super) _permit: Option<Arc<AdmissionPermit>>,
-    pub(super) _entry_permit: Option<OwnedSemaphorePermit>,
+    pub(super) permit: Option<Arc<AdmissionPermit>>,
+    pub(super) entry_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<T> Budgeted<T> {
     pub(super) fn untracked(value: T) -> Self {
         Self {
             value,
-            _permit: None,
-            _entry_permit: None,
+            permit: None,
+            entry_permit: None,
         }
     }
 }
@@ -324,8 +324,8 @@ where
                 self.in_flight.push(Box::pin(async move {
                     future.await.map(|(value, permit)| Budgeted {
                         value,
-                        _permit: Some(Arc::new(permit)),
-                        _entry_permit: None,
+                        permit: Some(Arc::new(permit)),
+                        entry_permit: None,
                     })
                 }));
                 continue;
@@ -541,14 +541,14 @@ mod tests {
             .map_ok(|window| {
                 let Budgeted {
                     value: builds,
-                    _permit,
-                    _entry_permit,
+                    permit,
+                    entry_permit,
                 } = window;
-                assert!(_entry_permit.is_none());
+                assert!(entry_permit.is_none());
                 builds.map_ok(move |(value, entry_permit)| Budgeted {
                     value,
-                    _permit: _permit.clone(),
-                    _entry_permit: Some(entry_permit),
+                    permit: permit.clone(),
+                    entry_permit: Some(entry_permit),
                 })
             })
             .try_flatten_unordered(Some(1))

@@ -200,6 +200,7 @@ impl Shuffler for IvfShuffler {
         let num_partitions = self.num_partitions;
         let mut partition_sizes = vec![0; num_partitions];
         let schema = data.schema().without_column(PART_ID_COLUMN);
+        let estimated_row_bytes = estimate_decoded_row_bytes(&schema)?;
         let mut writers = stream::iter(0..num_partitions)
             .map(|partition_id| {
                 let part_path = self
@@ -293,12 +294,15 @@ impl Shuffler for IvfShuffler {
             writer.finish().await?;
         }
 
-        Ok(Box::new(IvfShufflerReader::new(
-            self.object_store.clone(),
-            self.output_dir.clone(),
-            partition_sizes,
-            total_loss,
-        )))
+        Ok(Box::new(
+            IvfShufflerReader::new(
+                self.object_store.clone(),
+                self.output_dir.clone(),
+                partition_sizes,
+                total_loss,
+            )
+            .with_estimated_row_bytes(estimated_row_bytes),
+        ))
     }
 }
 
@@ -306,6 +310,7 @@ pub struct IvfShufflerReader {
     scheduler: Arc<ScanScheduler>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+    estimated_row_bytes: Option<usize>,
     loss: f64,
 }
 
@@ -322,8 +327,14 @@ impl IvfShufflerReader {
             scheduler,
             output_dir,
             partition_sizes,
+            estimated_row_bytes: None,
             loss,
         }
+    }
+
+    fn with_estimated_row_bytes(mut self, estimated_row_bytes: usize) -> Self {
+        self.estimated_row_bytes = Some(estimated_row_bytes);
+        self
     }
 }
 
@@ -365,6 +376,42 @@ impl ShuffleReader for IvfShufflerReader {
             Arc::new(schema),
             stream,
         ))))
+    }
+
+    fn plan_partition_window(
+        &self,
+        start_partition_id: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<ShufflePartitionWindowPlan> {
+        if max_decoded_bytes == 0 {
+            return Err(Error::invalid_input(
+                "max_decoded_bytes must be greater than 0",
+            ));
+        }
+        let Some(&partition_rows) = self.partition_sizes.get(start_partition_id) else {
+            return Err(Error::invalid_input(format!(
+                "start_partition_id={} is out of range [0, {})",
+                start_partition_id,
+                self.partition_sizes.len()
+            )));
+        };
+        let end_partition_id = start_partition_id.checked_add(1).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "start_partition_id={} cannot be advanced",
+                start_partition_id
+            ))
+        })?;
+        let estimated_decoded_bytes = match (partition_rows, self.estimated_row_bytes) {
+            (0, _) => 0,
+            (_, Some(estimated_row_bytes)) => {
+                conservative_partition_admission_bytes(partition_rows, estimated_row_bytes)?
+            }
+            (_, None) => usize::MAX,
+        };
+        Ok(ShufflePartitionWindowPlan {
+            partition_range: start_partition_id..end_partition_id,
+            estimated_decoded_bytes,
+        })
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
@@ -1310,6 +1357,13 @@ fn conservative_window_admission_bytes(
     if rows == 0 {
         return Ok(0);
     }
+    conservative_partition_admission_bytes(rows, estimated_row_bytes)
+}
+
+fn conservative_partition_admission_bytes(
+    rows: usize,
+    estimated_row_bytes: usize,
+) -> Result<usize> {
     let value_bytes = rows.checked_mul(estimated_row_bytes).ok_or_else(|| {
         Error::invalid_input(format!(
             "decoded byte estimate overflows for {} rows at {} bytes per row",
@@ -2072,6 +2126,32 @@ mod tests {
         let error = plan_partition_window_end(&partition_counts, 0, 4, 0).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn legacy_shuffler_uses_schema_estimate_for_parallel_admission() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let part_ids = vec![0; 32];
+        let values = (0..32).collect::<Vec<_>>();
+        let reader = IvfShuffler::new(output_dir, 2)
+            .shuffle(batches_to_stream(vec![make_batch(
+                &part_ids, &values, None,
+            )]))
+            .await
+            .unwrap();
+
+        let non_empty = reader.plan_partition_window(0, 128 * 1024 * 1024).unwrap();
+        assert_eq!(non_empty.partition_range, 0..1);
+        assert_eq!(
+            non_empty.estimated_decoded_bytes,
+            32 * 4 + 32 * 4 / 4 + WINDOW_ADMISSION_FIXED_HEADROOM_BYTES
+        );
+        assert_ne!(non_empty.estimated_decoded_bytes, usize::MAX);
+
+        let empty = reader.plan_partition_window(1, 128 * 1024 * 1024).unwrap();
+        assert_eq!(empty.partition_range, 1..2);
+        assert_eq!(empty.estimated_decoded_bytes, 0);
     }
 
     #[test]
