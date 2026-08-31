@@ -30,8 +30,8 @@ pub mod norm_l2;
 
 /// Widens an `Int8` query vector to `f32`, rejecting nulls.
 ///
-/// The three `_arrow_batch` entry points take the query as a `&dyn Array`, so an
-/// `Int8` one has to be widened before it reaches a kernel. A null element has no
+/// The three `_arrow_batch` entry points that accept `Int8` take the query as a
+/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null element has no
 /// distance to compute, and the widening this replaced resolved it with an
 /// `unwrap`.
 fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
@@ -602,7 +602,8 @@ mod tests {
         );
     }
 
-    /// The `_arrow_batch` entry points widen an `Int8` query element by element.
+    /// The `_arrow_batch` entry points that accept `Int8` widen the query element
+    /// by element.
     /// A null there used to reach an `unwrap`, so a query column with a null in
     /// its values panicked instead of returning an error, on the metrics that
     /// accept `Int8`.
@@ -659,9 +660,9 @@ mod tests {
     }
 
     /// An input that is both a length mismatch and a null query must reach the
-    /// null error on all three metrics. `dot` used to check the dimension in its
-    /// public entry point as well as in the shared body, which put that check
-    /// ahead of the `Int8` arm's null guard where the other two put it after.
+    /// null error on all three metrics. `dot` used to carry a second
+    /// `debug_assert_eq!` on the dimension in its public entry point, ahead of
+    /// the `Int8` arm's null guard.
     #[test]
     fn test_arrow_batch_null_and_length_mismatch_agree() {
         let targets =

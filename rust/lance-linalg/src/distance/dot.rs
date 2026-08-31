@@ -818,9 +818,9 @@ pub fn dot_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    // The dimension check lives in `do_dot_distance_arrow_batch`, which the four
-    // typed arms reach. Asserting it here as well put it ahead of the `Int8`
-    // arm's null check, which neither l2 nor cosine does.
+    // `do_dot_distance_arrow_batch` already carries this `debug_assert_eq!`, and
+    // the copy that was here sat ahead of the `Int8` arm's null guard, where l2
+    // and cosine have theirs after it.
     match *from.data_type() {
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
