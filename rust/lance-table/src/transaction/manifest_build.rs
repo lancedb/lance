@@ -1305,6 +1305,7 @@ impl Transaction {
 
         if current_manifest.is_none() {
             manifest.activate_stable_field_ids();
+            manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
             manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
         }
 
@@ -1626,7 +1627,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(manifest.max_allocated_field_id, Some(0));
-        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 

@@ -339,6 +339,14 @@ async fn test_deep_clone_repairs_legacy_schema_before_activation() {
     cloned.delete("false").await.unwrap();
     cloned.validate().await.unwrap();
     assert!(cloned.manifest.uses_stable_field_ids());
+    assert_ne!(
+        cloned.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+    assert_ne!(
+        cloned.manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
 }
 
 #[tokio::test]
@@ -684,7 +692,7 @@ async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
     assert!(dataset.manifest.uses_stable_field_ids());
     assert_eq!(dataset.manifest.max_allocated_field_id, Some(0));
-    assert_eq!(
+    assert_ne!(
         dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );
@@ -696,7 +704,7 @@ async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
 
     dataset.migrate_to_stable_field_ids().await.unwrap();
     assert_eq!(dataset.version().version, created_version);
-    assert_eq!(
+    assert_ne!(
         dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );
@@ -728,6 +736,10 @@ async fn test_stable_field_id_restore_boundary_and_high_water_mark() {
     let mut activation_snapshot = dataset.checkout_version(activation_version).await.unwrap();
     activation_snapshot.restore().await.unwrap();
     assert_eq!(activation_snapshot.manifest.max_allocated_field_id, Some(1));
+    assert_ne!(
+        activation_snapshot.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
     assert!(activation_snapshot.schema().field("new_field").is_none());
 }
 
@@ -747,7 +759,7 @@ async fn test_shallow_clone_preserves_stable_field_id_state() {
         cloned.manifest.max_allocated_field_id,
         dataset.manifest.max_allocated_field_id
     );
-    assert_eq!(
+    assert_ne!(
         cloned.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );

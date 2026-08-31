@@ -237,11 +237,13 @@ maximum non-negative ID referenced by the canonical manifest schema, base data f
 files. Activation provides a forward guarantee only; it cannot reconstruct identities that were
 dropped or reused in older snapshots.
 
-New datasets activate this contract in their initial manifest. The corresponding feature flag is a
-writer requirement because stable field IDs change allocation but not how readers interpret schema
-or data files. Existing legacy datasets remain unchanged until an explicit migration commit. Before
-activation, operators must ensure that every writer accessing the dataset understands and preserves
-the stable field-ID contract.
+New datasets activate this contract in their initial manifest and set the corresponding reader and
+writer feature bits. The reader bit is a compatibility fence for released runtimes whose generic
+commit path did not enforce unknown writer bits; stable field IDs do not otherwise change how fields
+are read. Existing legacy datasets remain unchanged until an explicit migration commit. Explicit
+migration sets only the writer bit and requires operators to retire older writers before activation.
+The reader fence, once set by automatic activation, is retained by every later commit, clone, and
+restore in that branch ancestry.
 
 Activation is one-way within a branch ancestry. After migration, restore cannot target a version
 from before activation because that version does not carry the high-water mark needed to preserve

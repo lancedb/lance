@@ -1323,7 +1323,10 @@ async fn test_write_manifest(
         manifest.data_storage_format.version.to_manifest_string(),
         "stable" | "next"
     ));
-    assert_eq!(manifest.reader_feature_flags, 0);
+    assert_eq!(
+        manifest.reader_feature_flags,
+        feature_flags::FLAG_STABLE_FIELD_IDS
+    );
     assert_eq!(
         manifest.writer_feature_flags,
         feature_flags::FLAG_STABLE_FIELD_IDS
@@ -1352,7 +1355,7 @@ async fn test_write_manifest(
     );
     assert_eq!(
         manifest.reader_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_STABLE_FIELD_IDS
     );
 
     // Write with custom manifest

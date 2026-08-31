@@ -11,6 +11,7 @@ covering various data types and file format versions.
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -139,3 +140,32 @@ class BasicTypesLegacy(DatasetUpgradeDowngradeTest):
         lance.write_dataset(
             build_basic_types(), self.path, data_storage_version="0.1", mode="append"
         )
+
+
+class StableFieldIdWriterFence:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        dataset = lance.write_dataset(pa.table({"a": [1]}), self.path)
+        dataset.add_columns({"retired": "a"})
+        dataset.drop_columns(["retired"])
+
+    def assert_write_rejected(self):
+        with pytest.raises(ValueError, match="cannot be read by this version of Lance"):
+            lance.dataset(self.path)
+
+    def add_replacement_and_check(self):
+        dataset = lance.dataset(self.path)
+        dataset.add_columns({"replacement": "a"})
+        assert dataset.lance_schema.field("replacement").id() == 2
+
+
+@pytest.mark.compat
+def test_released_writer_cannot_erase_field_id_high_water(venv_factory, tmp_path):
+    case = StableFieldIdWriterFence(tmp_path / "data.lance")
+    case.create()
+
+    venv_factory.get_venv("11.0.0").execute_method(case, "assert_write_rejected")
+
+    case.add_replacement_and_check()

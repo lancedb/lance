@@ -204,10 +204,9 @@ class UpgradeDowngradeTest:
 class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
     """Compatibility contract for new datasets with stable field IDs."""
 
-    def skip_write_after_current_write(self, version: str) -> bool:
-        # Older readers remain compatible. Older writers are outside the
-        # contract because released commit paths do not all enforce unknown
-        # writer flags.
+    def skip_downgrade(self, version: str) -> bool:
+        # Automatically activated datasets fence released runtimes from opening
+        # them. A dedicated v11 regression verifies this refusal.
         return True
 
 

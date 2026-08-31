@@ -18,9 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_FIELD_IDS, STICKY_PAIRED_FLAGS,
-};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -226,9 +224,8 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
-            writer_feature_flags: previous.writer_feature_flags
-                & (STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
+            reader_feature_flags: previous.reader_feature_flags & STICKY_READER_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_WRITER_FLAGS,
             max_fragment_id: previous.max_fragment_id,
             max_allocated_field_id: previous.max_allocated_field_id,
             transaction_file: None,
@@ -295,9 +292,9 @@ impl Manifest {
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
@@ -1676,33 +1673,41 @@ mod tests {
     }
 
     #[test]
-    fn shallow_clone_preserves_stable_field_id_allocation_state() {
+    fn shallow_clone_preserves_stable_field_id_allocation_state_and_fence_mode() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "a",
             arrow_schema::DataType::Int64,
             false,
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(
-            schema,
-            Arc::new(vec![]),
-            DataStorageFormat::default(),
-            HashMap::new(),
-        );
-        manifest.max_allocated_field_id = Some(41);
-        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        for reader_fenced in [false, true] {
+            let mut manifest = Manifest::new(
+                schema.clone(),
+                Arc::new(vec![]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.max_allocated_field_id = Some(41);
+            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            if reader_fenced {
+                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            }
 
-        let cloned = manifest.shallow_clone(
-            Some("parent".to_string()),
-            "memory://parent".to_string(),
-            7,
-            None,
-            String::new(),
-        );
+            let cloned = manifest.shallow_clone(
+                Some("parent".to_string()),
+                "memory://parent".to_string(),
+                7,
+                None,
+                String::new(),
+            );
 
-        assert_eq!(cloned.max_allocated_field_id, Some(41));
-        assert_eq!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+            assert_eq!(cloned.max_allocated_field_id, Some(41));
+            assert_eq!(
+                cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0,
+                reader_fenced
+            );
+            assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        }
     }
 
     #[test]

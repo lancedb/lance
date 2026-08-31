@@ -7,6 +7,7 @@
 //! a fragment list that disagrees with the schema, a merge that silently dropped
 //! or rewrote data files — before any manifest is written.
 
+use crate::feature_flags::FLAG_STABLE_FIELD_IDS;
 use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
@@ -470,6 +471,13 @@ pub fn validate_stable_field_id_transition(
         return Err(Error::invalid_input(format!(
             "Stable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
         )));
+    }
+    if parent.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0
+        && successor.reader_feature_flags & FLAG_STABLE_FIELD_IDS == 0
+    {
+        return Err(Error::invalid_input(
+            "Stable field-ID reader fence cannot be removed after automatic activation",
+        ));
     }
     let successor_schema_ids = successor
         .schema
@@ -1485,6 +1493,32 @@ mod tests {
 
         assert!(
             err.to_string().contains("high-water mark decreases"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_transition_rejects_removing_reader_fence() {
+        let mut manifest = activated_manifest();
+        manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        let mut successor = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            manifest.fragments.clone(),
+        );
+        successor.reader_feature_flags &= !FLAG_STABLE_FIELD_IDS;
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        let err =
+            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("reader fence cannot be removed"),
             "{err}"
         );
     }

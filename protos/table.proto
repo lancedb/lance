@@ -128,6 +128,9 @@ message Manifest {
   // * 1 << 8: reserved for datasets that may reference recognized V2 data files
   //   with different exact versions. Implementations that do not support the
   //   per-file exact-version contract must treat this bit as unknown.
+  // * 1 << 9: the stable field-ID contract was activated automatically. The
+  //   reader fence excludes released runtimes whose generic commit path did not
+  //   enforce unknown writer flags; it does not change how fields are read.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -140,6 +143,8 @@ message Manifest {
   // reader_feature_flags and writer_feature_flags are not required to be identical.
   // * 1 << 9: newly allocated field IDs must be greater than
   //   max_allocated_field_id, and the high-water mark must advance atomically.
+  //   Automatic activation sets this bit in both flag words. Explicit migration
+  //   may set only the writer bit after older writers have been retired.
   uint64 writer_feature_flags = 10;
 
   // The highest fragment ID that has been used so far.
