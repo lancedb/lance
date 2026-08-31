@@ -236,7 +236,8 @@ impl ScalarIndex for JsonIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         let target_criteria = self.target_index.update_criteria();
         UpdateCriteria {
-            requires_old_data: target_criteria.requires_old_data,
+            requires_old_data: self.conversion == JsonIndexConversion::LegacyV0
+                || target_criteria.requires_old_data,
             data_criteria: json_scan_criteria(&target_criteria.data_criteria),
         }
     }
@@ -837,9 +838,12 @@ impl JsonIndexPlugin {
             .ok_or_else(|| Error::invalid_input_source("type_tag is not UInt8".into()))?;
 
         Self::validate_json_types(values, type_tags, target_type, path)?;
+        let is_utf8 = target_type == &DataType::Utf8;
         let is_null = |index| {
             values.is_null(index)
-                || (!type_tags.is_null(index) && type_tags.value(index) == JsonbType::Null.as_u8())
+                || (!is_utf8
+                    && !type_tags.is_null(index)
+                    && type_tags.value(index) == JsonbType::Null.as_u8())
         };
         let converted: Arc<dyn Array> = match target_type {
             DataType::Boolean => {
@@ -1705,6 +1709,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(typed_result, SearchResult::exact(RowAddrTreeMap::default()));
+        assert!(
+            remapped.update_criteria().requires_old_data,
+            "legacy maintenance must select a full rebuild"
+        );
 
         let (update_store, _update_dir) = local_json_index_store();
         let error = remapped

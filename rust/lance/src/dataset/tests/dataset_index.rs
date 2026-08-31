@@ -6465,6 +6465,38 @@ async fn test_json_btree_routes_typed_json_extract() {
 }
 
 #[tokio::test]
+async fn test_inferred_json_btree_preserves_json_null() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": "x"}"#,
+        r#"{"val": null}"#,
+        r#"{"other": "missing"}"#,
+    ])
+    .await;
+    let predicate = "json_extract(json, '$.val') = 'null'";
+
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(predicate).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("json_idx"),
+        "Utf8 JSON-null predicate did not use the inferred JSON index:\n{plan}"
+    );
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(sorted_json_values(&indexed), sorted_json_values(&baseline));
+}
+
+#[tokio::test]
 async fn test_json_get_null_semantics_bypass_typed_json_index() {
     let dataset = json_btree_dataset(vec![
         r#"{"val": [1]}"#,
