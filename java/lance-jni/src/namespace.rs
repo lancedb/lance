@@ -10,6 +10,7 @@ use jni::JNIEnv;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jobject, jstring};
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace::LenientMergeInsertIntoTableRequest;
 use lance_namespace::models::*;
 use lance_namespace_impls::{
     ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider,
@@ -1914,8 +1915,12 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_mergeInsertIn
             handle,
             request_json,
             request_data,
-            |namespace_client, req, data| {
-                block_on(namespace_client.inner.merge_insert_into_table(req, data))
+            |namespace_client, req: LenientMergeInsertIntoTableRequest, data| {
+                block_on(
+                    namespace_client
+                        .inner
+                        .merge_insert_into_table(req.into(), data),
+                )
             }
         ),
         std::ptr::null_mut()
@@ -2864,8 +2869,12 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_mergeInsertIntoTab
             handle,
             request_json,
             request_data,
-            |namespace_client, req, data| {
-                block_on(namespace_client.inner.merge_insert_into_table(req, data))
+            |namespace_client, req: LenientMergeInsertIntoTableRequest, data| {
+                block_on(
+                    namespace_client
+                        .inner
+                        .merge_insert_into_table(req.into(), data),
+                )
             }
         ),
         std::ptr::null_mut()

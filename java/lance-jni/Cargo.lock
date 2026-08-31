@@ -4149,6 +4149,8 @@ dependencies = [
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
+ "serde",
+ "serde_json",
  "snafu",
 ]
 
@@ -4189,8 +4191,7 @@ dependencies = [
 [[package]]
 name = "lance-namespace-reqwest-client"
 version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d06b1fbb5d41f93bc652b61e2872af92e8a6c5f6b4ce8839a8ecfa05365d359"
+source = "git+https://github.com/wjones127/lance-namespace?branch=will%2Fent-2084-merge-insert-multi-column-on#f2d9ca427775e8678a76200d9a67c612f8de50f2"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

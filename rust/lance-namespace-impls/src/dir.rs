@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
+use crate::merge_insert_on_columns;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
@@ -5115,11 +5116,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<MergeInsertIntoTableResponse> {
         self.record_op("merge_insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let on = request.on.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge_insert_into_table".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
@@ -5145,8 +5142,8 @@ impl LanceNamespace for DirectoryNamespace {
                 .await?,
         );
 
-        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
-            .map_err(|e| {
+        let mut merge_builder =
+            MergeInsertBuilder::try_new(dataset.clone(), on.to_vec()).map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
                     message: format!("Failed to create merge_insert_into_table builder: {}", e),
                 })
@@ -11384,7 +11381,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11435,7 +11432,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11460,6 +11457,162 @@ mod tests {
         assert_eq!(
             namespace.list_tables(list_req).await.unwrap().tables,
             vec!["test_table".to_string()]
+        );
+    }
+
+    /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+    fn create_composite_key_ipc_data(rows: &[(&str, i32, &str)]) -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(region, _, _)| *region),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, id, _)| *id),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, _, value)| *value),
+                )),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_matches_on_every_column_of_a_composite_key() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let seed = create_composite_key_ipc_data(&[("us", 1, "a"), ("us", 2, "b"), ("eu", 1, "c")]);
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(merge_req, bytes::Bytes::from(seed))
+            .await
+            .unwrap();
+
+        // ("us", 1) matches an existing row; ("eu", 2) matches nothing even though a row
+        // with region "eu" and a row with id 2 both exist.
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    ("us", 1, "updated"),
+                    ("eu", 2, "inserted"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_updated_rows, Some(1));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        let dataset = Dataset::open(&format!("{}/test_table.lance", temp_path))
+            .await
+            .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let mut rows: Vec<(&str, i32, &str)> = (0..batch.num_rows())
+            .map(|row| (regions.value(row), ids.value(row), values.value(row)))
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                // ("eu", 1) keeps its value: matching on `id` alone would have clobbered it.
+                ("eu", 1, "c"),
+                ("eu", 2, "inserted"),
+                ("us", 1, "updated"),
+                ("us", 2, "b"),
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, "'on' field is required")]
+    #[case::empty(Some(vec![]), "must name at least one column")]
+    #[case::duplicate(
+        Some(vec!["region".to_string(), "region".to_string()]),
+        "names column 'region' more than once"
+    )]
+    #[tokio::test]
+    async fn test_merge_insert_rejects_an_invalid_on_key(
+        #[case] on: Option<Vec<String>>,
+        #[case] expected_message: &str,
+    ) {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = on;
+        let error = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[("us", 1, "a")])),
+            )
+            .await
+            .unwrap_err();
+
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected a Namespace error, got: {}", error);
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected a NamespaceError source");
+        assert_eq!(ns_err.code(), lance_namespace::ErrorCode::InvalidInput);
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error message: {error}"
         );
     }
 
