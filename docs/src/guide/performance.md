@@ -323,6 +323,17 @@ To enable the FRI, set `defer_index_remap=True` when compacting:
 dataset.optimize.compact_files(defer_index_remap=True)
 ```
 
+Each deferred compaction appends a generation to the FRI, so the index grows over time and
+every generation is applied on index load. Once all indices have caught up to a generation,
+for example after `optimize_indices` or a rebuild, it can be pruned:
+
+```python
+dataset.optimize.cleanup_frag_reuse_index()
+```
+
+Generations that any index has not yet caught up to are always retained, so this is safe to
+run periodically alongside `cleanup_old_versions`.
+
 For details on the index format and usage patterns, see the
 [Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 

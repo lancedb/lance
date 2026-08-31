@@ -514,6 +514,62 @@ def test_defer_index_remap(tmp_path: Path):
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
+def test_cleanup_frag_reuse_index(tmp_path: Path):
+    """cleanup_frag_reuse_index prunes only the reuse generations that every user
+    index has caught up to, and never the ones still in use.
+
+    Setup: 6 fragments, one BTREE scalar index.  Compact with
+    defer_index_remap=True so the frag-reuse index is populated.  While the
+    scalar index has not caught up, cleanup must retain the generation.  After
+    rebuilding the scalar index (create_scalar_index with replace=True) it is
+    newer than the reuse generation, so cleanup may prune it and num_versions
+    drops to 0.
+    """
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset = lance.dataset(base_dir)
+    assert any(
+        idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices()
+    ), "precondition: defer_index_remap must have created the frag-reuse index"
+
+    before_stats = dataset.stats.index_stats("__lance_frag_reuse")
+    versions_before = before_stats["num_versions"]
+    assert versions_before >= 1, (
+        "precondition: frag-reuse index must have at least one version before cleanup"
+    )
+
+    # Negative case: index not yet remapped, so cleanup must retain the generation.
+    dataset.optimize.cleanup_frag_reuse_index()
+    dataset = lance.dataset(base_dir)
+    retained_stats = dataset.stats.index_stats("__lance_frag_reuse")
+    assert retained_stats["num_versions"] == versions_before, (
+        f"cleanup_frag_reuse_index must retain generations that an index has not "
+        f"caught up to, but num_versions went from {versions_before} to "
+        f"{retained_stats['num_versions']}"
+    )
+
+    # Positive case: rebuilding catches the index up, so cleanup can now prune all.
+    dataset.create_scalar_index("i", "BTREE", replace=True)
+    dataset = lance.dataset(base_dir)
+
+    dataset.optimize.cleanup_frag_reuse_index()
+
+    dataset = lance.dataset(base_dir)
+    after_stats = dataset.stats.index_stats("__lance_frag_reuse")
+    assert after_stats["num_versions"] == 0, (
+        f"cleanup_frag_reuse_index should have pruned all reuse generations "
+        f"but num_versions={after_stats['num_versions']}"
+    )
+
+
 @pytest.mark.parametrize("use_commit_options", [True, False])
 def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
     """Compaction.commit respects defer_index_remap passed in options.

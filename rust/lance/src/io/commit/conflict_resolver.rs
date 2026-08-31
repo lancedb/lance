@@ -2059,9 +2059,7 @@ impl<'a> TransactionRebase<'a> {
                     Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
                 for committed_fri in &self.conflicting_frag_reuse_indices {
                     let committed_fri_details = Arc::try_unwrap(
-                        load_frag_reuse_index_details(dataset, committed_fri)
-                            .await
-                            .unwrap(),
+                        load_frag_reuse_index_details(dataset, committed_fri).await?,
                     )
                     .unwrap();
                     let max_version = committed_fri_details
@@ -2074,12 +2072,9 @@ impl<'a> TransactionRebase<'a> {
 
                 // there should be only 1 frag_reuse_index in new indices
                 let new_fri = &new_indices[0];
-                let mut new_fri_details = Arc::try_unwrap(
-                    load_frag_reuse_index_details(dataset, new_fri)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
+                let mut new_fri_details =
+                    Arc::try_unwrap(load_frag_reuse_index_details(dataset, new_fri).await?)
+                        .unwrap();
                 new_fri_details.versions.extend(max_versions);
 
                 let new_frag_bitmap = new_fri_details.new_frag_bitmap();
@@ -2165,12 +2160,9 @@ impl<'a> TransactionRebase<'a> {
                     return Ok(self.transaction);
                 }
 
-                let mut new_fri_details = Arc::try_unwrap(
-                    load_frag_reuse_index_details(dataset, new_fri)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
+                let mut new_fri_details =
+                    Arc::try_unwrap(load_frag_reuse_index_details(dataset, new_fri).await?)
+                        .unwrap();
                 let mut min_dataset_version = new_fri_details
                     .versions
                     .iter()
@@ -2179,9 +2171,7 @@ impl<'a> TransactionRebase<'a> {
                     .unwrap();
                 for committed_fri in self.conflicting_frag_reuse_indices.into_iter() {
                     let committed_fri_details =
-                        load_frag_reuse_index_details(dataset, &committed_fri)
-                            .await
-                            .unwrap();
+                        load_frag_reuse_index_details(dataset, &committed_fri).await?;
                     let committed_min_dataset_version = committed_fri_details
                         .versions
                         .iter()
