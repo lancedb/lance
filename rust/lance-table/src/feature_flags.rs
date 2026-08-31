@@ -53,16 +53,17 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// Reserved for datasets that reference recognized V2 data files with
 /// different exact versions.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// Data files contain Blob v2 reuse indices that redirect file-local blob ids
+/// to physical sidecars owned by another data file.
+pub const FLAG_BLOB_REUSE_INDEX: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 8;
+pub const FLAG_UNKNOWN: u64 = 1 << 10;
 
-// Supported flags stay below the unknown boundary; the mixed-version bit is
-// reserved at the boundary until its storage contract lands.
-const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_BLOB_REUSE_INDEX < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
-const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_BLOB_REUSE_INDEX);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -139,6 +140,16 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
+    let has_blob_reuse_index = manifest.fragments.iter().any(|fragment| {
+        fragment
+            .referenced_lance_files()
+            .any(|file| file.blob_reuse_index.is_some())
+    });
+    if has_blob_reuse_index {
+        manifest.reader_feature_flags |= FLAG_BLOB_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_BLOB_REUSE_INDEX;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -188,6 +199,9 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
+    // This reservation has no implementation yet even though a later known
+    // feature now occupies the next bit.
+    mark_supported(&mut supported, FLAG_MIXED_DATA_FILE_VERSIONS, false);
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -212,6 +226,7 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
     validate_paired_feature_flags(manifest)?;
+    validate_blob_reuse_feature_flag(manifest)?;
     if !can_read_dataset(manifest.reader_feature_flags) {
         return Err(Error::not_supported_source(
             format!(
@@ -229,6 +244,7 @@ pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
     validate_paired_feature_flags(manifest)?;
+    validate_blob_reuse_feature_flag(manifest)?;
     if !can_write_dataset(manifest.writer_feature_flags) {
         return Err(Error::not_supported_source(
             format!(
@@ -253,13 +269,37 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
-    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    if reader != writer {
+    for (flag, name) in [
+        (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
+        (FLAG_BLOB_REUSE_INDEX, "Blob reuse index"),
+    ] {
+        let reader = manifest.reader_feature_flags & flag != 0;
+        let writer = manifest.writer_feature_flags & flag != 0;
+        if reader != writer {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "Manifest has only one of the {name} reader and writer feature bits set, so its semantics are undefined"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_blob_reuse_feature_flag(manifest: &Manifest) -> Result<()> {
+    let has_blob_reuse_index = manifest.fragments.iter().any(|fragment| {
+        fragment
+            .referenced_lance_files()
+            .any(|file| file.blob_reuse_index.is_some())
+    });
+    let has_feature_flag = manifest.reader_feature_flags & FLAG_BLOB_REUSE_INDEX != 0;
+    if has_blob_reuse_index != has_feature_flag {
         return Err(Error::corrupt_file_named(
             "manifest",
-            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
-             so its semantics are undefined",
+            format!(
+                "Blob reuse index metadata presence ({has_blob_reuse_index}) does not match its reader and writer feature bits ({has_feature_flag})"
+            ),
         ));
     }
     Ok(())
@@ -304,6 +344,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_BLOB_REUSE_INDEX));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -372,6 +413,70 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_feature_flags_tracks_blob_reuse_indices() {
+        use crate::format::{BlobReuseIndex, BlobReuseSource, DataFile, Fragment};
+        use std::sync::Arc;
+
+        let mut manifest = empty_manifest();
+        let mut data_file = DataFile::new_legacy_from_fields("file.lance", vec![0], None);
+        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex {
+            sources: vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![2],
+            }],
+        }));
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(data_file);
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.reader_feature_flags & FLAG_BLOB_REUSE_INDEX, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_BLOB_REUSE_INDEX, 0);
+
+        manifest.fragments = Arc::new(vec![]);
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_BLOB_REUSE_INDEX, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_BLOB_REUSE_INDEX, 0);
+    }
+
+    #[test]
+    fn apply_feature_flags_rejects_half_set_blob_reuse_bit() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_BLOB_REUSE_INDEX;
+
+        let err = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(err.to_string().contains("only one of"), "{err}");
+    }
+
+    #[test]
+    fn read_gate_rejects_blob_reuse_metadata_without_feature_bits() {
+        use crate::format::{BlobReuseIndex, BlobReuseSource, DataFile, Fragment};
+        use std::sync::Arc;
+
+        let mut manifest = empty_manifest();
+        let mut data_file = DataFile::new_legacy_from_fields("file.lance", vec![0], None);
+        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex {
+            sources: vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![1],
+            }],
+        }));
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(data_file);
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let err = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
@@ -380,6 +485,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_BLOB_REUSE_INDEX));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -549,6 +655,6 @@ mod tests {
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
-        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_UNKNOWN);
+        assert_eq!(FLAG_BLOB_REUSE_INDEX * 2, FLAG_UNKNOWN);
     }
 }

@@ -3366,6 +3366,22 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let blob_reuse_index = env
+        .call_method(
+            &java_options,
+            "getBlobReuseIndex",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let blob_repack_active_ratio_threshold = env
+        .call_method(
+            &java_options,
+            "getBlobRepackActiveRatioThreshold",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3383,6 +3399,8 @@ fn convert_java_compaction_options_to_rust(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &blob_reuse_index,
+        &blob_repack_active_ratio_threshold,
         config,
     )
 }

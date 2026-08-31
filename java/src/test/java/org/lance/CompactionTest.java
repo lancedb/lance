@@ -163,12 +163,17 @@ public class CompactionTest {
             CompactionOptions.builder()
                 .withTargetRowsPerFragment(100)
                 .withExcludedFragmentIds(Arrays.asList(1L, 1L, 999L))
+                .withBlobReuseIndex(false)
+                .withBlobRepackActiveRatioThreshold(0.4f)
                 .build();
 
         CompactionPlan plan = Compaction.planCompaction(dataset, options);
 
         assertEquals(
             Arrays.asList(1L, 1L, 999L), plan.getCompactionOptions().getExcludedFragmentIds());
+        assertEquals(Optional.of(false), plan.getCompactionOptions().getBlobReuseIndex());
+        assertEquals(
+            Optional.of(0.4f), plan.getCompactionOptions().getBlobRepackActiveRatioThreshold());
         assertEquals(1, plan.getCompactionTasks().size());
         assertEquals(2, plan.getCompactionTasks().get(0).getTaskData().getFragments().size());
         assertEquals(
@@ -179,6 +184,9 @@ public class CompactionTest {
         CompactionTask task = serializeAndDeserialize(plan.getCompactionTasks().get(0));
         assertEquals(
             Arrays.asList(1L, 1L, 999L), task.getCompactionOptions().getExcludedFragmentIds());
+        assertEquals(Optional.of(false), task.getCompactionOptions().getBlobReuseIndex());
+        assertEquals(
+            Optional.of(0.4f), task.getCompactionOptions().getBlobRepackActiveRatioThreshold());
       }
     }
   }
@@ -249,6 +257,8 @@ public class CompactionTest {
     assertEquals(Optional.empty(), options.getMaxSourceRows());
     assertEquals(Optional.empty(), options.getMaxSourceBytes());
     assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
+    assertEquals(Optional.empty(), options.getBlobReuseIndex());
+    assertEquals(Optional.empty(), options.getBlobRepackActiveRatioThreshold());
   }
 
   private static <T> T serializeAndDeserialize(T object)

@@ -309,6 +309,15 @@ impl FromJObjectWithEnv<Vec<u32>> for JLongArray<'_> {
     }
 }
 
+impl FromJObjectWithEnv<Vec<i64>> for JLongArray<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Vec<i64>> {
+        let len = env.get_array_length(self)?;
+        let mut ret = vec![0; len as usize];
+        env.get_long_array_region(self, 0, ret.as_mut_slice())?;
+        Ok(ret)
+    }
+}
+
 impl FromJObjectWithEnv<i32> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<i32> {
         let ret = env.call_method(self, "intValue", "()I", &[])?.i()?;

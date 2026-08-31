@@ -451,6 +451,16 @@ async fn do_commit_new_dataset(
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
                 for df in f.referenced_lance_files_mut() {
+                    if let Some(index) = df.blob_reuse_index.as_mut() {
+                        for source in &mut Arc::make_mut(index).sources {
+                            let effective_base_id = source.base_id.or(df.base_id);
+                            source.blob_dir = crate::dataset::deep_clone_blob_dir(
+                                effective_base_id,
+                                &source.blob_dir,
+                            );
+                            source.base_id = None;
+                        }
+                    }
                     df.base_id = None;
                 }
                 if let Some(d) = f.deletion_file.as_mut() {

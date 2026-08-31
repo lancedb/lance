@@ -44,6 +44,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
     Error, Result,
+    utils::blob::blob_path,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, TRACE_DATASET_EVENTS,
@@ -74,6 +75,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -625,6 +627,30 @@ impl<'a> CleanupTask<'a> {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
+                if let Some(index) = &file.blob_reuse_index {
+                    for source in &index.sources {
+                        let effective_base_id = source.base_id.or(file.base_id);
+                        let source_is_current = effective_base_id.is_none()
+                            || effective_base_id.is_some_and(|base_id| {
+                                manifest
+                                    .base_paths
+                                    .get(&base_id)
+                                    .is_some_and(|base| base.path == self.dataset.uri)
+                            });
+                        if source_is_current {
+                            for physical_id in &source.physical_ids {
+                                let full_blob_path = blob_path(
+                                    &self.dataset.data_dir(),
+                                    &source.blob_dir,
+                                    *physical_id,
+                                );
+                                referenced_files
+                                    .blob_paths
+                                    .insert(remove_prefix(&full_blob_path, &self.dataset.base));
+                            }
+                        }
+                    }
+                }
             }
             let delpath = fragment
                 .deletion_file
@@ -989,6 +1015,14 @@ impl<'a> CleanupTask<'a> {
 
                 if inspection
                     .referenced_files
+                    .blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+
+                if inspection
+                    .referenced_files
                     .data_paths
                     .contains(&parent_data_path)
                 {
@@ -997,8 +1031,12 @@ impl<'a> CleanupTask<'a> {
                     Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
                 } else if inspection
                     .verified_files
-                    .data_paths
-                    .contains(&parent_data_path)
+                    .blob_paths
+                    .contains(&relative_path)
+                    || inspection
+                        .verified_files
+                        .data_paths
+                        .contains(&parent_data_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1242,6 +1280,31 @@ impl<'a> CleanupTask<'a> {
                             .data_paths
                             .insert(relative_data_path);
                         is_referenced = true;
+                    }
+                }
+                if let Some(index) = &file.blob_reuse_index {
+                    for source in &index.sources {
+                        let effective_base_id = source.base_id.or(file.base_id);
+                        let Some(base_id) = effective_base_id else {
+                            continue;
+                        };
+                        if manifest
+                            .base_paths
+                            .get(&base_id)
+                            .is_some_and(|base| base.path == self.dataset.uri)
+                        {
+                            for physical_id in &source.physical_ids {
+                                let path = blob_path(
+                                    &self.dataset.data_dir(),
+                                    &source.blob_dir,
+                                    *physical_id,
+                                );
+                                let relative_path = remove_prefix(&path, &self.dataset.base);
+                                inspection.verified_files.blob_paths.remove(&relative_path);
+                                inspection.referenced_files.blob_paths.insert(relative_path);
+                            }
+                            is_referenced = true;
+                        }
                     }
                 }
             }

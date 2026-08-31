@@ -630,6 +630,7 @@ mod tests {
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
+                blob_reuse_index: None,
             }],
             overlays: vec![],
             deletion_file: None,

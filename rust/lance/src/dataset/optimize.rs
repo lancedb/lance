@@ -251,6 +251,17 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
+    /// Reuse Blob v2 sidecars through a Blob Reuse Index instead of
+    /// materializing them into newly written sidecars. Dedicated sidecars are
+    /// always reused when enabled. Packed sidecars are subject to
+    /// [`Self::blob_repack_active_ratio_threshold`].
+    #[serde(default = "default_blob_reuse_index")]
+    pub blob_reuse_index: bool,
+    /// Repack a fragment's Packed Blob v2 sidecars when its ratio of active
+    /// rows to physical rows is below this threshold. Defaults to 30% (0.3).
+    /// Must be between 0.0 and 1.0, inclusive.
+    #[serde(default = "default_blob_repack_active_ratio_threshold")]
+    pub blob_repack_active_ratio_threshold: f32,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
     #[serde(default)]
@@ -331,6 +342,8 @@ impl Default for CompactionOptions {
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
+            blob_reuse_index: true,
+            blob_repack_active_ratio_threshold: 0.3,
             index_remap_mode: IndexRemapMode::Direct,
             compaction_mode: None,
             enable_binary_copy: false,
@@ -361,6 +374,8 @@ impl CompactionOptions {
     /// - `lance.compaction.materialize_deletions`
     /// - `lance.compaction.materialize_deletions_threshold`
     /// - `lance.compaction.defer_index_remap`
+    /// - `lance.compaction.blob_reuse_index`
+    /// - `lance.compaction.blob_repack_active_ratio_threshold`
     /// - `lance.compaction.index_remap_mode`
     /// - `lance.compaction.batch_size`
     /// - `lance.compaction.io_buffer_size`
@@ -441,6 +456,26 @@ impl CompactionOptions {
                             )));
                         }
                     };
+                }
+                "blob_reuse_index" => {
+                    self.blob_reuse_index = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected 'true' or 'false')",
+                                key, value
+                            )));
+                        }
+                    };
+                }
+                "blob_repack_active_ratio_threshold" => {
+                    self.blob_repack_active_ratio_threshold = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a float between 0.0 and 1.0)",
+                            key, value
+                        ))
+                    })?;
                 }
                 "index_remap_mode" => {
                     self.index_remap_mode = IndexRemapMode::try_from(value.as_str())?;
@@ -523,6 +558,13 @@ impl CompactionOptions {
             self.materialize_deletions = false;
         }
 
+        if !(0.0..=1.0).contains(&self.blob_repack_active_ratio_threshold) {
+            return Err(Error::invalid_input(format!(
+                "CompactionOptions::blob_repack_active_ratio_threshold must be between 0.0 and 1.0, got {}",
+                self.blob_repack_active_ratio_threshold
+            )));
+        }
+
         for (name, value) in [
             (
                 "max_source_fragments",
@@ -561,6 +603,14 @@ impl CompactionOptions {
         self.transaction_properties = Some(Arc::new(properties));
         self
     }
+}
+
+const fn default_blob_reuse_index() -> bool {
+    true
+}
+
+const fn default_blob_repack_active_ratio_threshold() -> f32 {
+    0.3
 }
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
@@ -1146,11 +1196,55 @@ impl CompactionPlan {
 ///
 /// - `Null`: NULL row.
 /// - `External`: External blob referenced by URI.
-/// - `DataBlob`: Inline/Packed/Dedicated blob stored in Lance files.
+/// - `ReuseSidecar`: Packed or Dedicated sidecar retained through a BRI entry.
+/// - `DataBlob`: Inline blob, or a sidecar selected for rewriting.
 enum RowClass {
     Null,
     External,
+    ReuseSidecar,
     DataBlob,
+}
+
+#[derive(Debug)]
+struct BlobSidecarRewritePolicy {
+    blob_reuse_index: bool,
+    repack_packed_fragments: HashSet<u32>,
+}
+
+impl BlobSidecarRewritePolicy {
+    fn should_reuse(&self, kind: BlobKind, row_addr: u64) -> bool {
+        if !self.blob_reuse_index {
+            return false;
+        }
+        match kind {
+            BlobKind::Dedicated => true,
+            BlobKind::Packed => {
+                let fragment_id =
+                    lance_core::utils::address::RowAddress::from(row_addr).fragment_id();
+                !self.repack_packed_fragments.contains(&fragment_id)
+            }
+            BlobKind::Inline | BlobKind::External => false,
+        }
+    }
+}
+
+fn should_repack_packed_sidecars(fragment: &Fragment, active_ratio_threshold: f32) -> Result<bool> {
+    let physical_rows = fragment.physical_rows.ok_or_else(|| {
+        Error::internal(format!(
+            "Fragment {} is missing physical row count for blob repack planning",
+            fragment.id
+        ))
+    })?;
+    if physical_rows == 0 {
+        return Ok(false);
+    }
+    let active_rows = fragment.num_rows().ok_or_else(|| {
+        Error::internal(format!(
+            "Fragment {} is missing active row count for blob repack planning",
+            fragment.id
+        ))
+    })?;
+    Ok(active_rows as f32 / (physical_rows as f32) < active_ratio_threshold)
 }
 
 /// Column views for the 5 fields in a blob v2 descriptor struct.
@@ -1238,7 +1332,9 @@ struct RowClassification {
 fn classify_rows(
     struct_arr: &StructArray,
     descriptor: &BlobV2Descriptor<'_>,
+    row_addrs: &[u64],
     column_name: &str,
+    sidecar_policy: &BlobSidecarRewritePolicy,
 ) -> Result<RowClassification> {
     let num_rows = struct_arr.len();
     let mut row_classes = Vec::with_capacity(num_rows);
@@ -1254,11 +1350,25 @@ fn classify_rows(
                     column_name, i
                 ))
             })?;
-            if kind == BlobKind::External {
-                row_classes.push(RowClass::External);
-            } else {
-                row_classes.push(RowClass::DataBlob);
-                data_blob_indices.push(i);
+            match kind {
+                BlobKind::External => row_classes.push(RowClass::External),
+                BlobKind::Packed | BlobKind::Dedicated
+                    if sidecar_policy.should_reuse(
+                        kind,
+                        *row_addrs.get(i).ok_or_else(|| {
+                            Error::internal(format!(
+                                "Blob v2 field '{}' row {} is missing its row address",
+                                column_name, i
+                            ))
+                        })?,
+                    ) =>
+                {
+                    row_classes.push(RowClass::ReuseSidecar)
+                }
+                BlobKind::Inline | BlobKind::Packed | BlobKind::Dedicated => {
+                    row_classes.push(RowClass::DataBlob);
+                    data_blob_indices.push(i);
+                }
             }
         }
     }
@@ -1392,6 +1502,41 @@ async fn descriptor_to_logical_blob_array(
                     out_size_builder.append_value(descriptor.size_col.value(i));
                 }
             }
+            RowClass::ReuseSidecar => {
+                if descriptor.blob_id_col.is_null(i) || descriptor.size_col.is_null(i) {
+                    return Err(Error::internal(format!(
+                        "Reused blob row {} in field '{}' is missing blob_id or size",
+                        i, field_name
+                    )));
+                }
+                let kind = BlobKind::try_from(descriptor.kind_col.value(i))?;
+                let reuse = super::blob::resolve_blob_reuse_input(
+                    dataset.as_ref(),
+                    blob_field_id,
+                    row_addrs[i],
+                    descriptor.blob_id_col.value(i),
+                )?;
+                data_builder.append_null();
+                uri_builder.append_value(super::blob::encode_blob_reuse_input(&reuse)?);
+                match kind {
+                    BlobKind::Packed => {
+                        if descriptor.position_col.is_null(i) {
+                            return Err(Error::internal(format!(
+                                "Packed blob row {} in field '{}' is missing its position",
+                                i, field_name
+                            )));
+                        }
+                        out_position_builder.append_value(descriptor.position_col.value(i));
+                    }
+                    BlobKind::Dedicated => out_position_builder.append_null(),
+                    _ => {
+                        return Err(Error::internal(format!(
+                            "Blob kind {kind:?} cannot reuse a sidecar"
+                        )));
+                    }
+                }
+                out_size_builder.append_value(descriptor.size_col.value(i));
+            }
             RowClass::DataBlob => {
                 let blob_file = blob_files
                     .get(blob_file_idx)
@@ -1448,6 +1593,7 @@ enum BlobV2FieldRewritePlan {
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
+        sidecar_policy: Arc<BlobSidecarRewritePolicy>,
     },
     Struct {
         field_name: String,
@@ -1473,7 +1619,11 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
-    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+    fn try_new(
+        field: &LanceField,
+        input_field: &ArrowField,
+        sidecar_policy: Arc<BlobSidecarRewritePolicy>,
+    ) -> Result<Self> {
         if !field_contains_blob_v2(field) {
             return Ok(Self::passthrough(input_field));
         }
@@ -1514,6 +1664,7 @@ impl BlobV2FieldRewritePlan {
                 field_id,
                 field_name: field.name.clone(),
                 output_field,
+                sidecar_policy,
             });
         }
 
@@ -1531,7 +1682,9 @@ impl BlobV2FieldRewritePlan {
                     .children
                     .iter()
                     .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .map(|(child, input_child)| {
+                        Self::try_new(child, input_child, sidecar_policy.clone())
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -1553,7 +1706,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, sidecar_policy)?);
                 Ok(Self::List {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1570,7 +1723,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, sidecar_policy)?);
                 Ok(Self::LargeList {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1609,6 +1762,7 @@ impl BlobV2FieldRewritePlan {
                 Self::Blob {
                     field_id,
                     field_name,
+                    sidecar_policy,
                     ..
                 } => {
                     let struct_arr = array.as_struct();
@@ -1617,8 +1771,13 @@ impl BlobV2FieldRewritePlan {
                         Some(BlobV2Layout::Descriptor) => {
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
-                            let classification =
-                                classify_rows(struct_arr, &descriptor, field_name)?;
+                            let classification = classify_rows(
+                                struct_arr,
+                                &descriptor,
+                                row_addrs.as_ref(),
+                                field_name,
+                                sidecar_policy,
+                            )?;
                             let logical = descriptor_to_logical_blob_array(
                                 dataset,
                                 *field_id,
@@ -1780,6 +1939,24 @@ impl BlobV2BatchRewritePlan {
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
+        blob_reuse_index: bool,
+    ) -> Result<Self> {
+        Self::try_new_with_policy(
+            schema,
+            input_schema,
+            keep_row_addr,
+            Arc::new(BlobSidecarRewritePolicy {
+                blob_reuse_index,
+                repack_packed_fragments: HashSet::new(),
+            }),
+        )
+    }
+
+    fn try_new_with_policy(
+        schema: &lance_core::datatypes::Schema,
+        input_schema: &ArrowSchema,
+        keep_row_addr: bool,
+        sidecar_policy: Arc<BlobSidecarRewritePolicy>,
     ) -> Result<Self> {
         let row_addr_idx = input_schema
             .column_with_name(lance_core::ROW_ADDR)
@@ -1801,7 +1978,7 @@ impl BlobV2BatchRewritePlan {
                 continue;
             }
             let field_plan = if let Some(field) = schema.field(input_field.name()) {
-                BlobV2FieldRewritePlan::try_new(field, input_field)?
+                BlobV2FieldRewritePlan::try_new(field, input_field, sidecar_policy.clone())?
             } else {
                 BlobV2FieldRewritePlan::passthrough(input_field)
             };
@@ -1861,7 +2038,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    let plan =
+        BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr, false)?;
     plan.transform_batch(dataset, batch).await
 }
 
@@ -2294,6 +2472,32 @@ async fn rewrite_files(
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
+    let repack_packed_fragments = fragments
+        .iter()
+        .map(|fragment| {
+            let repack = should_repack_packed_sidecars(
+                fragment,
+                options.blob_repack_active_ratio_threshold,
+            )?;
+            if repack {
+                Ok(Some(u32::try_from(fragment.id).map_err(|_| {
+                    Error::internal(format!(
+                        "Fragment id {} does not fit in u32 for blob repack planning",
+                        fragment.id
+                    ))
+                })?))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let sidecar_policy = Arc::new(BlobSidecarRewritePolicy {
+        blob_reuse_index: options.blob_reuse_index,
+        repack_packed_fragments,
+    });
     let num_rows = fragments
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
@@ -2349,10 +2553,11 @@ async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new_with_policy(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
+                sidecar_policy,
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
@@ -3067,7 +3272,7 @@ mod tests {
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::Cursor;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -7768,6 +7973,14 @@ mod tests {
                 "true".to_string(),
             ),
             (
+                "lance.compaction.blob_reuse_index".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "lance.compaction.blob_repack_active_ratio_threshold".to_string(),
+                "0.4".to_string(),
+            ),
+            (
                 "lance.compaction.batch_size".to_string(),
                 "4096".to_string(),
             ),
@@ -7808,6 +8021,8 @@ mod tests {
         assert!(!opts.materialize_deletions);
         assert!((opts.materialize_deletions_threshold - 0.25).abs() < f32::EPSILON);
         assert!(opts.defer_index_remap);
+        assert!(!opts.blob_reuse_index);
+        assert!((opts.blob_repack_active_ratio_threshold - 0.4).abs() < f32::EPSILON);
         assert_eq!(opts.batch_size, Some(4096));
         assert_eq!(opts.io_buffer_size, Some(1_073_741_824));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
@@ -7836,6 +8051,11 @@ mod tests {
             defaults.materialize_deletions_threshold
         );
         assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.blob_reuse_index, defaults.blob_reuse_index);
+        assert_eq!(
+            opts.blob_repack_active_ratio_threshold,
+            defaults.blob_repack_active_ratio_threshold
+        );
         assert_eq!(opts.index_remap_mode, defaults.index_remap_mode);
         assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
         assert_eq!(opts.batch_size, defaults.batch_size);
@@ -7911,6 +8131,19 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("materialize_deletions"));
         assert!(err_msg.contains("yes"));
+    }
+
+    #[rstest]
+    #[case(-0.1)]
+    #[case(1.1)]
+    #[case(f32::NAN)]
+    fn test_invalid_blob_repack_active_ratio_threshold(#[case] threshold: f32) {
+        let mut options = CompactionOptions {
+            blob_repack_active_ratio_threshold: threshold,
+            ..Default::default()
+        };
+        let error = options.validate().unwrap_err().to_string();
+        assert!(error.contains("blob_repack_active_ratio_threshold"));
     }
 
     #[test]
@@ -8799,8 +9032,15 @@ mod tests {
         input_schema.fields[0].unload_blobs_recursive();
         let input_field = Field::from(&input_schema.fields[0]);
 
-        let plan =
-            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let plan = BlobV2FieldRewritePlan::try_new(
+            &logical_schema.fields[0],
+            &input_field,
+            Arc::new(BlobSidecarRewritePolicy {
+                blob_reuse_index: true,
+                repack_packed_fragments: HashSet::new(),
+            }),
+        )
+        .unwrap();
         let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
             panic!("nested blob field should produce a struct rewrite plan");
         };
@@ -9005,7 +9245,7 @@ mod tests {
 
         let inline_data = b"small-inline-blob".as_slice();
         let packed_data: Vec<u8> = (0..64 * 1024 + 1024).map(|i| (i % 256) as u8).collect();
-        let dedicated_data: Vec<u8> = (0..4 * 1024 * 1024 + 512)
+        let dedicated_data: Vec<u8> = (0..128 * 1024 + 1024)
             .map(|i| ((i + 97) % 256) as u8)
             .collect();
 
@@ -9022,7 +9262,7 @@ mod tests {
             let mut new_metadata = metadata;
             new_metadata.insert(
                 BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
-                (4 * 1024 * 1024).to_string(),
+                (128 * 1024).to_string(),
             );
             blob_field = blob_field.with_metadata(new_metadata);
         }
@@ -9047,6 +9287,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(dataset.get_fragments().len(), 3);
+        let packed_source_dir = dataset.get_fragments()[1].metadata.files[0]
+            .path
+            .strip_suffix(".lance")
+            .unwrap()
+            .to_string();
+        let dedicated_source_dir = dataset.get_fragments()[2].metadata.files[0]
+            .path
+            .strip_suffix(".lance")
+            .unwrap()
+            .to_string();
 
         compact_files(
             &mut dataset,
@@ -9060,6 +9310,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(dataset.get_fragments().len(), 1);
+        let output_file = &dataset.get_fragments()[0].metadata.files[0];
+        let reuse_index = output_file
+            .blob_reuse_index
+            .as_ref()
+            .expect("packed and dedicated blobs should be reused");
+        assert_eq!(reuse_index.sources.len(), 2);
+        assert_eq!(
+            reuse_index
+                .sources
+                .iter()
+                .map(|source| source.blob_dir.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([packed_source_dir.clone(), dedicated_source_dir.clone()])
+        );
+        assert!(reuse_index.sources.iter().all(|source| {
+            source.base_id.is_none()
+                && source.local_ids.len() == 1
+                && source.physical_ids.len() == 1
+        }));
+        assert_ne!(
+            dataset.manifest.reader_feature_flags
+                & lance_table::feature_flags::FLAG_BLOB_REUSE_INDEX,
+            0
+        );
 
         let scan_result = dataset
             .scan()
@@ -9087,6 +9361,300 @@ mod tests {
                 (2, Some(dedicated_data))
             ]
         );
+
+        let shallow_dir = TempDir::default();
+        let mut shallow = dataset
+            .shallow_clone(&shallow_dir.path_str(), dataset.version().version, None)
+            .await
+            .unwrap();
+        let shallow_file = &shallow.get_fragments()[0].metadata.files[0];
+        let shallow_base_id = shallow_file.base_id.expect("shallow clone source base");
+        assert_eq!(shallow_file.blob_reuse_index, output_file.blob_reuse_index);
+        let mut shallow_values = read_blob_bytes_by_index(&Arc::new(shallow.clone()), "blob").await;
+        shallow_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(shallow_values, blob_values);
+
+        let shallow_deep_dir = TempDir::default();
+        let shallow_deep = shallow
+            .deep_clone(
+                &shallow_deep_dir.path_str(),
+                shallow.version().version,
+                None,
+            )
+            .await
+            .unwrap();
+        let shallow_deep_fragments = shallow_deep.get_fragments();
+        let shallow_deep_index = shallow_deep_fragments[0].metadata.files[0]
+            .blob_reuse_index
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            shallow_deep_index
+                .sources
+                .iter()
+                .map(|source| source.blob_dir.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                crate::dataset::deep_clone_blob_dir(Some(shallow_base_id), &packed_source_dir),
+                crate::dataset::deep_clone_blob_dir(Some(shallow_base_id), &dedicated_source_dir),
+            ])
+        );
+        assert!(
+            shallow_deep_index
+                .sources
+                .iter()
+                .all(|source| source.base_id.is_none())
+        );
+        let mut shallow_deep_values =
+            read_blob_bytes_by_index(&Arc::new(shallow_deep), "blob").await;
+        shallow_deep_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(shallow_deep_values, blob_values);
+
+        dataset
+            .cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        let mut after_cleanup = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        after_cleanup.sort_by_key(|(id, _)| *id);
+        assert_eq!(after_cleanup, blob_values);
+
+        let mut appended_blob = BlobArrayBuilder::new(1);
+        appended_blob.push_bytes(b"appended-inline").unwrap();
+        let append_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                appended_blob.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let append_reader = RecordBatchIterator::new(vec![Ok(append_batch)], schema.clone());
+        dataset = Dataset::write(
+            append_reader,
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let recompacted_fragments = dataset.get_fragments();
+        let recompacted_index = recompacted_fragments[0].metadata.files[0]
+            .blob_reuse_index
+            .as_ref()
+            .unwrap();
+        assert_eq!(recompacted_index.sources.len(), 2);
+        assert_eq!(
+            recompacted_index
+                .sources
+                .iter()
+                .map(|source| source.blob_dir.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([packed_source_dir.clone(), dedicated_source_dir.clone()])
+        );
+        blob_values.push((3, Some(b"appended-inline".to_vec())));
+        let mut recompacted_values =
+            read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        recompacted_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(recompacted_values, blob_values);
+
+        let clone_dir = TempDir::default();
+        let cloned = dataset
+            .deep_clone(&clone_dir.path_str(), dataset.version().version, None)
+            .await
+            .unwrap();
+        let cloned_fragments = cloned.get_fragments();
+        let cloned_index = cloned_fragments[0].metadata.files[0]
+            .blob_reuse_index
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            cloned_index
+                .sources
+                .iter()
+                .map(|source| source.blob_dir.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                crate::dataset::deep_clone_blob_dir(None, &packed_source_dir),
+                crate::dataset::deep_clone_blob_dir(None, &dedicated_source_dir),
+            ])
+        );
+        assert!(
+            cloned_index
+                .sources
+                .iter()
+                .all(|source| source.base_id.is_none())
+        );
+        let mut cloned_values = read_blob_bytes_by_index(&Arc::new(cloned), "blob").await;
+        cloned_values.sort_by_key(|(id, _)| *id);
+        assert_eq!(cloned_values, blob_values);
+    }
+
+    #[rstest]
+    #[case::below_default_threshold(2, 0.3, false)]
+    #[case::at_default_threshold(3, 0.3, true)]
+    #[case::above_default_threshold(4, 0.3, true)]
+    #[case::custom_threshold(4, 0.5, false)]
+    #[tokio::test]
+    async fn test_compact_blob_v2_packed_repack_active_ratio_threshold(
+        #[case] active_rows: i32,
+        #[case] threshold: f32,
+        #[case] expect_reuse: bool,
+    ) {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+        let payloads = (0_u8..10)
+            .map(|value| vec![value; 64 * 1024 + 1])
+            .collect::<Vec<_>>();
+        let mut blob_builder = BlobArrayBuilder::new(payloads.len());
+        for payload in &payloads {
+            blob_builder.push_bytes(payload).unwrap();
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        dataset
+            .delete(&format!("id >= {active_rows}"))
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                blob_repack_active_ratio_threshold: threshold,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let output_file = &dataset.get_fragments()[0].metadata.files[0];
+        assert_eq!(output_file.blob_reuse_index.is_some(), expect_reuse);
+        let mut actual = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
+        actual.sort_by_key(|(id, _)| *id);
+        let expected = (0..active_rows)
+            .map(|id| (id, Some(payloads[id as usize].clone())))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_can_materialize_dedicated_sidecars() {
+        use crate::BlobArrayBuilder;
+        use lance_arrow::BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+        let payloads = [vec![0x11; 1536], vec![0x22; 1536]];
+        let mut blob_builder = BlobArrayBuilder::new(payloads.len());
+        for payload in &payloads {
+            blob_builder.push_bytes(payload).unwrap();
+        }
+        let mut blob_field = crate::blob_field("blob", true);
+        let mut blob_metadata = blob_field.metadata().clone();
+        blob_metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            "1024".to_string(),
+        );
+        blob_field = blob_field.with_metadata(blob_metadata);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset.get_fragments()[0].metadata.files[0]
+                .blob_reuse_index
+                .is_some()
+        );
+        dataset.delete("id = 1").await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                blob_reuse_index: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let output_file = &dataset.get_fragments()[0].metadata.files[0];
+        assert!(output_file.blob_reuse_index.is_none());
+        assert_eq!(
+            dataset.manifest.reader_feature_flags
+                & lance_table::feature_flags::FLAG_BLOB_REUSE_INDEX,
+            0
+        );
+        let actual = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
+        assert_eq!(actual, vec![(0, Some(payloads[0].clone()))]);
     }
 
     #[tokio::test]

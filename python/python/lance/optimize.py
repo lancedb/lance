@@ -89,6 +89,17 @@ class CompactionOptions(TypedDict):
     """
     Whether to defer index remapping during compaction (default: False).
     """
+    blob_reuse_index: Optional[bool]
+    """
+    Whether to reuse Blob v2 sidecars through a Blob Reuse Index.
+    Set to False to materialize Packed and Dedicated payloads into new sidecars.
+    (default: True)
+    """
+    blob_repack_active_ratio_threshold: Optional[float]
+    """
+    Repack a fragment's Packed Blob v2 sidecars when active rows divided by
+    physical rows is below this threshold. (default: 0.3)
+    """
     max_source_fragments: Optional[int]
     """
     Maximum number of source fragments to compact in a single run. Tasks

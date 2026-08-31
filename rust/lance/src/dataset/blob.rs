@@ -47,10 +47,34 @@ use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
 use lance_io::utils::CachedFileSize;
+use lance_table::format::{BlobReuseIndex, BlobReuseSource};
+use serde::{Deserialize, Serialize};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+const BLOB_REUSE_INPUT_PREFIX: &str = "\0lance-internal-blob-reuse:";
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(super) struct BlobReuseInput {
+    pub base_id: Option<u32>,
+    pub blob_dir: String,
+    pub physical_id: u32,
+}
+
+pub(super) fn encode_blob_reuse_input(input: &BlobReuseInput) -> Result<String> {
+    Ok(format!(
+        "{BLOB_REUSE_INPUT_PREFIX}{}",
+        serde_json::to_string(input)?
+    ))
+}
+
+fn decode_blob_reuse_input(uri: &str) -> Result<Option<BlobReuseInput>> {
+    uri.strip_prefix(BLOB_REUSE_INPUT_PREFIX)
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(Error::from)
+}
 
 pub(super) fn blob_inline_threshold_from_metadata(
     metadata: &HashMap<String, String>,
@@ -433,6 +457,7 @@ pub struct BlobPreprocessor {
     object_store: ObjectStore,
     data_dir: Path,
     data_file_key: String,
+    data_file_base_id: Option<u32>,
     blob_id_allocator: BlobIdAllocator,
     pack_writer: RollingPackedBlobWriter,
     /// Write-param override for the pack-file roll size. When set, it takes
@@ -445,6 +470,9 @@ pub struct BlobPreprocessor {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    reused_blobs: HashMap<BlobReuseInput, (u32, BlobKind, Option<u64>)>,
+    reuse_source_indices: HashMap<(Option<u32>, String), usize>,
+    reuse_sources: Vec<BlobReuseSource>,
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -605,6 +633,7 @@ impl BlobPreprocessor {
         object_store: ObjectStore,
         data_dir: Path,
         data_file_key: String,
+        data_file_base_id: Option<u32>,
         schema: &lance_core::datatypes::Schema,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
@@ -624,6 +653,7 @@ impl BlobPreprocessor {
             object_store,
             data_dir,
             data_file_key,
+            data_file_base_id,
             blob_id_allocator: BlobIdAllocator::new(1),
             pack_writer,
             pack_file_size_override,
@@ -633,7 +663,93 @@ impl BlobPreprocessor {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            reused_blobs: HashMap::new(),
+            reuse_source_indices: HashMap::new(),
+            reuse_sources: Vec::new(),
         })
+    }
+
+    fn reuse_sidecar(
+        &mut self,
+        input: BlobReuseInput,
+        kind: BlobKind,
+        position: Option<u64>,
+        size: u64,
+    ) -> Result<BlobDescriptor> {
+        let descriptor = |local_id| match kind {
+            BlobKind::Packed => Ok(BlobDescriptor::Packed {
+                blob_id: local_id,
+                offset: position.ok_or_else(|| {
+                    Error::invalid_input("Reused Packed blob is missing its position".to_string())
+                })?,
+                size,
+            }),
+            BlobKind::Dedicated => {
+                if position.is_some() {
+                    return Err(Error::invalid_input(
+                        "Reused Dedicated blob must not contain a position".to_string(),
+                    ));
+                }
+                Ok(BlobDescriptor::Dedicated {
+                    blob_id: local_id,
+                    size,
+                })
+            }
+            _ => Err(Error::invalid_input(format!(
+                "Only Packed and Dedicated blobs can reuse sidecars, got {kind:?}"
+            ))),
+        };
+
+        if let Some((local_id, previous_kind, previous_dedicated_size)) =
+            self.reused_blobs.get(&input)
+        {
+            if *previous_kind != kind {
+                return Err(Error::invalid_input(format!(
+                    "Reused blob {:?} was described with conflicting kinds {:?} and {:?}",
+                    input, previous_kind, kind
+                )));
+            }
+            if kind == BlobKind::Dedicated && *previous_dedicated_size != Some(size) {
+                return Err(Error::invalid_input(format!(
+                    "Reused dedicated blob {:?} was described with conflicting sizes {:?} and {}",
+                    input, previous_dedicated_size, size
+                )));
+            }
+            return descriptor(*local_id);
+        }
+
+        let local_id = self.blob_id_allocator.next()?;
+        let source_base_id = if input.base_id == self.data_file_base_id {
+            None
+        } else {
+            input.base_id
+        };
+        let source_key = (source_base_id, input.blob_dir.clone());
+        let source_index = if let Some(source_index) = self.reuse_source_indices.get(&source_key) {
+            *source_index
+        } else {
+            let source_index = self.reuse_sources.len();
+            self.reuse_sources.push(BlobReuseSource {
+                base_id: source_base_id,
+                blob_dir: input.blob_dir.clone(),
+                local_ids: Vec::new(),
+                physical_ids: Vec::new(),
+            });
+            self.reuse_source_indices.insert(source_key, source_index);
+            source_index
+        };
+        let source = &mut self.reuse_sources[source_index];
+        source.local_ids.push(local_id);
+        source.physical_ids.push(input.physical_id);
+        self.reused_blobs.insert(
+            input,
+            (
+                local_id,
+                kind,
+                (kind == BlobKind::Dedicated).then_some(size),
+            ),
+        );
+        descriptor(local_id)
     }
 
     fn blob_writer_with_metadata(
@@ -1051,6 +1167,31 @@ impl BlobPreprocessor {
 
             if has_uri {
                 let uri_val = uri_col.value(i);
+                if let Some(reuse) = decode_blob_reuse_input(uri_val)? {
+                    if has_data || !has_size {
+                        return Err(Error::invalid_input(format!(
+                            "Internal blob reuse input for field '{}' must contain uri, size, and an optional Packed position",
+                            field.name()
+                        )));
+                    }
+                    let position = position_col
+                        .as_ref()
+                        .filter(|_| has_position)
+                        .map(|col| col.value(i));
+                    let kind = if position.is_some() {
+                        BlobKind::Packed
+                    } else {
+                        BlobKind::Dedicated
+                    };
+                    let value = self.reuse_sidecar(
+                        reuse,
+                        kind,
+                        position,
+                        size_col.as_ref().expect("size column must exist").value(i),
+                    )?;
+                    blob_writer.push(value)?;
+                    continue;
+                }
                 if self.external_blob_mode == ExternalBlobMode::Ingest {
                     let position = if has_position {
                         Some(
@@ -1130,8 +1271,15 @@ impl BlobPreprocessor {
         Ok((array, Arc::new(field)))
     }
 
-    pub(crate) async fn finish(&mut self) -> Result<()> {
-        self.pack_writer.finish().await
+    pub(crate) async fn finish(&mut self) -> Result<Option<Arc<BlobReuseIndex>>> {
+        self.pack_writer.finish().await?;
+        if self.reuse_sources.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Arc::new(BlobReuseIndex {
+                sources: std::mem::take(&mut self.reuse_sources),
+            })))
+        }
     }
 }
 
@@ -1418,6 +1566,8 @@ struct BlobReadLocation {
     data_file_dir: Path,
     data_file_key: String,
     data_file_path: Path,
+    base_id: Option<u32>,
+    blob_reuse_index: Option<Arc<BlobReuseIndex>>,
 }
 
 impl BlobFile {
@@ -3611,6 +3761,42 @@ impl<'a> BlobV2ReadContext<'a> {
         .await
     }
 
+    async fn sidecar_location(
+        &mut self,
+        location: &BlobReadLocation,
+        blob_id: u32,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        let Some((base_id, blob_dir, physical_id)) = location
+            .blob_reuse_index
+            .as_deref()
+            .and_then(|index| index.resolve(location.base_id, blob_id))
+            .map(|resolved| {
+                (
+                    resolved.base_id,
+                    resolved.blob_dir.to_string(),
+                    resolved.physical_id,
+                )
+            })
+        else {
+            let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+            return Ok((location.object_store.clone(), path));
+        };
+
+        let object_store = if let Some(base_id) = base_id {
+            if let Some(store) = self.store_cache.get(&base_id) {
+                store.clone()
+            } else {
+                let store = self.dataset.object_store(Some(base_id)).await?;
+                self.store_cache.insert(base_id, store.clone());
+                store
+            }
+        } else {
+            self.dataset.object_store.clone()
+        };
+        let data_dir = self.dataset.data_file_dir_for_base(base_id)?;
+        Ok((object_store, blob_path(&data_dir, &blob_dir, physical_id)))
+    }
+
     async fn collect_inline(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
@@ -3643,8 +3829,8 @@ impl<'a> BlobV2ReadContext<'a> {
         let blob_id = columns.blob_ids.value(idx);
         let size = columns.sizes.value(idx);
         let location = self.blob_read_location(row_addr).await?;
-        let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
+        let (object_store, path) = self.sidecar_location(&location, blob_id).await?;
+        let source = shared_blob_source(&mut self.source_cache, object_store, &path);
         Ok(BlobFile::with_source(
             source,
             0,
@@ -3664,8 +3850,8 @@ impl<'a> BlobV2ReadContext<'a> {
         let size = columns.sizes.value(idx);
         let position = columns.positions.value(idx);
         let location = self.blob_read_location(row_addr).await?;
-        let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
+        let (object_store, path) = self.sidecar_location(&location, blob_id).await?;
+        let source = shared_blob_source(&mut self.source_cache, object_store, &path);
         Ok(BlobFile::with_source(
             source,
             position,
@@ -3808,6 +3994,8 @@ async fn resolve_blob_read_location(
         data_file_dir,
         data_file_key,
         data_file_path,
+        base_id: data_file.base_id,
+        blob_reuse_index: data_file.blob_reuse_index.clone(),
     };
     fragment_cache.insert(frag_id, location.clone());
     Ok(location)
@@ -3816,6 +4004,37 @@ async fn resolve_blob_read_location(
 fn data_file_key_from_path(path: &str) -> &str {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename.strip_suffix(".lance").unwrap_or(filename)
+}
+
+pub(super) fn resolve_blob_reuse_input(
+    dataset: &Dataset,
+    blob_field_id: u32,
+    row_addr: u64,
+    blob_id: u32,
+) -> Result<BlobReuseInput> {
+    let frag_id = RowAddress::from(row_addr).fragment_id();
+    let fragment = dataset
+        .get_fragment(frag_id as usize)
+        .ok_or_else(|| Error::internal(format!("Fragment {frag_id} not found")))?;
+    let data_file = fragment
+        .data_file_for_field(blob_field_id)
+        .ok_or_else(|| Error::internal("Data file not found for blob field".to_string()))?;
+    if let Some(resolved) = data_file
+        .blob_reuse_index
+        .as_deref()
+        .and_then(|index| index.resolve(data_file.base_id, blob_id))
+    {
+        return Ok(BlobReuseInput {
+            base_id: resolved.base_id,
+            blob_dir: resolved.blob_dir.to_string(),
+            physical_id: resolved.physical_id,
+        });
+    }
+    Ok(BlobReuseInput {
+        base_id: data_file.base_id,
+        blob_dir: data_file_key_from_path(&data_file.path).to_string(),
+        physical_id: blob_id,
+    })
 }
 
 #[cfg(test)]
@@ -3883,7 +4102,10 @@ mod tests {
     };
     use crate::{
         Dataset,
-        blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, PackedBlobWriter, blob_field},
+        blob::{
+            BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, PackedBlobWriter,
+            blob_field,
+        },
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
             scanner::MaterializationStyle,
@@ -7478,6 +7700,7 @@ mod tests {
             object_store.clone(),
             data_dir,
             "data_file_key".to_string(),
+            None,
             &writer_schema,
             None,
             false,
@@ -7505,6 +7728,106 @@ mod tests {
             .downcast_ref::<arrow_array::StructArray>()
             .unwrap()
             .clone())
+    }
+
+    #[tokio::test]
+    async fn blob_reuse_deduplicates_physical_references_and_allocates_once() {
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://blob_reuse_preprocessor",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let field = blob_field("blob", true);
+        let writer_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field])).unwrap();
+        let mut preprocessor = super::BlobPreprocessor::new(
+            object_store.as_ref().clone(),
+            base_path.join("data"),
+            "output".to_string(),
+            None,
+            &writer_schema,
+            None,
+            false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap();
+        let source = super::BlobReuseInput {
+            base_id: None,
+            blob_dir: "source".to_string(),
+            physical_id: 9,
+        };
+
+        let first = preprocessor
+            .reuse_sidecar(source.clone(), BlobKind::Dedicated, None, 100)
+            .unwrap();
+        let duplicate = preprocessor
+            .reuse_sidecar(source.clone(), BlobKind::Dedicated, None, 100)
+            .unwrap();
+        assert_eq!(first, duplicate);
+        let second = preprocessor
+            .reuse_sidecar(
+                super::BlobReuseInput {
+                    physical_id: 10,
+                    ..source.clone()
+                },
+                BlobKind::Dedicated,
+                None,
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            (first, second),
+            (
+                BlobDescriptor::Dedicated {
+                    blob_id: 1,
+                    size: 100,
+                },
+                BlobDescriptor::Dedicated {
+                    blob_id: 2,
+                    size: 200,
+                },
+            )
+        );
+        assert!(
+            preprocessor
+                .reuse_sidecar(source.clone(), BlobKind::Dedicated, None, 101)
+                .is_err()
+        );
+
+        let packed = super::BlobReuseInput {
+            physical_id: 11,
+            ..source
+        };
+        assert_eq!(
+            preprocessor
+                .reuse_sidecar(packed.clone(), BlobKind::Packed, Some(10), 20)
+                .unwrap(),
+            BlobDescriptor::Packed {
+                blob_id: 3,
+                offset: 10,
+                size: 20,
+            }
+        );
+        assert_eq!(
+            preprocessor
+                .reuse_sidecar(packed, BlobKind::Packed, Some(40), 30)
+                .unwrap(),
+            BlobDescriptor::Packed {
+                blob_id: 3,
+                offset: 40,
+                size: 30,
+            }
+        );
+
+        let index = preprocessor.finish().await.unwrap().unwrap();
+        assert_eq!(index.sources.len(), 1);
+        assert_eq!(index.sources[0].local_ids, vec![1, 2, 3]);
+        assert_eq!(index.sources[0].physical_ids, vec![9, 10, 11]);
     }
 
     async fn try_preprocess_kind_with_blob_metadata(
@@ -7789,6 +8112,7 @@ mod tests {
             object_store.clone(),
             data_dir,
             "data_file_key".to_string(),
+            None,
             &writer_schema,
             None,
             false,
@@ -7876,6 +8200,7 @@ mod tests {
             object_store.clone(),
             data_dir,
             "data_file_key".to_string(),
+            None,
             &writer_schema,
             None,
             false,

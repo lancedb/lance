@@ -283,6 +283,50 @@ def test_fragment_meta():
     )
 
 
+def test_fragment_meta_blob_reuse_index_roundtrip(tmp_path: Path):
+    from lance.fragment import BlobReuseIndex, BlobReuseSource, DataFile
+
+    index = BlobReuseIndex(
+        sources=[
+            BlobReuseSource(
+                base_id=None,
+                blob_dir="local.blob",
+                local_ids=[1, 7],
+                physical_ids=[3, 9],
+            ),
+            BlobReuseSource(
+                base_id=5,
+                blob_dir="external.blob",
+                local_ids=[4],
+                physical_ids=[2],
+            ),
+        ]
+    )
+    metadata = FragmentMetadata(
+        id=1,
+        files=[DataFile("file.lance", [0], blob_reuse_index=index)],
+        physical_rows=1,
+    )
+
+    json_round_trip = FragmentMetadata.from_json(json.dumps(metadata.to_json()))
+    pickle_round_trip = pickle.loads(pickle.dumps(metadata))
+
+    assert json_round_trip.files[0].blob_reuse_index == index
+    assert pickle_round_trip.files[0].blob_reuse_index == index
+    assert "blob_reuse_index=BlobReuseIndex" in repr(metadata.files[0])
+
+    dataset = write_dataset([], tmp_path, schema=pa.schema([pa.field("a", pa.int64())]))
+    fragment = LanceFragment.create(tmp_path, pa.table({"a": [1]}))
+    native_index = BlobReuseIndex(sources=[index.sources[0]])
+    fragment.files[0].blob_reuse_index = native_index
+    dataset = LanceDataset.commit(
+        tmp_path,
+        LanceOperation.Append([fragment]),
+        read_version=dataset.version,
+    )
+    assert dataset.get_fragments()[0].metadata.files[0].blob_reuse_index == native_index
+
+
 def test_fragment_v2(tmp_path):
     dataset_uri = tmp_path / "dataset"
     tab = pa.table(

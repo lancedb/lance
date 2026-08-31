@@ -16,7 +16,7 @@ use std::ops::{Range, RangeInclusive};
 
 // These are all internal data structures, and are private.
 mod bitmap;
-mod encoded_array;
+pub(crate) mod encoded_array;
 mod index;
 pub mod segment;
 mod serde;

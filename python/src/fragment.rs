@@ -28,12 +28,13 @@ use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    BlobReuseIndex, BlobReuseSource, DataFile, DeletionFile, DeletionFileType, Fragment,
+    RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
@@ -899,6 +900,22 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
         let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
+        let blob_reuse_index = ob.getattr("blob_reuse_index")?;
+        let blob_reuse_index = if blob_reuse_index.is_none() {
+            None
+        } else {
+            let mut sources = Vec::new();
+            for source in blob_reuse_index.getattr("sources")?.try_iter()? {
+                let source = source?;
+                sources.push(BlobReuseSource {
+                    base_id: source.getattr("base_id")?.extract()?,
+                    blob_dir: source.getattr("blob_dir")?.extract()?,
+                    local_ids: source.getattr("local_ids")?.extract()?,
+                    physical_ids: source.getattr("physical_ids")?.extract()?,
+                });
+            }
+            Some(Arc::new(BlobReuseIndex { sources }))
+        };
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,
             fields: fields.into(),
@@ -907,6 +924,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
             base_id: ob.getattr("base_id")?.extract()?,
+            blob_reuse_index,
         }))
     }
 }
@@ -923,6 +941,25 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             .expect("DataFile class not found");
 
         let file_size_bytes = self.0.file_size_bytes.get().map(u64::from);
+        let blob_reuse_index = if let Some(index) = &self.0.blob_reuse_index {
+            let sources = index
+                .sources
+                .iter()
+                .map(|source| {
+                    let value = PyDict::new(py);
+                    value.set_item("base_id", source.base_id)?;
+                    value.set_item("blob_dir", &source.blob_dir)?;
+                    value.set_item("local_ids", &source.local_ids)?;
+                    value.set_item("physical_ids", &source.physical_ids)?;
+                    Ok(value)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let value = PyDict::new(py);
+            value.set_item("sources", PyList::new(py, sources)?)?;
+            Some(value)
+        } else {
+            None
+        };
         cls.call1((
             &self.0.path,
             self.0.fields.to_vec(),
@@ -931,6 +968,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_minor_version,
             file_size_bytes,
             self.0.base_id,
+            blob_reuse_index,
         ))
     }
 }

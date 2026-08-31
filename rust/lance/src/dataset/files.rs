@@ -904,6 +904,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
             base_id,
+            blob_reuse_index: None,
         };
 
         let fragment = Fragment {

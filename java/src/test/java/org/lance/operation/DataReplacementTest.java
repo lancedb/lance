@@ -20,6 +20,8 @@ import org.lance.FragmentMetadata;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.WriteParams;
+import org.lance.fragment.BlobReuseIndex;
+import org.lance.fragment.BlobReuseSource;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
 
@@ -114,13 +116,26 @@ public class DataReplacementTest extends OperationTestBase {
               }
               replaceVectorRoot.setRowCount(rowCount);
 
-              DataFile datafile =
+              DataFile writtenDataFile =
                   writeLanceDataFile(
                       dataset.allocator(),
                       datasetPath,
                       replaceVectorRoot,
                       new int[] {2},
                       new int[] {0});
+              BlobReuseIndex blobReuseIndex =
+                  new BlobReuseIndex(
+                      List.of(new BlobReuseSource(null, "source", new long[] {1}, new long[] {2})));
+              DataFile datafile =
+                  new DataFile(
+                      writtenDataFile.getPath(),
+                      writtenDataFile.getFields(),
+                      writtenDataFile.getColumnIndices(),
+                      writtenDataFile.getFileMajorVersion(),
+                      writtenDataFile.getFileMinorVersion(),
+                      writtenDataFile.getFileSizeBytes(),
+                      writtenDataFile.getBaseId().orElse(null),
+                      blobReuseIndex);
               List<DataReplacement.DataReplacementGroup> replacementGroups =
                   Collections.singletonList(
                       new DataReplacement.DataReplacementGroup(
@@ -134,6 +149,12 @@ public class DataReplacementTest extends OperationTestBase {
                     new CommitBuilder(initDataset).execute(replaceTxn)) {
                   assertEquals(4, datasetWithAddress.version());
                   assertEquals(rowCount, datasetWithAddress.countRows());
+                  DataFile committedDataFile =
+                      datasetWithAddress.getFragment(0).metadata().getFiles().stream()
+                          .filter(file -> file.getPath().equals(datafile.getPath()))
+                          .findFirst()
+                          .orElseThrow();
+                  assertEquals(blobReuseIndex, committedDataFile.getBlobReuseIndex().orElseThrow());
 
                   try (LanceScanner scanner = datasetWithAddress.newScan()) {
                     try (ArrowReader resultReader = scanner.scanBatches()) {

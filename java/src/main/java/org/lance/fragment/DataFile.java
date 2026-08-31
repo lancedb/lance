@@ -29,6 +29,7 @@ public class DataFile implements Serializable {
   private final int fileMinorVersion;
   private final Long fileSizeBytes;
   private final Integer baseId;
+  private final BlobReuseIndex blobReuseIndex;
 
   public DataFile(
       String path,
@@ -38,6 +39,26 @@ public class DataFile implements Serializable {
       int fileMinorVersion,
       Long fileSizeBytes,
       Integer baseId) {
+    this(
+        path,
+        fields,
+        columnIndices,
+        fileMajorVersion,
+        fileMinorVersion,
+        fileSizeBytes,
+        baseId,
+        null);
+  }
+
+  public DataFile(
+      String path,
+      int[] fields,
+      int[] columnIndices,
+      int fileMajorVersion,
+      int fileMinorVersion,
+      Long fileSizeBytes,
+      Integer baseId,
+      BlobReuseIndex blobReuseIndex) {
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
@@ -45,6 +66,7 @@ public class DataFile implements Serializable {
     this.fileMinorVersion = fileMinorVersion;
     this.fileSizeBytes = fileSizeBytes;
     this.baseId = baseId;
+    this.blobReuseIndex = blobReuseIndex;
   }
 
   public String getPath() {
@@ -75,6 +97,11 @@ public class DataFile implements Serializable {
     return Optional.ofNullable(baseId);
   }
 
+  /** Returns the physical blob sidecar reuse mappings attached to this data file. */
+  public Optional<BlobReuseIndex> getBlobReuseIndex() {
+    return Optional.ofNullable(blobReuseIndex);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -85,7 +112,9 @@ public class DataFile implements Serializable {
         && Objects.equals(path, that.path)
         && Arrays.equals(fields, that.fields)
         && Arrays.equals(columnIndices, that.columnIndices)
-        && Objects.equals(fileSizeBytes, that.fileSizeBytes);
+        && Objects.equals(fileSizeBytes, that.fileSizeBytes)
+        && Objects.equals(baseId, that.baseId)
+        && Objects.equals(blobReuseIndex, that.blobReuseIndex);
   }
 
   @Override
@@ -98,6 +127,7 @@ public class DataFile implements Serializable {
         .add("fileMinorVersion", fileMinorVersion)
         .add("fileSizeBytes", fileSizeBytes)
         .add("baseId", baseId)
+        .add("blobReuseIndex", blobReuseIndex)
         .toString();
   }
 }

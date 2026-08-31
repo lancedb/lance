@@ -1929,6 +1929,7 @@ impl FileFragment {
                 projection,
                 stream.schema().as_ref(),
                 false,
+                false,
             )?);
             Ok(stream
                 .map(move |batch_result| {
@@ -2825,6 +2826,7 @@ impl FileFragment {
             let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
                 schema,
                 stream.schema().as_ref(),
+                false,
                 false,
             )?);
             streams.push(
@@ -7289,6 +7291,7 @@ mod tests {
             file_minor_version: 1,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
+            blob_reuse_index: None,
         };
 
         let full_struct = file_versions::reader_projection_from_column_names(

@@ -202,6 +202,35 @@ impl Manifest {
         }
     }
 
+    /// Validate that every external base referenced by a Blob reuse index is
+    /// declared by this manifest.
+    pub fn validate_blob_reuse_indices(&self) -> Result<()> {
+        for data_file in self
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.referenced_lance_files())
+        {
+            let Some(index) = &data_file.blob_reuse_index else {
+                continue;
+            };
+            index.validate(data_file.base_id)?;
+            for source in &index.sources {
+                if let Some(base_id) = source.base_id.or(data_file.base_id)
+                    && !self.base_paths.contains_key(&base_id)
+                {
+                    return Err(Error::corrupt_file_named(
+                        "manifest",
+                        format!(
+                            "Data file '{}' BlobReuseIndex references missing base id {base_id}",
+                            data_file.path
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn new_from_previous(
         previous: &Self,
         schema: Schema,
@@ -984,7 +1013,7 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
-        Ok(Self {
+        let manifest = Self {
             schema,
             version: p.version,
             branch: p.branch,
@@ -1013,7 +1042,9 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
-        })
+        };
+        manifest.validate_blob_reuse_indices()?;
+        Ok(manifest)
     }
 }
 
@@ -1146,7 +1177,9 @@ impl SelfDescribingFileReader for V1FileReader {
 mod tests {
     use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use crate::format::{
+        BlobReuseIndex, BlobReuseSource, DataFile, DeletionFile, DeletionFileType,
+    };
     use std::num::NonZero;
 
     use super::*;
@@ -1154,6 +1187,40 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn blob_reuse_index_requires_declared_external_base() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut fragment = Fragment::with_file_legacy(0, "file.lance", &schema, Some(1));
+        fragment.files[0].blob_reuse_index = Some(Arc::new(BlobReuseIndex {
+            sources: vec![BlobReuseSource {
+                base_id: Some(42),
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![1],
+            }],
+        }));
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let err = manifest.validate_blob_reuse_indices().unwrap_err();
+        assert!(err.to_string().contains("missing base id 42"), "{err}");
+
+        manifest.base_paths.insert(
+            42,
+            BasePath::new(42, "memory://source".to_string(), None, false),
+        );
+        manifest.validate_blob_reuse_indices().unwrap();
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
@@ -1168,6 +1235,14 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let mut fragment = Fragment::with_file_legacy(0, "base.lance", &schema, Some(10));
+        fragment.files[0].blob_reuse_index = Some(Arc::new(BlobReuseIndex {
+            sources: vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![2],
+            }],
+        }));
         fragment.overlays = vec![DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
             coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
@@ -1190,6 +1265,17 @@ mod tests {
 
         let fragment = &cloned.fragments[0];
         assert_eq!(fragment.files[0].base_id, Some(7));
+        assert_eq!(
+            fragment.files[0]
+                .blob_reuse_index
+                .as_ref()
+                .unwrap()
+                .resolve(fragment.files[0].base_id, 1)
+                .unwrap()
+                .base_id,
+            Some(7),
+            "an implicit BRI source follows the containing data file into the parent base"
+        );
         assert_eq!(
             fragment.overlays[0].data_file.base_id,
             Some(7),
