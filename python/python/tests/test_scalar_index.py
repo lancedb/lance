@@ -6154,7 +6154,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         (
-            '{"path":"$.x","target_data_type":"Utf8",'
+            '{"path":"x","target_data_type":"Utf8",'
             '"conversion":"jsonpath_typed_v1","target_details":{}}'
         ),
         "{}",

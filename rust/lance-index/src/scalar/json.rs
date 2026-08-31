@@ -7,15 +7,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::LargeBinaryArray;
-use arrow_schema::{DataType, Field, SortOptions};
+use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
 };
-use datafusion_common::{ScalarValue, config::ConfigOptions};
+use datafusion_common::{DataFusionError, ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
@@ -28,8 +28,8 @@ use lance_datafusion::exec::{
 };
 use lance_datafusion::udf::json::{
     JSON_EXTRACT_BOOLEAN_UDF_NAME, JSON_EXTRACT_FLOAT64_UDF_NAME, JSON_EXTRACT_INT64_UDF_NAME,
-    JSON_EXTRACT_LARGE_BINARY_UDF_NAME, JSON_EXTRACT_UTF8_UDF_NAME, infer_json_extract_type,
-    json_extract_typed_udf, normalize_json_path,
+    JSON_EXTRACT_LARGE_BINARY_UDF_NAME, JSON_EXTRACT_UTF8_UDF_NAME, JsonbType,
+    json_extract_typed_udf, json_extract_with_type_udf, normalize_json_path,
 };
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -55,6 +55,17 @@ use crate::{
 const JSON_INDEX_VERSION: u32 = 1;
 const JSON_INDEX_CONVERSION: &str = "jsonpath_typed_v1";
 
+fn index_version_for_target_type(target_type: &DataType) -> u32 {
+    // Version-1 changes Utf8 keys from decoded strings to serialized JSON text.
+    // Native typed keys retain their version-0 encoding so released readers can
+    // continue to use current-created numeric, boolean, and binary indices.
+    if target_type == &DataType::Utf8 {
+        JSON_INDEX_VERSION
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonIndexConversion {
     LegacyV0,
@@ -68,7 +79,7 @@ enum JsonIndexConversion {
 pub struct JsonIndex {
     target_index: Arc<dyn ScalarIndex>,
     path: String,
-    target_type: DataType,
+    target_type: Option<DataType>,
     conversion: JsonIndexConversion,
 }
 
@@ -77,12 +88,13 @@ impl JsonIndex {
         Self {
             target_index,
             path,
-            target_type,
+            target_type: Some(target_type),
             conversion: JsonIndexConversion::TypedV1,
         }
     }
 
-    fn new_legacy(target_index: Arc<dyn ScalarIndex>, path: String, target_type: DataType) -> Self {
+    fn new_legacy(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
+        let target_type = target_index.training_data_type();
         Self {
             target_index,
             path,
@@ -94,11 +106,16 @@ impl JsonIndex {
     fn wrap_target_created_index(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
         let (target_data_type, conversion, index_version) = match self.conversion {
             JsonIndexConversion::LegacyV0 => (None, None, 0),
-            JsonIndexConversion::TypedV1 => (
-                Some(json_target_type_name(&self.target_type)?.to_string()),
-                Some(JSON_INDEX_CONVERSION.to_string()),
-                JSON_INDEX_VERSION,
-            ),
+            JsonIndexConversion::TypedV1 => {
+                let target_type = self.target_type.as_ref().ok_or_else(|| {
+                    Error::internal("Version-1 JSON index is missing its target type")
+                })?;
+                (
+                    Some(json_target_type_name(target_type)?.to_string()),
+                    Some(JSON_INDEX_CONVERSION.to_string()),
+                    index_version_for_target_type(target_type),
+                )
+            }
         };
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
@@ -197,12 +214,13 @@ impl ScalarIndex for JsonIndex {
                 self.path
             )));
         }
+        let target_type = self
+            .target_type
+            .clone()
+            .ok_or_else(|| Error::internal("Version-1 JSON index is missing its target type"))?;
         let target_criteria = self.target_index.update_criteria().data_criteria;
-        let new_data = JsonIndexPlugin::extract_json_typed(
-            new_data,
-            self.path.clone(),
-            self.target_type.clone(),
-        )?;
+        let new_data =
+            JsonIndexPlugin::extract_json_typed(new_data, self.path.clone(), target_type)?;
         let new_data = if target_criteria.ordering == TrainingOrdering::Values {
             JsonIndexPlugin::sort_stream_by_value(new_data).await?
         } else {
@@ -225,7 +243,11 @@ impl ScalarIndex for JsonIndex {
 
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
         let target_params = self.target_index.derive_index_params()?;
-        let target_data_type = Some(JsonIndexTargetType::try_from(&self.target_type)?);
+        let target_data_type = self
+            .target_type
+            .as_ref()
+            .map(JsonIndexTargetType::try_from)
+            .transpose()?;
         let params = JsonIndexParameters {
             target_index_type: target_params.index_type,
             target_index_parameters: target_params.params,
@@ -236,7 +258,7 @@ impl ScalarIndex for JsonIndex {
     }
 
     fn training_data_type(&self) -> Option<DataType> {
-        Some(self.target_type.clone())
+        self.target_type.clone()
     }
 }
 
@@ -355,7 +377,8 @@ impl AnyQuery for JsonQuery {
 #[derive(Debug)]
 pub struct JsonQueryParser {
     path: String,
-    target_type: DataType,
+    target_type: Option<DataType>,
+    conversion: JsonIndexConversion,
     target_parser: Box<dyn ScalarQueryParser>,
 }
 
@@ -367,7 +390,17 @@ impl JsonQueryParser {
     ) -> Self {
         Self {
             path,
-            target_type,
+            target_type: Some(target_type),
+            conversion: JsonIndexConversion::TypedV1,
+            target_parser,
+        }
+    }
+
+    fn new_legacy(path: String, target_parser: Box<dyn ScalarQueryParser>) -> Self {
+        Self {
+            path,
+            target_type: None,
+            conversion: JsonIndexConversion::LegacyV0,
             target_parser,
         }
     }
@@ -462,33 +495,53 @@ impl ScalarQueryParser for JsonQueryParser {
             return None;
         };
 
-        let reference_type = match udf.name() {
-            JSON_EXTRACT_INT64_UDF_NAME | "json_get_int" => DataType::Int64,
-            JSON_EXTRACT_FLOAT64_UDF_NAME | "json_get_float" => DataType::Float64,
-            JSON_EXTRACT_BOOLEAN_UDF_NAME | "json_get_bool" => DataType::Boolean,
-            JSON_EXTRACT_UTF8_UDF_NAME => DataType::Utf8,
-            JSON_EXTRACT_LARGE_BINARY_UDF_NAME | "json_get" => DataType::LargeBinary,
-            // json_get_string returns decoded string contents while typed Utf8
-            // JSONPath extraction preserves serialized JSON text.
-            _ => return None,
-        };
-        if reference_type != self.target_type {
-            return None;
-        }
-
-        let normalized_path = if udf.name().starts_with("json_get") {
-            let mut chars = path.chars();
-            let first = chars.next()?;
-            if !(first == '_' || first.is_ascii_alphabetic())
-                || !chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-            {
-                return None;
+        match self.conversion {
+            JsonIndexConversion::LegacyV0 => {
+                // Version-0 indices stored decoded values and preserved their
+                // unnormalized parameter path. Keep released json_get_* queries
+                // working, but do not route json_extract: its serialized-text
+                // semantics are incompatible with these decoded keys.
+                let reference_type = match udf.name() {
+                    "json_get_int" => DataType::Int64,
+                    "json_get_float" => DataType::Float64,
+                    "json_get_bool" => DataType::Boolean,
+                    "json_get_string" => DataType::Utf8,
+                    _ => return None,
+                };
+                (path == &self.path).then_some(reference_type)
             }
-            format!("$.{path}")
-        } else {
-            normalize_json_path(path).ok()?
-        };
-        (normalized_path == self.path).then_some(reference_type)
+            JsonIndexConversion::TypedV1 => {
+                let reference_type = match udf.name() {
+                    JSON_EXTRACT_INT64_UDF_NAME | "json_get_int" => DataType::Int64,
+                    JSON_EXTRACT_FLOAT64_UDF_NAME | "json_get_float" => DataType::Float64,
+                    JSON_EXTRACT_BOOLEAN_UDF_NAME | "json_get_bool" => DataType::Boolean,
+                    JSON_EXTRACT_UTF8_UDF_NAME => DataType::Utf8,
+                    JSON_EXTRACT_LARGE_BINARY_UDF_NAME => DataType::LargeBinary,
+                    // json_get_string returns decoded string contents while typed Utf8
+                    // JSONPath extraction preserves serialized JSON text.
+                    _ => return None,
+                };
+                if self.target_type.as_ref() != Some(&reference_type) {
+                    return None;
+                }
+
+                let normalized_path = if udf.name().starts_with("json_get") {
+                    let mut chars = path.chars();
+                    let first = chars.next()?;
+                    if !(first == '_' || first.is_ascii_alphabetic())
+                        || !chars
+                            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+                    {
+                        return None;
+                    }
+                    format!("$.{path}")
+                } else {
+                    normalize_json_path(path).ok()?
+                };
+                let indexed_path = normalize_json_path(&self.path).ok()?;
+                (normalized_path == indexed_path).then_some(reference_type)
+            }
+        }
     }
 }
 
@@ -555,6 +608,7 @@ impl JsonIndexPlugin {
         path: String,
         target_type: DataType,
     ) -> Result<SendableRecordBatchStream> {
+        let path = normalize_json_path(&path).map_err(Error::from)?;
         let input = Arc::new(OneShotExec::new(data));
         let input_schema = input.schema();
         let value_column_idx = input_schema
@@ -595,39 +649,97 @@ impl JsonIndexPlugin {
         project.execute(0, ctx.task_ctx()).map_err(Into::into)
     }
 
-    /// Infer the target type from the first non-null JSONPath value.
+    /// Extract a JSONPath value and type tag while preserving row-location columns.
+    fn extract_json_with_type(
+        data: SendableRecordBatchStream,
+        path: String,
+    ) -> Result<SendableRecordBatchStream> {
+        let path = normalize_json_path(&path).map_err(Error::from)?;
+        let input = Arc::new(OneShotExec::new(data));
+        let input_schema = input.schema();
+        let value_column_idx = input_schema
+            .column_with_name(VALUE_COLUMN_NAME)
+            .expect_ok()?
+            .0;
+        let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(input_schema.fields().len());
+        exprs.push((
+            Arc::new(ScalarFunctionExpr::try_new(
+                Arc::new(json_extract_with_type_udf()),
+                vec![
+                    Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
+                    Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
+                ],
+                &input_schema,
+                Arc::new(ConfigOptions::default()),
+            )?) as Arc<dyn PhysicalExpr>,
+            "json_result".to_string(),
+        ));
+        for (column_idx, field) in input_schema.fields().iter().enumerate() {
+            if field.name() != VALUE_COLUMN_NAME {
+                exprs.push((
+                    Arc::new(Column::new(field.name(), column_idx)) as Arc<dyn PhysicalExpr>,
+                    field.name().clone(),
+                ));
+            }
+        }
+
+        let project = ProjectionExec::try_new(exprs, input)?;
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        project.execute(0, ctx.task_ctx()).map_err(Into::into)
+    }
+
+    fn infer_type_from_batch(batch: &RecordBatch, path: &str) -> Result<Option<DataType>> {
+        let json_result = batch
+            .column_by_name("json_result")
+            .ok_or_else(|| Error::invalid_input_source("Missing json_result column".into()))?
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::invalid_input_source("json_result is not a struct".into()))?;
+        let type_array = json_result
+            .column_by_name("type_tag")
+            .ok_or_else(|| Error::invalid_input_source("Missing type_tag column".into()))?
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .ok_or_else(|| Error::invalid_input_source("type_tag is not UInt8".into()))?;
+
+        for type_tag in type_array.iter().flatten() {
+            let jsonb_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("JSONPath '{path}' produced invalid type tag {type_tag}").into(),
+                )
+            })?;
+            let data_type = match jsonb_type {
+                JsonbType::Null => continue,
+                JsonbType::Boolean => DataType::Boolean,
+                JsonbType::Int64 => DataType::Int64,
+                JsonbType::Float64 => DataType::Float64,
+                JsonbType::String => DataType::Utf8,
+                JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
+            };
+            return Ok(Some(data_type));
+        }
+        Ok(None)
+    }
+
+    /// Infer the target type from compact extracted values.
     ///
-    /// Only the raw input prefix needed for inference is buffered. The returned
-    /// stream still contains the original JSON column so typed evaluation happens
-    /// exactly once, through [`Self::extract_json_typed`].
+    /// Only extracted values and row locations are buffered until the first
+    /// non-null value is found. Large unrelated JSON fields are released as each
+    /// input batch is evaluated, and the JSONPath is evaluated only once.
     async fn infer_json_type(
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         path: String,
     ) -> Result<(SendableRecordBatchStream, DataType)> {
-        let schema = data.schema();
+        let path = normalize_json_path(&path).map_err(Error::from)?;
+        let mut extracted = Self::extract_json_with_type(data, path.clone())?;
+        let schema = extracted.schema();
         let mut buffered_batches = Vec::new();
         let mut inferred_type = None;
 
-        while let Some(batch_result) = data.next().await {
+        while let Some(batch_result) = extracted.next().await {
             let batch = batch_result?;
-            let values = batch
-                .column_by_name(VALUE_COLUMN_NAME)
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Missing JSON index value column '{VALUE_COLUMN_NAME}'").into(),
-                    )
-                })?
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!(
-                            "JSON index value column '{VALUE_COLUMN_NAME}' must be LargeBinary"
-                        )
-                        .into(),
-                    )
-                })?;
-            inferred_type = infer_json_extract_type(values, &path).map_err(Error::from)?;
+            inferred_type = Self::infer_type_from_batch(&batch, &path)?;
             buffered_batches.push(batch);
             if inferred_type.is_some() {
                 break;
@@ -636,10 +748,228 @@ impl JsonIndexPlugin {
 
         let inferred_type = inferred_type.unwrap_or(DataType::Utf8);
         let buffered = futures::stream::iter(buffered_batches.into_iter().map(Ok));
-        let recreated_stream = Box::pin(RecordBatchStreamAdapter::new(schema, buffered.chain(data)))
-            as SendableRecordBatchStream;
+        let recreated_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            buffered.chain(extracted),
+        )) as SendableRecordBatchStream;
 
         Ok((recreated_stream, inferred_type))
+    }
+
+    fn validate_json_types(
+        values: &LargeBinaryArray,
+        type_tags: &UInt8Array,
+        target_type: &DataType,
+        path: &str,
+    ) -> Result<()> {
+        for index in 0..values.len() {
+            if values.is_null(index) {
+                continue;
+            }
+            if type_tags.is_null(index) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "JSONPath '{path}' has a value at batch row {index} without a type tag"
+                    )
+                    .into(),
+                ));
+            }
+            let type_tag = type_tags.value(index);
+            let actual_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "JSONPath '{path}' produced invalid type tag {type_tag} at batch row {index}"
+                    )
+                    .into(),
+                )
+            })?;
+            if actual_type == JsonbType::Null {
+                continue;
+            }
+            let is_compatible = match target_type {
+                DataType::Boolean => actual_type == JsonbType::Boolean,
+                DataType::Int64 => actual_type == JsonbType::Int64,
+                DataType::Float64 => {
+                    matches!(actual_type, JsonbType::Int64 | JsonbType::Float64)
+                }
+                DataType::Utf8 => actual_type == JsonbType::String,
+                DataType::LargeBinary => {
+                    matches!(actual_type, JsonbType::Array | JsonbType::Object)
+                }
+                _ => false,
+            };
+            if !is_compatible {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "JSONPath '{path}' expected {target_type:?}, but batch row {index} has JSON type {actual_type:?}"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn convert_extracted_batch(
+        batch: RecordBatch,
+        output_schema: Arc<Schema>,
+        passthrough_indices: &[usize],
+        target_type: &DataType,
+        path: &str,
+    ) -> Result<RecordBatch> {
+        let json_result = batch
+            .column_by_name("json_result")
+            .ok_or_else(|| Error::invalid_input_source("Missing json_result column".into()))?
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::invalid_input_source("json_result is not a struct".into()))?;
+        let values = json_result
+            .column_by_name("value")
+            .ok_or_else(|| Error::invalid_input_source("Missing value column".into()))?
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::invalid_input_source("value is not LargeBinary".into()))?;
+        let type_tags = json_result
+            .column_by_name("type_tag")
+            .ok_or_else(|| Error::invalid_input_source("Missing type_tag column".into()))?
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .ok_or_else(|| Error::invalid_input_source("type_tag is not UInt8".into()))?;
+
+        Self::validate_json_types(values, type_tags, target_type, path)?;
+        let is_null = |index| {
+            values.is_null(index)
+                || (!type_tags.is_null(index) && type_tags.value(index) == JsonbType::Null.as_u8())
+        };
+        let converted: Arc<dyn Array> = match target_type {
+            DataType::Boolean => {
+                let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(values.len());
+                for index in 0..values.len() {
+                    if is_null(index) {
+                        builder.append_null();
+                    } else {
+                        let raw = jsonb::RawJsonb::new(values.value(index));
+                        let value = jsonb::from_raw_jsonb::<bool>(&raw).map_err(|error| {
+                            Error::invalid_input_source(
+                                format!(
+                                    "Failed to convert JSONPath '{path}' at batch row {index} to Boolean: {error}"
+                                )
+                                .into(),
+                            )
+                        })?;
+                        builder.append_value(value);
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Int64 => {
+                let mut builder = arrow_array::builder::Int64Builder::with_capacity(values.len());
+                for index in 0..values.len() {
+                    if is_null(index) {
+                        builder.append_null();
+                    } else {
+                        let raw = jsonb::RawJsonb::new(values.value(index));
+                        let value = jsonb::from_raw_jsonb::<i64>(&raw).map_err(|error| {
+                            Error::invalid_input_source(
+                                format!(
+                                    "Failed to convert JSONPath '{path}' at batch row {index} to Int64: {error}"
+                                )
+                                .into(),
+                            )
+                        })?;
+                        builder.append_value(value);
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Float64 => {
+                let mut builder = arrow_array::builder::Float64Builder::with_capacity(values.len());
+                for index in 0..values.len() {
+                    if is_null(index) {
+                        builder.append_null();
+                    } else {
+                        let raw = jsonb::RawJsonb::new(values.value(index));
+                        let value = jsonb::from_raw_jsonb::<f64>(&raw).map_err(|error| {
+                            Error::invalid_input_source(
+                                format!(
+                                    "Failed to convert JSONPath '{path}' at batch row {index} to Float64: {error}"
+                                )
+                                .into(),
+                            )
+                        })?;
+                        builder.append_value(value);
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Utf8 => {
+                let mut builder =
+                    arrow_array::builder::StringBuilder::with_capacity(values.len(), 1024);
+                for index in 0..values.len() {
+                    if is_null(index) {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(jsonb::RawJsonb::new(values.value(index)).to_string());
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(
+                (0..values.len()).map(|index| (!is_null(index)).then(|| values.value(index))),
+            )),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!("Unsupported JSON index target type: {target_type:?}").into(),
+                ));
+            }
+        };
+
+        let mut columns = Vec::with_capacity(output_schema.fields().len());
+        columns.push(converted);
+        columns.extend(
+            passthrough_indices
+                .iter()
+                .map(|column_idx| batch.column(*column_idx).clone()),
+        );
+        Ok(RecordBatch::try_new(output_schema, columns)?)
+    }
+
+    fn convert_extracted_stream(
+        data: SendableRecordBatchStream,
+        target_type: DataType,
+        path: String,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_schema = data.schema();
+        let passthrough_indices = input_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(column_idx, field)| (field.name() != "json_result").then_some(column_idx))
+            .collect::<Vec<_>>();
+        let output_schema = Arc::new(Schema::new(
+            std::iter::once(Field::new(VALUE_COLUMN_NAME, target_type.clone(), true))
+                .chain(
+                    passthrough_indices
+                        .iter()
+                        .map(|column_idx| input_schema.field(*column_idx).clone()),
+                )
+                .collect::<Vec<_>>(),
+        ));
+        let stream_schema = output_schema.clone();
+        let converted = data.map(move |batch_result| {
+            Self::convert_extracted_batch(
+                batch_result?,
+                output_schema.clone(),
+                &passthrough_indices,
+                &target_type,
+                &path,
+            )
+            .map_err(DataFusionError::from)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            stream_schema,
+            converted,
+        )))
     }
 
     /// Sort a value stream and its row-location columns ascending by value.
@@ -685,8 +1015,11 @@ impl BasicTrainer for JsonIndexPlugin {
             ));
         }
 
-        let mut params = serde_json::from_str::<JsonIndexParameters>(params)?;
-        params.path = normalize_json_path(&params.path).map_err(Error::from)?;
+        let params = serde_json::from_str::<JsonIndexParameters>(params)?;
+        // Validate the path now, but preserve its spelling in persisted metadata.
+        // Released readers compare direct-key paths literally, while current
+        // extraction and routing normalize them at their internal boundaries.
+        normalize_json_path(&params.path).map_err(Error::from)?;
         // Initial builds infer the type from the data. Derived rebuild parameters
         // carry the learned type so every new segment uses the same target schema.
         let target_type = params
@@ -721,18 +1054,17 @@ impl BasicTrainer for JsonIndexPlugin {
             .unwrap();
         let path = request.parameters.path.clone();
 
-        let (data_stream, target_type) =
+        let (converted_stream, target_type) =
             if let Some(target_data_type) = request.parameters.target_data_type {
-                (data, DataType::from(target_data_type))
+                let target_type = DataType::from(target_data_type);
+                let converted = Self::extract_json_typed(data, path.clone(), target_type.clone())?;
+                (converted, target_type)
             } else {
-                Self::infer_json_type(data, path.clone()).await?
+                let (extracted, target_type) = Self::infer_json_type(data, path.clone()).await?;
+                let converted =
+                    Self::convert_extracted_stream(extracted, target_type.clone(), path.clone())?;
+                (converted, target_type)
             };
-
-        // Initial builds use the inferred type; rebuilds use the learned target
-        // type carried in the derived parameters. Both paths evaluate index keys
-        // with the same typed UDF that the scan planner embeds in predicates.
-        let converted_stream =
-            Self::extract_json_typed(data_stream, path.clone(), target_type.clone())?;
 
         // `JsonTrainingRequest::criteria()` asked the scanner for unordered input (see
         // its constructor), since the scanner can only sort on the raw JSON column, not
@@ -784,7 +1116,7 @@ impl BasicTrainer for JsonIndexPlugin {
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
-            index_version: JSON_INDEX_VERSION,
+            index_version: index_version_for_target_type(&target_type),
             files: target_index.files,
         })
     }
@@ -822,18 +1154,24 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let registry = self.registry().ok()?;
         let json_details =
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
-        if json_details.conversion.as_deref()? != JSON_INDEX_CONVERSION {
-            return None;
-        }
-        let target_type = parse_json_target_type(json_details.target_data_type.as_deref()?)?;
         let target_details = json_details.target_details.as_ref()?;
         let target_plugin = registry.get_plugin_by_details(target_details).ok()?;
         let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
-        Some(Box::new(JsonQueryParser::new(
-            json_details.path.clone(),
-            target_type,
-            target_parser,
-        )) as Box<dyn ScalarQueryParser>)
+        let parser = match (
+            json_details.target_data_type.as_deref(),
+            json_details.conversion.as_deref(),
+        ) {
+            (None, None) => JsonQueryParser::new_legacy(json_details.path.clone(), target_parser),
+            (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => {
+                JsonQueryParser::new(
+                    json_details.path.clone(),
+                    parse_json_target_type(data_type)?,
+                    target_parser,
+                )
+            }
+            _ => return None,
+        };
+        Some(Box::new(parser) as Box<dyn ScalarQueryParser>)
     }
 
     async fn load_index(
@@ -854,22 +1192,14 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             json_details.target_data_type.as_deref(),
             json_details.conversion.as_deref(),
         ) {
-            (None, None) => (
-                target_index.training_data_type().ok_or_else(|| {
-                    Error::not_supported(format!(
-                        "Legacy JSON index path '{}' does not record its target data type",
-                        json_details.path
-                    ))
-                })?,
-                JsonIndexConversion::LegacyV0,
-            ),
+            (None, None) => (None, JsonIndexConversion::LegacyV0),
             (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => (
-                parse_json_target_type(data_type).ok_or_else(|| {
+                Some(parse_json_target_type(data_type).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "JSON index path '{}' has unsupported target data type '{data_type}'",
                         json_details.path
                     ))
-                })?,
+                })?),
                 JsonIndexConversion::TypedV1,
             ),
             (Some(_), Some(conversion)) => {
@@ -886,12 +1216,14 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             }
         };
         let index = match conversion {
-            JsonIndexConversion::LegacyV0 => {
-                JsonIndex::new_legacy(target_index, json_details.path, target_type)
-            }
-            JsonIndexConversion::TypedV1 => {
-                JsonIndex::new(target_index, json_details.path, target_type)
-            }
+            JsonIndexConversion::LegacyV0 => JsonIndex::new_legacy(target_index, json_details.path),
+            JsonIndexConversion::TypedV1 => JsonIndex::new(
+                target_index,
+                json_details.path,
+                target_type.ok_or_else(|| {
+                    Error::internal("Version-1 JSON index is missing its target type")
+                })?,
+            ),
         };
         Ok(Arc::new(index))
     }
@@ -920,8 +1252,10 @@ mod tests {
     use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::DataFusionError;
+    use datafusion_expr::{col, expr::ScalarFunction, lit};
     use futures::stream;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
+    use lance_datafusion::udf::json::{json_extract_udf, json_get_int_udf};
     use lance_select::RowAddrTreeMap;
     use rstest::rstest;
     use std::ops::Bound;
@@ -1063,6 +1397,45 @@ mod tests {
         assert_eq!(inferred_type, DataType::Utf8);
     }
 
+    #[tokio::test]
+    async fn test_sparse_type_inference_releases_raw_json_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let mut weak_values = Vec::new();
+        let mut batches = Vec::new();
+        for row_id in 0..3 {
+            let document = format!(r#"{{"other":"{}"}}"#, "x".repeat(64 * 1024));
+            let encoded = document.parse::<jsonb::OwnedJsonb>().unwrap().to_vec();
+            let values: ArrayRef =
+                Arc::new(LargeBinaryArray::from_iter_values([encoded.as_slice()]));
+            weak_values.push(Arc::downgrade(&values));
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![values, Arc::new(UInt64Array::from(vec![row_id]))],
+                )
+                .unwrap(),
+            );
+        }
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+
+        let (_extracted, inferred_type) =
+            JsonIndexPlugin::infer_json_type(data, "$.missing".to_string())
+                .await
+                .unwrap();
+
+        assert_eq!(inferred_type, DataType::Utf8);
+        assert!(
+            weak_values.iter().all(|values| values.upgrade().is_none()),
+            "inference should retain only compact extracted values"
+        );
+    }
+
     /// Trains a JSON-path index of `target_index_type` over `json_docs` (fed to the
     /// trainer in exactly the given order, with row ids `0..json_docs.len()`) and
     /// returns the loaded index. `store` is a caller-owned `LanceIndexStore` so the
@@ -1151,25 +1524,28 @@ mod tests {
         (store, tmpdir)
     }
 
-    async fn load_legacy_utf8_json_index(store: Arc<dyn IndexStore>) -> Arc<dyn ScalarIndex> {
+    async fn load_legacy_utf8_json_index(
+        store: Arc<dyn IndexStore>,
+        target_index_type: &str,
+    ) -> Arc<dyn ScalarIndex> {
         let registry = IndexPluginRegistry::with_default_plugins();
-        let target_plugin = registry.get_plugin_by_name("btree").unwrap();
+        let target_plugin = registry.get_plugin_by_name(target_index_type).unwrap();
         let target_trainer = target_plugin.basic_trainer().unwrap();
         let target_request = target_trainer
             .new_training_request("{}", &Field::new("", DataType::Utf8, true))
             .unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["foo"])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
-            ],
-        )
-        .unwrap();
+        let mut fields = vec![Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true)];
+        let mut columns = vec![Arc::new(StringArray::from(vec!["foo"])) as ArrayRef];
+        if target_request.criteria().needs_row_ids {
+            fields.push(Field::new(ROW_ID, DataType::UInt64, false));
+            columns.push(Arc::new(UInt64Array::from(vec![0])) as ArrayRef);
+        }
+        if target_request.criteria().needs_row_addrs {
+            fields.push(Field::new(ROW_ADDR, DataType::UInt64, false));
+            columns.push(Arc::new(UInt64Array::from(vec![0])) as ArrayRef);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::iter([Ok(batch)]),
@@ -1190,6 +1566,56 @@ mod tests {
             .load_index(store, &legacy_details, None, &LanceCache::no_cache())
             .await
             .unwrap()
+    }
+
+    #[rstest]
+    #[case::zonemap("zonemap")]
+    #[case::fm("fm")]
+    #[tokio::test]
+    async fn test_legacy_json_index_loads_without_known_target_type(
+        #[case] target_index_type: &str,
+    ) {
+        let (store, _dir) = local_json_index_store();
+        let index = load_legacy_utf8_json_index(store, target_index_type).await;
+
+        assert_eq!(index.training_data_type(), None);
+        index.statistics().unwrap();
+    }
+
+    #[test]
+    fn test_legacy_json_query_parser_preserves_getter_routing() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let legacy_details = crate::pb::JsonIndexDetails {
+            path: "val".to_string(),
+            target_details: Some(
+                prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap(),
+            ),
+            target_data_type: None,
+            conversion: None,
+        };
+        let legacy_details = prost_types::Any::from_msg(&legacy_details).unwrap();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let parser = plugin
+            .new_query_parser("json_idx".to_string(), &legacy_details)
+            .expect("version-0 JSON indices should retain a query parser");
+
+        let getter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_get_int_udf()),
+            vec![col("json"), lit("val")],
+        ));
+        assert_eq!(
+            parser.is_valid_reference(&getter, &DataType::LargeBinary),
+            Some(DataType::Int64)
+        );
+
+        let json_extract = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_extract_udf()),
+            vec![col("json"), lit("val")],
+        ));
+        assert_eq!(
+            parser.is_valid_reference(&json_extract, &DataType::LargeBinary),
+            None
+        );
     }
 
     fn json_update_batch(json_docs: &[&str], row_ids: Vec<u64>) -> RecordBatch {
@@ -1229,7 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_json_index_maintenance_preserves_conversion() {
         let (source_store, _source_dir) = local_json_index_store();
-        let legacy = load_legacy_utf8_json_index(source_store).await;
+        let legacy = load_legacy_utf8_json_index(source_store, "btree").await;
 
         let (remap_store, _remap_dir) = local_json_index_store();
         let remapped_created = legacy
@@ -1456,7 +1882,7 @@ mod tests {
         assert_eq!(derived.index_type, "json");
         let parameters: JsonIndexParameters =
             serde_json::from_str(derived.params.as_deref().unwrap()).unwrap();
-        assert_eq!(parameters.path, "$.v");
+        assert_eq!(parameters.path, "v");
         assert_eq!(parameters.target_index_type, "btree");
         assert!(parameters.target_index_parameters.is_some());
         assert_eq!(
