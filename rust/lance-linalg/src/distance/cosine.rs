@@ -1480,7 +1480,13 @@ mod tests {
 
     /// A mismatch has to stop at the boundary rather than reach a kernel that
     /// takes one length and reads both vectors with it. The lengths are 16 and 15
-    /// so the wider loops run instead of only a scalar remainder.
+    /// so a dispatch tier with wide loops enters one.
+    ///
+    /// Which construct reports the mismatch depends on the build. Where no SIMD
+    /// arm is compiled or dispatched, these calls reach `cosine_scalar` and
+    /// `dot` rejects the pair first with the same message: for f16 and bf16 that
+    /// is any build without `fp16kernels`, and for f32 and f64 any host below the
+    /// `Avx` tier.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
@@ -1512,11 +1518,8 @@ mod tests {
             assert!(message.contains("equal lengths"), "f64: {message}");
         }
 
-        // Both directions for f16 and bf16. With `fp16kernels` on, the kernels
-        // take `y.len()` and read `x` with it, so a short `x` is the operand that
-        // reads out of bounds and these two asserts are what stops it. Without
-        // the feature these arms reach `cosine_scalar`, where `dot` rejects the
-        // pair first and produces the same message.
+        // Both directions, because the kernels take `y.len()` and read `x` with
+        // it, so a short `x` is the operand that reads out of bounds.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
         let long_bf16 = [bf16::from_f32(1.0); 16];
