@@ -691,12 +691,14 @@ impl Writer {
     /// `column_metadata` must describe the buffers already persisted by the
     /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
     /// of rows in those buffers.
-    pub fn initialize_with_external_metadata(
+    pub(crate) fn initialize_with_external_metadata(
         &mut self,
-        schema: lance_core::datatypes::Schema,
+        mut schema: lance_core::datatypes::Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,
         rows_written: u64,
     ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.num_columns = column_metadata.len() as u32;
         self.column_metadata = column_metadata;
@@ -846,7 +848,7 @@ impl Writer {
     }
 
     /// Append a buffer whose metadata is supplied by the caller.
-    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         let start = self.tell().await?;
         self.writer.write_all(bytes).await?;
         Ok((start, bytes.len() as u64))
