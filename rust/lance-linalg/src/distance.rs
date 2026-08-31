@@ -649,6 +649,26 @@ mod tests {
         }
     }
 
+    /// An input that is both a length mismatch and a null query must behave the
+    /// same on all three metrics. It did not: `dot` asserted the dimension in its
+    /// public entry point as well as in the shared body, so it panicked there
+    /// while l2 and cosine returned the null error.
+    #[test]
+    fn test_arrow_batch_null_and_length_mismatch_agree() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None, Some(2)]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+                "{dt} did not report the null query, got: {err}"
+            );
+        }
+    }
+
     /// `Int8` is a valid vector element type elsewhere in the crate but has no
     /// multivector kernel, so it must be rejected for the type, not the metric.
     #[test]
