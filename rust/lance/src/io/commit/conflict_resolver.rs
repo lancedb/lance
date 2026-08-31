@@ -734,10 +734,16 @@ impl<'a> TransactionRebase<'a> {
                                 .iter()
                                 .any(|created_index| created_index.name == new_index.name)
                         });
+                    let has_uuid_conflict = new_indices.iter().any(|new_index| {
+                        created_indices
+                            .iter()
+                            .any(|created_index| created_index.uuid == new_index.uuid)
+                    });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
                         || has_regular_name_conflict
+                        || has_uuid_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -4189,7 +4195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_index_conflicts_only_on_same_name() {
+    fn test_create_index_conflicts_on_same_name_or_uuid() {
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
@@ -4231,7 +4237,18 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![IndexMetadata {
                     uuid: uuid::Uuid::new_v4(),
-                    ..index0
+                    ..index0.clone()
+                }],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let same_uuid = Transaction::new(
+            0,
+            Operation::CreateIndex {
+                new_indices: vec![IndexMetadata {
+                    name: "different_name".to_string(),
+                    ..index0.clone()
                 }],
                 removed_indices: vec![],
             },
@@ -4251,6 +4268,40 @@ mod tests {
             matches!(same_name_result, Err(Error::RetryableCommitConflict { .. })),
             "Expected retryable conflict for same-name CreateIndex, got {:?}",
             same_name_result
+        );
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: index0.uuid,
+                        name: index0.name.clone(),
+                        fields: index0.fields.clone(),
+                        covering_fields: index0.covering_fields.clone(),
+                        dataset_version: index0.dataset_version,
+                        fragment_bitmap: index0.fragment_bitmap.clone(),
+                        index_details: index0.index_details.clone(),
+                        index_version: index0.index_version,
+                        created_at: index0.created_at,
+                        base_id: index0.base_id,
+                        files: index0.files,
+                    }],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let same_uuid_result = rebase.check_txn(&same_uuid, 1);
+        assert!(
+            matches!(same_uuid_result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict for same-UUID CreateIndex, got {:?}",
+            same_uuid_result
         );
 
         let mut rebase = TransactionRebase {
@@ -4283,7 +4334,7 @@ mod tests {
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
             different_name_result.is_ok(),
-            "Expected compatibility for different-name CreateIndex, got {:?}",
+            "Expected compatibility for different-name and different-UUID CreateIndex, got {:?}",
             different_name_result
         );
     }
