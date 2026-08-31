@@ -12,8 +12,10 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
-use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type, Int8Type, UInt8Type};
+use arrow_array::{
+    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray, PrimitiveArray,
+};
 use arrow_schema::{ArrowError, DataType};
 
 pub mod cosine;
@@ -25,6 +27,24 @@ pub mod hamming;
 pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
+
+/// Widens an `Int8` query vector to `f32`, rejecting nulls.
+///
+/// The three `_arrow_batch` entry points take the query as a `&dyn Array` and
+/// widen an `Int8` one element at a time. A null element has no distance to
+/// compute, and the only alternative to an error here is a panic.
+fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
+    if query.null_count() > 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "query vector must not contain nulls, found {} in {} values",
+            query.null_count(),
+            query.len()
+        )));
+    }
+    Ok(Float32Array::from(
+        query.values().iter().map(|&v| v as f32).collect::<Vec<_>>(),
+    ))
+}
 
 #[inline]
 fn assert_equal_lengths(left_len: usize, right_len: usize) {
@@ -501,6 +521,7 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
     use half::f16;
+    use lance_arrow::FixedSizeListArrayExt;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -578,6 +599,39 @@ mod tests {
             matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
             "Float32 query with hamming must be rejected for the metric, got: {err}"
         );
+    }
+
+    /// The `_arrow_batch` entry points widen an `Int8` query element by element.
+    /// A null there used to reach an `unwrap`, so a query column with a null in
+    /// its values panicked instead of returning an error, on the metrics that
+    /// accept `Int8`.
+    #[test]
+    fn test_arrow_batch_rejects_null_int8_query() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+                "{dt} accepted a null Int8 query element, got: {err}"
+            );
+        }
+
+        // The same query without nulls goes through, so the guard is not
+        // rejecting every `Int8` query.
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![1_i8, 2]));
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            assert_eq!(
+                dt.arrow_batch_func()(query.as_ref(), &targets)
+                    .unwrap()
+                    .len(),
+                2,
+                "{dt} rejected a well-formed Int8 query"
+            );
+        }
     }
 
     /// `Int8` is a valid vector element type elsewhere in the crate but has no

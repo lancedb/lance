@@ -28,7 +28,7 @@ use crate::Result;
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
 use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
-use crate::distance::{assert_batch_layout, assert_equal_lengths};
+use crate::distance::{assert_batch_layout, assert_equal_lengths, int8_query_to_f32};
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
@@ -819,11 +819,7 @@ pub fn dot_distance_arrow_batch(
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::InvalidArgumentError(format!(
