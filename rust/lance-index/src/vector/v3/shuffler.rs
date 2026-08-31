@@ -85,7 +85,11 @@ pub trait ShuffleReader: Send + Sync {
                 start_partition_id
             ))
         })?;
-        let data = self.read_partition(start_partition_id).await?;
+        let data = if self.partition_size(start_partition_id)? == 0 {
+            None
+        } else {
+            self.read_partition(start_partition_id).await?
+        };
         Ok(ShufflePartitionWindow {
             partition_range: start_partition_id..end,
             partitions: vec![ShufflePartition {
