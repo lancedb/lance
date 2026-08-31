@@ -812,8 +812,7 @@ where
 ///
 /// # Panics
 ///
-/// Panics if the length of `from` is not equal to the dimension (value length)
-/// of `to`.
+/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
 pub fn dot_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
