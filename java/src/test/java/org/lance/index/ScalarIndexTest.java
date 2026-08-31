@@ -330,13 +330,17 @@ public class ScalarIndexTest {
 
     @Override
     public void stageStart(String stage, Optional<Long> total, String unit) {
+      // Intentionally empty: the cross-worker handoff is covered in stageProgress.
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      // stageProgress may resume on a different Tokio worker than stageStart. Reading the still-
+      // active outer Dataset here requires inherited callback context propagation.
       assertTrue(outerDataset.version() > 0);
       assertTrue(nestedDataset.version() > 0);
       readCompleted.set(true);
     }
-
-    @Override
-    public void stageProgress(String stage, long completed) {}
 
     @Override
     public void stageComplete(String stage) {}
@@ -1000,7 +1004,9 @@ public class ScalarIndexTest {
         assertFalse(outerCreate.isAlive(), "Outer create timed out");
         assertNull(createFailure.get(), "Outer create failed");
         assertTrue(outerProgress.nestedCompleted.get(), "Nested create did not complete");
-        assertTrue(nestedProgress.readCompleted.get(), "Nested callback read did not complete");
+        assertTrue(
+            nestedProgress.readCompleted.get(),
+            "Nested stageProgress callback read did not complete");
 
         Thread queuedWriter = outerProgress.writer.get();
         assertNotNull(queuedWriter, "Queued writer did not start");
