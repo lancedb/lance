@@ -725,7 +725,7 @@ mod tests {
         assert!(RowIdIndex::new(&[small]).unwrap().merged.is_some());
 
         // Past the row budget, with one fragment covering any id.
-        let wide = fragment(1, sparse_sequence(2 * MERGE_ROWS_BUDGET));
+        let wide = fragment(1, sparse_sequence(MERGE_ROWS_BUDGET + 1));
         let index = RowIdIndex::new(&[wide]).unwrap();
         assert!(index.merged.is_none());
         assert_eq!(
@@ -736,10 +736,14 @@ mod tests {
 
     #[test]
     fn test_deep_overlap_merges_however_many_rows_it_reads() {
-        let deep: Vec<FragmentRowIdIndex> = (0..MAX_PROBE_DEPTH as u32 + 1)
+        // Just past the row budget in total, interleaved so every fragment
+        // covers every id: the depth alone forces the merged build.
+        let fragments = MAX_PROBE_DEPTH + 1;
+        let rows_per_fragment = MERGE_ROWS_BUDGET / fragments + 1;
+        let deep: Vec<FragmentRowIdIndex> = (0..fragments as u32)
             .map(|id| {
-                let ids: Vec<u64> = (0..MERGE_ROWS_BUDGET)
-                    .map(|value| value * (MAX_PROBE_DEPTH + 1) + id as u64)
+                let ids: Vec<u64> = (0..rows_per_fragment)
+                    .map(|value| value * fragments + id as u64)
                     .collect();
                 fragment(id, RowIdSequence(vec![U64Segment::SortedArray(ids.into())]))
             })
