@@ -134,6 +134,14 @@ impl FlatIndex {
         NullableRowAddrSet::new(self.all_addrs_map.clone(), Default::default())
     }
 
+    /// Return every non-null row as TRUE without preserving NULL rows.
+    pub fn all_non_null(&self) -> NullableRowAddrSet {
+        NullableRowAddrSet::new(
+            self.all_addrs_map.clone() - &self.null_addrs_map,
+            Default::default(),
+        )
+    }
+
     pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
         let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
         let val_idx_and_new_id = row_ids
@@ -176,6 +184,7 @@ impl FlatIndex {
     pub fn search(
         &self,
         query: &dyn AnyQuery,
+        track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         metrics.record_comparisons(self.data.num_rows());
@@ -189,10 +198,11 @@ impl FlatIndex {
             SargableQuery::Equals(value) => {
                 if value.is_null() {
                     // if we have x = NULL then the correct SQL behavior is to return all NULLs
-                    return Ok(NullableRowAddrSet::new(
-                        Default::default(),
-                        self.all_addrs_map.clone(),
-                    ));
+                    return Ok(if track_nulls {
+                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                    } else {
+                        NullableRowAddrSet::empty()
+                    });
                 }
             }
             // x IS NULL we can use pre-computed nulls
@@ -212,19 +222,21 @@ impl FlatIndex {
                 }
                 (Bound::Unbounded, Bound::Included(upper) | Bound::Excluded(upper)) => {
                     if upper.is_null() {
-                        return Ok(NullableRowAddrSet::new(
-                            Default::default(),
-                            self.all_addrs_map.clone(),
-                        ));
+                        return Ok(if track_nulls {
+                            NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                        } else {
+                            NullableRowAddrSet::empty()
+                        });
                     }
                 }
                 (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded)
                     if lower.is_null() =>
                 {
-                    return Ok(NullableRowAddrSet::new(
-                        Default::default(),
-                        self.all_addrs_map.clone(),
-                    ));
+                    return Ok(if track_nulls {
+                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
+                    } else {
+                        NullableRowAddrSet::empty()
+                    });
                 }
                 _ => {}
             },
@@ -234,7 +246,7 @@ impl FlatIndex {
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
         let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
-        self.eval_expr(&expr)
+        self.eval_expr(&expr, track_nulls)
     }
 
     /// Evaluate a predicate compiled once by the caller. Lets a large IsIn that
@@ -243,20 +255,24 @@ impl FlatIndex {
     pub fn search_prebuilt(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
+        track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         metrics.record_comparisons(self.data.num_rows());
-        self.eval_expr(expr)
+        self.eval_expr(expr, track_nulls)
     }
 
-    fn eval_expr(&self, expr: &Arc<dyn PhysicalExpr>) -> Result<NullableRowAddrSet> {
+    fn eval_expr(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        track_nulls: bool,
+    ) -> Result<NullableRowAddrSet> {
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("Predicate should return boolean array");
-        let nulls = arrow::compute::is_null(&predicate)?;
 
         let matching_ids = arrow_select::filter::filter(self.ids(), predicate)?;
         let matching_ids = matching_ids
@@ -265,6 +281,11 @@ impl FlatIndex {
             .expect("Result of arrow_select::filter::filter did not match input type");
         let selected = RowAddrTreeMap::from_sorted_iter(matching_ids.values().iter().copied())?;
 
+        if !track_nulls {
+            return Ok(NullableRowAddrSet::new(selected, Default::default()));
+        }
+
+        let nulls = arrow::compute::is_null(&predicate)?;
         let null_row_ids = arrow_select::filter::filter(self.ids(), &nulls)?;
         let null_row_ids = null_row_ids
             .as_any()
@@ -364,7 +385,7 @@ mod tests {
 
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
-        let actual = index.search(query, &NoOpMetricsCollector).unwrap();
+        let actual = index.search(query, true, &NoOpMetricsCollector).unwrap();
         let expected =
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(expected), Default::default());
         assert_eq!(actual, expected);
@@ -537,7 +558,7 @@ mod tests {
         let index = FlatIndex::try_new(batch).unwrap();
 
         let check = |query: SargableQuery, true_ids: &[u64], null_ids: &[u64]| {
-            let actual = index.search(&query, &NoOpMetricsCollector).unwrap();
+            let actual = index.search(&query, true, &NoOpMetricsCollector).unwrap();
             let expected = NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(true_ids),
                 RowAddrTreeMap::from_iter(null_ids),
@@ -596,6 +617,82 @@ mod tests {
             SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(null)),
             &[],
             &[0, 1, 2],
+        );
+    }
+
+    /// Row addresses pack `(fragment_id << 32) | offset`, so a page spanning
+    /// several fragments must report exactly those fragments, deduped and
+    /// sorted. Every other test in this module uses offsets inside fragment 0,
+    /// which never exercises the shift.
+    #[test]
+    fn test_calculate_included_frags_spans_fragments() {
+        let addr = |frag: u32, offset: u32| u64::from(RowAddress::new_from_parts(frag, offset));
+        let batch = record_batch!(
+            (
+                BTREE_VALUES_COLUMN,
+                Int32,
+                [Some(1), Some(2), Some(3), Some(4)]
+            ),
+            (
+                BTREE_IDS_COLUMN,
+                UInt64,
+                [addr(0, 0), addr(2, 7), addr(0, 1), addr(5, 3)]
+            )
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        assert_eq!(
+            index.calculate_included_frags().unwrap(),
+            RoaringBitmap::from_iter([0u32, 2, 5])
+        );
+
+        // A hit still carries the full 64-bit address, not a bare offset.
+        let hit = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::from(2)),
+                true,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(
+            hit,
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[addr(2, 7)]), Default::default())
+        );
+    }
+
+    /// A zero-row page has to answer queries with empty sets rather than
+    /// panicking inside the Arrow predicate evaluation. The roundtrip test
+    /// builds an empty index but never queries one. Both `track_nulls` modes
+    /// take different shortcuts, and neither has any row to return here.
+    #[test]
+    fn test_empty_index_answers_queries_with_empty_sets() {
+        let empty = RecordBatch::new_empty(example_index().data.schema());
+        let index = FlatIndex::try_new(empty).unwrap();
+        let nothing = NullableRowAddrSet::new(RowAddrTreeMap::new(), RowAddrTreeMap::new());
+
+        for query in [
+            SargableQuery::Equals(ScalarValue::from(10)),
+            SargableQuery::Equals(ScalarValue::Int32(None)),
+            SargableQuery::IsNull(),
+            SargableQuery::IsIn(vec![ScalarValue::from(10), ScalarValue::from(20)]),
+            SargableQuery::Range(Bound::Unbounded, Bound::Unbounded),
+        ] {
+            for track_nulls in [true, false] {
+                assert_eq!(
+                    index
+                        .search(&query, track_nulls, &NoOpMetricsCollector)
+                        .unwrap(),
+                    nothing,
+                    "query: {query:?}, track_nulls: {track_nulls}"
+                );
+            }
+        }
+
+        assert!(index.all().true_rows().is_empty());
+        assert_eq!(
+            index.calculate_included_frags().unwrap(),
+            RoaringBitmap::new()
         );
     }
 }

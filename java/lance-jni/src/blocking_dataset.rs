@@ -121,6 +121,9 @@ impl BlockingDataset {
                 ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
                     .await
                     .map_err(|e| Error::io_error(e.to_string()))?;
+            lance::dataset::validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| Error::input_error(e.to_string()))?;
             object_store
                 .remove_dir_all(path)
                 .await
@@ -1652,7 +1655,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentStatistics<'a>(
     ok_or_throw!(env, inner_get_fragment_statistics(&mut env, jdataset))
 }
 
-/// Returns per-fragment statistics flattened as [id0, rowCount0, dataFileNum0, id1, ...].
+/// Returns per-fragment statistics in their final Java primitive arrays.
 ///
 /// Row count semantics match Java `FragmentMetadata.getNumRows()`:
 /// physical rows minus deleted rows, with absent values treated as 0.
@@ -1661,28 +1664,51 @@ fn inner_get_fragment_statistics<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
 ) -> Result<JObject<'local>> {
-    let stats: Vec<i64> = {
+    let fragments = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        let fragments = dataset.inner.get_fragments();
-        let mut stats = Vec::with_capacity(fragments.len() * 3);
-        for f in fragments.iter() {
-            let meta = f.metadata();
-            let physical_rows = meta.physical_rows.unwrap_or(0) as i64;
-            let deleted_rows = meta
-                .deletion_file
-                .as_ref()
-                .and_then(|d| d.num_deleted_rows)
-                .unwrap_or(0) as i64;
-            stats.push(f.id() as i64);
-            stats.push(physical_rows - deleted_rows);
-            stats.push(meta.files.len() as i64);
-        }
-        stats
+        dataset.inner.fragments().clone()
     };
-    let jarray = env.new_long_array(stats.len() as i32)?;
-    env.set_long_array_region(&jarray, 0, &stats)?;
-    Ok(jarray.into())
+    let fragment_count = i32::try_from(fragments.len()).map_err(|_| {
+        Error::runtime_error(format!(
+            "Fragment statistics contain {} fragments, exceeding the Java array limit of {}",
+            fragments.len(),
+            i32::MAX
+        ))
+    })?;
+    let ids = env.new_int_array(fragment_count)?;
+    let row_counts = env.new_long_array(fragment_count)?;
+    let data_file_nums = env.new_int_array(fragment_count)?;
+
+    let mut id_values = Vec::with_capacity(fragments.len());
+    let mut row_count_values = Vec::with_capacity(fragments.len());
+    let mut data_file_num_values = Vec::with_capacity(fragments.len());
+
+    for fragment in fragments.iter() {
+        let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
+        let deleted_rows = fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion_file| deletion_file.num_deleted_rows)
+            .unwrap_or(0) as i64;
+        id_values.push(fragment.id as i32);
+        row_count_values.push(physical_rows - deleted_rows);
+        data_file_num_values.push(fragment.files.len() as i32);
+    }
+
+    env.set_int_array_region(&ids, 0, &id_values)?;
+    env.set_long_array_region(&row_counts, 0, &row_count_values)?;
+    env.set_int_array_region(&data_file_nums, 0, &data_file_num_values)?;
+
+    Ok(env.new_object(
+        "org/lance/FragmentStatistics",
+        "([I[J[I)V",
+        &[
+            JValue::Object(&ids),
+            JValue::Object(&row_counts),
+            JValue::Object(&data_file_nums),
+        ],
+    )?)
 }
 
 #[unsafe(no_mangle)]
@@ -3332,6 +3358,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let excluded_fragment_ids = env
+        .call_method(
+            &java_options,
+            "getExcludedFragmentIds",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3348,6 +3382,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_fragments,
         &max_source_rows,
         &max_source_bytes,
+        &excluded_fragment_ids,
         config,
     )
 }

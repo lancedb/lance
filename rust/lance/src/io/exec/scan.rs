@@ -43,7 +43,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, buffered_fragment_opens};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -435,9 +435,11 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -449,9 +451,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -467,9 +469,11 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -481,9 +485,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)

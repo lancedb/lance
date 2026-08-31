@@ -9,6 +9,7 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_schema::{DataType, Field as ArrowField};
+use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -18,7 +19,9 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -123,6 +126,7 @@ pub async fn write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
@@ -150,6 +154,7 @@ pub async fn write_fragments(
         params,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await?;
     Ok((fragments, schema))
@@ -166,17 +171,50 @@ pub async fn write_fragments_direct(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
-    let buffered_reader = match version {
-        ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+    let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
+        if file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "File row counts must be greater than zero",
+            ));
+        }
+        match version {
+            ConcreteFileVersion::V1 => {
+                if params.max_rows_per_group == 0 {
+                    return Err(Error::invalid_input(
+                        "max_rows_per_group must be greater than zero when file row counts are specified",
+                    ));
+                }
+                let max_rows_per_group = params.max_rows_per_group;
+                let batch_row_counts =
+                    file_row_counts
+                        .clone()
+                        .into_iter()
+                        .flat_map(move |file_rows| {
+                            (0..file_rows)
+                                .step_by(max_rows_per_group)
+                                .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+                        });
+                chunk_stream_with_sizes(data, batch_row_counts)
+            }
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream_with_sizes(data, file_row_counts.clone()),
+        }
+    } else {
+        match version {
+            ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
+                .map_ok(|batch| vec![batch])
+                .boxed(),
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -197,6 +235,7 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await
 }
@@ -321,24 +360,6 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn validate_fragment_schema(
-    version: ConcreteFileVersion,
-    schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
-    match version {
-        ConcreteFileVersion::V1 => {
-            super::transaction::schema_fragments_legacy_valid(schema, fragments)
-        }
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => {
-            super::transaction::schema_fragments_modern_valid(schema, fragments)
-        }
-    }
 }
 
 pub async fn write_fragment(
@@ -713,6 +734,7 @@ pub(in crate::dataset) async fn filtered_read(
     fragments: Option<Arc<Vec<Fragment>>>,
     scan_range: Option<Range<u64>>,
     is_prefilter: bool,
+    session: Option<&dyn Session>,
 ) -> Result<PlannedFilteredScan> {
     match version {
         ConcreteFileVersion::V1 => {
@@ -739,6 +761,7 @@ pub(in crate::dataset) async fn filtered_read(
                     make_deletions_null,
                     fragments,
                     scan_range,
+                    session,
                 )
                 .await?;
             Ok(PlannedFilteredScan {

@@ -38,10 +38,11 @@ tracing.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = {version = "2.1", optional = true}
+protobuf-src = { workspace = true, optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
+rstest.workspace = true
 
 [features]
 datagen = ["dep:lance-datagen"]

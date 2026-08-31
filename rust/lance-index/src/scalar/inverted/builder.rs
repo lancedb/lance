@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
 
@@ -319,22 +320,36 @@ impl InvertedIndexBuilder {
                 if partition_builder.is_empty() {
                     continue;
                 }
-                match &mut merged {
-                    Some(merged) => {
-                        let would_exceed_memory = merged
+                match merged.take() {
+                    Some(mut accumulated) => {
+                        let would_exceed_memory = accumulated
                             .memory_size()
                             .saturating_add(partition_builder.memory_size())
                             >= memory_limit_bytes;
-                        let would_exceed_doc_ids = merged
+                        let would_exceed_doc_ids = accumulated
                             .docs
                             .len()
                             .saturating_add(partition_builder.docs.len())
                             > u32::MAX as usize;
                         if would_exceed_memory || would_exceed_doc_ids {
-                            let builder = std::mem::replace(merged, partition_builder);
-                            files.extend(self.write_new_partition(dest_store, builder).await?);
+                            merged = Some(partition_builder);
+                            files.extend(self.write_new_partition(dest_store, accumulated).await?);
                         } else {
-                            merged.merge_from(partition_builder)?;
+                            // `merge_from` remaps token ids into a unified
+                            // dictionary and concatenates posting lists across
+                            // builders holding up to LANCE_FTS_PARTITION_SIZE of
+                            // state, so it runs for seconds at a time. Inline it
+                            // would occupy a runtime worker for that whole span,
+                            // starving the tasks driving in-flight uploads; the
+                            // upload's whole-request timeout keeps running while
+                            // its task waits to be polled. The builder is moved
+                            // in and handed back so ownership survives the hop.
+                            accumulated = spawn_cpu(move || {
+                                accumulated.merge_from(partition_builder)?;
+                                Result::Ok(accumulated)
+                            })
+                            .await?;
+                            merged = Some(accumulated);
                         }
                     }
                     None => merged = Some(partition_builder),
@@ -1161,8 +1176,10 @@ impl InnerBuilder {
                 batch_rows,
             );
             let mut posting_lists = posting_lists.into_iter();
+            let mut encode_elapsed = Duration::ZERO;
             loop {
                 let docs_for_batches = docs_for_batches.clone();
+                let encode_started = Instant::now();
                 // Build the next batch on the CPU pool. The builder and the
                 // remaining posting lists are moved in and handed back so state
                 // persists across batches.
@@ -1187,6 +1204,7 @@ impl InnerBuilder {
                     Result::Ok((batch_builder, posting_lists, batch))
                 })
                 .await?;
+                encode_elapsed += encode_started.elapsed();
                 batch_builder = next_builder;
                 posting_lists = next_posting_lists;
 
@@ -1201,11 +1219,15 @@ impl InnerBuilder {
                 }
             }
 
-            Result::Ok(())
+            Result::Ok(encode_elapsed)
         });
 
+        let mut write_elapsed = Duration::ZERO;
         while let Ok(batch) = rx.recv().await {
-            if let Err(err) = writer.write_record_batch(batch).await {
+            let write_started = Instant::now();
+            let result = writer.write_record_batch(batch).await;
+            write_elapsed += write_started.elapsed();
+            if let Err(err) = result {
                 drop(rx);
                 // Wait for producer to stop; preserve the write error as the primary failure.
                 let _ = producer.await;
@@ -1213,8 +1235,21 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        producer.await??;
-        writer.finish().await
+        let encode_elapsed = producer.await??;
+        let finish_started = Instant::now();
+        let file = writer.finish().await?;
+        write_elapsed += finish_started.elapsed();
+
+        // Splits the cost of a partition write into the two halves that are
+        // otherwise indistinguishable from the outside, so a build that fails on
+        // an upload timeout shows whether encoding or the upload dominated.
+        log::info!(
+            "wrote posting lists of partition {}: {:.1?} encoding, {:.1?} writing",
+            id,
+            encode_elapsed,
+            write_elapsed
+        );
+        Ok(file)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2511,6 +2546,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CopyFailingObjectStore {
+        inner: InMemory,
+        copy_count: Arc<AtomicUsize>,
+    }
+
+    impl Display for CopyFailingObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyFailingObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyFailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            self.copy_count.fetch_add(1, Ordering::SeqCst);
+            Err(object_store::Error::Generic {
+                store: "CopyFailingObjectStore",
+                source: "native copy disabled in test".into(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_list_metadata_files_propagates_list_error() -> Result<()> {
         let mut object_store = ObjectStore::memory();
@@ -3058,6 +3164,99 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fts_remap_streams_files_when_native_copy_fails() -> Result<()> {
+        let copy_count = Arc::new(AtomicUsize::new(0));
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(CopyFailingObjectStore {
+            inner: InMemory::new(),
+            copy_count: copy_count.clone(),
+        });
+        let object_store = Arc::new(object_store);
+        let index_path = Path::from("index");
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_path.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        let probe_source = staged_partition_file_path(partitions[0], TOKENS_FILE);
+        let probe_source_size = base_store
+            .open_index_file(&probe_source)
+            .await?
+            .file_size_bytes()
+            .expect("written index file should report its size");
+        let copied = base_store
+            .copy_index_file_to(&probe_source, "probe.lance", base_store.as_ref())
+            .await?;
+        assert_eq!(copied.path, "probe.lance");
+        assert_eq!(copied.size_bytes, probe_source_size);
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "probe.lance").await?,
+            partitions[0]
+        );
+
+        let renamed = base_store
+            .rename_index_file("probe.lance", "renamed-probe.lance")
+            .await?;
+        assert_eq!(renamed.path, "renamed-probe.lance");
+        assert_eq!(renamed.size_bytes, probe_source_size);
+        assert!(base_store.open_index_file("probe.lance").await.is_err());
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "renamed-probe.lance").await?,
+            partitions[0]
+        );
+
+        let progress = Arc::new(RecordingProgress::default());
+        merge_index_files(object_store.as_ref(), &index_path, store, progress.clone()).await?;
+
+        let mut expected_partitions = partitions;
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;
+        }
+        let remap_progress = progress
+            .recorded_events()
+            .into_iter()
+            .filter_map(|(kind, stage, completed)| {
+                (kind == "progress" && stage == "remap_partition_files").then_some(completed)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remap_progress.last().copied(),
+            Some((expected_partitions.len() * PARTITION_FILE_SUFFIXES.len()) as u64)
+        );
+        assert_eq!(
+            copy_count.load(Ordering::SeqCst),
+            0,
+            "bulk index movement must not invoke native object-store copy"
+        );
 
         Ok(())
     }
@@ -4566,6 +4765,11 @@ mod tests {
         first.tokens.remap(&[1]);
         first.posting_lists.remove(1);
         assert_eq!(first.tokens.len(), first.posting_lists.len());
+
+        // Mimic a token set persisted by a writer from before #7115. Converting the
+        // loaded set for mutation must restore the dense token-id invariant.
+        first.tokens.next_id = 9;
+        first.tokens = std::mem::take(&mut first.tokens).into_mutable();
 
         // `second` contributes a brand-new token absent from `first`. Before the fix,
         // get_or_add returned the stale next_id, indexing past posting_lists.
