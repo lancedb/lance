@@ -1153,10 +1153,9 @@ mod tests {
     /// handed, then checks every value and every guard.
     ///
     /// 8 is the widest chunk store in the file, so one extra chunk iteration
-    /// lands inside this allocation rather than on unrelated memory. Two extra
-    /// iterations would still escape it. The remainder loops cannot trip the
-    /// guards at all: all three index through bounds-checked `results[..]` and
-    /// would panic instead.
+    /// lands inside this allocation rather than on unrelated memory. The
+    /// remainder loops cannot trip the guards at all: all three index through
+    /// bounds-checked `results[..]` and would panic instead.
     fn check_kernel_tail(n: usize, kernel: impl FnOnce(u64, &[u64], &mut [u32])) {
         const GUARD: u32 = u32::MAX;
         const GUARD_SLOTS: usize = 8;
@@ -1206,6 +1205,10 @@ mod tests {
     #[case::one_hundred_twenty_eight(128)]
     fn test_hamming_batch_u64(#[case] n: usize) {
         check_kernel_tail(n, hamming_batch_u64);
+        // Also directly, because on an x86_64 host with AVX2 the dispatcher never
+        // reaches the scalar kernel, and that is the host every Linux x86 job runs
+        // on.
+        check_kernel_tail(n, hamming_batch_scalar);
     }
 
     #[rstest]
