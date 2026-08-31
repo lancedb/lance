@@ -643,7 +643,11 @@ mod tests {
             let want =
                 dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
                     .unwrap();
-            assert_eq!(got.values(), want.values(), "{dt} mis-read a sliced query");
+            assert_eq!(
+                got.values(),
+                want.values(),
+                "{dt} did not follow the query slice"
+            );
         }
     }
 
