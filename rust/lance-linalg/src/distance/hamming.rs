@@ -1205,9 +1205,8 @@ mod tests {
     #[case::one_hundred_twenty_eight(128)]
     fn test_hamming_batch_u64(#[case] n: usize) {
         check_kernel_tail(n, hamming_batch_u64);
-        // Also directly, because on an x86_64 host with AVX2 the dispatcher never
-        // reaches the scalar kernel, and that is the host every Linux x86 job runs
-        // on.
+        // Also directly, because an x86_64 host with AVX2 takes an earlier branch
+        // and never reaches the scalar kernel through the dispatcher.
         check_kernel_tail(n, hamming_batch_scalar);
     }
 
@@ -1810,6 +1809,8 @@ mod tests {
     #[case::three(3)]
     #[case::four(4)]
     #[case::five(5)]
+    // Remainder 2 with a chunk ahead of it, which `two` alone does not reach.
+    #[case::six(6)]
     #[case::seven(7)]
     fn test_avx2_covers_tail(#[case] n: usize) {
         if !is_x86_feature_detected!("avx2") {
