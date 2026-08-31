@@ -855,8 +855,12 @@ def test_fragment_update_columns_with_offsets_rewrite_columns(tmp_path):
     updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
         update_data, left_on="id", with_offsets=True
     )
-    assert isinstance(matched_offsets, bytes)
-    assert len(matched_offsets) > 0
+    # Portable RoaringBitmap serialization of {1, 3}: ids 5 and 7 sit at those
+    # physical offsets within the second fragment.
+    assert matched_offsets == (
+        b"\x3a\x30\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00"
+        b"\x10\x00\x00\x00\x01\x00\x03\x00"
+    )
 
     op = LanceOperation.Update(
         updated_fragments=[updated_fragment],
@@ -901,7 +905,10 @@ def test_fragment_update_columns_no_match(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, with_offsets=True
+    )
+    assert matched_offsets == b"\x3a\x30\x00\x00\x00\x00\x00\x00"
 
     # Commit the changes
 

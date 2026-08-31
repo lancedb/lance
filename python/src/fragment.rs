@@ -43,6 +43,8 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
+type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
+
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
@@ -363,7 +365,8 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>, Vec<u8>)> {
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
         let mut fragment = self.fragment.clone();
         let result = rt()
             .spawn(None, async move {
@@ -373,11 +376,14 @@ impl FileFragment {
             })?
             .infer_error()?;
 
-        let mut matched_offsets = Vec::with_capacity(result.matched_offsets.serialized_size());
-        result
-            .matched_offsets
-            .serialize_into(&mut matched_offsets)
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let matched_offsets = with_offsets.then(|| {
+            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+            result
+                .matched_offsets
+                .serialize_into(&mut buf)
+                .expect("RoaringBitmap serialization cannot fail");
+            buf
+        });
         Ok((
             PyLance(result.fragment),
             result.fields_modified,

@@ -827,12 +827,35 @@ class LanceFragment(pa.dataset.Fragment):
         metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
         return metadata, schema
 
+    @overload
     def update_columns(
         self,
         data_obj: ReaderLike,
         left_on: str = "_rowid",
         right_on: Optional[str] = None,
         schema=None,
+        *,
+        with_offsets: Literal[False] = False,
+    ) -> Tuple[FragmentMetadata, List[int]]: ...
+
+    @overload
+    def update_columns(
+        self,
+        data_obj: ReaderLike,
+        left_on: str = "_rowid",
+        right_on: Optional[str] = None,
+        schema=None,
+        *,
+        with_offsets: Literal[True],
+    ) -> Tuple[FragmentMetadata, List[int], bytes]: ...
+
+    def update_columns(
+        self,
+        data_obj: ReaderLike,
+        left_on: str = "_rowid",
+        right_on: Optional[str] = None,
+        schema=None,
+        *,
         with_offsets: bool = False,
     ) -> Union[
         Tuple[FragmentMetadata, List[int]],
@@ -939,9 +962,9 @@ class LanceFragment(pa.dataset.Fragment):
 
         reader = _coerce_reader(data_obj, schema)
         metadata, fields_modified, matched_offsets = self._fragment.update_columns(
-            reader, left_on, right_on
+            reader, left_on, right_on, with_offsets
         )
-        if with_offsets:
+        if matched_offsets is not None:
             return metadata, fields_modified, matched_offsets
         return metadata, fields_modified
 
