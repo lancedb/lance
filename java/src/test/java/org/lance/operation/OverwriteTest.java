@@ -134,7 +134,7 @@ public class OverwriteTest extends OperationTestBase {
                 Collections.singletonMap("config_key", "config_value"),
                 committedOverwrite.configUpsertValues().orElseThrow());
             assertArrayEquals(
-                new int[] {4, 5},
+                new int[] {0, 1},
                 committedOverwrite.fragments().get(0).getFiles().get(0).getFields());
           }
         }

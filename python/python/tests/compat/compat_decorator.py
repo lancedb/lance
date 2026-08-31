@@ -130,8 +130,6 @@ LAST_BETA_RELEASE = last_beta_release()
 if LAST_BETA_RELEASE is not None:
     VERSIONS.append(LAST_BETA_RELEASE)
 
-STABLE_FIELD_IDS_MIN_READER_VERSION = Version("11.0.0b16")
-
 
 class UpgradeDowngradeTest:
     """Base class for compatibility tests.
@@ -155,8 +153,16 @@ class UpgradeDowngradeTest:
         """Return True to skip the old-version read after current-version writes."""
         return False
 
+    def expect_read_after_current_write_failure(self, version: str) -> bool:
+        """Return True when the old reader must reject current-version data."""
+        return False
+
     def skip_write_after_current_write(self, version: str) -> bool:
         """Return True to skip the old-version write after current-version writes."""
+        return False
+
+    def expect_write_after_current_write_failure(self, version: str) -> bool:
+        """Return True when the old writer must reject current-version data."""
         return False
 
     def skip_downgrade(self, version: str) -> bool:
@@ -173,13 +179,18 @@ class UpgradeDowngradeTest:
 
 
 class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
-    """Compatibility contract for datasets with stable field IDs enabled."""
+    """Compatibility contract for new datasets with stable field IDs."""
 
-    def skip_downgrade(self, version: str) -> bool:
-        # New datasets require the stable-field-ID reader feature. Versions
-        # released before the feature landed must fail closed instead of
-        # interpreting the dataset with reusable field identities.
-        return Version(version) < STABLE_FIELD_IDS_MIN_READER_VERSION
+    def expect_read_after_current_write_failure(self, version: str) -> bool:
+        # Every released version selected by this suite predates the reader
+        # feature bit. Once a supporting release enters the matrix this fails
+        # visibly, instead of silently skipping a valid reader combination.
+        return True
+
+    def expect_write_after_current_write_failure(self, version: str) -> bool:
+        # Opening the dataset must fail before an old writer can enter a commit
+        # path that does not enforce unknown writer feature flags.
+        return True
 
 
 @contextmanager
@@ -336,7 +347,7 @@ def _make_test_function(cls, param_names, test_type):
     if test_type == "downgrade":
         func_body = f'''
 def test_func({sig_params}):
-    """Test that old Lance version can read data written by current version."""
+    """Test the old-version contract for data written by the current version."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
     obj.compat_version = version
@@ -350,9 +361,31 @@ def test_func({sig_params}):
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
     if not obj.skip_read_after_current_write(version):
-        venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+        if obj.expect_read_after_current_write_failure(version):
+            with pytest.raises(
+                RuntimeError,
+                match="cannot be read by this version|Flags",
+            ):
+                venv.execute_method(
+                    obj, "check_read", obj.compat_env(version, "check_read")
+                )
+        else:
+            venv.execute_method(
+                obj, "check_read", obj.compat_env(version, "check_read")
+            )
     if not obj.skip_write_after_current_write(version):
-        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+        if obj.expect_write_after_current_write_failure(version):
+            with pytest.raises(
+                RuntimeError,
+                match="cannot be (?:read|written) by this version|Flags",
+            ):
+                venv.execute_method(
+                    obj, "check_write", obj.compat_env(version, "check_write")
+                )
+        else:
+            venv.execute_method(
+                obj, "check_write", obj.compat_env(version, "check_write")
+            )
 '''
     else:  # upgrade_downgrade
         func_body = f'''

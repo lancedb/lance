@@ -17,10 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .compat_decorator import (
-    DatasetUpgradeDowngradeTest,
-    compat_test,
-)
+from .compat_decorator import DatasetUpgradeDowngradeTest, compat_test
 from .util import safe_data_storage_version
 
 

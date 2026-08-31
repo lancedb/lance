@@ -3248,7 +3248,9 @@ impl Dataset {
     /// The activation commit records the current maximum referenced field ID as
     /// a persistent high-water mark. Later schema changes allocate above it even
     /// after fields and their files are dropped. New datasets already use this
-    /// contract by default. Activation is one-way and idempotent.
+    /// contract by default with reader and writer gates. `ReadersAndWriters`
+    /// can add a fail-closed reader gate to a writer-only activated dataset.
+    /// Activation and reader gating are one-way and idempotent.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -3264,7 +3266,11 @@ impl Dataset {
         &mut self,
         mode: StableFieldIdMigrationMode,
     ) -> Result<()> {
-        if self.manifest.uses_stable_field_ids() {
+        let require_reader = matches!(mode, StableFieldIdMigrationMode::ReadersAndWriters);
+        let reader_already_required = self.manifest.reader_feature_flags
+            & lance_table::feature_flags::FLAG_STABLE_FIELD_IDS
+            != 0;
+        if self.manifest.uses_stable_field_ids() && (!require_reader || reader_already_required) {
             return Ok(());
         }
 
@@ -3279,7 +3285,6 @@ impl Dataset {
             },
             None,
         );
-        let require_reader = matches!(mode, StableFieldIdMigrationMode::ReadersAndWriters);
         let new_ds = CommitBuilder::new(Arc::new(self.clone()))
             .with_max_retries(0)
             .with_stable_field_id_migration_activation(require_reader)

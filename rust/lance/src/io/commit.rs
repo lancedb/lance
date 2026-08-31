@@ -1072,6 +1072,9 @@ pub(crate) async fn do_commit_detached_transaction(
         )));
     }
     validate_stable_field_id_flags(&dataset.manifest)?;
+    let mut transaction = transaction.clone();
+    canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation)?;
+    let transaction = &transaction;
     validate_detached_stable_field_ids(&dataset.manifest, &transaction.operation)?;
     validate_operation(Some(&dataset.manifest), &transaction.operation)?;
 
@@ -1443,12 +1446,17 @@ pub(crate) async fn commit_transaction(
             )));
         }
         validate_stable_field_id_flags(&dataset.manifest)?;
-        canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation)?;
-        validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+
+        // Keep the rebased transaction as the source operation for the next
+        // attempt. Canonicalization consumes transient binding provenance, so
+        // mutating that source would make a retry depend on the first attempt.
+        let mut attempt_transaction = transaction.clone();
+        canonicalize_stable_field_ids(Some(&dataset.manifest), &mut attempt_transaction.operation)?;
+        validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::from(&transaction);
+        let pb_transaction = pb::Transaction::from(&attempt_transaction);
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
         current_transaction_file = if !write_config.disable_transaction_file() {
@@ -1465,7 +1473,7 @@ pub(crate) async fn commit_transaction(
             ));
         }
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, mut indices) = match transaction.operation {
+        let (mut manifest, mut indices) = match attempt_transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
                     object_store,
@@ -1478,7 +1486,7 @@ pub(crate) async fn commit_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest_with_read_version(
+            _ => attempt_transaction.build_manifest_with_read_version(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
@@ -1499,7 +1507,11 @@ pub(crate) async fn commit_transaction(
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
 
         fix_schema(&mut manifest)?;
-        validate_stable_field_id_transition(&dataset.manifest, &manifest, &transaction.operation)?;
+        validate_stable_field_id_transition(
+            &dataset.manifest,
+            &manifest,
+            &attempt_transaction.operation,
+        )?;
         manifest.update_max_field_id();
 
         check_storage_version(&mut manifest)?;
@@ -1537,7 +1549,7 @@ pub(crate) async fn commit_transaction(
             Ok(manifest_location) => {
                 record_successful_commit(
                     &dataset,
-                    &transaction,
+                    &attempt_transaction,
                     &manifest,
                     &manifest_location,
                     indices,
@@ -1558,7 +1570,7 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     target_version,
-                    &transaction,
+                    &attempt_transaction,
                 )
                 .await
                 {
@@ -1569,7 +1581,7 @@ pub(crate) async fn commit_transaction(
                         let committed_manifest = *committed_manifest;
                         record_successful_commit(
                             &dataset,
-                            &transaction,
+                            &attempt_transaction,
                             &committed_manifest,
                             &location,
                             indices,
@@ -1628,7 +1640,7 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     target_version,
-                    &transaction,
+                    &attempt_transaction,
                 )
                 .await
                 {
@@ -1639,7 +1651,7 @@ pub(crate) async fn commit_transaction(
                         let committed_manifest = *committed_manifest;
                         record_successful_commit(
                             &dataset,
-                            &transaction,
+                            &attempt_transaction,
                             &committed_manifest,
                             &location,
                             indices,
@@ -1704,6 +1716,7 @@ mod tests {
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
     };
+    use lance_table::transaction::TRANSACTION_SCHEMA_SOURCE_RAW_ARROW;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
@@ -1832,6 +1845,211 @@ mod tests {
         let locked_version = Arc::new(Mutex::new(None));
         let handler = Arc::new(CustomCommitHandler { locked_version });
         test_commit_handler(handler, true).await;
+    }
+
+    #[derive(Debug)]
+    struct InjectForeignCommitHandler {
+        foreign: Mutex<Option<(Manifest, lance_table::format::Transaction)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for InjectForeignCommitHandler {
+        fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let foreign = self.foreign.lock().unwrap().take();
+            if let Some((mut foreign_manifest, foreign_transaction)) = foreign {
+                foreign_manifest.version = manifest.version;
+                RenameCommitHandler
+                    .commit(
+                        &mut foreign_manifest,
+                        None,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        Some(foreign_transaction),
+                    )
+                    .await?;
+                return Err(CommitError::CommitConflict);
+            }
+
+            RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    fn inject_foreign_commit_handler(
+        manifest: Manifest,
+        transaction: &Transaction,
+    ) -> Arc<dyn CommitHandler> {
+        let transaction = pb::Transaction::from(transaction).into();
+        Arc::new(InjectForeignCommitHandler {
+            foreign: Mutex::new(Some((manifest, transaction))),
+        })
+    }
+
+    #[tokio::test]
+    async fn raw_arrow_project_retry_matches_single_attempt_ids() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(simple_batch(&simple_schema(), vec![1, 2, 3]))],
+                simple_schema(),
+            ),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut foreign_manifest = dataset.manifest.as_ref().clone();
+        foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
+        let foreign_transaction = Transaction::new(
+            dataset.version().version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let handler = inject_foreign_commit_handler(foreign_manifest.clone(), &foreign_transaction);
+
+        let raw_schema = Schema {
+            fields: vec![Field::new_arrow("x", DataType::Int32, false).unwrap()],
+            metadata: HashMap::from([(
+                TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+                String::new(),
+            )]),
+        };
+        let mut expected = Operation::Project {
+            schema: raw_schema.clone(),
+            preserves_nullability: true,
+        };
+        canonicalize_stable_field_ids(Some(&foreign_manifest), &mut expected).unwrap();
+        let Operation::Project {
+            schema: expected_schema,
+            ..
+        } = expected
+        else {
+            unreachable!();
+        };
+
+        let committed = Dataset::commit(
+            uri,
+            Operation::Project {
+                schema: raw_schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.version().version),
+            None,
+            Some(handler),
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(committed.schema(), &expected_schema);
+        assert!(
+            !committed
+                .schema()
+                .metadata
+                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_arrow_merge_retry_matches_single_attempt_ids() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(simple_batch(&simple_schema(), vec![1, 2, 3]))],
+                simple_schema(),
+            ),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut foreign_manifest = dataset.manifest.as_ref().clone();
+        foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
+        let foreign_transaction = Transaction::new(
+            dataset.version().version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let handler = inject_foreign_commit_handler(foreign_manifest.clone(), &foreign_transaction);
+
+        let mut merged_fragment = dataset.manifest.fragments[0].clone();
+        let mut new_file = merged_fragment.files[0].clone();
+        new_file.path = "retry-new-column.lance".to_string();
+        new_file.fields = Arc::from([1]);
+        merged_fragment.files.push(new_file);
+        let raw_schema = Schema {
+            fields: vec![
+                Field::new_arrow("x", DataType::Int32, false).unwrap(),
+                Field::new_arrow("new_column", DataType::Int32, true).unwrap(),
+            ],
+            metadata: HashMap::from([(
+                TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+                String::new(),
+            )]),
+        };
+        let operation = Operation::Merge {
+            fragments: vec![merged_fragment],
+            schema: raw_schema,
+            preserves_nullability: true,
+        };
+        let mut expected = operation.clone();
+        canonicalize_stable_field_ids(Some(&foreign_manifest), &mut expected).unwrap();
+
+        let committed = Dataset::commit(
+            uri,
+            operation,
+            Some(dataset.version().version),
+            None,
+            Some(handler),
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let Operation::Merge {
+            schema: expected_schema,
+            fragments: expected_fragments,
+            ..
+        } = expected
+        else {
+            unreachable!();
+        };
+        assert_eq!(committed.schema(), &expected_schema);
+        assert_eq!(committed.schema().field("new_column").unwrap().id, 1);
+        assert_eq!(
+            committed.manifest.fragments[0].files[1].fields,
+            expected_fragments[0].files[1].fields
+        );
     }
 
     #[tokio::test]

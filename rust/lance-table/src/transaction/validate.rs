@@ -70,8 +70,7 @@ pub fn canonicalize_stable_field_ids(
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let field_id_remap =
-                canonicalize_schema(manifest, schema, true, false, raw_arrow_schema)?;
+            let field_id_remap = canonicalize_schema(manifest, schema, true, raw_arrow_schema)?;
             remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new())?;
         }
         Operation::Project { schema, .. } if raw_arrow_schema => {
@@ -93,8 +92,7 @@ pub fn canonicalize_stable_field_ids(
                 .map(|file| (file.base_id, file.path.clone()))
                 .collect();
             if raw_arrow_schema {
-                let field_id_remap =
-                    canonicalize_schema(Some(manifest), schema, false, false, true)?;
+                let field_id_remap = canonicalize_schema(Some(manifest), schema, false, true)?;
                 remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
             }
             canonicalize_merge_replacements(manifest, schema, fragments, &retained_files)?;
@@ -186,7 +184,6 @@ fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> 
 fn canonicalize_schema(
     manifest: Option<&Manifest>,
     schema: &mut Schema,
-    replaces_all_identities: bool,
     allow_id_binding: bool,
     remap_raw_source_ids: bool,
 ) -> Result<FieldIdRemap> {
@@ -200,7 +197,7 @@ fn canonicalize_schema(
     };
 
     let max_existing_id = manifest.map(Manifest::max_field_id);
-    if replaces_all_identities || manifest.is_none() {
+    if manifest.is_none() {
         schema.try_reassign_field_ids(max_existing_id)?;
     } else if let Some(manifest) = manifest {
         for field in &mut schema.fields {
@@ -536,16 +533,13 @@ fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation
     }
     validate_stable_field_id_manifest(manifest)?;
 
-    let (schema, replaces_all_identities) = match operation {
-        Operation::Overwrite { schema, .. } => (schema, true),
-        Operation::Merge { schema, .. } | Operation::Project { schema, .. } => (schema, false),
-        _ => return Ok(()),
+    let (Operation::Overwrite { schema, .. }
+    | Operation::Merge { schema, .. }
+    | Operation::Project { schema, .. }) = operation
+    else {
+        return Ok(());
     };
     schema.validate()?;
-
-    if replaces_all_identities {
-        return validate_dense_new_field_ids(manifest, schema.fields_pre_order());
-    }
 
     for field in schema.fields_pre_order() {
         let Some(prior_field) = manifest.schema.field_by_id(field.id) else {
@@ -1083,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_ids_require_overwrite_to_replace_every_identity() {
+    fn stable_field_ids_allow_overwrite_to_preserve_compatible_identity() {
         let manifest = activated_manifest();
         let schema = manifest.schema.clone();
         let operation = Operation::Overwrite {
@@ -1093,12 +1087,7 @@ mod tests {
             initial_bases: None,
         };
 
-        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
-
-        assert!(
-            err.to_string().contains("densely allocated from 1"),
-            "{err}"
-        );
+        validate_operation(Some(&manifest), &operation).unwrap();
     }
 
     #[test]
@@ -1121,8 +1110,8 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(schema.fields[0].id, 1);
-        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
     }
 
     #[test]
@@ -1149,8 +1138,8 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(schema.fields[0].id, 1);
-        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
     }
 
     #[test]

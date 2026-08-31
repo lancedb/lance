@@ -125,9 +125,8 @@ message Manifest {
   //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
   //   maintain index_catchup can change an index without withdrawing the
   //   position recorded for it. Setting it is one-way.
-  // * 1 << 8: field IDs use a persistent allocation high-water mark and are
-  //   never reused. This bit is set for readers only by fail-closed activation;
-  //   writers always require the corresponding writer bit.
+  // * 1 << 8: readers must understand the stable field-ID contract. This is an
+  //   optional fail-closed policy; stable field IDs always require the writer bit.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.

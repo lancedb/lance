@@ -924,8 +924,6 @@ enum RawArrowFieldIdMode {
 }
 
 struct SchemaConversionOptions {
-    replaces_all_identities: bool,
-    commit_allocator_is_authoritative: bool,
     raw_field_id_mode: RawArrowFieldIdMode,
 }
 
@@ -985,10 +983,9 @@ fn convert_schema_from_operation(
         None => None,
     };
 
-    if options.commit_allocator_is_authoritative
-        && read_context
-            .as_ref()
-            .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
+    if read_context
+        .as_ref()
+        .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
     {
         original_schema.metadata.insert(
             TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
@@ -997,19 +994,9 @@ fn convert_schema_from_operation(
         return Ok((original_schema, HashMap::new()));
     }
 
-    let schema = if let Some((read_schema, max_field_id, stable_field_ids)) = read_context {
-        LanceSchema::from_arrow_schema(
-            &arrow_schema,
-            Some(read_schema),
-            Some(max_field_id),
-            stable_field_ids,
-            options.replaces_all_identities,
-        )?
-    } else {
-        // New datasets use stable field IDs by default, so Arrow metadata is
-        // not an allocation authority even before a manifest exists.
-        LanceSchema::from_arrow_schema(&arrow_schema, None, None, true, true)?
-    };
+    let (read_schema, max_field_id, _) = read_context.expect("legacy dataset context");
+    let schema =
+        LanceSchema::from_arrow_schema(&arrow_schema, Some(read_schema), Some(max_field_id))?;
 
     let field_id_remap = original_schema
         .fields_pre_order()
@@ -1091,17 +1078,11 @@ trait SchemaExt {
         max_existing_id: Option<i32>,
     ) -> Result<()>;
 
-    /// Create a schema from `arrow_schema`.
-    ///
-    /// For an existing dataset, Arrow field-ID metadata is not an allocation
-    /// authority: matching identities inherit IDs from `base_schema` and every
-    /// new identity is allocated above `max_existing_id`.
+    /// Create a schema from `arrow_schema` using the legacy Java conversion rules.
     fn from_arrow_schema(
         arrow_schema: &Schema,
         base_schema: Option<LanceSchema>,
         max_existing_id: Option<i32>,
-        dataset_allocator_is_authoritative: bool,
-        replaces_all_identities: bool,
     ) -> Result<LanceSchema>;
 }
 
@@ -1132,8 +1113,6 @@ impl SchemaExt for LanceSchema {
         arrow_schema: &Schema,
         base_schema: Option<LanceSchema>,
         max_existing_id: Option<i32>,
-        dataset_allocator_is_authoritative: bool,
-        replaces_all_identities: bool,
     ) -> Result<LanceSchema> {
         let mut schema = Self {
             fields: arrow_schema
@@ -1143,25 +1122,7 @@ impl SchemaExt for LanceSchema {
                 .collect::<lance_core::Result<_>>()?,
             metadata: arrow_schema.metadata.clone(),
         };
-        if dataset_allocator_is_authoritative {
-            if replaces_all_identities || base_schema.is_none() {
-                schema.try_reassign_field_ids(max_existing_id)?;
-            } else if let Some(base_schema) = &base_schema {
-                for field in &mut schema.fields {
-                    let base_field = if field.id >= 0 {
-                        base_schema
-                            .field_by_id(field.id)
-                            .or_else(|| base_schema.field(&field.name))
-                    } else {
-                        base_schema.field(&field.name)
-                    };
-                    field.set_stable_field_id_from_field(-1, base_schema, base_field)?;
-                }
-                schema.try_set_field_id(max_existing_id)?;
-            }
-        } else {
-            schema.set_field_id_from_schema(base_schema, max_existing_id)?;
-        }
+        schema.set_field_id_from_schema(base_schema, max_existing_id)?;
         schema.validate()?;
         schema.verify_primary_key()?;
 
@@ -1170,15 +1131,6 @@ impl SchemaExt for LanceSchema {
 }
 
 trait FieldExt {
-    fn clear_field_ids(&mut self);
-
-    fn set_stable_field_id_from_field(
-        &mut self,
-        parent_id: i32,
-        base_schema: &LanceSchema,
-        base_field: Option<&Field>,
-    ) -> lance_core::Result<()>;
-
     /// Recursively set field ID and parent ID for this field and all its children.
     fn set_field_id_from_field(
         &mut self,
@@ -1188,51 +1140,6 @@ trait FieldExt {
 }
 
 impl FieldExt for Field {
-    fn clear_field_ids(&mut self) {
-        self.id = -1;
-        self.parent_id = -1;
-        for child in &mut self.children {
-            child.clear_field_ids();
-        }
-    }
-
-    fn set_stable_field_id_from_field(
-        &mut self,
-        parent_id: i32,
-        base_schema: &LanceSchema,
-        base_field: Option<&Field>,
-    ) -> lance_core::Result<()> {
-        let Some(base_field) = base_field.filter(|base| base.logical_type == self.logical_type)
-        else {
-            self.clear_field_ids();
-            self.parent_id = parent_id;
-            return Ok(());
-        };
-
-        self.id = base_field.id;
-        self.parent_id = parent_id;
-        for child in &mut self.children {
-            let base_child = if child.id >= 0 {
-                base_schema
-                    .field_by_id(child.id)
-                    .filter(|base| base.parent_id == base_field.id)
-                    .or_else(|| {
-                        base_field
-                            .children
-                            .iter()
-                            .find(|base| base.name == child.name)
-                    })
-            } else {
-                base_field
-                    .children
-                    .iter()
-                    .find(|base| base.name == child.name)
-            };
-            child.set_stable_field_id_from_field(self.id, base_schema, base_child)?;
-        }
-        Ok(())
-    }
-
     fn set_field_id_from_field(
         &mut self,
         parent_id: i32,
@@ -1289,8 +1196,6 @@ fn convert_to_rust_operation(
                 dataset.as_deref_mut(),
                 read_version,
                 SchemaConversionOptions {
-                    replaces_all_identities: false,
-                    commit_allocator_is_authoritative: true,
                     raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
                 },
             )?;
@@ -1430,8 +1335,6 @@ fn convert_to_rust_operation(
                 dataset.as_deref_mut(),
                 read_version,
                 SchemaConversionOptions {
-                    replaces_all_identities: true,
-                    commit_allocator_is_authoritative: true,
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
                 },
             )?;
@@ -1592,8 +1495,6 @@ fn convert_to_rust_operation(
                 dataset.as_deref_mut(),
                 read_version,
                 SchemaConversionOptions {
-                    replaces_all_identities: false,
-                    commit_allocator_is_authoritative: true,
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
                 },
             )?;
@@ -1925,20 +1826,6 @@ mod tests {
     pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
 
     #[test]
-    fn java_schema_conversion_rejects_field_id_exhaustion() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "new_field",
-            ArrowDataType::Int32,
-            false,
-        )]);
-
-        let err = LanceSchema::from_arrow_schema(&arrow_schema, None, Some(i32::MAX), true, true)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("IDs are exhausted"), "{err}");
-    }
-
-    #[test]
     fn legacy_java_schema_conversion_preserves_arrow_field_ids() {
         let mut base = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
         base.id = 0;
@@ -1958,32 +1845,10 @@ mod tests {
         ]);
 
         let schema =
-            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(0), false, false)
-                .unwrap();
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(0)).unwrap();
 
         assert_eq!(schema.field("a").unwrap().id, 5);
         assert_eq!(schema.field("b").unwrap().id, 9);
-    }
-
-    #[test]
-    fn stable_java_schema_conversion_preserves_rename_identity() {
-        let mut base = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
-        base.id = 10;
-        let base_schema = LanceSchema {
-            fields: vec![base],
-            metadata: HashMap::new(),
-        };
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("renamed", ArrowDataType::Int32, false).with_metadata(HashMap::from([
-                (LANCE_FIELD_ID_KEY.to_string(), "10".to_string()),
-            ])),
-        ]);
-
-        let schema =
-            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(10), true, false)
-                .unwrap();
-
-        assert_eq!(schema.field("renamed").unwrap().id, 10);
     }
 
     #[test]
@@ -2072,19 +1937,22 @@ mod tests {
             metadata: HashMap::from([("base_schema_k".to_string(), "base_schema_v".to_string())]),
         };
 
-        // new_schema specifies field IDs in Arrow metadata to prove they are
-        // ignored for an existing dataset:
-        // - field a: inherits from base_schema
+        // new_schema specifies:
+        // - field a: manual field id
         // - field b: no id -> should inherit from base_schema
         // - field c: new field -> should be assigned based on max_field_id
-        // - existing nested fields inherit; new nested fields use the allocator
+        // - struct s: parent+child(x) manual, child(y) inherit, child(z) max_field_id
+        // - list l: parent manual, child(item) inherit
+        // - list l2: parent manual, child(item) max_field_id
+        // - map m: parent manual, child(entries/key/value) inherit
+        // - map m2: parent manual, child(entries/key/value) max_field_id
         let mut a_meta = HashMap::new();
         a_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "5".to_string());
         let arrow_a = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(a_meta);
         let arrow_b = ArrowField::new("b", ArrowDataType::Int32, false);
         let arrow_c = ArrowField::new("c", ArrowDataType::Int32, false);
 
-        // struct s: metadata IDs on the parent and child x are ignored.
+        // struct s: manual parent + manual child x
         let mut s_meta = HashMap::new();
         s_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "50".to_string());
         let mut x_meta = HashMap::new();
@@ -2100,7 +1968,7 @@ mod tests {
         )
         .with_metadata(s_meta);
 
-        // list l: the metadata parent ID is ignored; both identities inherit.
+        // list l: parent manual, item inherit
         let mut l_meta = HashMap::new();
         l_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "60".to_string());
         let arrow_l = ArrowField::new(
@@ -2114,7 +1982,7 @@ mod tests {
         )
         .with_metadata(l_meta);
 
-        // list l2: the metadata parent ID is ignored; both identities are new.
+        // list l2: parent manual, item max_field_id (no base match)
         let mut l2_meta = HashMap::new();
         l2_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "61".to_string());
         let arrow_l2 = ArrowField::new(
@@ -2128,7 +1996,7 @@ mod tests {
         )
         .with_metadata(l2_meta);
 
-        // map m: the metadata parent ID is ignored; all identities inherit.
+        // map m: parent manual, entries/key/value inherit
         let map_entries = ArrowField::new(
             "entries",
             ArrowDataType::Struct(ArrowFields::from(vec![
@@ -2142,7 +2010,7 @@ mod tests {
         let arrow_m = ArrowField::new("m", ArrowDataType::Map(Arc::new(map_entries), false), true)
             .with_metadata(m_meta);
 
-        // map m2: metadata IDs are ignored; the full new subtree is allocated.
+        // map m2: parent manual, entries/key/value max_field_id
         let map_entries = ArrowField::new(
             "entries",
             ArrowDataType::Struct(ArrowFields::from(vec![
@@ -2164,18 +2032,12 @@ mod tests {
             HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())]),
         );
 
-        let schema = LanceSchema::from_arrow_schema(
-            &arrow_schema,
-            Some(base_schema),
-            Some(100),
-            true,
-            false,
-        )
-        .unwrap();
+        let schema =
+            LanceSchema::from_arrow_schema(&arrow_schema, Some(base_schema), Some(100)).unwrap();
 
-        // 1. Arrow metadata cannot override an existing identity.
+        // 1. Manually specified field id
         let got_a = schema.field("a").unwrap();
-        assert_eq!(got_a.id, 10);
+        assert_eq!(got_a.id, 5);
         assert!(!got_a.metadata.contains_key(LANCE_FIELD_ID_KEY));
 
         // 2. Inherit field id + metadata from base_schema (field b)
@@ -2186,31 +2048,31 @@ mod tests {
         let got_c = schema.field("c").unwrap();
         assert_eq!(got_c.id, 101);
 
-        // 4. struct: existing parent and children inherit; z is allocated.
+        // 4. struct: parent+child(x) manual, child(y) inherit, child(z) max_field_id
         let got_s = schema.field("s").unwrap();
-        assert_eq!(got_s.id, 20);
+        assert_eq!(got_s.id, 50);
         let got_sx = schema.field("s.x").unwrap();
-        assert_eq!(got_sx.id, 21);
+        assert_eq!(got_sx.id, 51);
         let got_sy = schema.field("s.y").unwrap();
         assert_eq!(got_sy.id, 22);
         let got_sz = schema.field("s.z").unwrap();
         assert_eq!(got_sz.id, 102);
 
-        // 5. list l: parent and item inherit.
+        // 5. list l: parent manual, item inherit
         let got_l = schema.field("l").unwrap();
-        assert_eq!(got_l.id, 30);
+        assert_eq!(got_l.id, 60);
         let got_li = schema.field("l.item").unwrap();
         assert_eq!(got_li.id, 31);
 
-        // 6. list l2: parent and item are newly allocated.
+        // 6. list l2: parent manual, item max_field_id
         let got_l2 = schema.field("l2").unwrap();
-        assert_eq!(got_l2.id, 103);
+        assert_eq!(got_l2.id, 61);
         let got_l2i = schema.field("l2.item").unwrap();
-        assert_eq!(got_l2i.id, 104);
+        assert_eq!(got_l2i.id, 103);
 
-        // 7. map m: parent, entries, key, and value inherit.
+        // 7. map m: parent manual, entries/key/value inherit
         let got_m = schema.field("m").unwrap();
-        assert_eq!(got_m.id, 40);
+        assert_eq!(got_m.id, 70);
         let got_me = schema.field("m.entries").unwrap();
         assert_eq!(got_me.id, 41);
         let got_mk = schema.field("m.entries.key").unwrap();
@@ -2218,15 +2080,15 @@ mod tests {
         let got_mv = schema.field("m.entries.value").unwrap();
         assert_eq!(got_mv.id, 43);
 
-        // 8. map m2: the full new subtree is allocated in pre-order.
+        // 8. map m2: parent manual, entries/key/value max_field_id
         let got_m2 = schema.field("m2").unwrap();
-        assert_eq!(got_m2.id, 105);
+        assert_eq!(got_m2.id, 71);
         let got_m2e = schema.field("m2.entries").unwrap();
-        assert_eq!(got_m2e.id, 106);
+        assert_eq!(got_m2e.id, 104);
         let got_m2k = schema.field("m2.entries.key").unwrap();
-        assert_eq!(got_m2k.id, 107);
+        assert_eq!(got_m2k.id, 105);
         let got_m2v = schema.field("m2.entries.value").unwrap();
-        assert_eq!(got_m2v.id, 108);
+        assert_eq!(got_m2v.id, 106);
 
         // 9. Schema metadata: when new_schema.metadata is non-empty, use new_schema metadata
         assert_eq!(

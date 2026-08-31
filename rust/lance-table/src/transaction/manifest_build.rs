@@ -1388,18 +1388,19 @@ impl Transaction {
         }
 
         if let Some(require_reader) = config.stable_field_id_migration_requires_reader {
-            if current_manifest
+            let already_active = current_manifest
                 .map(|manifest| manifest.uses_stable_field_ids())
-                .unwrap_or(false)
-            {
-                return Err(Error::invalid_input(
-                    "Stable field IDs are already active for this dataset",
-                ));
-            }
-            manifest.activate_stable_field_ids();
-            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            if require_reader {
-                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+                .unwrap_or(false);
+            if already_active {
+                if require_reader {
+                    manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+                }
+            } else {
+                manifest.activate_stable_field_ids();
+                manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+                if require_reader {
+                    manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+                }
             }
         }
 

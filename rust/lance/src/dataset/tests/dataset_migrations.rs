@@ -346,12 +346,31 @@ async fn test_stable_field_id_migration_repairs_legacy_schema_before_activation(
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
     dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::WritersOnly)
         .await
         .unwrap();
 
     dataset.validate().await.unwrap();
     assert!(dataset.manifest.uses_stable_field_ids());
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+
+    let writer_only_version = dataset.version().version;
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, writer_only_version + 1);
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
 }
 
 #[tokio::test]
@@ -633,6 +652,16 @@ async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(dataset.version().version, created_version);
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
+        0
+    );
+
+    dataset
+        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, created_version);
 
     dataset
         .migrate_to_stable_field_ids(StableFieldIdMigrationMode::WritersOnly)
@@ -697,7 +726,7 @@ async fn test_shallow_clone_preserves_stable_field_id_state() {
 }
 
 #[tokio::test]
-async fn test_overwrite_replaces_all_stable_field_identities() {
+async fn test_overwrite_preserves_compatible_stable_field_identities() {
     let source_uri = TempStrDir::default();
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
     dataset
@@ -728,17 +757,9 @@ async fn test_overwrite_replaces_all_stable_field_identities() {
     .await
     .unwrap();
 
-    assert_eq!(overwritten.schema().field("id").unwrap().id, 1);
-    assert_eq!(overwritten.schema().field("replacement").unwrap().id, 2);
-    assert_eq!(overwritten.manifest.max_allocated_field_id, Some(2));
-    assert!(
-        overwritten
-            .manifest
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.files.iter())
-            .all(|file| file.fields.iter().all(|field_id| *field_id >= 1))
-    );
+    assert_eq!(overwritten.schema().field("id").unwrap().id, 0);
+    assert_eq!(overwritten.schema().field("replacement").unwrap().id, 1);
+    assert_eq!(overwritten.manifest.max_allocated_field_id, Some(1));
 }
 
 #[tokio::test]

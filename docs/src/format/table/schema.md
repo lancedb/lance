@@ -238,9 +238,15 @@ files. Activation provides a forward guarantee only; it cannot reconstruct ident
 dropped or reused in older snapshots.
 
 New datasets activate this contract in their initial manifest and require both readers and writers
-to understand it. Existing legacy datasets remain unchanged until an explicit migration commit;
-controlled deployments may use a writer-only migration only after every pre-gate writer has been
-retired.
+to understand it. The reader gate is required because older Lance versions do not enforce unknown
+writer feature flags on every mutation path; allowing them to open the dataset could let a legacy
+commit clear the writer gate and resume reusable allocation. Existing legacy datasets remain
+unchanged until an explicit migration commit. Controlled deployments may use writer-only migration
+only after every pre-gate writer has been retired.
+
+Activation is one-way within a branch ancestry. After migration, restore cannot target a version
+from before activation because that version does not carry the high-water mark needed to preserve
+retired identities.
 
 ### Field ID Properties
 
@@ -329,8 +335,8 @@ Field IDs enable efficient schema evolution:
 - **Reorder Columns**: Change field order in schema; IDs remain the same
 - **Metadata or Nullability Change**: Preserve the field ID
 - **Type Replacement**: Allocate a new field ID and retire the old identity
-- **Overwrite**: On an activated dataset, replace all field identities with fresh IDs above the
-  current high-water mark
+- **Overwrite**: Preserve compatible logical identities; allocate new IDs for added fields and type
+  replacements
 
 The use of field IDs ensures that data files can be correctly interpreted even as the schema changes over time.
 

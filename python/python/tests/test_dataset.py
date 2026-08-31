@@ -5232,6 +5232,25 @@ def test_detached_commits(tmp_path: Path):
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
 
 
+def test_detached_raw_arrow_merge_strips_transaction_metadata(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"x": [0, 1]}), tmp_path)
+    fragment = dataset.get_fragments()[0].metadata
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([fragment], dataset.schema, True)
+
+    detached = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=dataset.version,
+        detached=True,
+    )
+
+    assert detached.to_table() == dataset.to_table()
+    assert b"lance:transaction_schema_source_raw_arrow" not in (
+        detached.schema.metadata or {}
+    )
+
+
 def test_dataset_drop(tmp_path: Path):
     table = pa.table({"x": [0]})
     lance.write_dataset(table, tmp_path)
@@ -5473,11 +5492,11 @@ def test_data_overlay_round_trips_through_fragment_metadata(
     assert restored.overlays[0].offsets == [1, 4]
     assert restored.overlays[0].committed_version == overlay_version
 
-    # A commit that round-trips the fragment (here a Merge) must keep the
+    # A commit that round-trips the fragment (here an Overwrite) must keep the
     # overlays, so the overlay still resolves on read instead of being dropped.
     dataset = lance.LanceDataset.commit(
         dataset,
-        lance.LanceOperation.Merge([restored], dataset.lance_schema, True),
+        lance.LanceOperation.Overwrite(dataset.schema, [restored]),
         read_version=dataset.version,
     )
     result = dataset.to_table()
@@ -5594,6 +5613,9 @@ def test_schema_project_raw_arrow_cannot_allocate_field_id(tmp_path: Path):
 
     assert dataset.lance_schema.fields()[0].id() == 0
     assert dataset.to_table() == pa.table({"a": pa.array([1, 2], pa.int32())})
+    assert b"lance:transaction_schema_source_raw_arrow" not in (
+        dataset.schema.metadata or {}
+    )
 
 
 def test_overwrite_rejects_ambiguous_raw_arrow_field_ids(tmp_path: Path):
