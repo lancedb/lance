@@ -1453,8 +1453,8 @@ mod tests {
         assert!(message.contains(expected), "f64: {message}");
     }
 
-    /// Returns the panic message, so a case pins which contract was violated
-    /// rather than passing on any panic from the same call.
+    /// Returns the panic message, so a case can assert which contract was
+    /// violated instead of accepting any panic from the same call.
     fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
         payload
@@ -1480,37 +1480,62 @@ mod tests {
 
     /// A mismatch has to stop at the boundary rather than reach a kernel that
     /// takes one length and reads both vectors with it.
+    ///
+    /// The f32 and f64 cases assert both lengths, not just the contract. Without
+    /// the entry assert an f32 kernel reaches `dot` on its scalar tail, and `dot`
+    /// reports the tail lengths instead of these.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
         let short_f32 = [1.0f32; 15];
-        for message in [
-            panic_message(|| {
-                f32::cosine_fast(&long_f32, 1.0, &short_f32);
-            }),
-            panic_message(|| {
-                f32::cosine_fast(&short_f32, 1.0, &long_f32);
-            }),
-            panic_message(|| {
-                f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32);
-            }),
+        for (message, expected) in [
+            (
+                panic_message(|| {
+                    f32::cosine_fast(&long_f32, 1.0, &short_f32);
+                }),
+                "left=16, right=15",
+            ),
+            (
+                panic_message(|| {
+                    f32::cosine_fast(&short_f32, 1.0, &long_f32);
+                }),
+                "left=15, right=16",
+            ),
+            (
+                panic_message(|| {
+                    f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32);
+                }),
+                "left=16, right=15",
+            ),
         ] {
             assert!(message.contains("equal lengths"), "f32: {message}");
+            assert!(message.contains(expected), "f32: {message}");
         }
 
         let long_f64 = [1.0f64; 16];
         let short_f64 = [1.0f64; 15];
-        for message in [
-            panic_message(|| {
-                f64::cosine_fast(&long_f64, 1.0, &short_f64);
-            }),
-            panic_message(|| {
-                f64::cosine_fast(&short_f64, 1.0, &long_f64);
-            }),
+        for (message, expected) in [
+            (
+                panic_message(|| {
+                    f64::cosine_fast(&long_f64, 1.0, &short_f64);
+                }),
+                "left=16, right=15",
+            ),
+            (
+                panic_message(|| {
+                    f64::cosine_fast(&short_f64, 1.0, &long_f64);
+                }),
+                "left=15, right=16",
+            ),
         ] {
             assert!(message.contains("equal lengths"), "f64: {message}");
+            assert!(message.contains(expected), "f64: {message}");
         }
 
+        // Half precision asserts the contract only, not where it was enforced.
+        // With `fp16kernels` off, which is the default, `cosine_fast` here is
+        // `cosine_scalar`, and that hands `dot` the same two slices, so the entry
+        // assert and `dot`'s produce the same message.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
         let long_bf16 = [bf16::from_f32(1.0); 16];
