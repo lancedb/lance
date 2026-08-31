@@ -47,6 +47,7 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
     IndexMetadata {
         uuid: Uuid::new_v4(),
         fields: vec![0],
+        covering_fields: vec![],
         name: name.to_string(),
         dataset_version: 0,
         fragment_bitmap: Some([0].into_iter().collect()),

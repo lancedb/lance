@@ -1553,13 +1553,22 @@ fn arrow_binary_to_data_block(
     bits_per_offset: u8,
 ) -> DataBlock {
     let data_vec = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
+    arrow_binary_array_data_to_data_block(&data_vec, num_values, bits_per_offset)
+}
+
+fn arrow_binary_array_data_to_data_block(
+    data_vec: &[ArrayData],
+    num_values: u64,
+    bits_per_offset: u8,
+) -> DataBlock {
     let bytes_per_offset = bits_per_offset as usize / 8;
     let offsets = data_vec
         .iter()
         .map(|d| {
-            LanceBuffer::from(
-                d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
-            )
+            LanceBuffer::from(d.buffers()[0].slice_with_length(
+                d.offset() * bytes_per_offset,
+                (d.len() + 1) * bytes_per_offset,
+            ))
         })
         .collect::<Vec<_>>();
     let (offsets, data_ranges) = if bits_per_offset == 32 {
@@ -1814,6 +1823,71 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
 }
 
 impl DataBlock {
+    fn validate_variable_width_offsets<T: ArrowNativeType + Ord>(
+        array_data: &ArrayData,
+    ) -> std::result::Result<(), String> {
+        if array_data.is_empty() && array_data.buffers()[0].is_empty() {
+            return Ok(());
+        }
+        let offset_size = std::mem::size_of::<T>();
+        let offset_start = array_data.offset() * offset_size;
+        let offset_len = (array_data.len() + 1) * offset_size;
+        let offset_buffer =
+            LanceBuffer::from(array_data.buffers()[0].slice_with_length(offset_start, offset_len));
+        let offsets = offset_buffer.borrow_to_typed_slice::<T>();
+        VariableWidthBlock::offset_violation_detail(
+            offsets.as_ref(),
+            array_data.buffers()[1].len(),
+            0,
+        )
+        .map_or(Ok(()), Err)
+    }
+
+    // `validate_full` also rescans UTF-8 contents and character boundaries on every flush.
+    // Encoding only needs a complete monotonicity and bounds proof before slicing offsets.
+    fn validate_variable_width_layouts(array_data: &ArrayData) -> std::result::Result<(), String> {
+        match array_data.data_type() {
+            DataType::Binary | DataType::Utf8 => {
+                Self::validate_variable_width_offsets::<i32>(array_data)?;
+            }
+            DataType::LargeBinary | DataType::LargeUtf8 => {
+                Self::validate_variable_width_offsets::<i64>(array_data)?;
+            }
+            _ => {}
+        }
+        for child_data in array_data.child_data() {
+            Self::validate_variable_width_layouts(child_data)?;
+        }
+        Ok(())
+    }
+
+    fn validate_array_data(
+        array_data: &ArrayData,
+        field_name: &str,
+        array_index: usize,
+    ) -> Result<()> {
+        let validation = array_data
+            .validate()
+            .map_err(|error| error.to_string())
+            .and_then(|_| Self::validate_variable_width_layouts(array_data));
+        validation.map_err(|error| {
+            Error::invalid_input_source(
+                format!(
+                    "Invalid Arrow array for field '{}' at buffered array {}: {}",
+                    field_name, array_index, error
+                )
+                .into(),
+            )
+        })
+    }
+
+    pub(crate) fn validate_arrays(arrays: &[ArrayRef], field_name: &str) -> Result<()> {
+        for (array_index, array) in arrays.iter().enumerate() {
+            Self::validate_array_data(&array.to_data(), field_name, array_index)?;
+        }
+        Ok(())
+    }
+
     pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
         if arrays.is_empty() || num_values == 0 {
             return Self::AllNull(AllNullDataBlock { num_values: 0 });
@@ -2052,7 +2126,8 @@ mod tests {
         new_null_array,
         types::{Int8Type, Int32Type},
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+    use arrow_data::ArrayData;
 
     use arrow_schema::{DataType, Field, Fields};
     use lance_core::Error;
@@ -2216,6 +2291,70 @@ mod tests {
             vec![string.slice(0, 1), string2.slice(0, 1)],
             vec![0, 5, 8],
             b"hellofoo",
+        );
+    }
+
+    #[rstest]
+    #[case::utf8(
+        DataType::Utf8,
+        Buffer::from_slice_ref([0_i32, 5, 10]),
+        32,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5])
+    )]
+    #[case::large_utf8(
+        DataType::LargeUtf8,
+        Buffer::from_slice_ref([0_i64, 5, 10]),
+        64,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5])
+    )]
+    fn test_variable_width_array_data_offset(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+        #[case] bits_per_offset: u8,
+        #[case] expected_offsets: LanceBuffer,
+    ) {
+        let array_data = ArrayData::builder(data_type)
+            .len(1)
+            .offset(1)
+            .add_buffer(offsets)
+            .add_buffer(Buffer::from(b"helloworld"))
+            .build()
+            .unwrap();
+
+        DataBlock::validate_array_data(&array_data, "text", 0).unwrap();
+        let data = super::arrow_binary_array_data_to_data_block(&[array_data], 1, bits_per_offset);
+
+        let data = data.as_variable_width().unwrap();
+        assert_eq!(data.offsets, expected_offsets);
+        assert_eq!(data.data, LanceBuffer::copy_slice(b"world"));
+    }
+
+    #[rstest]
+    #[case::utf8(DataType::Utf8, Buffer::from_slice_ref([0_i32, -1]))]
+    #[case::large_utf8(DataType::LargeUtf8, Buffer::from_slice_ref([0_i64, -1]))]
+    fn test_invalid_string_offsets_rejected_before_encoding(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+    ) {
+        let array_data = unsafe {
+            ArrayData::builder(data_type)
+                .len(1)
+                .add_buffer(offsets)
+                .add_buffer(Buffer::from(b""))
+                .build_unchecked()
+        };
+
+        let error = DataBlock::validate_array_data(&array_data, "text", 0).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("field 'text'"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("offset[1] (-1)"),
+            "unexpected message: {message}"
         );
     }
 

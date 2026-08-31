@@ -9,6 +9,49 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Return whether a Match query requires vocabulary expansion.
+///
+/// `None` selects automatic fuzziness, while `Some(0)` is the only exact
+/// Match mode. Keeping this predicate here prevents tokenization, scorer
+/// preparation, and posting search from assigning different meanings to the
+/// same wire value.
+pub fn uses_fuzzy_expansion(fuzziness: Option<u32>) -> bool {
+    fuzziness != Some(0)
+}
+
+/// Fully resolved fuzzy options for one token.
+pub(crate) struct FuzzyTermOptions<'a> {
+    pub(crate) edit_distance: u32,
+    pub(crate) exact_prefix: &'a str,
+    pub(crate) fuzzy_suffix: &'a str,
+}
+
+/// Resolve automatic edit distance and the exact prefix for one token.
+///
+/// JSON tokens have the form `path,type,value`. The path and type are always
+/// exact; automatic fuzziness and the caller's prefix length apply only to the
+/// value. Prefix lengths count Unicode scalar values, even though the returned
+/// prefix remains a byte slice for the FST automaton.
+pub(crate) fn fuzzy_term_options<'a>(
+    token: &'a str,
+    token_type: &DocType,
+    fuzziness: Option<u32>,
+    prefix_length: u32,
+) -> FuzzyTermOptions<'a> {
+    let value_start = token_type.prefix_len(token);
+    let value = &token[value_start..];
+    let edit_distance = fuzziness.unwrap_or_else(|| MatchQuery::auto_fuzziness(value));
+    let value_prefix_end = value
+        .char_indices()
+        .nth(prefix_length as usize)
+        .map_or(value.len(), |(offset, _)| offset);
+    FuzzyTermOptions {
+        edit_distance,
+        exact_prefix: &token[..value_start + value_prefix_end],
+        fuzzy_suffix: &value[value_prefix_end..],
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
     /// Controls result completeness for each recursively planned FTS node.
@@ -21,6 +64,8 @@ pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
+    /// Final fuzzy vocabulary budget for one Match leaf across all selected
+    /// segments and partitions.
     pub max_expansions: usize,
     // None means not a phrase query
     // Some(n) means a phrase query with slop n
@@ -136,8 +181,8 @@ impl std::fmt::Display for FtsQuery {
             Self::Boolean(query) => {
                 write!(
                     f,
-                    "Boolean(must={:?}, should={:?})",
-                    query.must, query.should
+                    "Boolean(must={:?}, should={:?}, must_not={:?})",
+                    query.must, query.should, query.must_not
                 )
             }
         }
@@ -161,16 +206,7 @@ impl FtsQueryNode for FtsQuery {
                 }
                 columns
             }
-            Self::Boolean(query) => {
-                let mut columns = HashSet::new();
-                for query in &query.must {
-                    columns.extend(query.columns());
-                }
-                for query in &query.should {
-                    columns.extend(query.columns());
-                }
-                columns
-            }
+            Self::Boolean(query) => query.columns(),
         }
     }
 }
@@ -200,6 +236,7 @@ impl FtsQuery {
             Self::Boolean(query) => {
                 query.must.iter().any(|q| q.is_missing_column())
                     || query.should.iter().any(|q| q.is_missing_column())
+                    || query.must_not.iter().any(|q| q.is_missing_column())
             }
         }
     }
@@ -302,8 +339,11 @@ pub struct MatchQuery {
     // - 2 for terms with length > 5
     pub fuzziness: Option<u32>,
 
-    /// The maximum number of terms to expand for fuzzy matching.
-    /// Default to 50.
+    /// The maximum final vocabulary size for this Match leaf.
+    ///
+    /// One budget is shared across all query positions and every selected
+    /// physical segment and partition. Sibling Match leaves, including fields
+    /// of a MultiMatch query, have independent budgets. Defaults to 50.
     #[serde(default = "MatchQuery::default_max_expansions")]
     pub max_expansions: usize,
 
@@ -387,7 +427,7 @@ impl MatchQuery {
     }
 
     pub fn auto_fuzziness(token: &str) -> u32 {
-        match token.len() {
+        match token.chars().count() {
             0..=2 => 0,
             3..=5 => 1,
             _ => 2,
@@ -873,6 +913,25 @@ pub fn has_query_token(
     false
 }
 
+fn fill_match_query_columns(
+    query: &MatchQuery,
+    columns: &[String],
+    replace: bool,
+) -> Result<Vec<MatchQuery>> {
+    if query.column.is_some() && !replace {
+        return Ok(vec![query.clone()]);
+    }
+    if columns.is_empty() {
+        return Err(Error::invalid_input(
+            "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
+        ));
+    }
+    Ok(columns
+        .iter()
+        .map(|column| query.clone().with_column(Some(column.clone())))
+        .collect())
+}
+
 pub fn fill_fts_query_column(
     query: &FtsQuery,
     columns: &[String],
@@ -883,21 +942,11 @@ pub fn fill_fts_query_column(
     }
     match query {
         FtsQuery::Match(match_query) => {
-            match columns.len() {
-                0 => {
-                    Err(Error::invalid_input("Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string()))
-                }
-                1 => {
-                    let column = columns[0].clone();
-                    let query = match_query.clone().with_column(Some(column));
-                    Ok(FtsQuery::Match(query))
-                }
-                _ => {
-                    // if there are multiple columns, we need to create a MultiMatch query
-                    let multi_match_query =
-                        MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
-                    Ok(FtsQuery::MultiMatch(multi_match_query))
-                }
+            let match_queries = fill_match_query_columns(match_query, columns, replace)?;
+            if let [match_query] = match_queries.as_slice() {
+                Ok(FtsQuery::Match(match_query.clone()))
+            } else {
+                Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
             }
         }
         FtsQuery::Phrase(phrase_query) => {
@@ -928,17 +977,11 @@ pub fn fill_fts_query_column(
             let match_queries = multi_match_query
                 .match_queries
                 .iter()
-                .map(|query| fill_fts_query_column(&FtsQuery::Match(query.clone()), columns, replace))
-                .map(|result| {
-                    result.map(|query| {
-                        if let FtsQuery::Match(match_query) = query {
-                            match_query
-                        } else {
-                            unreachable!("Expected MatchQuery")
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .map(|query| fill_match_query_columns(query, columns, replace))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
         FtsQuery::Boolean(bool_query) => {
@@ -964,6 +1007,131 @@ pub fn fill_fts_query_column(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fuzzy_expansion_mode_and_unicode_auto_boundaries() {
+        assert!(!uses_fuzzy_expansion(Some(0)));
+        assert!(uses_fuzzy_expansion(Some(1)));
+        assert!(uses_fuzzy_expansion(None));
+
+        for (token, expected) in [
+            ("ab", 0),
+            ("abc", 1),
+            ("abcde", 1),
+            ("abcdef", 2),
+            ("你好", 0),
+            ("你好啊", 1),
+            ("你好啊世界", 1),
+            ("你好啊世界呀", 2),
+        ] {
+            assert_eq!(
+                MatchQuery::auto_fuzziness(token),
+                expected,
+                "unexpected automatic fuzziness for {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_fuzzy_options_keep_path_and_type_exact() {
+        let automatic = fuzzy_term_options("payload,str,éclair", &DocType::Json, None, 1);
+        assert_eq!(automatic.edit_distance, 2);
+        assert_eq!(automatic.exact_prefix, "payload,str,é");
+        assert_eq!(automatic.fuzzy_suffix, "clair");
+
+        let explicit = fuzzy_term_options("payload,str,éclair", &DocType::Json, Some(1), 0);
+        assert_eq!(explicit.edit_distance, 1);
+        assert_eq!(explicit.exact_prefix, "payload,str,");
+        assert_eq!(explicit.fuzzy_suffix, "éclair");
+
+        let text = fuzzy_term_options("éclair", &DocType::Text, None, 1);
+        assert_eq!(text.edit_distance, 2);
+        assert_eq!(text.exact_prefix, "é");
+        assert_eq!(text.fuzzy_suffix, "clair");
+    }
+
+    #[test]
+    fn test_boolean_query_introspection_includes_must_not() {
+        let implicit = MatchQuery::new("exclude".to_string())
+            .with_boost(3.0)
+            .with_fuzziness(Some(1))
+            .with_max_expansions(10)
+            .with_operator(Operator::And)
+            .with_prefix_length(2)
+            .with_document_granularity(DocumentGranularity::Row);
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("positive_text".to_string()))
+                    .into(),
+            ),
+            (Occur::MustNot, implicit.clone().into()),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["positive_text".to_string()])
+        );
+        assert!(query.is_missing_column());
+
+        let filled = fill_fts_query_column(
+            &query,
+            &["positive_text".to_string(), "negative_text".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            filled.columns(),
+            HashSet::from(["positive_text".to_string(), "negative_text".to_string()])
+        );
+        let FtsQuery::Boolean(filled) = filled else {
+            unreachable!()
+        };
+        let FtsQuery::MultiMatch(expanded) = &filled.must_not[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            expanded.match_queries,
+            ["positive_text", "negative_text"]
+                .into_iter()
+                .map(|column| implicit.clone().with_column(Some(column.to_string())))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fill_partial_multi_match_columns() {
+        use super::*;
+
+        let implicit = MatchQuery::new("include".to_string()).with_boost(2.0);
+        let query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("a".to_string()))
+                    .with_boost(3.0),
+                implicit.clone(),
+            ],
+        });
+
+        let filled =
+            fill_fts_query_column(&query, &["a".to_string(), "b".to_string()], false).unwrap();
+        let FtsQuery::MultiMatch(filled) = filled else {
+            unreachable!()
+        };
+        assert_eq!(
+            filled.match_queries,
+            vec![
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("a".to_string()))
+                    .with_boost(3.0),
+                implicit.clone().with_column(Some("a".to_string())),
+                implicit.with_column(Some("b".to_string())),
+            ]
+        );
+    }
+
     #[test]
     fn test_match_query_serde() {
         use super::*;
@@ -1077,6 +1245,38 @@ mod tests {
         assert_eq!(plan.should, vec![should]);
         assert_eq!(plan.must, vec![must]);
         assert_eq!(plan.must_not, vec![must_not]);
+    }
+
+    #[test]
+    fn test_boolean_query_columns_include_must_not() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string()).with_column(Some("body".to_string()));
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["title".to_string(), "body".to_string()])
+        );
+        assert!(!query.is_missing_column());
+    }
+
+    #[test]
+    fn test_boolean_query_missing_must_not_column_is_detected() {
+        use super::*;
+
+        let must = MatchQuery::new("required".to_string()).with_column(Some("title".to_string()));
+        let must_not = MatchQuery::new("blocked".to_string());
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (Occur::Must, must.into()),
+            (Occur::MustNot, must_not.into()),
+        ]));
+
+        assert!(query.is_missing_column());
     }
 
     #[test]
