@@ -219,7 +219,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             .await
             .unwrap();
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.is_empty() {
         return Ok(());
     }
 
@@ -299,27 +299,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         return Ok(());
     }
 
-    // Compose the row-address remap across all versions. `remap_row_id` already
-    // chains every version (and passes through addresses a version does not
-    // touch), so mapping the union of all versions' keys yields a single
-    // baseline -> final address map applied in one rebuild.
-    //
-    // Map every old address; do NOT filter by the current `fragment_bitmap`. In
-    // the sibling-coverage-remap case the bitmap was already advanced onto the
-    // new fragments while the index data still holds old addresses, so filtering
-    // by it would drop exactly the keys this index needs and leave its data
-    // stale (an empty map makes `index::remap_index` return `Keep`). The map is
-    // bounded by the rows the reuse index touched; addresses this index does not
-    // store are simply never looked up.
-    let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
-        .row_id_maps
-        .iter()
-        .flat_map(|row_id_map| row_id_map.keys().copied())
-        .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
-        .collect();
-
-    let remapper = RowAddrRemap::direct(composed_row_id_map);
-    let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
+    // Apply the compact version chain directly while rebuilding the index. The
+    // remapper passes intermediate moved addresses into later FRI versions and
+    // leaves missing mappings unchanged, so no composed per-row map is needed.
+    // This also handles the sibling-coverage-remap case: remapping is driven by
+    // the row addresses stored in the index, not by its already-advanced bitmap.
+    let remap_result =
+        index::remap_index(dataset, index_id, frag_reuse_index.row_addr_remap()).await?;
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
