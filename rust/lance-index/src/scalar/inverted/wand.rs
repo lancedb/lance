@@ -530,6 +530,7 @@ struct BlockMaxWindow {
 
 struct BlockMaxScore {
     score: f32,
+    #[cfg(test)]
     blocks_scanned: usize,
 }
 
@@ -561,6 +562,7 @@ impl BlockMaxWindow {
             self.reset(start_block_idx);
             return BlockMaxScore {
                 score: 0.0,
+                #[cfg(test)]
                 blocks_scanned: 0,
             };
         }
@@ -577,6 +579,7 @@ impl BlockMaxWindow {
             self.reset(start_block_idx);
             return BlockMaxScore {
                 score: 0.0,
+                #[cfg(test)]
                 blocks_scanned: 0,
             };
         }
@@ -588,11 +591,13 @@ impl BlockMaxWindow {
             self.reset(start_block_idx);
             return BlockMaxScore {
                 score: scorer_upper_bound(query_weight, scorer),
+                #[cfg(test)]
                 blocks_scanned: 0,
             };
         }
 
         self.next_block_idx = self.next_block_idx.max(start_block_idx);
+        #[cfg(test)]
         let mut blocks_scanned = 0;
         while self.next_block_idx < list.blocks.len()
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
@@ -611,7 +616,10 @@ impl BlockMaxWindow {
             }
             self.max_scores.push_back((self.next_block_idx, score));
             self.next_block_idx += 1;
-            blocks_scanned += 1;
+            #[cfg(test)]
+            {
+                blocks_scanned += 1;
+            }
         }
 
         let score = self
@@ -621,6 +629,7 @@ impl BlockMaxWindow {
             .unwrap_or(0.0);
         BlockMaxScore {
             score,
+            #[cfg(test)]
             blocks_scanned,
         }
     }
@@ -925,6 +934,19 @@ impl PostingIterator {
     #[inline]
     fn approximate_upper_bound(&self) -> f32 {
         self.approximate_upper_bound
+    }
+
+    /// Upper bound for the frequency clamp used by bulk conjunction search.
+    /// No-impact postings scored in a corpus-global scorer space cannot reuse
+    /// their persisted partition-local maximum. Impact-backed postings retain
+    /// their existing fast path.
+    #[inline]
+    fn frequency_clamp_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
+        if self.use_scorer_upper_bound {
+            scorer_upper_bound(self.query_weight, scorer)
+        } else {
+            self.approximate_upper_bound
+        }
     }
 
     /// Tightest known list-wide score bound. Impact lists answer from the
@@ -1324,6 +1346,7 @@ impl PostingIterator {
                 if self.has_grouped_terms() && list.block_size == MAX_POSTING_BLOCK_SIZE {
                     return BlockMaxScore {
                         score: self.approximate_upper_bound,
+                        #[cfg(test)]
                         blocks_scanned: 0,
                     };
                 }
@@ -1332,6 +1355,7 @@ impl PostingIterator {
                     if up_to <= u64::from(level0_up_to) {
                         return BlockMaxScore {
                             score: level0_score,
+                            #[cfg(test)]
                             blocks_scanned: 0,
                         };
                     }
@@ -1339,6 +1363,7 @@ impl PostingIterator {
                 if self.use_scorer_upper_bound {
                     return BlockMaxScore {
                         score: scorer_upper_bound(self.query_weight, scorer),
+                        #[cfg(test)]
                         blocks_scanned: 0,
                     };
                 }
@@ -1357,6 +1382,7 @@ impl PostingIterator {
                 } else {
                     self.approximate_upper_bound
                 },
+                #[cfg(test)]
                 blocks_scanned: 0,
             },
         }
@@ -2005,6 +2031,7 @@ impl PartialEq for TailPosting {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct AndWindowStats {
     windows_wide: usize,
@@ -2012,14 +2039,6 @@ struct AndWindowStats {
     windows_skipped: usize,
     range_blocks_scanned: usize,
     candidates_returned: usize,
-}
-
-#[derive(Default)]
-struct AndSearchStats {
-    pruned_before_return_start: usize,
-    candidates_seen: usize,
-    full_scores: usize,
-    freqs_collected: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2071,8 +2090,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Last conjunction doc returned to the caller. The next conjunction search
     // resumes strictly after this doc, like Lucene's `nextDoc()/advance()`.
     and_last_doc: Option<u64>,
+    #[cfg(test)]
     and_window_stats: AndWindowStats,
-    and_candidates_pruned_before_return: usize,
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
@@ -2148,8 +2167,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             up_to: None,
             and_max_score: f32::INFINITY,
             and_last_doc: None,
+            #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
-            and_candidates_pruned_before_return: 0,
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
@@ -2281,19 +2300,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
-        let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
-            pruned_before_return_start: self.and_candidates_pruned_before_return,
-            ..Default::default()
-        });
         loop {
             self.raise_to_shared_floor(params.wand_factor);
             let Some((doc, _)) = self.next()? else {
                 break;
             };
             num_comparisons += 1;
-            if let Some(and_stats) = and_search_stats.as_mut() {
-                and_stats.candidates_seen += 1;
-            }
 
             let posting_doc_id = doc.doc_id();
             let Some(document_key) = self.documents.document_key(&doc) else {
@@ -2321,9 +2333,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 {
                     continue;
                 }
-                if let Some(and_stats) = and_search_stats.as_mut() {
-                    and_stats.full_scores += 1;
-                }
                 self.score_in_query_order(doc_length)
             };
 
@@ -2332,38 +2341,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 doc_length,
                 posting_doc_id,
                 self.iter_term_freqs(),
-            )? {
-                if let Some(and_stats) = and_search_stats.as_mut() {
-                    and_stats.freqs_collected += 1;
-                }
-                if let Some(kth) = candidates.kth_score_if_full() {
-                    self.update_threshold(kth, params.wand_factor);
-                }
+            )? && let Some(kth) = candidates.kth_score_if_full()
+            {
+                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
             }
         }
-        if self.operator == Operator::And {
-            tracing::debug!(
-                and_windows_wide = self.and_window_stats.windows_wide,
-                and_windows_narrow = self.and_window_stats.windows_narrow,
-                and_windows_skipped = self.and_window_stats.windows_skipped,
-                and_range_blocks_scanned = self.and_window_stats.range_blocks_scanned,
-                and_candidates_returned = self.and_window_stats.candidates_returned,
-                "fts conjunction block-max window stats"
-            );
-        }
         metrics.record_comparisons(num_comparisons);
-        if let Some(and_stats) = and_search_stats {
-            let and_candidates_pruned_before_return = self
-                .and_candidates_pruned_before_return
-                .saturating_sub(and_stats.pruned_before_return_start);
-            metrics.record_and_candidates_seen(and_stats.candidates_seen);
-            metrics.record_and_candidates_pruned_before_return(and_candidates_pruned_before_return);
-            metrics.record_and_full_scores(and_stats.full_scores);
-            metrics.record_freqs_collected(and_stats.freqs_collected);
-        }
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -3114,8 +3100,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn next(&mut self) -> Result<Option<(DocInfo, f32)>> {
         if self.operator == Operator::And {
             let candidate = self.next_and_candidate();
-            if candidate.is_some() {
-                self.and_window_stats.candidates_returned += 1;
+            #[cfg(test)]
+            {
+                if candidate.is_some() {
+                    self.and_window_stats.candidates_returned += 1;
+                }
             }
             return Ok(candidate.map(|doc| (doc, 0.0)));
         }
@@ -3251,7 +3240,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
             let doc_length = self.documents.doc_length(&lead_doc);
             if self.and_candidate_cannot_beat_threshold(doc_length) {
-                self.and_candidates_pruned_before_return += 1;
                 let next_target = self.and_advance_target(doc.saturating_add(1));
                 if next_target == TERMINATED_DOC_ID {
                     return None;
@@ -3472,10 +3460,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
-        let mut stats = AndSearchStats {
-            pruned_before_return_start: self.and_candidates_pruned_before_return,
-            ..Default::default()
-        };
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
         // Per-window candidate batch. The merge kernel only records matches;
         // scoring then runs in two passes so the doc-length gather issues
@@ -3514,7 +3498,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         // The clamp bucket must bound every frequency it absorbs; the
         // clause-wide sup does.
-        freq_bound_lut[FREQ_LUT_BUCKETS - 1] = self.lead[0].approximate_upper_bound();
+        freq_bound_lut[FREQ_LUT_BUCKETS - 1] =
+            self.lead[0].frequency_clamp_upper_bound(&self.scorer);
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
@@ -3718,12 +3703,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             score_sum_upper_bound_factor(num_lists),
                             CompetitiveFloorMode::Exclusive,
                         ) {
-                            self.and_candidates_pruned_before_return += 1;
                             continue;
                         }
                     }
-                    stats.candidates_seen += 1;
-                    self.and_window_stats.candidates_returned += 1;
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.candidates_returned += 1;
+                    }
                     num_comparisons += 1;
 
                     let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
@@ -3753,8 +3739,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             continue;
                         }
                     }
-                    stats.full_scores += 1;
-
                     let mut score = 0.0_f32;
                     for &clause_index in &score_order {
                         let win = &wins[clause_index];
@@ -3780,11 +3764,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 })
                             },
                         ),
-                    )? {
-                        stats.freqs_collected += 1;
-                        if let Some(kth) = candidates.kth_score_if_full() {
-                            self.update_threshold(kth, params.wand_factor);
-                        }
+                    )? && let Some(kth) = candidates.kth_score_if_full()
+                    {
+                        self.update_threshold(kth, params.wand_factor);
                     }
                 }
             }
@@ -3795,22 +3777,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             target = win_end + 1;
         }
 
-        tracing::debug!(
-            and_windows_wide = self.and_window_stats.windows_wide,
-            and_windows_narrow = self.and_window_stats.windows_narrow,
-            and_windows_skipped = self.and_window_stats.windows_skipped,
-            and_range_blocks_scanned = self.and_window_stats.range_blocks_scanned,
-            and_candidates_returned = self.and_window_stats.candidates_returned,
-            "fts conjunction block-max window stats (bulk)"
-        );
         metrics.record_comparisons(num_comparisons);
-        let pruned_before_return = self
-            .and_candidates_pruned_before_return
-            .saturating_sub(stats.pruned_before_return_start);
-        metrics.record_and_candidates_seen(stats.candidates_seen);
-        metrics.record_and_candidates_pruned_before_return(pruned_before_return);
-        metrics.record_and_full_scores(stats.full_scores);
-        metrics.record_freqs_collected(stats.freqs_collected);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -3847,7 +3814,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if narrow_max_score >= self.threshold {
             self.up_to = Some(narrow_up_to);
             self.and_max_score = narrow_max_score;
-            self.and_window_stats.windows_narrow += 1;
+            #[cfg(test)]
+            {
+                self.and_window_stats.windows_narrow += 1;
+            }
             return;
         }
 
@@ -3862,26 +3832,39 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         if can_try_wide {
             let mut wide_bounds = SmallVec::<[f32; 8]>::new();
+            #[cfg(test)]
             let mut range_blocks_scanned = 0;
             for posting in &mut self.lead {
                 let block_max = posting.block_max_score_up_to_with_stats(lead_up_to, &self.scorer);
                 wide_bounds.push(block_max.score);
-                range_blocks_scanned += block_max.blocks_scanned;
+                #[cfg(test)]
+                {
+                    range_blocks_scanned += block_max.blocks_scanned;
+                }
             }
             let wide_max_score = conservative_score_sum(wide_bounds.into_iter());
-            self.and_window_stats.range_blocks_scanned += range_blocks_scanned;
+            #[cfg(test)]
+            {
+                self.and_window_stats.range_blocks_scanned += range_blocks_scanned;
+            }
 
             if wide_max_score < self.threshold {
                 self.up_to = Some(lead_up_to);
                 self.and_max_score = wide_max_score;
-                self.and_window_stats.windows_wide += 1;
+                #[cfg(test)]
+                {
+                    self.and_window_stats.windows_wide += 1;
+                }
                 return;
             }
         }
 
         self.up_to = Some(narrow_up_to);
         self.and_max_score = narrow_max_score;
-        self.and_window_stats.windows_narrow += 1;
+        #[cfg(test)]
+        {
+            self.and_window_stats.windows_narrow += 1;
+        }
     }
 
     fn and_advance_target(&mut self, mut target: u64) -> u64 {
@@ -3896,7 +3879,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if self.and_max_score >= self.threshold {
                 return target;
             }
-            self.and_window_stats.windows_skipped += 1;
+            #[cfg(test)]
+            {
+                self.and_window_stats.windows_skipped += 1;
+            }
             if up_to == TERMINATED_DOC_ID {
                 return TERMINATED_DOC_ID;
             }
@@ -5021,7 +5007,7 @@ mod tests {
     use super::*;
     use crate::scalar::inverted::scorer::{IndexBM25Scorer, MemBM25Scorer};
     use crate::{
-        metrics::{MetricsCollector, NoOpMetricsCollector},
+        metrics::{LocalMetricsCollector, NoOpMetricsCollector},
         scalar::inverted::{
             CompressedPostingList, PlainPostingList, PostingListBuilder, SharedPositionStream,
             builder::PositionRecorder,
@@ -5651,80 +5637,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct CountAndSearchStats {
-        comparisons: AtomicUsize,
-        candidates_seen: AtomicUsize,
-        candidates_pruned_before_return: AtomicUsize,
-        full_scores: AtomicUsize,
-        freqs_collected: AtomicUsize,
-    }
-
-    impl MetricsCollector for CountAndSearchStats {
-        fn record_parts_loaded(&self, _: usize) {}
-
-        fn record_index_loads(&self, _: usize) {}
-
-        fn record_comparisons(&self, n: usize) {
-            self.comparisons.fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_and_candidates_seen(&self, n: usize) {
-            self.candidates_seen.fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_and_candidates_pruned_before_return(&self, n: usize) {
-            self.candidates_pruned_before_return
-                .fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_and_full_scores(&self, n: usize) {
-            self.full_scores.fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_freqs_collected(&self, n: usize) {
-            self.freqs_collected.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    struct PanicOnAndMetrics {
-        comparisons: AtomicUsize,
-    }
-
-    impl PanicOnAndMetrics {
-        fn new() -> Self {
-            Self {
-                comparisons: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl MetricsCollector for PanicOnAndMetrics {
-        fn record_parts_loaded(&self, _: usize) {}
-
-        fn record_index_loads(&self, _: usize) {}
-
-        fn record_comparisons(&self, n: usize) {
-            self.comparisons.fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_and_candidates_seen(&self, _: usize) {
-            panic!("OR search should not record AND candidate metrics");
-        }
-
-        fn record_and_candidates_pruned_before_return(&self, _: usize) {
-            panic!("OR search should not record AND prune metrics");
-        }
-
-        fn record_and_full_scores(&self, _: usize) {
-            panic!("OR search should not record AND scoring metrics");
-        }
-
-        fn record_freqs_collected(&self, _: usize) {
-            panic!("OR search should not record AND frequency metrics");
-        }
-    }
-
     fn generate_posting_list(
         doc_ids: Vec<u32>,
         max_score: f32,
@@ -6225,7 +6137,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_or_search_does_not_record_and_metrics(#[values(false, true)] is_compressed: bool) {
+    fn test_or_search_records_comparisons(#[values(false, true)] is_compressed: bool) {
         let mut docs = DocSet::default();
         for row_id in 0..6 {
             docs.append(row_id, 1);
@@ -6251,7 +6163,7 @@ mod tests {
         ];
 
         let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
-        let metrics = PanicOnAndMetrics::new();
+        let metrics = LocalMetricsCollector::default();
         let candidates = wand.search(&FtsSearchParams::default(), &metrics).unwrap();
 
         assert_eq!(sorted_candidate_row_ids(candidates), vec![0, 1, 2, 4, 5]);
@@ -7078,7 +6990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_candidate_prune_records_scoring_counters() {
+    fn test_and_candidate_prune_keeps_top_candidate() {
         let total_docs = 2 * BLOCK_SIZE as u32 + 1;
         let mut docs = DocSet::default();
         for doc_id in 0..total_docs {
@@ -7113,7 +7025,7 @@ mod tests {
             &docs,
             InverseDocLengthScorer,
         );
-        let metrics = CountAndSearchStats::default();
+        let metrics = LocalMetricsCollector::default();
         let result = wand
             .search(&FtsSearchParams::new().with_limit(Some(1)), &metrics)
             .unwrap();
@@ -7124,16 +7036,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(addrs, vec![0]);
 
-        let candidates_seen = metrics.candidates_seen.load(Ordering::Relaxed);
-        let candidates_pruned_before_return = metrics
-            .candidates_pruned_before_return
-            .load(Ordering::Relaxed);
-        let full_scores = metrics.full_scores.load(Ordering::Relaxed);
         assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 1);
-        assert_eq!(candidates_seen, 1);
-        assert!(candidates_pruned_before_return > 0);
-        assert_eq!(full_scores, 1);
-        assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
     }
 
     #[test]

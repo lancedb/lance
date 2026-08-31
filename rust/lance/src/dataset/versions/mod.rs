@@ -19,7 +19,9 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -125,6 +127,7 @@ pub async fn write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
@@ -152,6 +155,7 @@ pub async fn write_fragments(
         params,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await?;
     Ok((fragments, schema))
@@ -168,17 +172,50 @@ pub async fn write_fragments_direct(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
-    let buffered_reader = match version {
-        ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+    let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
+        if file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "File row counts must be greater than zero",
+            ));
+        }
+        match version {
+            ConcreteFileVersion::V1 => {
+                if params.max_rows_per_group == 0 {
+                    return Err(Error::invalid_input(
+                        "max_rows_per_group must be greater than zero when file row counts are specified",
+                    ));
+                }
+                let max_rows_per_group = params.max_rows_per_group;
+                let batch_row_counts =
+                    file_row_counts
+                        .clone()
+                        .into_iter()
+                        .flat_map(move |file_rows| {
+                            (0..file_rows)
+                                .step_by(max_rows_per_group)
+                                .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+                        });
+                chunk_stream_with_sizes(data, batch_row_counts)
+            }
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream_with_sizes(data, file_row_counts.clone()),
+        }
+    } else {
+        match version {
+            ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
+                .map_ok(|batch| vec![batch])
+                .boxed(),
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -199,19 +236,9 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await
-}
-
-fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
-    for fragment in fragments {
-        for data_file in &fragment.files {
-            if data_file.file_version()? != expected {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
 }
 
 pub async fn can_use_binary_copy(
@@ -226,9 +253,6 @@ pub async fn can_use_binary_copy(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
-            if !binary_copy_files_match(fragments, version)? {
-                return Ok(false);
-            }
             super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
         }
     }
@@ -240,11 +264,13 @@ pub async fn rewrite_files_binary_copy(
     fragments: &[Fragment],
     params: &WriteParams,
     read_batch_bytes: Option<usize>,
-) -> Result<Vec<Fragment>> {
+) -> Result<super::optimize::binary_copy::BinaryCopyOutcome> {
     match version {
-        ConcreteFileVersion::V1 => Err(Error::not_supported(
-            "binary-copy compaction is not supported for Lance file version 1".to_string(),
-        )),
+        ConcreteFileVersion::V1 => Ok(
+            super::optimize::binary_copy::BinaryCopyOutcome::Unsupported(
+                lance_file::concat::FileConcatReason::LegacyVersion,
+            ),
+        ),
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
