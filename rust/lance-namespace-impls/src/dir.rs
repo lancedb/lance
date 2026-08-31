@@ -11461,20 +11461,22 @@ mod tests {
     }
 
     /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
-    fn create_composite_key_ipc_data(rows: &[(&str, i32, &str)]) -> Vec<u8> {
+    ///
+    /// `region` is nullable so tests can cover a NULL in one half of the key.
+    fn create_composite_key_ipc_data(rows: &[(Option<&str>, i32, &str)]) -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("region", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, true),
             Field::new("id", DataType::Int32, false),
             Field::new("value", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from_iter_values(
+                Arc::new(StringArray::from_iter(
                     rows.iter().map(|(region, _, _)| *region),
                 )),
                 Arc::new(Int32Array::from_iter_values(
@@ -11487,6 +11489,42 @@ mod tests {
         )
         .unwrap();
         create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    /// `test_table`'s rows as `(region, id, value)`, sorted for a stable comparison.
+    async fn read_composite_key_rows(root: &str) -> Vec<(Option<String>, i32, String)> {
+        use arrow::array::Array;
+
+        let dataset = Dataset::open(&format!("{}/test_table.lance", root))
+            .await
+            .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    regions
+                        .is_valid(row)
+                        .then(|| regions.value(row).to_string()),
+                    ids.value(row),
+                    values.value(row).to_string(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
     }
 
     #[tokio::test]
@@ -11505,7 +11543,11 @@ mod tests {
         declare_req.id = Some(vec!["test_table".to_string()]);
         namespace.declare_table(declare_req).await.unwrap();
 
-        let seed = create_composite_key_ipc_data(&[("us", 1, "a"), ("us", 2, "b"), ("eu", 1, "c")]);
+        let seed = create_composite_key_ipc_data(&[
+            (Some("us"), 1, "a"),
+            (Some("us"), 2, "b"),
+            (Some("eu"), 1, "c"),
+        ]);
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
         merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
@@ -11524,8 +11566,8 @@ mod tests {
             .merge_insert_into_table(
                 merge_req,
                 bytes::Bytes::from(create_composite_key_ipc_data(&[
-                    ("us", 1, "updated"),
-                    ("eu", 2, "inserted"),
+                    (Some("us"), 1, "updated"),
+                    (Some("eu"), 2, "inserted"),
                 ])),
             )
             .await
@@ -11534,34 +11576,74 @@ mod tests {
         assert_eq!(response.num_updated_rows, Some(1));
         assert_eq!(response.num_inserted_rows, Some(1));
 
-        let dataset = Dataset::open(&format!("{}/test_table.lance", temp_path))
-            .await
-            .unwrap();
-        let batch = dataset.scan().try_into_batch().await.unwrap();
-        let regions = batch["region"]
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        let ids = batch["id"]
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .unwrap();
-        let values = batch["value"]
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        let mut rows: Vec<(&str, i32, &str)> = (0..batch.num_rows())
-            .map(|row| (regions.value(row), ids.value(row), values.value(row)))
-            .collect();
-        rows.sort_unstable();
         assert_eq!(
-            rows,
+            read_composite_key_rows(temp_path).await,
             vec![
                 // ("eu", 1) keeps its value: matching on `id` alone would have clobbered it.
-                ("eu", 1, "c"),
-                ("eu", 2, "inserted"),
-                ("us", 1, "updated"),
-                ("us", 2, "b"),
+                (Some("eu".into()), 1, "c".into()),
+                (Some("eu".into()), 2, "inserted".into()),
+                (Some("us".into()), 1, "updated".into()),
+                (Some("us".into()), 2, "b".into()),
+            ]
+        );
+    }
+
+    /// Core switches NULL join semantics on the arity of the match key
+    /// (`merge_insert.rs`, `NullEquality`): a single-column key treats NULL as equal to
+    /// NULL, while a composite key uses standard SQL equality, under which it is not. So
+    /// adding a second key column changes whether NULL-keyed rows match at all.
+    #[tokio::test]
+    async fn test_merge_insert_composite_key_never_matches_a_null_key_column() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (None, 1, "seeded"),
+                    (Some("us"), 1, "us-seeded"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(None, 1, "not-a-match")])),
+            )
+            .await
+            .unwrap();
+
+        // The incoming row is byte-identical to the seeded one, and still does not match.
+        assert_eq!(response.num_updated_rows, Some(0));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                (None, 1, "not-a-match".into()),
+                (None, 1, "seeded".into()),
+                (Some("us".into()), 1, "us-seeded".into()),
             ]
         );
     }
@@ -11598,7 +11680,7 @@ mod tests {
         let error = namespace
             .merge_insert_into_table(
                 merge_req,
-                bytes::Bytes::from(create_composite_key_ipc_data(&[("us", 1, "a")])),
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(Some("us"), 1, "a")])),
             )
             .await
             .unwrap_err();
