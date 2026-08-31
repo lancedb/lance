@@ -93,8 +93,8 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
     key.iter()
         .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
-        .sum::<u32>() as f32
+        .map(|(&x, &y)| (x.abs_diff(y) as u64).pow(2))
+        .sum::<u64>() as f32
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -144,7 +144,7 @@ impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        super::l2_u8::l2_u8(x, y) as f32
+        super::l2_u8::l2_u8_u64(x, y) as f32
     }
 }
 
