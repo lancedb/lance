@@ -14,19 +14,6 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
-// This function is used to sum the distance table for 4-bit codes.
-// the distance table is a 2D array, that dist_table[i][j] is the distance between the i-th subvector and the code j,
-// the distance table is stored as a flat array for better cache locality and SIMD instruction usage.
-//
-// The codes are organized in the order of PERM0:
-// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
-// | address  |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |  8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 |
-// | (bytes)  |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |
-// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
-// | bits 0..3|  0 |  8 |  1 |  9 |  2 | 10 |  3 | 11 |  4 | 12 |  5 | 13 |  6 | 14 |  7 | 15 |
-// | bits 4..7| 16 | 24 | 17 | 25 | 18 | 26 | 19 | 27 | 20 | 28 | 21 | 29 | 22 | 30 | 23 | 31 |
-// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
-// so that we can use SIMD instruction (especially _mm256_shuffle_epi8) to do the summation.
 /// Which kernel a `dist_table` entry point runs on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DistTableBackend {
@@ -84,6 +71,19 @@ fn x86_dist_table_features() -> (bool, bool) {
     }
 }
 
+// This function is used to sum the distance table for 4-bit codes.
+// the distance table is a 2D array, that dist_table[i][j] is the distance between the i-th subvector and the code j,
+// the distance table is stored as a flat array for better cache locality and SIMD instruction usage.
+//
+// The codes are organized in the order of PERM0:
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// | address  |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |  8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 |
+// | (bytes)  |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// | bits 0..3|  0 |  8 |  1 |  9 |  2 | 10 |  3 | 11 |  4 | 12 |  5 | 13 |  6 | 14 |  7 | 15 |
+// | bits 4..7| 16 | 24 | 17 | 25 | 18 | 26 | 19 | 27 | 20 | 28 | 21 | 29 | 22 | 30 | 23 | 31 |
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// so that we can use SIMD instruction (especially _mm256_shuffle_epi8) to do the summation.
 #[inline]
 pub fn sum_4bit_dist_table(
     n: usize,
@@ -712,8 +712,10 @@ mod tests {
 
     /// The tier ladder is exclusive, so most of these combinations cannot be
     /// produced by any one host and the selector is the only place they can be
-    /// checked. `avx512_kernel` false is the hacc entry point, which has no
-    /// AVX-512 kernel of its own.
+    /// checked. `avx512_kernel` false covers both callers that reach it: the hacc
+    /// entry point, which has no AVX-512 kernel at all, and
+    /// `sum_4bit_dist_table_uninit` in a build where
+    /// `kernel_support = "avx512_dist_table"` is unset.
     #[rstest::rstest]
     // An AVX-512 host with the C kernel built takes it.
     #[case::avx512_ready(SimdSupport::Avx512, true, true, true, DistTableBackend::Avx512)]
@@ -746,6 +748,9 @@ mod tests {
     // `Avx` and `AvxFma` lack the integer ops the AVX2 inner uses.
     #[case::avx_fma(SimdSupport::AvxFma, false, false, false, DistTableBackend::Scalar)]
     #[case::avx(SimdSupport::Avx, false, false, false, DistTableBackend::Scalar)]
+    // AVX2 present but the tier says otherwise, which is what an AVX2 host
+    // without FMA reports. The tier gate has to hold on its own here.
+    #[case::avx_tier_with_avx2(SimdSupport::Avx, false, false, true, DistTableBackend::Scalar)]
     #[case::sse(SimdSupport::Sse, false, false, false, DistTableBackend::Scalar)]
     #[case::none(SimdSupport::None, false, false, false, DistTableBackend::Scalar)]
     #[case::neon(SimdSupport::Neon, false, false, false, DistTableBackend::Neon)]
