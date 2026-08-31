@@ -40,7 +40,6 @@ use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{
     IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
 };
-use crate::index::vector::details::physical_fragment_bitmap;
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -48,8 +47,6 @@ pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
-    /// Exact physical coverage when the output was rebuilt from current rows.
-    pub new_physical_fragment_bitmap: Option<RoaringBitmap>,
     pub new_dataset_version: u64,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
@@ -690,19 +687,6 @@ async fn build_fresh_vector_segment(
     .await
 }
 
-fn segment_merge_requires_rebuild(dataset: &Dataset, index: &IndexMetadata) -> bool {
-    let owned_fragments = index
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
-        .or_else(|| index.fragment_bitmap.clone())
-        .unwrap_or_default();
-
-    let Some(physical_fragments) = physical_fragment_bitmap(index) else {
-        return true;
-    };
-    let unowned_physical_fragments = &physical_fragments - &owned_fragments;
-    unowned_physical_fragments.intersection_len(&dataset.fragment_bitmap) > 0
-}
-
 async fn scan_vector_fragments(
     dataset: &Dataset,
     field_path: &str,
@@ -747,7 +731,6 @@ fn fresh_vector_segment_result<'a>(
     Ok(IndexMergeResults {
         new_uuid: segment.uuid,
         removed_indices,
-        new_physical_fragment_bitmap: Some(fragment_bitmap.clone()),
         new_fragment_bitmap: fragment_bitmap,
         new_dataset_version: segment.dataset_version,
         new_index_version: segment.index_version,
@@ -960,7 +943,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     new_uuid,
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
-                    new_physical_fragment_bitmap: None,
                     new_dataset_version: dataset.manifest.version,
                     new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
                         .version(),
@@ -1019,26 +1001,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     field_path.clone(),
                     vec![(selected_metadata, selected_index)],
                 )?;
-                let new_fragment_bitmap = removed_segment
-                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                    .or_else(|| removed_segment.fragment_bitmap.clone())
-                    .unwrap_or_default();
-                if segment_merge_requires_rebuild(dataset.as_ref(), removed_segment) {
-                    let segment = build_fresh_vector_segment(
-                        dataset.as_ref(),
-                        &selected_logical_index,
-                        &field_path,
-                        &new_fragment_bitmap,
-                        options.progress.clone(),
-                    )
-                    .await?;
-                    return fresh_vector_segment_result(
-                        segment,
-                        &new_fragment_bitmap,
-                        vec![removed_segment],
-                    )
-                    .map(Some);
-                }
                 let selected_ivf_view = selected_logical_index.as_ivf()?;
                 let (new_uuid, indices_merged, files) = Box::pin(optimize_vector_indices(
                     dataset.as_ref().clone(),
@@ -1055,6 +1017,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 if indices_merged == 0 {
                     return Ok(None);
                 }
+
+                let new_fragment_bitmap = removed_segment
+                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    .or_else(|| removed_segment.fragment_bitmap.clone())
+                    .unwrap_or_default();
 
                 Ok((
                     new_uuid,
@@ -1089,34 +1056,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .map(|(metadata, index)| (metadata.clone(), index.clone()))
                         .collect(),
                 )?;
-                let selected_segments = &old_indices[merge_start..];
-                if selected_segments
-                    .iter()
-                    .any(|segment| segment_merge_requires_rebuild(dataset.as_ref(), segment))
-                {
-                    let mut fragment_bitmap = base_unindexed_bitmap.clone();
-                    for segment in selected_segments {
-                        if let Some(effective) =
-                            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                        {
-                            fragment_bitmap |= effective;
-                        }
-                    }
-                    let segment = build_fresh_vector_segment(
-                        dataset.as_ref(),
-                        &merge_logical_index,
-                        &field_path,
-                        &fragment_bitmap,
-                        options.progress.clone(),
-                    )
-                    .await?;
-                    return fresh_vector_segment_result(
-                        segment,
-                        &fragment_bitmap,
-                        selected_segments.to_vec(),
-                    )
-                    .map(Some);
-                }
                 let merge_ivf_view = merge_logical_index.as_ivf()?;
 
                 let new_data_stream = if unindexed.is_empty() {
@@ -1279,7 +1218,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             new_uuid,
                             removed_indices: old_indices.to_vec(),
                             new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
-                            new_physical_fragment_bitmap: None,
                             new_dataset_version: dataset.manifest.version,
                             new_index_version: created_index.index_version as i32,
                             new_index_details: created_index.index_details,
@@ -1414,7 +1352,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_uuid,
         removed_indices,
         new_fragment_bitmap,
-        new_physical_fragment_bitmap: None,
         new_dataset_version,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
@@ -2661,11 +2598,6 @@ mod tests {
             dataset.fragment_bitmap.as_ref(),
             "the compatible merge must preserve exact fragment coverage"
         );
-        assert_eq!(
-            crate::index::vector::details::physical_fragment_bitmap(&merged[0]),
-            Some(dataset.fragment_bitmap.as_ref().clone()),
-            "the compatible merge must preserve physical fragment coverage"
-        );
     }
 
     #[tokio::test]
@@ -2942,50 +2874,6 @@ mod tests {
         assert!(
             ids.values().iter().all(|id| *id < 20),
             "stale pre-update vectors must not survive the optimize merge: {ids:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_stable_row_id_segment_built_after_deletion_keeps_merge_fast_path() {
-        let mut dataset = lance_datagen::gen_batch()
-            .col("id", array::step::<UInt32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(4)))
-            .into_dataset_with_params(
-                "memory://",
-                FragmentCount(1),
-                FragmentRowCount(40),
-                Some(WriteParams {
-                    enable_stable_row_ids: true,
-                    max_rows_per_file: 40,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-        dataset.delete("id < 20").await.unwrap();
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector_idx".to_string()),
-                &VectorIndexParams::ivf_flat(1, MetricType::L2),
-                true,
-            )
-            .await
-            .unwrap();
-
-        let segment = dataset
-            .load_indices_by_name("vector_idx")
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        let fragments = dataset.get_fragments();
-        let deletion_file = fragments[0].metadata().deletion_file.as_ref().unwrap();
-        assert!(deletion_file.read_version < segment.dataset_version);
-        assert!(
-            !segment_merge_requires_rebuild(&dataset, &segment),
-            "a segment built after a deletion must retain the auxiliary merge fast path"
         );
     }
 

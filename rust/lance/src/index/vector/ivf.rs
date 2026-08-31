@@ -5,7 +5,6 @@
 
 use super::{
     LogicalIvfView, derive_hnsw_params,
-    details::with_physical_fragment_bitmap,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
@@ -67,6 +66,7 @@ use lance_file::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
@@ -113,6 +113,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
 use log::{info, warn};
 use object_store::path::Path;
@@ -126,7 +127,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tokio::sync::mpsc;
 use tracing::instrument;
@@ -188,12 +189,20 @@ pub struct IVFIndex {
     pub metric_type: MetricType,
 
     index_cache: WeakLanceCache,
+    partition_rows: Vec<OnceLock<Arc<RowAddrTreeMap>>>,
 }
 
 impl DeepSizeOf for IVFIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
-        self.reader.deep_size_of_children(context) + self.sub_index.deep_size_of_children(context)
+        self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+            + self
+                .partition_rows
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|rows| rows.deep_size_of_children(context))
+                .sum::<usize>()
     }
 }
 
@@ -223,7 +232,38 @@ impl IVFIndex {
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
             index_cache: WeakLanceCache::from(&index_cache),
+            partition_rows: (0..num_partitions).map(|_| OnceLock::new()).collect(),
         })
+    }
+
+    fn cache_partition_rows(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndex,
+    ) -> Result<Arc<RowAddrTreeMap>> {
+        let rows = self.partition_rows.get(partition_id).ok_or_else(|| {
+            Error::index(format!(
+                "partition id {partition_id} is out of range of {} partitions",
+                self.ivf.num_partitions()
+            ))
+        })?;
+        Ok(rows
+            .get_or_init(|| Arc::new(partition.row_ids().collect()))
+            .clone())
+    }
+
+    fn prefilter_for_partition(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndex,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Arc<dyn PreFilter>> {
+        let rows = self.cache_partition_rows(partition_id, partition)?;
+        if pre_filter.is_empty_for(rows.as_ref()) {
+            Ok(Arc::new(NoFilter))
+        } else {
+            Ok(pre_filter)
+        }
     }
 
     /// Load one partition of the IVF sub-index.
@@ -283,6 +323,7 @@ impl IVFIndex {
                 idx
             }
         };
+        self.cache_partition_rows(partition_id, part_index.as_ref())?;
         Ok(part_index)
     }
 
@@ -1394,6 +1435,9 @@ impl VectorIndex for IVFIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+        let pre_filter =
+            self.prefilter_for_partition(partition_id, part_index.as_ref(), pre_filter)?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let batch = part_index.search(&query, pre_filter, metrics).await?;
@@ -2461,7 +2505,7 @@ async fn merge_segments_with_row_filters(
     let mut index_details = crate::index::vector_index_details_default();
     for segment in &segments {
         if let Some(details) = segment.index_details.as_deref() {
-            let details = with_physical_fragment_bitmap(details.clone(), None)?;
+            let details = details.clone();
             if !details.value.is_empty() {
                 index_details = details;
                 break;
@@ -2482,8 +2526,6 @@ async fn merge_segments_with_row_filters(
         progress,
     )
     .await?;
-    let index_details = with_physical_fragment_bitmap(index_details, Some(&fragment_bitmap))?;
-
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),

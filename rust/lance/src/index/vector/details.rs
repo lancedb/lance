@@ -24,7 +24,6 @@ use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
@@ -37,69 +36,6 @@ use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
-
-/// Return the immutable physical fragment coverage recorded for a vector segment.
-///
-/// Older segments do not carry this metadata and return `None` so callers can
-/// choose a conservative compatibility path.
-pub fn physical_fragment_bitmap(index: &IndexMetadata) -> Option<RoaringBitmap> {
-    let details = index.index_details.as_deref()?;
-    if !details.type_url.ends_with("VectorIndexDetails") {
-        return None;
-    }
-    let details = details.to_msg::<VectorIndexDetails>().ok()?;
-    let encoded = details.physical_fragment_bitmap.as_deref()?;
-    let mut encoded = encoded;
-    RoaringBitmap::deserialize_from(&mut encoded).ok()
-}
-
-/// Store immutable physical fragment coverage in vector index details.
-///
-/// Passing `None` explicitly marks the coverage as unknown, which is required
-/// when any input to a segment merge predates this metadata.
-pub fn with_physical_fragment_bitmap(
-    details: prost_types::Any,
-    physical_fragments: Option<&RoaringBitmap>,
-) -> Result<prost_types::Any> {
-    if !details.type_url.ends_with("VectorIndexDetails") {
-        return Ok(details);
-    }
-
-    let mut vector_details = details.to_msg::<VectorIndexDetails>().map_err(|error| {
-        Error::index(format!(
-            "Failed to deserialize VectorIndexDetails while recording physical fragment coverage: {error}"
-        ))
-    })?;
-    vector_details.physical_fragment_bitmap = if let Some(bitmap) = physical_fragments
-        && has_vector_index_configuration(&vector_details)
-    {
-        let mut encoded = Vec::with_capacity(bitmap.serialized_size());
-        bitmap.serialize_into(&mut encoded)?;
-        Some(encoded)
-    } else {
-        None
-    };
-    prost_types::Any::from_msg(&vector_details).map_err(|error| {
-        Error::index(format!(
-            "Failed to serialize VectorIndexDetails with physical fragment coverage: {error}"
-        ))
-    })
-}
-
-/// Union physical coverage across merge inputs and newly owned fragments.
-///
-/// A missing input provenance makes the result unknown instead of treating its
-/// mutable ownership bitmap as physical coverage.
-pub fn merged_physical_fragment_bitmap<'a>(
-    source_segments: impl IntoIterator<Item = &'a IndexMetadata>,
-    newly_owned_fragments: &RoaringBitmap,
-) -> Option<RoaringBitmap> {
-    let mut physical_fragments = newly_owned_fragments.clone();
-    for source_segment in source_segments {
-        physical_fragments |= physical_fragment_bitmap(source_segment)?;
-    }
-    Some(physical_fragments)
-}
 
 // Private structs for JSON serialization of VectorIndexDetails.
 // Changes to field names or structure are backwards-incompatible for users
@@ -226,7 +162,6 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
-        physical_fragment_bitmap: None,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -397,8 +332,8 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
 pub fn metric_type_from_index_metadata(index: &IndexMetadata) -> Option<DistanceType> {
     let index_details = index.index_details.as_ref()?;
 
-    // Physical coverage alone does not describe how to interpret the index.
-    if is_empty_vector_details(index_details) {
+    // Empty value bytes indicates legacy index that needs to be opened for details
+    if index_details.value.is_empty() {
         return None;
     }
 
@@ -410,25 +345,10 @@ pub fn metric_type_from_index_metadata(index: &IndexMetadata) -> Option<Distance
     Some(DistanceType::from(metric_enum))
 }
 
-/// Returns true if the proto lacks index-interpretation details.
-///
-/// Physical fragment coverage is independent provenance, so a details message
-/// that contains only that field still needs its index configuration inferred.
-fn has_vector_index_configuration(details: &VectorIndexDetails) -> bool {
-    details.metric_type != VectorMetricType::L2 as i32
-        || details.target_partition_size != 0
-        || details.hnsw_index_config.is_some()
-        || details.compression.is_some()
-        || !details.runtime_hints.is_empty()
-}
-
+/// Returns true if the proto value represents a "truly empty" VectorIndexDetails
+/// (i.e., a legacy index that was created before we populated this field).
 fn is_empty_vector_details(details: &prost_types::Any) -> bool {
-    if details.value.is_empty() {
-        return true;
-    }
-    details
-        .to_msg::<VectorIndexDetails>()
-        .is_ok_and(|details| !has_vector_index_configuration(&details))
+    details.value.is_empty()
 }
 
 /// Returns true if this is a vector index whose details need to be inferred from disk.
@@ -443,7 +363,7 @@ pub fn needs_vector_details_inference(
     schema: &lance_core::datatypes::Schema,
 ) -> bool {
     match &index.index_details {
-        Some(d) => d.type_url.ends_with("VectorIndexDetails") && is_empty_vector_details(d),
+        Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
         None => index.fields.first().is_some_and(|&field_id| {
             schema
                 .field_by_id(field_id)
@@ -486,18 +406,7 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
         .collect();
     for index in indices.iter_mut() {
         if let Some(details) = inferred.get(&index.name) {
-            let physical_fragments = physical_fragment_bitmap(index);
-            match with_physical_fragment_bitmap(
-                details.as_ref().clone(),
-                physical_fragments.as_ref(),
-            ) {
-                Ok(details) => index.index_details = Some(Arc::new(details)),
-                Err(error) => tracing::warn!(
-                    "Could not preserve vector index physical coverage for {}: {}",
-                    index.name,
-                    error
-                ),
-            }
+            index.index_details = Some(details.clone());
         }
     }
 }
@@ -649,7 +558,6 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
-        physical_fragment_bitmap: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -789,7 +697,6 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
-        physical_fragment_bitmap: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -839,7 +746,6 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
-            physical_fragment_bitmap: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -989,7 +895,6 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
-                physical_fragment_bitmap: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
@@ -1144,27 +1049,6 @@ mod tests {
         let vec_id = schema.field("vec").unwrap().id;
         let index = index_over_field(vec_id, Some(vector_index_details_default()));
         assert!(needs_vector_details_inference(&index, &schema));
-    }
-
-    #[test]
-    fn test_physical_coverage_preserves_empty_details_sentinel() {
-        let schema = schema_with_vector_and_scalar();
-        let vec_id = schema.field("vec").unwrap().id;
-        let physical_fragments = RoaringBitmap::from_iter([1, 3]);
-        let details = with_physical_fragment_bitmap(
-            vector_index_details_default(),
-            Some(&physical_fragments),
-        )
-        .unwrap();
-        assert!(details.value.is_empty());
-        let index = index_over_field(vec_id, Some(details));
-        assert_eq!(physical_fragment_bitmap(&index), None);
-        assert!(needs_vector_details_inference(&index, &schema));
-        assert_eq!(metric_type_from_index_metadata(&index), None);
-        assert_eq!(
-            vector_details_as_json(index.index_details.as_deref().unwrap()).unwrap(),
-            "{}"
-        );
     }
 
     #[test]

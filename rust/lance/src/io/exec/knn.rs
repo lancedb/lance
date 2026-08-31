@@ -56,7 +56,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use tokio::sync::Notify;
@@ -65,7 +65,6 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::details::physical_fragment_bitmap;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -1603,6 +1602,10 @@ impl PreFilter for SegmentPreFilter {
         false
     }
 
+    fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
+        self.base.is_empty() && self.ownership_mask.selects_all(rows)
+    }
+
     fn mask(&self) -> Arc<RowAddrMask> {
         self.final_mask
             .lock()
@@ -1617,39 +1620,11 @@ impl PreFilter for SegmentPreFilter {
     }
 }
 
-/// Return whether a segment can still physically contain rows from a fragment it no
-/// longer owns.
-fn segment_needs_ownership_filter(dataset: &Dataset, index: &IndexMetadata) -> bool {
-    let Some(owned_fragments) = index.fragment_bitmap.as_ref() else {
-        return false;
-    };
-    if dataset
-        .fragment_bitmap
-        .iter()
-        .all(|fragment_id| owned_fragments.contains(fragment_id))
-    {
-        return false;
-    }
-
-    let Some(physical_fragments) = physical_fragment_bitmap(index) else {
-        // Legacy vector segments do not record immutable physical coverage. A
-        // missing current fragment may be append-only or may still have stale
-        // rows in this segment, so filter conservatively for correctness.
-        return true;
-    };
-    let unowned_physical_fragments = physical_fragments - owned_fragments;
-    unowned_physical_fragments.intersection_len(&dataset.fragment_bitmap) > 0
-}
-
 async fn prefilter_for_segment(
     dataset: Arc<Dataset>,
     index: &IndexMetadata,
     base: Arc<DatasetPreFilter>,
 ) -> Result<Arc<dyn PreFilter>> {
-    if !segment_needs_ownership_filter(dataset.as_ref(), index) {
-        return Ok(base);
-    }
-
     let Some(owned_fragments) = index.fragment_bitmap.clone() else {
         return Ok(base);
     };
@@ -3140,20 +3115,6 @@ mod tests {
         dataset.append(second, None).await.unwrap();
         let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
-        let configured_details = crate::index::vector::details::vector_index_details(
-            &VectorIndexParams::ivf_flat(1, MetricType::L2),
-        );
-        let old_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            configured_details.clone(),
-            Some(&first_fragments),
-        )
-        .unwrap();
-        let new_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            configured_details.clone(),
-            Some(&appended_fragments),
-        )
-        .unwrap();
-
         let old_segment = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![field_id],
@@ -3161,7 +3122,7 @@ mod tests {
             name: "vector_idx".to_string(),
             dataset_version: first_version,
             fragment_bitmap: Some(first_fragments.clone()),
-            index_details: Some(Arc::new(old_details)),
+            index_details: None,
             index_version: 0,
             created_at: None,
             base_id: None,
@@ -3174,42 +3135,15 @@ mod tests {
             name: "vector_idx".to_string(),
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(appended_fragments.clone()),
-            index_details: Some(Arc::new(new_details)),
+            index_details: None,
             index_version: 0,
             created_at: None,
             base_id: None,
             files: None,
         };
         assert!(
-            !segment_needs_ownership_filter(dataset.as_ref(), &old_segment),
-            "append-only data must not look like an in-place fragment update"
-        );
-
-        let merged_physical_fragments = &first_fragments | &appended_fragments;
-        let merged_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            configured_details,
-            Some(&merged_physical_fragments),
-        )
-        .unwrap();
-        let merged_with_pruned_later_fragment = IndexMetadata {
-            index_details: Some(Arc::new(merged_details)),
-            ..old_segment.clone()
-        };
-        assert_eq!(
-            physical_fragment_bitmap(&merged_with_pruned_later_fragment),
-            Some(merged_physical_fragments.clone())
-        );
-        assert!(
             !appended_fragments.is_empty(),
             "the append fixture must create at least one new fragment"
-        );
-        assert!(
-            appended_fragments.intersection_len(&dataset.fragment_bitmap) > 0,
-            "the appended fragments must remain live in the current dataset"
-        );
-        assert!(
-            segment_needs_ownership_filter(dataset.as_ref(), &merged_with_pruned_later_fragment),
-            "a merged segment must retain the physical coverage of every input"
         );
         let base = Arc::new(DatasetPreFilter::new(
             dataset.clone(),
@@ -3224,9 +3158,24 @@ mod tests {
         segment_prefilter.wait_for_ready().await.unwrap();
 
         assert!(
-            segment_prefilter.is_empty(),
-            "an append-only delta must preserve the unfiltered sub-index fast path"
+            !segment_prefilter.is_empty(),
+            "the segment ownership restriction is not globally empty"
         );
+        let old_partition_rows = first_fragments
+            .iter()
+            .flat_map(|fragment_id| {
+                (0..20_u64).map(move |offset| (u64::from(fragment_id) << 32) | offset)
+            })
+            .collect::<RowAddrTreeMap>();
+        assert!(
+            segment_prefilter.is_empty_for(&old_partition_rows),
+            "an append-only segment must preserve the unfiltered partition fast path"
+        );
+
+        let appended_fragment_id = appended_fragments.iter().next().unwrap();
+        let mut rows_with_unowned_entry = old_partition_rows;
+        rows_with_unowned_entry.insert(u64::from(appended_fragment_id) << 32);
+        assert!(!segment_prefilter.is_empty_for(&rows_with_unowned_entry));
     }
 
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {

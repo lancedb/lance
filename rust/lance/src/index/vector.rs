@@ -64,7 +64,6 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use self::details::with_physical_fragment_bitmap;
 use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -1942,14 +1941,7 @@ pub async fn initialize_vector_index(
         ))
     })?;
 
-    let fragment_bitmap = target_dataset.fragment_bitmap.as_ref().clone();
-    let index_details = source_index
-        .index_details
-        .as_deref()
-        .cloned()
-        .map(|details| with_physical_fragment_bitmap(details, Some(&fragment_bitmap)))
-        .transpose()?
-        .map(Arc::new);
+    let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -1957,8 +1949,8 @@ pub async fn initialize_vector_index(
         fields: vec![field.id],
         covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details,
+        fragment_bitmap,
+        index_details: source_index.index_details.clone(),
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

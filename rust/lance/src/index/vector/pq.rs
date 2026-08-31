@@ -459,8 +459,11 @@ impl VectorIndex for PQIndex {
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-        todo!("this method is for only IVF_HNSW_* index");
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+        match self.row_ids.as_ref() {
+            Some(row_ids) => Box::new(row_ids.values().iter()),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
     async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {

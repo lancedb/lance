@@ -9,7 +9,7 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::{BinaryHeap, HashMap},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
 };
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
@@ -40,6 +40,7 @@ use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, Read
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
+use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
@@ -75,6 +76,7 @@ use lance_io::{
     ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
+use lance_select::RowAddrTreeMap;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -620,6 +622,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     distance_type: DistanceType,
 
     index_cache: WeakLanceCache,
+    partition_rows: Vec<OnceLock<Arc<RowAddrTreeMap>>>,
 
     io_parallelism: usize,
     /// Cumulative I/O performed while opening this index (file footers, IVF
@@ -645,6 +648,12 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
             + self
+                .partition_rows
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|rows| rows.deep_size_of_children(context))
+                .sum::<usize>()
+            + self
                 .rq_search_cache
                 .as_ref()
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
@@ -664,6 +673,40 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 )
             })
             .transpose()
+    }
+
+    fn cache_partition_rows(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndexCacheEntry,
+    ) -> Result<Arc<RowAddrTreeMap>> {
+        let rows = self.partition_rows.get(partition_id).ok_or_else(|| {
+            Error::index(format!(
+                "partition id {partition_id} is out of range of {} partitions",
+                self.ivf.num_partitions()
+            ))
+        })?;
+        let partition = partition
+            .as_any()
+            .downcast_ref::<PartitionEntry<S, Q>>()
+            .ok_or_else(|| Error::internal("failed to downcast partition entry".to_string()))?;
+        Ok(rows
+            .get_or_init(|| Arc::new(partition.storage.row_ids().collect()))
+            .clone())
+    }
+
+    fn prefilter_for_partition(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndexCacheEntry,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Arc<dyn PreFilter>> {
+        let rows = self.cache_partition_rows(partition_id, partition)?;
+        if pre_filter.is_empty_for(rows.as_ref()) {
+            Ok(Arc::new(NoFilter))
+        } else {
+            Ok(pre_filter)
+        }
     }
 
     fn use_query_residual(
@@ -748,6 +791,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             self.load_partition(partition_id, true, metrics),
             pre_filter.wait_for_ready(),
         )?;
+        let pre_filter =
+            self.prefilter_for_partition(partition_id, part_entry.as_ref(), pre_filter)?;
         Ok(PreparedPartitionSearch {
             query: query.clone(),
             pre_filter,
@@ -769,6 +814,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let pre_filter =
+            self.prefilter_for_partition(partition_id, part_entry.as_ref(), pre_filter)?;
         Ok(PreparedPartitionSearch {
             query: query.clone(),
             pre_filter,
@@ -1109,6 +1156,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
+        let num_partitions = ivf.num_partitions();
 
         Ok(Self {
             uri: to_local_path(&uri),
@@ -1125,6 +1173,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            partition_rows: (0..num_partitions).map(|_| OnceLock::new()).collect(),
             io_parallelism,
             open_io_stats,
             _marker: PhantomData,
@@ -1150,6 +1199,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
+        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri,
             index_path,
@@ -1165,6 +1215,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            partition_rows: (0..num_partitions).map(|_| OnceLock::new()).collect(),
             io_parallelism,
             // Reconstruction from cached state re-opens readers on its own path;
             // the open-time I/O is not attributed here (it is a one-time cost,
@@ -1206,19 +1257,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 _ => metrics.record_index_cache_miss(),
             }
             let (entry, _) = result?;
-            Ok(entry as Arc<dyn VectorIndexCacheEntry>)
+            let entry = entry as Arc<dyn VectorIndexCacheEntry>;
+            self.cache_partition_rows(partition_id, entry.as_ref())?;
+            Ok(entry)
         } else {
             if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
                 metrics.record_index_cache_hit();
+                self.cache_partition_rows(partition_id, part_idx.as_ref())?;
                 return Ok(part_idx);
             }
             metrics.record_index_cache_miss();
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
-            Ok(Arc::new(
+            let entry = Arc::new(
                 self.load_partition_entry(partition_id, metrics.io_stats())
                     .await?,
-            ))
+            );
+            self.cache_partition_rows(partition_id, entry.as_ref())?;
+            Ok(entry)
         }
     }
 
@@ -1482,6 +1538,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
+        let pre_filter =
+            self.prefilter_for_partition(partition_id, part_entry.as_ref(), pre_filter)?;
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -4198,12 +4256,6 @@ mod tests {
         );
         let expected_rows = fragments[0].physical_rows().await.unwrap() as u64
             + fragments[1].physical_rows().await.unwrap() as u64;
-        let expected_physical_fragments = fragments
-            .iter()
-            .take(2)
-            .map(|fragment| fragment.id() as u32)
-            .collect();
-
         let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
         let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
         let mut segments = Vec::new();
@@ -4228,11 +4280,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            crate::index::vector::details::physical_fragment_bitmap(&merged_segment),
-            Some(expected_physical_fragments),
-            "a merged segment must retain every input's physical fragment coverage"
-        );
         dataset
             .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
             .await

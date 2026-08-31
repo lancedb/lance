@@ -14,7 +14,6 @@ use crate::{
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
-            details::with_physical_fragment_bitmap,
         },
         vector_index_details, vector_index_details_default,
     },
@@ -600,28 +599,22 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        let fragment_bitmap = if train {
-            match &self.fragments {
-                Some(fragment_ids) => fragment_ids.iter().collect(),
-                None => self.dataset.fragment_bitmap.as_ref().clone(),
-            }
-        } else {
-            // Empty bitmap for untrained indices
-            roaring::RoaringBitmap::new()
-        };
-        let index_details = with_physical_fragment_bitmap(
-            created_index.index_details,
-            Some(&fragment_bitmap),
-        )?;
-
         Ok(IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
             covering_fields: vec![],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: Some(fragment_bitmap),
-            index_details: Some(Arc::new(index_details)),
+            fragment_bitmap: if train {
+                match &self.fragments {
+                    Some(fragment_ids) => Some(fragment_ids.iter().collect()),
+                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
+                }
+            } else {
+                // Empty bitmap for untrained indices
+                Some(roaring::RoaringBitmap::new())
+            },
+            index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -1029,7 +1022,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::{DatasetIndexExt, IndexSegment, vector::details::physical_fragment_bitmap};
+    use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
@@ -1041,6 +1034,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::{
         BloomFilterQuery, FullTextSearchQuery, SargableQuery, SearchResult,
@@ -1049,7 +1043,6 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
-    use lance_index::{optimize::OptimizeOptions, pb::VectorIndexDetails};
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
@@ -1467,17 +1460,6 @@ mod tests {
         )
         .await
         .unwrap()
-    }
-
-    fn vector_details_without_physical_coverage(index: &IndexMetadata) -> VectorIndexDetails {
-        let mut details = index
-            .index_details
-            .as_deref()
-            .expect("vector index should have details")
-            .to_msg::<VectorIndexDetails>()
-            .expect("vector index details should decode");
-        details.physical_fragment_bitmap = None;
-        details
     }
 
     #[tokio::test]
@@ -2670,11 +2652,9 @@ mod tests {
             .iter()
             .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
             .collect::<RoaringBitmap>();
-        let expected_merged_details =
-            vector_details_without_physical_coverage(compatible_tail.last().unwrap());
+        let expected_merged_details = compatible_tail.last().unwrap().index_details.clone();
         assert_ne!(
-            vector_details_without_physical_coverage(&independent_segment),
-            expected_merged_details,
+            independent_segment.index_details, expected_merged_details,
             "test setup must distinguish base and suffix metadata"
         );
         let mut segments = vec![independent_segment];
@@ -2712,14 +2692,8 @@ mod tests {
             &expected_merged_fragments
         );
         assert_eq!(
-            vector_details_without_physical_coverage(merged),
-            expected_merged_details,
+            merged.index_details, expected_merged_details,
             "merged metadata must come from the selected suffix, not an incompatible base segment"
-        );
-        assert_eq!(
-            physical_fragment_bitmap(merged),
-            Some(expected_merged_fragments),
-            "merged physical coverage must include every selected suffix segment"
         );
     }
 
