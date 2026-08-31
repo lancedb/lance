@@ -632,6 +632,19 @@ mod tests {
                 "{dt} rejected a well-formed Int8 query"
             );
         }
+
+        // A sliced query reads through `values()`, which has to follow the
+        // slice: the window here holds no nulls while the full buffer does, and
+        // its two elements must be the ones the slice selects.
+        let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
+        let query: Arc<dyn Array> = Arc::new(sliced);
+        for dt in [DistanceType::L2, DistanceType::Dot] {
+            let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+            let want =
+                dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
+                    .unwrap();
+            assert_eq!(got.values(), want.values(), "{dt} mis-read a sliced query");
+        }
     }
 
     /// `Int8` is a valid vector element type elsewhere in the crate but has no
