@@ -225,6 +225,7 @@ mod tests {
         IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_idx".into(),
             dataset_version,
             fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),

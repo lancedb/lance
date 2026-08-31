@@ -249,6 +249,9 @@ impl StructuralFileSink {
         while let Some(encoding_task) = encoding_tasks.next().await {
             self.write_page(encoding_task?).await?;
         }
+        // Reaps any upload that has already failed so the error is attributed to
+        // this batch. This does not wait for in-flight uploads; see
+        // `ObjectWriter::poll_flush`.
         self.writer.flush().await?;
         Ok(())
     }

@@ -73,7 +73,11 @@ impl InvertedIndex {
         self.partitions
             .first()
             .map(|partition| partition.inverted_list.posting_tail_codec())
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                // Empty segments have no partition-level codec metadata, so
+                // derive the codec from the segment's declared format.
+                self.format_version().posting_tail_codec()
+            })
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
@@ -268,6 +272,20 @@ impl InvertedIndex {
         self.partitions.len() == 1 && self.partitions[0].docs.legacy().is_some()
     }
 
+    /// Returns whether bounded WAND results can certify exact global top-k membership.
+    ///
+    /// The certificate requires a modern index whose every physical partition
+    /// contains impact metadata. Modern postings without impacts can prune with
+    /// partition-local scores before applying a corpus-wide scorer, so their
+    /// bounded candidate set cannot establish global exactness.
+    pub fn supports_wand_exactness_certificate(&self) -> bool {
+        !self.is_legacy()
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.has_impacts)
+    }
+
     /// Read only the index's [`InvertedIndexParams`],
     /// Contains more complete info than manifest's lossy `InvertedIndexDetails`.
     pub async fn load_params(store: &dyn IndexStore) -> Result<InvertedIndexParams> {
@@ -455,6 +473,19 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Return whether an explicit prewarm prepared everything this query needs.
+    ///
+    /// This is an O(1) routing hint for query planning. It never starts I/O or
+    /// waits for a concurrent prewarm. The projection check also clears a stale
+    /// optimistic hint after cache eviction; an unexpected posting eviction is
+    /// still handled exactly by the normal eager loader.
+    pub(in super::super) fn prewarmed_query_state_ready(&self, with_position: bool) -> bool {
+        let Ok(state) = self.prewarm_state.try_lock() else {
+            return false;
+        };
+        state.satisfies(with_position) && self.has_resident_document_projections()
+    }
+
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_result(options).await.map(|_| ())
     }

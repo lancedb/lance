@@ -484,7 +484,66 @@ pub async fn encode_batch(
 mod tests {
     use super::*;
     use crate::testing::{TestEncoding, create_test_field_encoder, test_encoding_strategy};
+    use arrow_array::make_array;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields};
+    use rstest::rstest;
+
+    #[rstest]
+    fn test_nested_variable_width_offsets_are_validated_before_dispatch(
+        #[values(TestEncoding::Array, TestEncoding::StructuralU32)] encoding: TestEncoding,
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8)] item_type: ArrowDataType,
+    ) {
+        let offsets = match &item_type {
+            ArrowDataType::Utf8 => Buffer::from_slice_ref([0_i32, 2, 1, 3]),
+            ArrowDataType::LargeUtf8 => Buffer::from_slice_ref([0_i64, 2, 1, 3]),
+            _ => unreachable!(),
+        };
+        let child_data = unsafe {
+            ArrayData::builder(item_type.clone())
+                .len(3)
+                .add_buffer(offsets)
+                .add_buffer(Buffer::from(b"abc"))
+                .build_unchecked()
+        };
+        let item_field = Arc::new(ArrowField::new("item", item_type, false));
+        let data_type = ArrowDataType::FixedSizeList(item_field, 1);
+        let array_data = unsafe {
+            ArrayData::builder(data_type.clone())
+                .len(3)
+                .add_child_data(child_data)
+                .build_unchecked()
+        };
+        let array = make_array(array_data);
+        let field = Field::try_from(&ArrowField::new("payload", data_type, false)).unwrap();
+        let strategy = test_encoding_strategy(encoding);
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions {
+            cache_bytes_per_column: 0,
+            ..Default::default()
+        };
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+
+        let error = encoder
+            .maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 3)
+            .err()
+            .expect("malformed nested offsets should fail before task dispatch");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("field 'payload'"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("non-monotonic offset at position 2"),
+            "unexpected message: {message}"
+        );
+    }
 
     #[test]
     fn test_fixed_size_list_struct_requires_v2_2() {
