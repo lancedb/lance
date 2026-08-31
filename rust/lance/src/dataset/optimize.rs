@@ -102,9 +102,7 @@ use super::{
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, unsupported_index_version,
-};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -2151,7 +2149,7 @@ async fn index_fragment_coverage(
 async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
-        if is_system_index(index) || unsupported_index_version(index).is_none() {
+        if index_is_usable(index) {
             continue;
         }
         coverage.push((
