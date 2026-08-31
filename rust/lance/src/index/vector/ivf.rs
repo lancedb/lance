@@ -258,6 +258,12 @@ impl IVFIndex {
         partition: &dyn VectorIndex,
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<Arc<dyn PreFilter>> {
+        if pre_filter.is_empty() {
+            return Ok(Arc::new(NoFilter));
+        }
+        if !pre_filter.needs_partition_row_ids() {
+            return Ok(pre_filter);
+        }
         let rows = self.cache_partition_rows(partition_id, partition)?;
         if pre_filter.is_empty_for(rows.as_ref()) {
             Ok(Arc::new(NoFilter))
@@ -323,7 +329,6 @@ impl IVFIndex {
                 idx
             }
         };
-        self.cache_partition_rows(partition_id, part_index.as_ref())?;
         Ok(part_index)
     }
 

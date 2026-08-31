@@ -1602,6 +1602,10 @@ impl PreFilter for SegmentPreFilter {
         false
     }
 
+    fn needs_partition_row_ids(&self) -> bool {
+        self.base.is_empty()
+    }
+
     fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
         self.base.is_empty() && self.ownership_mask.selects_all(rows)
     }
@@ -3147,12 +3151,12 @@ mod tests {
         );
         let base = Arc::new(DatasetPreFilter::new(
             dataset.clone(),
-            &[old_segment.clone(), new_segment],
+            &[old_segment.clone(), new_segment.clone()],
             None,
         ));
         base.wait_for_ready().await.unwrap();
         assert!(base.is_empty(), "the combined delta coverage is unfiltered");
-        let segment_prefilter = prefilter_for_segment(dataset, &old_segment, base)
+        let segment_prefilter = prefilter_for_segment(dataset.clone(), &old_segment, base)
             .await
             .unwrap();
         segment_prefilter.wait_for_ready().await.unwrap();
@@ -3161,6 +3165,7 @@ mod tests {
             !segment_prefilter.is_empty(),
             "the segment ownership restriction is not globally empty"
         );
+        assert!(segment_prefilter.needs_partition_row_ids());
         let old_partition_rows = first_fragments
             .iter()
             .flat_map(|fragment_id| {
@@ -3176,6 +3181,17 @@ mod tests {
         let mut rows_with_unowned_entry = old_partition_rows;
         rows_with_unowned_entry.insert(u64::from(appended_fragment_id) << 32);
         assert!(!segment_prefilter.is_empty_for(&rows_with_unowned_entry));
+
+        let ordinary_base = Arc::new(
+            DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)
+                .with_overlay_block(RowAddrMask::allow_nothing()),
+        );
+        let ordinary_segment =
+            SegmentPreFilter::new(ordinary_base, Arc::new(RowAddrMask::all_rows()));
+        assert!(
+            !ordinary_segment.needs_partition_row_ids(),
+            "a user filter cannot take the no-filter fast path, so partition coverage is unused"
+        );
     }
 
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
