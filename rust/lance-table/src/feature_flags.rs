@@ -30,27 +30,47 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
-/// `index_catchup` is maintained on this table, so a missing entry means the
-/// index is *not* caught up rather than fully caught up.
+/// Some index declares covering columns: `IndexMetadata.covering_fields` names
+/// columns the index carries values for but is not keyed on.
 ///
-/// A reader without this bit would read a missing `index_catchup` entry as
-/// "fully caught up" and could answer an index-only query without the SSTables
-/// holding the newest rows. A writer without it would change an index without
-/// invalidating the catch-up position recorded for that index, leaving a stale
-/// position behind. Both must refuse the table.
-pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
+/// Covering makes `fields` mean "keyed columns followed by carried columns"
+/// rather than "the columns this index is searched on". A reader without this
+/// bit still selects a vector index by testing membership of `fields`, so it
+/// would answer a query on a merely-carried column with an index keyed on a
+/// different column and return wrong neighbours with no error. A writer without
+/// it would maintain the index as though every entry of `fields` were keyed.
+/// Both must refuse the table.
+///
+/// This takes the bit reclaimed from the retired MemWAL index-catchup flag
+/// (<https://github.com/lance-format/lance/pull/8680>), which is the boundary the
+/// current released build treats as unknown -- so that build refuses a covering
+/// dataset without needing a change of its own. Builds from the window where the
+/// bit was allocated to index catch-up (v11.0.0-beta.4 through beta.17) still
+/// count it as supported and will open a covering dataset rather than refuse it;
+/// that exposure comes with the reclamation and is inherited by whichever flag
+/// takes the bit.
+pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
+/// Reserved for datasets that reference recognized V2 data files with
+/// different exact versions.
+pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 256;
 /// Field IDs are allocated from a persistent high-water mark and are never reused.
 ///
 /// This is always a writer requirement. It is also a reader requirement when an
 /// activation chooses fail-closed compatibility with pre-gate binaries.
-pub const FLAG_STABLE_FIELD_IDS: u64 = 256;
+pub const FLAG_STABLE_FIELD_IDS: u64 = 512;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 512;
+pub const FLAG_UNKNOWN: u64 = 1024;
 
-// This build only understands flags below the unknown boundary, so a bit
-// allocated at or above it would be refused by the very readers meant to use it.
-const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
+// Supported flags stay below the unknown boundary. The mixed-version bit is a
+// reserved hole and is removed from the supported mask until its contract lands.
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
+// The fence needs a bit the current released build already refuses, which means
+// at or above the boundary that build shipped with (128).
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
+const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_STABLE_FIELD_IDS < FLAG_UNKNOWN);
+
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -62,25 +82,15 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
-    // Carried across the reset. This bit is not derivable from the manifest --
-    // it depends on the `__lance_mem_wal` index details, which a manifest only
-    // points at -- and this function runs twice per commit: once in
-    // `build_manifest` and again in `write_manifest_file`. Dropping it here
-    // would clear it immediately before the write, so an activated table would
-    // report success and stay legacy.
-    //
-    // Only a consistent state carries: one bit set is neither mode, and
-    // `inherit_mem_wal_index_catchup` refuses it at the boundary where a
-    // manifest is derived from another. Reaching here half-set means the
-    // manifest was already written that way, so leave it for the reader check
-    // rather than silently completing it.
-    let mem_wal_index_catchup = if manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
-        && manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
-    {
-        FLAG_MEM_WAL_INDEX_CATCHUP
-    } else {
-        0
-    };
+    // Carried across the reset: a `Manifest` only points at its index section,
+    // so whether any index declares covering columns is not visible here.
+    // `build_manifest` decides it from the index list it is committing and sets
+    // the bit after calling this; without the carry the second call, from
+    // `write_manifest_file`, would clear that decision immediately before the
+    // write.
+    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_COVERED_INDEX_METADATA;
+    let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let stable_field_ids_reader = if manifest.max_allocated_field_id.is_some()
         && manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0
     {
@@ -152,37 +162,29 @@ pub fn apply_feature_flags(
         manifest.reader_feature_flags |= stable_field_ids_reader;
     }
 
-    manifest.reader_feature_flags |= mem_wal_index_catchup;
-    manifest.writer_feature_flags |= mem_wal_index_catchup;
+    manifest.reader_feature_flags |= covered_index_metadata;
+    manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= sticky_paired_flags;
+    manifest.writer_feature_flags |= sticky_paired_flags;
 
     Ok(())
 }
 
-/// Carry [`FLAG_MEM_WAL_INDEX_CATCHUP`] from the manifest a new one is derived
+/// Carry sticky paired capabilities from the manifest a new one is derived
 /// from.
 ///
-/// [`apply_feature_flags`] carries this bit across its own reset, while this
-/// helper validates and explicitly carries the transition between source and
-/// destination manifests. Constructors preserve the bit as defense in depth,
-/// but callers must not depend on a constructor choice for protocol safety.
+/// [`apply_feature_flags`] carries these bits across its own reset, but it only
+/// ever sees one manifest. Constructors preserve these flags, and this helper
+/// also validates that the source is not half-set before a derived manifest is
+/// committed.
 ///
 /// A half-set state is refused rather than normalized: one bit set means a
 /// legacy reader or a legacy writer is still permitted, which is neither mode.
-pub fn inherit_mem_wal_index_catchup(destination: &mut Manifest, source: &Manifest) -> Result<()> {
-    let reader = source.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
-    let writer = source.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
-    match (reader, writer) {
-        (false, false) => Ok(()),
-        (true, true) => {
-            destination.reader_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
-            destination.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
-            Ok(())
-        }
-        _ => Err(Error::invalid_input(
-            "Manifest has only one of the MemWAL index-catchup reader and writer \
-             feature bits set, so its catch-up semantics are undefined",
-        )),
-    }
+pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifest) -> Result<()> {
+    let sticky_flags = validated_sticky_paired_flags(source)?;
+    destination.reader_feature_flags |= sticky_flags;
+    destination.writer_feature_flags |= sticky_flags;
+    Ok(())
 }
 
 /// Whether this build understands data overlay files: always in debug builds,
@@ -210,6 +212,7 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
+    mark_supported(&mut supported, FLAG_MIXED_DATA_FILE_VERSIONS, false);
     supported
 }
 
@@ -225,23 +228,60 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
     writer_flags & !supported_flags() == 0
 }
 
+/// Refuse reads from manifests whose required reader features this build does
+/// not support or whose paired capabilities are inconsistent.
+pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
+    validate_paired_feature_flags(manifest)?;
+    validate_stable_field_id_flags(manifest)?;
+    if !can_read_dataset(manifest.reader_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be read by this version of Lance. Please upgrade \
+                 Lance to read this dataset. Flags: {}",
+                manifest.reader_feature_flags
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse writes to manifests whose required writer features this build does
+/// not support or whose paired capabilities are inconsistent.
+pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
+    validate_paired_feature_flags(manifest)?;
+    validate_stable_field_id_flags(manifest)?;
+    if !can_write_dataset(manifest.writer_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be written by this version of Lance. Please upgrade \
+                 Lance to write this dataset. Flags: {}",
+                manifest.writer_feature_flags
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
     writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
 }
 
-/// Refuse a manifest whose MemWAL index-catchup bits disagree.
+/// Refuse a manifest whose paired reader and writer capability bits disagree.
 ///
 /// One word set and the other not is neither mode: it would let a legacy reader
 /// or a legacy writer through on a table where the other half is enforcing. The
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
-pub fn validate_mem_wal_index_catchup_flags(manifest: &Manifest) -> Result<()> {
-    let reader = manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
-    let writer = manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
+    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     if reader != writer {
-        return Err(Error::invalid_input(
-            "Manifest has only one of the MemWAL index-catchup reader and writer \
-             feature bits set, so its catch-up semantics are undefined",
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
+             so its semantics are undefined",
         ));
     }
     Ok(())
@@ -249,24 +289,49 @@ pub fn validate_mem_wal_index_catchup_flags(manifest: &Manifest) -> Result<()> {
 
 /// Refuse a manifest whose stable-field-ID marker and required flags disagree.
 ///
-/// The high-water mark is the activation marker and the writer bit is what
-/// keeps pre-feature writers away. Either one without the other is an unsafe,
-/// undefined state. The reader bit is optional migration policy, but cannot be
-/// set on a legacy manifest.
+/// The high-water mark is the activation marker and the writer bit keeps
+/// pre-feature writers away. The reader bit is optional deployment policy, but
+/// it cannot be set on a legacy manifest.
 pub fn validate_stable_field_id_flags(manifest: &Manifest) -> Result<()> {
     let activated = manifest.max_allocated_field_id.is_some();
     let reader = manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
     let writer = manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
     if activated != writer || (reader && !activated) {
-        return Err(Error::invalid_input(
+        return Err(Error::corrupt_file_named(
+            "manifest",
             "Manifest stable-field-ID high-water mark and reader/writer feature flags disagree",
         ));
     }
     Ok(())
 }
 
+fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
+    validate_paired_feature_flags(manifest)?;
+    Ok(manifest.reader_feature_flags & STICKY_PAIRED_FLAGS)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The covering fence only works if the bit is one the current released
+    /// build already rejects. That build's unknown boundary is 128, so the bit
+    /// has to be 128 and this build has to have moved its own boundary past it
+    /// -- otherwise either that build accepts a covering dataset, or we refuse
+    /// our own.
+    #[test]
+    fn test_covered_index_metadata_fences_older_builds_only() {
+        assert_eq!(
+            FLAG_COVERED_INDEX_METADATA, 128,
+            "the fence must sit on the boundary the released build shipped with"
+        );
+        assert!(
+            can_read_dataset(FLAG_COVERED_INDEX_METADATA),
+            "this build implements covering, so it must accept its own datasets"
+        );
+        assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
+        // A build whose boundary is still 128 refuses the bit, which is the fence;
+        // the module-level `const _` assertion keeps it at or above that boundary.
+    }
+
     use super::*;
     use crate::format::BasePath;
 
@@ -280,6 +345,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_read_dataset(super::FLAG_STABLE_FIELD_IDS));
+        assert!(!can_read_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -357,6 +423,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_write_dataset(super::FLAG_STABLE_FIELD_IDS));
+        assert!(!can_write_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -425,28 +492,22 @@ mod tests {
             0
         );
     }
-
-    /// The MemWAL bit depends on the `__lance_mem_wal` index details, which a
-    /// manifest cannot see — it holds only a byte offset to its index section.
-    /// So an unrelated recomputation must preserve the bit rather than derive
-    /// it, or a later transaction would silently downgrade the table to legacy
-    /// semantics and a reader would treat missing coverage as complete.
     #[test]
-    fn inheriting_carries_the_mem_wal_bit_from_the_source() {
+    fn inheriting_carries_sticky_paired_bits_from_the_source() {
         let mut source = empty_manifest();
-        source.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-        source.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-        // Model a destination assembled without protocol-specific inheritance.
+        source.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        source.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        // A fresh destination models any derived manifest before inheritance.
         let mut destination = empty_manifest();
 
-        inherit_mem_wal_index_catchup(&mut destination, &source).unwrap();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
 
         assert_ne!(
-            destination.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            destination.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
             0
         );
         assert_ne!(
-            destination.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            destination.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
             0
         );
     }
@@ -454,57 +515,58 @@ mod tests {
     #[test]
     fn inheriting_refuses_a_half_set_source() {
         for (reader, writer) in [
-            (FLAG_MEM_WAL_INDEX_CATCHUP, 0),
-            (0, FLAG_MEM_WAL_INDEX_CATCHUP),
+            (FLAG_MIXED_DATA_FILE_VERSIONS, 0),
+            (0, FLAG_MIXED_DATA_FILE_VERSIONS),
         ] {
             let mut source = empty_manifest();
             source.reader_feature_flags = reader;
             source.writer_feature_flags = writer;
             let mut destination = empty_manifest();
 
-            let err = inherit_mem_wal_index_catchup(&mut destination, &source).unwrap_err();
+            let err = inherit_sticky_feature_flags(&mut destination, &source).unwrap_err();
 
             assert!(err.to_string().contains("only one of"), "{err}");
         }
     }
 
     #[test]
-    fn apply_feature_flags_carries_the_mem_wal_bit_across_its_reset() {
-        // It runs twice per commit -- `build_manifest` and `write_manifest_file`
-        // -- so dropping the bit here would clear it immediately before the
-        // write, and an activated table would report success and stay legacy.
+    fn apply_feature_flags_carries_sticky_paired_bits_across_its_reset() {
         let mut manifest = empty_manifest();
-        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-        manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
 
         apply_feature_flags(&mut manifest, false, false).unwrap();
 
         assert_ne!(
-            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
             0
         );
         assert_ne!(
-            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
             0
         );
     }
 
     #[test]
-    fn apply_feature_flags_drops_a_half_set_mem_wal_bit() {
-        // Neither mode, so leave it for the reader check rather than completing it.
+    fn apply_feature_flags_rejects_half_set_sticky_bits() {
         let mut manifest = empty_manifest();
-        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
 
-        apply_feature_flags(&mut manifest, false, false).unwrap();
+        let err = apply_feature_flags(&mut manifest, false, false).unwrap_err();
 
-        assert_eq!(
-            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0
-        );
-        assert_eq!(
-            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0
-        );
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(err.to_string().contains("only one of"), "{err}");
+    }
+
+    #[test]
+    fn writer_gate_rejects_reserved_mixed_capability() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+
+        let err = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        assert!(err.to_string().contains("cannot be written"), "{err}");
     }
 
     #[test]
@@ -525,14 +587,30 @@ mod tests {
         manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
 
-        // This runs more than once while committing a manifest. The reader
-        // requirement is migration policy, not something schema contents can
-        // derive, so it must survive every recomputation.
         apply_feature_flags(&mut manifest, false, false).unwrap();
         apply_feature_flags(&mut manifest, false, false).unwrap();
 
         assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+    }
+
+    #[test]
+    fn stable_field_id_marker_and_writer_gate_must_agree() {
+        let mut activated_without_gate = empty_manifest();
+        activated_without_gate.activate_stable_field_ids();
+        assert!(validate_stable_field_id_flags(&activated_without_gate).is_err());
+
+        let mut gate_without_marker = empty_manifest();
+        gate_without_marker.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        assert!(validate_stable_field_id_flags(&gate_without_marker).is_err());
+
+        let mut writer_only = empty_manifest();
+        writer_only.activate_stable_field_ids();
+        writer_only.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        validate_stable_field_id_flags(&writer_only).unwrap();
+
+        writer_only.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        validate_stable_field_id_flags(&writer_only).unwrap();
     }
 
     fn empty_manifest() -> Manifest {
@@ -554,37 +632,12 @@ mod tests {
     /// A build that does not know the bit must refuse the table rather than
     /// continue with legacy semantics.
     #[test]
-    fn the_mem_wal_bit_is_below_the_unknown_boundary() {
-        assert!(can_read_dataset(FLAG_MEM_WAL_INDEX_CATCHUP));
-        assert!(can_write_dataset(FLAG_MEM_WAL_INDEX_CATCHUP));
-        // The next bit up is still unknown, so allocating this one did not
-        // silently widen what this build claims to understand.
-        assert!(!can_read_dataset(FLAG_UNKNOWN));
-    }
-
-    #[test]
-    fn the_stable_field_id_bit_is_below_the_unknown_boundary() {
-        assert!(can_read_dataset(FLAG_STABLE_FIELD_IDS));
-        assert!(can_write_dataset(FLAG_STABLE_FIELD_IDS));
-        assert!(!can_write_dataset(FLAG_UNKNOWN));
-    }
-
-    #[test]
-    fn stable_field_id_marker_and_writer_gate_must_agree() {
-        let mut activated_without_gate = empty_manifest();
-        activated_without_gate.activate_stable_field_ids();
-        assert!(validate_stable_field_id_flags(&activated_without_gate).is_err());
-
-        let mut gate_without_marker = empty_manifest();
-        gate_without_marker.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        assert!(validate_stable_field_id_flags(&gate_without_marker).is_err());
-
-        let mut writer_only = empty_manifest();
-        writer_only.activate_stable_field_ids();
-        writer_only.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        validate_stable_field_id_flags(&writer_only).unwrap();
-
-        writer_only.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        validate_stable_field_id_flags(&writer_only).unwrap();
+    fn reserved_mixed_capability_remains_unsupported() {
+        assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
+        assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
+        assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_STABLE_FIELD_IDS);
+        assert!(FLAG_STABLE_FIELD_IDS < FLAG_UNKNOWN);
     }
 }

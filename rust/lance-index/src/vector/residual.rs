@@ -5,7 +5,7 @@ use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::{iter, ops::MulAssign};
 
-use crate::vector::kmeans::{KMeansAlgoFloat, compute_partitions};
+use crate::vector::kmeans::{KMeansAlgoFloat, MaybeF16, compute_partitions};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
     Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
@@ -53,7 +53,7 @@ impl ResidualTransform {
     }
 }
 
-fn do_compute_residual<T: ArrowNumericType>(
+fn do_compute_residual<T: ArrowNumericType + MaybeF16>(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: Option<DistanceType>,
