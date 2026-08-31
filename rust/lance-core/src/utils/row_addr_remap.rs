@@ -51,6 +51,7 @@ use crate::utils::address::RowAddress;
 use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 
 /// A queryable row-address remapping with the exact semantics of
 /// `HashMap<u64, Option<u64>>::get(&addr).copied()`:
@@ -193,19 +194,165 @@ pub struct GroupInputWithLayout {
     pub new_frags: Vec<(u32, u32)>,
 }
 
+/// Keep Roaring only when its serialized representation is substantially
+/// smaller than either rank-friendly representation. This preserves compact
+/// run containers while avoiding Roaring's linear word scan for dense rank.
+const ROARING_SIZE_ADVANTAGE_FOR_RANK: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RankedOffsets {
+    /// Retained for highly compressible run layouts.
+    Roaring(RoaringBitmap),
+    /// Sorted rewritten offsets. Binary search returns membership and rank in
+    /// one operation.
+    Sparse(Vec<u32>),
+    /// Dense bits with the number of rewritten rows before every word.
+    Dense(DenseRankedOffsets),
+}
+
+impl RankedOffsets {
+    fn try_new(offsets: RoaringBitmap, physical_rows: Option<u32>) -> Result<Self> {
+        let universe_rows = physical_rows.map(u64::from).unwrap_or_else(|| {
+            offsets
+                .max()
+                .map(|offset| u64::from(offset) + 1)
+                .unwrap_or(0)
+        });
+        let word_count = usize::try_from(universe_rows.div_ceil(64)).map_err(|_| {
+            Error::invalid_input(format!(
+                "fragment row range {universe_rows} is too large for compact rank lookup"
+            ))
+        })?;
+        let sparse_bytes = usize::try_from(offsets.len())
+            .ok()
+            .and_then(|len| len.checked_mul(size_of::<u32>()))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "rewritten row count {} is too large for sparse rank lookup",
+                    offsets.len()
+                ))
+            })?;
+        let dense_bytes = word_count
+            .checked_mul(size_of::<u64>() + size_of::<u32>())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "fragment row range {universe_rows} is too large for dense rank lookup"
+                ))
+            })?;
+        let rank_friendly_bytes = sparse_bytes.min(dense_bytes);
+        if offsets
+            .serialized_size()
+            .checked_mul(ROARING_SIZE_ADVANTAGE_FOR_RANK)
+            .is_some_and(|roaring_bytes| roaring_bytes < rank_friendly_bytes)
+        {
+            return Ok(Self::Roaring(offsets));
+        }
+        if sparse_bytes <= dense_bytes {
+            return Ok(Self::Sparse(offsets.into_iter().collect()));
+        }
+        Ok(Self::Dense(DenseRankedOffsets::try_new(
+            offsets, word_count,
+        )?))
+    }
+
+    /// Return the zero-based rank when `offset` was rewritten.
+    #[inline]
+    fn rank_if_present(&self, offset: u32) -> Option<u64> {
+        match self {
+            Self::Roaring(offsets) => offsets.contains(offset).then(|| offsets.rank(offset) - 1),
+            Self::Sparse(offsets) => offsets.binary_search(&offset).ok().map(|rank| rank as u64),
+            Self::Dense(offsets) => offsets.rank_if_present(offset),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Roaring(offsets) => offsets.is_empty(),
+            Self::Sparse(offsets) => offsets.is_empty(),
+            Self::Dense(offsets) => offsets.words.is_empty(),
+        }
+    }
+}
+
+impl DeepSizeOf for RankedOffsets {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        match self {
+            // Roaring does not expose its allocation capacity. Its serialized
+            // size is a stable proxy for the retained containers.
+            Self::Roaring(offsets) => offsets.serialized_size(),
+            Self::Sparse(offsets) => offsets.deep_size_of_children(context),
+            Self::Dense(offsets) => offsets.deep_size_of_children(context),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DenseRankedOffsets {
+    words: Vec<u64>,
+    rank_before_word: Vec<u32>,
+}
+
+impl DenseRankedOffsets {
+    fn try_new(offsets: RoaringBitmap, word_count: usize) -> Result<Self> {
+        let mut words = vec![0u64; word_count];
+        for offset in offsets {
+            let word_idx = (offset / 64) as usize;
+            let Some(word) = words.get_mut(word_idx) else {
+                return Err(Error::invalid_input(format!(
+                    "rewritten row offset {offset} is outside dense rank word_count={word_count}"
+                )));
+            };
+            *word |= 1u64 << (offset % 64);
+        }
+
+        let mut rank_before_word = Vec::with_capacity(word_count);
+        let mut rewritten_rows_before = 0u64;
+        for word in &words {
+            rank_before_word.push(u32::try_from(rewritten_rows_before).map_err(|_| {
+                Error::invalid_input(format!(
+                    "rewritten row count {rewritten_rows_before} exceeds the row-address offset range"
+                ))
+            })?);
+            rewritten_rows_before += u64::from(word.count_ones());
+        }
+        Ok(Self {
+            words,
+            rank_before_word,
+        })
+    }
+
+    #[inline]
+    fn rank_if_present(&self, offset: u32) -> Option<u64> {
+        let word_idx = (offset / 64) as usize;
+        let word = *self.words.get(word_idx)?;
+        let bit = 1u64 << (offset % 64);
+        if word & bit == 0 {
+            return None;
+        }
+        Some(
+            u64::from(self.rank_before_word[word_idx]) + u64::from((word & (bit - 1)).count_ones()),
+        )
+    }
+}
+
+impl DeepSizeOf for DenseRankedOffsets {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.words.deep_size_of_children(context)
+            + self.rank_before_word.deep_size_of_children(context)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OldFragmentRemap {
     group_idx: usize,
-    rewritten_offsets: RoaringBitmap,
+    rewritten_offsets: RankedOffsets,
     rewritten_rows_before: u64,
     physical_rows: Option<u32>,
 }
 
 impl DeepSizeOf for OldFragmentRemap {
-    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-        // Roaring does not expose its allocation capacity. Its serialized size
-        // is a stable, density-sensitive proxy for the retained containers.
-        self.rewritten_offsets.serialized_size()
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.rewritten_offsets.deep_size_of_children(context)
     }
 }
 
@@ -283,11 +430,12 @@ impl GroupRemap {
                 )));
             }
             let num_rewritten_rows = bitmap.len();
+            let rewritten_offsets = RankedOffsets::try_new(bitmap, physical_rows)?;
             frags.push((
                 frag_id,
                 OldFragmentRemap {
                     group_idx,
-                    rewritten_offsets: bitmap,
+                    rewritten_offsets,
                     rewritten_rows_before,
                     physical_rows,
                 },
@@ -406,11 +554,10 @@ impl CompactRemapStep {
         {
             return None;
         }
-        if !old_frag.rewritten_offsets.contains(offset) {
+        let Some(rewritten_rank) = old_frag.rewritten_offsets.rank_if_present(offset) else {
             return Some(None);
-        }
-        let rewritten_row_index =
-            old_frag.rewritten_rows_before + old_frag.rewritten_offsets.rank(offset) - 1;
+        };
+        let rewritten_row_index = old_frag.rewritten_rows_before + rewritten_rank;
         Some(Some(
             self.groups[old_frag.group_idx].compute_new_addr(rewritten_row_index),
         ))
@@ -593,6 +740,54 @@ mod tests {
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
+    }
+
+    #[test]
+    fn test_sparse_ranked_offsets() {
+        let offsets = RankedOffsets::try_new(
+            RoaringBitmap::from_iter([1u32, 63, 511, 9_999]),
+            Some(10_000),
+        )
+        .unwrap();
+        assert!(matches!(offsets, RankedOffsets::Sparse(_)));
+        assert_eq!(offsets.rank_if_present(0), None);
+        assert_eq!(offsets.rank_if_present(1), Some(0));
+        assert_eq!(offsets.rank_if_present(63), Some(1));
+        assert_eq!(offsets.rank_if_present(511), Some(2));
+        assert_eq!(offsets.rank_if_present(9_999), Some(3));
+    }
+
+    #[test]
+    fn test_dense_ranked_offsets_across_words() {
+        let rewritten = (0..1_024u32)
+            .filter(|offset| offset % 10 != 0)
+            .collect::<RoaringBitmap>();
+        let offsets = RankedOffsets::try_new(rewritten.clone(), Some(1_024)).unwrap();
+        assert!(matches!(offsets, RankedOffsets::Dense(_)));
+
+        let mut expected_rank = 0u64;
+        for offset in 0..1_024 {
+            if rewritten.contains(offset) {
+                assert_eq!(offsets.rank_if_present(offset), Some(expected_rank));
+                expected_rank += 1;
+            } else {
+                assert_eq!(offsets.rank_if_present(offset), None);
+            }
+        }
+        assert_eq!(expected_rank, rewritten.len());
+    }
+
+    #[test]
+    fn test_run_compressed_ranked_offsets() {
+        let mut rewritten = RoaringBitmap::new();
+        rewritten.insert_range(100..9_900);
+        rewritten.optimize();
+        let offsets = RankedOffsets::try_new(rewritten, Some(10_000)).unwrap();
+        assert!(matches!(offsets, RankedOffsets::Roaring(_)));
+        assert_eq!(offsets.rank_if_present(99), None);
+        assert_eq!(offsets.rank_if_present(100), Some(0));
+        assert_eq!(offsets.rank_if_present(9_899), Some(9_799));
+        assert_eq!(offsets.rank_if_present(9_900), None);
     }
 
     #[test]

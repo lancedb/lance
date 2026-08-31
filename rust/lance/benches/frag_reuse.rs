@@ -7,13 +7,16 @@
 //! This benchmark starts from the same decoded `FragReuseIndexDetails` for
 //! both implementations. The open measurement includes Roaring deserialization
 //! and construction of the queryable runtime representation, but excludes
-//! object-store I/O and protobuf decoding.
+//! object-store I/O and protobuf decoding. Pass `--storage-uri` to additionally
+//! measure external FRI detail fetch, protobuf decode, and runtime open on local
+//! storage or an object store such as S3.
 
 #![allow(clippy::print_stdout)]
 
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Instant;
 
 use lance::dataset::optimize::remapping::transpose_row_ids_from_digest;
@@ -22,9 +25,16 @@ use lance_core::utils::address::RowAddress;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
+use lance_io::object_store::ObjectStore as LanceObjectStore;
+use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+use object_store::path::Path;
+use prost::Message;
 use roaring::RoaringTreemap;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+const EXTERNAL_DETAILS_THRESHOLD: usize = 204_800;
 
 #[derive(Clone, Copy)]
 struct Case {
@@ -40,7 +50,15 @@ struct Config {
     repeats: usize,
     lookups: usize,
     batch_size: usize,
+    storage_repeats: usize,
+    storage_uri: Option<String>,
     quick: bool,
+}
+
+struct StorageTarget {
+    kind: &'static str,
+    store: Arc<LanceObjectStore>,
+    base_path: Path,
 }
 
 struct LegacyFragReuseIndex {
@@ -97,7 +115,8 @@ impl DeepSizeOf for LegacyFragReuseIndex {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = parse_config();
     let cases = if config.quick {
         vec![Case {
@@ -127,10 +146,26 @@ fn main() {
                 groups_per_version: 1,
             },
             Case {
+                name: "medium_density_5",
+                rows: 1_000_000,
+                changed_basis_points: 500,
+                chain_len: 1,
+                old_fragment_count: 64,
+                groups_per_version: 8,
+            },
+            Case {
                 name: "medium_sparse_chain",
                 rows: 1_000_000,
                 changed_basis_points: 1_000,
                 chain_len: 4,
+                old_fragment_count: 64,
+                groups_per_version: 8,
+            },
+            Case {
+                name: "medium_density_25",
+                rows: 1_000_000,
+                changed_basis_points: 2_500,
+                chain_len: 1,
                 old_fragment_count: 64,
                 groups_per_version: 8,
             },
@@ -143,9 +178,25 @@ fn main() {
                 groups_per_version: 8,
             },
             Case {
+                name: "medium_density_75",
+                rows: 1_000_000,
+                changed_basis_points: 7_500,
+                chain_len: 1,
+                old_fragment_count: 64,
+                groups_per_version: 8,
+            },
+            Case {
                 name: "medium_dense",
                 rows: 1_000_000,
                 changed_basis_points: 9_000,
+                chain_len: 1,
+                old_fragment_count: 64,
+                groups_per_version: 8,
+            },
+            Case {
+                name: "medium_density_99",
+                rows: 1_000_000,
+                changed_basis_points: 9_900,
                 chain_len: 1,
                 old_fragment_count: 64,
                 groups_per_version: 8,
@@ -190,7 +241,20 @@ fn main() {
                 old_fragment_count: 256,
                 groups_per_version: 32,
             },
+            Case {
+                name: "large_dense",
+                rows: 5_000_000,
+                changed_basis_points: 9_000,
+                chain_len: 1,
+                old_fragment_count: 128,
+                groups_per_version: 16,
+            },
         ]
+    };
+
+    let storage = match config.storage_uri.as_deref() {
+        Some(uri) => Some(StorageTarget::open(uri).await),
+        None => None,
     };
 
     println!(
@@ -202,14 +266,16 @@ fn main() {
             "repeats": config.repeats,
             "lookups": config.lookups,
             "batch_size": config.batch_size,
+            "storage_repeats": config.storage_repeats,
+            "storage_kind": storage.as_ref().map(|target| target.kind),
             "unaffected_query_percent": 10,
             "profile": "cargo bench (release)",
-            "memory_metric": "DeepSizeOf retained-bytes proxy; Roaring containers use serialized_size",
+            "memory_metric": "DeepSizeOf retained-bytes proxy; retained Roaring containers use serialized_size",
         })
     );
 
     for case in cases {
-        run_case(case, &config);
+        run_case(case, &config, storage.as_ref()).await;
     }
 }
 
@@ -218,6 +284,8 @@ fn parse_config() -> Config {
         repeats: 30,
         lookups: 200_000,
         batch_size: 65_536,
+        storage_repeats: 10,
+        storage_uri: None,
         quick: false,
     };
     let mut args = std::env::args().skip(1);
@@ -231,10 +299,20 @@ fn parse_config() -> Config {
                 config.repeats = 5;
                 config.lookups = 20_000;
                 config.batch_size = 8_192;
+                config.storage_repeats = 3;
             }
             "--repeats" => config.repeats = parse_value(&mut args, "--repeats"),
             "--lookups" => config.lookups = parse_value(&mut args, "--lookups"),
             "--batch-size" => config.batch_size = parse_value(&mut args, "--batch-size"),
+            "--storage-repeats" => {
+                config.storage_repeats = parse_value(&mut args, "--storage-repeats")
+            }
+            "--storage-uri" => {
+                config.storage_uri = Some(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--storage-uri requires a URI")),
+                )
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -243,6 +321,10 @@ fn parse_config() -> Config {
     assert!(
         config.batch_size > 0,
         "--batch-size must be greater than zero"
+    );
+    assert!(
+        config.storage_repeats > 0,
+        "--storage-repeats must be greater than zero"
     );
     config
 }
@@ -254,15 +336,19 @@ fn parse_value(args: &mut impl Iterator<Item = String>, name: &str) -> usize {
         .unwrap_or_else(|_| panic!("{name} requires a positive integer"))
 }
 
-fn run_case(case: Case, config: &Config) {
+async fn run_case(case: Case, config: &Config, storage: Option<&StorageTarget>) {
     let (details, baseline_frags) = generate_details(case);
     let queries = sample_queries(&baseline_frags, config.lookups);
-    let batch_source = queries
+    let random_batch = queries
         .iter()
         .take(config.batch_size)
         .copied()
         .map(Some)
         .collect::<Vec<_>>();
+    let mut fragment_grouped_batch = random_batch.clone();
+    fragment_grouped_batch.sort_by_key(|row_id| row_id.map(|row_id| row_id >> 32));
+    let mut monotonic_batch = random_batch.clone();
+    monotonic_batch.sort_unstable();
 
     let legacy = LegacyFragReuseIndex::open(&details);
     let compact =
@@ -318,30 +404,205 @@ fn run_case(case: Case, config: &Config) {
         compact_lookup,
     );
 
-    let legacy_batch = measure(config.repeats, || {
-        let mut batch = batch_source.clone();
+    measure_batch_order(
+        case,
+        config.repeats,
+        "batch_random_ns_per_row",
+        &random_batch,
+        &legacy,
+        &compact,
+    );
+    measure_batch_order(
+        case,
+        config.repeats,
+        "batch_fragment_grouped_ns_per_row",
+        &fragment_grouped_batch,
+        &legacy,
+        &compact,
+    );
+    measure_batch_order(
+        case,
+        config.repeats,
+        "batch_monotonic_ns_per_row",
+        &monotonic_batch,
+        &legacy,
+        &compact,
+    );
+
+    if let Some(storage) = storage {
+        storage
+            .benchmark_external_open(case, &details, config.storage_repeats)
+            .await;
+    }
+}
+
+fn measure_batch_order(
+    case: Case,
+    repeats: usize,
+    metric: &str,
+    batch_source: &[Option<u64>],
+    legacy: &LegacyFragReuseIndex,
+    compact: &CompactFragReuseIndex,
+) {
+    let legacy_batch = measure(repeats, || {
+        let mut batch = batch_source.to_vec();
         legacy.remap_row_ids_in_place(black_box(&mut batch));
         black_box(batch);
     });
-    let compact_batch = measure(config.repeats, || {
-        let mut batch = batch_source.clone();
+    let compact_batch = measure(repeats, || {
+        let mut batch = batch_source.to_vec();
         compact.remap_row_ids_in_place(black_box(&mut batch));
         black_box(batch);
     });
     emit_timing(
         case,
-        "batch_remap_ns_per_row",
+        metric,
         "legacy_hash_map",
         batch_source.len(),
         legacy_batch,
     );
     emit_timing(
         case,
-        "batch_remap_ns_per_row",
+        metric,
         "compact_rank",
         batch_source.len(),
         compact_batch,
     );
+}
+
+impl StorageTarget {
+    async fn open(uri: &str) -> Self {
+        let (store, base_path) = LanceObjectStore::from_uri(uri)
+            .await
+            .unwrap_or_else(|error| panic!("failed to open benchmark storage URI {uri}: {error}"));
+        let kind = if uri.starts_with("s3://") {
+            "s3"
+        } else if uri.starts_with("file://") || !uri.contains("://") {
+            "local"
+        } else {
+            "object_store"
+        };
+        Self {
+            kind,
+            store,
+            base_path,
+        }
+    }
+
+    async fn benchmark_external_open(
+        &self,
+        case: Case,
+        details: &FragReuseIndexDetails,
+        repeats: usize,
+    ) {
+        let encoded = InlineContent::from(details).encode_to_vec();
+        if encoded.len() <= EXTERNAL_DETAILS_THRESHOLD {
+            println!(
+                "{}",
+                json!({
+                    "type": "storage_skip",
+                    "case": case.name,
+                    "storage": self.kind,
+                    "encoded_bytes": encoded.len(),
+                    "reason": "FRI details remain inline at the production external-file threshold",
+                })
+            );
+            return;
+        }
+
+        let path = self
+            .base_path
+            .clone()
+            .join(format!("{}.details.binpb", case.name));
+        let mut writer = self.store.create(&path).await.unwrap_or_else(|error| {
+            panic!(
+                "failed to create {} benchmark object {}: {error}",
+                self.kind, path
+            )
+        });
+        writer.write_all(&encoded).await.unwrap_or_else(|error| {
+            panic!(
+                "failed to write {} benchmark object {}: {error}",
+                self.kind, path
+            )
+        });
+        writer.shutdown().await.unwrap_or_else(|error| {
+            panic!(
+                "failed to finish {} benchmark object {}: {error}",
+                self.kind, path
+            )
+        });
+
+        let loaded = self.load_details(&path, encoded.len()).await;
+        assert_eq!(
+            &loaded, details,
+            "{} storage roundtrip changed FRI details for case {}",
+            self.kind, case.name
+        );
+
+        let mut legacy_samples = Vec::with_capacity(repeats);
+        let mut compact_samples = Vec::with_capacity(repeats);
+        for repeat in 0..repeats {
+            if repeat % 2 == 0 {
+                legacy_samples.push(self.measure_legacy_open(&path, encoded.len()).await);
+                compact_samples.push(self.measure_compact_open(&path, encoded.len()).await);
+            } else {
+                compact_samples.push(self.measure_compact_open(&path, encoded.len()).await);
+                legacy_samples.push(self.measure_legacy_open(&path, encoded.len()).await);
+            }
+        }
+        emit_storage_timing(
+            case,
+            self.kind,
+            encoded.len(),
+            "legacy_hash_map",
+            legacy_samples,
+        );
+        emit_storage_timing(
+            case,
+            self.kind,
+            encoded.len(),
+            "compact_rank",
+            compact_samples,
+        );
+    }
+
+    async fn load_details(&self, path: &Path, encoded_len: usize) -> FragReuseIndexDetails {
+        let data = self
+            .store
+            .open(path)
+            .await
+            .unwrap_or_else(|error| panic!("failed to open {} object {path}: {error}", self.kind))
+            .get_range(0..encoded_len)
+            .await
+            .unwrap_or_else(|error| panic!("failed to read {} object {path}: {error}", self.kind));
+        let content = InlineContent::decode(data).unwrap_or_else(|error| {
+            panic!("failed to decode {} FRI details {path}: {error}", self.kind)
+        });
+        FragReuseIndexDetails::try_from(content).unwrap_or_else(|error| {
+            panic!(
+                "failed to convert {} FRI details {path}: {error}",
+                self.kind
+            )
+        })
+    }
+
+    async fn measure_legacy_open(&self, path: &Path, encoded_len: usize) -> u128 {
+        let start = Instant::now();
+        let details = self.load_details(path, encoded_len).await;
+        black_box(LegacyFragReuseIndex::open(&details));
+        start.elapsed().as_nanos()
+    }
+
+    async fn measure_compact_open(&self, path: &Path, encoded_len: usize) -> u128 {
+        let start = Instant::now();
+        let details = self.load_details(path, encoded_len).await;
+        black_box(
+            CompactFragReuseIndex::try_new(Uuid::nil(), details)
+                .expect("valid stored benchmark FRI"),
+        );
+        start.elapsed().as_nanos()
+    }
 }
 
 fn measure(mut repeats: usize, mut operation: impl FnMut()) -> Vec<u128> {
@@ -397,6 +658,41 @@ fn emit_timing(
             "implementation": implementation,
             "metric": metric,
             "operations_per_sample": operations,
+            "repeats": samples_ns.len(),
+            "p50": percentile(&normalized, 0.50),
+            "p99": percentile(&normalized, 0.99),
+            "raw_total_ns": samples_ns,
+        })
+    );
+}
+
+fn emit_storage_timing(
+    case: Case,
+    storage: &str,
+    encoded_bytes: usize,
+    implementation: &str,
+    samples_ns: Vec<u128>,
+) {
+    let mut normalized = samples_ns
+        .iter()
+        .map(|sample| *sample as f64)
+        .collect::<Vec<_>>();
+    normalized.sort_by(f64::total_cmp);
+    println!(
+        "{}",
+        json!({
+            "type": "storage_timing",
+            "case": case.name,
+            "rows": case.rows,
+            "changed_basis_points": case.changed_basis_points,
+            "chain_len": case.chain_len,
+            "old_fragment_count": case.old_fragment_count,
+            "groups_per_version": case.groups_per_version,
+            "storage": storage,
+            "encoded_bytes": encoded_bytes,
+            "implementation": implementation,
+            "metric": "external_details_fetch_decode_open_ns",
+            "operations_per_sample": 1,
             "repeats": samples_ns.len(),
             "p50": percentile(&normalized, 0.50),
             "p99": percentile(&normalized, 0.99),
