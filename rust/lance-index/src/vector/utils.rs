@@ -201,13 +201,18 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     unsafe {
         use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
         const CACHE_LINE_SIZE: usize = 64;
+        // Cap the byte length before any pointer arithmetic: `ptr::add` must
+        // stay within the allocation even for intermediate values, and a
+        // short vector at the end of its backing buffer has fewer bytes left
+        // than the cap.
         let start = ptrs.start as *const i8;
-        let end =
-            (ptrs.end as *const i8).min(start.add(PREFETCH_MAX_CACHE_LINES * CACHE_LINE_SIZE));
-        let mut current_ptr = start;
-        while current_ptr < end {
-            _mm_prefetch(current_ptr, _MM_HINT_T0);
-            current_ptr = current_ptr.add(CACHE_LINE_SIZE);
+        let len = (ptrs.end as usize)
+            .saturating_sub(ptrs.start as usize)
+            .min(PREFETCH_MAX_CACHE_LINES * CACHE_LINE_SIZE);
+        let mut offset = 0;
+        while offset < len {
+            _mm_prefetch(start.add(offset), _MM_HINT_T0);
+            offset += CACHE_LINE_SIZE;
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -359,6 +364,19 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vector shorter than the prefetch cap whose slice ends exactly at its
+    /// allocation must not make `do_prefetch` form an out-of-allocation
+    /// pointer, and neither may a range that is not a multiple of the cache
+    /// line (UB under Miri; caught in review of #8882).
+    #[test]
+    fn test_do_prefetch_stays_in_short_allocations() {
+        let one_line: Vec<f32> = vec![0.0; 16]; // 64 bytes, far below the cap
+        do_prefetch(one_line.as_ptr_range());
+
+        let odd_length: Vec<f32> = vec![0.0; 24]; // 96 bytes, not line-aligned
+        do_prefetch(odd_length.as_ptr_range());
+    }
 
     use arrow_array::{Float16Array, Float32Array, Float64Array, UInt8Array};
     use half::f16;
