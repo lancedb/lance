@@ -732,7 +732,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             tokio::time::sleep(flush_wait).await;
         }
     }
-    // Wait for any triggered (sealed) memtable flushes to commit to the
+    // Wait for any triggered (frozen) memtable flushes to commit to the
     // manifest before we snapshot it — otherwise the SSTables
     // race the read and may not all be visible yet.
     writer.wait_for_flush_drain().await?;
