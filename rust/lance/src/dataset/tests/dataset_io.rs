@@ -1506,6 +1506,7 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         },
         dataset.manifest_location.naming_scheme,
         None,
+        false,
     )
     .await
     .unwrap();
@@ -1615,6 +1616,7 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
         },
         dataset.manifest_location.naming_scheme,
         None,
+        false,
     )
     .await
     .unwrap();
