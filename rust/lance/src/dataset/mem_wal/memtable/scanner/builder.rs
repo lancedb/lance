@@ -423,11 +423,11 @@ impl ScalarPredicate {
 /// Provides a builder pattern similar to Lance's Scanner interface
 /// for constructing DataFusion execution plans over in-memory data.
 ///
-/// # Index Visibility Model
+/// # Readable Prefix
 ///
-/// The scanner captures `visible_count` from the `IndexStore` at
-/// construction time. This frozen visibility ensures queries only see data
-/// that has been indexed, providing consistent results.
+/// The scanner snapshots one readable prefix at construction, so every plan it
+/// builds cuts at the same bound. [`MemTableVisibility`] selects which prefix:
+/// published, or the writer's own indexed prefix.
 ///
 /// # Example
 ///
@@ -447,9 +447,9 @@ pub struct MemTableScanner {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     schema: SchemaRef,
-    /// Frozen visibility captured at scanner construction time.
-    /// This is the `visible_count` from the IndexStore.
-    visible_count: usize,
+    /// Readable prefix frozen at scanner construction. Which `IndexStore`
+    /// cursor it came from is this scanner's [`MemTableVisibility`].
+    readable_count: usize,
     projection: Option<Vec<String>>,
     filter: Option<Expr>,
     limit: Option<usize>,
@@ -477,7 +477,7 @@ impl MemTableScanner {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing the data
-    /// * `indexes` - Index registry (carries the visibility watermark)
+    /// * `indexes` - Index registry (carries the visibility cursors)
     /// * `schema` - Schema of the data
     pub fn new(batch_store: Arc<BatchStore>, indexes: Arc<IndexStore>, schema: SchemaRef) -> Self {
         Self::new_at_visibility(batch_store, indexes, schema, MemTableVisibility::Published)
@@ -491,13 +491,13 @@ impl MemTableScanner {
         schema: SchemaRef,
         visibility: MemTableVisibility,
     ) -> Self {
-        let visible_count = indexes.prefix_count(visibility);
+        let readable_count = indexes.prefix_count(visibility);
 
         Self {
             batch_store,
             indexes,
             schema,
-            visible_count,
+            readable_count,
             projection: None,
             filter: None,
             limit: None,
@@ -556,12 +556,12 @@ impl MemTableScanner {
         self
     }
 
-    /// The `visible_count` snapshot this scanner latched at
-    /// construction. A downstream recency filter must key on this same snapshot
-    /// (not a fresh read of the IndexStore watermark, which a concurrent append
-    /// could have advanced) so it stays consistent with the rows the search saw.
-    pub fn visible_count(&self) -> usize {
-        self.visible_count
+    /// The readable-prefix snapshot this scanner latched at construction. A
+    /// downstream recency filter must key on this same snapshot (not a fresh
+    /// read of the IndexStore cursor, which a concurrent append could have
+    /// advanced) so it stays consistent with the rows the search saw.
+    pub fn readable_count(&self) -> usize {
+        self.readable_count
     }
 
     /// Include the _rowaddr column in output.
@@ -1023,7 +1023,7 @@ impl MemTableScanner {
 
         let scan = MemTableScanExec::with_filter(
             self.batch_store.clone(),
-            self.visible_count,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             self.schema.clone(),
@@ -1085,7 +1085,7 @@ impl MemTableScanner {
 
         Ok(Arc::new(MemTableDedupScanExec::new(
             self.batch_store.clone(),
-            self.visible_count,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             pk_indices,
@@ -1098,7 +1098,7 @@ impl MemTableScanner {
 
     /// Plan a BTree index query.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data. Falls back to full scan if no index exists.
     async fn plan_btree_query(
         &self,
@@ -1108,14 +1108,14 @@ impl MemTableScanner {
             return self.plan_full_scan().await;
         }
 
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
 
         let index_exec = BTreeIndexExec::new(
             self.batch_store.clone(),
             self.indexes.clone(),
             predicate.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.output_schema(),
             self.with_row_id,
@@ -1147,7 +1147,7 @@ impl MemTableScanner {
     }
 
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
         let filter_predicate = self.filter_predicate()?;
@@ -1175,7 +1175,7 @@ impl MemTableScanner {
                 self.batch_store.clone(),
                 self.indexes.clone(),
                 query.clone(),
-                max_visible,
+                max_readable,
                 projection_indices,
                 base_schema,
                 self.with_row_id,
@@ -1185,7 +1185,7 @@ impl MemTableScanner {
                 MemTableBruteForceVectorExec::new(
                     self.batch_store.clone(),
                     query.clone(),
-                    max_visible,
+                    max_readable,
                     projection_indices,
                     base_schema,
                     self.with_row_id,
@@ -1199,14 +1199,14 @@ impl MemTableScanner {
 
     /// Plan a full-text search.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
         if !self.has_fts_index(&query.column, query.document_granularity) {
             return self.empty_fts_plan(query.document_granularity);
         }
 
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
@@ -1217,7 +1217,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.indexes.clone(),
             query.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
@@ -1486,7 +1486,7 @@ mod tests {
         let indexes = Arc::new(index_store);
         let scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
         let result = scanner.try_into_batch().await.unwrap();
-        // visible_count is 1, so we see batches 0 and 1 (20 rows)
+        // readable_count is 1, so we see batches 0 and 1 (20 rows)
         assert_eq!(result.num_rows(), 20);
     }
 
