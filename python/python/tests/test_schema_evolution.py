@@ -460,6 +460,11 @@ def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
             if path.is_file()
         }
 
+    def dataset_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
     files_before_staging = data_files()
     staged_fragment, staged_schema, cleanup = fragments[0].merge_columns(
         {"staged": "a * 2"}, return_cleanup=True
@@ -472,10 +477,11 @@ def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
     merged_fragments = [staged_fragment]
     merged_fragments.extend(fragment.metadata for fragment in fragments[1:])
 
-    # A concurrent Merge advances the dataset and makes the staged Merge based
-    # on read_version conflict definitively before it can land.
-    dataset.add_columns({"concurrent": "a + 1"})
+    # A concurrent Delete updates the same fragment without changing field ids,
+    # so the staged Merge based on read_version conflicts before it can land.
+    dataset.delete("a = 0")
     files_before_cleanup = data_files()
+    dataset_files_before_cleanup = dataset_files()
     with pytest.raises(Exception, match="conflict"):
         lance.LanceDataset.commit(
             base_dir,
@@ -485,6 +491,7 @@ def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
 
     cleanup.cleanup()
     assert data_files() == files_before_cleanup - staged_files
+    assert dataset_files() == dataset_files_before_cleanup - staged_files
     assert files_before_staging <= data_files()
 
 
