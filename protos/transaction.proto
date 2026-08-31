@@ -137,8 +137,9 @@ message Transaction {
     // When present, index remapping is deferred through this index, so the
     // rewrite can be compatible with a concurrently created index. When
     // absent, including for transactions written before this field existed,
-    // index remapping is not deferred and conflict detection remains
-    // conservative.
+    // deferred-remap metadata was not recorded. Readers cannot infer whether
+    // remapping was deferred and must handle these records conservatively
+    // during conflict detection.
     optional IndexMetadata frag_reuse_index = 5;
   }
 
