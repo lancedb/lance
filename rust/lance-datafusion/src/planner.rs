@@ -26,8 +26,8 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
@@ -71,14 +71,6 @@ fn supported_json_extract_type(data_type: &ArrowDataType) -> Option<ArrowDataTyp
     .then(|| data_type.clone())
 }
 
-fn explicit_expr_type(expr: &Expr) -> Option<ArrowDataType> {
-    match expr {
-        Expr::Literal(value, _) => supported_json_extract_type(&value.data_type()),
-        Expr::Cast(cast) => supported_json_extract_type(cast.field.data_type()),
-        _ => None,
-    }
-}
-
 fn is_untyped_json_extract(expr: &Expr) -> bool {
     match expr {
         Expr::ScalarFunction(function) => function.name() == "json_extract",
@@ -119,7 +111,14 @@ fn rewrite_json_extract_reference(
     }
 }
 
-fn rewrite_typed_json_extract_predicates(expr: Expr) -> Result<Expr> {
+fn analyzed_json_extract_type(
+    expr: &Expr,
+    schema: &DFSchema,
+) -> datafusion::error::Result<Option<ArrowDataType>> {
+    Ok(supported_json_extract_type(&expr.get_type(schema)?))
+}
+
+fn rewrite_typed_json_extract_predicates(expr: Expr, schema: &DFSchema) -> Result<Expr> {
     expr.transform(|expr| {
         let Expr::BinaryExpr(mut binary) = expr else {
             return Ok(Transformed::no(expr));
@@ -141,32 +140,60 @@ fn rewrite_typed_json_extract_predicates(expr: Expr) -> Result<Expr> {
         if !left_is_json && !right_is_json {
             return Ok(Transformed::no(Expr::BinaryExpr(binary)));
         }
-        if left_is_json && right_is_json {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "A json_extract predicate comparing two untyped extractions is ambiguous; cast one extraction to Int64 or Utf8"
-                    .to_string(),
-            ));
-        }
+        let left_cast_type = left_is_json
+            .then(|| explicit_json_extract_cast_type(binary.left.as_ref()))
+            .flatten();
+        let right_cast_type = right_is_json
+            .then(|| explicit_json_extract_cast_type(binary.right.as_ref()))
+            .flatten();
 
-        if left_is_json {
-            let output_type = explicit_json_extract_cast_type(binary.left.as_ref())
-                .or_else(|| explicit_expr_type(binary.right.as_ref()))
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Plan(
-                        "json_extract predicate output type is ambiguous; compare it to an Int64 or Utf8 literal, or add an explicit cast"
+        let (left_output_type, right_output_type) = match (left_is_json, right_is_json) {
+            (true, true) => match (left_cast_type, right_cast_type) {
+                (None, None) => {
+                    return Err(datafusion::error::DataFusionError::Plan(
+                        "A json_extract predicate comparing two untyped extractions is ambiguous; add an explicit cast to at least one extraction"
                             .to_string(),
-                    )
-                })?;
+                    ));
+                }
+                (Some(output_type), None) => (Some(output_type.clone()), Some(output_type)),
+                (None, Some(output_type)) => (Some(output_type.clone()), Some(output_type)),
+                (Some(left_type), Some(right_type)) => (Some(left_type), Some(right_type)),
+            },
+            (true, false) => {
+                let output_type = match left_cast_type {
+                    Some(output_type) => output_type,
+                    None => analyzed_json_extract_type(binary.right.as_ref(), schema)?.ok_or_else(
+                        || {
+                            datafusion::error::DataFusionError::Plan(
+                                "json_extract predicate output type is ambiguous; compare it to a supported typed expression, or add an explicit cast"
+                                    .to_string(),
+                            )
+                        },
+                    )?,
+                };
+                (Some(output_type), None)
+            }
+            (false, true) => {
+                let output_type = match right_cast_type {
+                    Some(output_type) => output_type,
+                    None => analyzed_json_extract_type(binary.left.as_ref(), schema)?.ok_or_else(
+                        || {
+                            datafusion::error::DataFusionError::Plan(
+                                "json_extract predicate output type is ambiguous; compare it to a supported typed expression, or add an explicit cast"
+                                    .to_string(),
+                            )
+                        },
+                    )?,
+                };
+                (None, Some(output_type))
+            }
+            (false, false) => (None, None),
+        };
+
+        if let Some(output_type) = left_output_type {
             binary.left = Box::new(rewrite_json_extract_reference(*binary.left, &output_type)?);
-        } else {
-            let output_type = explicit_json_extract_cast_type(binary.right.as_ref())
-                .or_else(|| explicit_expr_type(binary.left.as_ref()))
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Plan(
-                        "json_extract predicate output type is ambiguous; compare it to an Int64 or Utf8 literal, or add an explicit cast"
-                            .to_string(),
-                    )
-                })?;
+        }
+        if let Some(output_type) = right_output_type {
             binary.right = Box::new(rewrite_json_extract_reference(*binary.right, &output_type)?);
         }
 
@@ -1060,11 +1087,13 @@ impl Planner {
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let ast_expr = parse_sql_filter(filter)?;
-        let expr = rewrite_typed_json_extract_predicates(self.parse_sql_expr(&ast_expr)?)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
             Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let resolved = rewrite_typed_json_extract_predicates(resolved, &df_schema)?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
     }
@@ -1171,7 +1200,7 @@ impl Planner {
         // their literal or explicit cast, so resolve that before DataFusion's
         // ordinary coercion can erase the distinction between numeric and
         // lexicographic comparison semantics.
-        let expr = rewrite_typed_json_extract_predicates(expr)?;
+        let expr = rewrite_typed_json_extract_predicates(expr, df_schema.as_ref())?;
 
         // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
@@ -1367,12 +1396,25 @@ mod tests {
 
     #[test]
     fn test_json_extract_predicate_type_is_resolved_before_coercion() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "json",
-            DataType::LargeBinary,
-            true,
-        )]));
-        let planner = Planner::new(schema);
+        let json_values = [r#"{"n": 1}"#, r#"{"n": 2}"#, r#"{"n": 3}"#]
+            .map(|value| lance_arrow::json::encode_json(value).unwrap());
+        let json2_values = [r#"{"n": 1}"#, r#"{"n": 7}"#, r#"{"n": 3}"#]
+            .map(|value| lance_arrow::json::encode_json(value).unwrap());
+        let batch = arrow_array::record_batch!(
+            (
+                "json",
+                LargeBinary,
+                json_values.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            ),
+            (
+                "json2",
+                LargeBinary,
+                json2_values.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            ),
+            ("n", Int64, [1, 2, 4])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
 
         let numeric = planner
             .parse_filter("json_extract(json, '$.n') >= 9")
@@ -1399,6 +1441,34 @@ mod tests {
             .parse_filter("json_extract(json, '$.n') = NULL")
             .unwrap_err();
         assert!(error.to_string().contains("output type is ambiguous"));
+
+        let cases = [
+            (
+                "json_extract(json, '$.n') = n",
+                BooleanArray::from(vec![true, true, false]),
+            ),
+            (
+                "CAST(json_extract(json, '$.n') AS BIGINT) = \
+                 CAST(json_extract(json2, '$.n') AS BIGINT)",
+                BooleanArray::from(vec![true, false, true]),
+            ),
+        ];
+        for (filter, expected) in cases {
+            let logical = planner.parse_filter(filter).unwrap();
+            assert!(
+                logical
+                    .to_string()
+                    .contains(crate::udf::json::JSON_EXTRACT_INT64_UDF_NAME)
+            );
+            let logical = planner.optimize_expr(logical).unwrap();
+            let physical = planner.create_physical_expr(&logical).unwrap();
+            let actual = physical
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(actual.as_ref(), &expected, "unexpected result for {filter}");
+        }
     }
 
     #[test]

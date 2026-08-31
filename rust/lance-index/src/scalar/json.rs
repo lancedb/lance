@@ -55,6 +55,12 @@ use crate::{
 const JSON_INDEX_VERSION: u32 = 1;
 const JSON_INDEX_CONVERSION: &str = "jsonpath_typed_v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonIndexConversion {
+    LegacyV0,
+    TypedV1,
+}
+
 /// A JSON index that indexes a field in a JSON column
 ///
 /// The underlying index can be any other type of scalar index
@@ -63,6 +69,7 @@ pub struct JsonIndex {
     target_index: Arc<dyn ScalarIndex>,
     path: String,
     target_type: DataType,
+    conversion: JsonIndexConversion,
 }
 
 impl JsonIndex {
@@ -71,7 +78,39 @@ impl JsonIndex {
             target_index,
             path,
             target_type,
+            conversion: JsonIndexConversion::TypedV1,
         }
+    }
+
+    fn new_legacy(target_index: Arc<dyn ScalarIndex>, path: String, target_type: DataType) -> Self {
+        Self {
+            target_index,
+            path,
+            target_type,
+            conversion: JsonIndexConversion::LegacyV0,
+        }
+    }
+
+    fn wrap_target_created_index(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+        let (target_data_type, conversion, index_version) = match self.conversion {
+            JsonIndexConversion::LegacyV0 => (None, None, 0),
+            JsonIndexConversion::TypedV1 => (
+                Some(json_target_type_name(&self.target_type)?.to_string()),
+                Some(JSON_INDEX_CONVERSION.to_string()),
+                JSON_INDEX_VERSION,
+            ),
+        };
+        let json_details = crate::pb::JsonIndexDetails {
+            path: self.path.clone(),
+            target_details: Some(target_created.index_details),
+            target_data_type,
+            conversion,
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&json_details)?,
+            index_version,
+            files: target_created.files,
+        })
     }
 }
 
@@ -143,18 +182,7 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-            target_data_type: Some(json_target_type_name(&self.target_type)?.to_string()),
-            conversion: Some(JSON_INDEX_CONVERSION.to_string()),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.wrap_target_created_index(target_created)
     }
 
     async fn update(
@@ -163,6 +191,12 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
+        if self.conversion == JsonIndexConversion::LegacyV0 {
+            return Err(Error::not_supported(format!(
+                "Legacy version-0 JSON index at path '{}' must be fully rebuilt before adding new data",
+                self.path
+            )));
+        }
         let target_criteria = self.target_index.update_criteria().data_criteria;
         let new_data = JsonIndexPlugin::extract_json_typed(
             new_data,
@@ -178,18 +212,7 @@ impl ScalarIndex for JsonIndex {
             .target_index
             .update(new_data, dest_store, old_data_filter)
             .await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-            target_data_type: Some(json_target_type_name(&self.target_type)?.to_string()),
-            conversion: Some(JSON_INDEX_CONVERSION.to_string()),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.wrap_target_created_index(target_created)
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -827,25 +850,50 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let target_index = target_plugin
             .load_index(index_store, target_details, frag_reuse_index, cache)
             .await?;
-        let target_type = match json_details.target_data_type.as_deref() {
-            Some(data_type) => parse_json_target_type(data_type).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "JSON index path '{}' has unsupported target data type '{data_type}'",
+        let (target_type, conversion) = match (
+            json_details.target_data_type.as_deref(),
+            json_details.conversion.as_deref(),
+        ) {
+            (None, None) => (
+                target_index.training_data_type().ok_or_else(|| {
+                    Error::not_supported(format!(
+                        "Legacy JSON index path '{}' does not record its target data type",
+                        json_details.path
+                    ))
+                })?,
+                JsonIndexConversion::LegacyV0,
+            ),
+            (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => (
+                parse_json_target_type(data_type).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "JSON index path '{}' has unsupported target data type '{data_type}'",
+                        json_details.path
+                    ))
+                })?,
+                JsonIndexConversion::TypedV1,
+            ),
+            (Some(_), Some(conversion)) => {
+                return Err(Error::not_supported(format!(
+                    "JSON index path '{}' uses unsupported conversion '{conversion}'",
                     json_details.path
-                ))
-            })?,
-            None => target_index.training_data_type().ok_or_else(|| {
-                Error::not_supported(format!(
-                    "Legacy JSON index path '{}' does not record its target data type",
+                )));
+            }
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "JSON index path '{}' has incomplete conversion metadata",
                     json_details.path
-                ))
-            })?,
+                )));
+            }
         };
-        Ok(Arc::new(JsonIndex::new(
-            target_index,
-            json_details.path,
-            target_type,
-        )))
+        let index = match conversion {
+            JsonIndexConversion::LegacyV0 => {
+                JsonIndex::new_legacy(target_index, json_details.path, target_type)
+            }
+            JsonIndexConversion::TypedV1 => {
+                JsonIndex::new(target_index, json_details.path, target_type)
+            }
+        };
+        Ok(Arc::new(index))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -866,11 +914,15 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::progress::noop_progress;
     use crate::scalar::{SargableQuery, TextQuery};
-    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::DataFusionError;
+    use futures::stream;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
+    use lance_select::RowAddrTreeMap;
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -1099,6 +1151,47 @@ mod tests {
         (store, tmpdir)
     }
 
+    async fn load_legacy_utf8_json_index(store: Arc<dyn IndexStore>) -> Arc<dyn ScalarIndex> {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let target_plugin = registry.get_plugin_by_name("btree").unwrap();
+        let target_trainer = target_plugin.basic_trainer().unwrap();
+        let target_request = target_trainer
+            .new_training_request("{}", &Field::new("", DataType::Utf8, true))
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["foo"])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter([Ok(batch)]),
+        ));
+        let target_created = target_trainer
+            .train_index(data, store.as_ref(), target_request, None, noop_progress())
+            .await
+            .unwrap();
+        let legacy_details = crate::pb::JsonIndexDetails {
+            path: "$.v".to_string(),
+            target_details: Some(target_created.index_details),
+            target_data_type: None,
+            conversion: None,
+        };
+        let legacy_details = prost_types::Any::from_msg(&legacy_details).unwrap();
+        let json_plugin = registry.get_plugin_by_name("json").unwrap();
+        json_plugin
+            .load_index(store, &legacy_details, None, &LanceCache::no_cache())
+            .await
+            .unwrap()
+    }
+
     fn json_update_batch(json_docs: &[&str], row_ids: Vec<u64>) -> RecordBatch {
         use arrow_array::{LargeBinaryArray, UInt64Array};
 
@@ -1131,6 +1224,78 @@ mod tests {
             schema,
             stream::iter([Ok(batch)]),
         ))
+    }
+
+    #[tokio::test]
+    async fn test_legacy_json_index_maintenance_preserves_conversion() {
+        let (source_store, _source_dir) = local_json_index_store();
+        let legacy = load_legacy_utf8_json_index(source_store).await;
+
+        let (remap_store, _remap_dir) = local_json_index_store();
+        let remapped_created = legacy
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remapped_created.index_version, 0);
+        let remapped_details =
+            crate::pb::JsonIndexDetails::decode(remapped_created.index_details.value.as_slice())
+                .unwrap();
+        assert_eq!(remapped_details.target_data_type, None);
+        assert_eq!(remapped_details.conversion, None);
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let json_plugin = registry.get_plugin_by_name("json").unwrap();
+        let remapped = json_plugin
+            .load_index(
+                remap_store,
+                &remapped_created.index_details,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        let decoded_key = JsonQuery::new(
+            Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "foo".to_string(),
+            )))),
+            "$.v".to_string(),
+        );
+        let decoded_result = remapped
+            .search(&decoded_key, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded_result,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0]))
+        );
+        let typed_key = JsonQuery::new(
+            Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                r#""foo""#.to_string(),
+            )))),
+            "$.v".to_string(),
+        );
+        let typed_result = remapped
+            .search(&typed_key, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(typed_result, SearchResult::exact(RowAddrTreeMap::default()));
+
+        let (update_store, _update_dir) = local_json_index_store();
+        let error = remapped
+            .update(
+                json_update_stream(&[r#"{"v": "bar"}"#], vec![1]),
+                update_store.as_ref(),
+                None,
+            )
+            .await
+            .err()
+            .expect("legacy incremental update should require a rebuild");
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("must be fully rebuilt before adding new data")
+        );
     }
 
     #[rstest]
