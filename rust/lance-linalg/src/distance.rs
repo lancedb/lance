@@ -658,10 +658,10 @@ mod tests {
         }
     }
 
-    /// An input that is both a length mismatch and a null query must behave the
-    /// same on all three metrics. It did not: `dot` asserted the dimension in its
-    /// public entry point as well as in the shared body, so it panicked there
-    /// while l2 and cosine returned the null error.
+    /// An input that is both a length mismatch and a null query must reach the
+    /// null error on all three metrics. `dot` used to check the dimension in its
+    /// public entry point as well as in the shared body, which put that check
+    /// ahead of the `Int8` arm's null guard where the other two put it after.
     #[test]
     fn test_arrow_batch_null_and_length_mismatch_agree() {
         let targets =
